@@ -256,11 +256,7 @@ impl GatewayAuthService {
             return Err(AuthError::new(AuthErrorCode::InvalidCredential));
         }
         if session.status == "revoked" {
-            let code = if session.revoke_reason.as_deref() == Some("refresh_reuse") {
-                AuthErrorCode::SessionCompromised
-            } else {
-                AuthErrorCode::SessionRevoked
-            };
+            let code = revoked_session_error_code(session.revoke_reason.as_deref());
             let _ = transaction.rollback().await;
             return Err(AuthError::new(code));
         }
@@ -2467,6 +2463,15 @@ fn timestamp(value: DateTime<FixedOffset>) -> Result<u64, AuthError> {
     u64::try_from(value.timestamp()).map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))
 }
 
+fn revoked_session_error_code(revoke_reason: Option<&str>) -> AuthErrorCode {
+    match revoke_reason {
+        Some("refresh_reuse") => AuthErrorCode::SessionCompromised,
+        Some("principal_suspended") => AuthErrorCode::PrincipalSuspended,
+        Some("principal_removed") => AuthErrorCode::PrincipalRemoved,
+        _ => AuthErrorCode::SessionRevoked,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use migration::{Migrator, MigratorTrait};
@@ -2486,6 +2491,26 @@ mod tests {
     use crate::identity::bootstrap_identity;
     use crate::member::MemberService;
     use crate::secrets::{AuthKeyMaterial, GatewaySecrets};
+
+    #[test]
+    fn revoked_refresh_preserves_exact_terminal_member_reason() {
+        assert_eq!(
+            revoked_session_error_code(Some("principal_suspended")),
+            AuthErrorCode::PrincipalSuspended
+        );
+        assert_eq!(
+            revoked_session_error_code(Some("principal_removed")),
+            AuthErrorCode::PrincipalRemoved
+        );
+        assert_eq!(
+            revoked_session_error_code(Some("refresh_reuse")),
+            AuthErrorCode::SessionCompromised
+        );
+        assert_eq!(
+            revoked_session_error_code(Some("self_revoke")),
+            AuthErrorCode::SessionRevoked
+        );
+    }
 
     async fn fixture() -> (GatewayAuthService, Arc<IdentityBootstrapSnapshot>) {
         let database = Database::connect("sqlite::memory:").await.unwrap();

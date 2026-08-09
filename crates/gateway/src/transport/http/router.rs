@@ -3,7 +3,7 @@ use axum::middleware;
 use axum::routing::get;
 
 use super::GatewayHttpState;
-use super::avatars::member_avatar_route;
+use super::avatars::{agent_avatar_route, member_avatar_route};
 use super::content::{artifact_content_route, artifact_projection_route};
 use super::health::{health, ready};
 use super::views::view_grant_route;
@@ -26,6 +26,10 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
         .route(
             "/storage/members/{principal_id}/avatar/{avatar_revision}",
             get(member_avatar_route).head(member_avatar_route),
+        )
+        .route(
+            "/storage/system/agent/avatar/{avatar_revision}",
+            get(agent_avatar_route).head(agent_avatar_route),
         )
         .layer(middleware::from_fn(super::header_policy::enforce))
         .with_state(state)

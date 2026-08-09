@@ -5,7 +5,9 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
-use pioneer_protocol::{PrincipalId, RequestId};
+use pioneer_protocol::{
+    PIONEER_AGENT_AVATAR_REVISION, PrincipalId, ProfileAvatarMediaType, RequestId,
+};
 use serde::Deserialize;
 
 use crate::authorization::{AuthorizationExternalError, external_error_for_decision};
@@ -16,12 +18,18 @@ use super::errors::{HttpError, HttpErrorKind};
 use super::state::GatewayHttpState;
 
 const AVATAR_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
+const PIONEER_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/pioneer-avatar.jpeg");
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("pioneer-request-id");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 
 #[derive(Debug, Deserialize)]
 pub(super) struct MemberAvatarPath {
     principal_id: String,
+    avatar_revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AgentAvatarPath {
     avatar_revision: String,
 }
 
@@ -61,6 +69,35 @@ pub(super) async fn member_avatar_route(
     avatar_response(snapshot, method, &headers, &request_id)
 }
 
+pub(super) async fn agent_avatar_route(
+    State(state): State<GatewayHttpState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Path(path): Path<AgentAvatarPath>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    let context =
+        authenticate_native_storage_request(&state, peer_addr, &headers, "storage/agent/avatar")
+            .await?;
+    let request_id = context
+        .request_id()
+        .cloned()
+        .expect("native HTTP authentication always assigns a request ID");
+    if path.avatar_revision != PIONEER_AGENT_AVATAR_REVISION {
+        record_avatar_hidden(&request_id, "invalid_revision");
+        return Err(HttpError::not_found(request_id));
+    }
+
+    avatar_representation_response(
+        PIONEER_AGENT_AVATAR_BYTES,
+        ProfileAvatarMediaType::Jpeg,
+        PIONEER_AGENT_AVATAR_REVISION,
+        method,
+        &headers,
+        &request_id,
+    )
+}
+
 fn valid_revision(revision: &str) -> bool {
     revision.len() == 64
         && revision
@@ -74,7 +111,25 @@ fn avatar_response(
     request_headers: &HeaderMap,
     request_id: &RequestId,
 ) -> Result<Response, HttpError> {
-    let etag = format!("\"{}\"", snapshot.revision());
+    avatar_representation_response(
+        snapshot.content(),
+        snapshot.media_type(),
+        snapshot.revision(),
+        method,
+        request_headers,
+        request_id,
+    )
+}
+
+fn avatar_representation_response(
+    content: &[u8],
+    media_type: ProfileAvatarMediaType,
+    revision: &str,
+    method: Method,
+    request_headers: &HeaderMap,
+    request_id: &RequestId,
+) -> Result<Response, HttpError> {
+    let etag = format!("\"{revision}\"");
     let not_modified = if_none_match_matches(request_headers, etag.as_str());
     let status = if not_modified {
         StatusCode::NOT_MODIFIED
@@ -83,7 +138,7 @@ fn avatar_response(
     };
     let send_body = !not_modified && method == Method::GET;
     let body = if send_body {
-        Body::from(snapshot.content().to_vec())
+        Body::from(content.to_vec())
     } else {
         Body::empty()
     };
@@ -101,14 +156,11 @@ fn avatar_response(
     insert_header(headers, REQUEST_ID_HEADER, request_id.as_str(), request_id)?;
 
     if !not_modified {
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static(snapshot.media_type().as_str()),
-        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(media_type.as_str()));
         insert_header(
             headers,
             CONTENT_LENGTH,
-            snapshot.content().len().to_string().as_str(),
+            content.len().to_string().as_str(),
             request_id,
         )?;
     }
@@ -202,6 +254,7 @@ fn record_avatar_hidden(request_id: &RequestId, reason_code: &'static str) {
 mod tests {
     use axum::body::to_bytes;
     use pioneer_protocol::ProfileAvatarMediaType;
+    use sha2::{Digest as _, Sha256};
 
     use super::*;
 
@@ -263,5 +316,14 @@ mod tests {
         assert!(!valid_revision("A".repeat(64).as_str()));
         assert!(!valid_revision("a".repeat(63).as_str()));
         assert!(!valid_revision(format!("{}g", "a".repeat(63)).as_str()));
+    }
+
+    #[test]
+    fn embedded_agent_avatar_matches_the_shared_immutable_revision() {
+        assert_eq!(
+            hex::encode(Sha256::digest(PIONEER_AGENT_AVATAR_BYTES)),
+            PIONEER_AGENT_AVATAR_REVISION,
+        );
+        assert!(PIONEER_AGENT_AVATAR_BYTES.starts_with(&[0xff, 0xd8, 0xff]));
     }
 }

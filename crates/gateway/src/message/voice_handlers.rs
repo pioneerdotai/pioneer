@@ -6,7 +6,7 @@ use crate::voice::transcription::{
 };
 use crate::voice::vad::{EnergyVoiceActivityDetector, SmoothedVoiceVad, VoiceVadConfig};
 use pioneer_protocol::{
-    AgentExecutionBackend, VoiceSessionOutcome, VoiceSessionResultNotification,
+    AgentExecutionBackend, ThreadMode, VoiceSessionOutcome, VoiceSessionResultNotification,
 };
 
 const GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR: f32 = 0.02;
@@ -431,6 +431,25 @@ impl MessageProcessor {
                             return;
                         }
                     };
+                if turn_params.mode == Some(ThreadMode::Message) {
+                    let message_admission =
+                        super::message_turn::MessageTurnAdmission::from_voice_execution_admission(
+                            &execution_admission,
+                        );
+                    self.turn_start_message(
+                        request_context,
+                        message_admission,
+                        super::message_turn::MessageTurnResponse::Voice {
+                            session_id: session.session_id.clone(),
+                            thread_id: session.thread_id.clone(),
+                            turn_id: session.turn_id.clone(),
+                        },
+                        turn_params,
+                        false,
+                    )
+                    .await;
+                    return;
+                }
                 if execution_admission.is_member() {
                     let requested = pioneer_protocol::resolve_turn_permission_profile(
                         turn_params.permission_profile.as_ref(),

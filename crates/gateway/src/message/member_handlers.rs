@@ -64,6 +64,7 @@ impl MessageProcessor {
                     self.terminate_member_sessions_after_commit(
                         &target_principal_id,
                         committed.revoked_session_ids.clone(),
+                        AuthSessionTerminationReason::PrincipalSuspended,
                         Epic5Operation::SessionTerminationSuspended,
                     )
                     .await;
@@ -180,6 +181,7 @@ impl MessageProcessor {
                     self.terminate_member_sessions_after_commit(
                         &target_principal_id,
                         committed.revoked_session_ids.clone(),
+                        AuthSessionTerminationReason::PrincipalRemoved,
                         Epic5Operation::SessionTerminationRemoved,
                     )
                     .await;
@@ -484,6 +486,7 @@ impl MessageProcessor {
         &self,
         target_principal_id: &PrincipalId,
         committed_session_ids: Vec<AuthSessionId>,
+        reason: AuthSessionTerminationReason,
         metric_operation: Epic5Operation,
     ) {
         let mut session_ids = BTreeMap::new();
@@ -499,7 +502,7 @@ impl MessageProcessor {
         }
         for session_id in session_ids.into_values() {
             self.session_manager
-                .disconnect_session(&session_id, AuthSessionTerminationReason::SessionRevoked)
+                .disconnect_session(&session_id, reason)
                 .await;
             record_outcome(metric_operation, Epic5Outcome::Success);
         }

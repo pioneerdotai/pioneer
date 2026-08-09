@@ -1,7 +1,113 @@
 use super::dispatch::RequestAdmission;
 use super::*;
 use crate::authorization::{RuntimeDraftCreator, RuntimeDraftMaterialization};
-use pioneer_protocol::UserInput;
+use pioneer_protocol::{
+    UserInput, VoiceError, VoiceErrorKind, VoiceSessionOutcome, VoiceSessionResultNotification,
+};
+
+/// Selects how the Message leaf reports its result. Normal `turn/start`
+/// requests receive JSON-RPC responses; voice transcription uses the existing
+/// voice-session notification channel while committing the exact same Message
+/// turn projection.
+pub(super) enum MessageTurnResponse {
+    JsonRpc {
+        request_id: RequestId,
+    },
+    Voice {
+        session_id: String,
+        thread_id: String,
+        turn_id: String,
+    },
+}
+
+impl MessageTurnResponse {
+    async fn send_error(
+        &self,
+        processor: &MessageProcessor,
+        connection_id: ConnectionId,
+        code: i64,
+        message: impl Into<String>,
+    ) {
+        match self {
+            Self::JsonRpc { request_id } => {
+                processor
+                    .send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(Some(request_id.clone()), code, message),
+                    )
+                    .await;
+            }
+            Self::Voice {
+                session_id,
+                thread_id,
+                turn_id,
+            } => {
+                processor
+                    .send_voice_session_result_notification(
+                        connection_id,
+                        thread_id,
+                        VoiceSessionResultNotification {
+                            session_id: session_id.clone(),
+                            outcome: VoiceSessionOutcome::Failed,
+                            turn_id: Some(turn_id.clone()),
+                            error: Some(VoiceError {
+                                kind: VoiceErrorKind::Unknown,
+                                message: message.into(),
+                            }),
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn send_success(
+        &self,
+        processor: &MessageProcessor,
+        connection_id: ConnectionId,
+        response: &pioneer_protocol::TurnStartResponse,
+    ) {
+        match self {
+            Self::JsonRpc { request_id } => {
+                let _ = send_message_turn_response(
+                    processor,
+                    connection_id,
+                    request_id.clone(),
+                    response,
+                )
+                .await;
+            }
+            Self::Voice {
+                session_id,
+                thread_id,
+                ..
+            } => {
+                processor
+                    .send_voice_session_result_notification(
+                        connection_id,
+                        thread_id,
+                        VoiceSessionResultNotification {
+                            session_id: session_id.clone(),
+                            outcome: VoiceSessionOutcome::TurnStarted,
+                            turn_id: Some(response.turn.id.clone()),
+                            error: None,
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn send_conflict(&self, processor: &MessageProcessor, connection_id: ConnectionId) {
+        self.send_error(
+            processor,
+            connection_id,
+            INVALID_REQUEST_CODE,
+            "turn_id is already used by a different request",
+        )
+        .await;
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct MessageInputMetrics {
@@ -400,23 +506,6 @@ async fn send_message_turn_response(
     true
 }
 
-async fn send_message_turn_conflict(
-    processor: &MessageProcessor,
-    connection_id: ConnectionId,
-    request_id: RequestId,
-) {
-    processor
-        .send_error(
-            connection_id,
-            JsonRpcErrorResponse::new(
-                Some(request_id),
-                INVALID_REQUEST_CODE,
-                "turn_id is already used by a different request",
-            ),
-        )
-        .await;
-}
-
 /// Narrow authorization carrier for the instant-completed Message leaf.
 /// It deliberately contains no provider, executor, tool or runtime state.
 pub(super) struct MessageTurnAdmission {
@@ -539,6 +628,14 @@ mod tests {
 }
 
 impl MessageTurnAdmission {
+    pub(super) fn from_voice_execution_admission(
+        admission: &crate::authorization::ExecutionAuthorizationAdmission,
+    ) -> Self {
+        Self {
+            runtime_draft: admission.runtime_draft().cloned(),
+        }
+    }
+
     pub(super) fn from_dispatch(
         request_context: &RequestContext,
         admission: &RequestAdmission,
@@ -580,7 +677,7 @@ impl MessageProcessor {
         &'a self,
         request_context: &'a RequestContext,
         admission: MessageTurnAdmission,
-        request_id: RequestId,
+        response: MessageTurnResponse,
         mut params: TurnStartParams,
         client_author_override: bool,
     ) -> MessageFuture<'a, ()> {
@@ -597,15 +694,14 @@ impl MessageProcessor {
                     0,
                     operation_started.elapsed().as_millis(),
                 );
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
+                response
+                    .send_error(
+                        self,
+                        connection_id,
                         INVALID_PARAMS_CODE,
                         format!("invalid params for `{}`: {error}", methods::TURN_START),
-                    ),
-                )
-                .await;
+                    )
+                    .await;
                 return;
             }
             if let Err(error) = normalize_turn_collaboration_params(&mut params) {
@@ -617,15 +713,14 @@ impl MessageProcessor {
                     0,
                     operation_started.elapsed().as_millis(),
                 );
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
+                response
+                    .send_error(
+                        self,
+                        connection_id,
                         INVALID_PARAMS_CODE,
                         format!("invalid params for `{}`: {error}", methods::TURN_START),
-                    ),
-                )
-                .await;
+                    )
+                    .await;
                 return;
             }
             let Some(thread) = self
@@ -641,29 +736,29 @@ impl MessageProcessor {
                     0,
                     operation_started.elapsed().as_millis(),
                 );
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
+                response
+                    .send_error(
+                        self,
+                        connection_id,
                         INVALID_REQUEST_CODE,
                         "authorized Message thread is unavailable",
-                    ),
-                )
-                .await;
+                    )
+                    .await;
                 return;
             };
             let request_actor = request_context.persisted_actor();
             match existing_message_turn(self.crud_store.as_ref(), &request_actor, &params).await {
-                Ok(ExistingMessageTurn::Idempotent(response)) => {
+                Ok(ExistingMessageTurn::Idempotent(turn_response)) => {
                     log_message_turn_outcome(
                         &params,
                         input_metrics,
                         "idempotent",
-                        response.turn.message_revision,
+                        turn_response.turn.message_revision,
                         0,
                         operation_started.elapsed().as_millis(),
                     );
-                    let _ = send_message_turn_response(self, connection_id, request_id, &response)
+                    response
+                        .send_success(self, connection_id, &turn_response)
                         .await;
                     return;
                 }
@@ -676,7 +771,7 @@ impl MessageProcessor {
                         0,
                         operation_started.elapsed().as_millis(),
                     );
-                    send_message_turn_conflict(self, connection_id, request_id).await;
+                    response.send_conflict(self, connection_id).await;
                     return;
                 }
                 Ok(ExistingMessageTurn::Missing) => {}
@@ -689,15 +784,14 @@ impl MessageProcessor {
                         0,
                         operation_started.elapsed().as_millis(),
                     );
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
+                    response
+                        .send_error(
+                            self,
+                            connection_id,
                             INVALID_REQUEST_CODE,
                             format!("failed to resolve Message idempotency: {error:#}"),
-                        ),
-                    )
-                    .await;
+                        )
+                        .await;
                     return;
                 }
             }
@@ -717,15 +811,14 @@ impl MessageProcessor {
                     0,
                     operation_started.elapsed().as_millis(),
                 );
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
+                response
+                    .send_error(
+                        self,
+                        connection_id,
                         INVALID_REQUEST_CODE,
                         format!("invalid Message attachment: {error}"),
-                    ),
-                )
-                .await;
+                    )
+                    .await;
                 return;
             }
             let author = match resolve_turn_author_snapshot(
@@ -744,15 +837,14 @@ impl MessageProcessor {
                         0,
                         operation_started.elapsed().as_millis(),
                     );
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
+                    response
+                        .send_error(
+                            self,
+                            connection_id,
                             INVALID_REQUEST_CODE,
                             "authenticated Message author is unavailable",
-                        ),
-                    )
-                    .await;
+                        )
+                        .await;
                     return;
                 }
                 Err(error) => {
@@ -764,15 +856,14 @@ impl MessageProcessor {
                         0,
                         operation_started.elapsed().as_millis(),
                     );
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
+                    response
+                        .send_error(
+                            self,
+                            connection_id,
                             INVALID_REQUEST_CODE,
                             format!("failed to resolve Message author: {error:#}"),
-                        ),
-                    )
-                    .await;
+                        )
+                        .await;
                     return;
                 }
             };
@@ -793,15 +884,14 @@ impl MessageProcessor {
                         0,
                         operation_started.elapsed().as_millis(),
                     );
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
+                    response
+                        .send_error(
+                            self,
+                            connection_id,
                             INVALID_REQUEST_CODE,
                             format!("invalid Turn collaboration metadata: {error}"),
-                        ),
-                    )
-                    .await;
+                        )
+                        .await;
                     return;
                 }
             };
@@ -820,15 +910,14 @@ impl MessageProcessor {
                         0,
                         operation_started.elapsed().as_millis(),
                     );
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(
-                            Some(request_id),
+                    response
+                        .send_error(
+                            self,
+                            connection_id,
                             INVALID_REQUEST_CODE,
                             format!("failed to admit Message turn: {error:#}"),
-                        ),
-                    )
-                    .await;
+                        )
+                        .await;
                     return;
                 }
             };
@@ -850,18 +939,18 @@ impl MessageProcessor {
             {
                 match existing_message_turn(self.crud_store.as_ref(), &request_actor, &params).await
                 {
-                    Ok(ExistingMessageTurn::Idempotent(response)) => {
+                    Ok(ExistingMessageTurn::Idempotent(turn_response)) => {
                         log_message_turn_outcome(
                             &params,
                             input_metrics,
                             "idempotent",
-                            response.turn.message_revision,
+                            turn_response.turn.message_revision,
                             commit_started.elapsed().as_millis(),
                             operation_started.elapsed().as_millis(),
                         );
-                        let _ =
-                            send_message_turn_response(self, connection_id, request_id, &response)
-                                .await;
+                        response
+                            .send_success(self, connection_id, &turn_response)
+                            .await;
                     }
                     Ok(ExistingMessageTurn::Conflict) => {
                         log_message_turn_outcome(
@@ -872,7 +961,7 @@ impl MessageProcessor {
                             commit_started.elapsed().as_millis(),
                             operation_started.elapsed().as_millis(),
                         );
-                        send_message_turn_conflict(self, connection_id, request_id).await;
+                        response.send_conflict(self, connection_id).await;
                     }
                     Ok(ExistingMessageTurn::Missing) | Err(_) => {
                         log_message_turn_outcome(
@@ -883,15 +972,14 @@ impl MessageProcessor {
                             commit_started.elapsed().as_millis(),
                             operation_started.elapsed().as_millis(),
                         );
-                        self.send_error(
-                            connection_id,
-                            JsonRpcErrorResponse::new(
-                                Some(request_id),
+                        response
+                            .send_error(
+                                self,
+                                connection_id,
                                 INVALID_REQUEST_CODE,
                                 format!("failed to persist Message turn: {error:#}"),
-                            ),
-                        )
-                        .await;
+                            )
+                            .await;
                     }
                 }
                 return;
@@ -928,7 +1016,8 @@ impl MessageProcessor {
                     Some(outcome.completed_notification.workspace_id.clone()),
                 )
                 .await;
-            let _ = send_message_turn_response(self, connection_id, request_id, &outcome.response)
+            response
+                .send_success(self, connection_id, &outcome.response)
                 .await;
 
             self.send_notification_to_authorized_thread_connections(

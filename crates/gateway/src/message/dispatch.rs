@@ -2446,7 +2446,9 @@ impl MessageProcessor {
                             self.turn_start_message(
                                 &context,
                                 message_admission,
-                                request.id,
+                                super::message_turn::MessageTurnResponse::JsonRpc {
+                                    request_id: request.id,
+                                },
                                 params,
                                 client_author_override,
                             )
