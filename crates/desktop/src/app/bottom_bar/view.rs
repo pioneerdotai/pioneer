@@ -172,7 +172,7 @@ impl PioneerDesktop {
         let status_text = self.active_thread_status_text();
 
         Popover::new("active-thread-status-popover")
-            .anchor(Corner::BottomRight)
+            .anchor(Anchor::BottomRight)
             .trigger(
                 Button::new("active-thread-status-trigger")
                     .ghost()
