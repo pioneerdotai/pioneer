@@ -4196,6 +4196,7 @@ mod tests {
                     authorization_revision: 7,
                     workspace_id: "workspace-one".to_owned(),
                     thread_id: None,
+                    access_lost: None,
                     change: pioneer_protocol::AccessChangeKind::WorkspaceMembership,
                 },
             ));

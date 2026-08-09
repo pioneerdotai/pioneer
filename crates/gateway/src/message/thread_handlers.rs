@@ -927,6 +927,7 @@ impl MessageProcessor {
             .await;
             return;
         }
+        let visibility_changed = params.visibility.is_some();
 
         let workspace_id = authorization.workspace_id().to_owned();
         let access_class = params.visibility.map(|visibility| match visibility {
@@ -1052,16 +1053,36 @@ impl MessageProcessor {
         }
 
         if changed {
+            let placement = if visibility_changed {
+                self.crud_store
+                    .get_thread_placement(thread.id.as_str())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let notification = ThreadUpdatedNotification {
                 thread: thread.clone(),
+                placement,
             };
-            self.send_notification_to_thread_subscribers(
-                thread.id.as_str(),
-                events::THREAD_UPDATED,
-                &notification,
-            )
-            .await;
-            self.notify_thread_tree_changed(workspace_id).await;
+            if visibility_changed {
+                self.send_thread_scoped_notification_to_connections(
+                    thread.id.as_str(),
+                    events::THREAD_UPDATED,
+                    &notification,
+                    self.session_manager.connection_ids().await,
+                )
+                .await;
+            } else {
+                self.send_notification_to_thread_subscribers(
+                    thread.id.as_str(),
+                    events::THREAD_UPDATED,
+                    &notification,
+                )
+                .await;
+                self.notify_thread_tree_changed(workspace_id).await;
+            }
             if let Some(name) = name {
                 self.best_effort_sync_cli_runtime_thread_name(
                     thread.workspace_id.as_str(),

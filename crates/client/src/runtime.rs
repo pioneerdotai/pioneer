@@ -1048,6 +1048,7 @@ mod tests {
             authorization_revision: 12,
             workspace_id: "ws_a".to_owned(),
             thread_id: Some("thread_a".to_owned()),
+            access_lost: None,
             change: AccessChangeKind::ThreadVisibility,
         };
 

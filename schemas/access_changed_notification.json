@@ -9,6 +9,13 @@
       "format": "uint64",
       "minimum": 0
     },
+    "access_lost": {
+      "description": "Whether this particular connection actually lost access to the scope.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "change": {
       "$ref": "#/$defs/AccessChangeKind"
     },

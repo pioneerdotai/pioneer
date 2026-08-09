@@ -89,7 +89,6 @@ impl PioneerDesktop {
             workspace_members_loading: HashSet::new(),
             thread_scope_pending: ThreadScopePendingAction::Idle,
             thread_scope_error: None,
-            thread_scope_dialog: None,
             message_revision_dialog: None,
             message_revision_loading: false,
             message_mutation_pending: false,

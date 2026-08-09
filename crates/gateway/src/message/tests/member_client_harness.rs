@@ -344,6 +344,7 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
         access_changed.authorization_revision,
         signal.authorization_revision
     );
+    assert_eq!(access_changed.access_lost, Some(true));
 
     let plan = apply_access_changed_to_client_state(&mut client_state, &access_changed);
     assert!(plan.apply);

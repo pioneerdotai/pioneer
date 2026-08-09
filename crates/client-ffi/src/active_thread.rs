@@ -1442,14 +1442,15 @@ impl ClientFfiActiveThreadState {
                 for thread_id in &plan.invalidate_thread_ids {
                     remove_thread_session_state(&mut inner, thread_id.as_str());
                 }
-                let workspace_wide =
-                    plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
-                let draft_removed = workspace_wide
+                let workspace_access_lost = plan.change
+                    == pioneer_protocol::AccessChangeKind::WorkspaceMembership
+                    && notification.access_lost != Some(false);
+                let draft_removed = workspace_access_lost
                     && inner
                         .draft_thread_by_workspace
                         .remove(plan.workspace_id.as_str())
                         .is_some();
-                let last_active_removed = workspace_wide
+                let last_active_removed = workspace_access_lost
                     && inner
                         .last_active_thread_by_workspace
                         .remove(plan.workspace_id.as_str())
@@ -1457,7 +1458,7 @@ impl ClientFfiActiveThreadState {
                 if plan.clear_active_thread {
                     clear_active_thread(&mut inner);
                 }
-                if workspace_wide {
+                if workspace_access_lost {
                     inner
                         .pending_requests
                         .apply(PendingRequestsReduction::ClearWorkspace {
@@ -2966,6 +2967,7 @@ mod tests {
                     authorization_revision: 7,
                     workspace_id: "workspace_revoked".to_owned(),
                     thread_id: None,
+                    access_lost: None,
                     change: AccessChangeKind::WorkspaceMembership,
                 },
             )
@@ -3059,6 +3061,7 @@ mod tests {
                     authorization_revision: 8,
                     workspace_id: "workspace_affected".to_owned(),
                     thread_id: Some("thread_revoked".to_owned()),
+                    access_lost: None,
                     change: AccessChangeKind::ThreadParticipantRemoved,
                 },
             )
@@ -3067,7 +3070,7 @@ mod tests {
         assert!(lifecycle.applied);
         assert!(!lifecycle.active_scope_cleared);
         assert!(lifecycle.active_thread_cleared);
-        assert!(lifecycle.refresh_workspace_catalog);
+        assert!(!lifecycle.refresh_workspace_catalog);
         let inner = state.inner.lock().expect("active thread state");
         assert_eq!(inner.authorization_revision, Some(8));
         assert!(inner.active_thread_id.is_none());
@@ -3095,6 +3098,42 @@ mod tests {
     }
 
     #[test]
+    fn retained_visibility_change_keeps_active_thread_and_projection() {
+        let state = ClientFfiActiveThreadState::default();
+        {
+            let mut inner = state.inner.lock().expect("active thread state");
+            inner.authorization_revision = Some(8);
+            inner.active_thread_id = Some("thread_current".to_owned());
+            inner.coordinators.insert(
+                "thread_current".to_owned(),
+                ThreadCoordinator::new(thread("thread_current", "workspace_current")),
+            );
+        }
+
+        let lifecycle = state
+            .apply_access_changed(
+                &ClientRuntime::default(),
+                &AccessChangedNotification {
+                    authorization_revision: 9,
+                    workspace_id: "workspace_current".to_owned(),
+                    thread_id: Some("thread_current".to_owned()),
+                    access_lost: Some(false),
+                    change: AccessChangeKind::ThreadVisibility,
+                },
+            )
+            .expect("retained visibility change");
+
+        assert!(lifecycle.applied);
+        assert!(!lifecycle.active_scope_cleared);
+        assert!(!lifecycle.active_thread_cleared);
+        assert!(!lifecycle.refresh_workspace_catalog);
+        let inner = state.inner.lock().expect("active thread state");
+        assert_eq!(inner.authorization_revision, Some(9));
+        assert_eq!(inner.active_thread_id.as_deref(), Some("thread_current"));
+        assert!(inner.coordinators.contains_key("thread_current"));
+    }
+
+    #[test]
     fn stale_access_change_is_reported_without_mutating_ffi_state() {
         let state = ClientFfiActiveThreadState::default();
         {
@@ -3114,6 +3153,7 @@ mod tests {
                     authorization_revision: 8,
                     workspace_id: "workspace_current".to_owned(),
                     thread_id: Some("thread_current".to_owned()),
+                    access_lost: None,
                     change: AccessChangeKind::ThreadVisibility,
                 },
             )

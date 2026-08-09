@@ -6542,7 +6542,10 @@ impl MessageProcessor {
             .sync_thread_metadata_from_persisted(&thread)
             .await;
 
-        let notification = ThreadUpdatedNotification { thread };
+        let notification = ThreadUpdatedNotification {
+            thread,
+            placement: None,
+        };
 
         self.send_notification_to_thread_subscribers(
             thread_id,

@@ -432,8 +432,6 @@ pub struct PioneerDesktop {
     pub(super) workspace_members_loading: HashSet<WorkspaceId>,
     pub(super) thread_scope_pending: ThreadScopePendingAction,
     pub(super) thread_scope_error: Option<String>,
-    pub(super) thread_scope_dialog:
-        Option<Entity<Option<pioneer_client::threads::scope::ThreadScopePresentation>>>,
     pub(super) message_revision_dialog: Option<Entity<DesktopMessageRevisionDialogState>>,
     pub(super) message_revision_loading: bool,
     pub(super) message_mutation_pending: bool,

@@ -13583,6 +13583,14 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
             .and_then(JsonValue::as_u64),
         Some(signal.authorization_revision)
     );
+    assert_eq!(
+        access_changed
+            .params
+            .as_ref()
+            .and_then(|params| params.get("access_lost"))
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
     assert!(!access_changed_json.contains(AFFECTED_THREAD_ID));
     assert!(!access_changed_json.contains("affected.txt"));
 

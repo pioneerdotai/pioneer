@@ -692,6 +692,7 @@ mod tests {
             authorization_revision: 9,
             workspace_id: "WAAAAAAAAAAAAAAAAAAAA".to_owned(),
             thread_id: None,
+            access_lost: None,
             change: AccessChangeKind::WorkspaceMembership,
         });
 

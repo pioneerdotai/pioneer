@@ -30,6 +30,16 @@ pub async fn list_placements_by_workspace<C: ConnectionTrait>(
         .context("failed to list thread placements by workspace")
 }
 
+pub async fn find_placement_by_thread_id<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<thread_placement::Model>> {
+    thread_placement::Entity::find_by_id(thread_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query thread placement by thread id")
+}
+
 pub async fn find_folder_by_id<C: ConnectionTrait>(
     db: &C,
     folder_id: &str,

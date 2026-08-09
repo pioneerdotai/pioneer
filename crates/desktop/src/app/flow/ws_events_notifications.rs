@@ -127,7 +127,7 @@ impl PioneerDesktop {
                 self.apply_workspace_refresh_reduction(reduction);
             }
             ClientRuntimeNotification::ThreadUpdated(reduction) => {
-                self.apply_thread_updated_reduction(reduction);
+                self.apply_thread_updated_reduction(reduction, cx);
             }
             ClientRuntimeNotification::SkillsRefresh(reduction) => {
                 self.apply_skills_refresh_reduction(reduction);
@@ -244,23 +244,19 @@ impl PioneerDesktop {
 
         self.gateway.authorization_revision = Some(plan.authorization_revision);
         if plan.clear_active_thread || plan.clear_active_workspace {
-            if let Some(state) = self.thread_scope_dialog.take() {
-                state.update(cx, |presentation, cx| {
-                    *presentation = None;
-                    cx.notify();
-                });
-            }
             self.thread_scope_pending = Default::default();
             self.thread_scope_error = None;
             self.message_revision_dialog = None;
             self.message_revision_loading = false;
             self.message_mutation_pending = false;
         }
-        apply_desktop_workspace_catalog_invalidation(
-            &mut self.workspaces,
-            &mut self.preferred_workspace_id,
-            &plan,
-        );
+        if notification.access_lost != Some(false) {
+            apply_desktop_workspace_catalog_invalidation(
+                &mut self.workspaces,
+                &mut self.preferred_workspace_id,
+                &plan,
+            );
+        }
         self.workspaces_error = None;
 
         self.thread_artifacts
@@ -276,8 +272,9 @@ impl PioneerDesktop {
         self.thread_unread
             .retain(|thread_id, _| !invalidated_thread_ids.contains(thread_id.as_str()));
         let workspace_wide = plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
+        let workspace_access_lost = workspace_wide && notification.access_lost != Some(false);
         self.task_thread_navigation_stack.retain(|entry| {
-            !(workspace_wide && entry.workspace_id == plan.workspace_id)
+            !(workspace_access_lost && entry.workspace_id == plan.workspace_id)
                 && !invalidated_thread_ids.contains(entry.parent_thread_id.as_str())
                 && !invalidated_thread_ids.contains(entry.child_thread_id.as_str())
         });
@@ -287,38 +284,38 @@ impl PioneerDesktop {
             .retain(|thread_id| !invalidated_thread_ids.contains(thread_id.as_str()));
         self.last_active_thread_by_workspace
             .retain(|workspace_id, thread_id| {
-                !(workspace_wide && workspace_id == &plan.workspace_id)
+                !(workspace_access_lost && workspace_id == &plan.workspace_id)
                     && !invalidated_thread_ids.contains(thread_id.as_str())
             });
         self.draft_thread_by_workspace
             .retain(|workspace_id, thread_id| {
-                !(workspace_wide && workspace_id == &plan.workspace_id)
+                !(workspace_access_lost && workspace_id == &plan.workspace_id)
                     && !invalidated_thread_ids.contains(thread_id.as_str())
             });
 
-        // Folder and inherited Agents.md visibility is an aggregate of the
-        // server-filtered tree. Reload it as a unit rather than retaining
-        // ancestors whose current accessibility cannot be proven locally.
-        let removed_folder_ids = self
-            .thread_folders
-            .iter()
-            .filter(|(_, folder)| folder.workspace_id == plan.workspace_id)
-            .map(|(folder_id, _)| folder_id.clone())
-            .collect::<Vec<_>>();
-        self.thread_folders
-            .retain(|_, folder| folder.workspace_id != plan.workspace_id);
-        self.thread_placements
-            .retain(|_, placement| placement.workspace_id != plan.workspace_id);
-        self.thread_agents_doc_summaries
-            .retain(|_, summary| summary.workspace_id != plan.workspace_id);
-        for folder_id in removed_folder_ids {
-            self.thread_folder_expanded.remove(folder_id.as_str());
+        if workspace_access_lost {
+            let removed_folder_ids = self
+                .thread_folders
+                .iter()
+                .filter(|(_, folder)| folder.workspace_id == plan.workspace_id)
+                .map(|(folder_id, _)| folder_id.clone())
+                .collect::<Vec<_>>();
+            self.thread_folders
+                .retain(|_, folder| folder.workspace_id != plan.workspace_id);
+            self.thread_placements
+                .retain(|_, placement| placement.workspace_id != plan.workspace_id);
+            self.thread_agents_doc_summaries
+                .retain(|_, summary| summary.workspace_id != plan.workspace_id);
+            for folder_id in removed_folder_ids {
+                self.thread_folder_expanded.remove(folder_id.as_str());
+            }
         }
 
-        let active_editor_lost = self
-            .active_agents_doc_editor_scope
-            .as_ref()
-            .is_some_and(|scope| scope.workspace_id() == plan.workspace_id);
+        let active_editor_lost = workspace_access_lost
+            && self
+                .active_agents_doc_editor_scope
+                .as_ref()
+                .is_some_and(|scope| scope.workspace_id() == plan.workspace_id);
         if active_editor_lost {
             self.active_agents_doc_editor_scope = None;
             self.agents_doc_editor = None;
@@ -327,7 +324,7 @@ impl PioneerDesktop {
             }
         }
 
-        if workspace_wide {
+        if workspace_access_lost {
             self.pending_requests.apply(
                 pioneer_client::cli_runtime::approvals::PendingRequestsReduction::ClearWorkspace {
                     workspace_id: plan.workspace_id.clone(),
@@ -352,7 +349,13 @@ impl PioneerDesktop {
             self.clear_persisted_active_gateway_workspace_id();
         }
 
-        self.rebuild_sidebar_tree_state(cx);
+        let affected_workspace_is_active =
+            active_workspace_id.as_deref() == Some(plan.workspace_id.as_str());
+        if affected_workspace_is_active
+            && (workspace_access_lost || !plan.invalidate_thread_ids.is_empty())
+        {
+            self.rebuild_sidebar_tree_state(cx);
+        }
         execute_desktop_client_effects(self, plan.effects, cx);
         if administration_invalidation.apply {
             self.apply_administration_refetches(administration_invalidation.effects, cx);
@@ -530,7 +533,17 @@ impl PioneerDesktop {
         }
     }
 
-    fn apply_thread_updated_reduction(&mut self, reduction: ThreadUpdatedReduction) {
+    fn apply_thread_updated_reduction(
+        &mut self,
+        reduction: ThreadUpdatedReduction,
+        cx: &mut Context<Self>,
+    ) {
+        let affected_workspace_is_active =
+            self.active_workspace_id() == Some(reduction.workspace_id.as_str());
+        if let Some(placement) = reduction.placement {
+            self.thread_placements
+                .insert(reduction.thread_id.clone(), placement);
+        }
         self.upsert_thread_snapshot(reduction.thread);
         self.upsert_thread_for_workspace(
             reduction.thread_id.as_str(),
@@ -538,6 +551,9 @@ impl PioneerDesktop {
         );
         if reduction.sync_composer_model_selection {
             self.sync_composer_model_selection_for_active_thread();
+        }
+        if affected_workspace_is_active {
+            self.rebuild_sidebar_tree_state(cx);
         }
     }
 
@@ -768,6 +784,7 @@ mod access_change_tests {
                 authorization_revision: 9,
                 workspace_id: "workspace-protected".to_owned(),
                 thread_id: None,
+                access_lost: None,
                 change: AccessChangeKind::WorkspaceMembership,
             },
             Some(8),
@@ -796,6 +813,7 @@ mod access_change_tests {
                 authorization_revision: 4,
                 workspace_id: "workspace-superuser".to_owned(),
                 thread_id: Some("thread-superuser".to_owned()),
+                access_lost: None,
                 change: AccessChangeKind::ThreadVisibility,
             },
             Some(4),
@@ -818,6 +836,7 @@ mod access_change_tests {
                 authorization_revision: 5,
                 workspace_id: "workspace-affected".to_owned(),
                 thread_id: Some("thread-affected".to_owned()),
+                access_lost: None,
                 change: AccessChangeKind::ThreadParticipantRemoved,
             },
             Some(4),

@@ -152,6 +152,7 @@ mod tests {
                 authorization_revision: 11,
                 workspace_id: "workspace_a".to_owned(),
                 thread_id: Some("thread_a".to_owned()),
+                access_lost: None,
                 change: pioneer_protocol::AccessChangeKind::ThreadParticipantRemoved,
             });
         let event = ClientEvent::GatewayNotification(notification);

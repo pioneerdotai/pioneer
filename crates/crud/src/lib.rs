@@ -16667,6 +16667,14 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .collect())
     }
 
+    pub async fn get_thread_placement(&self, thread_id: &str) -> Result<Option<ThreadPlacement>> {
+        Ok(
+            thread_tree::find_placement_by_thread_id(&self.connection, thread_id)
+                .await?
+                .map(thread_placement_from_db_model),
+        )
+    }
+
     pub async fn get_thread_agents_doc_explicit(
         &self,
         workspace_id: &str,

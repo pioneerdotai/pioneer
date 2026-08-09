@@ -19,7 +19,7 @@ use pioneer_protocol::{
     ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
     ItemToolRetryScheduledNotification, ItemUpdatedNotification, SkillsChangedNotification, Thread,
     ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
-    ThreadClosedNotification, ThreadStartedNotification, ThreadStatus,
+    ThreadClosedNotification, ThreadPlacement, ThreadStartedNotification, ThreadStatus,
     ThreadTreeChangedNotification, ThreadUpdatedNotification, TurnBlockedNotification,
     TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
     TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
@@ -99,6 +99,7 @@ pub struct ThreadClosedReduction {
 #[derive(Clone, Debug)]
 pub struct ThreadUpdatedReduction {
     pub thread: Thread,
+    pub placement: Option<ThreadPlacement>,
     pub thread_id: String,
     pub workspace_id: String,
     pub sync_composer_model_selection: bool,
@@ -744,6 +745,7 @@ pub fn reduce_thread_updated_notification(
 
     ThreadUpdatedReduction {
         thread,
+        placement: notification.placement,
         thread_id,
         workspace_id,
         sync_composer_model_selection: true,
@@ -1529,6 +1531,7 @@ mod tests {
     fn thread_updated_reduction_projects_snapshot_upsert() {
         let reduction = reduce_thread_updated_notification(ThreadUpdatedNotification {
             thread: thread("thr_a", "ws_a"),
+            placement: None,
         });
 
         assert_eq!(reduction.thread_id, "thr_a");

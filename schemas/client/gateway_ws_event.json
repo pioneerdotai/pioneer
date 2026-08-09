@@ -243,6 +243,13 @@
       "description": "Minimal notification telling an authenticated client to re-resolve access.",
       "type": "object",
       "properties": {
+        "access_lost": {
+          "description": "Whether this particular connection actually lost access to the scope.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "authorization_revision": {
           "type": "integer",
           "format": "uint64",
@@ -8770,9 +8777,40 @@
         "workspace_id"
       ]
     },
+    "ThreadPlacement": {
+      "type": "object",
+      "properties": {
+        "folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "workspace_id"
+      ]
+    },
     "ThreadUpdatedNotification": {
       "type": "object",
       "properties": {
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadPlacement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "thread": {
           "$ref": "#/$defs/Thread"
         }

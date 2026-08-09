@@ -244,6 +244,7 @@ pub fn plan_access_changed(
     }
 
     let workspace_wide = notification.change == AccessChangeKind::WorkspaceMembership;
+    let access_explicitly_retained = notification.access_lost == Some(false);
     let potentially_restrictive_without_exact_thread = matches!(
         notification.change,
         AccessChangeKind::ThreadVisibility | AccessChangeKind::ThreadParticipantRemoved
@@ -253,7 +254,9 @@ pub fn plan_access_changed(
         .as_deref()
         .map(str::trim)
         .filter(|thread_id| !thread_id.is_empty());
-    let mut invalidate_thread_ids = if workspace_wide
+    let mut invalidate_thread_ids = if access_explicitly_retained {
+        Vec::new()
+    } else if workspace_wide
         || (exact_thread_id.is_none() && potentially_restrictive_without_exact_thread)
     {
         // Compatibility with an older Gateway that cannot identify a
@@ -269,8 +272,9 @@ pub fn plan_access_changed(
     invalidate_thread_ids.sort();
     invalidate_thread_ids.dedup();
 
-    let clear_active_workspace =
-        workspace_wide && active_workspace_id == Some(notification.workspace_id.as_str());
+    let clear_active_workspace = !access_explicitly_retained
+        && workspace_wide
+        && active_workspace_id == Some(notification.workspace_id.as_str());
     let clear_active_thread = clear_active_workspace
         || active_thread_id.is_some_and(|active_thread_id| {
             invalidate_thread_ids
@@ -284,9 +288,9 @@ pub fn plan_access_changed(
             thread_ids: invalidate_thread_ids.clone(),
         });
     }
-    // Reloading the server-filtered catalog is the re-authorization step.
-    // The client never turns the notification or its cache into a grant.
-    effects.push(ClientEffect::RefreshWorkspaceList);
+    if workspace_wide {
+        effects.push(ClientEffect::RefreshWorkspaceList);
+    }
 
     AccessChangedPlan {
         authorization_revision: notification.authorization_revision,
@@ -329,7 +333,9 @@ pub fn apply_access_changed_to_client_state(
 
     state.administration.apply_access_changed(notification);
     state.gateway.authorization_revision = Some(plan.authorization_revision);
-    if plan.change == AccessChangeKind::WorkspaceMembership {
+    if plan.change == AccessChangeKind::WorkspaceMembership
+        && notification.access_lost != Some(false)
+    {
         state
             .workspaces
             .workspaces
@@ -337,6 +343,7 @@ pub fn apply_access_changed_to_client_state(
     }
     state.workspaces.error = None;
     if plan.change == AccessChangeKind::WorkspaceMembership
+        && notification.access_lost != Some(false)
         && state.workspaces.preferred_workspace_id.as_deref() == Some(plan.workspace_id.as_str())
     {
         state.workspaces.preferred_workspace_id = None;
@@ -348,49 +355,48 @@ pub fn apply_access_changed_to_client_state(
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
     let workspace_wide = plan.change == AccessChangeKind::WorkspaceMembership;
+    let workspace_access_lost = workspace_wide && notification.access_lost != Some(false);
     state
         .threads
         .coordinators
         .retain(|thread_id, _| !invalidated_thread_ids.contains(thread_id.as_str()));
     state.threads.placements.retain(|thread_id, placement| {
         !invalidated_thread_ids.contains(thread_id.as_str())
-            && !(workspace_wide && placement.workspace_id == plan.workspace_id)
+            && !(workspace_access_lost && placement.workspace_id == plan.workspace_id)
     });
 
-    // Folder and inherited Agents.md visibility is an aggregate of the
-    // server-filtered tree. An exact thread eviction cannot prove which
-    // ancestors remain visible through another thread, so invalidate this
-    // projection and let the authoritative tree reload repopulate it.
-    let removed_folder_ids = state
-        .threads
-        .folders
-        .iter()
-        .filter(|(_, folder)| folder.workspace_id == plan.workspace_id)
-        .map(|(folder_id, _)| folder_id.clone())
-        .collect::<Vec<_>>();
-    state
-        .threads
-        .folders
-        .retain(|_, folder| folder.workspace_id != plan.workspace_id);
-    for folder_id in removed_folder_ids {
-        state.threads.folder_expanded.remove(folder_id.as_str());
+    if workspace_access_lost {
+        let removed_folder_ids = state
+            .threads
+            .folders
+            .iter()
+            .filter(|(_, folder)| folder.workspace_id == plan.workspace_id)
+            .map(|(folder_id, _)| folder_id.clone())
+            .collect::<Vec<_>>();
+        state
+            .threads
+            .folders
+            .retain(|_, folder| folder.workspace_id != plan.workspace_id);
+        for folder_id in removed_folder_ids {
+            state.threads.folder_expanded.remove(folder_id.as_str());
+        }
+        state
+            .threads
+            .agents_doc_summaries
+            .retain(|_, summary| summary.workspace_id != plan.workspace_id);
     }
-    state
-        .threads
-        .agents_doc_summaries
-        .retain(|_, summary| summary.workspace_id != plan.workspace_id);
     state
         .threads
         .last_active_thread_by_workspace
         .retain(|workspace_id, thread_id| {
-            !(workspace_wide && workspace_id == &plan.workspace_id)
+            !(workspace_access_lost && workspace_id == &plan.workspace_id)
                 && !invalidated_thread_ids.contains(thread_id.as_str())
         });
     state
         .threads
         .draft_thread_by_workspace
         .retain(|workspace_id, thread_id| {
-            !(workspace_wide && workspace_id == &plan.workspace_id)
+            !(workspace_access_lost && workspace_id == &plan.workspace_id)
                 && !invalidated_thread_ids.contains(thread_id.as_str())
         });
 
@@ -406,7 +412,7 @@ pub fn apply_access_changed_to_client_state(
         state.threads.draft_thread_id = None;
     }
 
-    if workspace_wide {
+    if workspace_access_lost {
         state
             .pending_requests
             .apply(PendingRequestsReduction::ClearWorkspace {
@@ -739,6 +745,7 @@ mod tests {
                 authorization_revision: 7,
                 workspace_id: "ws_revoked".to_owned(),
                 thread_id: None,
+                access_lost: None,
                 change: AccessChangeKind::WorkspaceMembership,
             },
         );
@@ -846,6 +853,7 @@ mod tests {
                 authorization_revision: 8,
                 workspace_id: "ws_affected".to_owned(),
                 thread_id: Some("thread_affected".to_owned()),
+                access_lost: None,
                 change: AccessChangeKind::ThreadParticipantRemoved,
             },
         );
@@ -930,6 +938,7 @@ mod tests {
                 authorization_revision: 9,
                 workspace_id: "ws_affected".to_owned(),
                 thread_id: None,
+                access_lost: None,
                 change: AccessChangeKind::ThreadParticipantRemoved,
             },
             None,
@@ -955,6 +964,7 @@ mod tests {
                 authorization_revision: 10,
                 workspace_id: "ws_affected".to_owned(),
                 thread_id: None,
+                access_lost: None,
                 change: AccessChangeKind::ThreadParticipantAdded,
             },
             None,
@@ -966,7 +976,32 @@ mod tests {
         assert!(plan.invalidate_thread_ids.is_empty());
         assert!(!plan.clear_active_thread);
         assert!(!plan.clear_active_workspace);
-        assert_eq!(plan.effects, vec![ClientEffect::RefreshWorkspaceList]);
+        assert!(plan.effects.is_empty());
+    }
+
+    #[test]
+    fn retained_thread_visibility_change_preserves_active_thread_and_cache() {
+        let plan = plan_access_changed(
+            &AccessChangedNotification {
+                authorization_revision: 11,
+                workspace_id: "ws_affected".to_owned(),
+                thread_id: Some("thread_current".to_owned()),
+                access_lost: Some(false),
+                change: AccessChangeKind::ThreadVisibility,
+            },
+            Some(10),
+            Some("ws_affected"),
+            Some("thread_current"),
+            &[ThreadAuthorizationScope {
+                thread_id: "thread_current".to_owned(),
+                workspace_id: "ws_affected".to_owned(),
+            }],
+        );
+
+        assert!(plan.apply);
+        assert!(plan.invalidate_thread_ids.is_empty());
+        assert!(!plan.clear_active_thread);
+        assert!(plan.effects.is_empty());
     }
 
     #[test]
@@ -982,6 +1017,7 @@ mod tests {
                 authorization_revision: 8,
                 workspace_id: "ws_a".to_owned(),
                 thread_id: Some("thread_current".to_owned()),
+                access_lost: None,
                 change: AccessChangeKind::ThreadParticipantRemoved,
             },
         );
@@ -1024,6 +1060,7 @@ mod tests {
                 authorization_revision: 1,
                 workspace_id: "ws_a".to_owned(),
                 thread_id: None,
+                access_lost: None,
                 change: AccessChangeKind::WorkspaceMembership,
             },
         );

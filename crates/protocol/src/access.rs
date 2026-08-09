@@ -40,6 +40,14 @@ pub struct AccessChangedNotification {
     /// workspace state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Whether this particular connection actually lost access to the scope.
+    ///
+    /// `None` is retained for compatibility with older Gateways and must be
+    /// handled fail-closed by clients. `Some(false)` lets an already-authorized
+    /// client apply the accompanying targeted projection update without
+    /// discarding unrelated workspace state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_lost: Option<bool>,
     pub change: AccessChangeKind,
 }
 
@@ -54,6 +62,7 @@ mod tests {
             authorization_revision: 42,
             workspace_id: "workspace-red".to_owned(),
             thread_id: Some("thread-private".to_owned()),
+            access_lost: Some(true),
             change: AccessChangeKind::ThreadParticipantRemoved,
         };
         let value = serde_json::to_value(&notification).expect("notification should encode");
@@ -63,6 +72,7 @@ mod tests {
                 "authorization_revision": 42,
                 "workspace_id": "workspace-red",
                 "thread_id": "thread-private",
+                "access_lost": true,
                 "change": "thread_participant_removed"
             })
         );
@@ -76,6 +86,7 @@ mod tests {
             authorization_revision: 43,
             workspace_id: "workspace-red".to_owned(),
             thread_id: None,
+            access_lost: None,
             change: AccessChangeKind::WorkspaceMembership,
         };
         assert_eq!(

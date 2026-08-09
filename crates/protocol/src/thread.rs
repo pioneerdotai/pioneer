@@ -606,6 +606,8 @@ pub struct ThreadClosedNotification {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadUpdatedNotification {
     pub thread: Thread,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<ThreadPlacement>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

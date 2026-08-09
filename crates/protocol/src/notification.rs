@@ -1335,6 +1335,7 @@ mod tests {
                 authorization_revision: 7,
                 workspace_id: "ws_123".to_owned(),
                 thread_id: Some("thread_123".to_owned()),
+                access_lost: Some(false),
                 change: AccessChangeKind::ThreadVisibility,
             },
         )

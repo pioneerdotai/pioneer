@@ -3,6 +3,16 @@
   "title": "ThreadUpdatedNotification",
   "type": "object",
   "properties": {
+    "placement": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadPlacement"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "thread": {
       "$ref": "#/$defs/Thread"
     }
@@ -11,6 +21,27 @@
     "thread"
   ],
   "$defs": {
+    "ThreadPlacement": {
+      "type": "object",
+      "properties": {
+        "folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "workspace_id"
+      ]
+    },
     "PermissionBehavior": {
       "type": "string",
       "enum": [

@@ -43,7 +43,8 @@ impl MessageProcessor {
                 .collect::<HashSet<_>>(),
             None => HashSet::new(),
         };
-        let mut notification_recipients = Vec::new();
+        let mut retained_access_recipients = Vec::new();
+        let mut lost_access_recipients = Vec::new();
 
         for connection_id in self.session_manager.connection_ids().await {
             let Ok(principal) = self
@@ -179,21 +180,31 @@ impl MessageProcessor {
                 || had_thread_subscription
                 || workspace_access
             {
-                notification_recipients.push(connection_id);
+                if workspace_access_lost || thread_access_lost {
+                    lost_access_recipients.push(connection_id);
+                } else {
+                    retained_access_recipients.push(connection_id);
+                }
             }
         }
 
-        self.send_notification_to_connections(
-            events::ACCESS_CHANGED,
-            &AccessChangedNotification {
-                authorization_revision: signal.authorization_revision,
-                workspace_id: signal.workspace_id.clone(),
-                thread_id: signal.thread_id.clone(),
-                change: signal.kind,
-            },
-            notification_recipients,
-        )
-        .await;
+        for (access_lost, recipients) in [
+            (false, retained_access_recipients),
+            (true, lost_access_recipients),
+        ] {
+            self.send_notification_to_connections(
+                events::ACCESS_CHANGED,
+                &AccessChangedNotification {
+                    authorization_revision: signal.authorization_revision,
+                    workspace_id: signal.workspace_id.clone(),
+                    thread_id: signal.thread_id.clone(),
+                    access_lost: Some(access_lost),
+                    change: signal.kind,
+                },
+                recipients,
+            )
+            .await;
+        }
     }
 
     async fn current_workspace_access(

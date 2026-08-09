@@ -12,6 +12,7 @@ use gpui_component::{
     Disableable, WindowExt,
     button::{Button, ButtonVariants},
     collapsible::Collapsible,
+    dialog::DialogFooter,
     form::{field, v_form},
     h_flex,
     input::{Input, InputState},
@@ -607,37 +608,33 @@ impl PioneerDesktop {
                     let submit_revision = submit_revision.clone();
                     move |_, _, cx| submit_revision(cx)
                 })
-                .footer(
-                    crate::components::legacy_dialog_footer::legacy_dialog_footer({
-                        let submit_revision = submit_revision.clone();
-                        move |_, _, _, _| {
-                            vec![
-                                Button::new("task-review-revise-cancel")
-                                    .small()
-                                    .outline()
-                                    .label(t!("buttons.cancel").to_string())
-                                    .on_click(|_, window, cx| {
+                .footer(DialogFooter::new().children({
+                    let submit_revision = submit_revision.clone();
+                    vec![
+                        Button::new("task-review-revise-cancel")
+                            .small()
+                            .outline()
+                            .label(t!("buttons.cancel").to_string())
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            })
+                            .into_any_element(),
+                        Button::new("task-review-revise-submit")
+                            .small()
+                            .primary()
+                            .label(t!("timeline.task_review.request_revision").to_string())
+                            .disabled(!can_submit)
+                            .on_click({
+                                let submit_revision = submit_revision.clone();
+                                move |_, window, cx| {
+                                    if submit_revision(cx) {
                                         window.close_dialog(cx);
-                                    })
-                                    .into_any_element(),
-                                Button::new("task-review-revise-submit")
-                                    .small()
-                                    .primary()
-                                    .label(t!("timeline.task_review.request_revision").to_string())
-                                    .disabled(!can_submit)
-                                    .on_click({
-                                        let submit_revision = submit_revision.clone();
-                                        move |_, window, cx| {
-                                            if submit_revision(cx) {
-                                                window.close_dialog(cx);
-                                            }
-                                        }
-                                    })
-                                    .into_any_element(),
-                            ]
-                        }
-                    }),
-                )
+                                    }
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_form()
                         .child(
