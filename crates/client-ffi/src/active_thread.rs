@@ -1360,6 +1360,7 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::ThreadArtifactsRefresh(_)
             | ClientRuntimeNotification::ArtifactThreadRefresh(_)
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_)
+            | ClientRuntimeNotification::ThreadParticipantsChanged(_)
             | ClientRuntimeNotification::CLIRuntimeRefresh(_)
             | ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
             | ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(_)

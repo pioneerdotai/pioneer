@@ -197,6 +197,7 @@ impl PioneerDesktop {
             .any(|summary| summary.artifact.artifact_id == artifact_id);
 
         self.show_thread_artifacts_sidebar = true;
+        self.show_thread_members_sidebar = false;
         self.thread_artifacts.select_artifact(artifact_id);
         if let Some(thread_id) = active_thread_id {
             self.refresh_thread_artifacts(thread_id, artifact_missing_from_cache, cx);

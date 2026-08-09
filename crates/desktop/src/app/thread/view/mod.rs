@@ -2,6 +2,7 @@ mod approvals;
 mod artifacts;
 mod composer;
 mod header;
+mod members;
 pub(crate) mod timeline;
 
 use super::super::root::PioneerDesktop;
@@ -20,6 +21,9 @@ impl PioneerDesktop {
     ) -> AnyElement {
         self.ensure_active_thread_workspace_members_loaded(cx);
         self.ensure_active_thread_artifacts_loaded(cx);
+        if self.show_thread_members_sidebar {
+            self.ensure_active_thread_members_loaded(false, cx);
+        }
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
 
         let timeline_model = self.semantic_timeline_render_model(active_thread_id.as_deref());
@@ -68,10 +72,14 @@ impl PioneerDesktop {
             )
             .child(
                 resizable_panel()
-                    .visible(self.show_thread_artifacts_sidebar)
+                    .visible(self.show_thread_artifacts_sidebar || self.show_thread_members_sidebar)
                     .size(self.thread_artifacts_sidebar_width)
                     .size_range(px(320.)..px(640.))
-                    .child(self.render_thread_artifacts_panel(cx)),
+                    .child(if self.show_thread_members_sidebar {
+                        self.render_thread_members_panel(window, cx)
+                    } else {
+                        self.render_thread_artifacts_panel(cx)
+                    }),
             );
 
         v_flex()

@@ -110,6 +110,7 @@ impl PioneerDesktop {
             || thread.status == ThreadStatus::Closed
             || !matches!(self.thread_scope_pending, ThreadScopePendingAction::Idle);
         let desktop_entity = cx.entity().clone();
+        let show_members = thread.visibility.is_some();
 
         Button::new("thread-title-menu")
             .small()
@@ -121,6 +122,7 @@ impl PioneerDesktop {
                 let visibility_thread_id = thread_id.clone();
                 let desktop_entity = desktop_entity.clone();
                 let edit_desktop_entity = desktop_entity.clone();
+                let members_desktop_entity = desktop_entity.clone();
                 let menu = menu.min_w(px(180.)).item(
                     PopupMenuItem::new(t!("sidebar.contextmenu.thread.edit").to_string())
                         .icon(PioneerIconName::Pen)
@@ -131,6 +133,19 @@ impl PioneerDesktop {
                             });
                         }),
                 );
+                let menu = if show_members {
+                    menu.item(
+                        PopupMenuItem::new(t!("settings.sidebar.members").to_string())
+                            .icon(PioneerIconName::UserCheck)
+                            .on_click(move |_, _, cx| {
+                                let _ = members_desktop_entity.update(cx, |view, cx| {
+                                    view.open_thread_members_sidebar(cx);
+                                });
+                            }),
+                    )
+                } else {
+                    menu
+                };
                 if let Some((visibility_label, target_visibility, visibility_icon)) =
                     visibility_action.clone()
                 {

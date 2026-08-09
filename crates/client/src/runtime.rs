@@ -63,7 +63,8 @@ use pioneer_protocol::{
     AccessChangedNotification, ArtifactSummary, GatewayNotification,
     GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification,
-    GatewayVoiceInputStatusChangedNotification, Workspace, WorkspaceChangedNotification,
+    GatewayVoiceInputStatusChangedNotification, ThreadParticipantsChangedNotification, Workspace,
+    WorkspaceChangedNotification,
 };
 
 #[derive(Clone)]
@@ -124,6 +125,7 @@ pub enum ClientRuntimeNotification {
     ThreadClosed(ThreadClosedReduction),
     WorkspaceRefresh(WorkspaceRefreshReduction),
     ThreadUpdated(ThreadUpdatedReduction),
+    ThreadParticipantsChanged(ThreadParticipantsChangedNotification),
     SkillsRefresh(SkillsRefreshReduction),
     McpRefresh(McpRefreshReduction),
     McpServerStatusChanged(McpServerStatusChangedReduction),
@@ -665,6 +667,9 @@ pub fn reduce_gateway_notification(
                 SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification),
             ))
         }
+        GatewayNotification::ThreadParticipantsChanged(notification) => Some(
+            ClientRuntimeNotification::ThreadParticipantsChanged(notification),
+        ),
         GatewayNotification::ThreadReadCursorChanged(notification) => Some(
             ClientRuntimeNotification::WorkspaceRefresh(WorkspaceRefreshReduction {
                 queue_thread_list_refresh: context.active_workspace_id
@@ -689,7 +694,6 @@ pub fn reduce_gateway_notification(
         }
         GatewayNotification::AuthSessionRevoked(_)
         | GatewayNotification::AuthAccessExpiring(_)
-        | GatewayNotification::ThreadParticipantsChanged(_)
         | GatewayNotification::ContextCompressing(_)
         | GatewayNotification::ContextCompressed(_)
         | GatewayNotification::Unknown(_)
@@ -747,6 +751,7 @@ mod tests {
         GatewayThreadEpisodicVectorRefillStatusChangedNotification, GatewayVoiceInputProvider,
         GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot, GatewayVoiceInputSettings,
         GatewayVoiceInputStatusChangedNotification, SkillsChangedNotification,
+        ThreadParticipantChangeKind, ThreadParticipantsChangedNotification,
         ThreadTimelineBlocksChangedNotification, TimelineChangeReason,
         TurnPermissionApprovalRequest, TurnPermissionApprovalResolution,
         TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
@@ -1059,6 +1064,27 @@ mod tests {
 
         let Some(ClientRuntimeNotification::AccessChanged(actual)) = reduced else {
             panic!("expected access changed notification");
+        };
+        assert_eq!(actual, notification);
+    }
+
+    #[test]
+    fn runtime_routes_thread_participant_changes_without_a_tree_refresh() {
+        let notification = ThreadParticipantsChangedNotification {
+            workspace_id: "workspace-1".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            change: ThreadParticipantChangeKind::Added,
+            principal_id: pioneer_protocol::PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA")
+                .expect("valid principal id"),
+        };
+
+        let reduced = reduce_gateway_notification(
+            GatewayNotification::ThreadParticipantsChanged(notification.clone()),
+            ClientRuntimeNotificationContext::default(),
+        );
+
+        let Some(ClientRuntimeNotification::ThreadParticipantsChanged(actual)) = reduced else {
+            panic!("expected thread participant change notification");
         };
         assert_eq!(actual, notification);
     }

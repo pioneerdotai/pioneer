@@ -4,8 +4,8 @@ use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::timeline::rows::UserMessagePresentation;
 use pioneer_client::transport::ws::command_sender::turn_message_error_reason;
 use pioneer_protocol::{
-    ArtifactRef, ThreadMode, TurnMessageDeleteParams, TurnMessageEditParams, TurnMessageErrorReason,
-    UserInput,
+    ArtifactRef, ThreadMode, TurnMessageDeleteParams, TurnMessageEditParams,
+    TurnMessageErrorReason, UserInput,
 };
 
 impl PioneerDesktop {
@@ -112,10 +112,15 @@ impl PioneerDesktop {
                 text_elements: Vec::new(),
             });
         }
-        input.extend(target.artifacts.into_iter().map(|artifact| UserInput::Artifact {
-            artifact_id: artifact.artifact_id,
-            version_id: artifact.version_id,
-        }));
+        input.extend(
+            target
+                .artifacts
+                .into_iter()
+                .map(|artifact| UserInput::Artifact {
+                    artifact_id: artifact.artifact_id,
+                    version_id: artifact.version_id,
+                }),
+        );
         let params = TurnMessageEditParams {
             thread_id: target.presentation.thread_id,
             turn_id: target.presentation.turn_id.clone(),
@@ -144,10 +149,10 @@ impl PioneerDesktop {
                             view.refresh_thread_list(cx);
                             view.clear_composer(window, cx);
                         } else {
-                            if let Some(target) =
-                                view.composer_edit_target.as_mut().filter(|target| {
-                                    target.presentation.turn_id == target_turn_id
-                                })
+                            if let Some(target) = view
+                                .composer_edit_target
+                                .as_mut()
+                                .filter(|target| target.presentation.turn_id == target_turn_id)
                             {
                                 target.conflicted = conflict;
                                 target.error = Some(if conflict {

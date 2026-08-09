@@ -4,12 +4,12 @@ use crate::{
     },
     app::thread::view::composer::voice::DesktopVoiceEntryAvailability,
     assets::PioneerIconName,
+    components::member_picker::{MemberPicker, member_picker_items},
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
     IconName,
     button::*,
-    combobox::Combobox,
     input::Input,
     menu::{DropdownMenu, PopupMenuItem},
     spinner::Spinner,
@@ -169,9 +169,7 @@ impl PioneerDesktop {
         let desktop_voice_context_locked = self.desktop_voice_context_locked();
         let desktop_voice_hold_ui_active = self.desktop_voice_hold_ui_active();
         let desktop_voice_send_processing = self.desktop_voice_send_processing();
-        let voice_entry_availability = if editing_message
-            || (has_in_flight_turn && !message_mode)
-        {
+        let voice_entry_availability = if editing_message || (has_in_flight_turn && !message_mode) {
             DesktopVoiceEntryAvailability::Hidden
         } else {
             self.desktop_voice_entry_availability()
@@ -466,21 +464,11 @@ impl PioneerDesktop {
         if self.composer_mention_items != candidates {
             self.composer_mention_items = candidates.clone();
 
-            let select_items = gpui_component::searchable_list::SearchableVec::new(
-                candidates
-                    .into_iter()
-                    .map(|candidate| {
-                        let avatar_path = self
-                            .member_avatar_state
-                            .presentation(&candidate.principal_id)
-                            .and_then(|avatar| avatar.cached_image_path.clone());
-                        crate::app::root::DesktopComposerMentionItem {
-                            candidate,
-                            avatar_path,
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            let select_items = member_picker_items(candidates, |principal_id| {
+                self.member_avatar_state
+                    .presentation(principal_id)
+                    .and_then(|avatar| avatar.cached_image_path.clone())
+            });
             self.composer_mention_select.update(cx, |state, cx| {
                 state.set_items(select_items, window, cx);
             });
@@ -488,6 +476,7 @@ impl PioneerDesktop {
 
         let trigger = if directory_loading || self.composer_upload_in_progress {
             div()
+                .id("composer-mention-picker")
                 .size_6()
                 .ml_0p5()
                 .flex()
@@ -497,63 +486,17 @@ impl PioneerDesktop {
                 .child(Icon::new(PioneerIconName::AtSign).size_3p5())
                 .into_any_element()
         } else {
-            let hover_background = if cx.theme().mode.is_dark() {
-                cx.theme().secondary.lighten(0.1).opacity(0.8)
-            } else {
-                cx.theme().secondary.darken(0.1).opacity(0.8)
-            };
-            let active_background = if cx.theme().mode.is_dark() {
-                cx.theme().secondary.lighten(0.2).opacity(0.8)
-            } else {
-                cx.theme().secondary.darken(0.2).opacity(0.8)
-            };
-
-            div()
-                .size_6()
-                .relative()
-                .child(
-                    Combobox::new(&self.composer_mention_select)
-                        .appearance(false)
-                        .search_placeholder(t!("chat.composer.mention.search").to_string())
-                        .placeholder("")
-                        .menu_width(px(420.))
-                        // This picker is intentionally single-select. Mentions remain in the
-                        // composer text, but the dropdown does not present a persistent checked
-                        // selection when opened again.
-                        .check_icon(Icon::new(IconName::Check).opacity(0.0))
-                        .with_size(gpui_component::Size::Small)
-                        .render_trigger(|_, _, _| div()),
-                )
-                // The current Combobox always paints its focus border for a custom
-                // trigger. Paint the actual button above that container so the
-                // trigger keeps button hover/active feedback without a stuck ring.
-                .child(
-                    div().absolute().inset_0().bg(cx.theme().background).child(
-                        div()
-                            .id("composer-mention-trigger-button")
-                            .size_full()
-                            .flex()
-                            .ml_0p5()
-                            .items_center()
-                            .justify_center()
-                            .rounded(cx.theme().radius)
-                            .cursor_pointer()
-                            .text_color(cx.theme().secondary_foreground)
-                            .hover(move |this| this.bg(hover_background))
-                            .active(move |this| this.bg(active_background))
-                            .child(Icon::new(PioneerIconName::AtSign).size_3p5().opacity(0.6)),
-                    ),
-                )
-                .into_any_element()
+            MemberPicker::new(
+                "composer-mention-picker",
+                "composer-mention-trigger-button",
+                &self.composer_mention_select,
+                Icon::new(PioneerIconName::AtSign).size_3p5().opacity(0.6),
+            )
+            .inset_trigger()
+            .into_any_element()
         };
 
-        Some(
-            div()
-                .id("composer-mention-picker")
-                .size_6()
-                .child(trigger)
-                .into_any_element(),
-        )
+        Some(trigger)
     }
 
     pub(crate) fn insert_composer_mention(

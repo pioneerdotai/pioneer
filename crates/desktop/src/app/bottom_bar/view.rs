@@ -160,6 +160,11 @@ impl PioneerDesktop {
                         div().into_any_element()
                     })
                     .child(if show_thread_artifacts_button {
+                        self.render_thread_members_sidebar_toggle_button(cx)
+                    } else {
+                        div().into_any_element()
+                    })
+                    .child(if show_thread_artifacts_button {
                         self.render_thread_artifacts_sidebar_toggle_button(cx)
                     } else {
                         div().into_any_element()
@@ -218,7 +223,30 @@ impl PioneerDesktop {
             )
             .on_click(cx.listener(|view, _, _, cx| {
                 view.show_thread_artifacts_sidebar = !view.show_thread_artifacts_sidebar;
+                if view.show_thread_artifacts_sidebar {
+                    view.show_thread_members_sidebar = false;
+                }
                 cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_thread_members_sidebar_toggle_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        Button::new("bottom-bar-toggle-thread-members-sidebar")
+            .ghost()
+            .small()
+            .compact()
+            .tooltip(t!("settings.sidebar.members").to_string())
+            .child(
+                Icon::new(PioneerIconName::UserCheck)
+                    .size_3p5()
+                    .opacity(0.6)
+                    .when(self.show_thread_members_sidebar, |this| {
+                        this.opacity(1.0).text_color(cx.theme().blue)
+                    }),
+            )
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.toggle_thread_members_sidebar(cx);
             }))
             .into_any_element()
     }

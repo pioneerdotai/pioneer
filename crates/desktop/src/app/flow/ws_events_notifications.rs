@@ -129,6 +129,9 @@ impl PioneerDesktop {
             ClientRuntimeNotification::ThreadUpdated(reduction) => {
                 self.apply_thread_updated_reduction(reduction, cx);
             }
+            ClientRuntimeNotification::ThreadParticipantsChanged(notification) => {
+                self.apply_thread_participants_changed_notification(notification, cx);
+            }
             ClientRuntimeNotification::SkillsRefresh(reduction) => {
                 self.apply_skills_refresh_reduction(reduction);
             }
@@ -341,6 +344,10 @@ impl PioneerDesktop {
             self.thread_timeline_terminal_item.borrow_mut().clear();
             *self.code_highlight_cache.borrow_mut() = Default::default();
             self.show_thread_artifacts_sidebar = false;
+            self.show_thread_members_sidebar = false;
+            self.thread_members_thread_id = None;
+            self.thread_members.clear();
+            self.thread_members_loading = false;
             self.task_review_actions = Default::default();
         }
 
