@@ -1,7 +1,8 @@
 use super::*;
 use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
+use crate::components::member_picker::{MemberPickerDelegate, new_member_picker_state};
 use crate::{state, window};
-use gpui_component::{combobox::ComboboxState, searchable_list::SearchableVec, table::TableState};
+use gpui_component::table::TableState;
 use pioneer_client::composer::{
     model_selection::default_composer_turn_mode, permissions::default_composer_permission_mode,
 };
@@ -28,15 +29,8 @@ impl PioneerDesktop {
                 .auto_grow(2, 13)
                 .placeholder(t!("chat.composer.placeholder").to_string())
         });
-        let composer_mention_select = cx.new(|cx| {
-            ComboboxState::new(
-                SearchableVec::new(Vec::<DesktopComposerMentionItem>::new()),
-                Vec::new(),
-                window,
-                cx,
-            )
-            .searchable(true)
-        });
+        let composer_mention_select = cx.new(|cx| new_member_picker_state(window, cx));
+        let thread_member_select = cx.new(|cx| new_member_picker_state(window, cx));
         let member_exact_principal_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("P00000000000000000000"));
         let thread_tree_state = cx.new(|cx| TreeState::new(cx));
@@ -127,6 +121,12 @@ impl PioneerDesktop {
             composer_mention_select,
             composer_mention_select_subscription: None,
             composer_mention_items: Vec::new(),
+            thread_member_select,
+            thread_member_select_subscription: None,
+            thread_member_items: Vec::new(),
+            thread_members_thread_id: None,
+            thread_members: Vec::new(),
+            thread_members_loading: false,
             composer_attachments: Vec::new(),
             composer_capabilities: Vec::new(),
             composer_skill_selections: Vec::new(),
@@ -205,6 +205,7 @@ impl PioneerDesktop {
             thread_artifacts: ThreadArtifactsState::default(),
             artifact_download_cancellations: HashMap::new(),
             show_thread_artifacts_sidebar: false,
+            show_thread_members_sidebar: false,
             thread_artifacts_sidebar_width: px(340.),
             ready_turn_resume_threads: VecDeque::new(),
             ready_turn_resume_thread_set: HashSet::new(),
@@ -267,9 +268,7 @@ impl PioneerDesktop {
             window,
             |_view,
              select,
-             event: &gpui_component::combobox::ComboboxEvent<
-                DesktopComposerMentionComboboxDelegate,
-            >,
+             event: &gpui_component::combobox::ComboboxEvent<MemberPickerDelegate>,
              window,
              cx| {
                 if let gpui_component::combobox::ComboboxEvent::Confirm(candidates) = event {
@@ -283,6 +282,34 @@ impl PioneerDesktop {
                     window.defer(cx, move |window, cx| {
                         let _ = desktop_entity.update(cx, |view, cx| {
                             view.insert_composer_mention(candidate, window, cx);
+                        });
+                        let _ = select.update(cx, |state, cx| {
+                            state.clear_selection(cx);
+                        });
+                    });
+                }
+            },
+        ));
+
+        let thread_member_select = view.thread_member_select.clone();
+        view.thread_member_select_subscription = Some(cx.subscribe_in(
+            &thread_member_select,
+            window,
+            |_view,
+             select,
+             event: &gpui_component::combobox::ComboboxEvent<MemberPickerDelegate>,
+             window,
+             cx| {
+                if let gpui_component::combobox::ComboboxEvent::Confirm(candidates) = event {
+                    let Some(candidate) = candidates.first().cloned() else {
+                        return;
+                    };
+
+                    let desktop_entity = cx.entity().clone();
+                    let select = select.clone();
+                    window.defer(cx, move |_, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.add_thread_member(candidate.principal_id, cx);
                         });
                         let _ = select.update(cx, |state, cx| {
                             state.clear_selection(cx);

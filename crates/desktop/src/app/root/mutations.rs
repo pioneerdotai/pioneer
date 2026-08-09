@@ -469,6 +469,11 @@ impl PioneerDesktop {
         self.ready_turn_resume_thread_set.clear();
         self.thread_artifacts = Default::default();
         self.show_thread_artifacts_sidebar = false;
+        self.show_thread_members_sidebar = false;
+        self.thread_members_thread_id = None;
+        self.thread_members.clear();
+        self.thread_members_loading = false;
+        self.thread_member_items.clear();
         self.active_agents_doc_editor_scope = None;
         self.agents_doc_editor = None;
         self.thread_tree_selected_node_id = None;

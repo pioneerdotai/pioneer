@@ -27,18 +27,13 @@ use crate::{
         microphone::DesktopMicrophoneGateReport,
     },
     code_highlight::DesktopCodeHighlightCache,
+    components::member_picker::MemberPickerDelegate,
     gateway::{ClientRuntime, DesktopGatewayHttpClient, GatewayRuntime, GatewayWsCommandSender},
 };
 pub(super) use desktop_update::DesktopUpdateUiState;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    Sizable, VirtualListScrollHandle,
-    avatar::Avatar,
-    combobox::ComboboxState,
-    h_flex,
-    input::InputState,
-    searchable_list::{SearchableListItem, SearchableVec},
-    table::TableState,
+    VirtualListScrollHandle, combobox::ComboboxState, input::InputState, table::TableState,
     tree::TreeState,
 };
 pub(super) use pioneer_client::{
@@ -77,8 +72,8 @@ pub(super) use pioneer_client::{
 use pioneer_protocol::{
     ArtifactRef, AuthMeResponse, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
     McpServerDetailsResponse, PrincipalId, SkillHealthItem, SkillId, SkillListItem, SkillPackId,
-    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadPlacement, ThreadVisibility,
-    TurnPermissionMode, VoiceStatus, Workspace, WorkspaceId,
+    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadParticipantSummary,
+    ThreadPlacement, ThreadVisibility, TurnPermissionMode, VoiceStatus, Workspace, WorkspaceId,
 };
 #[cfg(test)]
 pub(crate) use queries::{
@@ -179,74 +174,6 @@ pub(super) enum SettingsContentView {
     Memory,
     SelfImprovement,
 }
-
-#[derive(Clone)]
-pub(super) struct DesktopComposerMentionItem {
-    pub(super) candidate: ComposerMentionCandidate,
-    pub(super) avatar_path: Option<String>,
-}
-
-impl SearchableListItem for DesktopComposerMentionItem {
-    type Value = ComposerMentionCandidate;
-
-    fn title(&self) -> SharedString {
-        format!(
-            "{} · @{}",
-            self.candidate.display_name, self.candidate.nickname
-        )
-        .into()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.candidate
-    }
-
-    fn render(&self, _: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let avatar = Avatar::new()
-            .small()
-            .name(self.candidate.display_name.clone())
-            .when_some(self.avatar_path.clone(), |this, path| this.src(path));
-
-        h_flex()
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .gap_2()
-            .py_0p5()
-            .child(avatar)
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .child(self.candidate.display_name.clone()),
-                    )
-                    .when(!self.candidate.nickname.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .opacity(0.6)
-                                .child(format!("@{}", self.candidate.nickname)),
-                        )
-                    }),
-            )
-    }
-
-    fn matches(&self, query: &str) -> bool {
-        let query = query.to_lowercase();
-        self.candidate.display_name.to_lowercase().contains(&query)
-            || self.candidate.nickname.to_lowercase().contains(&query)
-    }
-}
-
-pub(super) type DesktopComposerMentionComboboxDelegate = SearchableVec<DesktopComposerMentionItem>;
 
 pub(super) struct GatewayCoordinator {
     pub(super) runtime: Option<GatewayRuntime>,
@@ -467,10 +394,15 @@ pub struct PioneerDesktop {
     pub(super) draft_thread_by_workspace: HashMap<String, String>,
     pub(super) composer_state: Entity<InputState>,
     pub(super) composer_input_subscription: Option<Subscription>,
-    pub(super) composer_mention_select:
-        Entity<ComboboxState<DesktopComposerMentionComboboxDelegate>>,
+    pub(super) composer_mention_select: Entity<ComboboxState<MemberPickerDelegate>>,
     pub(super) composer_mention_select_subscription: Option<Subscription>,
     pub(super) composer_mention_items: Vec<ComposerMentionCandidate>,
+    pub(super) thread_member_select: Entity<ComboboxState<MemberPickerDelegate>>,
+    pub(super) thread_member_select_subscription: Option<Subscription>,
+    pub(super) thread_member_items: Vec<ComposerMentionCandidate>,
+    pub(super) thread_members_thread_id: Option<String>,
+    pub(super) thread_members: Vec<ThreadParticipantSummary>,
+    pub(super) thread_members_loading: bool,
     pub(super) composer_attachments: Vec<ComposerAttachment>,
     pub(super) composer_capabilities: Vec<ComposerCapability>,
     pub(super) composer_skill_selections: Vec<ComposerSkillSelection>,
@@ -554,6 +486,7 @@ pub struct PioneerDesktop {
     pub(super) artifact_download_cancellations:
         HashMap<ArtifactVersionKey, tokio_util::sync::CancellationToken>,
     pub(super) show_thread_artifacts_sidebar: bool,
+    pub(super) show_thread_members_sidebar: bool,
     pub(super) thread_artifacts_sidebar_width: Pixels,
     pub(super) ready_turn_resume_threads: VecDeque<String>,
     pub(super) ready_turn_resume_thread_set: HashSet<String>,
