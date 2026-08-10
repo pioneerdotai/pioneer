@@ -559,6 +559,21 @@ impl ClientFfiRuntime {
             .map_err(normal_auth_error)
     }
 
+    fn gateway_auth_profile_update(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthProfileUpdateResponse, ClientFfiError> {
+        let params = serde_json::from_str::<pioneer_protocol::AuthProfileUpdateParams>(input_json)
+            .map_err(|_| {
+                ClientFfiError::new("invalid profile update request", "invalid_profile")
+            })?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .auth_profile_update(params)
+            .map_err(normal_auth_error)
+    }
+
     fn gateway_auth_session_list(
         &self,
         input_json: &str,
@@ -2489,6 +2504,8 @@ fn normal_auth_error(error: anyhow::Error) -> ClientFfiError {
         "invalid_credential",
         "device_activation_consumed",
         "device_activation_expired",
+        "nickname_unavailable",
+        "avatar_invalid",
     ]
     .into_iter()
     .find(|code| message.contains(code))
@@ -2695,6 +2712,10 @@ ffi_client_json_typed_method!(
     gateway_auth_session_cleanup
 );
 ffi_client_json_typed_method!(pioneer_client_ffi_gateway_auth_me, gateway_auth_me);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_auth_profile_update,
+    gateway_auth_profile_update
+);
 ffi_client_json_typed_method!(
     pioneer_client_ffi_gateway_auth_session_list,
     gateway_auth_session_list

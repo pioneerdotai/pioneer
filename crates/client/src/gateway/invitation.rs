@@ -723,6 +723,7 @@ mod tests {
                     kind: PrincipalKind::User,
                     display_name: "Member".to_owned(),
                     nickname: "member".to_owned(),
+                    avatar_revision: None,
                 },
                 device: AuthDeviceSnapshot {
                     id: device_id.clone(),

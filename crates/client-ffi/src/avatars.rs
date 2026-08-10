@@ -73,26 +73,7 @@ impl ClientFfiAvatarCache {
         let _operation = self.operation_gate.lock().map_err(|_| {
             ClientFfiError::new("avatar cache is unavailable", "avatar_cache_unavailable")
         })?;
-        let access = sender
-            .current_gateway_http_access()
-            .map_err(map_authority_error)?;
-        let authority = Arc::new(FfiAvatarHttpAuthority {
-            sender: sender.clone(),
-        });
-        let session = GatewayHttpSession::from_access(&access, authority).map_err(|_| {
-            ClientFfiError::new(
-                "Gateway endpoint is unavailable for avatar access",
-                AVATAR_RECONFIGURATION_CODE,
-            )
-        })?;
-        let service =
-            AvatarCacheService::new(session, runtime_home, access.gateway_id, access.session_id);
-        let runtime = Runtime::new().map_err(|_| {
-            ClientFfiError::new(
-                "avatar cache runtime is unavailable",
-                "avatar_cache_unavailable",
-            )
-        })?;
+        let (service, runtime) = avatar_cache_service(sender, runtime_home)?;
         let result = runtime
             .block_on(service.resolve(
                 AvatarCacheRequest {
@@ -102,18 +83,7 @@ impl ClientFfiAvatarCache {
                 CancellationToken::new(),
             ))
             .map_err(map_cache_error)?;
-        let cached_image_path = result
-            .local_path
-            .as_path()
-            .to_str()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                ClientFfiError::new(
-                    "avatar cache path cannot be represented for the native shell",
-                    "avatar_cache_path_invalid",
-                )
-            })?
-            .to_owned();
+        let cached_image_path = cached_image_path_for_shell(result.local_path.as_path())?;
         Ok(ClientMemberAvatarCacheResult {
             cached_image_path,
             principal_id: result.principal_id,
@@ -132,26 +102,7 @@ impl ClientFfiAvatarCache {
         let _operation = self.operation_gate.lock().map_err(|_| {
             ClientFfiError::new("avatar cache is unavailable", "avatar_cache_unavailable")
         })?;
-        let access = sender
-            .current_gateway_http_access()
-            .map_err(map_authority_error)?;
-        let authority = Arc::new(FfiAvatarHttpAuthority {
-            sender: sender.clone(),
-        });
-        let session = GatewayHttpSession::from_access(&access, authority).map_err(|_| {
-            ClientFfiError::new(
-                "Gateway endpoint is unavailable for avatar access",
-                AVATAR_RECONFIGURATION_CODE,
-            )
-        })?;
-        let service =
-            AvatarCacheService::new(session, runtime_home, access.gateway_id, access.session_id);
-        let runtime = Runtime::new().map_err(|_| {
-            ClientFfiError::new(
-                "avatar cache runtime is unavailable",
-                "avatar_cache_unavailable",
-            )
-        })?;
+        let (service, runtime) = avatar_cache_service(sender, runtime_home)?;
         let result = runtime
             .block_on(service.resolve_agent_avatar(CancellationToken::new()))
             .map_err(map_cache_error)?;
@@ -166,12 +117,47 @@ impl ClientFfiAvatarCache {
     }
 }
 
+fn avatar_cache_service(
+    sender: &GatewayWsCommandSender,
+    runtime_home: PathBuf,
+) -> Result<(AvatarCacheService, Runtime), ClientFfiError> {
+    let access = sender
+        .current_gateway_http_access()
+        .map_err(map_authority_error)?;
+    let authority = Arc::new(FfiAvatarHttpAuthority {
+        sender: sender.clone(),
+    });
+    let session = GatewayHttpSession::from_access(&access, authority).map_err(|_| {
+        ClientFfiError::new(
+            "Gateway endpoint is unavailable for avatar access",
+            AVATAR_RECONFIGURATION_CODE,
+        )
+    })?;
+    let service =
+        AvatarCacheService::new(session, runtime_home, access.gateway_id, access.session_id);
+    let runtime = Runtime::new().map_err(|_| {
+        ClientFfiError::new(
+            "avatar cache runtime is unavailable",
+            "avatar_cache_unavailable",
+        )
+    })?;
+    Ok((service, runtime))
+}
+
 fn agent_result_for_shell(
     result: AgentAvatarCacheResult,
 ) -> Result<ClientAgentAvatarCacheResult, ClientFfiError> {
-    let cached_image_path = result
-        .local_path
-        .as_path()
+    let cached_image_path = cached_image_path_for_shell(result.local_path.as_path())?;
+    Ok(ClientAgentAvatarCacheResult {
+        cached_image_path,
+        avatar_revision: result.avatar_revision,
+        media_type: result.media_type,
+        source: result.source,
+    })
+}
+
+fn cached_image_path_for_shell(path: &Path) -> Result<String, ClientFfiError> {
+    Ok(path
         .to_str()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -180,13 +166,7 @@ fn agent_result_for_shell(
                 "avatar_cache_path_invalid",
             )
         })?
-        .to_owned();
-    Ok(ClientAgentAvatarCacheResult {
-        cached_image_path,
-        avatar_revision: result.avatar_revision,
-        media_type: result.media_type,
-        source: result.source,
-    })
+        .to_owned())
 }
 
 struct FfiAvatarHttpAuthority {

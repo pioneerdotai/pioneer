@@ -188,6 +188,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::auth_me(self)
     }
 
+    pub fn auth_profile_update(
+        &self,
+        params: AuthProfileUpdateParams,
+    ) -> Result<AuthProfileUpdateResponse> {
+        client_ws_commands::auth_profile_update(self, params)
+    }
+
     pub fn auth_session_list(&self) -> Result<AuthSessionListResponse> {
         client_ws_commands::auth_session_list(self)
     }

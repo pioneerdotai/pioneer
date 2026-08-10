@@ -23,6 +23,8 @@ pub(crate) enum AuthErrorCode {
     InvitationNicknameUnavailable,
     InvitationInvalidInstallation,
     InvitationAvatarInvalid,
+    ProfileNicknameUnavailable,
+    ProfileAvatarInvalid,
     RecoveryRateLimited,
     RecoveryInvalidTarget,
 }
@@ -52,6 +54,8 @@ impl AuthErrorCode {
             Self::InvitationNicknameUnavailable => "nickname_unavailable",
             Self::InvitationInvalidInstallation => "invalid_installation",
             Self::InvitationAvatarInvalid => "avatar_invalid",
+            Self::ProfileNicknameUnavailable => "nickname_unavailable",
+            Self::ProfileAvatarInvalid => "avatar_invalid",
             Self::RecoveryRateLimited => "recovery_rate_limited",
             Self::RecoveryInvalidTarget => "recovery_invalid_target",
         }

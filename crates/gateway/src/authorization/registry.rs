@@ -95,8 +95,8 @@ use ResourceAction::{
     ArtifactDelete, ArtifactRead, ArtifactWrite, CliRuntimeManage, CliRuntimeUse, GatewayManage,
     InvitationCreate, InvitationList, InvitationRevoke, McpManage, MemberDeviceCreate,
     MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend, MemoryRead, MemoryWrite,
-    ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn, SkillManage, SkillUse,
-    TaskManage, TaskRead, TaskRun, ThreadCreate, ThreadManage, ThreadMove,
+    ProfileUpdateOwn, ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn, SkillManage,
+    SkillUse, TaskManage, TaskRead, TaskRun, ThreadCreate, ThreadManage, ThreadMove,
     ThreadParticipantsManage, ThreadRead, ThreadWrite, WorkspaceCreate, WorkspaceList,
     WorkspaceManage, WorkspaceMemberAdd, WorkspaceMemberList, WorkspaceMemberRemove, WorkspaceRead,
 };
@@ -190,6 +190,13 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         OwnSession,
         NotFound,
         Authentication,
+    ),
+    method_entry(
+        AUTH_PROFILE_UPDATE,
+        ProfileUpdateOwn,
+        OwnSession,
+        NotFound,
+        Mutation,
     ),
     method_entry(
         AUTH_SESSION_LIST,
@@ -925,7 +932,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 138);
+        assert_eq!(registry.len(), 139);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());

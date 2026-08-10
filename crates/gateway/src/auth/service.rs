@@ -14,20 +14,21 @@ use pioneer_crud::{
     load_active_device_by_installation, load_active_session_by_device, load_current_refresh,
     load_device, load_gateway_singleton, load_pending_local_session,
     load_pending_session_by_activation_locator_hash, load_pending_session_for_creator,
-    load_principal_by_id, load_session, load_session_by_activation_hash, mark_device_revoked,
-    mark_session_revoked, record_failed_device_activation, replace_current_refresh,
-    revoke_session_family_for_refresh_reuse, touch_active_auth_session, touch_active_device,
+    load_principal_avatar, load_principal_by_id, load_session, load_session_by_activation_hash,
+    mark_device_revoked, mark_session_revoked, record_failed_device_activation,
+    replace_current_refresh, revoke_session_family_for_refresh_reuse, touch_active_auth_session,
+    touch_active_device,
 };
 use pioneer_protocol::{
     AUTH_DOMAIN_ID_LEN, AuthDeviceActivateParams, AuthDeviceCreateResponse, AuthDeviceSnapshot,
     AuthGatewaySnapshot, AuthLogoutResponse, AuthMeResponse, AuthPrincipalSnapshot,
-    AuthRefreshGrant, AuthRefreshParams, AuthSecretString, AuthSessionGrant, AuthSessionId,
-    AuthSessionListItem, AuthSessionListResponse, AuthSessionRevokeReason,
-    AuthSessionRevokeResponse, AuthSessionSnapshot, AuthSessionStatus,
-    AuthSessionTerminationReason, ClientInstallationDescriptor, ClientKind, CredentialStorageOrder,
-    DEVICE_ACTIVATION_ALPHABET, DeviceId, DeviceStatus, InvitationId, PrincipalKind,
-    PrincipalStatus, RefreshCredentialId, RequestId, RoleKey, TokenFamilyId, WorkspaceId,
-    format_device_activation_code, generate_id,
+    AuthProfileAvatarUpdate, AuthProfileUpdateParams, AuthProfileUpdateResponse, AuthRefreshGrant,
+    AuthRefreshParams, AuthSecretString, AuthSessionGrant, AuthSessionId, AuthSessionListItem,
+    AuthSessionListResponse, AuthSessionRevokeReason, AuthSessionRevokeResponse,
+    AuthSessionSnapshot, AuthSessionStatus, AuthSessionTerminationReason,
+    ClientInstallationDescriptor, ClientKind, CredentialStorageOrder, DEVICE_ACTIVATION_ALPHABET,
+    DeviceId, DeviceStatus, InvitationId, PrincipalKind, PrincipalStatus, RefreshCredentialId,
+    RequestId, RoleKey, TokenFamilyId, WorkspaceId, format_device_activation_code, generate_id,
 };
 use sea_orm::{
     DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
@@ -43,6 +44,7 @@ use crate::epic5_observability::{
 use crate::helpers::unix_timestamp_secs;
 use crate::identity::IdentityBootstrapSnapshot;
 use crate::invitation::{InvitationAcceptServiceError, InvitationService};
+use crate::profile_avatar::prepare_avatar;
 use crate::secrets::AuthKeyMaterial;
 use crate::transport::{
     AUTH_DEVICE_ACTIVATE, AUTH_REFRESH, INVITE_ACCEPT, INVITE_PREVIEW, RestrictedExchangeExecutor,
@@ -554,6 +556,7 @@ impl GatewayAuthService {
                 kind: principal.kind,
                 display_name: principal.display_name,
                 nickname: principal.nickname,
+                avatar_revision: None,
             },
             access_token: AuthSecretString::new(access_token),
             access_expires_at_unix,
@@ -779,6 +782,10 @@ impl GatewayAuthService {
         if device.status != "active" {
             return Err(AuthError::new(AuthErrorCode::SessionRevoked));
         }
+        let avatar_revision = load_principal_avatar(&self.database, &principal.principal_id)
+            .await
+            .map_err(storage_error)?
+            .map(|avatar| hex::encode(avatar.content_hash));
         Ok(SessionLeaseSnapshot {
             kind: owner.kind,
             role_key: role_key.clone(),
@@ -791,6 +798,7 @@ impl GatewayAuthService {
                     kind: owner.kind,
                     display_name: owner.display_name,
                     nickname: owner.nickname,
+                    avatar_revision,
                 },
                 device: AuthDeviceSnapshot {
                     id: principal.device_id.clone(),
@@ -892,6 +900,154 @@ impl GatewayAuthService {
         principal: &AuthenticatedSessionPrincipal,
     ) -> Result<AuthMeResponse, AuthError> {
         Ok(self.validate_session_lease(principal).await?.me)
+    }
+
+    pub(crate) async fn update_profile(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        params: AuthProfileUpdateParams,
+    ) -> Result<AuthProfileUpdateResponse, AuthError> {
+        self.validate_session_lease(principal).await?;
+        let avatar_action = params.avatar.clone();
+        let prepared_avatar = match &avatar_action {
+            AuthProfileAvatarUpdate::Set { avatar } => Some(
+                prepare_avatar(avatar.clone())
+                    .map_err(|_| AuthError::new(AuthErrorCode::ProfileAvatarInvalid))?,
+            ),
+            AuthProfileAvatarUpdate::Unchanged | AuthProfileAvatarUpdate::Remove => None,
+        };
+        let nickname_key = params.nickname_key();
+        let now_unix =
+            unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let now = datetime(now_unix)?;
+        let transaction = self
+            .database
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| storage_error(error.into()))?;
+
+        let outcome = async {
+            let current = load_principal_by_id(&transaction, &principal.principal_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("authenticated profile principal is missing"))?;
+            if current.gateway_id != principal.gateway_id
+                || current.status != PrincipalStatus::Active
+            {
+                anyhow::bail!("authenticated profile principal is unavailable");
+            }
+            if pioneer_crud::nickname_key_exists_for_other_principal(
+                &transaction,
+                &principal.gateway_id,
+                nickname_key.as_str(),
+                &principal.principal_id,
+            )
+            .await?
+            {
+                return Ok::<_, anyhow::Error>(Err(AuthErrorCode::ProfileNicknameUnavailable));
+            }
+
+            let current_avatar =
+                load_principal_avatar(&transaction, &principal.principal_id).await?;
+            let profile_changed =
+                current.display_name != params.display_name || current.nickname != params.nickname;
+            let avatar_changed = match (&avatar_action, prepared_avatar.as_ref()) {
+                (AuthProfileAvatarUpdate::Unchanged, _) => false,
+                (AuthProfileAvatarUpdate::Remove, _) => current_avatar.is_some(),
+                (AuthProfileAvatarUpdate::Set { .. }, Some(avatar)) => {
+                    current_avatar.as_ref().is_none_or(|current| {
+                        current.content_hash.as_slice() != avatar.content_hash.as_slice()
+                    })
+                }
+                (AuthProfileAvatarUpdate::Set { .. }, None) => {
+                    unreachable!("set avatar was prepared")
+                }
+            };
+
+            let updated = if profile_changed {
+                pioneer_crud::update_principal_profile(
+                    &transaction,
+                    &principal.gateway_id,
+                    &principal.principal_id,
+                    params.display_name.clone(),
+                    params.nickname.clone(),
+                    nickname_key,
+                    now,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("authenticated profile principal disappeared"))?
+            } else {
+                current
+            };
+
+            let avatar_revision = match avatar_action {
+                AuthProfileAvatarUpdate::Unchanged => current_avatar
+                    .as_ref()
+                    .map(|avatar| hex::encode(avatar.content_hash.as_slice())),
+                AuthProfileAvatarUpdate::Remove => {
+                    if avatar_changed {
+                        pioneer_crud::delete_principal_avatar(
+                            &transaction,
+                            &principal.principal_id,
+                        )
+                        .await?;
+                    }
+                    None
+                }
+                AuthProfileAvatarUpdate::Set { .. } => {
+                    let avatar = prepared_avatar.expect("set avatar was prepared");
+                    let revision = avatar.revision();
+                    if avatar_changed {
+                        pioneer_crud::replace_principal_avatar(
+                            &transaction,
+                            pioneer_crud::NewPrincipalAvatarRow {
+                                principal_id: principal.principal_id.clone(),
+                                media_type: avatar.media_type,
+                                content: avatar.content,
+                                content_hash: avatar.content_hash,
+                                width: avatar.width,
+                                height: avatar.height,
+                                now,
+                            },
+                        )
+                        .await?;
+                    }
+                    Some(revision)
+                }
+            };
+
+            Ok(Ok(AuthProfileUpdateResponse {
+                principal: AuthPrincipalSnapshot {
+                    id: updated.id,
+                    kind: updated.kind,
+                    display_name: updated.display_name,
+                    nickname: updated.nickname,
+                    avatar_revision,
+                },
+                changed: profile_changed || avatar_changed,
+            }))
+        }
+        .await;
+
+        match outcome {
+            Ok(Ok(response)) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| storage_error(error.into()))?;
+                Ok(response)
+            }
+            Ok(Err(code)) => {
+                let _ = transaction.rollback().await;
+                Err(AuthError::new(code))
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(storage_error(error))
+            }
+        }
     }
 
     pub(crate) async fn expire_pending_device_sessions(
@@ -1668,6 +1824,7 @@ impl GatewayAuthService {
                 kind: principal.kind,
                 display_name: principal.display_name,
                 nickname: principal.nickname,
+                avatar_revision: None,
             },
             device: AuthDeviceSnapshot {
                 id: device_id.clone(),
@@ -2474,10 +2631,17 @@ fn revoked_session_error_code(revoke_reason: Option<&str>) -> AuthErrorCode {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use image::{DynamicImage, ImageFormat};
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::CrudStore;
     use pioneer_keystore::MemorySecretStore;
-    use pioneer_protocol::{MemberRemoveParams, MemberSuspendParams, PrincipalId};
+    use pioneer_protocol::{
+        MemberRemoveParams, MemberSuspendParams, PrincipalId, ProfileAvatarInput,
+        ProfileAvatarMediaType,
+    };
     use sea_orm::{ConnectionTrait, Database, Statement};
     use std::sync::Mutex;
 
@@ -3421,6 +3585,117 @@ mod tests {
             scalar_text(&service.database, "SELECT status AS value FROM device").await,
             "active"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_principal_can_atomically_update_and_remove_own_profile() {
+        let (service, identity) = fixture().await;
+        let grant = service
+            .create_initial_session_with_ids(
+                params("profile-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let principal = authenticate_grant(&service, &grant).await;
+
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let avatar = ProfileAvatarInput::new(
+            ProfileAvatarMediaType::Png,
+            BASE64_STANDARD.encode(encoded.into_inner()),
+        )
+        .unwrap();
+        let updated = service
+            .update_profile(
+                principal.as_ref(),
+                AuthProfileUpdateParams::new(
+                    "Alice Smith",
+                    "Alice.Smith",
+                    AuthProfileAvatarUpdate::Set { avatar },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(updated.changed);
+        assert_eq!(updated.principal.display_name, "Alice Smith");
+        assert_eq!(updated.principal.nickname, "Alice.Smith");
+        assert_eq!(
+            updated.principal.avatar_revision.as_deref().map(str::len),
+            Some(64)
+        );
+        assert_eq!(count(&service.database, "principal_avatar").await, 1);
+
+        let me = service.auth_me(principal.as_ref()).await.unwrap();
+        assert_eq!(me.principal, updated.principal);
+        let unchanged = service
+            .update_profile(
+                principal.as_ref(),
+                AuthProfileUpdateParams::new(
+                    "Alice Smith",
+                    "Alice.Smith",
+                    AuthProfileAvatarUpdate::Unchanged,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!unchanged.changed);
+
+        service
+            .database
+            .execute_unprepared(
+                format!(
+                    "INSERT INTO gateway_principal(\
+                     id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                     created_at,updated_at,removed_at\
+                     ) VALUES(\
+                     'P0000000000000000000B','{}','user','member','active',\
+                     'Taken','taken','taken',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                     )",
+                    identity.gateway.id
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+        let conflict = service
+            .update_profile(
+                principal.as_ref(),
+                AuthProfileUpdateParams::new(
+                    "Changed Again",
+                    "taken",
+                    AuthProfileAvatarUpdate::Remove,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), AuthErrorCode::ProfileNicknameUnavailable);
+        assert_eq!(
+            service.auth_me(principal.as_ref()).await.unwrap().principal,
+            updated.principal
+        );
+        assert_eq!(count(&service.database, "principal_avatar").await, 1);
+
+        let removed = service
+            .update_profile(
+                principal.as_ref(),
+                AuthProfileUpdateParams::new(
+                    "Alice Smith",
+                    "Alice.Smith",
+                    AuthProfileAvatarUpdate::Remove,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(removed.changed);
+        assert_eq!(removed.principal.avatar_revision, None);
+        assert_eq!(count(&service.database, "principal_avatar").await, 0);
     }
 
     #[tokio::test]

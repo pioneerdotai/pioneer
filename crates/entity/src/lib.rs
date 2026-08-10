@@ -36,6 +36,7 @@ pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub mod principal_avatar;
+pub mod principal_avatar_revision;
 pub mod recovery_job;
 pub mod recovery_terminalization_outbox;
 pub mod self_improvement_run;

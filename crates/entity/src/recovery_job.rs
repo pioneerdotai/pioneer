@@ -40,6 +40,8 @@ pub struct Model {
     pub active_attempt_started_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(has_one)]
+    pub recovery_terminalization_outbox: HasOne<super::recovery_terminalization_outbox::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

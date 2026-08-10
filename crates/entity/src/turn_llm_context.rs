@@ -21,9 +21,10 @@ pub struct Model {
     pub payload: String,
     #[sea_orm(column_type = "Text")]
     pub output_policy_snapshot: String,
-    pub delivery_key: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(unique_key = "uq_turn_llm_context_turn_id_delivery_key")]
+    pub delivery_key: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

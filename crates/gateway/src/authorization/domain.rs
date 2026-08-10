@@ -129,6 +129,7 @@ pub(crate) enum ResourceAction {
     CliRuntimeManage,
     SessionReadOwn,
     SessionRevokeOwn,
+    ProfileUpdateOwn,
     InvitationCreate,
     InvitationList,
     InvitationRevoke,
@@ -145,7 +146,7 @@ pub(crate) enum ResourceAction {
 
 impl ResourceAction {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 41] = [
+    pub(crate) const ALL: [Self; 42] = [
         Self::GatewayManage,
         Self::WorkspaceList,
         Self::WorkspaceRead,
@@ -175,6 +176,7 @@ impl ResourceAction {
         Self::CliRuntimeManage,
         Self::SessionReadOwn,
         Self::SessionRevokeOwn,
+        Self::ProfileUpdateOwn,
         Self::InvitationCreate,
         Self::InvitationList,
         Self::InvitationRevoke,
@@ -220,6 +222,7 @@ impl ResourceAction {
             Self::CliRuntimeManage => "cli_runtime_manage",
             Self::SessionReadOwn => "session_read_own",
             Self::SessionRevokeOwn => "session_revoke_own",
+            Self::ProfileUpdateOwn => "profile_update_own",
             Self::InvitationCreate => "invitation_create",
             Self::InvitationList => "invitation_list",
             Self::InvitationRevoke => "invitation_revoke",

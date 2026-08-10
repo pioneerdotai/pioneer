@@ -19,15 +19,16 @@ use pioneer_protocol::{
     ArtifactRestoreResponse, ArtifactUploadAbortParams, ArtifactUploadAbortResponse,
     ArtifactUploadFinishParams, ArtifactUploadFinishResponse, ArtifactUploadStartParams,
     ArtifactUploadStartResponse, ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse,
-    AuthDeviceCreateResponse, AuthLogoutResponse, AuthMeResponse, AuthSessionListResponse,
-    AuthSessionRevokeParams, AuthSessionRevokeResponse, CLIRuntimeListModelsParams,
-    CLIRuntimeListModelsResponse, CLIRuntimeListParams, CLIRuntimeListResponse,
-    CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams,
-    CLIRuntimeLoginStartResponse, CLIRuntimeProxyDeleteParams, CLIRuntimeProxyDeleteResponse,
-    CLIRuntimeProxySetParams, CLIRuntimeProxySetResponse, CLIRuntimeRefreshParams,
-    CLIRuntimeRefreshResponse, CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse,
-    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeStatusParams,
-    CLIRuntimeStatusResponse, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    AuthDeviceCreateResponse, AuthLogoutResponse, AuthMeResponse, AuthProfileUpdateParams,
+    AuthProfileUpdateResponse, AuthSessionListResponse, AuthSessionRevokeParams,
+    AuthSessionRevokeResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
+    CLIRuntimeListParams, CLIRuntimeListResponse, CLIRuntimeLoginCancelParams,
+    CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
+    CLIRuntimeProxyDeleteParams, CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams,
+    CLIRuntimeProxySetResponse, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
+    CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams,
+    CLIRuntimeReviewStartResponse, CLIRuntimeStatusParams, CLIRuntimeStatusResponse,
+    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
     CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsUpdate,
@@ -85,6 +86,8 @@ const AUTH_ERROR_MACHINE_CODES: &[&str] = &[
     "session_compromised",
     "session_expired",
     "session_revoked",
+    "nickname_unavailable",
+    "avatar_invalid",
 ];
 
 fn send_auth_json_rpc_request_typed<TResponse, TParams, TTransport>(
@@ -132,6 +135,16 @@ where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
     send_auth_json_rpc_request_typed(transport, methods::AUTH_ME, &serde_json::json!({}))
+}
+
+pub fn auth_profile_update<TTransport>(
+    transport: &TTransport,
+    params: AuthProfileUpdateParams,
+) -> Result<AuthProfileUpdateResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    send_auth_json_rpc_request_typed(transport, methods::AUTH_PROFILE_UPDATE, &params)
 }
 
 pub fn auth_session_list<TTransport>(transport: &TTransport) -> Result<AuthSessionListResponse>

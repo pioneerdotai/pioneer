@@ -9,23 +9,17 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub principal_id: String,
-    pub media_type: String,
-    #[sea_orm(column_type = "Binary(1)")]
-    pub content: Vec<u8>,
-    #[sea_orm(column_type = "Binary(1)")]
-    pub content_hash: Vec<u8>,
-    pub width: i64,
-    pub height: i64,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(unique)]
+    pub revision_id: String,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
-        from = "principal_id",
+        from = "revision_id",
         to = "id",
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_principal: HasOne<super::gateway_principal::Entity>,
+    pub principal_avatar_revision: HasOne<super::principal_avatar_revision::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

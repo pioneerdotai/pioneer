@@ -1,6 +1,6 @@
 use pioneer_protocol::{
-    AuthSessionRevokeParams, AuthSessionTerminationReason, JsonRpcError, JsonRpcErrorResponse,
-    JsonRpcResponse, RequestId,
+    AuthProfileUpdateParams, AuthSessionRevokeParams, AuthSessionTerminationReason, JsonRpcError,
+    JsonRpcErrorResponse, JsonRpcResponse, RequestId,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -85,6 +85,44 @@ impl MessageProcessor {
         };
         match service.list_sessions(context.principal()).await {
             Ok(response) => self.send_auth_result(context, request_id, &response).await,
+            Err(error) => {
+                self.send_auth_error(context, request_id, error.code().as_str())
+                    .await
+            }
+        }
+    }
+
+    pub(in crate::message) async fn auth_profile_update(
+        &self,
+        context: &RequestContext,
+        authorization: &AuthorizedSession,
+        request_id: RequestId,
+        params: AuthProfileUpdateParams,
+    ) {
+        if !authorized_session_matches(
+            context,
+            authorization,
+            ResourceAction::ProfileUpdateOwn,
+            &context.principal().session_id,
+        ) {
+            self.send_auth_error(context, request_id, "authorization_unavailable")
+                .await;
+            return;
+        }
+        let Some(service) = self.auth_service.as_ref() else {
+            self.send_auth_error(context, request_id, "auth_not_ready")
+                .await;
+            return;
+        };
+        match service.update_profile(context.principal(), params).await {
+            Ok(response) => {
+                let changed = response.changed;
+                self.send_auth_result(context, request_id, &response).await;
+                if changed {
+                    self.publish_profile_change(&context.principal().principal_id)
+                        .await;
+                }
+            }
             Err(error) => {
                 self.send_auth_error(context, request_id, error.code().as_str())
                     .await

@@ -312,6 +312,54 @@ pub async fn nickname_key_exists<C: ConnectionTrait>(
         .is_some())
 }
 
+pub async fn nickname_key_exists_for_other_principal<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    nickname_key: &str,
+    principal_id: &PrincipalId,
+) -> Result<bool> {
+    Ok(gateway_principal::Entity::find()
+        .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(gateway_principal::Column::NicknameKey.eq(nickname_key))
+        .filter(gateway_principal::Column::Id.ne(principal_id.to_string()))
+        .one(db)
+        .await
+        .context("failed to check Gateway principal nickname availability")?
+        .is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_principal_profile<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+    display_name: String,
+    nickname: String,
+    nickname_key: String,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<GatewayPrincipalRecord>> {
+    let result = gateway_principal::Entity::update_many()
+        .col_expr(
+            gateway_principal::Column::DisplayName,
+            Expr::value(display_name),
+        )
+        .col_expr(gateway_principal::Column::Nickname, Expr::value(nickname))
+        .col_expr(
+            gateway_principal::Column::NicknameKey,
+            Expr::value(nickname_key),
+        )
+        .col_expr(gateway_principal::Column::UpdatedAt, Expr::value(now))
+        .filter(gateway_principal::Column::Id.eq(principal_id.to_string()))
+        .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
+        .exec(db)
+        .await
+        .context("failed to update Gateway principal profile")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+    load_principal_by_id(db, principal_id).await
+}
+
 pub async fn create_member_principal<C: ConnectionTrait>(
     db: &C,
     row: NewMemberPrincipalRow,

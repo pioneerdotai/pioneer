@@ -57,9 +57,9 @@ pub use repositories::identity::{
     gateway_identity_record_from_model, gateway_principal_record_from_model,
     list_gateway_identities, list_gateway_principals, load_gateway_singleton,
     load_identity_invariant_rows, load_principal_by_id, load_superusers_for_gateway,
-    mark_gateway_auth_ready, nickname_key_exists, principal_kind_from_db, principal_kind_to_db,
-    principal_status_from_db, principal_status_to_db, set_identity_bootstrap_version,
-    transition_member_principal_status,
+    mark_gateway_auth_ready, nickname_key_exists, nickname_key_exists_for_other_principal,
+    principal_kind_from_db, principal_kind_to_db, principal_status_from_db, principal_status_to_db,
+    set_identity_bootstrap_version, transition_member_principal_status, update_principal_profile,
 };
 pub use repositories::invitation::{
     InvitationListCursor, InvitationListPage, InvitationProjectionRows,
@@ -88,8 +88,9 @@ pub use repositories::membership::{
     persisted_thread_access_class_to_db,
 };
 pub use repositories::principal_avatar::{
-    NewPrincipalAvatarRow, PrincipalAvatarRevisionRow, insert_principal_avatar,
-    list_principal_avatar_revisions, load_principal_avatar,
+    NewPrincipalAvatarRow, PrincipalAvatarRevisionRow, PrincipalAvatarRow, delete_principal_avatar,
+    insert_principal_avatar, list_principal_avatar_revisions, load_principal_avatar,
+    load_principal_avatar_revision, replace_principal_avatar,
 };
 pub use repositories::task::TaskRootAccessFilter;
 pub use repositories::thread::{

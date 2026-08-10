@@ -159,6 +159,7 @@ mod tests {
                 kind,
                 display_name: "Alice".to_owned(),
                 nickname: "alice".to_owned(),
+                avatar_revision: None,
             },
             device: AuthDeviceSnapshot {
                 id: device_id.clone(),
@@ -300,7 +301,7 @@ mod tests {
         assert_eq!(result.display_name, "Alice");
         assert_eq!(result.nickname, "alice");
         assert_eq!(result.avatar_revision.as_deref(), Some("avatar-2"));
-        assert!(result.read_only);
+        assert!(!result.read_only);
         assert!(result.capabilities.can_manage_own_sessions);
     }
 

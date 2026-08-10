@@ -21,6 +21,21 @@ use crate::request_context::RequestContext;
 use super::MessageProcessor;
 
 impl MessageProcessor {
+    pub(in crate::message) async fn publish_profile_change(&self, principal_id: &PrincipalId) {
+        let revision = self
+            .authorization_invalidation_hub
+            .advance_snapshot_revision();
+        self.send_notification_to_authorized_member_connections(
+            principal_id,
+            events::MEMBER_CHANGED,
+            &MemberChangedNotification {
+                revision,
+                principal_id: principal_id.clone(),
+            },
+        )
+        .await;
+    }
+
     pub(in crate::message) async fn member_suspend(
         &self,
         context: &RequestContext,

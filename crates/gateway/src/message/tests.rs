@@ -26355,7 +26355,7 @@ async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispat
         .database_connection()
         .execute_unprepared(
             "UPDATE gateway_principal SET display_name='Renamed', nickname='renamed', nickname_key='renamed' WHERE id='P00000000000000000001';
-             UPDATE principal_avatar SET content_hash=zeroblob(32) WHERE principal_id='P00000000000000000001';",
+             DELETE FROM principal_avatar WHERE principal_id='P00000000000000000001';",
         )
         .await
         .expect("profile mutation should succeed");

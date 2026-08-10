@@ -45,6 +45,7 @@ mod m20260804_000001_shared_messages_authorship;
 mod m20260804_000002_refresh_exchange_recovery;
 mod m20260805_000001_native_durable_delivery;
 mod m20260806_000001_atomic_turn_terminalization;
+mod m20260810_000001_immutable_principal_avatar_revisions;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -91,6 +92,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260804_000002_refresh_exchange_recovery::Migration),
             Box::new(m20260805_000001_native_durable_delivery::Migration),
             Box::new(m20260806_000001_atomic_turn_terminalization::Migration),
+            Box::new(m20260810_000001_immutable_principal_avatar_revisions::Migration),
         ]
     }
 }

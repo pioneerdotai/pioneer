@@ -6,13 +6,13 @@ use pioneer_protocol::{
     ArtifactListForMessageParams, ArtifactListForThreadParams, ArtifactListForTurnParams,
     ArtifactListParams, ArtifactRestoreParams, ArtifactUploadAbortParams,
     ArtifactUploadFinishParams, ArtifactUploadStartParams, ArtifactViewGrantCreateParams,
-    AuthSessionRevokeParams, CLIRuntimeGetParams, CLIRuntimeListParams, CLIRuntimeRefreshParams,
-    CLIRuntimeReviewStartParams, CLIRuntimeStatusParams, CLIRuntimeThreadBindingGetParams,
-    CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams, CLIRuntimeTurnSteerParams,
-    GatewaySettingsGetParams, GatewaySettingsUpdateParams, InvitationCreateParams,
-    InvitationListParams, InvitationRevokeParams, McpInstallParams, McpListParams,
-    McpPolicySetParams, MemberDeviceCreateParams, MemberListParams, MemberRemoveParams,
-    MemberRestoreParams, MemberSuspendParams, MemoryCandidatesApproveParams,
+    AuthProfileUpdateParams, AuthSessionRevokeParams, CLIRuntimeGetParams, CLIRuntimeListParams,
+    CLIRuntimeRefreshParams, CLIRuntimeReviewStartParams, CLIRuntimeStatusParams,
+    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
+    CLIRuntimeTurnSteerParams, GatewaySettingsGetParams, GatewaySettingsUpdateParams,
+    InvitationCreateParams, InvitationListParams, InvitationRevokeParams, McpInstallParams,
+    McpListParams, McpPolicySetParams, MemberDeviceCreateParams, MemberListParams,
+    MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, MemoryCandidatesApproveParams,
     MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
     MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
     MemoryCandidatesSuppressSimilarParams, MemoryForgetParams, MemoryGetParams, MemoryListParams,
@@ -2928,6 +2928,36 @@ impl MessageProcessor {
                             request.id,
                         )
                         .await;
+                    }
+                }
+                methods::AUTH_PROFILE_UPDATE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<AuthProfileUpdateParams>(params_value) {
+                        Ok(params) => {
+                            self.auth_profile_update(
+                                &context,
+                                admission
+                                    .own_session()
+                                    .expect("central admission supplies own-session proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::AUTH_PROFILE_UPDATE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
                     }
                 }
                 methods::AUTH_SESSION_LIST => {

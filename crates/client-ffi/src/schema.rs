@@ -373,6 +373,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("auth_me_response.json", pioneer_protocol::AuthMeResponse),
         schema_doc!(
+            "auth_profile_update_params.json",
+            pioneer_protocol::AuthProfileUpdateParams
+        ),
+        schema_doc!(
+            "auth_profile_update_response.json",
+            pioneer_protocol::AuthProfileUpdateResponse
+        ),
+        schema_doc!(
             "session_list_row_presentation.json",
             pioneer_client::authorization::SessionListRowPresentation
         ),
@@ -845,6 +853,8 @@ mod tests {
             "auth_session_grant.json",
             "auth_refresh_grant.json",
             "auth_me_response.json",
+            "auth_profile_update_params.json",
+            "auth_profile_update_response.json",
             "auth_session_list_response.json",
             "auth_session_revoke_params.json",
             "auth_session_revoke_response.json",

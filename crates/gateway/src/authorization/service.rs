@@ -154,6 +154,7 @@ const fn member_action_requires_resource(action: ResourceAction) -> bool {
             | ResourceAction::CliRuntimeUse
             | ResourceAction::SessionReadOwn
             | ResourceAction::SessionRevokeOwn
+            | ResourceAction::ProfileUpdateOwn
             | ResourceAction::InvitationCreate
             | ResourceAction::InvitationList
             | ResourceAction::InvitationRevoke
@@ -381,7 +382,9 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
         ),
         ResolvedResourceAccess::Session { .. } => matches!(
             action,
-            ResourceAction::SessionReadOwn | ResourceAction::SessionRevokeOwn
+            ResourceAction::SessionReadOwn
+                | ResourceAction::SessionRevokeOwn
+                | ResourceAction::ProfileUpdateOwn
         ),
         ResolvedResourceAccess::Capability { .. } => matches!(
             action,
@@ -455,7 +458,7 @@ mod tests {
         WorkspaceAccessFacts,
     };
 
-    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 27] = [
+    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 28] = [
         ResourceAction::WorkspaceList,
         ResourceAction::WorkspaceRead,
         ResourceAction::ThreadCreate,
@@ -476,6 +479,7 @@ mod tests {
         ResourceAction::CliRuntimeUse,
         ResourceAction::SessionReadOwn,
         ResourceAction::SessionRevokeOwn,
+        ResourceAction::ProfileUpdateOwn,
         ResourceAction::InvitationCreate,
         ResourceAction::InvitationList,
         ResourceAction::InvitationRevoke,

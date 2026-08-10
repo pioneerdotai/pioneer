@@ -623,9 +623,22 @@ impl MemberService {
                     return Err(MemberServiceError::Authorization(decision));
                 }
             }
-            let avatar = pioneer_crud::load_principal_avatar(&transaction, target_principal_id)
-                .await?
-                .ok_or_else(|| MemberServiceError::Authorization(missing_resource()))?;
+            let avatar = match expected_revision {
+                Some(expected_revision) => {
+                    let content_hash = hex::decode(expected_revision)
+                        .map_err(|_| MemberServiceError::Authorization(missing_resource()))?;
+                    pioneer_crud::load_principal_avatar_revision(
+                        &transaction,
+                        target_principal_id,
+                        content_hash.as_slice(),
+                    )
+                    .await?
+                }
+                None => {
+                    pioneer_crud::load_principal_avatar(&transaction, target_principal_id).await?
+                }
+            }
+            .ok_or_else(|| MemberServiceError::Authorization(missing_resource()))?;
             if avatar.content.is_empty()
                 || avatar.content.len() > PROFILE_AVATAR_MAX_DECODED_BYTES
                 || avatar.width <= 0
@@ -660,9 +673,6 @@ impl MemberService {
                 )));
             }
             let revision = hex::encode(avatar.content_hash);
-            if expected_revision.is_some_and(|expected| expected != revision) {
-                return Err(MemberServiceError::Authorization(missing_resource()));
-            }
             Ok::<_, MemberServiceError>(MemberAvatarSnapshot::new(
                 media_type,
                 revision,
@@ -1387,7 +1397,7 @@ mod tests {
         harness
             .database
             .execute_unprepared(
-                "UPDATE principal_avatar SET media_type='image/jpeg' \
+                "UPDATE principal_avatar_revision SET media_type='image/jpeg' \
                  WHERE principal_id='P0000000000000000000B'",
             )
             .await
@@ -1402,14 +1412,15 @@ mod tests {
         harness
             .database
             .execute_unprepared(
-                "UPDATE principal_avatar SET media_type='image/png', content_hash=zeroblob(32) \
+                "UPDATE principal_avatar_revision \
+                 SET media_type='image/png', content=zeroblob(length(content)) \
                  WHERE principal_id='P0000000000000000000B'",
             )
             .await
             .unwrap();
         assert!(matches!(
             service
-                .avatar_snapshot(&viewer, &target, Some("0".repeat(64).as_str()))
+                .avatar_snapshot(&viewer, &target, Some(revision.as_str()))
                 .await,
             Err(MemberServiceError::Unavailable(_))
         ));
@@ -1435,6 +1446,92 @@ mod tests {
             avatar_proof(&store, &viewer, &hidden).await,
             ProofResolution::Denied(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn historical_avatar_revisions_survive_replacement_and_current_removal() {
+        let harness = IsolatedEpic4Harness::populated().await.unwrap();
+        let service = MemberService::new(
+            CrudStore::new(harness.database.clone()),
+            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+        );
+        let target = PrincipalId::new(MEMBER_B_ID).unwrap();
+        let viewer = member_a();
+        let first_content = b"\x89PNG\r\n\x1a\nfirst-avatar".to_vec();
+        let first_hash: [u8; 32] = Sha256::digest(first_content.as_slice()).into();
+        let second_content = b"\x89PNG\r\n\x1a\nsecond-avatar".to_vec();
+        let second_hash: [u8; 32] = Sha256::digest(second_content.as_slice()).into();
+        let transaction = harness.database.begin().await.unwrap();
+        pioneer_crud::insert_principal_avatar(
+            &transaction,
+            NewPrincipalAvatarRow {
+                principal_id: target.clone(),
+                media_type: ProfileAvatarMediaType::Png,
+                content: first_content.clone(),
+                content_hash: first_hash,
+                width: 1,
+                height: 1,
+                now: chrono::Utc::now().fixed_offset(),
+            },
+        )
+        .await
+        .unwrap();
+        pioneer_crud::replace_principal_avatar(
+            &transaction,
+            NewPrincipalAvatarRow {
+                principal_id: target.clone(),
+                media_type: ProfileAvatarMediaType::Png,
+                content: second_content.clone(),
+                content_hash: second_hash,
+                width: 1,
+                height: 1,
+                now: chrono::Utc::now().fixed_offset(),
+            },
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let first_revision = hex::encode(first_hash);
+        let second_revision = hex::encode(second_hash);
+        assert_eq!(
+            service
+                .avatar_snapshot(&viewer, &target, Some(first_revision.as_str()))
+                .await
+                .unwrap()
+                .content(),
+            first_content
+        );
+        assert_eq!(
+            service
+                .avatar_snapshot(&viewer, &target, Some(second_revision.as_str()))
+                .await
+                .unwrap()
+                .content(),
+            second_content
+        );
+
+        let transaction = harness.database.begin().await.unwrap();
+        assert!(
+            pioneer_crud::delete_principal_avatar(&transaction, &target)
+                .await
+                .unwrap()
+        );
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            service
+                .avatar_snapshot(&viewer, &target, Some(first_revision.as_str()))
+                .await
+                .unwrap()
+                .content(),
+            first_content
+        );
+        assert!(
+            service
+                .avatar_snapshot(&viewer, &target, None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

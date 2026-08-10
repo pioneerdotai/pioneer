@@ -17,8 +17,11 @@ pub struct Model {
     pub event_type: String,
     #[sea_orm(column_type = "Text")]
     pub payload: String,
-    pub idempotency_key: Option<String>,
     pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(unique_key = "uq_turn_event_turn_id_idempotency_key")]
+    pub idempotency_key: Option<String>,
+    #[sea_orm(has_many)]
+    pub turn_event_deliveries: HasMany<super::turn_event_delivery::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

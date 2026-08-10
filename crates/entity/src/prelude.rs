@@ -34,6 +34,7 @@ pub use super::mcp_audit_event::Entity as McpAuditEvent;
 pub use super::mcp_server_catalog_snapshot::Entity as McpServerCatalogSnapshot;
 pub use super::mcp_server_installation::Entity as McpServerInstallation;
 pub use super::principal_avatar::Entity as PrincipalAvatar;
+pub use super::principal_avatar_revision::Entity as PrincipalAvatarRevision;
 pub use super::recovery_job::Entity as RecoveryJob;
 pub use super::recovery_terminalization_outbox::Entity as RecoveryTerminalizationOutbox;
 pub use super::self_improvement_run::Entity as SelfImprovementRun;

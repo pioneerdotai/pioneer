@@ -102,16 +102,18 @@ pub fn current_principal_kind_presentation(
     }
 }
 
-/// Project the authenticated identity. A directory row may contribute only an
-/// already-disclosed avatar revision and only when it names the same principal;
-/// auth/me remains the identity authority.
+/// Project the authenticated identity. `auth/me` is authoritative for the
+/// editable profile; an older peer that omitted the avatar revision may still
+/// use a matching, already-disclosed directory row as a compatibility fallback.
 pub fn current_principal_presentation(
     auth: &AuthMeResponse,
     visible_member: Option<&MemberSummary>,
 ) -> CurrentPrincipalPresentation {
-    let avatar_revision = visible_member
-        .filter(|member| member.principal_id == auth.principal.id)
-        .and_then(|member| member.avatar_revision.clone());
+    let avatar_revision = auth.principal.avatar_revision.clone().or_else(|| {
+        visible_member
+            .filter(|member| member.principal_id == auth.principal.id)
+            .and_then(|member| member.avatar_revision.clone())
+    });
 
     CurrentPrincipalPresentation {
         principal_id: auth.principal.id.clone(),
@@ -119,7 +121,7 @@ pub fn current_principal_presentation(
         nickname: auth.principal.nickname.clone(),
         kind: current_principal_kind_presentation(Some(auth.principal.kind)),
         avatar_revision,
-        read_only: true,
+        read_only: false,
         capabilities: principal_presentation_capabilities_from_auth(auth),
     }
 }

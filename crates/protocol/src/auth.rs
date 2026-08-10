@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::{
-    AuthSessionId, DeviceId, GatewayBaseUrl, GatewayId, PrincipalId, PrincipalKind, RoleKey,
-    TokenFamilyId,
+    AuthSessionId, DeviceId, GatewayBaseUrl, GatewayId, NewMemberProfile, PrincipalId,
+    PrincipalKind, ProfileAvatarInput, RoleKey, TokenFamilyId,
 };
 
 pub const REFRESH_CREDENTIAL_PREFIX: &str = "prf2_";
@@ -97,6 +97,8 @@ pub struct AuthPrincipalSnapshot {
     pub kind: PrincipalKind,
     pub display_name: String,
     pub nickname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -126,6 +128,72 @@ pub struct AuthMeResponse {
     pub session: AuthSessionSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_key: Option<RoleKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AuthProfileAvatarUpdate {
+    #[default]
+    Unchanged,
+    Remove,
+    Set {
+        avatar: ProfileAvatarInput,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(try_from = "AuthProfileUpdateParamsWire")]
+pub struct AuthProfileUpdateParams {
+    pub display_name: String,
+    pub nickname: String,
+    pub avatar: AuthProfileAvatarUpdate,
+}
+
+impl AuthProfileUpdateParams {
+    pub fn new(
+        display_name: impl Into<String>,
+        nickname: impl Into<String>,
+        avatar: AuthProfileAvatarUpdate,
+    ) -> Result<Self, crate::MemberProfileValidationError> {
+        let normalized = NewMemberProfile::new(display_name, nickname, None)?;
+        Ok(Self {
+            display_name: normalized.display_name,
+            nickname: normalized.nickname,
+            avatar,
+        })
+    }
+
+    pub fn nickname_key(&self) -> String {
+        self.nickname.to_ascii_lowercase()
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AuthProfileUpdateParamsWire {
+    #[schemars(length(min = 1, max = 128))]
+    display_name: String,
+    #[schemars(
+        length(min = 2, max = 32),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$")
+    )]
+    nickname: String,
+    #[serde(default)]
+    avatar: AuthProfileAvatarUpdate,
+}
+
+impl TryFrom<AuthProfileUpdateParamsWire> for AuthProfileUpdateParams {
+    type Error = crate::MemberProfileValidationError;
+
+    fn try_from(value: AuthProfileUpdateParamsWire) -> Result<Self, Self::Error> {
+        Self::new(value.display_name, value.nickname, value.avatar)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AuthProfileUpdateResponse {
+    pub principal: AuthPrincipalSnapshot,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -543,6 +611,47 @@ mod tests {
         let mut invalid = serde_json::to_value(decoded).expect("Member auth/me should re-encode");
         invalid["role_key"] = serde_json::json!("Member");
         assert!(serde_json::from_value::<AuthMeResponse>(invalid).is_err());
+    }
+
+    #[test]
+    fn profile_update_normalizes_identity_and_defaults_avatar_to_unchanged() {
+        let decoded = serde_json::from_value::<AuthProfileUpdateParams>(serde_json::json!({
+            "display_name": "  Alice Smith  ",
+            "nickname": "Alice.Smith"
+        }))
+        .expect("valid profile update");
+        assert_eq!(decoded.display_name, "Alice Smith");
+        assert_eq!(decoded.nickname, "Alice.Smith");
+        assert_eq!(decoded.nickname_key(), "alice.smith");
+        assert_eq!(decoded.avatar, AuthProfileAvatarUpdate::Unchanged);
+    }
+
+    #[test]
+    fn profile_update_avatar_actions_are_bounded_and_tagged() {
+        let removed =
+            AuthProfileUpdateParams::new("Alice", "alice", AuthProfileAvatarUpdate::Remove)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(removed).unwrap()["avatar"],
+            serde_json::json!({"action": "remove"})
+        );
+        assert!(
+            serde_json::from_value::<AuthProfileUpdateParams>(serde_json::json!({
+                "display_name": "Alice",
+                "nickname": "not allowed",
+                "avatar": {"action": "unchanged"}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AuthProfileUpdateParams>(serde_json::json!({
+                "display_name": "Alice",
+                "nickname": "alice",
+                "avatar": {"action": "unchanged"},
+                "principal_id": "P00000000000000000001"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

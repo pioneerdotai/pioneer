@@ -61,7 +61,11 @@ pub struct Model {
     )]
     pub turn: HasOne<Entity>,
     #[sea_orm(has_one)]
+    pub turn_admission: HasOne<super::turn_admission::Entity>,
+    #[sea_orm(has_one)]
     pub turn_cli_runtime_instruction: HasOne<super::turn_cli_runtime_instruction::Entity>,
+    #[sea_orm(has_one)]
+    pub turn_finalization: HasOne<super::turn_finalization::Entity>,
     #[sea_orm(has_one)]
     pub turn_mcp_projection: HasOne<super::turn_mcp_projection::Entity>,
     #[sea_orm(has_many)]

@@ -33,6 +33,7 @@ mod memory_tools;
 mod message;
 mod operations;
 mod permissions;
+mod profile_avatar;
 mod prompt_hooks;
 mod request_context;
 mod resilience;

@@ -1363,10 +1363,11 @@ impl MessageProcessor {
                         .await
                         .ok()
                         .flatten();
+                    let notification = ThreadUpdatedNotification { thread, placement };
                     self.send_thread_scoped_notification_to_connections(
-                        thread.id.as_str(),
+                        notification.thread.id.as_str(),
                         events::THREAD_UPDATED,
-                        &ThreadUpdatedNotification { thread, placement },
+                        &notification,
                         self.session_manager.connection_ids().await,
                     )
                     .await;

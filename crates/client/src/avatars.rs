@@ -282,7 +282,6 @@ impl AvatarCacheService {
             return Err(AvatarCacheError::Corrupt);
         }
         persist_atomically(&paths, bytes.as_slice()).await?;
-        prune_other_revisions(paths.parent(), paths.final_path.as_path()).await?;
         let _ = prune_avatar_cache(self.runtime_home.as_path()).await;
         Ok(ResolvedAvatarRepresentation {
             local_path: paths.final_path,
@@ -604,29 +603,6 @@ async fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, AvatarCacheEr
     Ok(Some(bytes))
 }
 
-async fn prune_other_revisions(parent: &Path, keep: &Path) -> Result<(), AvatarCacheError> {
-    let mut entries = fs::read_dir(parent)
-        .await
-        .map_err(|_| AvatarCacheError::Disk)?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|_| AvatarCacheError::Disk)?
-    {
-        let path = entry.path();
-        if path != keep
-            && entry
-                .file_type()
-                .await
-                .map_err(|_| AvatarCacheError::Disk)?
-                .is_file()
-        {
-            remove_owned_file(path.as_path()).await;
-        }
-    }
-    Ok(())
-}
-
 async fn prune_avatar_cache(runtime_home: &Path) -> Result<u64, AvatarCacheError> {
     let root = avatar_cache_root(runtime_home);
     let mut files = Vec::new();
@@ -857,7 +833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revision_change_replaces_member_entry_and_corruption_never_publishes() {
+    async fn immutable_member_revisions_coexist_and_corruption_never_publishes() {
         let temp = tempfile::tempdir().unwrap();
         let first_bytes = png(b"avatar-one");
         let second_bytes = png(b"avatar-two");
@@ -880,7 +856,7 @@ mod tests {
             .resolve(second.clone(), CancellationToken::new())
             .await
             .unwrap();
-        assert!(!first_result.local_path.as_path().exists());
+        assert!(first_result.local_path.as_path().exists());
         assert_eq!(
             fs::read(second_result.local_path.as_path()).await.unwrap(),
             second_bytes
