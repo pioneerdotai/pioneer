@@ -31,10 +31,9 @@ impl PioneerDesktop {
         });
         let composer_mention_select = cx.new(|cx| new_member_picker_state(window, cx));
         let thread_member_select = cx.new(|cx| new_member_picker_state(window, cx));
-        let member_exact_principal_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("P00000000000000000000"));
         let thread_tree_state = cx.new(|cx| TreeState::new(cx));
         let settings_tree_state = cx.new(|cx| TreeState::new(cx));
+        let administration_tree_state = cx.new(|cx| TreeState::new(cx));
         let provider_tree_state = cx.new(|cx| TreeState::new(cx));
         let skills_audit_table_state = cx.new(|cx| {
             TableState::new(
@@ -78,6 +77,7 @@ impl PioneerDesktop {
             thread_folder_expanded: state::thread_folders_expanded_for_workspace(cx, None),
             thread_tree_selected_node_id: None,
             thread_tree_state,
+            administration_content_view: AdministrationContentView::Members,
             settings_content_view: SettingsContentView::General,
             administration: AdministrationCache::default(),
             workspace_members_loading: HashSet::new(),
@@ -88,13 +88,10 @@ impl PioneerDesktop {
             message_mutation_pending: false,
             invitations_loading: false,
             invitations_error: None,
-            invitation_workspace_selection: HashSet::new(),
             members_loading: false,
+            member_workspaces_saving: false,
             members_error: None,
-            selected_member_id: None,
             member_avatar_state: DesktopMemberAvatarState::default(),
-            member_exact_principal_input,
-            member_exact_workspace_id: None,
             voice_input_action_error: None,
             voice_input_action_generation: 0,
             pending_voice_input_enabled: None,
@@ -102,6 +99,7 @@ impl PioneerDesktop {
             remote_access_key_input_revision: 0,
             remote_access_status_poll_generation: 0,
             settings_tree_state,
+            administration_tree_state,
             provider_tree_state,
             thread_list_loading: false,
             thread_list_refresh_requested: false,
@@ -336,6 +334,7 @@ impl PioneerDesktop {
         .detach();
 
         view.sync_settings_sidebar_tree_state(cx);
+        view.sync_administration_sidebar_tree_state(cx);
         view.sync_provider_sidebar_tree_state(cx);
         view.start_gateway_ws_event_pump(cx);
         view.bootstrap_gateway_runtime(cx);

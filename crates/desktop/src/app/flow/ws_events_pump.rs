@@ -345,8 +345,8 @@ impl PioneerDesktop {
         self.clear_authorization_epoch_cache();
         self.gateway.current_auth = None;
         self.administration.clear_for_session_termination();
-        self.selected_member_id = None;
         self.member_avatar_state.clear();
+        self.member_workspaces_saving = false;
         self.gateway.auth_sessions.clear();
         self.gateway.ws_connection_id = None;
         self.gateway.connection_state = GatewayConnectionState::Disconnected;

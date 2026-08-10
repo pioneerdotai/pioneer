@@ -31,6 +31,8 @@ impl Render for PioneerDesktop {
                 .is_some_and(|runtime| !runtime.endpoints().is_empty());
         let is_settings_view_active = self.main_content_view == MainContentView::Settings;
         let is_providers_view_active = self.main_content_view == MainContentView::Providers;
+        let is_administration_view_active =
+            self.main_content_view == MainContentView::Administration;
         let is_mcp_view_active = self.main_content_view == MainContentView::Mcp;
         let is_mcp_details_view_active = self.main_content_view == MainContentView::McpDetails;
         let is_skills_view_active = self.main_content_view == MainContentView::Skills;
@@ -50,6 +52,7 @@ impl Render for PioneerDesktop {
                 MainContentView::Threads => self.render_thread(window, cx),
                 MainContentView::AgentsDoc => self.render_agents_doc_editor(cx),
                 MainContentView::Providers => self.render_providers(window, cx),
+                MainContentView::Administration => self.render_administration(window, cx),
                 MainContentView::Mcp => self.render_mcp(window, cx),
                 MainContentView::McpDetails => self.render_mcp_details(window, cx),
                 MainContentView::Skills => self.render_skills(window, cx),
@@ -61,6 +64,8 @@ impl Render for PioneerDesktop {
                 self.render_settings_sidebar(cx)
             } else if is_providers_view_active {
                 self.render_providers_sidebar(cx)
+            } else if is_administration_view_active {
+                self.render_administration_sidebar(cx)
             } else if is_mcp_details_view_active {
                 self.render_mcp_details_sidebar(cx)
             } else if is_mcp_view_active {

@@ -158,6 +158,7 @@ pub(super) enum MainContentView {
     Threads,
     AgentsDoc,
     Providers,
+    Administration,
     Mcp,
     McpDetails,
     Skills,
@@ -166,11 +167,15 @@ pub(super) enum MainContentView {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AdministrationContentView {
+    Members,
+    Invitations,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SettingsContentView {
     General,
     Devices,
-    Invitations,
-    Members,
     Memory,
     SelfImprovement,
 }
@@ -354,6 +359,7 @@ pub struct PioneerDesktop {
     pub(super) thread_folder_expanded: HashMap<String, bool>,
     pub(super) thread_tree_selected_node_id: Option<String>,
     pub(super) thread_tree_state: Entity<TreeState>,
+    pub(super) administration_content_view: AdministrationContentView,
     pub(super) settings_content_view: SettingsContentView,
     pub(super) administration: AdministrationCache,
     pub(super) workspace_members_loading: HashSet<WorkspaceId>,
@@ -364,13 +370,10 @@ pub struct PioneerDesktop {
     pub(super) message_mutation_pending: bool,
     pub(super) invitations_loading: bool,
     pub(super) invitations_error: Option<String>,
-    pub(super) invitation_workspace_selection: HashSet<String>,
     pub(super) members_loading: bool,
+    pub(super) member_workspaces_saving: bool,
     pub(super) members_error: Option<String>,
-    pub(super) selected_member_id: Option<pioneer_protocol::PrincipalId>,
     pub(super) member_avatar_state: DesktopMemberAvatarState,
-    pub(super) member_exact_principal_input: Entity<InputState>,
-    pub(super) member_exact_workspace_id: Option<String>,
     pub(super) voice_input_action_error: Option<String>,
     pub(super) voice_input_action_generation: u64,
     pub(super) pending_voice_input_enabled: Option<bool>,
@@ -378,6 +381,7 @@ pub struct PioneerDesktop {
     pub(super) remote_access_key_input_revision: u64,
     pub(super) remote_access_status_poll_generation: u64,
     pub(super) settings_tree_state: Entity<TreeState>,
+    pub(super) administration_tree_state: Entity<TreeState>,
     pub(super) provider_tree_state: Entity<TreeState>,
     pub(super) thread_list_loading: bool,
     pub(super) thread_list_refresh_requested: bool,

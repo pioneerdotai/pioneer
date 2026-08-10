@@ -1,5 +1,5 @@
 use super::*;
-use crate::app::root::{DesktopVoiceComposerState, SettingsContentView};
+use crate::app::root::{AdministrationContentView, DesktopVoiceComposerState, MainContentView};
 use crate::audio::capture::DesktopVoiceCaptureErrorKind;
 use pioneer_client::administration::{AdministrationEvent, AdministrationRefetch};
 use pioneer_client::authorization::{
@@ -205,17 +205,23 @@ impl PioneerDesktop {
         for effect in effects {
             match effect {
                 AdministrationRefetch::InvitationList
-                    if self.settings_content_view == SettingsContentView::Invitations =>
+                    if self.main_content_view == MainContentView::Administration
+                        && self.administration_content_view
+                            == AdministrationContentView::Invitations =>
                 {
                     self.refresh_invitations(false, cx);
                 }
                 AdministrationRefetch::MemberDirectory
-                    if self.settings_content_view == SettingsContentView::Members =>
+                    if self.main_content_view == MainContentView::Administration
+                        && self.administration_content_view
+                            == AdministrationContentView::Members =>
                 {
                     self.refresh_members(false, cx);
                 }
                 AdministrationRefetch::WorkspaceMembers { workspace_id }
-                    if self.settings_content_view == SettingsContentView::Members =>
+                    if self.main_content_view == MainContentView::Administration
+                        && self.administration_content_view
+                            == AdministrationContentView::Members =>
                 {
                     self.refresh_workspace_members(workspace_id, cx);
                 }

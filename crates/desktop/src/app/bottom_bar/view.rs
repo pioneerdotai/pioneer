@@ -3,7 +3,9 @@ use crate::{
     assets::PioneerIconName,
 };
 use gpui::{prelude::*, *};
-use gpui_component::{Icon, button::*, popover::Popover, theme::ActiveTheme, *};
+use gpui_component::{
+    Icon, button::*, popover::Popover, separator::Separator, theme::ActiveTheme, *,
+};
 
 impl PioneerDesktop {
     pub(crate) fn render_bottom_bar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -13,6 +15,8 @@ impl PioneerDesktop {
         );
         let show_thread_artifacts_button = self.main_content_view == MainContentView::Threads;
         let is_providers_view_active = self.main_content_view == MainContentView::Providers;
+        let is_administration_view_active =
+            self.main_content_view == MainContentView::Administration;
         let is_settings_view_active = self.main_content_view == MainContentView::Settings;
         let is_mcp_view_active = matches!(
             self.main_content_view,
@@ -59,6 +63,7 @@ impl PioneerDesktop {
                                 cx.notify();
                             })),
                     )
+                    .child(Separator::vertical().h_4().mx_1())
                     .child(
                         Button::new("bottom-bar-open-providers")
                             .ghost()
@@ -121,6 +126,29 @@ impl PioneerDesktop {
                                     view.show_sidebar = !view.show_sidebar;
                                 } else {
                                     view.open_skills_screen_from_bottom_bar(cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(Separator::vertical().h_4().mx_1())
+                    .child(
+                        Button::new("bottom-bar-open-administration")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .child(
+                                Icon::new(PioneerIconName::Users)
+                                    .size_3p5()
+                                    .opacity(0.6)
+                                    .when(is_administration_view_active, |this| {
+                                        this.opacity(1.0).text_color(cx.theme().blue)
+                                    }),
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if view.main_content_view == MainContentView::Administration {
+                                    view.show_sidebar = !view.show_sidebar;
+                                } else {
+                                    view.open_administration_screen_from_bottom_bar(cx);
                                 }
                                 cx.notify();
                             })),

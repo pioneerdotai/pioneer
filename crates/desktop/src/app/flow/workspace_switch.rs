@@ -371,6 +371,10 @@ impl PioneerDesktop {
             MainContentView::Providers => {
                 self.sync_provider_sidebar_tree_state(cx);
             }
+            MainContentView::Administration => {
+                self.sync_administration_sidebar_tree_state(cx);
+                self.refresh_current_administration_content(cx);
+            }
             _ => {}
         }
     }
