@@ -14,7 +14,8 @@ use pioneer_protocol::{
     InvitationPresentation, InvitationPreviewResponse, InvitationRevokeParams,
     InvitationRevokeReason, InvitationRevokeResponse, InvitationStatus, InvitationSummary,
     InvitationTransportSecurity, InvitationWorkspaceSummary, MemberSummary, PersistedActorRef,
-    PrincipalId, PrincipalKind, PrincipalStatus, RoleKey, WorkspaceId, generate_id,
+    PioneerAppUrlScheme, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey, WorkspaceId,
+    generate_id,
 };
 use sea_orm::{
     DatabaseConnection, SqliteTransactionMode, TransactionOptions, TransactionTrait,
@@ -49,6 +50,7 @@ pub(crate) struct InvitationService {
     store: CrudStore,
     secrets: Arc<GatewaySecrets>,
     gateway_base_url: GatewayBaseUrl,
+    app_url_scheme: PioneerAppUrlScheme,
     audit: AdministrativeAuditWriter,
     rate_limits: Arc<Epic5RateLimits>,
 }
@@ -294,6 +296,7 @@ impl InvitationService {
             store,
             secrets,
             gateway_base_url,
+            app_url_scheme: PioneerAppUrlScheme::for_current_build(),
             audit: AdministrativeAuditWriter,
             rate_limits,
         })
@@ -481,10 +484,11 @@ impl InvitationService {
 
         let summary =
             invitation_summary(projection, now).map_err(InvitationServiceError::Unavailable)?;
-        let presentation = InvitationPresentation::new(
+        let presentation = InvitationPresentation::new_with_scheme(
             self.gateway_base_url.clone(),
             principal.gateway_id.clone(),
             issued.into_credential(),
+            self.app_url_scheme,
         )
         .context("failed to construct canonical invitation presentation")
         .map_err(InvitationServiceError::Unavailable)?;

@@ -6,7 +6,7 @@ use pioneer_client::{
 };
 use pioneer_protocol::{
     AuthDeviceActivateParams, AuthDeviceActivationPresentation, AuthDeviceCreateResponse,
-    AuthRefreshParams, AuthSecretString, AuthSessionId, DeviceId, GatewayId,
+    AuthRefreshParams, AuthSecretString, AuthSessionId, DeviceId, GatewayId, PioneerAppUrlScheme,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -34,6 +34,7 @@ pub struct ClientGatewaySessionLifecycleResult {
 pub struct ClientDeviceActivationPresentationRequest {
     pub gateway_base_url: GatewayBaseUrl,
     pub created_device: AuthDeviceCreateResponse,
+    pub app_url_scheme: PioneerAppUrlScheme,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -71,9 +72,10 @@ impl ClientDeviceActivationPresentationResult {
     ) -> Result<Self, String> {
         let gateway_base_url = request.gateway_base_url.clone();
         let presentation =
-            pioneer_client::gateway::device_activation::DeviceActivationQrPresentation::from_created_device(
+            pioneer_client::gateway::device_activation::DeviceActivationQrPresentation::from_created_device_with_scheme(
                 &request.gateway_base_url,
                 request.created_device,
+                request.app_url_scheme,
             )
             .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -339,11 +341,18 @@ mod tests {
                 expires_at_unix: 1_800_000_000,
                 gateway_id: gateway_id.clone(),
             },
+            app_url_scheme: PioneerAppUrlScheme::Development,
         };
         assert!(!format!("{request:?}").contains(&token));
 
         let presentation = ClientDeviceActivationPresentationResult::from_request(request).unwrap();
         assert_eq!(presentation.manual_code.expose_secret(), token);
+        assert!(
+            presentation
+                .deep_link
+                .expose_secret()
+                .starts_with("pioneer-dev://activate")
+        );
         assert_eq!(
             presentation.qr_modules.len(),
             usize::try_from(presentation.qr_width * presentation.qr_width).unwrap()

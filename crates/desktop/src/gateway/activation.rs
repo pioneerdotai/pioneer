@@ -335,6 +335,7 @@ mod tests {
                 kind: PrincipalKind::Superuser,
                 display_name: "Owner".to_owned(),
                 nickname: "owner".to_owned(),
+                avatar_revision: None,
             },
             device: AuthDeviceSnapshot {
                 id: device_id.clone(),

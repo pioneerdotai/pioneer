@@ -7,8 +7,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     AuthSecretString, AuthSessionGrant, ClientInstallationDescriptor, GatewayBaseUrl, GatewayId,
-    GatewayTransportSecurity, InvitationId, MemberSummary, NewMemberProfile, PrincipalId,
-    PrincipalKind, WorkspaceId,
+    GatewayTransportSecurity, InvitationId, MemberSummary, NewMemberProfile, PioneerAppUrlScheme,
+    PrincipalId, PrincipalKind, WorkspaceId,
 };
 
 pub const INVITATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -125,7 +125,22 @@ impl InvitationPresentation {
         gateway_id: GatewayId,
         token: InvitationCredential,
     ) -> Result<Self, InvitationUriError> {
-        let mut uri = url::Url::parse("pioneer://invite").expect("static invite URI is valid");
+        Self::new_with_scheme(
+            gateway_base_url,
+            gateway_id,
+            token,
+            PioneerAppUrlScheme::Production,
+        )
+    }
+
+    pub fn new_with_scheme(
+        gateway_base_url: GatewayBaseUrl,
+        gateway_id: GatewayId,
+        token: InvitationCredential,
+        app_url_scheme: PioneerAppUrlScheme,
+    ) -> Result<Self, InvitationUriError> {
+        let mut uri = url::Url::parse(format!("{}://invite", app_url_scheme.as_str()).as_str())
+            .expect("Pioneer invite URI is valid");
         uri.query_pairs_mut()
             .append_pair("gateway_base_url", gateway_base_url.as_str())
             .append_pair("gateway_id", gateway_id.as_str());
@@ -150,8 +165,9 @@ impl InvitationPresentation {
         }
         let (base, fragment) = uri.split_once('#').ok_or(InvitationUriError)?;
         let parsed = url::Url::parse(base).map_err(|_| InvitationUriError)?;
-        if parsed.scheme() != "pioneer"
-            || parsed.host_str() != Some("invite")
+        let app_url_scheme =
+            PioneerAppUrlScheme::parse(parsed.scheme()).ok_or(InvitationUriError)?;
+        if parsed.host_str() != Some("invite")
             || !parsed.username().is_empty()
             || parsed.password().is_some()
             || parsed.port().is_some()
@@ -183,10 +199,11 @@ impl InvitationPresentation {
         let token = fragment.strip_prefix("token=").ok_or(InvitationUriError)?;
         let token =
             InvitationCredential::parse(token.to_owned()).map_err(|_| InvitationUriError)?;
-        Self::new(
+        Self::new_with_scheme(
             gateway_base_url.ok_or(InvitationUriError)?,
             gateway_id.ok_or(InvitationUriError)?,
             token,
+            app_url_scheme,
         )
     }
 
@@ -196,6 +213,15 @@ impl InvitationPresentation {
 
     pub fn deep_link(&self) -> &str {
         self.deep_link.expose_secret()
+    }
+
+    pub fn app_url_scheme(&self) -> PioneerAppUrlScheme {
+        let base = self
+            .deep_link()
+            .split_once('#')
+            .map_or(self.deep_link(), |(base, _)| base);
+        let parsed = url::Url::parse(base).expect("stored invitation URI is valid");
+        PioneerAppUrlScheme::parse(parsed.scheme()).expect("stored invitation scheme is valid")
     }
 
     pub fn transport_security(&self) -> InvitationTransportSecurity {
@@ -240,8 +266,12 @@ impl TryFrom<InvitationPresentationWire> for InvitationPresentation {
     type Error = InvitationUriError;
 
     fn try_from(value: InvitationPresentationWire) -> Result<Self, Self::Error> {
-        let presentation = Self::new(value.gateway_base_url, value.gateway_id, value.token)?;
-        if presentation.deep_link() != value.deep_link.expose_secret() {
+        let presentation = Self::parse(value.deep_link.expose_secret())?;
+        if presentation.gateway_base_url != value.gateway_base_url
+            || presentation.gateway_id != value.gateway_id
+            || presentation.token != value.token
+            || presentation.deep_link() != value.deep_link.expose_secret()
+        {
             return Err(InvitationUriError);
         }
         Ok(presentation)
@@ -483,7 +513,7 @@ mod tests {
         InvitationPresentation, InvitationRevokeParams, InvitationRevokeReason, InvitationStatus,
         InvitationTransportSecurity, InvitationWorkspaceGrant,
     };
-    use crate::{GatewayBaseUrl, GatewayId, InvitationId, WorkspaceId};
+    use crate::{GatewayBaseUrl, GatewayId, InvitationId, PioneerAppUrlScheme, WorkspaceId};
     use serde_json::json;
 
     #[test]
@@ -585,6 +615,47 @@ mod tests {
         let rendered = format!("{presentation:?}");
         assert!(!rendered.contains(&raw));
         assert!(!rendered.contains("pioneer://invite"));
+    }
+
+    #[test]
+    fn invitation_uri_preserves_production_and_development_schemes() {
+        let raw = credential();
+        for scheme in [
+            PioneerAppUrlScheme::Production,
+            PioneerAppUrlScheme::Development,
+        ] {
+            let presentation = InvitationPresentation::new_with_scheme(
+                GatewayBaseUrl::parse_presentation("https://gateway.example.test/").unwrap(),
+                GatewayId::new("G00000000000000000001").unwrap(),
+                InvitationCredential::parse(raw.clone()).unwrap(),
+                scheme,
+            )
+            .unwrap();
+            assert!(
+                presentation
+                    .deep_link()
+                    .starts_with(format!("{}://invite", scheme.as_str()).as_str())
+            );
+            let parsed = InvitationPresentation::parse(presentation.deep_link()).unwrap();
+            assert_eq!(parsed.app_url_scheme(), scheme);
+            assert_eq!(parsed, presentation);
+            assert_eq!(
+                serde_json::from_value::<InvitationPresentation>(
+                    serde_json::to_value(&presentation).unwrap()
+                )
+                .unwrap(),
+                presentation
+            );
+        }
+        assert!(
+            InvitationPresentation::parse(
+                format!(
+                    "pioneer-preview://invite?gateway_base_url=https%3A%2F%2Fgateway.example.test%2F&gateway_id=G00000000000000000001#token={raw}"
+                )
+                .as_str()
+            )
+            .is_err()
+        );
     }
 
     #[test]

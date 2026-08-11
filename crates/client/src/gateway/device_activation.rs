@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use pioneer_protocol::{
     AuthDeviceActivationPresentation, AuthDeviceCreateResponse, AuthSecretString, AuthSessionId,
-    DeviceId, GatewayId,
+    DeviceId, GatewayId, PioneerAppUrlScheme,
 };
 use qrcode::{Color, QrCode};
 
@@ -31,10 +31,23 @@ impl DeviceActivationQrPresentation {
         gateway_base_url: &GatewayBaseUrl,
         created: AuthDeviceCreateResponse,
     ) -> Result<Self> {
-        let presentation = AuthDeviceActivationPresentation::new(
+        Self::from_created_device_with_scheme(
+            gateway_base_url,
+            created,
+            PioneerAppUrlScheme::for_current_build(),
+        )
+    }
+
+    pub fn from_created_device_with_scheme(
+        gateway_base_url: &GatewayBaseUrl,
+        created: AuthDeviceCreateResponse,
+        app_url_scheme: PioneerAppUrlScheme,
+    ) -> Result<Self> {
+        let presentation = AuthDeviceActivationPresentation::new_with_scheme(
             gateway_base_url.clone(),
             created.gateway_id.clone(),
             created.activation_code.expose_secret(),
+            app_url_scheme,
         )
         .map_err(anyhow::Error::msg)?;
         let deep_link = presentation.to_uri();

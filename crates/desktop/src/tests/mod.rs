@@ -5,7 +5,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use super::{VersionProbe, version_probe_from_args};
+use super::{VersionProbe, invitation_urls_from_args, version_probe_from_args};
+use pioneer_protocol::{
+    GatewayBaseUrl, GatewayId, InvitationCredential, InvitationPresentation, PioneerAppUrlScheme,
+};
 
 #[test]
 fn version_probe_does_not_require_window_startup() {
@@ -27,6 +30,32 @@ fn version_probe_does_not_require_window_startup() {
     );
     assert_eq!(version_probe_from_args(["--help".to_owned()]), None);
     assert_eq!(version_probe_from_args(Vec::<String>::new()), None);
+}
+
+#[test]
+fn command_line_invitation_urls_are_scoped_to_the_current_build() {
+    let current = PioneerAppUrlScheme::for_current_build();
+    let other = match current {
+        PioneerAppUrlScheme::Production => PioneerAppUrlScheme::Development,
+        PioneerAppUrlScheme::Development => PioneerAppUrlScheme::Production,
+    };
+    let create = |scheme| {
+        InvitationPresentation::new_with_scheme(
+            GatewayBaseUrl::parse_presentation("https://gateway.example.test/").unwrap(),
+            GatewayId::new("G00000000000000000001").unwrap(),
+            InvitationCredential::parse(format!("pinv1_{}", "A".repeat(43))).unwrap(),
+            scheme,
+        )
+        .unwrap()
+        .deep_link()
+        .to_owned()
+    };
+    let expected = create(current);
+    let ignored = create(other);
+    assert_eq!(
+        invitation_urls_from_args(["--other".to_owned(), expected.clone(), ignored]),
+        vec![expected]
+    );
 }
 
 #[derive(Debug, Default)]

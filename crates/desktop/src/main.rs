@@ -28,6 +28,8 @@ use reqwest::header::HeaderValue;
 use std::sync::Arc;
 use tracing::error;
 
+use pioneer_protocol::{InvitationPresentation, PioneerAppUrlScheme};
+
 use app::PioneerDesktop;
 
 #[derive(Clone)]
@@ -99,10 +101,12 @@ impl HttpClient for DesktopHttpClient {
 }
 
 fn main() {
-    if let Some(version_probe) = version_probe_from_args(std::env::args().skip(1)) {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(version_probe) = version_probe_from_args(args.iter().cloned()) {
         print_version_probe(version_probe);
         return;
     }
+    let initial_urls = invitation_urls_from_args(args);
 
     let sentry_guard =
         pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Desktop);
@@ -154,6 +158,15 @@ fn main() {
                 .context(t!("errors.window.open_failed").to_string())?;
             let desktop = desktop.context("desktop view was not created")?;
 
+            for url in initial_urls {
+                let desktop = desktop.clone();
+                let _ = window_handle.update(cx, move |_, window, cx| {
+                    let _ = desktop.update(cx, |view, cx| {
+                        view.handle_invitation_url(url, window, cx);
+                    });
+                });
+            }
+
             while let Some(urls) = url_receiver.recv().await {
                 for url in urls {
                     let desktop = desktop.clone();
@@ -169,6 +182,16 @@ fn main() {
         })
         .detach();
     });
+}
+
+fn invitation_urls_from_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let expected_scheme = PioneerAppUrlScheme::for_current_build();
+    args.into_iter()
+        .filter(|candidate| {
+            InvitationPresentation::parse(candidate)
+                .is_ok_and(|presentation| presentation.app_url_scheme() == expected_scheme)
+        })
+        .collect()
 }
 
 fn init_locale() {

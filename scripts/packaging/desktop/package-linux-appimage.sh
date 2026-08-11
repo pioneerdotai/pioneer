@@ -81,6 +81,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
 
+PIONEER_APP_URL_SCHEME="${PIONEER_APP_URL_SCHEME:-pioneer}"
+case "$PIONEER_APP_URL_SCHEME" in
+  pioneer|pioneer-dev) ;;
+  *)
+    echo "PIONEER_APP_URL_SCHEME must be either pioneer or pioneer-dev" >&2
+    exit 1
+    ;;
+esac
+export PIONEER_APP_URL_SCHEME
+
 if [[ -z "$OUT_DIR" ]]; then
   OUT_DIR="$REPO_ROOT/dist"
 fi
@@ -141,14 +151,15 @@ exec "$HERE/usr/bin/pioneer-app" "$@"
 APP_RUN
 chmod 0755 "$APPDIR/AppRun"
 
-cat > "$APPDIR/pioneer.desktop" <<'DESKTOP'
+cat > "$APPDIR/pioneer.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Pioneer
-Exec=pioneer-app
+Exec=pioneer-app %u
 Icon=pioneer
 Categories=Utility;
 Terminal=false
+MimeType=x-scheme-handler/${PIONEER_APP_URL_SCHEME};
 DESKTOP
 cp "$APPDIR/pioneer.desktop" "$APPDIR/usr/share/applications/pioneer.desktop"
 

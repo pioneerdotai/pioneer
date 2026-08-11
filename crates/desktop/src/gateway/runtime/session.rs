@@ -976,6 +976,7 @@ mod tests {
                 kind: pioneer_protocol::PrincipalKind::Superuser,
                 display_name: "Superuser".to_owned(),
                 nickname: "superuser".to_owned(),
+                avatar_revision: None,
             },
             access_token: pioneer_protocol::AuthSecretString::new(format!(
                 "access_generation_{generation}"

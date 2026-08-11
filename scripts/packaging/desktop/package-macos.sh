@@ -348,6 +348,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
 APP_VERSION="$(resolve_release_version)"
+PIONEER_APP_URL_SCHEME="${PIONEER_APP_URL_SCHEME:-pioneer}"
+case "$PIONEER_APP_URL_SCHEME" in
+  pioneer|pioneer-dev) ;;
+  *)
+    echo "PIONEER_APP_URL_SCHEME must be either pioneer or pioneer-dev" >&2
+    exit 1
+    ;;
+esac
+export PIONEER_APP_URL_SCHEME
 
 require_cmd cargo
 require_cmd hdiutil
@@ -471,6 +480,17 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <string>${DESKTOP_EXECUTABLE_NAME}</string>
   <key>CFBundleIconFile</key>
   <string>${MACOS_ICON_NAME}</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>ai.pioneer.desktop</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>${PIONEER_APP_URL_SCHEME}</string>
+      </array>
+    </dict>
+  </array>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>NSMicrophoneUsageDescription</key>

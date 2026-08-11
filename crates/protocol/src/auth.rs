@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::{
-    AuthSessionId, DeviceId, GatewayBaseUrl, GatewayId, NewMemberProfile, PrincipalId,
-    PrincipalKind, ProfileAvatarInput, RoleKey, TokenFamilyId,
+    AuthSessionId, DeviceId, GatewayBaseUrl, GatewayId, NewMemberProfile, PioneerAppUrlScheme,
+    PrincipalId, PrincipalKind, ProfileAvatarInput, RoleKey, TokenFamilyId,
 };
 
 pub const REFRESH_CREDENTIAL_PREFIX: &str = "prf2_";
@@ -356,6 +356,7 @@ pub struct AuthDeviceActivationPresentation {
     pub gateway_base_url: GatewayBaseUrl,
     pub gateway_id: GatewayId,
     activation_code: AuthSecretString,
+    app_url_scheme: PioneerAppUrlScheme,
 }
 
 impl AuthDeviceActivationPresentation {
@@ -364,6 +365,20 @@ impl AuthDeviceActivationPresentation {
         gateway_id: GatewayId,
         activation_code: impl Into<String>,
     ) -> Result<Self, String> {
+        Self::new_with_scheme(
+            gateway_base_url,
+            gateway_id,
+            activation_code,
+            PioneerAppUrlScheme::Production,
+        )
+    }
+
+    pub fn new_with_scheme(
+        gateway_base_url: GatewayBaseUrl,
+        gateway_id: GatewayId,
+        activation_code: impl Into<String>,
+        app_url_scheme: PioneerAppUrlScheme,
+    ) -> Result<Self, String> {
         let activation_code = AuthSecretString::new(format_device_activation_code(
             activation_code.into().as_str(),
         )?);
@@ -371,6 +386,7 @@ impl AuthDeviceActivationPresentation {
             gateway_base_url,
             gateway_id,
             activation_code,
+            app_url_scheme,
         })
     }
 
@@ -378,9 +394,14 @@ impl AuthDeviceActivationPresentation {
         self.activation_code.expose_secret()
     }
 
+    pub fn app_url_scheme(&self) -> PioneerAppUrlScheme {
+        self.app_url_scheme
+    }
+
     pub fn to_uri(&self) -> String {
         let mut uri =
-            url::Url::parse("pioneer://activate").expect("static activation URI is valid");
+            url::Url::parse(format!("{}://activate", self.app_url_scheme.as_str()).as_str())
+                .expect("Pioneer activation URI is valid");
         uri.query_pairs_mut()
             .append_pair("gateway_base_url", self.gateway_base_url.as_str())
             .append_pair("gateway_id", self.gateway_id.as_str());
@@ -397,8 +418,9 @@ impl AuthDeviceActivationPresentation {
         }
         let parsed =
             url::Url::parse(uri).map_err(|_| "invalid device activation URI".to_owned())?;
-        if parsed.scheme() != "pioneer"
-            || parsed.host_str() != Some("activate")
+        let app_url_scheme = PioneerAppUrlScheme::parse(parsed.scheme())
+            .ok_or_else(|| "invalid device activation URI scheme".to_owned())?;
+        if parsed.host_str() != Some("activate")
             || !parsed.username().is_empty()
             || parsed.password().is_some()
             || parsed.port().is_some()
@@ -454,11 +476,12 @@ impl AuthDeviceActivationPresentation {
                 }
             }
         }
-        Self::new(
+        Self::new_with_scheme(
             gateway_base_url
                 .ok_or_else(|| "device activation URI has no Gateway base URL".to_owned())?,
             gateway_id.ok_or_else(|| "device activation URI has no Gateway id".to_owned())?,
             code.ok_or_else(|| "device activation URI has no code fragment".to_owned())?,
+            app_url_scheme,
         )
     }
 }
@@ -699,6 +722,33 @@ mod tests {
         let round_trip = AuthDeviceActivationPresentation::parse(&uri).unwrap();
         assert_eq!(round_trip, presentation);
         assert!(!format!("{presentation:?}").contains(code));
+    }
+
+    #[test]
+    fn activation_presentation_preserves_production_and_development_schemes() {
+        for scheme in [
+            PioneerAppUrlScheme::Production,
+            PioneerAppUrlScheme::Development,
+        ] {
+            let presentation = AuthDeviceActivationPresentation::new_with_scheme(
+                GatewayBaseUrl::parse_presentation("https://gateway.example.test/").unwrap(),
+                GatewayId::new("G00000000000000000001").unwrap(),
+                "K7M4-P9Q2",
+                scheme,
+            )
+            .unwrap();
+            let uri = presentation.to_uri();
+            assert!(uri.starts_with(format!("{}://activate", scheme.as_str()).as_str()));
+            let parsed = AuthDeviceActivationPresentation::parse(uri.as_str()).unwrap();
+            assert_eq!(parsed.app_url_scheme(), scheme);
+            assert_eq!(parsed, presentation);
+        }
+        assert!(
+            AuthDeviceActivationPresentation::parse(
+                "pioneer-preview://activate?gateway_base_url=https%3A%2F%2Fgateway.example.test%2F&gateway_id=G00000000000000000001#code=K7M4-P9Q2"
+            )
+            .is_err()
+        );
     }
 
     #[test]

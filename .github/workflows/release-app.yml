@@ -27,6 +27,7 @@ jobs:
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
       PIONEER_DESKTOP_SENTRY_DSN: ${{ secrets.PIONEER_DESKTOP_SENTRY_DSN }}
       PIONEER_SENTRY_ENVIRONMENT: production
+      PIONEER_APP_URL_SCHEME: pioneer
     timeout-minutes: 90
     strategy:
       fail-fast: false

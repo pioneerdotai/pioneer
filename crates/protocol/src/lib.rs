@@ -2,6 +2,7 @@ pub mod constants;
 
 mod access;
 mod agent_event;
+mod app_url;
 mod artifact;
 mod audit;
 mod auth;
@@ -39,6 +40,9 @@ pub use agent_event::{
     TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
     TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
     TurnPermissionAuditRequestKey, TurnRejectedCapability, TurnSkillBinding,
+};
+pub use app_url::{
+    PIONEER_DEVELOPMENT_URL_SCHEME, PIONEER_PRODUCTION_URL_SCHEME, PioneerAppUrlScheme,
 };
 pub use artifact::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactBindingDirection, ArtifactBindingKind,

@@ -268,6 +268,16 @@ if ([string]::IsNullOrWhiteSpace($WixPath)) {
 
 $signingRequired = Test-True -Value $env:WINDOWS_SIGNING_REQUIRED
 $productVersion = Resolve-ProductVersion -RepoRoot $repoRoot
+$appUrlScheme = if ([string]::IsNullOrWhiteSpace($env:PIONEER_APP_URL_SCHEME)) {
+    "pioneer"
+}
+else {
+    $env:PIONEER_APP_URL_SCHEME.Trim()
+}
+if ($appUrlScheme -notin @("pioneer", "pioneer-dev")) {
+    throw "PIONEER_APP_URL_SCHEME must be either pioneer or pioneer-dev"
+}
+$env:PIONEER_APP_URL_SCHEME = $appUrlScheme
 $upgradeCode = "4f0b8f79-0f9c-4b7f-a0d1-f9cf472a61b4"
 $bundleUpgradeCode = "8d3f730a-1ef9-4d3d-a4cd-b36640bcc350"
 $appIconPath = Join-Path $repoRoot "crates/desktop/assets/app-icon.ico"
@@ -338,6 +348,16 @@ try {
       <Directory Id="INSTALLFOLDER" Name="Pioneer">
         <Component Id="DesktopExeComponent" Guid="*">
           <File Id="DesktopExeFile" Source="`$(var.StageDir)\\pioneer-app.exe" KeyPath="yes" />
+          <RegistryKey Root="HKLM" Key="Software\Classes\$appUrlScheme">
+            <RegistryValue Type="string" Value="URL:Pioneer Protocol" />
+            <RegistryValue Name="URL Protocol" Type="string" Value="" />
+            <RegistryKey Key="DefaultIcon">
+              <RegistryValue Type="string" Value="&quot;[#DesktopExeFile]&quot;,0" />
+            </RegistryKey>
+            <RegistryKey Key="shell\open\command">
+              <RegistryValue Type="string" Value="&quot;[#DesktopExeFile]&quot; &quot;%1&quot;" />
+            </RegistryKey>
+          </RegistryKey>
         </Component>
         <Component Id="DesktopUpdaterComponent" Guid="*">
           <File Id="DesktopUpdaterFile" Source="`$(var.StageDir)\\pioneer-app-updater.exe" KeyPath="yes" />
