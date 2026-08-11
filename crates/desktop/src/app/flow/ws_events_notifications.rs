@@ -191,9 +191,19 @@ impl PioneerDesktop {
     }
 
     fn apply_administration_event(&mut self, event: AdministrationEvent, cx: &mut Context<Self>) {
+        let current_profile_changed = matches!(
+            &event,
+            AdministrationEvent::MemberChanged(notification)
+                if self.gateway.current_auth.as_ref().is_some_and(|auth| {
+                    auth.principal.id == notification.principal_id
+                })
+        );
         let invalidation = self.administration.apply_event(&event);
         if invalidation.apply {
             self.apply_administration_refetches(invalidation.effects, cx);
+            if current_profile_changed {
+                self.refresh_current_principal(cx);
+            }
         }
     }
 

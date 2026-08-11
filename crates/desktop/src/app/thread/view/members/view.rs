@@ -252,7 +252,9 @@ impl PioneerDesktop {
                 Avatar::new()
                     .name(member.display_name.clone())
                     .size_10()
-                    .when_some(avatar_path, |this, path| this.src(path)),
+                    .when_some(avatar_path, |this, path| {
+                        this.src(std::path::PathBuf::from(path))
+                    }),
             )
             .child(
                 v_flex()

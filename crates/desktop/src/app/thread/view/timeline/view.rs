@@ -28,7 +28,7 @@ use std::{
 
 impl PioneerDesktop {
     pub(crate) fn render_timeline(
-        &self,
+        &mut self,
         active_thread_id: Option<&str>,
         model: TimelineRenderModel,
         pending_requests: Vec<PendingRequest>,

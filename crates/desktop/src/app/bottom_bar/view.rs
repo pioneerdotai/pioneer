@@ -171,7 +171,7 @@ impl PioneerDesktop {
                                     view.show_sidebar = !view.show_sidebar;
                                 } else {
                                     view.open_settings_content_from_sidebar(
-                                        SettingsContentView::General,
+                                        SettingsContentView::Account,
                                         cx,
                                     );
                                 }

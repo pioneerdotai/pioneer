@@ -67,9 +67,13 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(editor) = self.profile_editor.clone() {
+            return self.render_profile_editor(editor, window, cx);
+        }
+
         match self.settings_content_view {
             SettingsContentView::General => self.render_settings_general(window, cx),
-            SettingsContentView::Devices => self.render_settings_devices(window, cx),
+            SettingsContentView::Account => self.render_settings_account(window, cx),
             SettingsContentView::Memory => self.render_settings_memory(window, cx),
             SettingsContentView::SelfImprovement => {
                 self.render_settings_self_improvement(window, cx)
@@ -573,7 +577,7 @@ impl PioneerDesktop {
             )
             .child(
                 Popover::new("settings-language-popover")
-                    .anchor(Corner::TopRight)
+                    .anchor(Anchor::TopRight)
                     .p_0()
                     .trigger(
                         small_outline_button("settings-language-trigger").child(

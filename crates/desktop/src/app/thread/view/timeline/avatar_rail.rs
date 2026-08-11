@@ -6,16 +6,19 @@ use super::running_indicator::render_running_turn_dino;
 use crate::app::root::PioneerDesktop;
 use gpui::{prelude::*, *};
 use gpui_component::{Sizable as _, avatar::Avatar, theme::ActiveTheme};
-use std::{path::PathBuf, rc::Rc};
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 #[derive(Clone)]
 enum TimelineAvatarVisual {
     HistoricalUser {
         display_name: String,
-        cached_path: Option<String>,
+        cached_path: Option<PathBuf>,
     },
     Agent {
-        cached_path: Option<String>,
+        cached_path: Option<PathBuf>,
     },
     RunningAgent {
         is_dark: bool,
@@ -25,13 +28,39 @@ enum TimelineAvatarVisual {
 
 impl PioneerDesktop {
     pub(super) fn render_timeline_avatar_rail(
-        &self,
+        &mut self,
         layout: Rc<TimelineLayoutIndex>,
         scroll_handle: gpui_component::VirtualListScrollHandle,
         content_width: Pixels,
         rendered_list_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let historical_revisions = layout
+            .grouping()
+            .avatar_groups()
+            .iter()
+            .filter_map(|group| {
+                let TimelineAvatarSource::HistoricalUser {
+                    author: Some(author),
+                } = &group.source
+                else {
+                    return None;
+                };
+                let pioneer_protocol::PersistedActorRef::Principal(principal_id) = &author.actor
+                else {
+                    return None;
+                };
+                author
+                    .avatar_revision
+                    .as_ref()
+                    .map(|revision| (principal_id.clone(), revision.clone()))
+            })
+            .collect::<Vec<_>>();
+        let requests = self
+            .member_avatar_state
+            .reconcile_historical_revisions(&historical_revisions);
+        self.resolve_member_avatar_requests(requests, cx);
+
         let visuals = Rc::new(
             layout
                 .grouping()
@@ -59,7 +88,7 @@ impl PioneerDesktop {
                         cached_path: self
                             .member_avatar_state
                             .agent_cached_image_path()
-                            .map(str::to_owned),
+                            .map(Path::to_path_buf),
                     },
                 })
                 .collect::<Vec<_>>(),
@@ -147,7 +176,7 @@ impl PioneerDesktop {
     fn historical_author_avatar_parts(
         &self,
         author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
-    ) -> (String, Option<String>) {
+    ) -> (String, Option<PathBuf>) {
         let display_name = author
             .map(|author| author.display_name.trim().to_owned())
             .filter(|value| !value.is_empty())
@@ -156,9 +185,9 @@ impl PioneerDesktop {
             let pioneer_protocol::PersistedActorRef::Principal(principal_id) = &author.actor else {
                 return None;
             };
+            let revision = author.avatar_revision.as_deref()?;
             self.member_avatar_state
-                .presentation(principal_id)
-                .filter(|avatar| avatar.avatar_revision == author.avatar_revision)
+                .presentation_for_revision(principal_id, revision)
                 .and_then(|avatar| avatar.cached_image_path.clone())
         });
         (display_name, cached_path)
@@ -172,7 +201,7 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
             cached_path: Some(path),
         } => Avatar::new()
             .name(display_name.clone())
-            .src(PathBuf::from(path.as_str()))
+            .src(path.clone())
             .with_size(TIMELINE_AVATAR_SIZE)
             .into_any_element(),
         // gpui-component gives custom-size initials a half-size layout box. Use the
@@ -186,7 +215,7 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
         TimelineAvatarVisual::Agent {
             cached_path: Some(path),
         } => Avatar::new()
-            .src(PathBuf::from(path.as_str()))
+            .src(path.clone())
             .with_size(TIMELINE_AVATAR_SIZE)
             .border_0()
             .into_any_element(),

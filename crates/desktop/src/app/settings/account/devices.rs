@@ -1,48 +1,32 @@
 use crate::{
     app::root::{GatewayConnectionState, PioneerDesktop},
-    components::buttonts::{default_outline_button, default_primary_button},
+    components::{
+        buttonts::{default_outline_button, default_primary_button},
+        device_activation_form::{DeviceActivationForm, DeviceActivationFormPhase},
+    },
 };
 use gpui::{prelude::*, *};
-use gpui_component::{button::*, clipboard::Clipboard, spinner::Spinner, theme::ActiveTheme, *};
-use pioneer_client::gateway::{
-    device_activation::DeviceActivationQrPresentation, endpoint::GatewayBaseUrl,
+use gpui_component::{button::*, dialog::DialogFooter, theme::ActiveTheme, *};
+use pioneer_client::{
+    authorization::{SessionStatusPresentation, session_list_row_presentation},
+    gateway::{device_activation::DeviceActivationQrPresentation, endpoint::GatewayBaseUrl},
 };
 use pioneer_protocol::{
-    AuthSessionListItem, AuthSessionRevokeParams, AuthSessionStatus, ClientKind, DeviceStatus,
+    AuthSessionListItem, AuthSessionRevokeParams, AuthSessionStatus, ClientKind,
 };
 
-const DEVICES_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
-
-#[derive(Clone)]
-enum DeviceActivationDialogPhase {
-    Loading,
-    Ready(DeviceActivationQrPresentation),
-    Failed(String),
-}
-
 struct DeviceActivationDialogState {
-    phase: DeviceActivationDialogPhase,
+    phase: DeviceActivationFormPhase,
 }
 
 impl PioneerDesktop {
-    pub(super) fn render_settings_devices(
+    pub(super) fn render_auth_sessions_content(
         &self,
-        _window: &mut Window,
+        desktop: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let desktop = cx.entity().clone();
-        let active_sessions = self
-            .gateway
-            .auth_sessions
-            .iter()
-            .filter(|item| {
-                item.session.status == AuthSessionStatus::Active
-                    && item.device.status == DeviceStatus::Active
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let content = if self.gateway.auth_sessions_loading {
+        let sessions = self.gateway.auth_sessions.clone();
+        if self.gateway.auth_sessions_loading {
             v_flex()
                 .p_4()
                 .child(t!("settings.devices.loading").to_string())
@@ -73,96 +57,13 @@ impl PioneerDesktop {
                 .border_1()
                 .border_color(cx.theme().border)
                 .bg(cx.theme().background)
-                .children(
-                    active_sessions
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, item)| render_session_row(item, index, desktop.clone(), cx)),
-                )
+                .children(sessions.into_iter().enumerate().map(|(index, item)| {
+                    let pending =
+                        self.gateway.auth_session_action_pending.as_ref() == Some(&item.session.id);
+                    render_session_row(item, index, pending, desktop.clone(), cx)
+                }))
                 .into_any_element()
-        };
-
-        v_flex()
-            .id("settings-devices-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_6()
-            .bg(cx.theme().background)
-            .child(
-                h_flex().w_full().justify_center().child(
-                    v_flex()
-                        .w_full()
-                        .max_w(px(DEVICES_CONTENT_MAX_WIDTH_PX))
-                        .gap_6()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .justify_between()
-                                .items_center()
-                                .child(
-                                    v_flex()
-                                        .child(
-                                            div()
-                                                .text_xl()
-                                                .font_semibold()
-                                                .child(t!("settings.devices.title").to_string()),
-                                        )
-                                        .child(
-                                            div().text_sm().opacity(0.6).child(
-                                                t!("settings.devices.description").to_string(),
-                                            ),
-                                        ),
-                                )
-                                .child(
-                                    div().pt_1p5().child(
-                                        Button::new("devices-create-activation")
-                                            .ghost()
-                                            .justify_start()
-                                            .px_2()
-                                            .group("new-device-btn")
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .text_sm()
-                                                    .line_height(relative(1.))
-                                                    .child(
-                                                        t!("settings.devices.activate_device")
-                                                            .to_string(),
-                                                    ),
-                                            )
-                                            .child({
-                                                let icon_bg = cx.theme().foreground.opacity(0.075);
-                                                let icon_bg_hover =
-                                                    cx.theme().foreground.opacity(0.1);
-                                                div()
-                                                    .id("new-device-icon")
-                                                    .size_6()
-                                                    .rounded_full()
-                                                    .bg(icon_bg)
-                                                    .group_hover("new-device-btn", move |s| {
-                                                        s.bg(icon_bg_hover)
-                                                    })
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(Icon::new(IconName::Plus).size_4())
-                                            })
-                                            .on_click({
-                                                let desktop = desktop.clone();
-                                                move |_, window, cx| {
-                                                    let _ = desktop.update(cx, |view, cx| {
-                                                        view.create_desktop_activation(window, cx)
-                                                    });
-                                                }
-                                            }),
-                                    ),
-                                ),
-                        )
-                        .child(content),
-                ),
-            )
-            .into_any_element()
+        }
     }
 
     pub(in crate::app) fn refresh_auth_sessions(&mut self, cx: &mut Context<Self>) {
@@ -246,6 +147,12 @@ impl PioneerDesktop {
     }
 
     fn execute_auth_session_action(&mut self, item: AuthSessionListItem, cx: &mut Context<Self>) {
+        if self.gateway.auth_session_action_pending.is_some() {
+            return;
+        }
+        self.gateway.auth_session_action_pending = Some(item.session.id.clone());
+        self.gateway.auth_sessions_error = None;
+        cx.notify();
         let sender = self.gateway.ws_command_sender.clone();
         let current_endpoint_id = item.current.then(|| {
             self.gateway
@@ -284,9 +191,15 @@ impl PioneerDesktop {
                     .await;
                 let _ = this.update(&mut cx, |view, cx| match result {
                     Ok((_, runtime)) if item.current => {
+                        view.gateway.auth_session_action_pending = None;
                         if let Some(runtime) = runtime {
                             view.gateway.runtime = Some(runtime);
                         }
+                        view.clear_authorization_epoch_cache();
+                        view.gateway.current_auth = None;
+                        view.administration.clear_for_session_termination();
+                        view.member_avatar_state.clear();
+                        view.member_workspaces_saving = false;
                         view.gateway.auth_sessions.clear();
                         view.gateway.ws_connection_id = None;
                         view.gateway.connection_state = GatewayConnectionState::Disconnected;
@@ -295,8 +208,12 @@ impl PioneerDesktop {
                         let _ = view.gateway.ws_command_sender.disconnect();
                         cx.notify();
                     }
-                    Ok(_) => view.refresh_auth_sessions(cx),
+                    Ok(_) => {
+                        view.gateway.auth_session_action_pending = None;
+                        view.refresh_auth_sessions(cx)
+                    }
                     Err(error) => {
+                        view.gateway.auth_session_action_pending = None;
                         view.gateway.auth_sessions_error = Some(format!("{error:#}"));
                         cx.notify();
                     }
@@ -306,7 +223,11 @@ impl PioneerDesktop {
         .detach();
     }
 
-    fn create_desktop_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn create_desktop_activation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let endpoint_address = self
             .gateway
             .runtime
@@ -314,7 +235,7 @@ impl PioneerDesktop {
             .and_then(|runtime| runtime.active_gateway().cloned())
             .map(|endpoint| endpoint.gateway_base_url);
         let activation_state = cx.new(|_| DeviceActivationDialogState {
-            phase: DeviceActivationDialogPhase::Loading,
+            phase: DeviceActivationFormPhase::Loading,
         });
 
         self.open_activation_dialog(
@@ -327,7 +248,7 @@ impl PioneerDesktop {
             self.request_desktop_activation(endpoint_address, activation_state, window, cx);
         } else {
             activation_state.update(cx, |state, cx| {
-                state.phase = DeviceActivationDialogPhase::Failed(
+                state.phase = DeviceActivationFormPhase::Failed(
                     t!("settings.gateway_not_connected").to_string(),
                 );
                 cx.notify();
@@ -343,7 +264,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         activation_state.update(cx, |state, cx| {
-            state.phase = DeviceActivationDialogPhase::Loading;
+            state.phase = DeviceActivationFormPhase::Loading;
             cx.notify();
         });
         let sender = self.gateway.ws_command_sender.clone();
@@ -373,8 +294,8 @@ impl PioneerDesktop {
                         .await;
                     let _ = activation_state.update(&mut cx, |state, cx| {
                         state.phase = match result {
-                            Ok(presentation) => DeviceActivationDialogPhase::Ready(presentation),
-                            Err(error) => DeviceActivationDialogPhase::Failed(format!("{error:#}")),
+                            Ok(presentation) => DeviceActivationFormPhase::Ready(presentation),
+                            Err(error) => DeviceActivationFormPhase::Failed(format!("{error:#}")),
                         };
                         cx.notify();
                     });
@@ -396,141 +317,10 @@ impl PioneerDesktop {
 
         window.open_dialog(cx, move |dialog, _window, cx| {
             let phase = activation_state.read(cx).phase.clone();
-
-            let code = match &phase {
-                DeviceActivationDialogPhase::Ready(presentation) => {
-                    Some(presentation.manual_code().to_owned())
-                }
-                _ => None,
-            };
-            let link = match &phase {
-                DeviceActivationDialogPhase::Ready(presentation) => {
-                    Some(presentation.deep_link().to_owned())
-                }
-                _ => None,
-            };
-
-            let content = match phase {
-                DeviceActivationDialogPhase::Loading => v_flex()
-                    .w_full()
-                    .min_h(px(240.))
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .child(Spinner::new())
-                    .child(
-                        div()
-                            .text_sm()
-                            .opacity(0.6)
-                            .child(t!("settings.devices.activation_loading").to_string()),
-                    )
-                    .into_any_element(),
-                DeviceActivationDialogPhase::Ready(presentation) => v_flex()
-                    .w_full()
-                    .pt_1()
-                    .pb_5()
-                    .gap_5()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .line_height(relative(1.35))
-                            .opacity(0.6)
-                            .child(t!("settings.devices.activation_description").to_string()),
-                    )
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_4()
-                            .child(render_activation_qr(&presentation))
-                            .when_some(code, |this, code| {
-                                this.child(
-                                    v_flex()
-                                        .w_full()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            div().text_sm().opacity(0.6).child(
-                                                t!("settings.devices.code_label").to_string(),
-                                            ),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .w_full()
-                                                .p_4()
-                                                .rounded_2xl()
-                                                .justify_center()
-                                                .bg(cx.theme().muted)
-                                                .text_xl()
-                                                .font_semibold()
-                                                .child(presentation.manual_code().to_owned())
-                                                .child(
-                                                    div().absolute().top_1p5().right_1p5().child(
-                                                        Clipboard::new("activation-copy-code")
-                                                            .value(code),
-                                                    ),
-                                                ),
-                                        ),
-                                )
-                            })
-                            .when_some(link, |this, link| {
-                                this.child(
-                                    v_flex()
-                                        .w_full()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            div().text_sm().opacity(0.6).child(
-                                                t!("settings.devices.link_label").to_string(),
-                                            ),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .w_full()
-                                                .min_w_0()
-                                                .p_4()
-                                                .rounded_2xl()
-                                                .justify_center()
-                                                .bg(cx.theme().muted)
-                                                .text_sm()
-                                                .font_medium()
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .flex_1()
-                                                        .overflow_x_hidden()
-                                                        .whitespace_normal()
-                                                        .text_center()
-                                                        .child(link.to_owned()),
-                                                )
-                                                .child(
-                                                    div().absolute().top_1p5().right_1p5().child(
-                                                        Clipboard::new("activation-copy-link")
-                                                            .value(link),
-                                                    ),
-                                                ),
-                                        ),
-                                )
-                            }),
-                    )
-                    .into_any_element(),
-                DeviceActivationDialogPhase::Failed(error) => v_flex()
-                    .w_full()
-                    .min_h(px(180.))
-                    .justify_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_medium()
-                            .child(t!("settings.devices.activation_failed").to_string()),
-                    )
-                    .child(div().text_xs().text_color(cx.theme().danger).child(error))
-                    .into_any_element(),
-            };
+            let content = DeviceActivationForm::new(
+                phase,
+                t!("settings.devices.activation_description").to_string(),
+            );
 
             dialog
                 .w(px(440.))
@@ -545,14 +335,14 @@ impl PioneerDesktop {
                         .font_semibold()
                         .child(t!("settings.devices.activation_title").to_string()),
                 )
-                .footer({
+                .footer(DialogFooter::new().children({
                     let activation_state = activation_state.clone();
                     let desktop = desktop.clone();
                     let endpoint_address = endpoint_address.clone();
                     let sender = sender.clone();
-                    move |_, _, _, cx| match activation_state.read(cx).phase.clone() {
-                        DeviceActivationDialogPhase::Loading => Vec::new(),
-                        DeviceActivationDialogPhase::Failed(_) => {
+                    match activation_state.read(cx).phase.clone() {
+                        DeviceActivationFormPhase::Loading => Vec::new(),
+                        DeviceActivationFormPhase::Failed(_) => {
                             let mut actions = vec![
                                 default_outline_button("activation-error-close")
                                     .label(t!("buttons.cancel").to_string())
@@ -587,7 +377,7 @@ impl PioneerDesktop {
                             }
                             actions
                         }
-                        DeviceActivationDialogPhase::Ready(_) => vec![
+                        DeviceActivationFormPhase::Ready(_) => vec![
                             default_primary_button("activation-close")
                                 .label(t!("settings.devices.close_activation").to_string())
                                 .on_click({
@@ -595,7 +385,7 @@ impl PioneerDesktop {
                                     let sender = sender.clone();
                                     move |_, window, cx| {
                                         let session_id = match &activation_state.read(cx).phase {
-                                            DeviceActivationDialogPhase::Ready(presentation) => {
+                                            DeviceActivationFormPhase::Ready(presentation) => {
                                                 Some(presentation.session_id.clone())
                                             }
                                             _ => None,
@@ -624,7 +414,7 @@ impl PioneerDesktop {
                                 .into_any_element(),
                         ],
                     }
-                })
+                }))
                 .child(content)
         });
     }
@@ -633,6 +423,7 @@ impl PioneerDesktop {
 fn render_session_row(
     item: AuthSessionListItem,
     index: usize,
+    pending: bool,
     desktop: Entity<PioneerDesktop>,
     cx: &mut Context<PioneerDesktop>,
 ) -> AnyElement {
@@ -642,6 +433,13 @@ fn render_session_row(
         ClientKind::Other => t!("settings.devices.client_other").to_string(),
     };
     let last_seen = format_last_seen(item.last_seen_at_unix);
+    let presentation = session_list_row_presentation(&item);
+    let status = match presentation.status {
+        SessionStatusPresentation::Active => t!("settings.devices.status_active").to_string(),
+        SessionStatusPresentation::Pending => t!("settings.devices.status_pending").to_string(),
+        SessionStatusPresentation::Expired => t!("settings.devices.status_expired").to_string(),
+        SessionStatusPresentation::Revoked => t!("settings.devices.status_revoked").to_string(),
+    };
     let action_label = if item.current {
         t!("settings.devices.logout").to_string()
     } else {
@@ -680,8 +478,9 @@ fn render_session_row(
                         }),
                 )
                 .child(div().text_xs().opacity(0.6).child(format!(
-                    "{} · {}",
+                    "{} · {} · {}",
                     kind,
+                    status,
                     t!("settings.devices.last_seen", value = last_seen.as_str())
                 ))),
         )
@@ -690,6 +489,7 @@ fn render_session_row(
                 .ghost()
                 .compact()
                 .small()
+                .disabled(pending || !presentation.actionable)
                 .label(action_label)
                 .on_click(move |_, window, cx| {
                     let item = item.clone();
@@ -711,29 +511,6 @@ fn format_last_seen(unix: u64) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| t!("settings.devices.unknown_time").to_string())
-}
-
-fn render_activation_qr(presentation: &DeviceActivationQrPresentation) -> AnyElement {
-    let width = presentation.qr_width();
-    v_flex()
-        .p_3()
-        .bg(rgb(0xffffff))
-        .children(
-            presentation
-                .qr_modules()
-                .chunks(width)
-                .enumerate()
-                .map(|(row_index, row)| {
-                    h_flex().children(row.iter().enumerate().map(move |(column_index, dark)| {
-                        div()
-                            .id(("activation-qr-module", row_index * width + column_index))
-                            .w(px(4.))
-                            .h(px(4.))
-                            .bg(if *dark { rgb(0x000000) } else { rgb(0xffffff) })
-                    }))
-                }),
-        )
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -795,9 +572,10 @@ mod tests {
             .next()
             .unwrap();
         assert!(activation_source.contains("open_activation_dialog"));
-        assert!(activation_source.contains("DeviceActivationDialogPhase::Loading"));
-        assert!(activation_source.contains("DeviceActivationDialogPhase::Ready"));
-        assert!(activation_source.contains("DeviceActivationDialogPhase::Failed"));
+        assert!(activation_source.contains("DeviceActivationForm::new"));
+        assert!(activation_source.contains("DeviceActivationFormPhase::Loading"));
+        assert!(activation_source.contains("DeviceActivationFormPhase::Ready"));
+        assert!(activation_source.contains("DeviceActivationFormPhase::Failed"));
         assert!(!activation_source.contains("auth_sessions_error"));
     }
 
@@ -805,5 +583,43 @@ mod tests {
     fn current_and_peer_rows_choose_distinct_session_actions() {
         assert!(session(true).current);
         assert!(!session(false).current);
+    }
+
+    #[::core::prelude::v1::test]
+    fn every_authoritative_session_state_has_a_non_color_label() {
+        let mut pending = session(false);
+        pending.session.status = AuthSessionStatus::Pending;
+        pending.device.status = DeviceStatus::Pending;
+        let mut expired = session(false);
+        expired.session.status = AuthSessionStatus::Expired;
+        let mut revoked = session(false);
+        revoked.session.status = AuthSessionStatus::Revoked;
+        revoked.device.status = DeviceStatus::Revoked;
+        assert_eq!(
+            session_list_row_presentation(&session(true)).status,
+            SessionStatusPresentation::Active
+        );
+        assert_eq!(
+            session_list_row_presentation(&pending).status,
+            SessionStatusPresentation::Pending
+        );
+        assert_eq!(
+            session_list_row_presentation(&expired).status,
+            SessionStatusPresentation::Expired
+        );
+        assert_eq!(
+            session_list_row_presentation(&revoked).status,
+            SessionStatusPresentation::Revoked
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn desktop_session_rows_use_the_shared_presentation_owner() {
+        let source = include_str!("devices.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(source.contains("session_list_row_presentation(&item)"));
+        assert!(!source.contains("fn session_status_presentation"));
     }
 }

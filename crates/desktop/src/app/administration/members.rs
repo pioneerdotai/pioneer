@@ -27,7 +27,6 @@ use pioneer_protocol::{
     WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
 };
 use std::collections::HashSet;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct MemberWorkspacesDialogState {
@@ -221,7 +220,9 @@ impl PioneerDesktop {
                         Avatar::new()
                             .name(member.display_name.clone())
                             .size_10()
-                            .when_some(avatar_path, |avatar, path| avatar.src(path)),
+                            .when_some(avatar_path, |avatar, path| {
+                                avatar.src(std::path::PathBuf::from(path))
+                            }),
                     )
                     .child(
                         v_flex()
@@ -615,42 +616,8 @@ impl PioneerDesktop {
             );
         }
         let requests = self.member_avatar_state.reconcile_visible_members(&members);
-        if requests.is_empty() {
-            return;
-        }
-        let Ok(http) = self.active_gateway_http_client() else {
-            return;
-        };
-        for request in requests {
-            let client = http.clone();
-            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let mut cx = cx.clone();
-                async move {
-                    let request_for_error = request.clone();
-                    let result = cx
-                        .background_spawn(async move {
-                            client.resolve_member_avatar(request, CancellationToken::new())
-                        })
-                        .await;
-                    let _ = this.update(&mut cx, |view, cx| {
-                        match result {
-                            Ok(result) => {
-                                view.member_avatar_state.apply_result(result);
-                            }
-                            Err(error) => {
-                                view.member_avatar_state.apply_error(
-                                    &request_for_error.principal_id,
-                                    request_for_error.avatar_revision.as_str(),
-                                    error,
-                                );
-                            }
-                        }
-                        cx.notify();
-                    });
-                }
-            })
-            .detach();
-        }
+        self.resolve_current_principal_avatar(cx);
+        self.resolve_member_avatar_requests(requests, cx);
     }
 
     pub(in crate::app) fn refresh_all_workspace_members(&mut self, cx: &mut Context<Self>) {

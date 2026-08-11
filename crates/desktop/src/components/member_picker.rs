@@ -9,15 +9,16 @@ use gpui_component::{
 };
 use pioneer_client::composer::state_machine::ComposerMentionCandidate;
 use pioneer_protocol::PrincipalId;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub(crate) struct MemberPickerItem {
     candidate: ComposerMentionCandidate,
-    avatar_path: Option<String>,
+    avatar_path: Option<PathBuf>,
 }
 
 impl MemberPickerItem {
-    fn new(candidate: ComposerMentionCandidate, avatar_path: Option<String>) -> Self {
+    fn new(candidate: ComposerMentionCandidate, avatar_path: Option<PathBuf>) -> Self {
         Self {
             candidate,
             avatar_path,
@@ -103,7 +104,7 @@ pub(crate) fn new_member_picker_state(
 
 pub(crate) fn member_picker_items(
     candidates: impl IntoIterator<Item = ComposerMentionCandidate>,
-    mut avatar_path: impl FnMut(&PrincipalId) -> Option<String>,
+    mut avatar_path: impl FnMut(&PrincipalId) -> Option<PathBuf>,
 ) -> MemberPickerDelegate {
     SearchableVec::new(
         candidates

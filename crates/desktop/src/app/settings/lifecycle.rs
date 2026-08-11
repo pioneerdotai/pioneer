@@ -1,7 +1,7 @@
 use crate::{
     app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, SettingsContentView},
     app::settings::{
-        MemoryModelSetting, MemorySettingToggle, SETTINGS_CONTENT_DEVICES_NODE_ID,
+        MemoryModelSetting, MemorySettingToggle, SETTINGS_CONTENT_ACCOUNT_NODE_ID,
         SETTINGS_CONTENT_GENERAL_NODE_ID, SETTINGS_CONTENT_MEMORY_NODE_ID,
         SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID, SelfImprovementModelSetting,
         VoiceInputEnableAction,
@@ -50,35 +50,48 @@ impl PioneerDesktop {
         content_view: SettingsContentView,
         cx: &mut Context<Self>,
     ) {
+        self.profile_editor = None;
+        self.profile_editor_input_subscriptions.clear();
         self.settings_content_view = content_view;
         self.sync_settings_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Settings, cx);
-        if content_view == SettingsContentView::Devices {
-            self.refresh_auth_sessions(cx);
-        } else {
-            self.refresh_gateway_settings(cx);
+        match content_view {
+            SettingsContentView::Account => self.refresh_auth_sessions(cx),
+            _ => self.refresh_gateway_settings(cx),
         }
     }
 
     pub(in crate::app) fn sync_settings_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
-        let selected_ix = match self.settings_content_view {
-            SettingsContentView::General => Some(0),
-            SettingsContentView::Devices => Some(1),
-            SettingsContentView::Memory => Some(2),
-            SettingsContentView::SelfImprovement => Some(3),
-        };
+        let mut items = vec![
+            (
+                SettingsContentView::Account,
+                TreeItem::new(SETTINGS_CONTENT_ACCOUNT_NODE_ID, "account"),
+            ),
+            (
+                SettingsContentView::General,
+                TreeItem::new(SETTINGS_CONTENT_GENERAL_NODE_ID, "general"),
+            ),
+        ];
+        items.extend([
+            (
+                SettingsContentView::Memory,
+                TreeItem::new(SETTINGS_CONTENT_MEMORY_NODE_ID, "memory"),
+            ),
+            (
+                SettingsContentView::SelfImprovement,
+                TreeItem::new(
+                    SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
+                    "self-improvement",
+                ),
+            ),
+        ]);
+        let selected_ix = items
+            .iter()
+            .position(|(content_view, _)| *content_view == self.settings_content_view);
         let settings_tree_state = self.settings_tree_state.clone();
         settings_tree_state.update(cx, |state, cx| {
             state.set_items(
-                vec![
-                    TreeItem::new(SETTINGS_CONTENT_GENERAL_NODE_ID, "general"),
-                    TreeItem::new(SETTINGS_CONTENT_DEVICES_NODE_ID, "devices"),
-                    TreeItem::new(SETTINGS_CONTENT_MEMORY_NODE_ID, "memory"),
-                    TreeItem::new(
-                        SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
-                        "self-improvement",
-                    ),
-                ],
+                items.into_iter().map(|(_, item)| item).collect::<Vec<_>>(),
                 cx,
             );
             state.set_selected_index(selected_ix, cx);
@@ -678,7 +691,9 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 for _ in 0..REMOTE_ACCESS_STATUS_POLL_ATTEMPTS {
-                    Timer::after(REMOTE_ACCESS_STATUS_POLL_INTERVAL).await;
+                    cx.background_executor()
+                        .timer(REMOTE_ACCESS_STATUS_POLL_INTERVAL)
+                        .await;
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if view.remote_access_status_poll_generation != generation {

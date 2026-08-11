@@ -13,6 +13,7 @@ use crate::{
         gateway_setup::{GatewaySetupDialogState, GatewaySetupFormState},
         invitation_join::DesktopInvitationJoinState,
         member_avatars::DesktopMemberAvatarState,
+        settings::ProfileEditorState,
         skills::details::table::SkillDiagnosticsTableDelegate,
         thread::{
             ThreadCoordinator,
@@ -175,7 +176,7 @@ pub(super) enum AdministrationContentView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SettingsContentView {
     General,
-    Devices,
+    Account,
     Memory,
     SelfImprovement,
 }
@@ -361,6 +362,8 @@ pub struct PioneerDesktop {
     pub(super) thread_tree_state: Entity<TreeState>,
     pub(super) administration_content_view: AdministrationContentView,
     pub(super) settings_content_view: SettingsContentView,
+    pub(super) profile_editor: Option<Entity<ProfileEditorState>>,
+    pub(super) profile_editor_input_subscriptions: Vec<Subscription>,
     pub(super) administration: AdministrationCache,
     pub(super) workspace_members_loading: HashSet<WorkspaceId>,
     pub(super) thread_scope_pending: ThreadScopePendingAction,

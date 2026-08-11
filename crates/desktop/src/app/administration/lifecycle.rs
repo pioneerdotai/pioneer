@@ -31,6 +31,7 @@ impl PioneerDesktop {
                 let result = cx.background_spawn(async move { sender.auth_me() }).await;
                 let _ = this.update(&mut cx, |view, cx| {
                     view.gateway.current_auth = result.ok();
+                    view.resolve_current_principal_avatar(cx);
                     view.sync_settings_sidebar_tree_state(cx);
                     view.sync_administration_sidebar_tree_state(cx);
                     if view.main_content_view == MainContentView::Administration {
