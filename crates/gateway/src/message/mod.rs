@@ -1555,10 +1555,13 @@ impl MessageProcessor {
             return;
         }
 
-        let this = self.clone();
+        let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
             let mut next_skill_upload_cleanup = 0;
             loop {
+                let Some(this) = processor.upgrade() else {
+                    break;
+                };
                 let now = now_timestamp_secs();
                 let mut transient_storage_poll_failed = false;
                 if now >= next_skill_upload_cleanup {
@@ -1907,10 +1910,13 @@ impl MessageProcessor {
             return;
         }
 
-        let this = self.clone();
+        let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
             let mut first_pass = true;
             loop {
+                let Some(this) = processor.upgrade() else {
+                    break;
+                };
                 let config = this.hook_recovery_config.read().await.clone();
                 if config.enabled && (!first_pass || config.startup_scan) {
                     this.run_hook_recovery_pass(config.clone()).await;
@@ -1969,7 +1975,7 @@ impl MessageProcessor {
         if guard.is_some() {
             return;
         }
-        let this = self.clone();
+        let processor = Arc::downgrade(self);
         let mut subscription = self
             .task_runtime
             .event_bus()
@@ -1977,6 +1983,9 @@ impl MessageProcessor {
         *guard = Some(tokio::spawn(async move {
             let mut cursors_by_task: HashMap<String, i64> = HashMap::new();
             loop {
+                let Some(this) = processor.upgrade() else {
+                    break;
+                };
                 match subscription.recv().await {
                     pioneer_tasks::TaskEventWakeDelivery::Wake(wake) => {
                         if let Err(error) = this

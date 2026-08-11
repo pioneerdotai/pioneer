@@ -34,6 +34,14 @@ use tokio::time::{Duration, sleep};
 
 const TASK_EXECUTION_HEARTBEAT_SECONDS: u64 = 30;
 
+#[derive(Debug, Clone)]
+pub(crate) enum TaskChildResumeOutcome {
+    Resumed { recovery_job_id: String },
+    NotFound,
+    MissingRuntimeSnapshot { recovery_job_id: String },
+    Conflict { reason: String },
+}
+
 async fn close_admitted_task_turn_on_error<T>(
     processor: &Arc<MessageProcessor>,
     thread_id: &str,
@@ -106,6 +114,14 @@ impl TaskAgentExecutor {
             .ok_or_else(|| anyhow!("task agent executor is not bound"))?;
         weak.upgrade()
             .ok_or_else(|| anyhow!("message processor is no longer available"))
+    }
+
+    pub(super) fn processor_weak(&self) -> Result<Weak<MessageProcessor>> {
+        self.processor
+            .read()
+            .map_err(|_| anyhow!("task agent executor lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow!("task agent executor is not bound"))
     }
 
     async fn initiating_member_still_has_root_access(
@@ -2227,18 +2243,49 @@ impl TaskAgentExecutor {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<bool> {
-        let processor = self.processor()?;
+        let processor = match self.processor() {
+            Ok(processor) => processor,
+            Err(error) if error.to_string() == "task agent executor is not bound" => {
+                // Processors used without the task runtime have no task
+                // aggregate to reconcile; ordinary native terminal cleanup
+                // remains safe to complete.
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
         let Some(child_runtime) =
             load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
         else {
-            return Ok(false);
+            // No task lineage means this is an ordinary native Turn.  Its
+            // terminal cleanup is safe to proceed even though there is no
+            // task aggregate to reconcile.
+            return Ok(true);
         };
+        // A late completion from the pre-resume actor must not reopen or
+        // complete a task-run turn that has already been fenced terminally.
+        // The aggregate resume transaction is the only path that puts this
+        // durable turn back into `InProgress`.
+        if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
+            // A late completion from the pre-resume actor must not erase the
+            // blocked transcript/runtime capsule that an explicit resume
+            // still needs.
+            return Ok(false);
+        }
+        if !matches!(
+            child_runtime.task_run_turn.status,
+            TaskRunTurnStatus::InProgress | TaskRunTurnStatus::CandidateCreated
+        ) {
+            return Ok(true);
+        }
         let Some(task_response) = processor
             .crud_store
             .get_task(child_runtime.task_run_turn.task_id.as_str())
             .await?
         else {
-            return Ok(true);
+            bail!(
+                "task `{}` disappeared while reconciling completed child turn",
+                child_runtime.task_run_turn.task_id
+            );
         };
         if task_response.task.status.is_terminal() {
             return Ok(true);
@@ -2254,24 +2301,190 @@ impl TaskAgentExecutor {
         Ok(true)
     }
 
+    /// Reopen and dispatch a blocked task child through the native
+    /// `TaskExecutor` path.  Generic Turn recovery must not be allowed to
+    /// start an actor while TaskRun/execution/locks remain terminal.
+    pub(super) async fn resume_blocked_child_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        recovery_job_id: Option<&str>,
+        now_unix: i64,
+    ) -> Result<Option<TaskChildResumeOutcome>> {
+        let processor = self.processor()?;
+        let Some(task_run_turn) = processor
+            .crud_store
+            .get_task_run_turn_by_turn(thread_id, turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let outcome = processor
+            .crud_store
+            .resume_task_owned_turn(thread_id, turn_id, recovery_job_id, now_unix)
+            .await?;
+        let Some(outcome) = outcome else {
+            return Ok(Some(TaskChildResumeOutcome::Conflict {
+                reason: "task-owned child lineage disappeared while resuming".to_owned(),
+            }));
+        };
+        let outcome = match outcome {
+            pioneer_crud::TaskOwnedTurnResumeOutcome::NotFound => TaskChildResumeOutcome::NotFound,
+            pioneer_crud::TaskOwnedTurnResumeOutcome::MissingRuntimeSnapshot {
+                recovery_job_id,
+            } => TaskChildResumeOutcome::MissingRuntimeSnapshot { recovery_job_id },
+            pioneer_crud::TaskOwnedTurnResumeOutcome::Conflict { reason } => {
+                TaskChildResumeOutcome::Conflict { reason }
+            }
+            pioneer_crud::TaskOwnedTurnResumeOutcome::Resumed {
+                recovery_job,
+                task,
+                run,
+                execution,
+                ..
+            } => {
+                let handle = TaskExecutionHandle::new(
+                    processor.crud_store.clone(),
+                    processor.task_runtime.event_bus(),
+                    task.id.clone(),
+                    run.id.clone(),
+                );
+                // Reacquire scopes before dispatch.  The CRUD transaction
+                // already restored rows belonging to this run; this call also
+                // covers tasks whose lock rows had been removed entirely.
+                // Resume must not use the ordinary start helper here: that
+                // helper intentionally terminalizes a rejected fresh run,
+                // while this aggregate has already been reopened and must
+                // remain resumably Blocked on a lock conflict.
+                match processor
+                    .task_runtime
+                    .service()
+                    .acquire_write_locks_for_run(run.id.as_str(), now_unix)
+                    .await?
+                {
+                    WriteLockDecision::NoLocksRequired | WriteLockDecision::Acquired(_) => {}
+                    WriteLockDecision::Queued | WriteLockDecision::Rejected => {
+                        let reason =
+                            "task child resume could not reacquire its write locks".to_owned();
+                        let error = task_error(
+                            "task_child_resume_lock_conflict",
+                            reason.clone(),
+                            TaskErrorClass::Policy,
+                            Some(run.id.clone()),
+                        );
+                        let blocked_at = now_timestamp_secs();
+                        handle
+                            .record_task_run_turn_blocked(
+                                blocked_task_run_turn(&task_run_turn, blocked_at),
+                                Some(error.clone()),
+                                blocked_at,
+                            )
+                            .await?;
+                        handle.block_run(Some(error), now_timestamp_secs()).await?;
+                        let _ = processor
+                            .mark_turn_blocked(
+                                thread_id.to_owned(),
+                                turn_id.to_owned(),
+                                reason.clone(),
+                            )
+                            .await;
+                        return Ok(Some(TaskChildResumeOutcome::Conflict { reason }));
+                    }
+                }
+
+                let execution_id = execution.as_ref().map(|execution| execution.id.clone());
+                let start_result = self
+                    .start_or_recover_run(
+                        TaskExecutionContext {
+                            workspace_id: task.workspace_id.clone(),
+                            task_id: task.id.clone(),
+                            execution_id,
+                            worker_id: format!("task-resume-{}-{now_unix}", run.id),
+                        },
+                        run.clone(),
+                        handle.clone(),
+                    )
+                    .await;
+                match start_result {
+                    Ok(TaskExecutorStartOutcome::Started)
+                    | Ok(TaskExecutorStartOutcome::Queued) => TaskChildResumeOutcome::Resumed {
+                        recovery_job_id: recovery_job.id,
+                    },
+                    Ok(TaskExecutorStartOutcome::Rejected) | Err(_) => {
+                        let reason =
+                            "task child resume failed while restarting its executor".to_owned();
+                        let error = task_error(
+                            "task_child_resume_dispatch_failed",
+                            reason.clone(),
+                            TaskErrorClass::Internal,
+                            Some(run.id.clone()),
+                        );
+                        let blocked_at = now_timestamp_secs();
+                        handle
+                            .record_task_run_turn_blocked(
+                                blocked_task_run_turn(&task_run_turn, blocked_at),
+                                Some(error.clone()),
+                                blocked_at,
+                            )
+                            .await?;
+                        let _ = handle.block_run(Some(error), now_timestamp_secs()).await;
+                        let _ = processor
+                            .mark_turn_blocked(
+                                thread_id.to_owned(),
+                                turn_id.to_owned(),
+                                reason.clone(),
+                            )
+                            .await;
+                        TaskChildResumeOutcome::Conflict { reason }
+                    }
+                }
+            }
+        };
+
+        // Keep the compiler from treating the initial lineage read as an
+        // accidental unused query: it is the ownership discriminator that
+        // selects this path instead of generic recovery.
+        let _ = task_run_turn;
+        Ok(Some(outcome))
+    }
+
     pub(super) async fn reconcile_child_turn_failed(
         &self,
         thread_id: &str,
         turn_id: &str,
         error_message: &str,
     ) -> Result<bool> {
-        let processor = self.processor()?;
+        let processor = match self.processor() {
+            Ok(processor) => processor,
+            Err(error) if error.to_string() == "task agent executor is not bound" => {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
         let Some(child_runtime) =
             load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
         else {
-            return Ok(false);
+            return Ok(true);
         };
+        if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
+            return Ok(false);
+        }
+        if !matches!(
+            child_runtime.task_run_turn.status,
+            TaskRunTurnStatus::InProgress | TaskRunTurnStatus::CandidateCreated
+        ) {
+            return Ok(true);
+        }
         let Some(task_response) = processor
             .crud_store
             .get_task(child_runtime.task_run_turn.task_id.as_str())
             .await?
         else {
-            return Ok(true);
+            bail!(
+                "task `{}` disappeared while reconciling failed child turn",
+                child_runtime.task_run_turn.task_id
+            );
         };
         if task_response.task.status.is_terminal() {
             return Ok(true);
@@ -2327,18 +2540,36 @@ impl TaskAgentExecutor {
         turn_id: &str,
         reason: &str,
     ) -> Result<bool> {
-        let processor = self.processor()?;
+        let processor = match self.processor() {
+            Ok(processor) => processor,
+            Err(error) if error.to_string() == "task agent executor is not bound" => {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
         let Some(child_runtime) =
             load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
         else {
-            return Ok(false);
+            return Ok(true);
         };
+        if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
+            return Ok(false);
+        }
+        if !matches!(
+            child_runtime.task_run_turn.status,
+            TaskRunTurnStatus::InProgress | TaskRunTurnStatus::CandidateCreated
+        ) {
+            return Ok(true);
+        }
         let Some(task_response) = processor
             .crud_store
             .get_task(child_runtime.task_run_turn.task_id.as_str())
             .await?
         else {
-            return Ok(true);
+            bail!(
+                "task `{}` disappeared while reconciling cancelled child turn",
+                child_runtime.task_run_turn.task_id
+            );
         };
         if task_response.task.status.is_terminal() {
             return Ok(true);
@@ -2360,18 +2591,36 @@ impl TaskAgentExecutor {
         turn_id: &str,
         reason: &str,
     ) -> Result<bool> {
-        let processor = self.processor()?;
+        let processor = match self.processor() {
+            Ok(processor) => processor,
+            Err(error) if error.to_string() == "task agent executor is not bound" => {
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
         let Some(child_runtime) =
             load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
         else {
-            return Ok(false);
+            return Ok(true);
         };
+        if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked {
+            return Ok(false);
+        }
+        if !matches!(
+            child_runtime.task_run_turn.status,
+            TaskRunTurnStatus::InProgress | TaskRunTurnStatus::CandidateCreated
+        ) {
+            return Ok(true);
+        }
         let Some(task_response) = processor
             .crud_store
             .get_task(child_runtime.task_run_turn.task_id.as_str())
             .await?
         else {
-            return Ok(true);
+            bail!(
+                "task `{}` disappeared while reconciling blocked child turn",
+                child_runtime.task_run_turn.task_id
+            );
         };
         if task_response.task.status.is_terminal() {
             return Ok(true);
@@ -4790,10 +5039,13 @@ fn spawn_execution_heartbeat(
     child_turn_id: String,
     run_id: String,
 ) {
-    let processor = processor.clone();
+    let processor = Arc::downgrade(processor);
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(TASK_EXECUTION_HEARTBEAT_SECONDS)).await;
+            let Some(processor) = processor.upgrade() else {
+                break;
+            };
             let Ok(Some(execution)) = processor.crud_store.load_execution_for_run(&run_id).await
             else {
                 break;

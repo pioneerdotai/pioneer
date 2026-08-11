@@ -1,8 +1,8 @@
 use crate::message::{MessageProcessor, now_timestamp_secs};
 use async_trait::async_trait;
 use pioneer_agent::{
-    PendingAttachedTask, ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider,
-    TaskTurnContext, TerminalTaskObservation,
+    PendingAttachedTask, ReviewRequiredTaskObservation, TaskFinalizationSnapshot,
+    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, TerminalTaskObservation,
 };
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
@@ -51,7 +51,6 @@ const TASK_PAUSE_TOOL: &str = "task_pause";
 const TASK_RESUME_TOOL: &str = "task_resume";
 const DEFAULT_ROOT_MAX_DEPTH: i64 = 3;
 const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
-const GUARD_TASK_LIST_LIMIT: u32 = 500;
 
 type TaskToolFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -147,6 +146,169 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         Ok(TaskToolMaterialization {
             bundles: vec![bundle],
             diagnostics: Vec::new(),
+        })
+    }
+
+    async fn attached_task_finalization_snapshot(
+        &self,
+        context: TaskTurnContext,
+    ) -> Result<TaskFinalizationSnapshot, String> {
+        let processor = self.processor()?;
+        resolve_task_tool_authorization_scope(processor.as_ref(), &context)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        // This is the sole authoritative read for the parent finalization
+        // gate.  It resolves creator identity in SQL, then asks Task Service
+        // for one zero-timeout wait snapshot rather than three independently
+        // changing queries.
+        let tasks = processor
+            .crud_store
+            .list_tasks_created_by_turn(context.thread_id.as_str(), context.turn_id.as_str())
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let mut task_ids = tasks
+            .iter()
+            .filter(|task| {
+                task.lifecycle_policy
+                    .as_ref()
+                    .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
+                    .unwrap_or(false)
+            })
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        task_ids.sort();
+        task_ids.dedup();
+
+        let task_revision = tasks
+            .iter()
+            .filter(|task| {
+                task.lifecycle_policy
+                    .as_ref()
+                    .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
+                    .unwrap_or(false)
+            })
+            .map(|task| format!("{}:{}", task.id, task.revision))
+            .collect::<Vec<_>>()
+            .join("|");
+        if task_ids.is_empty() {
+            return Ok(TaskFinalizationSnapshot {
+                revision: "tasks:0".to_owned(),
+                ..TaskFinalizationSnapshot::default()
+            });
+        }
+
+        let task_service = processor.task_runtime.service();
+        let wait_state = task_tool_fresh_task(async move {
+            task_service
+                .get_wait_state_snapshot(TaskWaitParams {
+                    task_ids,
+                    run_ids: Vec::new(),
+                    timeout_ms: Some(0),
+                    mode: TaskWaitMode::AllTerminalOrReviewRequired,
+                    return_completed: true,
+                    return_pending: true,
+                })
+                .await
+        })
+        .await
+        .map_err(|error| format!("task finalization snapshot task failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))?;
+
+        let pending = wait_state
+            .pending
+            .iter()
+            .map(|item| PendingAttachedTask {
+                task_id: item.task.id.clone(),
+                run_id: item.run.as_ref().map(|run| run.id.clone()),
+                title: item.task.title.clone(),
+                status: task_status_label(item.task.status),
+            })
+            .collect::<Vec<_>>();
+        let mut review_required = wait_state
+            .review_required
+            .iter()
+            .map(review_required_task_observation)
+            .collect::<Vec<_>>();
+        review_required.sort_by(|left, right| {
+            left.task_id
+                .cmp(&right.task_id)
+                .then_with(|| left.run_id.cmp(&right.run_id))
+                .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+        });
+
+        let terminal_items = wait_state
+            .completed
+            .iter()
+            .chain(wait_state.failed.iter())
+            .chain(wait_state.blocked.iter())
+            .chain(wait_state.cancelled.iter())
+            .collect::<Vec<_>>();
+        let terminal = terminal_items
+            .iter()
+            .map(|item| {
+                let run = item.run.as_ref();
+                TerminalTaskObservation {
+                    task_id: item.task.id.clone(),
+                    run_id: run.map(|run| run.id.clone()),
+                    title: item.task.title.clone(),
+                    status: task_status_label(item.task.status),
+                    summary: run
+                        .and_then(|run| run.result.as_ref())
+                        .and_then(|result| result.summary.clone())
+                        .or_else(|| {
+                            item.task
+                                .result
+                                .as_ref()
+                                .and_then(|result| result.summary.clone())
+                        }),
+                    error_message: run
+                        .and_then(|run| run.error.as_ref())
+                        .map(|error| error.message.clone())
+                        .or_else(|| item.task.error.as_ref().map(|error| error.message.clone())),
+                    child_thread_id: item.child_thread_id.clone(),
+                    child_turn_id: item.child_turn_id.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Task revisions alone do not advance for every run/Turn projection
+        // (for example a child can move Running -> WaitingReview while the
+        // task row revision is unchanged).  Include the complete returned
+        // partition in the read token so a caller can persist the exact gate
+        // it observed and detect a materially different graph on retry.
+        let mut revision_parts = vec![task_revision];
+        revision_parts.extend(wait_state.pending.iter().map(|item| {
+            format!(
+                "pending:{}:{}",
+                item.task.id,
+                item.run.as_ref().map(|run| run.id.as_str()).unwrap_or("-")
+            )
+        }));
+        revision_parts.extend(
+            wait_state
+                .review_required
+                .iter()
+                .map(|item| format!("review:{}:{}", item.item.task.id, item.candidate.id)),
+        );
+        revision_parts.extend(terminal_items.iter().map(|item| {
+            format!(
+                "terminal:{}:{}:{}",
+                item.task.id,
+                item.run.as_ref().map(|run| run.id.as_str()).unwrap_or("-"),
+                task_status_label(item.task.status)
+            )
+        }));
+
+        Ok(TaskFinalizationSnapshot {
+            revision: if revision_parts.iter().all(|part| part.is_empty()) {
+                "tasks:0".to_owned()
+            } else {
+                revision_parts.join("|")
+            },
+            pending,
+            review_required,
+            terminal,
         })
     }
 
@@ -2821,23 +2983,11 @@ async fn attached_tasks_for_turn(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
 ) -> anyhow::Result<Vec<Task>> {
-    let response = processor
-        .task_runtime
-        .service()
-        .list_tasks(TaskListParams {
-            workspace_id: context.workspace_id.clone(),
-            owner_kind: Some(TaskOwnerKind::Thread),
-            owner_id: Some(context.thread_id.clone()),
-            parent_task_id: None,
-            root_task_id: None,
-            status: None,
-            limit: Some(GUARD_TASK_LIST_LIMIT),
-        })
-        .await?;
-    Ok(response
-        .tasks
+    Ok(processor
+        .crud_store
+        .list_tasks_created_by_turn(context.thread_id.as_str(), context.turn_id.as_str())
+        .await?
         .into_iter()
-        .filter(|task| task.created_by_turn_id.as_deref() == Some(context.turn_id.as_str()))
         .filter(|task| {
             task.lifecycle_policy
                 .as_ref()
