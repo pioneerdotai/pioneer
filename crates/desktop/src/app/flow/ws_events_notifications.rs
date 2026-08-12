@@ -221,12 +221,13 @@ impl PioneerDesktop {
                 {
                     self.refresh_invitations(false, cx);
                 }
-                AdministrationRefetch::MemberDirectory
+                AdministrationRefetch::MemberDirectory => {
+                    self.members_error = None;
                     if self.main_content_view == MainContentView::Administration
-                        && self.administration_content_view
-                            == AdministrationContentView::Members =>
-                {
-                    self.refresh_members(false, cx);
+                        && self.administration_content_view == AdministrationContentView::Members
+                    {
+                        self.refresh_members(false, cx);
+                    }
                 }
                 AdministrationRefetch::WorkspaceMembers { workspace_id }
                     if self.main_content_view == MainContentView::Administration
@@ -262,6 +263,28 @@ impl PioneerDesktop {
         let administration_invalidation = self.administration.apply_access_changed(&notification);
 
         self.gateway.authorization_revision = Some(plan.authorization_revision);
+        let active_thread_projection_affected =
+            active_thread_id.as_deref().is_some_and(|active_thread_id| {
+                self.thread_workspace_id(active_thread_id)
+                    == Some(notification.workspace_id.as_str())
+                    && notification
+                        .thread_id
+                        .as_deref()
+                        .is_none_or(|thread_id| thread_id == active_thread_id)
+            });
+        if active_thread_projection_affected {
+            self.invalidate_active_thread_capability_projection();
+        }
+        // The root snapshot is global + workspace scoped. A thread-scoped ACL
+        // change cannot revoke any of those bits, so keep the last verified
+        // projection visible while the new authorization revision is fetched.
+        // Clearing it here made every Member-created thread temporarily turn
+        // off models, Skills, MCP and the rest of the agent UI. Workspace
+        // membership changes can alter the projection itself and still fail
+        // closed until their replacement snapshot arrives.
+        if desktop_access_change_invalidates_workspace_capability_snapshot(&notification) {
+            self.gateway.capability_snapshot = None;
+        }
         if plan.clear_active_thread || plan.clear_active_workspace {
             self.thread_scope_pending = Default::default();
             self.thread_scope_error = None;
@@ -383,6 +406,7 @@ impl PioneerDesktop {
         if administration_invalidation.apply {
             self.apply_administration_refetches(administration_invalidation.effects, cx);
         }
+        self.refresh_current_principal(cx);
         cx.notify();
     }
 
@@ -756,6 +780,12 @@ fn desktop_thread_authorization_scopes(
         .collect()
 }
 
+fn desktop_access_change_invalidates_workspace_capability_snapshot(
+    notification: &pioneer_protocol::AccessChangedNotification,
+) -> bool {
+    notification.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership
+}
+
 fn apply_desktop_workspace_catalog_invalidation(
     workspaces: &mut Vec<pioneer_protocol::Workspace>,
     preferred_workspace_id: &mut Option<String>,
@@ -776,6 +806,41 @@ mod access_change_tests {
     use crate::app::thread::ThreadCoordinator;
     use pioneer_protocol::{AccessChangeKind, AccessChangedNotification};
     use std::collections::HashMap;
+
+    #[test]
+    fn thread_scoped_access_changes_retain_verified_workspace_capabilities() {
+        for change in [
+            AccessChangeKind::ThreadCreated,
+            AccessChangeKind::ThreadVisibility,
+            AccessChangeKind::ThreadParticipantAdded,
+            AccessChangeKind::ThreadParticipantRemoved,
+        ] {
+            assert!(
+                !desktop_access_change_invalidates_workspace_capability_snapshot(
+                    &AccessChangedNotification {
+                        authorization_revision: 2,
+                        workspace_id: "workspace-member".to_owned(),
+                        thread_id: Some("thread-member".to_owned()),
+                        access_lost: Some(false),
+                        change,
+                    },
+                ),
+                "{change:?} must refresh without collapsing workspace agent capabilities"
+            );
+        }
+
+        assert!(
+            desktop_access_change_invalidates_workspace_capability_snapshot(
+                &AccessChangedNotification {
+                    authorization_revision: 3,
+                    workspace_id: "workspace-member".to_owned(),
+                    thread_id: None,
+                    access_lost: Some(false),
+                    change: AccessChangeKind::WorkspaceMembership,
+                },
+            )
+        );
+    }
 
     fn workspace(id: &str) -> pioneer_protocol::Workspace {
         pioneer_protocol::Workspace {

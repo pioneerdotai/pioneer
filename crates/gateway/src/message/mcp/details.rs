@@ -8,10 +8,12 @@ impl MessageProcessor {
     pub(crate) async fn mcp_server_details(
         &self,
         request_context: &RequestContext,
+        _authorization: &crate::authorization::AuthorizedCapability,
         request_id: RequestId,
         params: McpServerDetailsParams,
     ) {
         let connection_id = request_context.connection_id();
+        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
         let workspace_id = match self
             .validate_mcp_workspace(
                 connection_id,
@@ -129,50 +131,64 @@ impl MessageProcessor {
                 }
             };
 
-        let audit = match self
-            .crud_store
-            .list_recent_mcp_audit_event_records_for_server_id(
-                server_id.as_str(),
-                MCP_DETAILS_AUDIT_LIMIT,
-            )
-            .await
-        {
-            Ok(rows) => rows.into_iter().map(audit_summary_from_record).collect(),
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "failed to load MCP audit events",
-                        json!({"error": format!("{error:#}")}),
-                    ),
+        // Members need the catalog to select and understand an MCP server.
+        // Management audit and cross-turn binding history are not part of
+        // that operational capability and may reveal other users' activity.
+        let audit = if member {
+            Vec::new()
+        } else {
+            match self
+                .crud_store
+                .list_recent_mcp_audit_event_records_for_server_id(
+                    server_id.as_str(),
+                    MCP_DETAILS_AUDIT_LIMIT,
                 )
-                .await;
-                return;
+                .await
+            {
+                Ok(rows) => rows.into_iter().map(audit_summary_from_record).collect(),
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        mcp_error(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INTERNAL,
+                            "failed to load MCP audit events",
+                            json!({"error": format!("{error:#}")}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
         };
 
-        let recent_bindings = match self
-            .crud_store
-            .list_recent_turn_mcp_bindings_for_server(server_id.as_str(), MCP_DETAILS_BINDING_LIMIT)
-            .await
-        {
-            Ok(rows) => rows.into_iter().map(binding_summary_from_record).collect(),
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    mcp_error(
-                        Some(request_id.clone()),
-                        INVALID_REQUEST_CODE,
-                        MCP_ERROR_INTERNAL,
-                        "failed to load MCP turn bindings",
-                        json!({"error": format!("{error:#}")}),
-                    ),
+        let recent_bindings = if member {
+            Vec::new()
+        } else {
+            match self
+                .crud_store
+                .list_recent_turn_mcp_bindings_for_server(
+                    server_id.as_str(),
+                    MCP_DETAILS_BINDING_LIMIT,
                 )
-                .await;
-                return;
+                .await
+            {
+                Ok(rows) => rows.into_iter().map(binding_summary_from_record).collect(),
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        mcp_error(
+                            Some(request_id.clone()),
+                            INVALID_REQUEST_CODE,
+                            MCP_ERROR_INTERNAL,
+                            "failed to load MCP turn bindings",
+                            json!({"error": format!("{error:#}")}),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
         };
 

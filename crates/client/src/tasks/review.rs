@@ -113,6 +113,21 @@ pub fn task_review_action_enabled(
     validate_task_review_target(item, action).is_ok() && !state.any_in_flight(&item.candidate_id)
 }
 
+/// Presentation gate for user-review controls. The task owner comes from the
+/// Gateway's sanitized task_wait projection; the RPC remains authoritative and
+/// revalidates the same ownership before mutating task state.
+pub fn task_review_item_is_manageable_by(
+    item: &TaskWaitReviewDisplayItem,
+    principal_id: Option<&str>,
+    can_manage_all_threads: bool,
+    can_respond_to_agent_requests: bool,
+) -> bool {
+    can_manage_all_threads
+        || (can_respond_to_agent_requests
+            && principal_id.is_some()
+            && item.owner_principal_id.as_deref() == principal_id)
+}
+
 pub fn plan_task_review_accept(
     item: &TaskWaitReviewDisplayItem,
     reason: Option<String>,
@@ -231,6 +246,7 @@ mod tests {
     fn review_item() -> TaskWaitReviewDisplayItem {
         TaskWaitReviewDisplayItem {
             task_id: "task_1".to_owned(),
+            owner_principal_id: Some("principal_1".to_owned()),
             run_id: Some("run_1".to_owned()),
             title: Some("Review task".to_owned()),
             status: Some("waiting_review".to_owned()),
@@ -276,6 +292,35 @@ mod tests {
 
         assert!(!state.any_in_flight("candidate_1"));
         assert_eq!(state.error("candidate_1"), Some("boom"));
+    }
+
+    #[test]
+    fn task_review_ownership_survives_agent_and_subtask_turns() {
+        let item = review_item();
+        assert!(task_review_item_is_manageable_by(
+            &item,
+            Some("principal_1"),
+            false,
+            true,
+        ));
+        assert!(!task_review_item_is_manageable_by(
+            &item,
+            Some("principal_2"),
+            false,
+            true,
+        ));
+        assert!(!task_review_item_is_manageable_by(
+            &item,
+            Some("principal_1"),
+            false,
+            false,
+        ));
+        assert!(task_review_item_is_manageable_by(
+            &item,
+            Some("principal_2"),
+            true,
+            false,
+        ));
     }
 
     #[test]

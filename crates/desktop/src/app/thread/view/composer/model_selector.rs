@@ -37,12 +37,16 @@ impl PioneerDesktop {
             ProviderModelDisplayState::Loading | ProviderModelDisplayState::Missing => None,
         };
         let loading = matches!(display_state, ProviderModelDisplayState::Loading);
+        let capabilities = self.principal_presentation_capabilities();
+        let model_selection_available = (capabilities.can_use_providers
+            || capabilities.can_use_cli_runtimes)
+            && self.can_start_active_thread_agent_presentation();
 
         Button::new("composer-model-trigger")
             .small()
             .ghost()
             .compact()
-            .disabled(self.desktop_voice_context_locked())
+            .disabled(self.desktop_voice_context_locked() || !model_selection_available)
             .child(
                 h_flex()
                     .items_center()
@@ -87,6 +91,12 @@ impl PioneerDesktop {
     }
 
     fn open_composer_model_selector_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let capabilities = self.principal_presentation_capabilities();
+        if (!capabilities.can_use_providers && !capabilities.can_use_cli_runtimes)
+            || !self.can_start_active_thread_agent_presentation()
+        {
+            return;
+        }
         let workspace_id = self.model_selector_workspace_id();
         self.open_model_selector_dialog(
             ModelSelectorDialogOptions {

@@ -1,10 +1,14 @@
 use pioneer_client::authorization::{
     CurrentPrincipalPresentation, PrincipalPresentationCapabilities, SessionListRowPresentation,
-    current_principal_presentation, principal_presentation_capabilities_from_auth,
-    session_list_row_presentation,
+    current_principal_presentation, principal_presentation_capabilities,
+    session_list_row_presentation, thread_presentation_capabilities,
 };
+#[cfg(test)]
+use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
-    AuthMeResponse, AuthSessionListItem, InvitationSummary, MemberSummary, WorkspaceId,
+    AuthMeResponse, AuthSessionListItem, AuthorizationCapabilitySnapshot,
+    AuthorizationThreadCapabilities, AuthorizationWorkspaceCapabilities, InvitationSummary,
+    MemberSummary, WorkspaceId,
 };
 use serde::Deserialize;
 
@@ -13,6 +17,7 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub struct ClientMemberPresentationRequest {
     pub auth: AuthMeResponse,
+    pub capability_snapshot: AuthorizationCapabilitySnapshot,
     pub member: MemberSummary,
     pub is_workspace_member: bool,
 }
@@ -22,6 +27,7 @@ pub struct ClientMemberPresentationRequest {
 #[serde(deny_unknown_fields)]
 pub struct ClientInvitationListRowRequest {
     pub auth: AuthMeResponse,
+    pub capability_snapshot: AuthorizationCapabilitySnapshot,
     pub invitation: InvitationSummary,
 }
 
@@ -30,6 +36,7 @@ pub struct ClientInvitationListRowRequest {
 #[serde(deny_unknown_fields)]
 pub struct ClientCurrentPrincipalPresentationRequest {
     pub auth: AuthMeResponse,
+    pub capability_snapshot: AuthorizationCapabilitySnapshot,
     #[serde(default)]
     pub visible_member: Option<MemberSummary>,
 }
@@ -40,7 +47,7 @@ pub struct ClientCurrentPrincipalPresentationRequest {
 pub struct ClientThreadScopePresentationRequest {
     pub auth: AuthMeResponse,
     pub thread: pioneer_protocol::Thread,
-    pub current_principal_is_creator: bool,
+    pub capabilities: AuthorizationThreadCapabilities,
     pub participants: pioneer_protocol::ThreadParticipantsResponse,
     pub workspace_members: pioneer_protocol::WorkspaceMemberListResponse,
 }
@@ -49,7 +56,7 @@ pub struct ClientThreadScopePresentationRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientThreadCreateVisibilityRequest {
-    pub auth: AuthMeResponse,
+    pub capabilities: AuthorizationWorkspaceCapabilities,
     pub origin_kind: pioneer_protocol::ThreadOriginKind,
 }
 
@@ -62,14 +69,17 @@ pub struct ClientThreadScopeMutationPlanRequest {
     pub action: pioneer_client::threads::scope::ThreadScopeAction,
 }
 
-pub fn principal_capabilities(auth: AuthMeResponse) -> PrincipalPresentationCapabilities {
-    principal_presentation_capabilities_from_auth(&auth)
+pub fn principal_capabilities(
+    snapshot: AuthorizationCapabilitySnapshot,
+) -> PrincipalPresentationCapabilities {
+    principal_presentation_capabilities(&snapshot)
 }
 
 pub fn current_principal(
     request: ClientCurrentPrincipalPresentationRequest,
 ) -> CurrentPrincipalPresentation {
-    current_principal_presentation(&request.auth, request.visible_member.as_ref())
+    let capabilities = capabilities_for_auth(&request.auth, &request.capability_snapshot);
+    current_principal_presentation(&request.auth, request.visible_member.as_ref(), capabilities)
 }
 
 pub fn session_list_row(item: AuthSessionListItem) -> SessionListRowPresentation {
@@ -91,10 +101,8 @@ pub fn thread_scope(
     };
     pioneer_client::threads::scope::thread_scope_presentation(
         &request.thread,
-        Some(request.auth.principal.kind),
-        request.auth.role_key.as_ref(),
         Some(&request.auth.principal.id),
-        request.current_principal_is_creator,
+        thread_presentation_capabilities(Some(&request.capabilities)),
         &participants,
         &request.workspace_members.members,
     )
@@ -104,8 +112,7 @@ pub fn thread_create_visibility(
     request: ClientThreadCreateVisibilityRequest,
 ) -> pioneer_client::threads::scope::ThreadCreateVisibilityPlan {
     pioneer_client::threads::scope::thread_create_visibility_plan(
-        Some(request.auth.principal.kind),
-        request.auth.role_key.as_ref(),
+        Some(&request.capabilities),
         request.origin_kind,
     )
 }
@@ -123,7 +130,7 @@ pub fn thread_scope_mutation_plan(
 pub fn member_presentation(
     request: ClientMemberPresentationRequest,
 ) -> pioneer_client::administration::MemberListRow {
-    let capabilities = principal_presentation_capabilities_from_auth(&request.auth);
+    let capabilities = capabilities_for_auth(&request.auth, &request.capability_snapshot);
     pioneer_client::administration::member_list_row(
         &request.member,
         Some(&request.auth.principal.id),
@@ -135,8 +142,19 @@ pub fn member_presentation(
 pub fn invitation_list_row(
     request: ClientInvitationListRowRequest,
 ) -> pioneer_client::administration::InvitationListRow {
-    let capabilities = principal_presentation_capabilities_from_auth(&request.auth);
+    let capabilities = capabilities_for_auth(&request.auth, &request.capability_snapshot);
     pioneer_client::administration::invitation_list_row(&request.invitation, capabilities)
+}
+
+fn capabilities_for_auth(
+    auth: &AuthMeResponse,
+    snapshot: &AuthorizationCapabilitySnapshot,
+) -> PrincipalPresentationCapabilities {
+    if snapshot.principal_id != auth.principal.id {
+        PrincipalPresentationCapabilities::default()
+    } else {
+        principal_presentation_capabilities(snapshot)
+    }
 }
 
 #[cfg(test)]
@@ -144,8 +162,9 @@ mod tests {
     use super::*;
     use pioneer_protocol::{
         AuthDeviceSnapshot, AuthGatewaySnapshot, AuthPrincipalSnapshot, AuthSessionSnapshot,
-        AuthSessionStatus, ClientKind, DeviceId, DeviceStatus, GatewayId, PrincipalId,
-        PrincipalKind, RoleKey, TokenFamilyId,
+        AuthSessionStatus, AuthorizationGlobalCapabilities,
+        AuthorizationWorkspaceCapabilitySnapshot, ClientKind, DeviceId, DeviceStatus, GatewayId,
+        PrincipalId, PrincipalKind, RoleKey, ThreadVisibility, TokenFamilyId,
     };
 
     fn auth(kind: PrincipalKind, role_key: Option<RoleKey>) -> AuthMeResponse {
@@ -181,11 +200,64 @@ mod tests {
         }
     }
 
+    fn capability_snapshot(
+        auth: &AuthMeResponse,
+        elevated: bool,
+    ) -> AuthorizationCapabilitySnapshot {
+        AuthorizationCapabilitySnapshot {
+            schema_version: 1,
+            authorization_revision: 7,
+            principal_id: auth.principal.id.clone(),
+            role_key: auth
+                .role_key
+                .as_ref()
+                .map_or_else(|| "superuser".to_owned(), ToString::to_string),
+            global: AuthorizationGlobalCapabilities {
+                can_create_workspace: elevated,
+                can_manage_gateway_settings: elevated,
+                can_manage_capabilities: elevated,
+                can_manage_all_threads: elevated,
+                can_view_invitations: true,
+                can_create_invitation: true,
+                can_view_member_directory: true,
+                can_manage_member_lifecycle: elevated,
+                can_manage_own_sessions: true,
+            },
+            workspace: Some(AuthorizationWorkspaceCapabilitySnapshot {
+                workspace_id: "workspace-a".to_owned(),
+                capabilities: AuthorizationWorkspaceCapabilities {
+                    can_read: true,
+                    can_create_thread: true,
+                    can_manage: elevated,
+                    can_use_providers: true,
+                    can_use_cli_runtimes: true,
+                    can_use_skills: true,
+                    can_use_mcp: true,
+                    can_run_tasks: true,
+                    turn_permission_modes: vec![
+                        TurnPermissionMode::FullAccess,
+                        TurnPermissionMode::AutoAcceptEdits,
+                        TurnPermissionMode::Supervised,
+                    ],
+                    can_list_members: true,
+                    can_add_member: true,
+                    can_remove_member: elevated,
+                    thread_visibility_options: vec![
+                        ThreadVisibility::Private,
+                        ThreadVisibility::Workspace,
+                    ],
+                },
+            }),
+            thread: None,
+        }
+    }
+
     #[test]
     fn bridge_delegates_presentation_policy_to_shared_client() {
         let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
-        assert!(principal_capabilities(auth.clone()).can_create_invitation);
-        assert!(principal_capabilities(auth).can_add_workspace_member);
+        let snapshot = capability_snapshot(&auth, false);
+        assert!(principal_capabilities(snapshot.clone()).can_create_invitation);
+        assert!(principal_capabilities(snapshot).can_add_workspace_member);
     }
 
     #[test]
@@ -201,6 +273,7 @@ mod tests {
             avatar_revision: None,
         };
         let row = member_presentation(ClientMemberPresentationRequest {
+            capability_snapshot: capability_snapshot(&auth, true),
             auth,
             member,
             is_workspace_member: true,
@@ -214,6 +287,7 @@ mod tests {
     fn invitation_row_bridge_delegates_status_and_capability_policy() {
         let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
         let row = invitation_list_row(ClientInvitationListRowRequest {
+            capability_snapshot: capability_snapshot(&auth, false),
             auth,
             invitation: InvitationSummary {
                 invitation_id: pioneer_protocol::InvitationId::new("IAAAAAAAAAAAAAAAAAAAA")
@@ -241,17 +315,38 @@ mod tests {
 
     #[test]
     fn thread_create_visibility_bridge_uses_shared_fail_closed_plan() {
+        let capabilities = AuthorizationWorkspaceCapabilities {
+            can_read: true,
+            can_create_thread: true,
+            can_manage: false,
+            can_use_providers: true,
+            can_use_cli_runtimes: true,
+            can_use_skills: true,
+            can_use_mcp: true,
+            can_run_tasks: true,
+            turn_permission_modes: vec![TurnPermissionMode::Supervised],
+            can_list_members: true,
+            can_add_member: true,
+            can_remove_member: false,
+            thread_visibility_options: vec![
+                pioneer_protocol::ThreadVisibility::Private,
+                pioneer_protocol::ThreadVisibility::Workspace,
+            ],
+        };
         let member = thread_create_visibility(ClientThreadCreateVisibilityRequest {
-            auth: auth(PrincipalKind::User, Some(RoleKey::member())),
+            capabilities: capabilities.clone(),
             origin_kind: pioneer_protocol::ThreadOriginKind::Collaborative,
         });
         assert_eq!(
             member.options,
-            vec![pioneer_protocol::ThreadVisibility::Private]
+            vec![
+                pioneer_protocol::ThreadVisibility::Private,
+                pioneer_protocol::ThreadVisibility::Workspace,
+            ]
         );
 
         let superuser = thread_create_visibility(ClientThreadCreateVisibilityRequest {
-            auth: auth(PrincipalKind::Superuser, None),
+            capabilities,
             origin_kind: pioneer_protocol::ThreadOriginKind::Collaborative,
         });
         assert_eq!(
@@ -294,6 +389,7 @@ mod tests {
             avatar_revision: Some("avatar-2".to_owned()),
         };
         let result = current_principal(ClientCurrentPrincipalPresentationRequest {
+            capability_snapshot: capability_snapshot(&auth, false),
             auth: auth.clone(),
             visible_member: Some(visible_member),
         });
@@ -318,6 +414,7 @@ mod tests {
             avatar_revision: Some("avatar-b".to_owned()),
         };
         let result = current_principal(ClientCurrentPrincipalPresentationRequest {
+            capability_snapshot: capability_snapshot(&auth, true),
             auth,
             visible_member: Some(visible_member),
         });

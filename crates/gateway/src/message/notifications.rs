@@ -108,20 +108,68 @@ impl MessageProcessor {
         recipients
     }
 
-    pub(super) async fn send_execution_owner_notification<T: Serialize>(
+    pub(super) async fn send_execution_initiator_notification<T: Serialize>(
         &self,
         thread_id: &str,
         initiating_principal_id: &str,
         initiating_session_id: &str,
+        action: crate::authorization::ResourceAction,
         method: &str,
         payload: &T,
     ) {
         let candidate_connection_ids = self.session_manager.connection_ids().await;
+        self.send_execution_scoped_notification(
+            thread_id,
+            initiating_principal_id,
+            initiating_session_id,
+            action,
+            method,
+            payload,
+            candidate_connection_ids,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn send_execution_initiator_notification_to_connections<T: Serialize>(
+        &self,
+        thread_id: &str,
+        initiating_principal_id: &str,
+        initiating_session_id: &str,
+        action: crate::authorization::ResourceAction,
+        method: &str,
+        payload: &T,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) {
+        self.send_execution_scoped_notification(
+            thread_id,
+            initiating_principal_id,
+            initiating_session_id,
+            action,
+            method,
+            payload,
+            candidate_connection_ids,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_execution_scoped_notification<T: Serialize>(
+        &self,
+        thread_id: &str,
+        initiating_principal_id: &str,
+        initiating_session_id: &str,
+        action: crate::authorization::ResourceAction,
+        method: &str,
+        payload: &T,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) {
         let initially_authorized_connection_ids = self
             .authorized_execution_owner_notification_recipients(
                 thread_id,
                 initiating_principal_id,
                 initiating_session_id,
+                action,
                 candidate_connection_ids,
             )
             .await;
@@ -133,6 +181,7 @@ impl MessageProcessor {
                 thread_id,
                 initiating_principal_id,
                 initiating_session_id,
+                action,
                 initially_authorized_connection_ids,
             )
             .await;
@@ -147,6 +196,7 @@ impl MessageProcessor {
                 thread_id,
                 initiating_principal_id,
                 initiating_session_id,
+                action,
                 serialization_connection_ids,
             )
             .await;
@@ -154,17 +204,19 @@ impl MessageProcessor {
             .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn authorized_execution_owner_notification_recipients(
         &self,
         thread_id: &str,
         initiating_principal_id: &str,
         initiating_session_id: &str,
+        action: crate::authorization::ResourceAction,
         candidate_connection_ids: Vec<ConnectionId>,
     ) -> Vec<ConnectionId> {
         use crate::authorization::{
             ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
-            DenyReason, DisclosurePolicy, ProofResolution, ResourceAction,
-            record_authorization_unavailable, record_thread_notification_decision,
+            DenyReason, DisclosurePolicy, ProofResolution, record_authorization_unavailable,
+            record_thread_notification_decision,
         };
 
         let thread_id = thread_id.trim();
@@ -199,21 +251,18 @@ impl MessageProcessor {
                     reason: DenyReason::InactivePrincipal,
                     disclosure: DisclosurePolicy::AuthenticationTerminal,
                 };
-                record_thread_notification_decision(ResourceAction::CliRuntimeUse, &decision);
+                record_thread_notification_decision(action, &decision);
                 continue;
             }
-            let action_gate = service.authorize_action(
-                principal.kind,
-                principal.role_key.as_ref(),
-                ResourceAction::CliRuntimeUse,
-            );
-            if action_gate == ActionGateDecision::AllowSuperuser {
-                recipients.push(connection_id);
-                continue;
-            }
+            let action_gate =
+                service.authorize_action(principal.kind, principal.role_key.as_ref(), action);
             if principal.principal_id.as_str() != initiating_principal_id
                 || principal.session_id.as_str() != initiating_session_id
             {
+                continue;
+            }
+            if action_gate == ActionGateDecision::AllowSuperuser {
+                recipients.push(connection_id);
                 continue;
             }
             if let ActionGateDecision::Deny { reason, disclosure } = &action_gate {
@@ -221,42 +270,72 @@ impl MessageProcessor {
                     reason: *reason,
                     disclosure: *disclosure,
                 };
-                record_thread_notification_decision(ResourceAction::CliRuntimeUse, &decision);
+                record_thread_notification_decision(action, &decision);
                 continue;
             }
-            match resolver
-                .authorize_thread(
-                    principal.as_ref(),
-                    &action_gate,
-                    ResourceAction::CliRuntimeUse,
-                    thread_id,
-                    None,
-                )
+            let mut resolution = match resolver
+                .authorize_thread(principal.as_ref(), &action_gate, action, thread_id, None)
                 .await
             {
-                Ok(ProofResolution::Authorized(proof)) => {
-                    record_thread_notification_decision(
-                        ResourceAction::CliRuntimeUse,
-                        proof.decision(),
-                    );
-                    recipients.push(connection_id);
-                }
-                Ok(ProofResolution::Denied(decision)) => {
-                    record_thread_notification_decision(ResourceAction::CliRuntimeUse, &decision);
-                }
+                Ok(resolution) => resolution,
                 Err(error) => {
                     record_authorization_unavailable(
-                        ResourceAction::CliRuntimeUse.safe_name(),
+                        action.safe_name(),
                         "thread",
                         "execution_notification",
                     );
                     warn!(
                         connection_id,
-                        authorization_action = ResourceAction::CliRuntimeUse.safe_name(),
+                        authorization_action = action.safe_name(),
                         authorization_resource_kind = "thread",
                         error = %format!("{error:#}"),
                         "execution notification authorization unavailable"
                     );
+                    continue;
+                }
+            };
+            if matches!(
+                resolution.denial(),
+                Some(AuthorizationDecision::Deny {
+                    reason: DenyReason::MissingAuthoritativeResource,
+                    ..
+                })
+            ) {
+                resolution = match resolver
+                    .authorize_internal_thread_via_root(
+                        principal.as_ref(),
+                        &action_gate,
+                        action,
+                        thread_id,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        record_authorization_unavailable(
+                            action.safe_name(),
+                            "thread_lineage",
+                            "execution_notification",
+                        );
+                        warn!(
+                            connection_id,
+                            authorization_action = action.safe_name(),
+                            authorization_resource_kind = "thread_lineage",
+                            error = %format!("{error:#}"),
+                            "execution notification lineage authorization unavailable"
+                        );
+                        continue;
+                    }
+                };
+            }
+            match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_thread_notification_decision(action, proof.decision());
+                    recipients.push(connection_id);
+                }
+                ProofResolution::Denied(decision) => {
+                    record_thread_notification_decision(action, &decision);
                 }
             }
         }
@@ -952,58 +1031,6 @@ impl MessageProcessor {
             .await;
     }
 
-    pub(crate) async fn send_notification_to_thread_subscription_scopes<T: Serialize>(
-        &self,
-        thread_ids: &[String],
-        method: &str,
-        payload: &T,
-    ) {
-        let mut inspected_thread_ids = HashSet::new();
-        let mut recipient_ids = HashSet::new();
-
-        for thread_id in thread_ids {
-            let thread_id = thread_id.trim();
-            if thread_id.is_empty() || !inspected_thread_ids.insert(thread_id.to_owned()) {
-                continue;
-            }
-            let subscribers = self.thread_manager.subscribed_connections(thread_id).await;
-            recipient_ids.extend(
-                self.authorized_thread_notification_recipients(thread_id, subscribers)
-                    .await,
-            );
-        }
-
-        if recipient_ids.is_empty() {
-            return;
-        }
-        let Some(serialized) = self.serialize_notification(method, payload) else {
-            return;
-        };
-
-        let initially_authorized_connection_ids: Vec<_> = recipient_ids.into_iter().collect();
-        let mut final_recipient_ids = HashSet::new();
-        for thread_id in inspected_thread_ids {
-            let subscribers = self
-                .thread_manager
-                .subscribed_connections_for_candidates(
-                    thread_id.as_str(),
-                    initially_authorized_connection_ids.clone(),
-                )
-                .await;
-            final_recipient_ids.extend(
-                self.authorized_thread_notification_recipients(thread_id.as_str(), subscribers)
-                    .await,
-            );
-        }
-
-        self.send_serialized_notification_to_connections(
-            method,
-            &serialized,
-            final_recipient_ids.into_iter().collect(),
-        )
-        .await;
-    }
-
     pub(super) async fn authorized_thread_notification_recipients(
         &self,
         thread_id: &str,
@@ -1140,7 +1167,7 @@ impl MessageProcessor {
                 continue;
             }
 
-            match resolver
+            let mut resolution = match resolver
                 .authorize_thread(
                     principal.as_ref(),
                     &action_gate,
@@ -1150,16 +1177,7 @@ impl MessageProcessor {
                 )
                 .await
             {
-                Ok(ProofResolution::Authorized(proof)) => {
-                    record_thread_notification_decision(
-                        ResourceAction::ThreadRead,
-                        proof.decision(),
-                    );
-                    recipients.push(connection_id);
-                }
-                Ok(ProofResolution::Denied(decision)) => {
-                    record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
-                }
+                Ok(resolution) => resolution,
                 Err(error) => {
                     record_authorization_unavailable(
                         ResourceAction::ThreadRead.safe_name(),
@@ -1173,6 +1191,54 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "thread notification authorization unavailable"
                     );
+                    continue;
+                }
+            };
+            if matches!(
+                resolution.denial(),
+                Some(AuthorizationDecision::Deny {
+                    reason: DenyReason::MissingAuthoritativeResource,
+                    ..
+                })
+            ) {
+                resolution = match resolver
+                    .authorize_internal_thread_via_root(
+                        principal.as_ref(),
+                        &action_gate,
+                        ResourceAction::ThreadRead,
+                        thread_id,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        record_authorization_unavailable(
+                            ResourceAction::ThreadRead.safe_name(),
+                            "thread_lineage",
+                            "notification",
+                        );
+                        warn!(
+                            connection_id,
+                            authorization_action = ResourceAction::ThreadRead.safe_name(),
+                            authorization_resource_kind = "thread_lineage",
+                            error = %format!("{error:#}"),
+                            "thread notification lineage authorization unavailable"
+                        );
+                        continue;
+                    }
+                };
+            }
+            match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_thread_notification_decision(
+                        ResourceAction::ThreadRead,
+                        proof.decision(),
+                    );
+                    recipients.push(connection_id);
+                }
+                ProofResolution::Denied(decision) => {
+                    record_thread_notification_decision(ResourceAction::ThreadRead, &decision);
                 }
             }
         }

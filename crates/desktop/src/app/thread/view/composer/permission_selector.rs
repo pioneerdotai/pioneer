@@ -31,7 +31,15 @@ impl PioneerDesktop {
     }
 
     pub(super) fn render_composer_permission_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected_mode = self.composer_permission_mode;
+        let allowed_modes = self.allowed_composer_permission_modes();
+        let selected_mode = if allowed_modes.contains(&self.composer_permission_mode) {
+            self.composer_permission_mode
+        } else {
+            allowed_modes
+                .last()
+                .copied()
+                .unwrap_or(TurnPermissionMode::Supervised)
+        };
         let selected_option = composer_permissions::composer_permission_mode_option(selected_mode);
         let trigger_icon = Self::composer_permission_icon(selected_mode);
         let desktop_entity = cx.entity();
@@ -59,7 +67,11 @@ impl PioneerDesktop {
                     .small()
                     .ghost()
                     .compact()
-                    .disabled(self.desktop_voice_context_locked())
+                    .disabled(
+                        self.desktop_voice_context_locked()
+                            || !self.can_start_active_thread_agent_presentation()
+                            || allowed_modes.is_empty(),
+                    )
                     .child(
                         h_flex()
                             .items_center()
@@ -151,6 +163,7 @@ impl PioneerDesktop {
                 v_flex().w(px(320.)).gap_1().children(
                     composer_permissions::composer_permission_mode_options()
                         .into_iter()
+                        .filter(|option| allowed_modes.contains(&option.mode))
                         .map(render_option),
                 )
             })

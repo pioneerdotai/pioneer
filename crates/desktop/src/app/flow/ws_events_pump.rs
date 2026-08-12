@@ -344,6 +344,7 @@ impl PioneerDesktop {
         self.discard_deferred_gateway_ws_events();
         self.clear_authorization_epoch_cache();
         self.gateway.current_auth = None;
+        self.gateway.capability_snapshot = None;
         self.administration.clear_for_session_termination();
         self.member_avatar_state.clear();
         self.member_workspaces_saving = false;

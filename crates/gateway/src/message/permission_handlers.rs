@@ -126,12 +126,14 @@ impl MessageProcessor {
             details: request.details,
         };
 
+        let initiating_principal_id = authorization_context.initiating_principal_id().clone();
+        let initiating_session_id = authorization_context.initiating_session_id().clone();
         let pending = PendingNativePermissionApprovalRequest {
             workspace_id: workspace_id.clone(),
             thread_id,
             turn_id,
-            initiating_principal_id: authorization_context.initiating_principal_id().clone(),
-            initiating_session_id: authorization_context.initiating_session_id().clone(),
+            initiating_principal_id: initiating_principal_id.clone(),
+            initiating_session_id: initiating_session_id.clone(),
             initiating_session_generation: session.refresh_generation,
             authorization_context_fingerprint,
             request: protocol_request.clone(),
@@ -149,9 +151,13 @@ impl MessageProcessor {
                 .send(pioneer_tools::PermissionApprovalResolution::Expired);
         }
 
-        let notification_thread_ids = native_permission_notification_thread_ids(&protocol_request);
-        self.send_notification_to_thread_subscription_scopes(
-            notification_thread_ids.as_slice(),
+        let notification_thread_id =
+            native_permission_notification_thread_id(&protocol_request).to_owned();
+        self.send_execution_initiator_notification(
+            notification_thread_id.as_str(),
+            initiating_principal_id.as_str(),
+            initiating_session_id.as_str(),
+            crate::authorization::ResourceAction::ThreadWrite,
             events::TURN_PERMISSION_REQUEST_OPENED,
             &TurnPermissionRequestOpenedNotification {
                 request: protocol_request,
@@ -180,13 +186,22 @@ impl MessageProcessor {
                             .iter()
                             .any(|visible_thread_id| visible_thread_id == thread_id))
             })
-            .map(|pending| pending.request.clone())
+            .map(|pending| {
+                (
+                    pending.request.clone(),
+                    pending.initiating_principal_id.clone(),
+                    pending.initiating_session_id.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        requests.sort_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
 
-        for request in requests {
-            self.send_notification_to_authorized_thread_connections(
+        for (request, initiating_principal_id, initiating_session_id) in requests {
+            self.send_execution_initiator_notification_to_connections(
                 thread_id,
+                initiating_principal_id.as_str(),
+                initiating_session_id.as_str(),
+                crate::authorization::ResourceAction::ThreadWrite,
                 events::TURN_PERMISSION_REQUEST_OPENED,
                 &TurnPermissionRequestOpenedNotification {
                     request: request.clone(),
@@ -202,8 +217,11 @@ impl MessageProcessor {
                 .get(request.request_id.as_str())
                 .is_some_and(|pending| pending.request == request);
             if !still_pending {
-                self.send_notification_to_authorized_thread_connections(
+                self.send_execution_initiator_notification_to_connections(
                     thread_id,
+                    initiating_principal_id.as_str(),
+                    initiating_session_id.as_str(),
+                    crate::authorization::ResourceAction::ThreadWrite,
                     events::TURN_PERMISSION_REQUEST_RESOLVED,
                     &TurnPermissionRequestResolvedNotification {
                         request_id: request.request_id,
@@ -381,6 +399,10 @@ impl MessageProcessor {
             return;
         };
 
+        let notification_thread_id =
+            native_permission_notification_thread_id(&pending.request).to_owned();
+        let notification_principal_id = pending.initiating_principal_id.clone();
+        let notification_session_id = pending.initiating_session_id.clone();
         let resolution = params.resolution;
         let _ = pending
             .respond_to
@@ -393,7 +415,6 @@ impl MessageProcessor {
         self.send_turn_permission_response(connection_id, request_id, &response)
             .await;
 
-        let notification_thread_ids = native_permission_notification_thread_ids(&pending.request);
         let workspace_id = pending.workspace_id.clone();
         let notification = TurnPermissionRequestResolvedNotification {
             request_id: params.request_id,
@@ -402,8 +423,11 @@ impl MessageProcessor {
             turn_id: pending.turn_id,
             resolution,
         };
-        self.send_notification_to_thread_subscription_scopes(
-            notification_thread_ids.as_slice(),
+        self.send_execution_initiator_notification(
+            notification_thread_id.as_str(),
+            notification_principal_id.as_str(),
+            notification_session_id.as_str(),
+            crate::authorization::ResourceAction::ThreadWrite,
             events::TURN_PERMISSION_REQUEST_RESOLVED,
             &notification,
         )
@@ -421,11 +445,14 @@ impl MessageProcessor {
             return;
         };
 
+        let notification_thread_id =
+            native_permission_notification_thread_id(&pending.request).to_owned();
+        let notification_principal_id = pending.initiating_principal_id.clone();
+        let notification_session_id = pending.initiating_session_id.clone();
         let _ = pending
             .respond_to
             .send(pioneer_tools::PermissionApprovalResolution::Cancelled);
 
-        let notification_thread_ids = native_permission_notification_thread_ids(&pending.request);
         let workspace_id = pending.workspace_id.clone();
         let notification = TurnPermissionRequestResolvedNotification {
             request_id: request_id.to_owned(),
@@ -434,8 +461,11 @@ impl MessageProcessor {
             turn_id: pending.turn_id,
             resolution: TurnPermissionApprovalResolution::Cancelled,
         };
-        self.send_notification_to_thread_subscription_scopes(
-            notification_thread_ids.as_slice(),
+        self.send_execution_initiator_notification(
+            notification_thread_id.as_str(),
+            notification_principal_id.as_str(),
+            notification_session_id.as_str(),
+            crate::authorization::ResourceAction::ThreadWrite,
             events::TURN_PERMISSION_REQUEST_RESOLVED,
             &notification,
         )
@@ -557,12 +587,18 @@ impl MessageProcessor {
             return;
         };
 
+        let notification_thread_id =
+            native_permission_notification_thread_id(&pending.request).to_owned();
+        let notification_principal_id = pending.initiating_principal_id.clone();
+        let notification_session_id = pending.initiating_session_id.clone();
         let _ = pending
             .respond_to
             .send(pioneer_tools::PermissionApprovalResolution::Expired);
-        let notification_thread_ids = native_permission_notification_thread_ids(&pending.request);
-        self.send_notification_to_thread_subscription_scopes(
-            notification_thread_ids.as_slice(),
+        self.send_execution_initiator_notification(
+            notification_thread_id.as_str(),
+            notification_principal_id.as_str(),
+            notification_session_id.as_str(),
+            crate::authorization::ResourceAction::ThreadWrite,
             events::TURN_PERMISSION_REQUEST_RESOLVED,
             &TurnPermissionRequestResolvedNotification {
                 request_id: request_id.to_owned(),
@@ -641,13 +677,12 @@ impl MessageProcessor {
     }
 }
 
-fn native_permission_notification_thread_ids(
-    request: &TurnPermissionApprovalRequest,
-) -> Vec<String> {
-    let mut thread_ids = Vec::with_capacity(1 + request.visible_thread_ids.len());
-    thread_ids.push(request.thread_id.clone());
-    thread_ids.extend(request.visible_thread_ids.iter().cloned());
-    thread_ids
+fn native_permission_notification_thread_id(request: &TurnPermissionApprovalRequest) -> &str {
+    request
+        .visible_thread_ids
+        .last()
+        .map(String::as_str)
+        .unwrap_or(request.thread_id.as_str())
 }
 
 fn permission_approval_resolution_from_protocol(

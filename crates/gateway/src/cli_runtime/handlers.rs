@@ -75,6 +75,46 @@ enum CLIRuntimeAttemptRecoveryState {
     },
 }
 
+/// Runtime discovery is operational for workspace Members, but local paths,
+/// account identity and raw process output belong to Gateway management.
+/// Keep the capability/model metadata used by composers while returning a
+/// deliberately non-secret presentation of failures.
+fn member_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
+    runtime.account = None;
+    runtime.binary_path = None;
+    runtime.home_path = None;
+    runtime.shadow_home_path = None;
+    runtime.proxy_url = None;
+    runtime.debug_native_events_enabled = false;
+    runtime.recent_stderr.clear();
+    runtime.diagnostics = member_safe_runtime_diagnostics(runtime.diagnostics);
+    runtime.status = match runtime.status {
+        RuntimeStatus::MissingBinary { .. } => RuntimeStatus::MissingBinary { binary_path: None },
+        RuntimeStatus::SpawnFailed { .. } => RuntimeStatus::SpawnFailed {
+            message: "runtime failed to start".to_owned(),
+        },
+        RuntimeStatus::Degraded { .. } => RuntimeStatus::Degraded {
+            message: "runtime is degraded".to_owned(),
+        },
+        RuntimeStatus::Error { .. } => RuntimeStatus::Error {
+            message: "runtime is unavailable".to_owned(),
+        },
+        status => status,
+    };
+    runtime
+}
+
+fn member_safe_runtime_diagnostics(diagnostics: Vec<RuntimeDiagnostic>) -> Vec<RuntimeDiagnostic> {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| RuntimeDiagnostic {
+            level: diagnostic.level,
+            code: diagnostic.code,
+            message: "Runtime capability is unavailable".to_owned(),
+        })
+        .collect()
+}
+
 impl MessageProcessor {
     pub(super) async fn cli_runtime_list(
         &self,
@@ -95,7 +135,7 @@ impl MessageProcessor {
             return;
         };
 
-        let runtimes = match self.load_cli_runtime_summaries(workspace_id.as_str()).await {
+        let mut runtimes = match self.load_cli_runtime_summaries(workspace_id.as_str()).await {
             Ok(runtimes) => runtimes,
             Err(error) => {
                 self.send_error(
@@ -110,6 +150,12 @@ impl MessageProcessor {
                 return;
             }
         };
+        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+            runtimes = runtimes
+                .into_iter()
+                .map(member_safe_runtime_summary)
+                .collect();
+        }
 
         self.send_cli_runtime_response(
             connection_id,
@@ -139,7 +185,7 @@ impl MessageProcessor {
             return;
         };
 
-        let Some(runtime) = self
+        let Some(mut runtime) = self
             .load_cli_runtime_live_summary_by_id(
                 connection_id,
                 request_id.clone(),
@@ -150,6 +196,9 @@ impl MessageProcessor {
         else {
             return;
         };
+        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+            runtime = member_safe_runtime_summary(runtime);
+        }
 
         self.send_cli_runtime_response(
             connection_id,
@@ -179,7 +228,7 @@ impl MessageProcessor {
             return;
         };
 
-        let Some(runtime) = self
+        let Some(mut runtime) = self
             .load_cli_runtime_summary_by_id(
                 connection_id,
                 request_id.clone(),
@@ -190,6 +239,9 @@ impl MessageProcessor {
         else {
             return;
         };
+        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+            runtime = member_safe_runtime_summary(runtime);
+        }
 
         self.send_cli_runtime_response(
             connection_id,
@@ -254,6 +306,12 @@ impl MessageProcessor {
                     .await,
             );
         }
+        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+            runtimes = runtimes
+                .into_iter()
+                .map(member_safe_runtime_summary)
+                .collect();
+        }
 
         self.send_cli_runtime_response(
             connection_id,
@@ -290,7 +348,7 @@ impl MessageProcessor {
             return;
         };
 
-        let model_list = if instance.enabled {
+        let mut model_list = if instance.enabled {
             match instance.kind {
                 GatewayCliAgentRuntimeKindConfig::Codex => {
                     let proxy_url = self
@@ -325,6 +383,12 @@ impl MessageProcessor {
                 error_message: Some(format!("CLI runtime `{}` is disabled", instance.id)),
             }
         };
+        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+            model_list.diagnostics = member_safe_runtime_diagnostics(model_list.diagnostics);
+            if model_list.error_message.is_some() {
+                model_list.error_message = Some("runtime models are unavailable".to_owned());
+            }
+        }
 
         if model_list.models.is_empty() {
             if let Some(error_message) = model_list.error_message.as_deref() {
@@ -8078,10 +8142,11 @@ impl MessageProcessor {
         notification: &T,
     ) {
         if let Some(binding) = request.authorization_binding.as_ref() {
-            self.send_execution_owner_notification(
+            self.send_execution_initiator_notification(
                 request.thread_id.as_str(),
                 binding.initiating_principal_id.as_str(),
                 binding.initiating_session_id.as_str(),
+                crate::authorization::ResourceAction::CliRuntimeUse,
                 method,
                 notification,
             )

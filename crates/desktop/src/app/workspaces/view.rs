@@ -26,6 +26,28 @@ struct WorkspaceSelectorTrigger {
     selected: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkspaceSelectorInteractionState {
+    trigger_disabled: bool,
+    actions_disabled: bool,
+}
+
+fn workspace_selector_interaction_state(
+    workspace_unavailable: bool,
+    workspace_action_in_progress: bool,
+    composer_context_locked: bool,
+) -> WorkspaceSelectorInteractionState {
+    let trigger_disabled = workspace_unavailable || workspace_action_in_progress;
+
+    WorkspaceSelectorInteractionState {
+        trigger_disabled,
+        // A send/voice request owns the active workspace context until its RPC
+        // finishes. Keep workspace actions blocked without visually changing
+        // the unrelated selector trigger on every composer submission.
+        actions_disabled: trigger_disabled || composer_context_locked,
+    }
+}
+
 impl WorkspaceSelectorTrigger {
     fn new(
         id: impl Into<ElementId>,
@@ -209,6 +231,9 @@ impl RenderOnce for WorkspaceSelectorTrigger {
 
 impl PioneerDesktop {
     pub(in crate::app) fn render_workspaces_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let capabilities = self.principal_presentation_capabilities();
+        let can_create_workspace = capabilities.can_create_workspace;
+        let can_manage_workspace = capabilities.can_manage_workspace;
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
         let active_workspace_name = active_workspace_id
             .as_deref()
@@ -221,13 +246,15 @@ impl PioneerDesktop {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        let selector_disabled = self.gateway.connecting
+        let workspace_unavailable = self.gateway.connecting
             || self.gateway.connection_state.is_transitioning()
             || self.gateway.connection_state != GatewayConnectionState::Connected
-            || self.gateway.session_refresh_in_flight
-            || self.workspace_action_in_progress()
-            || self.desktop_voice_context_locked()
-            || self.composer_upload_in_progress;
+            || self.gateway.session_refresh_in_flight;
+        let selector_interaction = workspace_selector_interaction_state(
+            workspace_unavailable,
+            self.workspace_action_in_progress(),
+            self.desktop_voice_context_locked() || self.composer_upload_in_progress,
+        );
         // A user-initiated switch is optimistic: keep showing the newly selected
         // workspace while its server scope is synchronized in the background.
         let show_spinner = self.workspaces_loading();
@@ -260,7 +287,7 @@ impl PioneerDesktop {
                 active_workspace_name.clone(),
                 workspace_selector_subtitle.clone(),
                 show_spinner,
-                selector_disabled,
+                selector_interaction.trigger_disabled,
             ))
             .content({
                 let active_workspaces = active_workspaces.clone();
@@ -315,7 +342,8 @@ impl PioneerDesktop {
                                                 index,
                                                 workspace,
                                                 active_workspace_id.as_deref(),
-                                                selector_disabled,
+                                                selector_interaction.actions_disabled,
+                                                can_manage_workspace,
                                                 active_indicator_color,
                                                 inactive_indicator_color,
                                                 option_foreground,
@@ -330,21 +358,24 @@ impl PioneerDesktop {
                                 ),
                             )
                         })
-                        .child(Separator::horizontal())
-                        .child(h_flex().p_2().pt_0().justify_start().child(
-                            Self::render_create_workspace_popover_action(
-                                selector_disabled,
-                                desktop_entity.clone(),
-                                popover_entity.clone(),
-                            ),
-                        ))
+                        .when(can_create_workspace, |this| {
+                            this.child(Separator::horizontal()).child(
+                                h_flex().p_2().pt_0().justify_start().child(
+                                    Self::render_create_workspace_popover_action(
+                                        selector_interaction.actions_disabled,
+                                        desktop_entity.clone(),
+                                        popover_entity.clone(),
+                                    ),
+                                ),
+                            )
+                        })
                 }
             })
             .into_any_element()
     }
 
     fn render_create_workspace_popover_action(
-        selector_disabled: bool,
+        actions_disabled: bool,
         desktop_entity: Entity<Self>,
         popover_entity: Entity<PopoverState>,
     ) -> AnyElement {
@@ -352,7 +383,7 @@ impl PioneerDesktop {
             .ghost()
             .xsmall()
             .compact()
-            .disabled(selector_disabled)
+            .disabled(actions_disabled)
             .child(div().opacity(0.6).child(IconName::Plus))
             .child(
                 div()
@@ -378,7 +409,8 @@ impl PioneerDesktop {
         index: usize,
         workspace: &Workspace,
         active_workspace_id: Option<&str>,
-        selector_disabled: bool,
+        actions_disabled: bool,
+        can_manage_workspace: bool,
         active_indicator_color: Hsla,
         inactive_indicator_color: Hsla,
         option_foreground: Hsla,
@@ -401,13 +433,13 @@ impl PioneerDesktop {
             .min_w_0()
             .cursor_pointer()
             .rounded_lg()
-            .pr(px(36.))
+            .when(can_manage_workspace, |this| this.pr(px(36.)))
             .p_2()
             .text_color(option_foreground)
             .when(is_active, |this| this.bg(option_muted_background))
             .hover(move |this| this.bg(ghost_hover))
             .active(move |this| this.bg(ghost_active))
-            .when(selector_disabled, |this| this.opacity(0.5))
+            .when(actions_disabled, |this| this.opacity(0.5))
             .on_mouse_down(MouseButton::Left, |_, window, _| {
                 window.prevent_default();
             })
@@ -415,7 +447,7 @@ impl PioneerDesktop {
                 let desktop_entity = desktop_entity.clone();
                 let popover_entity = popover_entity.clone();
                 move |_, window, cx| {
-                    if selector_disabled {
+                    if actions_disabled {
                         cx.stop_propagation();
                         return;
                     }
@@ -483,43 +515,74 @@ impl PioneerDesktop {
             .w_full()
             .min_w_0()
             .child(select_button)
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .flex()
-                    .items_center()
-                    .pr_1()
-                    .child(
-                        Button::new(("workspace-option-rename", index))
-                            .ghost()
-                            .xsmall()
-                            .compact()
-                            .disabled(selector_disabled)
-                            .icon(PioneerIconName::Bolt)
-                            .tooltip(t!("workspace.action.rename").to_string())
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                let popover_entity = popover_entity.clone();
-                                let workspace_id = workspace_id.clone();
-                                move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    let _ = popover_entity.update(cx, |state, cx| {
-                                        state.dismiss(window, cx);
-                                    });
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.open_rename_workspace_dialog(
-                                            workspace_id.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            }),
-                    ),
-            )
+            .when(can_manage_workspace, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .pr_1()
+                        .child(
+                            Button::new(("workspace-option-rename", index))
+                                .ghost()
+                                .xsmall()
+                                .compact()
+                                .disabled(actions_disabled)
+                                .icon(PioneerIconName::Bolt)
+                                .tooltip(t!("workspace.action.rename").to_string())
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    let popover_entity = popover_entity.clone();
+                                    let workspace_id = workspace_id.clone();
+                                    move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        let _ = popover_entity.update(cx, |state, cx| {
+                                            state.dismiss(window, cx);
+                                        });
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.open_rename_workspace_dialog(
+                                                workspace_id.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+            })
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_selector_interaction_state;
+
+    #[test]
+    fn composer_context_lock_does_not_change_workspace_trigger_visual_state() {
+        let state = workspace_selector_interaction_state(false, false, true);
+
+        assert!(!state.trigger_disabled);
+        assert!(state.actions_disabled);
+    }
+
+    #[test]
+    fn workspace_unavailability_disables_trigger_and_actions() {
+        let state = workspace_selector_interaction_state(true, false, false);
+
+        assert!(state.trigger_disabled);
+        assert!(state.actions_disabled);
+    }
+
+    #[test]
+    fn workspace_operation_disables_trigger_and_actions() {
+        let state = workspace_selector_interaction_state(false, true, false);
+
+        assert!(state.trigger_disabled);
+        assert!(state.actions_disabled);
     }
 }

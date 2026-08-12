@@ -9,6 +9,12 @@ impl PioneerDesktop {
         name: String,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self
+            .principal_presentation_capabilities()
+            .can_create_workspace
+        {
+            return false;
+        }
         let create_plan =
             workspace_actions::plan_workspace_create(name, self.workspace_action_in_progress());
         let create_params = match create_plan {
@@ -88,6 +94,12 @@ impl PioneerDesktop {
         name: String,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return false;
+        }
         let action_in_progress = self.workspace_action_in_progress();
         let current_workspace = self.workspace_by_id(workspace_id.as_str());
         let rename_plan = workspace_actions::plan_workspace_rename(

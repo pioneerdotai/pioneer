@@ -21,33 +21,34 @@ use pioneer_protocol::{
     ArtifactUploadStartResponse, ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse,
     AuthDeviceCreateResponse, AuthLogoutResponse, AuthMeResponse, AuthProfileUpdateParams,
     AuthProfileUpdateResponse, AuthSessionListResponse, AuthSessionRevokeParams,
-    AuthSessionRevokeResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
-    CLIRuntimeListParams, CLIRuntimeListResponse, CLIRuntimeLoginCancelParams,
-    CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
-    CLIRuntimeProxyDeleteParams, CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams,
-    CLIRuntimeProxySetResponse, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
-    CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams,
-    CLIRuntimeReviewStartResponse, CLIRuntimeStatusParams, CLIRuntimeStatusResponse,
-    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
-    CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
-    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
-    GatewaySettingsGetParams, GatewaySettingsGetResponse, GatewaySettingsUpdate,
-    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, InvitationCreateParams,
-    InvitationCreateResponse, InvitationListParams, InvitationListResponse, InvitationRevokeParams,
-    InvitationRevokeResponse, McpInstallParams, McpInstallResponse, McpListParams, McpListResponse,
-    McpPolicySetParams, McpPolicySetResponse, McpServerDetailsParams, McpServerDetailsResponse,
-    McpServerRestartParams, McpServerRestartResponse, McpUninstallParams, McpUninstallResponse,
-    MemberDeviceCreateParams, MemberDeviceCreateResponse, MemberListParams, MemberListResponse,
-    MemberMutationResponse, MemberRemoveParams, MemberRestoreParams, MemberSuspendParams,
-    ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
-    ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
-    SkillListParams, SkillListResponse, SkillsHealthParams, SkillsHealthResponse,
-    SkillsInstallParams, SkillsInstallResponse, SkillsPackInstallParams, SkillsPackInstallResponse,
-    SkillsPackUninstallParams, SkillsPackUninstallResponse, SkillsPackUpdateParams,
-    SkillsPackUpdateResponse, SkillsPolicyListParams, SkillsPolicyListResponse,
-    SkillsPolicySetParams, SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse,
-    SkillsUpdateParams, SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
+    AuthSessionRevokeResponse, AuthorizationCapabilitiesParams, AuthorizationCapabilitySnapshot,
+    CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
+    CLIRuntimeListResponse, CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse,
+    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeProxyDeleteParams,
+    CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams, CLIRuntimeProxySetResponse,
+    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestRespondParams,
+    CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse,
+    CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBindingGetParams,
+    CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams,
+    CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
+    CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, GatewaySettingsGetParams,
+    GatewaySettingsGetResponse, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
+    GatewaySettingsUpdateResponse, InvitationCreateParams, InvitationCreateResponse,
+    InvitationListParams, InvitationListResponse, InvitationRevokeParams, InvitationRevokeResponse,
+    McpInstallParams, McpInstallResponse, McpListParams, McpListResponse, McpPolicySetParams,
+    McpPolicySetResponse, McpServerDetailsParams, McpServerDetailsResponse, McpServerRestartParams,
+    McpServerRestartResponse, McpUninstallParams, McpUninstallResponse, MemberDeviceCreateParams,
+    MemberDeviceCreateResponse, MemberListParams, MemberListResponse, MemberMutationResponse,
+    MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, ProviderConfigureParams,
+    ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
+    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, SkillListParams, SkillListResponse,
+    SkillsHealthParams, SkillsHealthResponse, SkillsInstallParams, SkillsInstallResponse,
+    SkillsPackInstallParams, SkillsPackInstallResponse, SkillsPackUninstallParams,
+    SkillsPackUninstallResponse, SkillsPackUpdateParams, SkillsPackUpdateResponse,
+    SkillsPolicyListParams, SkillsPolicyListResponse, SkillsPolicySetParams,
+    SkillsPolicySetResponse, SkillsUninstallParams, SkillsUninstallResponse, SkillsUpdateParams,
+    SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
     SkillsUploadFinishParams, SkillsUploadFinishResponse, SkillsUploadStartParams,
     SkillsUploadStartResponse, TaskAcceptParams, TaskAcceptResponse, TaskCancelParams,
     TaskCancelResponse, TaskReviseParams, TaskReviseResponse, ThreadAgentsDocArchiveParams,
@@ -135,6 +136,36 @@ where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
     send_auth_json_rpc_request_typed(transport, methods::AUTH_ME, &serde_json::json!({}))
+}
+
+pub fn authorization_capabilities<TTransport>(
+    transport: &TTransport,
+    params: AuthorizationCapabilitiesParams,
+) -> Result<AuthorizationCapabilitySnapshot>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    let snapshot: AuthorizationCapabilitySnapshot =
+        send_auth_json_rpc_request_typed(transport, methods::AUTHORIZATION_CAPABILITIES, &params)?;
+    anyhow::ensure!(
+        snapshot.schema_version
+            == pioneer_protocol::AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION,
+        "Gateway returned an unsupported authorization capability schema"
+    );
+    anyhow::ensure!(
+        snapshot.workspace.as_ref().is_none_or(|workspace| {
+            params.workspace_id.as_deref() == Some(workspace.workspace_id.as_str())
+        }),
+        "Gateway returned capabilities for a different workspace"
+    );
+    anyhow::ensure!(
+        snapshot.thread.as_ref().is_none_or(|thread| {
+            params.workspace_id.as_deref() == Some(thread.workspace_id.as_str())
+                && params.thread_id.as_deref() == Some(thread.thread_id.as_str())
+        }),
+        "Gateway returned capabilities for a different thread"
+    );
+    Ok(snapshot)
 }
 
 pub fn auth_profile_update<TTransport>(

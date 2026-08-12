@@ -7,6 +7,7 @@ mod invalidation;
 mod registry;
 mod resolver;
 mod service;
+mod snapshot;
 
 pub(crate) use admission::{
     AuthorizationExternalError, external_error_for_decision, record_authorization_unavailable,
@@ -35,7 +36,7 @@ pub(crate) use registry::{
 #[cfg(test)]
 pub(crate) use resolver::AuthorizedMemberAvatar;
 pub(crate) use resolver::{
-    AuthorizationResolver, AuthorizedArtifact, AuthorizedInvitation,
+    AuthorizationResolver, AuthorizedArtifact, AuthorizedCapability, AuthorizedInvitation,
     AuthorizedInvitationCollection, AuthorizedInvitationGrants, AuthorizedMemberDirectory,
     AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
     AuthorizedWorkspace, AuthorizedWorkspaceCollection, ProofResolution,
@@ -44,3 +45,4 @@ pub(crate) use resolver::{
 pub(crate) use service::{
     AuthorizationService, ResolvedResourceAccess, ThreadAccessFacts, WorkspaceAccessFacts,
 };
+pub(crate) use snapshot::AuthorizationCapabilitySnapshotService;

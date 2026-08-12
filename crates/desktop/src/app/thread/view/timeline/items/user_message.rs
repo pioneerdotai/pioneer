@@ -99,10 +99,16 @@ impl PioneerDesktop {
             .is_some_and(|value| value.can_delete)
             .then(|| presentation.cloned())
             .flatten();
-        let author_label = presentation
-            .and_then(|presentation| presentation.author.as_ref())
-            .map(|author| format!("{} · @{}", author.display_name, author.nickname))
-            .unwrap_or_else(|| t!("timeline.message.unknown_author").to_string());
+        let author = self.current_timeline_author_presentation(
+            presentation.and_then(|presentation| presentation.author.as_ref()),
+        );
+        let author_label = if author.display_name == "?" {
+            t!("timeline.message.unknown_author").to_string()
+        } else if author.nickname.is_empty() {
+            author.display_name
+        } else {
+            format!("{} · @{}", author.display_name, author.nickname)
+        };
         let active_workspace_id = self
             .current_active_thread_id()
             .and_then(|thread_id| self.thread_workspace_id(thread_id))

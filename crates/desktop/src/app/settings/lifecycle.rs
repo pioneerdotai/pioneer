@@ -47,9 +47,18 @@ fn vector_search_embedding_provider_from_selector(
 impl PioneerDesktop {
     pub(in crate::app) fn open_settings_content_from_sidebar(
         &mut self,
-        content_view: SettingsContentView,
+        mut content_view: SettingsContentView,
         cx: &mut Context<Self>,
     ) {
+        if matches!(
+            content_view,
+            SettingsContentView::Memory | SettingsContentView::SelfImprovement
+        ) && !self
+            .principal_presentation_capabilities()
+            .can_manage_gateway_settings
+        {
+            content_view = SettingsContentView::Account;
+        }
         self.profile_editor = None;
         self.profile_editor_input_subscriptions.clear();
         self.settings_content_view = content_view;
@@ -57,7 +66,17 @@ impl PioneerDesktop {
         self.set_main_content_view(MainContentView::Settings, cx);
         match content_view {
             SettingsContentView::Account => self.refresh_auth_sessions(cx),
-            _ => self.refresh_gateway_settings(cx),
+            SettingsContentView::General => {
+                if self
+                    .principal_presentation_capabilities()
+                    .can_manage_gateway_settings
+                {
+                    self.refresh_gateway_settings(cx);
+                }
+            }
+            SettingsContentView::Memory | SettingsContentView::SelfImprovement => {
+                self.refresh_gateway_settings(cx)
+            }
         }
     }
 
@@ -72,19 +91,30 @@ impl PioneerDesktop {
                 TreeItem::new(SETTINGS_CONTENT_GENERAL_NODE_ID, "general"),
             ),
         ];
-        items.extend([
-            (
-                SettingsContentView::Memory,
-                TreeItem::new(SETTINGS_CONTENT_MEMORY_NODE_ID, "memory"),
-            ),
-            (
-                SettingsContentView::SelfImprovement,
-                TreeItem::new(
-                    SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
-                    "self-improvement",
+        if self
+            .principal_presentation_capabilities()
+            .can_manage_gateway_settings
+        {
+            items.extend([
+                (
+                    SettingsContentView::Memory,
+                    TreeItem::new(SETTINGS_CONTENT_MEMORY_NODE_ID, "memory"),
                 ),
-            ),
-        ]);
+                (
+                    SettingsContentView::SelfImprovement,
+                    TreeItem::new(
+                        SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
+                        "self-improvement",
+                    ),
+                ),
+            ]);
+        }
+        if !items
+            .iter()
+            .any(|(content_view, _)| *content_view == self.settings_content_view)
+        {
+            self.settings_content_view = SettingsContentView::Account;
+        }
         let selected_ix = items
             .iter()
             .position(|(content_view, _)| *content_view == self.settings_content_view);
@@ -419,6 +449,15 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_gateway_settings(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_gateway_settings
+        {
+            self.gateway.settings = None;
+            self.gateway.settings_loading = false;
+            self.gateway.settings_error = None;
+            return;
+        }
         let plan = gateway_settings::plan_gateway_settings_refresh(
             self.gateway.settings_loading,
             self.gateway.connection_state == GatewayConnectionState::Connected,
@@ -536,6 +575,12 @@ impl PioneerDesktop {
         pending_enabled: Option<bool>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_gateway_settings
+        {
+            return false;
+        }
         let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
             self.gateway.ws_connection_id,
             self.gateway.connection_epoch,
@@ -605,6 +650,12 @@ impl PioneerDesktop {
         update: GatewaySettingsUpdate,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_gateway_settings
+        {
+            return;
+        }
         let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
             self.gateway.ws_connection_id,
             self.gateway.connection_epoch,

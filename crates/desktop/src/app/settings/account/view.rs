@@ -19,7 +19,11 @@ impl PioneerDesktop {
                 .administration
                 .members()
                 .find(|member| member.principal_id == auth.principal.id);
-            current_principal_presentation(auth, visible_member)
+            current_principal_presentation(
+                auth,
+                visible_member,
+                self.principal_presentation_capabilities(),
+            )
         });
         let principal_avatar_path = self.gateway.current_auth.as_ref().and_then(|auth| {
             self.member_avatar_state

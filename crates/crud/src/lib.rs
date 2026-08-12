@@ -2127,10 +2127,8 @@ async fn insert_new_user_thread_for_initial_turn(
         bail!("new user thread visibility differs from authorized access class");
     }
     if let Some((_, principal_id)) = creation.member.as_ref() {
-        if creation.access_class != PersistedThreadAccessClass::Private
-            || creator_principal_id != principal_id
-        {
-            bail!("Member first-turn materialization requires its private creator scope");
+        if creator_principal_id != principal_id {
+            bail!("Member first-turn materialization requires its creator scope");
         }
     }
 
@@ -2159,7 +2157,8 @@ async fn insert_new_user_thread_for_initial_turn(
         {
             bail!("runtime draft collides with a different durable user thread");
         }
-        if let Some((_, principal_id)) = creation.member.as_ref()
+        if creation.access_class == PersistedThreadAccessClass::Private
+            && let Some((_, principal_id)) = creation.member.as_ref()
             && find_thread_membership(transaction, started.thread.id.as_str(), principal_id)
                 .await?
                 .is_none()
@@ -2181,7 +2180,13 @@ async fn insert_new_user_thread_for_initial_turn(
     )
     .await?;
 
-    if let Some((gateway_id, principal_id)) = creation.member.as_ref() {
+    // Explicit membership is the ACL for a private thread. A workspace-visible
+    // thread is authorized exclusively through workspace membership, so
+    // persisting the creator into `thread_membership` would create an invalid
+    // mixed access model and make the first Turn fail atomically.
+    if creation.access_class == PersistedThreadAccessClass::Private
+        && let Some((gateway_id, principal_id)) = creation.member.as_ref()
+    {
         insert_thread_membership(
             transaction,
             &NewThreadMembership {
@@ -9254,6 +9259,7 @@ impl CrudStore {
         write: CompletedMessageTurnWrite<'_>,
         gateway_id: &GatewayId,
         principal_id: &PrincipalId,
+        access_class: PersistedThreadAccessClass,
     ) -> Result<()> {
         let updated_at = write.thread.updated_at;
         let actor = write.actor.clone();
@@ -9263,7 +9269,7 @@ impl CrudStore {
             updated_at,
             NewUserThreadCreation {
                 creator: actor,
-                access_class: PersistedThreadAccessClass::Private,
+                access_class,
                 member: Some((gateway_id.clone(), principal_id.clone())),
             },
         )
@@ -9281,6 +9287,7 @@ impl CrudStore {
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
         gateway_id: &GatewayId,
         principal_id: &PrincipalId,
+        access_class: PersistedThreadAccessClass,
         admission: NewTurnAdmission,
     ) -> Result<()> {
         self.materialize_new_user_turn_start_with_reasoning_effort_and_permission_audit(
@@ -9293,7 +9300,7 @@ impl CrudStore {
             audit_event,
             NewUserThreadCreation {
                 creator: actor,
-                access_class: PersistedThreadAccessClass::Private,
+                access_class,
                 member: Some((gateway_id.clone(), principal_id.clone())),
             },
             Some(admission),
@@ -9359,9 +9366,10 @@ impl CrudStore {
         .await
     }
 
-    /// Atomically creates a Member-owned private thread, its creator
-    /// membership, the first turn, and the permission audit. No empty thread
-    /// row is visible if first-turn materialization fails.
+    /// Atomically creates a Member-owned user thread, its private-thread
+    /// creator membership when required, the first turn, and the permission
+    /// audit. No empty thread row is visible if first-turn materialization
+    /// fails.
     pub async fn materialize_new_member_turn_start_with_reasoning_effort_and_permission_audit(
         &self,
         thread_model: &Thread,
@@ -9373,6 +9381,7 @@ impl CrudStore {
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
         gateway_id: &GatewayId,
         principal_id: &PrincipalId,
+        access_class: PersistedThreadAccessClass,
     ) -> Result<()> {
         self.materialize_new_user_turn_start_with_reasoning_effort_and_permission_audit(
             thread_model,
@@ -9384,7 +9393,7 @@ impl CrudStore {
             audit_event,
             NewUserThreadCreation {
                 creator: actor,
-                access_class: PersistedThreadAccessClass::Private,
+                access_class,
                 member: Some((gateway_id.clone(), principal_id.clone())),
             },
             None,

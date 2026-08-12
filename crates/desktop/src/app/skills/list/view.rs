@@ -155,6 +155,9 @@ fn skill_pack_context_menu(
 impl PioneerDesktop {
     pub(crate) fn render_skills(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
+        let can_manage = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
         let skills_error = self.skills_error.clone();
         let skills_upload_progress = self.skills_upload_progress.clone();
         let management_rows = Rc::new(project_desktop_skill_management_rows(
@@ -310,38 +313,48 @@ impl PioneerDesktop {
                                         .gap_4()
                                         .p_8()
                                         .bg(cx.theme().background)
-                                        .child({
-                                            let desktop_entity = desktop_entity.clone();
-                                            Button::new("skills-empty-install")
-                                                .text()
-                                                .group("skills-empty-install-btn")
-                                                .on_click(move |_, window, cx| {
-                                                    let _ =
-                                                        desktop_entity.update(cx, |view, cx| {
-                                                            view.open_skill_install_dialog(
-                                                                window, cx,
-                                                            );
-                                                            cx.notify();
-                                                        });
-                                                })
-                                                .child({
-                                                    let icon_bg = cx.theme().foreground;
-                                                    let icon_bg_hover =
-                                                        cx.theme().foreground.opacity(0.8);
-                                                    div()
-                                                        .size_10()
-                                                        .rounded_full()
-                                                        .bg(icon_bg)
-                                                        .group_hover(
-                                                            "skills-empty-install-btn",
-                                                            move |style| style.bg(icon_bg_hover),
-                                                        )
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .text_color(cx.theme().primary_foreground)
-                                                        .child(Icon::new(IconName::Plus).size_6())
-                                                })
+                                        .when(can_manage, |this| {
+                                            this.child({
+                                                let desktop_entity = desktop_entity.clone();
+                                                Button::new("skills-empty-install")
+                                                    .text()
+                                                    .group("skills-empty-install-btn")
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ = desktop_entity.update(
+                                                            cx,
+                                                            |view, cx| {
+                                                                view.open_skill_install_dialog(
+                                                                    window, cx,
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                    })
+                                                    .child({
+                                                        let icon_bg = cx.theme().foreground;
+                                                        let icon_bg_hover =
+                                                            cx.theme().foreground.opacity(0.8);
+                                                        div()
+                                                            .size_10()
+                                                            .rounded_full()
+                                                            .bg(icon_bg)
+                                                            .group_hover(
+                                                                "skills-empty-install-btn",
+                                                                move |style| {
+                                                                    style.bg(icon_bg_hover)
+                                                                },
+                                                            )
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .text_color(
+                                                                cx.theme().primary_foreground,
+                                                            )
+                                                            .child(
+                                                                Icon::new(IconName::Plus).size_6(),
+                                                            )
+                                                    })
+                                            })
                                         })
                                         .child(
                                             v_flex()
@@ -362,6 +375,7 @@ impl PioneerDesktop {
                             .when(!management_rows.is_empty(), |this| {
                                 this.child(self.render_skill_management_virtual_list(
                                     management_rows.clone(),
+                                    can_manage,
                                     desktop_entity.clone(),
                                     cx,
                                 ))
@@ -374,6 +388,7 @@ impl PioneerDesktop {
     fn render_skill_management_virtual_list(
         &self,
         rows: Rc<Vec<DesktopSkillManagementRow>>,
+        can_manage: bool,
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -417,6 +432,7 @@ impl PioneerDesktop {
                                         view.gateway.connection_state
                                             == GatewayConnectionState::Connected,
                                         view.is_skill_pack_pending(&pack.id),
+                                        can_manage,
                                         desktop_entity.clone(),
                                         cx,
                                     ),
@@ -614,6 +630,7 @@ impl PioneerDesktop {
         expanded: bool,
         is_connected: bool,
         is_pending: bool,
+        can_manage: bool,
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -637,13 +654,17 @@ impl PioneerDesktop {
                 });
             })
             .context_menu(move |menu, _, _| {
-                skill_pack_context_menu(
-                    menu,
-                    context_pack_id.clone(),
-                    context_pack_name.clone(),
-                    context_actions_enabled,
-                    context_desktop_entity.clone(),
-                )
+                if can_manage {
+                    skill_pack_context_menu(
+                        menu,
+                        context_pack_id.clone(),
+                        context_pack_name.clone(),
+                        context_actions_enabled,
+                        context_desktop_entity.clone(),
+                    )
+                } else {
+                    menu
+                }
             })
             .child(
                 h_flex()

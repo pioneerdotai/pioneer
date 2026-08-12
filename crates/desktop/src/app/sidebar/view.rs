@@ -36,6 +36,7 @@ const SIDEBAR_MENU_ITEM_OPACITY: f32 = 0.8;
 struct SidebarThreadRow {
     thread_id: String,
     title: String,
+    unread_count: u64,
 }
 
 struct SidebarTreeModel {
@@ -93,6 +94,11 @@ impl PioneerDesktop {
 
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
+        let principal_capabilities = self.principal_presentation_capabilities();
+        let can_manage_workspace = principal_capabilities.can_manage_workspace;
+        let can_manage_all_threads = principal_capabilities.can_manage_all_threads;
+        let scoped_thread_id = self.thread_scope_capabilities_thread_id.clone();
+        let scoped_thread_capabilities = self.thread_scope_capabilities;
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
         let rows_by_thread_id = self.sidebar_rows_by_thread_id();
         let folders_by_id: Arc<HashMap<String, ThreadFolder>> = Arc::new(
@@ -176,9 +182,14 @@ impl PioneerDesktop {
                                 .h(px(TREE_ROW_HEIGHT_PX))
                                 .justify_between()
                                 .items_center()
-                                .on_action(root_edit_agents_doc_action_listener)
-                                .on_action(root_remove_agents_doc_action_listener)
+                                .when(can_manage_workspace, |this| {
+                                    this.on_action(root_edit_agents_doc_action_listener)
+                                        .on_action(root_remove_agents_doc_action_listener)
+                                })
                                 .context_menu(move |menu, _, _| {
+                                    if !can_manage_workspace {
+                                        return menu;
+                                    }
                                     let menu = menu.menu(
                                         match root_agents_doc_edit_menu_label {
                                             AgentsDocEditAction::Create => {
@@ -209,7 +220,7 @@ impl PioneerDesktop {
                                         .opacity(0.6)
                                         .child(t!("sidebar.title.threads").to_string()),
                                 )
-                                .child(
+                                .when(can_manage_workspace, |this| this.child(
                                     h_flex().pr_2().items_center().child(
                                         Button::new("create-thread-folder")
                                             .small()
@@ -222,7 +233,7 @@ impl PioneerDesktop {
                                             )
                                             .on_click(create_folder_listener),
                                     ),
-                                ),
+                                )),
                         )
                 }
                 SidebarTreeNodeKey::Thread(thread_id) => {
@@ -232,7 +243,11 @@ impl PioneerDesktop {
                         .unwrap_or_else(|| SidebarThreadRow {
                             thread_id: thread_id.to_owned(),
                             title: thread_id.to_owned(),
+                            unread_count: 0,
                         });
+                    let can_manage_thread = can_manage_all_threads
+                        || (scoped_thread_id.as_deref() == Some(row.thread_id.as_str())
+                            && scoped_thread_capabilities.can_manage_thread);
                     let thread_id_for_click = row.thread_id.clone();
                     let thread_id_for_context_menu_rename = row.thread_id.clone();
                     let thread_payload = SidebarTreeDragPayload {
@@ -274,13 +289,23 @@ impl PioneerDesktop {
                                 .w_full()
                                 .h(px(TREE_ROW_HEIGHT_PX))
                                 .on_click(open_listener)
-                                .on_action(thread_rename_action_listener)
-                                .on_drag(thread_payload, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                                .when(can_manage_thread, |this| {
+                                    this.on_action(thread_rename_action_listener)
+                                })
+                                .when(can_manage_workspace, |this| {
+                                    this.on_drag(thread_payload, |drag, _, _, cx| {
+                                        cx.new(|_| drag.clone())
+                                    })
+                                })
                                 .context_menu(move |menu, _, _| {
-                                    menu.menu(
-                                        t!("sidebar.contextmenu.thread.edit"),
-                                        Box::new(SidebarThreadRename),
-                                    )
+                                    if can_manage_thread {
+                                        menu.menu(
+                                            t!("sidebar.contextmenu.thread.edit"),
+                                            Box::new(SidebarThreadRename),
+                                        )
+                                    } else {
+                                        menu
+                                    }
                                 })
                                 .child(
                                     h_flex()
@@ -291,6 +316,9 @@ impl PioneerDesktop {
                                         .child(tree_depth_guides(entry.depth(), cx))
                                         .child(
                                             h_flex()
+                                                // Newer GPUI versions only schedule an immediate
+                                                // hover repaint for elements with persistent state.
+                                                .id(("thread-tree-thread-hover", ix))
                                                 .w_full()
                                                 .min_w_0()
                                                 .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
@@ -315,6 +343,29 @@ impl PioneerDesktop {
                                                         .opacity(SIDEBAR_MENU_ITEM_OPACITY)
                                                         .when(selected, |this| this.opacity(1.0))
                                                         .child(row.title),
+                                                )
+                                                .when(
+                                                    should_render_thread_unread_badge(
+                                                        row.unread_count,
+                                                        selected,
+                                                    ),
+                                                    |this| {
+                                                        this.child(
+                                                            div()
+                                                                .min_w_5()
+                                                                .h_5()
+                                                                .px_1()
+                                                                .rounded_full()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .text_xs()
+                                                                .bg(cx.theme().muted)
+                                                                .child(div().opacity(0.8).child(
+                                                                    row.unread_count.to_string(),
+                                                                )),
+                                                        )
+                                                    },
                                                 ),
                                         ),
                                 ),
@@ -448,31 +499,36 @@ impl PioneerDesktop {
                             div()
                                 .id(("thread-tree-folder-drag", ix))
                                 .on_click(folder_click_listener)
-                                .on_action(folder_rename_action_listener)
-                                .on_action(folder_delete_action_listener)
-                                .on_action(folder_edit_agents_doc_action_listener)
-                                .on_action(folder_remove_agents_doc_action_listener)
-                                .on_drag(folder_payload, |drag, _, _, cx| cx.new(|_| drag.clone()))
-                                .can_drop({
-                                    let folder_id = folder_id.to_owned();
-                                    let active_workspace_id = active_workspace_id.clone();
-                                    let folders_by_id = Arc::clone(&folders_by_id);
-                                    move |value, _, _| {
-                                        can_drop_on_folder(
-                                            value,
-                                            active_workspace_id.as_deref(),
-                                            folders_by_id.as_ref(),
-                                            folder_id.as_str(),
-                                        )
-                                    }
+                                .when(can_manage_workspace, |this| {
+                                    this.on_action(folder_rename_action_listener)
+                                        .on_action(folder_delete_action_listener)
+                                        .on_action(folder_edit_agents_doc_action_listener)
+                                        .on_action(folder_remove_agents_doc_action_listener)
+                                        .on_drag(folder_payload, |drag, _, _, cx| {
+                                            cx.new(|_| drag.clone())
+                                        })
+                                        .can_drop({
+                                            let folder_id = folder_id.to_owned();
+                                            let active_workspace_id = active_workspace_id.clone();
+                                            let folders_by_id = Arc::clone(&folders_by_id);
+                                            move |value, _, _| {
+                                                can_drop_on_folder(
+                                                    value,
+                                                    active_workspace_id.as_deref(),
+                                                    folders_by_id.as_ref(),
+                                                    folder_id.as_str(),
+                                                )
+                                            }
+                                        })
+                                        .drag_over::<SidebarTreeDragPayload>(|style, _, _, cx| {
+                                            style.rounded_md().bg(cx.theme().sidebar_accent)
+                                        })
+                                        .on_drop(drop_listener)
                                 })
-                                .drag_over::<SidebarTreeDragPayload>(|style, _, _, cx| {
-                                    style.rounded_md().bg(cx.theme().sidebar_accent)
-                                })
-                                .on_drop(drop_listener)
-                                .w_full()
-                                .h(px(TREE_ROW_HEIGHT_PX))
                                 .context_menu(move |menu, _, _| {
+                                    if !can_manage_workspace {
+                                        return menu;
+                                    }
                                     let menu = menu
                                         .menu(
                                             t!("sidebar.contextmenu.folder.rename"),
@@ -485,16 +541,12 @@ impl PioneerDesktop {
                                         .separator()
                                         .menu(
                                             match agents_doc_edit_menu_label {
-                                                AgentsDocEditAction::Create => {
-                                                    t!(
-                                                        "sidebar.contextmenu.folder.create_agents_doc"
-                                                    )
-                                                }
-                                                AgentsDocEditAction::Edit => {
-                                                    t!(
-                                                        "sidebar.contextmenu.folder.edit_agents_doc"
-                                                    )
-                                                }
+                                                AgentsDocEditAction::Create => t!(
+                                                    "sidebar.contextmenu.folder.create_agents_doc"
+                                                ),
+                                                AgentsDocEditAction::Edit => t!(
+                                                    "sidebar.contextmenu.folder.edit_agents_doc"
+                                                ),
                                             },
                                             Box::new(SidebarFolderEditAgentsDoc),
                                         );
@@ -510,6 +562,8 @@ impl PioneerDesktop {
                                         menu
                                     }
                                 })
+                                .w_full()
+                                .h(px(TREE_ROW_HEIGHT_PX))
                                 .child(
                                     h_flex()
                                         .w_full()
@@ -518,6 +572,7 @@ impl PioneerDesktop {
                                         .child(tree_depth_guides(entry.depth(), cx))
                                         .child(
                                             h_flex()
+                                                .id(("thread-tree-folder-hover", ix))
                                                 .w_full()
                                                 .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
                                                 .items_center()
@@ -606,32 +661,45 @@ impl PioneerDesktop {
                                 .group("new-agent-btn")
                                 .selected(is_new_thread_active)
                                 .child({
-                                    let icon_bg = cx.theme().foreground.opacity(0.075);
-                                    let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                                    div()
-                                        .id("new-agent-icon")
-                                        .size_6()
-                                        .rounded_full()
-                                        .bg(icon_bg)
-                                        .group_hover("new-agent-btn", move |s| s.bg(icon_bg_hover))
-                                        .flex()
+                                    h_flex()
+                                        .w_full()
                                         .items_center()
-                                        .justify_center()
+                                        .justify_start()
+                                        .gap_2()
+                                        .child({
+                                            let icon_bg = cx.theme().foreground.opacity(0.075);
+                                            let icon_bg_hover = cx.theme().foreground.opacity(0.1);
+                                            div()
+                                                .id("new-agent-icon")
+                                                .size_6()
+                                                .rounded_full()
+                                                .bg(icon_bg)
+                                                .group_hover("new-agent-btn", move |s| {
+                                                    s.bg(icon_bg_hover)
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::new(IconName::Plus)
+                                                        .size_4()
+                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                                        .when(is_new_thread_active, |this| {
+                                                            this.opacity(1.0)
+                                                        }),
+                                                )
+                                        })
                                         .child(
-                                            Icon::new(IconName::Plus)
-                                                .size_4()
+                                            div()
+                                                .flex_none()
+                                                .line_height(relative(1.))
                                                 .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                                .when(is_new_thread_active, |this| this.opacity(1.0)),
+                                                .when(is_new_thread_active, |this| {
+                                                    this.opacity(1.0)
+                                                })
+                                                .child(t!("sidebar.action.new_thread").to_string())
                                         )
                                 })
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .line_height(relative(1.))
-                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                        .when(is_new_thread_active, |this| this.opacity(1.0))
-                                        .child(t!("sidebar.action.new_thread").to_string()),
-                                )
                                 .on_click(cx.listener(|view, _, window, cx| {
                                     view.open_or_create_new_thread_from_sidebar(window, cx);
                                     cx.notify();
@@ -645,18 +713,20 @@ impl PioneerDesktop {
                         .size_full()
                         .id("thread-tree-root-drop")
                         .relative()
-                        .can_drop(can_drop_on_root)
-                        .drag_over::<SidebarTreeDragPayload>(|style, _, _, cx| {
-                            style.bg(cx.theme().sidebar)
+                        .when(can_manage_workspace, |this| {
+                            this.can_drop(can_drop_on_root)
+                                .drag_over::<SidebarTreeDragPayload>(|style, _, _, cx| {
+                                    style.bg(cx.theme().sidebar)
+                                })
+                                .on_drop(cx.listener(
+                                    |view, payload: &SidebarTreeDragPayload, _, cx| {
+                                        view.handle_sidebar_drop_to_root(payload.clone(), cx);
+                                        cx.notify();
+                                    },
+                                ))
                         })
-                        .on_drop(
-                            cx.listener(|view, payload: &SidebarTreeDragPayload, _, cx| {
-                                view.handle_sidebar_drop_to_root(payload.clone(), cx);
-                                cx.notify();
-                            }),
-                        )
                         .child(tree_view)
-                        .child(
+                        .when(can_manage_workspace, |this| this.child(
                             div()
                                 .id("thread-tree-root-context-area")
                                 .absolute()
@@ -699,7 +769,7 @@ impl PioneerDesktop {
                                         menu
                                     }
                                 }),
-                        ),
+                        )),
                 ),
             )
             .when_some(desktop_update_panel, |this, panel| {
@@ -812,7 +882,19 @@ impl PioneerDesktop {
                 let coordinator = self.thread_coordinator(thread_id.as_str());
                 let title = sidebar_thread_title_from_coordinator(coordinator);
 
-                (thread_id.clone(), SidebarThreadRow { thread_id, title })
+                let unread_count = self
+                    .thread_unread
+                    .get(thread_id.as_str())
+                    .copied()
+                    .unwrap_or(0);
+                (
+                    thread_id.clone(),
+                    SidebarThreadRow {
+                        thread_id,
+                        title,
+                        unread_count,
+                    },
+                )
             })
             .collect()
     }
@@ -825,14 +907,23 @@ impl PioneerDesktop {
             };
         };
 
+        let can_manage_workspace = self
+            .principal_presentation_capabilities()
+            .can_manage_workspace;
         let client_model = client_thread_tree::sidebar_tree_model_from_workspace_data(
             client_thread_tree::SidebarTreeSourceData {
                 workspace_id,
                 folders: self.thread_folders_for_workspace(workspace_id),
                 placements: self.thread_placements_for_workspace(workspace_id),
                 sorted_thread_ids: self.sorted_thread_ids_for_workspace(workspace_id),
-                agents_doc_summaries: self.thread_agents_doc_summaries.values().collect(),
-                active_agents_doc_editor_scope: self.active_agents_doc_editor_scope.as_ref(),
+                agents_doc_summaries: if can_manage_workspace {
+                    self.thread_agents_doc_summaries.values().collect()
+                } else {
+                    Vec::new()
+                },
+                active_agents_doc_editor_scope: can_manage_workspace
+                    .then_some(self.active_agents_doc_editor_scope.as_ref())
+                    .flatten(),
                 expanded_folder_ids: self
                     .thread_folder_expanded
                     .iter()
@@ -850,6 +941,10 @@ impl PioneerDesktop {
             visible_node_ids: client_model.visible_node_ids,
         }
     }
+}
+
+fn should_render_thread_unread_badge(unread_count: u64, selected: bool) -> bool {
+    unread_count > 0 && !selected
 }
 
 fn gpui_tree_item_from_sidebar_item(item: &client_thread_tree::SidebarTreeItem) -> TreeItem {
@@ -932,6 +1027,7 @@ fn render_agents_doc_file_row(
                         .child(tree_depth_guides(depth, cx))
                         .child(
                             h_flex()
+                                .id(("thread-tree-agents-doc-hover", ix))
                                 .w_full()
                                 .min_w_0()
                                 .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
@@ -1188,5 +1284,28 @@ mod tests {
             sidebar_thread_title_from_coordinator(Some(&coordinator_without_preview)),
             t!("sidebar.thread.untitled").to_string()
         );
+        let source = include_str!("view.rs");
+        assert!(source.contains("self.thread_unread.get"));
+        assert!(source.contains("should_render_thread_unread_badge"));
+        assert!(!source.contains(&["projection.items", ".len()"].concat()));
+    }
+
+    #[::core::prelude::v1::test]
+    fn selected_thread_never_renders_an_unread_badge() {
+        assert!(should_render_thread_unread_badge(3, false));
+        assert!(!should_render_thread_unread_badge(3, true));
+        assert!(!should_render_thread_unread_badge(0, false));
+    }
+
+    #[::core::prelude::v1::test]
+    fn tree_hover_surfaces_keep_stateful_ids_for_immediate_gpui_repaints() {
+        let source = include_str!("view.rs");
+        for id in [
+            "thread-tree-thread-hover",
+            "thread-tree-folder-hover",
+            "thread-tree-agents-doc-hover",
+        ] {
+            assert!(source.contains(id), "missing stateful hover id: {id}");
+        }
     }
 }

@@ -247,6 +247,11 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.principal_presentation_capabilities().can_use_skills
+            || !self.can_start_active_thread_agent_presentation()
+        {
+            return;
+        }
         let Some(target_thread_id) = self.current_active_thread_id().map(str::to_owned) else {
             return;
         };
@@ -355,6 +360,11 @@ impl PioneerDesktop {
     }
 
     pub(super) fn open_composer_mcp_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.principal_presentation_capabilities().can_use_mcp
+            || !self.can_start_active_thread_agent_presentation()
+        {
+            return;
+        }
         let Some(target_thread_id) = self.current_active_thread_id().map(str::to_owned) else {
             return;
         };

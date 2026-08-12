@@ -1,7 +1,7 @@
 use super::*;
 use crate::authorization::{
     AuthorizationExternalError, AuthorizedThread, AuthorizedWorkspace, ResourceAction,
-    record_authorization_unavailable,
+    ThreadAccessClass, record_authorization_unavailable,
 };
 use crate::thread::{RuntimeDraftAccess, ThreadSubscriptionIdentity};
 use pioneer_crud::{PersistedThreadAccessClass, PrivateThreadParticipantMutation};
@@ -156,7 +156,7 @@ impl MessageProcessor {
         request_context: &RequestContext,
         authorization: &AuthorizedWorkspace,
         request_id: RequestId,
-        mut params: ThreadStartParams,
+        params: ThreadStartParams,
     ) {
         let connection_id = request_context.connection_id();
         if authorization.action() != ResourceAction::ThreadCreate
@@ -170,34 +170,12 @@ impl MessageProcessor {
             return;
         }
 
-        let is_superuser = authorization.decision().is_absolute_superuser();
-        let access_class = match (is_superuser, params.visibility) {
-            (true, Some(ThreadVisibility::Workspace)) => PersistedThreadAccessClass::Workspace,
-            (true, Some(ThreadVisibility::Private) | None) | (false, None) => {
-                PersistedThreadAccessClass::Private
-            }
-            (false, Some(_)) => {
-                self.send_error(
-                    connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_PARAMS_CODE,
-                        "Member-created threads must use private visibility",
-                    ),
-                )
-                .await;
-                return;
-            }
+        let access_class = match params.visibility.unwrap_or(ThreadVisibility::Private) {
+            ThreadVisibility::Private => PersistedThreadAccessClass::Private,
+            ThreadVisibility::Workspace => PersistedThreadAccessClass::Workspace,
         };
 
         let workspace_id = authorization.workspace_id().to_owned();
-        if !is_superuser {
-            // Provider/model selection is a server-owned execution
-            // capability. A Member may use the configured defaults but
-            // cannot establish a new provider boundary through thread/create.
-            params.model = None;
-            params.model_provider = None;
-        }
         let (mut thread, sandbox_mode) = match self
             .thread_manager
             .prepare_new_user_thread(workspace_id.clone(), &params)
@@ -1104,7 +1082,13 @@ impl MessageProcessor {
         operation: ThreadParticipantOperation,
     ) {
         let connection_id = request_context.connection_id();
-        if authorization.action() != ResourceAction::ThreadParticipantsManage
+        let listing = matches!(&operation, ThreadParticipantOperation::List);
+        let expected_action = if listing {
+            ResourceAction::ThreadRead
+        } else {
+            ResourceAction::ThreadParticipantsManage
+        };
+        if authorization.action() != expected_action
             || authorization.workspace_id() != workspace_id
             || authorization.thread_id() != thread_id
         {
@@ -1115,23 +1099,30 @@ impl MessageProcessor {
             .await;
             return;
         }
-        let acting_member = (!authorization.decision().is_absolute_superuser())
-            .then(|| authorization.principal_id());
+        let absolute_superuser = authorization.decision().is_absolute_superuser();
+        let acting_member = (!absolute_superuser).then(|| authorization.principal_id());
         let actor = request_context.persisted_actor();
         let gateway_id = &request_context.principal().gateway_id;
 
         let (changed, participant_ids, access_change_kind, target_principal_id) = match operation {
             ThreadParticipantOperation::List => {
-                match self
-                    .crud_store
-                    .list_private_thread_participant_ids(
-                        gateway_id,
-                        authorization.workspace_id(),
-                        authorization.thread_id(),
-                        acting_member,
-                    )
-                    .await
-                {
+                let result =
+                    if authorization.thread_access_class() == Some(ThreadAccessClass::Private) {
+                        // Exact ThreadRead admission already established that the
+                        // requester is a participant (or the Superuser). Do not
+                        // re-interpret a read as creator-only management here.
+                        self.crud_store
+                            .list_private_thread_participant_ids(
+                                gateway_id,
+                                authorization.workspace_id(),
+                                authorization.thread_id(),
+                                None,
+                            )
+                            .await
+                    } else {
+                        Ok(Some(Vec::new()))
+                    };
+                match result {
                     Ok(Some(ids)) => (false, ids, None, None),
                     Ok(None) => {
                         self.send_error(
@@ -1143,7 +1134,7 @@ impl MessageProcessor {
                     }
                     Err(error) => {
                         record_authorization_unavailable(
-                            ResourceAction::ThreadParticipantsManage.safe_name(),
+                            expected_action.safe_name(),
                             "thread",
                             "read",
                         );

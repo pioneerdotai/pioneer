@@ -78,6 +78,9 @@ impl PioneerDesktop {
     pub(crate) fn render_mcp_details_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
+        let can_manage_capabilities = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
         let selected = mcp_details::selected_mcp_server(
             self.mcp_servers.as_slice(),
             self.mcp_selected_server_id.as_deref(),
@@ -145,101 +148,111 @@ impl PioneerDesktop {
                                 }
                             }),
                     )
-                    .child(
-                        Button::new("mcp-details-sidebar-update")
-                            .ghost()
-                            .justify_start()
-                            .px_2()
-                            .disabled(!is_connected || selected.is_none() || is_pending)
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .child(sidebar_pioneer_icon(PioneerIconName::RefreshCw))
-                                    .child(sidebar_label(
-                                        t!("mcp.sidebar.update_config").to_string(),
-                                    )),
-                            )
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                move |_, window, cx| {
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.open_mcp_config_dialog(None, window, cx);
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
-                    .child(
-                        Button::new("mcp-details-sidebar-restart")
-                            .ghost()
-                            .justify_start()
-                            .px_2()
-                            .disabled(
-                                !is_connected
-                                    || selected.is_none()
-                                    || is_pending
-                                    || restart_disabled,
-                            )
-                            .loading(is_pending)
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .child(sidebar_pioneer_icon(PioneerIconName::RotateCcw))
-                                    .child(sidebar_label(t!("mcp.sidebar.restart").to_string())),
-                            )
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                let selected = selected.clone();
-                                move |_, _, cx| {
-                                    let Some(selected) = selected.clone() else {
-                                        return;
-                                    };
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.restart_mcp_server(selected.name.clone(), cx);
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
-                    .child(
-                        Button::new("mcp-details-sidebar-uninstall")
-                            .ghost()
-                            .justify_start()
-                            .px_2()
-                            .disabled(!is_connected || selected.is_none() || is_pending)
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .child(sidebar_pioneer_icon(PioneerIconName::Trash))
-                                    .child(sidebar_label(t!("mcp.sidebar.uninstall").to_string())),
-                            )
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                let selected = selected.clone();
-                                move |_, window, cx| {
-                                    let Some(selected) = selected.clone() else {
-                                        return;
-                                    };
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.confirm_uninstall_mcp_server(
-                                            selected.name.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    ),
+                    .when(can_manage_capabilities, |this| {
+                        this.child(
+                            Button::new("mcp-details-sidebar-update")
+                                .ghost()
+                                .justify_start()
+                                .px_2()
+                                .disabled(!is_connected || selected.is_none() || is_pending)
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_start()
+                                        .gap_2()
+                                        .child(sidebar_pioneer_icon(PioneerIconName::RefreshCw))
+                                        .child(sidebar_label(
+                                            t!("mcp.sidebar.update_config").to_string(),
+                                        )),
+                                )
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    move |_, window, cx| {
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.open_mcp_config_dialog(None, window, cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    })
+                    .when(can_manage_capabilities, |this| {
+                        this.child(
+                            Button::new("mcp-details-sidebar-restart")
+                                .ghost()
+                                .justify_start()
+                                .px_2()
+                                .disabled(
+                                    !is_connected
+                                        || selected.is_none()
+                                        || is_pending
+                                        || restart_disabled,
+                                )
+                                .loading(is_pending)
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_start()
+                                        .gap_2()
+                                        .child(sidebar_pioneer_icon(PioneerIconName::RotateCcw))
+                                        .child(sidebar_label(
+                                            t!("mcp.sidebar.restart").to_string(),
+                                        )),
+                                )
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    let selected = selected.clone();
+                                    move |_, _, cx| {
+                                        let Some(selected) = selected.clone() else {
+                                            return;
+                                        };
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.restart_mcp_server(selected.name.clone(), cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    })
+                    .when(can_manage_capabilities, |this| {
+                        this.child(
+                            Button::new("mcp-details-sidebar-uninstall")
+                                .ghost()
+                                .justify_start()
+                                .px_2()
+                                .disabled(!is_connected || selected.is_none() || is_pending)
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_start()
+                                        .gap_2()
+                                        .child(sidebar_pioneer_icon(PioneerIconName::Trash))
+                                        .child(sidebar_label(
+                                            t!("mcp.sidebar.uninstall").to_string(),
+                                        )),
+                                )
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    let selected = selected.clone();
+                                    move |_, window, cx| {
+                                        let Some(selected) = selected.clone() else {
+                                            return;
+                                        };
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.confirm_uninstall_mcp_server(
+                                                selected.name.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    }),
             )
             .into_any_element()
     }

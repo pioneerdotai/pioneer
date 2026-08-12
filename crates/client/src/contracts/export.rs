@@ -1943,6 +1943,48 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "task_accept_params.json",
+            pioneer_protocol::TaskAcceptParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_accept_response.json",
+            pioneer_protocol::TaskAcceptResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_revise_params.json",
+            pioneer_protocol::TaskReviseParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_revise_response.json",
+            pioneer_protocol::TaskReviseResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_cancel_params.json",
+            pioneer_protocol::TaskCancelParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_cancel_response.json",
+            pioneer_protocol::TaskCancelResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
             "task_wait_review_display.json",
             crate::timeline::labels::TaskWaitReviewDisplay,
             Domain::Timeline,
@@ -2324,6 +2366,20 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             "thread_participants_response.json",
             pioneer_protocol::ThreadParticipantsResponse,
             Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "authorization_capabilities_params.json",
+            pioneer_protocol::AuthorizationCapabilitiesParams,
+            Domain::Connection,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "authorization_capability_snapshot.json",
+            pioneer_protocol::AuthorizationCapabilitySnapshot,
+            Domain::Connection,
             Kind::Snapshot,
             Stability::Stable
         ),

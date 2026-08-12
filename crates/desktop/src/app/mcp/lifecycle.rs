@@ -19,6 +19,12 @@ const MCP_POLL_INTERVAL_SECS: u64 = 20;
 
 impl PioneerDesktop {
     pub(in crate::app) fn open_mcp_screen_from_bottom_bar(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         self.mcp_selected_server_id = None;
         self.mcp_server_details = None;
         self.set_main_content_view(MainContentView::Mcp, cx);
@@ -31,6 +37,12 @@ impl PioneerDesktop {
         server_id: String,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         if !mcp_list::mcp_server_exists_by_id(self.mcp_servers.as_slice(), server_id.as_str()) {
             self.mcp_error = Some(t!("mcp.error.server_not_available").to_string());
             return;
@@ -48,6 +60,9 @@ impl PioneerDesktop {
         server_id: String,
         cx: &mut Context<Self>,
     ) {
+        if !self.principal_presentation_capabilities().can_use_mcp {
+            return;
+        }
         let server_id =
             mcp_list::resolve_mcp_server_id_from_timeline(self.mcp_servers.as_slice(), server_id);
 
@@ -60,7 +75,14 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn close_mcp_details_screen(&mut self, cx: &mut Context<Self>) {
-        self.set_main_content_view(MainContentView::Mcp, cx);
+        let can_manage_capabilities = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
+        if !can_manage_capabilities {
+            self.mcp_selected_server_id = None;
+            self.mcp_server_details = None;
+        }
+        self.set_main_content_view(mcp_details_return_view(can_manage_capabilities), cx);
     }
 
     pub(in crate::app) fn queue_mcp_refresh(&mut self) {
@@ -392,5 +414,25 @@ impl PioneerDesktop {
             }
         })
         .detach();
+    }
+}
+
+const fn mcp_details_return_view(can_manage_capabilities: bool) -> MainContentView {
+    if can_manage_capabilities {
+        MainContentView::Mcp
+    } else {
+        MainContentView::Threads
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mcp_details_return_view;
+    use crate::app::root::MainContentView;
+
+    #[test]
+    fn mcp_details_returns_operational_members_to_threads() {
+        assert_eq!(mcp_details_return_view(false), MainContentView::Threads);
+        assert_eq!(mcp_details_return_view(true), MainContentView::Mcp);
     }
 }

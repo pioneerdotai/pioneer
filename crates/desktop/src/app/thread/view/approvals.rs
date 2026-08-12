@@ -116,6 +116,13 @@ impl PioneerDesktop {
         actions: Vec<PendingRequestAvailableAction>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // A native permission opened by a child/subagent is intentionally
+        // projected into every visible ancestor timeline. The capability to
+        // answer therefore belongs to the currently displayed root scope;
+        // the Gateway still validates the exact request/session/turn.
+        if !self.can_respond_to_agent_requests_presentation(self.current_active_thread_id()) {
+            return div().into_any_element();
+        }
         let action_elements = actions
             .into_iter()
             .map(|action| render_pending_request_action(request.clone(), action, cx))

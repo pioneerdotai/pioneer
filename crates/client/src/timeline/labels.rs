@@ -736,6 +736,7 @@ pub struct TaskWaitReviewDisplay {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TaskWaitReviewDisplayItem {
     pub task_id: String,
+    pub owner_principal_id: Option<String>,
     pub run_id: Option<String>,
     pub title: Option<String>,
     pub status: Option<String>,
@@ -1077,6 +1078,7 @@ fn task_wait_review_display_item(value: &JsonValue) -> Option<TaskWaitReviewDisp
     let candidate_id = json_string(value, "candidateId")?;
     Some(TaskWaitReviewDisplayItem {
         task_id,
+        owner_principal_id: json_string(value, "ownerPrincipalId"),
         run_id: json_string(value, "runId"),
         title: json_string(value, "title"),
         status: json_string(value, "status"),
@@ -2049,6 +2051,7 @@ mod tests {
                     "mode": "user_approval",
                     "reviewRequired": [{
                         "taskId": "task_1",
+                        "ownerPrincipalId": "principal_1",
                         "runId": "run_1",
                         "candidateId": "candidate_1",
                         "reviewMode": "user_approval",
@@ -2063,6 +2066,10 @@ mod tests {
         });
         let review = task_wait_review_display("task_wait", &review_display).expect("review");
         assert_eq!(review.review_required_count, 1);
+        assert_eq!(
+            review.items[0].owner_principal_id.as_deref(),
+            Some("principal_1")
+        );
         assert!(review.items[0].user_controls_allowed());
         assert!(review.items[0].allows_action("task_accept"));
         assert_eq!(

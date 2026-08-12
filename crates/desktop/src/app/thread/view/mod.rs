@@ -20,10 +20,12 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.ensure_active_thread_workspace_members_loaded(cx);
+        self.ensure_active_thread_mention_directory_loaded(cx);
         self.ensure_active_thread_artifacts_loaded(cx);
-        if self.show_thread_members_sidebar {
-            self.ensure_active_thread_members_loaded(false, cx);
-        }
+        // Operational agent capabilities are independent from the optional
+        // participant list and also exist for internal task/subagent threads.
+        self.ensure_active_thread_capabilities_loaded(false, cx);
+        self.ensure_active_thread_members_loaded(false, cx);
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
 
         let timeline_model = self.semantic_timeline_render_model(active_thread_id.as_deref());

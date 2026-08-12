@@ -29,7 +29,8 @@ use super::{
 };
 use crate::providers::list::runtime_id_from_cli_runtime_provider_key;
 use pioneer_protocol::{
-    ArtifactRef, MemberSummary, PrincipalId, PrincipalStatus, ThreadMode, TurnPermissionMode,
+    ArtifactRef, MemberSummary, PrincipalId, PrincipalKind, PrincipalStatus, ThreadMode,
+    TurnPermissionMode,
 };
 
 const COMPOSER_REPLY_PREVIEW_MAX_CHARS: usize = 160;
@@ -485,6 +486,42 @@ pub fn composer_mention_candidates(
         });
     }
     candidates
+}
+
+/// Builds the effective mention directory for a workspace without changing
+/// the meaning of `workspace/member/list`: explicit workspace Members come
+/// from that scoped list, while active Superusers come from the ACL-scoped
+/// Gateway member directory because their access is implicit.
+pub fn composer_workspace_mention_candidates(
+    workspace_members: impl IntoIterator<Item = MemberSummary>,
+    member_directory: impl IntoIterator<Item = MemberSummary>,
+    current_principal_id: Option<&PrincipalId>,
+) -> Vec<ComposerMentionCandidate> {
+    let member_directory = member_directory.into_iter().collect::<Vec<_>>();
+    let current_profile_by_id = member_directory
+        .iter()
+        .map(|member| (member.principal_id.clone(), member))
+        .collect::<std::collections::HashMap<_, _>>();
+    let workspace_members = workspace_members
+        .into_iter()
+        .map(|member| {
+            current_profile_by_id
+                .get(&member.principal_id)
+                .map(|current| (*current).clone())
+                .unwrap_or(member)
+        })
+        .collect::<Vec<_>>();
+
+    composer_mention_candidates(
+        workspace_members
+            .into_iter()
+            .chain(
+                member_directory
+                    .into_iter()
+                    .filter(|member| member.kind == PrincipalKind::Superuser),
+            )
+            .filter(|member| current_principal_id != Some(&member.principal_id)),
+    )
 }
 
 pub fn composer_reply_target_from_visible_message(
@@ -984,6 +1021,77 @@ mod tests {
             },
         );
         assert!(reconciled.state.selected_mentions.is_empty());
+    }
+
+    #[test]
+    fn workspace_mentions_include_implicit_superusers_but_not_other_directory_members_or_self() {
+        let current = MemberSummary {
+            principal_id: PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").expect("principal id"),
+            kind: PrincipalKind::User,
+            display_name: "Current".to_owned(),
+            nickname: "current".to_owned(),
+            role_key: None,
+            status: PrincipalStatus::Active,
+            avatar_revision: None,
+        };
+        let workspace_member = MemberSummary {
+            principal_id: PrincipalId::new("PBBBBBBBBBBBBBBBBBBBB").expect("principal id"),
+            kind: PrincipalKind::User,
+            display_name: "Workspace Member".to_owned(),
+            nickname: "workspace_member".to_owned(),
+            role_key: None,
+            status: PrincipalStatus::Active,
+            avatar_revision: None,
+        };
+        let current_workspace_member = MemberSummary {
+            display_name: "Current Workspace Member".to_owned(),
+            nickname: "current_workspace_member".to_owned(),
+            avatar_revision: Some("b".repeat(64)),
+            ..workspace_member.clone()
+        };
+        let superuser = MemberSummary {
+            principal_id: PrincipalId::new("PCCCCCCCCCCCCCCCCCCCC").expect("principal id"),
+            kind: PrincipalKind::Superuser,
+            display_name: "Root".to_owned(),
+            nickname: "root".to_owned(),
+            role_key: None,
+            status: PrincipalStatus::Active,
+            avatar_revision: Some("c".repeat(64)),
+        };
+        let other_workspace_member = MemberSummary {
+            principal_id: PrincipalId::new("PDDDDDDDDDDDDDDDDDDDD").expect("principal id"),
+            kind: PrincipalKind::User,
+            display_name: "Other Workspace".to_owned(),
+            nickname: "other".to_owned(),
+            role_key: None,
+            status: PrincipalStatus::Active,
+            avatar_revision: None,
+        };
+
+        let candidates = composer_workspace_mention_candidates(
+            [current.clone(), workspace_member.clone()],
+            [
+                current.clone(),
+                current_workspace_member,
+                superuser.clone(),
+                other_workspace_member,
+            ],
+            Some(&current.principal_id),
+        );
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.principal_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PrincipalId::new("PBBBBBBBBBBBBBBBBBBBB").expect("principal id"),
+                superuser.principal_id,
+            ]
+        );
+        assert_eq!(candidates[0].display_name, "Current Workspace Member");
+        assert_eq!(candidates[0].nickname, "current_workspace_member");
+        assert_eq!(candidates[0].avatar_revision, Some("b".repeat(64)));
     }
 
     #[test]

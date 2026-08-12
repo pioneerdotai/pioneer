@@ -1400,6 +1400,7 @@ mod tests {
                 audit.clone(),
                 &fixture.gateway_id,
                 &fixture.member_id,
+                crate::PersistedThreadAccessClass::Private,
             )
             .await
             .expect_err("missing workspace membership must roll back the initial turn");
@@ -1454,10 +1455,11 @@ mod tests {
                 &turn,
                 &[],
                 None,
-                actor,
-                audit,
+                actor.clone(),
+                audit.clone(),
                 &fixture.gateway_id,
                 &fixture.member_id,
+                crate::PersistedThreadAccessClass::Private,
             )
             .await
             .expect("first turn should atomically materialize the private thread");
@@ -1489,6 +1491,65 @@ mod tests {
                 .expect("query committed first-turn events")
                 .len(),
             2
+        );
+
+        let workspace_thread_id = generate_id(AUTH_DOMAIN_ID_LEN);
+        let workspace_turn_id = generate_id(AUTH_DOMAIN_ID_LEN);
+        let workspace_thread = Thread {
+            id: workspace_thread_id.clone(),
+            visibility: Some(ThreadVisibility::Workspace),
+            ..thread.clone()
+        };
+        let workspace_turn = Turn {
+            id: workspace_turn_id.clone(),
+            ..turn
+        };
+        let workspace_audit = TurnPermissionAuditEvent {
+            workspace_id: workspace_thread.workspace_id.clone(),
+            thread_id: workspace_thread_id.clone(),
+            turn_id: workspace_turn_id.clone(),
+            ..audit
+        };
+
+        store
+            .materialize_new_member_turn_start_with_reasoning_effort_and_permission_audit(
+                &workspace_thread,
+                SandboxMode::FullAccess,
+                &workspace_turn,
+                &[],
+                None,
+                actor,
+                workspace_audit,
+                &fixture.gateway_id,
+                &fixture.member_id,
+                crate::PersistedThreadAccessClass::Workspace,
+            )
+            .await
+            .expect("first turn should atomically materialize the workspace-visible thread");
+
+        let persisted = thread::Entity::find_by_id(workspace_thread_id.clone())
+            .one(&fixture.database)
+            .await
+            .expect("query materialized workspace thread")
+            .expect("materialized workspace thread should exist");
+        assert_eq!(persisted.access_class, "workspace");
+        assert!(
+            crate::find_thread_membership(
+                &fixture.database,
+                &workspace_thread_id,
+                &fixture.member_id,
+            )
+            .await
+            .expect("query workspace-thread creator membership")
+            .is_none(),
+            "workspace-visible threads must not persist explicit membership"
+        );
+        assert!(
+            store
+                .get_turn(&workspace_thread_id, &workspace_turn_id)
+                .await
+                .expect("query committed workspace-thread first turn")
+                .is_some()
         );
     }
 

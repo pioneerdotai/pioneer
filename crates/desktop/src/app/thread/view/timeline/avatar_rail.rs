@@ -46,14 +46,12 @@ impl PioneerDesktop {
                 else {
                     return None;
                 };
-                let pioneer_protocol::PersistedActorRef::Principal(principal_id) = &author.actor
-                else {
-                    return None;
-                };
-                author
-                    .avatar_revision
-                    .as_ref()
-                    .map(|revision| (principal_id.clone(), revision.clone()))
+                let author = self.current_timeline_author_presentation(Some(author));
+                author.avatar_revision.as_ref().and_then(|revision| {
+                    author
+                        .principal_id
+                        .map(|principal_id| (principal_id, revision.clone()))
+                })
             })
             .collect::<Vec<_>>();
         let requests = self
@@ -69,7 +67,7 @@ impl PioneerDesktop {
                 .map(|group| match &group.source {
                     TimelineAvatarSource::HistoricalUser { author } => {
                         let (display_name, cached_path) =
-                            self.historical_author_avatar_parts(author.as_ref());
+                            self.timeline_author_avatar_parts(author.as_ref());
                         TimelineAvatarVisual::HistoricalUser {
                             display_name,
                             cached_path,
@@ -173,24 +171,18 @@ impl PioneerDesktop {
         .into_any_element()
     }
 
-    fn historical_author_avatar_parts(
+    fn timeline_author_avatar_parts(
         &self,
         author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
     ) -> (String, Option<PathBuf>) {
-        let display_name = author
-            .map(|author| author.display_name.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "?".to_owned());
-        let cached_path = author.and_then(|author| {
-            let pioneer_protocol::PersistedActorRef::Principal(principal_id) = &author.actor else {
-                return None;
-            };
+        let author = self.current_timeline_author_presentation(author);
+        let cached_path = author.principal_id.as_ref().and_then(|principal_id| {
             let revision = author.avatar_revision.as_deref()?;
             self.member_avatar_state
                 .presentation_for_revision(principal_id, revision)
                 .and_then(|avatar| avatar.cached_image_path.clone())
         });
-        (display_name, cached_path)
+        (author.display_name, cached_path)
     }
 }
 

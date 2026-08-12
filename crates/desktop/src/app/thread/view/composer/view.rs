@@ -20,7 +20,7 @@ use pioneer_client::composer::skill_selection::{
     ComposerSkillChip, ComposerSkillChipKind, ComposerSkillSelection, project_composer_skill_chips,
 };
 use pioneer_client::composer::state_machine::{
-    ComposerDomainAction, ComposerMentionCandidate, composer_mention_candidates,
+    ComposerDomainAction, ComposerMentionCandidate, composer_workspace_mention_candidates,
 };
 use pioneer_client::state::snapshot::ActiveThreadSnapshot;
 use pioneer_protocol::{ThreadMode, WorkspaceId};
@@ -160,6 +160,13 @@ impl PioneerDesktop {
             });
         let can_steer_cli_runtime_turn = has_cli_runtime_steer_target
             && gateway_connected
+            && active_thread_snapshot
+                .thread_id
+                .as_deref()
+                .is_some_and(|thread_id| {
+                    self.thread_presentation_capabilities(thread_id)
+                        .is_some_and(|capabilities| capabilities.can_control_cli_runtime)
+                })
             && !is_cancelling
             && !self.composer_upload_in_progress
             && attachments.is_empty()
@@ -442,13 +449,26 @@ impl PioneerDesktop {
             .current_active_thread_id()
             .and_then(|thread_id| self.thread_workspace_id(thread_id))
             .and_then(|workspace_id| WorkspaceId::new(workspace_id.to_owned()).ok());
-        let directory_loading = workspace_id
+        let directory_loading = self.members_loading
+            || !self.administration.member_directory_complete()
+            || workspace_id
+                .as_ref()
+                .is_some_and(|workspace_id| self.workspace_members_loading.contains(workspace_id));
+        let current_principal_id = self
+            .gateway
+            .current_auth
             .as_ref()
-            .is_some_and(|workspace_id| self.workspace_members_loading.contains(workspace_id));
+            .map(|auth| &auth.principal.id);
         let candidates = workspace_id
             .as_ref()
             .and_then(|workspace_id| self.administration.workspace_members(workspace_id))
-            .map(|members| composer_mention_candidates(members.iter().cloned()))
+            .map(|members| {
+                composer_workspace_mention_candidates(
+                    members.iter().cloned(),
+                    self.administration.members().cloned(),
+                    current_principal_id,
+                )
+            })
             .unwrap_or_default();
 
         // There is no useful action when a workspace has no active members to
@@ -523,12 +543,22 @@ impl PioneerDesktop {
     }
 
     fn render_composer_add_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let message_mode = self.composer_turn_mode == ThreadMode::Message;
+        let scoped_action_allowed = if message_mode {
+            self.can_write_active_thread_presentation()
+        } else {
+            self.can_start_active_thread_agent_presentation()
+        };
         let desktop_entity = cx.entity().clone();
         let disabled = self.composer_upload_in_progress
             || self.message_mutation_pending
             || self.composer_edit_target.is_some()
-            || self.desktop_voice_context_locked();
-        let message_mode = self.composer_turn_mode == ThreadMode::Message;
+            || self.desktop_voice_context_locked()
+            || !scoped_action_allowed;
+        let capabilities = self.principal_presentation_capabilities();
+        let can_start_agent = self.can_start_active_thread_agent_presentation();
+        let can_use_skills = capabilities.can_use_skills && can_start_agent;
+        let can_use_mcp = capabilities.can_use_mcp && can_start_agent;
         Button::new("composer-add-attachment")
             .small()
             .ghost()
@@ -554,33 +584,41 @@ impl PioneerDesktop {
                     return menu;
                 }
 
-                let menu = menu.item(Self::composer_add_menu_item(
-                    t!("chat.composer.add_menu.skills").to_string().into(),
-                    PioneerIconName::Zap,
-                    {
-                        let desktop_entity = desktop_entity.clone();
-                        move |window, cx| {
-                            let _ = desktop_entity.update(cx, |view, cx| {
-                                view.open_composer_skills_picker(window, cx);
-                                cx.notify();
-                            });
-                        }
-                    },
-                ));
+                let menu = if can_use_skills {
+                    menu.item(Self::composer_add_menu_item(
+                        t!("chat.composer.add_menu.skills").to_string().into(),
+                        PioneerIconName::Zap,
+                        {
+                            let desktop_entity = desktop_entity.clone();
+                            move |window, cx| {
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.open_composer_skills_picker(window, cx);
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    ))
+                } else {
+                    menu
+                };
 
-                menu.item(Self::composer_add_menu_item(
-                    t!("chat.composer.add_menu.mcp").to_string().into(),
-                    PioneerIconName::Mcp,
-                    {
-                        let desktop_entity = desktop_entity.clone();
-                        move |window, cx| {
-                            let _ = desktop_entity.update(cx, |view, cx| {
-                                view.open_composer_mcp_picker(window, cx);
-                                cx.notify();
-                            });
-                        }
-                    },
-                ))
+                if can_use_mcp {
+                    menu.item(Self::composer_add_menu_item(
+                        t!("chat.composer.add_menu.mcp").to_string().into(),
+                        PioneerIconName::Mcp,
+                        {
+                            let desktop_entity = desktop_entity.clone();
+                            move |window, cx| {
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.open_composer_mcp_picker(window, cx);
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    ))
+                } else {
+                    menu
+                }
             })
             .into_any_element()
     }

@@ -50,6 +50,7 @@ impl MessageProcessor {
             .mcp_service
             .runtime_snapshot("workspace", workspace_id.as_str())
             .await;
+        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
         let mut servers = Vec::with_capacity(rows.len());
         for row in &rows {
             let catalog = match row.id.as_deref() {
@@ -98,6 +99,12 @@ impl MessageProcessor {
                     return;
                 }
             };
+            // Discovery for an ordinary workspace member is a catalog of
+            // usable capabilities, not a management inventory. Disabled
+            // installations remain visible only to Gateway administrators.
+            if member && !item.policy.enabled {
+                continue;
+            }
             servers.push(item);
         }
         let response_payload = McpListResponse {

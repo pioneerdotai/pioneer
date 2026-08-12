@@ -12,6 +12,26 @@ use pioneer_client::threads::{
 use tracing::warn;
 
 impl PioneerDesktop {
+    pub(in crate::app) fn reconcile_composer_permission_mode_with_capabilities(&mut self) {
+        let allowed = self.allowed_composer_permission_modes();
+        if allowed.is_empty() || allowed.contains(&self.composer_permission_mode) {
+            return;
+        }
+        let Some(mode) = allowed.last().copied() else {
+            return;
+        };
+        self.reduce_composer_domain(ComposerDomainAction::SetPermissionMode { mode });
+    }
+
+    pub(in crate::app) fn invalidate_active_thread_capability_projection(&mut self) {
+        self.thread_scope_capabilities_refresh_generation = self
+            .thread_scope_capabilities_refresh_generation
+            .wrapping_add(1);
+        self.thread_scope_capabilities_thread_id = None;
+        self.thread_scope_capabilities_loading_thread_id = None;
+        self.thread_scope_capabilities = ThreadPresentationCapabilities::default();
+    }
+
     pub(in crate::app) fn set_main_content_view(
         &mut self,
         view: MainContentView,
@@ -25,6 +45,10 @@ impl PioneerDesktop {
         let changed = thread_session::set_active_thread_id(&mut self.active_thread_id, thread_id);
         if changed {
             self.composer_edit_target = None;
+            self.invalidate_active_thread_capability_projection();
+            self.thread_members_thread_id = None;
+            self.thread_members.clear();
+            self.thread_members_loading = false;
             self.active_thread_resubscribe_pending = self.active_thread_id.is_some()
                 && self.gateway.connection_state == GatewayConnectionState::Connected;
             self.reset_composer_model_selection_for_active_thread();
@@ -54,6 +78,13 @@ impl PioneerDesktop {
             return false;
         }
 
+        if self.current_active_thread_id() == Some(thread_id) {
+            // A connection-owned draft has no persisted thread projection.
+            // Materialization changes that without changing the thread id, so
+            // force a fresh server snapshot instead of retaining the draft's
+            // fail-closed empty projection.
+            self.invalidate_active_thread_capability_projection();
+        }
         self.request_thread_start_if_needed();
         true
     }
@@ -289,6 +320,16 @@ impl PioneerDesktop {
         &mut self,
         thread: Thread,
     ) -> &mut ThreadCoordinator {
+        let scope_changed = self
+            .thread_coordinators
+            .get(thread.id.as_str())
+            .and_then(ThreadCoordinator::thread)
+            .is_some_and(|current| current.visibility != thread.visibility);
+        if scope_changed && self.current_active_thread_id() == Some(thread.id.as_str()) {
+            self.thread_members_thread_id = None;
+            self.invalidate_active_thread_capability_projection();
+            self.thread_members.clear();
+        }
         client_state_reducers::upsert_thread_snapshot_in(&mut self.thread_coordinators, thread)
     }
 
@@ -458,6 +499,7 @@ impl PioneerDesktop {
     /// new authorization epoch. Endpoint registry and device-session state are
     /// deliberately owned by the Gateway coordinator and remain untouched.
     pub(in crate::app) fn clear_authorization_epoch_cache(&mut self) {
+        self.gateway.capability_snapshot = None;
         self.workspaces.clear();
         self.workspaces_error = None;
         self.set_active_thread_id(None);

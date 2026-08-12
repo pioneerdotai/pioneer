@@ -1,5 +1,9 @@
 use super::*;
 use pioneer_client::agents_doc::scope as agents_doc_scope;
+use pioneer_client::authorization::{
+    PrincipalPresentationCapabilities, ThreadPresentationCapabilities,
+    principal_presentation_capabilities,
+};
 #[cfg(test)]
 use pioneer_client::composer::capabilities::{
     ComposerCapabilityTarget,
@@ -32,6 +36,89 @@ pub(crate) fn composer_submission_plan_for_provider(
 }
 
 impl PioneerDesktop {
+    pub(in crate::app) fn principal_presentation_capabilities(
+        &self,
+    ) -> PrincipalPresentationCapabilities {
+        self.gateway
+            .capability_snapshot
+            .as_ref()
+            .map(principal_presentation_capabilities)
+            .unwrap_or_default()
+    }
+
+    pub(in crate::app) fn can_manage_thread_presentation(&self, thread_id: &str) -> bool {
+        self.principal_presentation_capabilities()
+            .can_manage_all_threads
+            || (self.thread_scope_capabilities_thread_id.as_deref() == Some(thread_id)
+                && self.thread_scope_capabilities.can_manage_thread)
+    }
+
+    pub(in crate::app) fn thread_presentation_capabilities(
+        &self,
+        thread_id: &str,
+    ) -> Option<ThreadPresentationCapabilities> {
+        (self.thread_scope_capabilities_thread_id.as_deref() == Some(thread_id))
+            .then_some(self.thread_scope_capabilities)
+    }
+
+    pub(in crate::app) fn can_write_active_thread_presentation(&self) -> bool {
+        let Some(thread_id) = self.current_active_thread_id() else {
+            return false;
+        };
+        if self.draft_thread_id() == Some(thread_id) {
+            return self
+                .gateway
+                .capability_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.workspace.as_ref())
+                .is_some_and(|workspace| workspace.capabilities.can_create_thread);
+        }
+        self.thread_presentation_capabilities(thread_id)
+            .is_some_and(|capabilities| capabilities.can_write)
+    }
+
+    pub(in crate::app) fn can_start_active_thread_agent_presentation(&self) -> bool {
+        let Some(thread_id) = self.current_active_thread_id() else {
+            return false;
+        };
+        if self.draft_thread_id() == Some(thread_id) {
+            return self
+                .gateway
+                .capability_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.workspace.as_ref())
+                .is_some_and(|workspace| workspace.capabilities.can_create_thread);
+        }
+        self.thread_presentation_capabilities(thread_id)
+            .is_some_and(|capabilities| capabilities.can_start_turn)
+    }
+
+    pub(in crate::app) fn can_respond_to_agent_requests_presentation(
+        &self,
+        thread_id: Option<&str>,
+    ) -> bool {
+        if self
+            .principal_presentation_capabilities()
+            .can_manage_all_threads
+        {
+            return true;
+        }
+        thread_id
+            .and_then(|thread_id| self.thread_presentation_capabilities(thread_id))
+            .is_some_and(|capabilities| capabilities.can_respond_to_agent_requests)
+    }
+
+    pub(in crate::app) fn allowed_composer_permission_modes(
+        &self,
+    ) -> Vec<pioneer_protocol::TurnPermissionMode> {
+        self.gateway
+            .capability_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.workspace.as_ref())
+            .map(|workspace| workspace.capabilities.turn_permission_modes.clone())
+            .unwrap_or_default()
+    }
+
     pub(in crate::app) fn thread_tree_state(&self) -> &Entity<TreeState> {
         &self.thread_tree_state
     }

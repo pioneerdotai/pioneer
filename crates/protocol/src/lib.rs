@@ -6,6 +6,7 @@ mod app_url;
 mod artifact;
 mod audit;
 mod auth;
+mod authorization;
 mod cli_runtime;
 mod gateway_endpoint;
 mod id;
@@ -82,6 +83,12 @@ pub use auth::{
     encode_device_activation_entropy, format_device_activation_code,
     normalize_device_activation_code, normalize_device_activation_code_input,
 };
+pub use authorization::{
+    AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AuthorizationCapabilitiesParams,
+    AuthorizationCapabilitySnapshot, AuthorizationGlobalCapabilities,
+    AuthorizationThreadCapabilities, AuthorizationThreadCapabilitySnapshot,
+    AuthorizationWorkspaceCapabilities, AuthorizationWorkspaceCapabilitySnapshot,
+};
 pub use cli_runtime::{
     CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
     CLIRuntimeGetResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
@@ -117,8 +124,8 @@ pub use id::{
     TokenFamilyId, WorkspaceId, generate_id,
 };
 pub use identity::{
-    MEMBER_ROLE_KEY, PersistedActorRef, PrincipalKind, PrincipalStatus, ROLE_KEY_MAX_LEN, RoleKey,
-    RoleKeyError,
+    BUILT_IN_USER_ROLE_KEYS, MEMBER_ROLE_KEY, PersistedActorRef, PrincipalKind, PrincipalStatus,
+    ROLE_KEY_MAX_LEN, RoleKey, RoleKeyError, SUPERUSER_CAPABILITY_ROLE_KEY,
 };
 pub use invitation::{
     INVITATION_CREDENTIAL_BODY_LEN, INVITATION_CREDENTIAL_ENTROPY_BYTES,

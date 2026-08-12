@@ -480,6 +480,96 @@ impl TaskToolAuthorizationScope {
         }
         Ok(())
     }
+
+    async fn authorize_delivery_policy(
+        &self,
+        store: &CrudStore,
+        policy: Option<&TaskDeliveryPolicy>,
+    ) -> Result<(), ToolError> {
+        let Self::Member {
+            principal,
+            workspace_id,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let Some(policy) = policy else {
+            return Ok(());
+        };
+
+        match policy.mode {
+            TaskDeliveryMode::None
+            | TaskDeliveryMode::OwnerThread
+            | TaskDeliveryMode::UserNotification => Ok(()),
+            TaskDeliveryMode::Thread => {
+                let thread_id = policy
+                    .thread_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::invalid_arguments(
+                            "thread delivery requires deliveryPolicy.threadId",
+                        )
+                    })?;
+                let action = crate::authorization::ResourceAction::ThreadWrite;
+                let gate = crate::authorization::AuthorizationService::new().authorize_action(
+                    principal.kind,
+                    principal.role_key.as_ref(),
+                    action,
+                );
+                let resolver = crate::authorization::AuthorizationResolver::new(store.clone());
+                let mut resolution = resolver
+                    .authorize_thread(
+                        principal,
+                        &gate,
+                        action,
+                        thread_id,
+                        Some(workspace_id.as_str()),
+                    )
+                    .await;
+                if matches!(
+                    resolution.as_ref().ok().and_then(|value| value.denial()),
+                    Some(crate::authorization::AuthorizationDecision::Deny {
+                        reason: crate::authorization::DenyReason::MissingAuthoritativeResource,
+                        ..
+                    })
+                ) {
+                    resolution = resolver
+                        .authorize_internal_thread_via_root(
+                            principal,
+                            &gate,
+                            action,
+                            thread_id,
+                            Some(workspace_id.as_str()),
+                        )
+                        .await;
+                }
+                match resolution {
+                    Ok(crate::authorization::ProofResolution::Authorized(proof)) => {
+                        crate::authorization::record_task_tool_decision(action, proof.decision());
+                        Ok(())
+                    }
+                    Ok(crate::authorization::ProofResolution::Denied(decision)) => {
+                        crate::authorization::record_task_tool_decision(action, &decision);
+                        Err(task_tool_authorization_error())
+                    }
+                    Err(_) => {
+                        crate::authorization::record_authorization_unavailable(
+                            action.safe_name(),
+                            "thread",
+                            "tool",
+                        );
+                        Err(task_tool_authorization_error())
+                    }
+                }
+            }
+            TaskDeliveryMode::Webhook => Err(ToolError::invalid_arguments(
+                "webhook task delivery is unavailable to a Member execution",
+            )),
+        }
+    }
 }
 
 fn task_tool_authorization_error() -> ToolError {
@@ -1004,6 +1094,12 @@ impl TaskToolHandler {
             )
             .await?;
         let params = self.update_params(input).await?;
+        authorization
+            .authorize_delivery_policy(
+                self.processor.crud_store.as_ref(),
+                params.delivery_policy.as_ref(),
+            )
+            .await?;
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
@@ -1335,6 +1431,12 @@ impl TaskToolHandler {
             metadata: input.metadata,
         };
         authorization.constrain_create_params(&mut params);
+        authorization
+            .authorize_delivery_policy(
+                self.processor.crud_store.as_ref(),
+                params.delivery_policy.as_ref(),
+            )
+            .await?;
         Ok(params)
     }
 
@@ -3494,6 +3596,9 @@ fn wait_item_output(item: &pioneer_protocol::TaskWaitItem) -> JsonValue {
 fn review_required_item_output(item: &pioneer_protocol::TaskWaitReviewItem) -> JsonValue {
     let run = item.item.run.as_ref();
     let candidate = &item.candidate;
+    let owner_principal_id = (item.item.task.owner_kind == TaskOwnerKind::User)
+        .then(|| item.item.task.owner_id.clone())
+        .flatten();
     let review_mode = item
         .review_policy
         .as_ref()
@@ -3516,6 +3621,7 @@ fn review_required_item_output(item: &pioneer_protocol::TaskWaitReviewItem) -> J
         .collect::<Vec<_>>();
     json!({
         "taskId": item.item.task.id,
+        "ownerPrincipalId": owner_principal_id,
         "runId": run.map(|run| run.id.clone()).unwrap_or_else(|| candidate.run_id.clone()),
         "title": item.item.task.title,
         "status": wait_item_status(&item.item.task, run),
@@ -4186,6 +4292,106 @@ mod tests {
         assert_ne!(THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID);
     }
 
+    #[tokio::test]
+    async fn member_task_delivery_is_limited_to_authorized_threads_and_safe_modes() {
+        use crate::tests::authorization::{
+            IsolatedEpic4Harness, MEMBER_A_ID, THREAD_RED_INTERNAL_ID, THREAD_RED_PRIVATE_A_ID,
+            THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID,
+        };
+
+        let harness = IsolatedEpic4Harness::new()
+            .await
+            .expect("create isolated Epic 4 delivery fixture");
+        let store = CrudStore::new(harness.database.clone());
+        let scope = TaskToolAuthorizationScope::Member {
+            principal: crate::auth::AuthenticatedSessionPrincipal {
+                gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
+                    .expect("gateway id"),
+                principal_id: pioneer_protocol::PrincipalId::new(MEMBER_A_ID)
+                    .expect("Member principal id"),
+                kind: PrincipalKind::User,
+                role_key: Some(pioneer_protocol::RoleKey::member()),
+                device_id: pioneer_protocol::DeviceId::new("D0000000000000000000A")
+                    .expect("device id"),
+                session_id: pioneer_protocol::AuthSessionId::new("S0000000000000000000A")
+                    .expect("session id"),
+                access_jti: "task-delivery-test".to_owned(),
+                access_expires_at_unix: u64::MAX,
+            },
+            workspace_id: WORKSPACE_RED_ID.to_owned(),
+            root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
+        };
+        let policy =
+            |mode, thread_id: Option<&str>, webhook_url: Option<&str>| TaskDeliveryPolicy {
+                mode,
+                thread_id: thread_id.map(str::to_owned),
+                webhook_url: webhook_url.map(str::to_owned),
+                include_result: true,
+                format: pioneer_protocol::TaskDeliveryFormat::Summary,
+            };
+
+        for mode in [
+            TaskDeliveryMode::None,
+            TaskDeliveryMode::OwnerThread,
+            TaskDeliveryMode::UserNotification,
+        ] {
+            scope
+                .authorize_delivery_policy(&store, Some(&policy(mode, None, None)))
+                .await
+                .expect("safe Member delivery mode");
+        }
+        scope
+            .authorize_delivery_policy(
+                &store,
+                Some(&policy(
+                    TaskDeliveryMode::Thread,
+                    Some(THREAD_RED_PRIVATE_A_ID),
+                    None,
+                )),
+            )
+            .await
+            .expect("Member may deliver to its authorized root thread");
+        scope
+            .authorize_delivery_policy(
+                &store,
+                Some(&policy(
+                    TaskDeliveryMode::Thread,
+                    Some(THREAD_RED_INTERNAL_ID),
+                    None,
+                )),
+            )
+            .await
+            .expect("Member task result may return through persisted child-thread lineage");
+        assert!(
+            scope
+                .authorize_delivery_policy(
+                    &store,
+                    Some(&policy(
+                        TaskDeliveryMode::Thread,
+                        Some(THREAD_RED_PRIVATE_B_ID),
+                        None,
+                    )),
+                )
+                .await
+                .is_err(),
+            "delivery to another Member's private thread must fail closed"
+        );
+        assert!(
+            scope
+                .authorize_delivery_policy(
+                    &store,
+                    Some(&policy(
+                        TaskDeliveryMode::Webhook,
+                        None,
+                        Some("https://example.invalid/result"),
+                    )),
+                )
+                .await
+                .is_err(),
+            "detached webhook egress requires a future explicit capability"
+        );
+    }
+
     #[test]
     fn member_task_tool_creation_is_owned_by_the_initiating_principal() {
         let principal_id =
@@ -4485,7 +4691,7 @@ mod tests {
 
     #[test]
     fn task_wait_tool_output_renders_review_required_candidate() {
-        let response = sample_review_wait_response(
+        let mut response = sample_review_wait_response(
             vec![
                 pioneer_protocol::TaskWaitReviewAction::TaskAccept,
                 pioneer_protocol::TaskWaitReviewAction::TaskRevise,
@@ -4495,6 +4701,8 @@ mod tests {
             None,
             TaskResultCandidateStatus::PendingReview,
         );
+        response.review_required[0].item.task.owner_kind = TaskOwnerKind::User;
+        response.review_required[0].item.task.owner_id = Some("principal_member".to_owned());
         let signature = TaskWaitSignature {
             task_ids: vec!["task_1234567890123456".to_owned()],
             run_ids: Vec::new(),
@@ -4507,6 +4715,7 @@ mod tests {
         assert_eq!(output["completed"].as_array().unwrap().len(), 0);
         let review = &output["reviewRequired"][0];
         assert_eq!(review["taskId"], "task_1234567890123456");
+        assert_eq!(review["ownerPrincipalId"], "principal_member");
         assert_eq!(review["runId"], "run_12345678901234567");
         assert_eq!(review["status"], "waiting_review");
         assert_eq!(review["candidateId"], "candidate_123456789012");

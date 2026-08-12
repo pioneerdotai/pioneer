@@ -93,7 +93,7 @@ use AuthorizationAuditClass::{Authentication, Execution, Management, Mutation, R
 use DisclosurePolicy::{Forbidden, NotFound};
 use ResourceAction::{
     ArtifactDelete, ArtifactRead, ArtifactWrite, CliRuntimeManage, CliRuntimeUse, GatewayManage,
-    InvitationCreate, InvitationList, InvitationRevoke, McpManage, MemberDeviceCreate,
+    InvitationCreate, InvitationList, InvitationRevoke, McpManage, McpUse, MemberDeviceCreate,
     MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend, MemoryRead, MemoryWrite,
     ProfileUpdateOwn, ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn, SkillManage,
     SkillUse, TaskManage, TaskRead, TaskRun, ThreadCreate, ThreadManage, ThreadMove,
@@ -192,6 +192,13 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Authentication,
     ),
     method_entry(
+        AUTHORIZATION_CAPABILITIES,
+        SessionReadOwn,
+        OwnSession,
+        NotFound,
+        Authentication,
+    ),
+    method_entry(
         AUTH_PROFILE_UPDATE,
         ProfileUpdateOwn,
         OwnSession,
@@ -265,13 +272,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     method_entry(THREAD_TREE, WorkspaceRead, Workspace, NotFound, Read),
     method_entry(THREAD_UPDATE, ThreadManage, Thread, NotFound, Mutation),
     method_entry(THREAD_MOVE, ThreadMove, Thread, NotFound, Management),
-    method_entry(
-        THREAD_PARTICIPANTS_LIST,
-        ThreadParticipantsManage,
-        Thread,
-        NotFound,
-        Read,
-    ),
+    method_entry(THREAD_PARTICIPANTS_LIST, ThreadRead, Thread, NotFound, Read),
     method_entry(
         THREAD_PARTICIPANTS_ADD,
         ThreadParticipantsManage,
@@ -421,40 +422,22 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Forbidden,
         Management,
     ),
-    method_entry(
-        CLI_RUNTIME_LIST,
-        CliRuntimeManage,
-        Capability,
-        Forbidden,
-        Management,
-    ),
-    method_entry(
-        CLI_RUNTIME_GET,
-        CliRuntimeManage,
-        Capability,
-        Forbidden,
-        Management,
-    ),
-    method_entry(
-        CLI_RUNTIME_STATUS,
-        CliRuntimeManage,
-        Capability,
-        Forbidden,
-        Management,
-    ),
+    method_entry(CLI_RUNTIME_LIST, CliRuntimeUse, Workspace, NotFound, Read),
+    method_entry(CLI_RUNTIME_GET, CliRuntimeUse, Workspace, NotFound, Read),
+    method_entry(CLI_RUNTIME_STATUS, CliRuntimeUse, Workspace, NotFound, Read),
     method_entry(
         CLI_RUNTIME_REFRESH,
-        CliRuntimeManage,
-        Capability,
-        Forbidden,
-        Management,
+        CliRuntimeUse,
+        Workspace,
+        NotFound,
+        Execution,
     ),
     method_entry(
         CLI_RUNTIME_LIST_MODELS,
-        CliRuntimeManage,
-        Capability,
-        Forbidden,
-        Management,
+        CliRuntimeUse,
+        Workspace,
+        NotFound,
+        Read,
     ),
     method_entry(
         CLI_RUNTIME_THREAD_BINDING_GET,
@@ -619,7 +602,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Forbidden,
         Management,
     ),
-    method_entry(MCP_LIST, McpManage, Capability, Forbidden, Management),
+    method_entry(MCP_LIST, McpUse, Workspace, NotFound, Read),
     method_entry(MCP_INSTALL, McpManage, Capability, Forbidden, Management),
     method_entry(MCP_POLICY_SET, McpManage, Capability, Forbidden, Management),
     method_entry(
@@ -630,13 +613,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Management,
     ),
     method_entry(MCP_UNINSTALL, McpManage, Capability, Forbidden, Management),
-    method_entry(
-        MCP_SERVER_DETAILS,
-        McpManage,
-        Capability,
-        Forbidden,
-        Management,
-    ),
+    method_entry(MCP_SERVER_DETAILS, McpUse, Capability, NotFound, Read),
     method_entry(TASK_CREATE, TaskRun, Thread, NotFound, Execution),
     method_entry(TASK_GET, TaskRead, Task, NotFound, Read),
     method_entry(TASK_LIST, TaskRead, Task, NotFound, Read),
@@ -932,7 +909,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 139);
+        assert_eq!(registry.len(), 140);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());
@@ -1013,12 +990,75 @@ mod tests {
         for (method, action) in [
             (methods::ARTIFACT_CAPABILITIES, ResourceAction::ArtifactRead),
             (methods::SKILLS_LIST, ResourceAction::SkillUse),
+            (methods::CLI_RUNTIME_LIST, ResourceAction::CliRuntimeUse),
+            (methods::CLI_RUNTIME_GET, ResourceAction::CliRuntimeUse),
+            (methods::CLI_RUNTIME_STATUS, ResourceAction::CliRuntimeUse),
+            (
+                methods::CLI_RUNTIME_LIST_MODELS,
+                ResourceAction::CliRuntimeUse,
+            ),
+            (methods::MCP_LIST, ResourceAction::McpUse),
         ] {
             let entry = normal_method_entry(method).expect("registered discovery method");
             assert_eq!(entry.action, action);
             assert_eq!(entry.resolver, ResourceResolverKind::Workspace);
             assert_eq!(entry.disclosure, DisclosurePolicy::NotFound);
             assert_eq!(entry.audit, AuthorizationAuditClass::Read);
+        }
+
+        let refresh =
+            normal_method_entry(methods::CLI_RUNTIME_REFRESH).expect("registered runtime refresh");
+        assert_eq!(refresh.action, ResourceAction::CliRuntimeUse);
+        assert_eq!(refresh.resolver, ResourceResolverKind::Workspace);
+        assert_eq!(refresh.disclosure, DisclosurePolicy::NotFound);
+        assert_eq!(refresh.audit, AuthorizationAuditClass::Execution);
+
+        let mcp_details = normal_method_entry(methods::MCP_SERVER_DETAILS)
+            .expect("registered MCP details discovery");
+        assert_eq!(mcp_details.action, ResourceAction::McpUse);
+        assert_eq!(mcp_details.resolver, ResourceResolverKind::Capability);
+        assert_eq!(mcp_details.disclosure, DisclosurePolicy::NotFound);
+        assert_eq!(mcp_details.audit, AuthorizationAuditClass::Read);
+    }
+
+    #[test]
+    fn agent_control_methods_are_scoped_use_actions_not_gateway_management() {
+        for (method, action, resolver) in [
+            (
+                methods::TURN_PERMISSION_REQUEST_RESPOND,
+                ResourceAction::ThreadWrite,
+                ResourceResolverKind::Turn,
+            ),
+            (
+                methods::CLI_RUNTIME_REQUEST_RESPOND,
+                ResourceAction::CliRuntimeUse,
+                ResourceResolverKind::Turn,
+            ),
+            (
+                methods::CLI_RUNTIME_TURN_STEER,
+                ResourceAction::CliRuntimeUse,
+                ResourceResolverKind::Turn,
+            ),
+            (
+                methods::CLI_RUNTIME_REVIEW_START,
+                ResourceAction::CliRuntimeUse,
+                ResourceResolverKind::Thread,
+            ),
+            (
+                methods::TASK_CREATE,
+                ResourceAction::TaskRun,
+                ResourceResolverKind::Thread,
+            ),
+            (
+                methods::TASK_ACCEPT,
+                ResourceAction::TaskManage,
+                ResourceResolverKind::Task,
+            ),
+        ] {
+            let entry = normal_method_entry(method).expect("registered agent-control method");
+            assert_eq!(entry.action, action, "{method}");
+            assert_eq!(entry.resolver, resolver, "{method}");
+            assert_ne!(entry.audit, AuthorizationAuditClass::Management, "{method}");
         }
     }
 

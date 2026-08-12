@@ -24,6 +24,12 @@ use tracing::warn;
 
 impl PioneerDesktop {
     pub(super) fn install_skill_from_path(&mut self, source_path: String, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let Some(source_path) = skill_actions::normalize_skill_source_path(source_path.as_str())
         else {
             self.skills_error = Some(t!("skills.error.path_required").to_string());
@@ -180,6 +186,12 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
+        if !self
             .skills_management
             .packs
             .iter()
@@ -286,6 +298,12 @@ impl PioneerDesktop {
 
     pub(super) fn uninstall_skill_pack(&mut self, pack_id: SkillPackId, cx: &mut Context<Self>) {
         if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
+        if !self
             .skills_management
             .packs
             .iter()
@@ -365,6 +383,12 @@ impl PioneerDesktop {
         source_path: String,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         if skill_actions::skill_lifecycle_editable(
             self.installed_skills.as_slice(),
             self.skills_catalog.as_slice(),
@@ -478,6 +502,12 @@ impl PioneerDesktop {
     }
 
     pub(super) fn uninstall_skill(&mut self, skill_id: SkillId, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         if skill_actions::skill_lifecycle_editable(
             self.installed_skills.as_slice(),
             self.skills_catalog.as_slice(),
@@ -565,6 +595,12 @@ impl PioneerDesktop {
         allow_implicit_invocation: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let allow_implicit_invocation = skill_actions::effective_allow_implicit_invocation(
             allow_implicit_invocation,
             skill_actions::skill_policy_implicit_editable(

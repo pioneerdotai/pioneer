@@ -376,12 +376,14 @@ async fn persist_completed_message_turn(
         Some(RuntimeDraftCreator::Member {
             gateway_id,
             principal_id,
+            access_class,
         }) => {
             crud_store
                 .materialize_new_member_completed_message_turn_with_permission_audit(
                     write(),
                     gateway_id,
                     principal_id,
+                    *access_class,
                 )
                 .await
         }

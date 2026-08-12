@@ -18,6 +18,12 @@ impl PioneerDesktop {
         clear_proxy: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let plan = provider_actions::plan_provider_configure(
             self.gateway.connection_state == GatewayConnectionState::Connected,
             self.gateway.ws_connection_id,
@@ -93,6 +99,12 @@ impl PioneerDesktop {
     }
 
     pub(super) fn delete_provider_api_key(&mut self, provider_id: String, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let plan = provider_actions::plan_provider_delete_api_key(
             self.gateway.connection_state == GatewayConnectionState::Connected,
             self.gateway.ws_connection_id,
@@ -357,6 +369,14 @@ impl PioneerDesktop {
         draft: cli_provider_settings::CLIRuntimeProviderDraft,
         cx: &mut Context<Self>,
     ) -> Result<(), cli_provider_settings::CLIRuntimeProviderSettingsRejection> {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return Err(
+                cli_provider_settings::CLIRuntimeProviderSettingsRejection::MissingSettings,
+            );
+        }
         let plan = cli_provider_settings::plan_cli_runtime_provider_draft_update(
             self.gateway.settings.as_ref(),
             &draft,
@@ -386,6 +406,12 @@ impl PioneerDesktop {
         value: String,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let Some(instance) = cli_provider_settings::find_cli_runtime_provider_instance(
             self.gateway.settings.as_ref(),
             runtime_id.as_str(),
@@ -426,6 +452,12 @@ impl PioneerDesktop {
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let plan = cli_provider_settings::plan_cli_runtime_provider_enabled_update(
             self.gateway.settings.as_ref(),
             runtime_id.as_str(),

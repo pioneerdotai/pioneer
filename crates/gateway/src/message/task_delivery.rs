@@ -160,19 +160,85 @@ impl MessageProcessor {
             .created_by_turn_id
             .as_deref()
             .ok_or_else(|| anyhow!("user-owned task delivery has no initiating turn"))?;
-        let context = self
-            .revalidate_execution_authorization_for_turn(
+        let current = self
+            .revalidate_tool_execution_authorization(
                 root_task.workspace_id.as_str(),
                 root_thread_id,
                 root_turn_id,
+                Some(owner_id),
                 crate::authorization::ResourceAction::ThreadWrite,
             )
             .await
             .map_err(|_| {
                 anyhow!("task delivery withheld because initiating authority is no longer active")
+            })?
+            .ok_or_else(|| {
+                anyhow!("task delivery withheld because initiating authority is unavailable")
             })?;
-        if context.initiating_principal_id().as_str() != owner_id {
+        if current.principal().principal_id.as_str() != owner_id {
             bail!("task delivery withheld because initiating principal lost root-thread access");
+        }
+
+        match delivery.mode {
+            TaskDeliveryMode::None => {}
+            TaskDeliveryMode::UserNotification => {
+                if delivery.target_user_id.as_deref() != Some(owner_id) {
+                    bail!("task delivery target does not match the initiating principal");
+                }
+            }
+            TaskDeliveryMode::Webhook => {
+                bail!("webhook task delivery is unavailable to a Member execution");
+            }
+            TaskDeliveryMode::OwnerThread | TaskDeliveryMode::Thread => {
+                let target_thread_id = delivery
+                    .target_thread_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("task delivery has no target thread"))?;
+                let action = crate::authorization::ResourceAction::ThreadWrite;
+                let gate = crate::authorization::AuthorizationService::new().authorize_action(
+                    current.principal().kind,
+                    current.principal().role_key.as_ref(),
+                    action,
+                );
+                let resolver = crate::authorization::AuthorizationResolver::new(
+                    self.crud_store.as_ref().clone(),
+                );
+                let mut resolution = resolver
+                    .authorize_thread(
+                        current.principal(),
+                        &gate,
+                        action,
+                        target_thread_id,
+                        Some(delivery.workspace_id.as_str()),
+                    )
+                    .await?;
+                if matches!(
+                    resolution.denial(),
+                    Some(crate::authorization::AuthorizationDecision::Deny {
+                        reason: crate::authorization::DenyReason::MissingAuthoritativeResource,
+                        ..
+                    })
+                ) {
+                    resolution = resolver
+                        .authorize_internal_thread_via_root(
+                            current.principal(),
+                            &gate,
+                            action,
+                            target_thread_id,
+                            Some(delivery.workspace_id.as_str()),
+                        )
+                        .await?;
+                }
+                match resolution {
+                    crate::authorization::ProofResolution::Authorized(proof) => {
+                        crate::authorization::record_task_tool_decision(action, proof.decision());
+                    }
+                    crate::authorization::ProofResolution::Denied(decision) => {
+                        crate::authorization::record_task_tool_decision(action, &decision);
+                        bail!("task delivery target is no longer authorized");
+                    }
+                }
+            }
         }
         Ok(())
     }

@@ -5,6 +5,7 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     StyledExt, WindowExt,
+    dialog::DialogFooter,
     form::{field, v_form},
     input::{Input, InputState},
     v_flex,
@@ -18,6 +19,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_manage_thread_presentation(thread_id.as_str()) {
+            return;
+        }
         let Some(coordinator) = self.thread_coordinator(thread_id.as_str()) else {
             return;
         };
@@ -64,31 +68,29 @@ impl PioneerDesktop {
                     let save_rename = save_rename.clone();
                     move |_, _, cx| save_rename(cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let save_rename = save_rename.clone();
-                    move |_, _, _, _| {
-                        vec![
-                            default_outline_button("rename-thread-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .outline()
-                                .on_click(|_, window, cx| {
-                                    window.close_dialog(cx);
-                                })
-                                .into_any_element(),
-                            default_primary_button("rename-thread-save")
-                                .label(t!("buttons.save").to_string())
-                                .on_click({
-                                    let save_rename = save_rename.clone();
-                                    move |_, window, cx| {
-                                        if save_rename(cx) {
-                                            window.close_dialog(cx);
-                                        }
+                    vec![
+                        default_outline_button("rename-thread-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            })
+                            .into_any_element(),
+                        default_primary_button("rename-thread-save")
+                            .label(t!("buttons.save").to_string())
+                            .on_click({
+                                let save_rename = save_rename.clone();
+                                move |_, window, cx| {
+                                    if save_rename(cx) {
+                                        window.close_dialog(cx);
                                     }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_flex()
                         .w_full()
@@ -117,6 +119,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         let Some(folder) = self.thread_folder(folder_id.as_str()).cloned() else {
             return;
         };
@@ -159,31 +167,29 @@ impl PioneerDesktop {
                     let save_rename = save_rename.clone();
                     move |_, _, cx| save_rename(cx)
                 })
-                .footer({
+                .footer(DialogFooter::new().children({
                     let save_rename = save_rename.clone();
-                    move |_, _, _, _| {
-                        vec![
-                            default_outline_button("rename-folder-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .outline()
-                                .on_click(|_, window, cx| {
-                                    window.close_dialog(cx);
-                                })
-                                .into_any_element(),
-                            default_primary_button("rename-folder-save")
-                                .label(t!("buttons.save").to_string())
-                                .on_click({
-                                    let save_rename = save_rename.clone();
-                                    move |_, window, cx| {
-                                        if save_rename(cx) {
-                                            window.close_dialog(cx);
-                                        }
+                    vec![
+                        default_outline_button("rename-folder-cancel")
+                            .label(t!("buttons.cancel").to_string())
+                            .outline()
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                            })
+                            .into_any_element(),
+                        default_primary_button("rename-folder-save")
+                            .label(t!("buttons.save").to_string())
+                            .on_click({
+                                let save_rename = save_rename.clone();
+                                move |_, window, cx| {
+                                    if save_rename(cx) {
+                                        window.close_dialog(cx);
                                     }
-                                })
-                                .into_any_element(),
-                        ]
-                    }
-                })
+                                }
+                            })
+                            .into_any_element(),
+                    ]
+                }))
                 .child(
                     v_flex()
                         .w_full()

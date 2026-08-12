@@ -246,6 +246,7 @@ fn skill_management_order(left: &SkillListItem, right: &SkillListItem) -> std::c
 pub fn load_skills_snapshot<TTransport>(
     transport: &TTransport,
     workspace_id: impl Into<String>,
+    include_management_health: bool,
 ) -> Result<SkillsCatalogSnapshot>
 where
     TTransport: SkillSnapshotTransport,
@@ -253,7 +254,7 @@ where
     let workspace_id = workspace_id.into();
     let list = transport.skills_list(skill_list_params(workspace_id.clone()))?;
     let targets = skill_health::skill_health_targets(list.skills.as_slice());
-    let health_items = if targets.is_empty() {
+    let health_items = if !include_management_health || targets.is_empty() {
         Vec::new()
     } else {
         transport
@@ -623,7 +624,7 @@ mod tests {
         );
         transport.packs.push(parent);
 
-        let snapshot = load_skills_snapshot(&transport, "workspace").expect("snapshot");
+        let snapshot = load_skills_snapshot(&transport, "workspace", true).expect("snapshot");
 
         assert_eq!(
             transport.requests.borrow().as_slice(),

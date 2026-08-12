@@ -18,6 +18,13 @@ pub use runtime::{GatewayRuntime, ensure_runtime_home_dir};
 pub(crate) use ws::DesktopGatewayWsCommandSenderExt;
 pub use ws::GatewayWsCommandSender;
 
+pub(crate) fn is_supported_session_principal_kind(kind: &pioneer_protocol::PrincipalKind) -> bool {
+    matches!(
+        kind,
+        pioneer_protocol::PrincipalKind::Superuser | pioneer_protocol::PrincipalKind::User
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

@@ -6,7 +6,7 @@ use pioneer_entity::{
     task, task_run, thread, thread_lineage, turn, workspace,
 };
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter};
 
 use super::identity::actor_ref_from_db;
 use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
@@ -553,14 +553,23 @@ pub async fn resolve_persisted_capability_authorization_scope<C: ConnectionTrait
             let Some(server) = mcp_server_installation::Entity::find()
                 .filter(mcp_server_installation::Column::ScopeKind.eq("workspace"))
                 .filter(mcp_server_installation::Column::ScopeKey.eq(workspace_id.to_owned()))
-                .filter(mcp_server_installation::Column::Name.eq(capability_id.to_owned()))
+                .filter(
+                    Condition::any()
+                        .add(mcp_server_installation::Column::Id.eq(capability_id.to_owned()))
+                        .add(mcp_server_installation::Column::Name.eq(capability_id.to_owned())),
+                )
                 .one(db)
                 .await
                 .context("failed to resolve workspace MCP capability policy")?
             else {
                 return Ok(None);
             };
-            server.enabled
+            return Ok(Some(CapabilityAuthorizationScope {
+                workspace_id: workspace.workspace_id,
+                capability_id: server.name,
+                workspace_is_active: workspace.is_active,
+                enabled: server.enabled,
+            }));
         }
     };
     Ok(Some(CapabilityAuthorizationScope {

@@ -280,6 +280,26 @@ impl MessageProcessor {
             return denied;
         }
 
+        let service = AuthorizationService::new();
+        let gate = service.authorize_action(
+            request_context.principal().kind,
+            request_context.role_key(),
+            action,
+        );
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        if let Ok(ProofResolution::Authorized(proof)) = resolver
+            .authorize_internal_thread_via_root(
+                request_context.principal(),
+                &gate,
+                action,
+                thread_id,
+                Some(workspace_id),
+            )
+            .await
+        {
+            return proof.decision().clone();
+        }
+
         match self
             .authorize_runtime_draft_for_request(
                 request_context,

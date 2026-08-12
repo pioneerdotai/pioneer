@@ -322,6 +322,7 @@ impl AdministrationEventTracker {
 pub struct AdministrationCache {
     invitations: Vec<InvitationSummary>,
     members: Vec<MemberSummary>,
+    member_directory_loaded: bool,
     workspace_members: BTreeMap<WorkspaceId, Vec<MemberSummary>>,
     invitation_next_cursor: Option<String>,
     member_next_cursor: Option<String>,
@@ -337,6 +338,14 @@ impl AdministrationCache {
 
     pub fn members(&self) -> impl Iterator<Item = &MemberSummary> {
         self.members.iter()
+    }
+
+    pub fn member_directory_loaded(&self) -> bool {
+        self.member_directory_loaded
+    }
+
+    pub fn member_directory_complete(&self) -> bool {
+        self.member_directory_loaded && self.member_next_cursor.is_none()
     }
 
     pub fn workspace_members(&self, workspace_id: &WorkspaceId) -> Option<&[MemberSummary]> {
@@ -410,10 +419,12 @@ impl AdministrationCache {
     pub fn apply_member_list(&mut self, response: MemberListResponse) {
         self.members = response.members;
         self.member_next_cursor = response.next_cursor;
+        self.member_directory_loaded = true;
     }
 
     pub fn append_member_page(&mut self, response: MemberListResponse) {
         self.member_next_cursor = response.next_cursor.clone();
+        self.member_directory_loaded = true;
         let mut known = self
             .members
             .iter()
@@ -485,6 +496,7 @@ impl AdministrationCache {
         let Ok(workspace_id) = WorkspaceId::new(notification.workspace_id.clone()) else {
             self.members.clear();
             self.member_next_cursor = None;
+            self.member_directory_loaded = false;
             self.event_tracker.clear_member_revisions();
             return AdministrationInvalidation {
                 apply: true,
@@ -500,6 +512,7 @@ impl AdministrationCache {
         // after this change. Other workspace snapshots remain intact.
         self.members.clear();
         self.member_next_cursor = None;
+        self.member_directory_loaded = false;
         self.event_tracker.clear_member_revisions();
 
         AdministrationInvalidation {
@@ -532,6 +545,7 @@ impl AdministrationCache {
         self.members
             .retain(|member| member.principal_id != notification.principal_id);
         self.member_next_cursor = None;
+        self.member_directory_loaded = false;
         let affected_workspaces = self
             .workspace_members
             .iter()
@@ -570,6 +584,7 @@ impl AdministrationCache {
         // add or remove directory rows even when no profile itself changed.
         self.members.clear();
         self.member_next_cursor = None;
+        self.member_directory_loaded = false;
         AdministrationInvalidation {
             apply: true,
             effects: vec![
@@ -747,6 +762,7 @@ mod tests {
             ]
         );
         assert!(cache.members().next().is_none());
+        assert!(!cache.member_directory_loaded());
         assert!(cache.workspace_members(&workspace_id).is_none());
 
         cache.apply_member_list(MemberListResponse {
@@ -774,6 +790,7 @@ mod tests {
             ]
         );
         assert!(cache.members().next().is_none());
+        assert!(!cache.member_directory_loaded());
         assert!(cache.workspace_members(&workspace_id).is_none());
     }
 
@@ -793,6 +810,8 @@ mod tests {
     #[test]
     fn authoritative_refetch_replaces_stale_rows_and_pages_append_in_server_order() {
         let mut cache = AdministrationCache::default();
+        assert!(!cache.member_directory_loaded());
+        assert!(!cache.member_directory_complete());
         cache.apply_invitation_list(InvitationListResponse {
             invitations: vec![
                 invitation("IBBBBBBBBBBBBBBBBBBBB"),
@@ -838,6 +857,8 @@ mod tests {
             ],
             next_cursor: Some("page-2".to_owned()),
         });
+        assert!(cache.member_directory_loaded());
+        assert!(!cache.member_directory_complete());
         cache.append_member_page(MemberListResponse {
             members: vec![
                 member("PAAAAAAAAAAAAAAAAAAAA"),
@@ -845,6 +866,7 @@ mod tests {
             ],
             next_cursor: None,
         });
+        assert!(cache.member_directory_complete());
         assert_eq!(
             cache
                 .members()
@@ -868,6 +890,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["PCCCCCCCCCCCCCCCCCCCC"]
         );
+        assert!(cache.member_directory_complete());
     }
 
     #[test]
@@ -914,6 +937,16 @@ mod tests {
 
         let target = member("PAAAAAAAAAAAAAAAAAAAA");
         let root = PrincipalPresentationCapabilities {
+            can_create_workspace: true,
+            can_manage_workspace: true,
+            can_manage_gateway_settings: true,
+            can_manage_capabilities: true,
+            can_use_providers: true,
+            can_use_cli_runtimes: true,
+            can_use_skills: true,
+            can_use_mcp: true,
+            can_run_tasks: true,
+            can_manage_all_threads: true,
             can_view_invitations: true,
             can_create_invitation: true,
             can_view_member_directory: true,
@@ -929,6 +962,16 @@ mod tests {
         assert!(!row.actions.can_add_to_workspace);
 
         let member_capabilities = PrincipalPresentationCapabilities {
+            can_create_workspace: false,
+            can_manage_workspace: false,
+            can_manage_gateway_settings: false,
+            can_manage_capabilities: false,
+            can_use_providers: true,
+            can_use_cli_runtimes: true,
+            can_use_skills: true,
+            can_use_mcp: true,
+            can_run_tasks: true,
+            can_manage_all_threads: false,
             can_view_invitations: true,
             can_create_invitation: true,
             can_view_member_directory: true,

@@ -10,12 +10,12 @@ use crate::{
     threads::start::ThreadStartCoordinator,
 };
 use pioneer_protocol::{
-    AccessChangeKind, AccessChangedNotification, AuthMeResponse, AuthSessionListItem,
-    AuthSessionStatus, DeviceStatus, MemberSummary, PrincipalId, PrincipalKind, RoleKey,
+    AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AccessChangeKind, AccessChangedNotification,
+    AuthMeResponse, AuthSessionListItem, AuthSessionStatus, AuthorizationCapabilitySnapshot,
+    AuthorizationThreadCapabilities, DeviceStatus, MemberSummary, PrincipalId, PrincipalKind,
 };
 
-/// Global, shell-neutral discoverability derived from the authenticated
-/// principal snapshot.
+/// Shell-neutral compatibility projection of the Gateway capability snapshot.
 ///
 /// These flags are presentation hints only. The Gateway remains authoritative
 /// for every operation and callers must still handle an authoritative denial.
@@ -23,6 +23,16 @@ use pioneer_protocol::{
 #[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PrincipalPresentationCapabilities {
+    pub can_create_workspace: bool,
+    pub can_manage_workspace: bool,
+    pub can_manage_gateway_settings: bool,
+    pub can_manage_capabilities: bool,
+    pub can_use_providers: bool,
+    pub can_use_cli_runtimes: bool,
+    pub can_use_skills: bool,
+    pub can_use_mcp: bool,
+    pub can_run_tasks: bool,
+    pub can_manage_all_threads: bool,
     pub can_view_invitations: bool,
     pub can_create_invitation: bool,
     pub can_view_member_directory: bool,
@@ -108,6 +118,7 @@ pub fn current_principal_kind_presentation(
 pub fn current_principal_presentation(
     auth: &AuthMeResponse,
     visible_member: Option<&MemberSummary>,
+    capabilities: PrincipalPresentationCapabilities,
 ) -> CurrentPrincipalPresentation {
     let avatar_revision = auth.principal.avatar_revision.clone().or_else(|| {
         visible_member
@@ -122,85 +133,106 @@ pub fn current_principal_presentation(
         kind: current_principal_kind_presentation(Some(auth.principal.kind)),
         avatar_revision,
         read_only: false,
-        capabilities: principal_presentation_capabilities_from_auth(auth),
+        capabilities,
     }
-}
-
-/// Server-owned resource facts needed to decide whether thread-management UI
-/// is discoverable. Shells must obtain these facts from an authoritative
-/// thread detail/action response rather than infer them from a cached list row.
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadPresentationFacts {
-    pub is_user_thread: bool,
-    pub is_private_thread: bool,
-    pub current_principal_is_creator: bool,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadPresentationCapabilities {
+    pub can_read: bool,
+    pub can_write: bool,
+    pub can_start_turn: bool,
+    pub can_respond_to_agent_requests: bool,
+    pub can_control_cli_runtime: bool,
+    pub can_create_task: bool,
+    pub can_read_artifacts: bool,
+    pub can_write_artifacts: bool,
     pub can_manage_thread: bool,
     pub can_manage_private_participants: bool,
+    pub can_move: bool,
 }
 
-/// Derive global presentation capabilities from server-owned identity facts.
-/// Missing/future principal kinds and unsupported roles fail closed.
+/// Flatten the context-aware server snapshot for existing shell components.
+/// This performs no role inference: every output bit comes from the Gateway.
 pub fn principal_presentation_capabilities(
-    principal_kind: Option<PrincipalKind>,
-    role_key: Option<&RoleKey>,
+    snapshot: &AuthorizationCapabilitySnapshot,
 ) -> PrincipalPresentationCapabilities {
-    match (principal_kind, role_key) {
-        (Some(PrincipalKind::Superuser), None) => PrincipalPresentationCapabilities {
-            can_view_invitations: true,
-            can_create_invitation: true,
-            can_view_member_directory: true,
-            can_add_workspace_member: true,
-            can_manage_member_lifecycle: true,
-            can_remove_workspace_member: true,
-            can_manage_own_sessions: true,
-        },
-        (Some(PrincipalKind::User), Some(role_key)) if role_key.is_supported() => {
-            PrincipalPresentationCapabilities {
-                can_view_invitations: true,
-                can_create_invitation: true,
-                can_view_member_directory: true,
-                can_add_workspace_member: true,
-                can_manage_member_lifecycle: false,
-                can_remove_workspace_member: false,
-                can_manage_own_sessions: true,
-            }
-        }
-        _ => PrincipalPresentationCapabilities::default(),
+    if snapshot.schema_version != AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION {
+        return PrincipalPresentationCapabilities::default();
+    }
+    let workspace = snapshot.workspace.as_ref().map(|value| &value.capabilities);
+    PrincipalPresentationCapabilities {
+        can_create_workspace: snapshot.global.can_create_workspace,
+        can_manage_workspace: workspace.is_some_and(|value| value.can_manage),
+        can_manage_gateway_settings: snapshot.global.can_manage_gateway_settings,
+        can_manage_capabilities: snapshot.global.can_manage_capabilities,
+        can_use_providers: workspace.is_some_and(|value| value.can_use_providers),
+        can_use_cli_runtimes: workspace.is_some_and(|value| value.can_use_cli_runtimes),
+        can_use_skills: workspace.is_some_and(|value| value.can_use_skills),
+        can_use_mcp: workspace.is_some_and(|value| value.can_use_mcp),
+        can_run_tasks: workspace.is_some_and(|value| value.can_run_tasks),
+        can_manage_all_threads: snapshot.global.can_manage_all_threads,
+        can_view_invitations: snapshot.global.can_view_invitations,
+        can_create_invitation: snapshot.global.can_create_invitation,
+        can_view_member_directory: snapshot.global.can_view_member_directory,
+        can_add_workspace_member: workspace.is_some_and(|value| value.can_add_member),
+        can_manage_member_lifecycle: snapshot.global.can_manage_member_lifecycle,
+        can_remove_workspace_member: workspace.is_some_and(|value| value.can_remove_member),
+        can_manage_own_sessions: snapshot.global.can_manage_own_sessions,
     }
 }
 
-pub fn principal_presentation_capabilities_from_auth(
-    auth: &AuthMeResponse,
-) -> PrincipalPresentationCapabilities {
-    principal_presentation_capabilities(Some(auth.principal.kind), auth.role_key.as_ref())
+/// Validate that a server snapshot belongs to the request context before it
+/// is cached by a shell. Missing scoped projections are valid and mean that
+/// the scoped capability set is empty; mismatched projections are rejected.
+pub fn authorization_capability_snapshot_is_compatible(
+    snapshot: &AuthorizationCapabilitySnapshot,
+    expected_principal_id: &PrincipalId,
+    expected_workspace_id: Option<&str>,
+    expected_thread_id: Option<&str>,
+) -> bool {
+    if snapshot.schema_version != AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION
+        || &snapshot.principal_id != expected_principal_id
+    {
+        return false;
+    }
+    if snapshot
+        .workspace
+        .as_ref()
+        .is_some_and(|workspace| Some(workspace.workspace_id.as_str()) != expected_workspace_id)
+    {
+        return false;
+    }
+    if snapshot.thread.as_ref().is_some_and(|thread| {
+        Some(thread.thread_id.as_str()) != expected_thread_id
+            || Some(thread.workspace_id.as_str()) != expected_workspace_id
+    }) {
+        return false;
+    }
+    true
 }
 
-/// Derive resource-scoped thread discoverability. This output is never an
-/// authorization proof and must not be sent back as one.
+/// Project Gateway-owned thread flags into the shell vocabulary.
 pub fn thread_presentation_capabilities(
-    principal_kind: Option<PrincipalKind>,
-    role_key: Option<&RoleKey>,
-    facts: ThreadPresentationFacts,
+    capabilities: Option<&AuthorizationThreadCapabilities>,
 ) -> ThreadPresentationCapabilities {
-    let recognized_superuser =
-        matches!(principal_kind, Some(PrincipalKind::Superuser)) && role_key.is_none();
-    let recognized_member = matches!(principal_kind, Some(PrincipalKind::User))
-        && role_key.is_some_and(RoleKey::is_supported);
-    let may_manage = facts.is_user_thread
-        && (recognized_superuser || (recognized_member && facts.current_principal_is_creator));
-
-    ThreadPresentationCapabilities {
-        can_manage_thread: may_manage,
-        can_manage_private_participants: may_manage && facts.is_private_thread,
-    }
+    capabilities.map_or_else(ThreadPresentationCapabilities::default, |capabilities| {
+        ThreadPresentationCapabilities {
+            can_read: capabilities.can_read,
+            can_write: capabilities.can_write,
+            can_start_turn: capabilities.can_start_turn,
+            can_respond_to_agent_requests: capabilities.can_respond_to_agent_requests,
+            can_control_cli_runtime: capabilities.can_control_cli_runtime,
+            can_create_task: capabilities.can_create_task,
+            can_read_artifacts: capabilities.can_read_artifacts,
+            can_write_artifacts: capabilities.can_write_artifacts,
+            can_manage_thread: capabilities.can_manage,
+            can_manage_private_participants: capabilities.can_manage_private_participants,
+            can_move: capabilities.can_move,
+        }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -469,8 +501,10 @@ mod tests {
         threads::coordinator::ThreadCoordinator,
     };
     use pioneer_protocol::{
-        AuthDeviceSnapshot, AuthSessionId, AuthSessionSnapshot, ClientKind, DeviceId, Thread,
-        ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, TokenFamilyId,
+        AuthDeviceSnapshot, AuthSessionId, AuthSessionSnapshot, AuthorizationGlobalCapabilities,
+        AuthorizationThreadCapabilities, AuthorizationWorkspaceCapabilities,
+        AuthorizationWorkspaceCapabilitySnapshot, ClientKind, DeviceId, Thread, ThreadMode,
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ThreadVisibility, TokenFamilyId,
         TurnPermissionActionKind, TurnPermissionApprovalRequest, TurnPermissionDecisionReason,
         Workspace,
     };
@@ -532,126 +566,170 @@ mod tests {
     }
 
     #[test]
-    fn principal_capability_matrix_is_bounded_and_future_roles_fail_closed() {
-        struct Case {
-            kind: Option<PrincipalKind>,
-            role: Option<RoleKey>,
-            expected: PrincipalPresentationCapabilities,
-        }
-
-        let cases = [
-            Case {
-                kind: Some(PrincipalKind::Superuser),
-                role: None,
-                expected: PrincipalPresentationCapabilities {
-                    can_view_invitations: true,
-                    can_create_invitation: true,
-                    can_view_member_directory: true,
-                    can_add_workspace_member: true,
-                    can_manage_member_lifecycle: true,
-                    can_remove_workspace_member: true,
-                    can_manage_own_sessions: true,
+    fn principal_capabilities_are_projected_without_role_inference() {
+        let snapshot = AuthorizationCapabilitySnapshot {
+            schema_version: 1,
+            authorization_revision: 42,
+            principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
+            // A future code-defined role must not require a client release:
+            // presentation is driven exclusively by the server-owned bits.
+            role_key: "future_role".to_owned(),
+            global: AuthorizationGlobalCapabilities {
+                can_create_workspace: true,
+                can_manage_gateway_settings: false,
+                can_manage_capabilities: true,
+                can_manage_all_threads: false,
+                can_view_invitations: true,
+                can_create_invitation: false,
+                can_view_member_directory: true,
+                can_manage_member_lifecycle: false,
+                can_manage_own_sessions: true,
+            },
+            workspace: Some(AuthorizationWorkspaceCapabilitySnapshot {
+                workspace_id: "workspace_1".to_owned(),
+                capabilities: AuthorizationWorkspaceCapabilities {
+                    can_read: true,
+                    can_create_thread: true,
+                    can_manage: false,
+                    can_use_providers: true,
+                    can_use_cli_runtimes: true,
+                    can_use_skills: false,
+                    can_use_mcp: true,
+                    can_run_tasks: true,
+                    turn_permission_modes: vec![
+                        pioneer_protocol::TurnPermissionMode::FullAccess,
+                        pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+                        pioneer_protocol::TurnPermissionMode::Supervised,
+                    ],
+                    can_list_members: true,
+                    can_add_member: true,
+                    can_remove_member: false,
+                    thread_visibility_options: vec![ThreadVisibility::Private],
                 },
-            },
-            Case {
-                kind: Some(PrincipalKind::User),
-                role: Some(RoleKey::member()),
-                expected: PrincipalPresentationCapabilities {
-                    can_view_invitations: true,
-                    can_create_invitation: true,
-                    can_view_member_directory: true,
-                    can_add_workspace_member: true,
-                    can_manage_member_lifecycle: false,
-                    can_remove_workspace_member: false,
-                    can_manage_own_sessions: true,
-                },
-            },
-            Case {
-                kind: Some(PrincipalKind::User),
-                role: Some(RoleKey::new("future_role").expect("valid future role")),
-                expected: PrincipalPresentationCapabilities::default(),
-            },
-            Case {
-                kind: None,
-                role: None,
-                expected: PrincipalPresentationCapabilities::default(),
-            },
-            Case {
-                kind: Some(PrincipalKind::Superuser),
-                role: Some(RoleKey::member()),
-                expected: PrincipalPresentationCapabilities::default(),
-            },
-        ];
+            }),
+            thread: None,
+        };
 
-        for case in cases {
-            assert_eq!(
-                principal_presentation_capabilities(case.kind, case.role.as_ref()),
-                case.expected
-            );
-        }
+        assert_eq!(
+            principal_presentation_capabilities(&snapshot),
+            PrincipalPresentationCapabilities {
+                can_create_workspace: true,
+                can_manage_workspace: false,
+                can_manage_gateway_settings: false,
+                can_manage_capabilities: true,
+                can_use_providers: true,
+                can_use_cli_runtimes: true,
+                can_use_skills: false,
+                can_use_mcp: true,
+                can_run_tasks: true,
+                can_manage_all_threads: false,
+                can_view_invitations: true,
+                can_create_invitation: false,
+                can_view_member_directory: true,
+                can_add_workspace_member: true,
+                can_manage_member_lifecycle: false,
+                can_remove_workspace_member: false,
+                can_manage_own_sessions: true,
+            }
+        );
     }
 
     #[test]
-    fn thread_capabilities_require_recognized_principal_and_explicit_resource_facts() {
-        let private_creator = ThreadPresentationFacts {
-            is_user_thread: true,
-            is_private_thread: true,
-            current_principal_is_creator: true,
+    fn thread_capabilities_are_projected_only_from_gateway_flags() {
+        let capabilities = AuthorizationThreadCapabilities {
+            can_read: true,
+            can_write: true,
+            can_start_turn: true,
+            can_respond_to_agent_requests: true,
+            can_control_cli_runtime: true,
+            can_create_task: true,
+            can_read_artifacts: true,
+            can_write_artifacts: true,
+            can_manage: true,
+            can_manage_private_participants: true,
+            can_move: false,
         };
-        let member = RoleKey::member();
-
         assert_eq!(
-            thread_presentation_capabilities(
-                Some(PrincipalKind::User),
-                Some(&member),
-                private_creator,
-            ),
+            thread_presentation_capabilities(Some(&capabilities)),
             ThreadPresentationCapabilities {
+                can_read: true,
+                can_write: true,
+                can_start_turn: true,
+                can_respond_to_agent_requests: true,
+                can_control_cli_runtime: true,
+                can_create_task: true,
+                can_read_artifacts: true,
+                can_write_artifacts: true,
                 can_manage_thread: true,
                 can_manage_private_participants: true,
+                can_move: false,
             }
         );
         assert_eq!(
-            thread_presentation_capabilities(
-                Some(PrincipalKind::User),
-                Some(&member),
-                ThreadPresentationFacts {
-                    current_principal_is_creator: false,
-                    ..private_creator
-                },
-            ),
-            ThreadPresentationCapabilities::default()
-        );
-        assert_eq!(
-            thread_presentation_capabilities(
-                Some(PrincipalKind::Superuser),
-                None,
-                ThreadPresentationFacts {
-                    is_private_thread: false,
-                    current_principal_is_creator: false,
-                    ..private_creator
-                },
-            ),
+            thread_presentation_capabilities(Some(&AuthorizationThreadCapabilities {
+                can_manage_private_participants: false,
+                ..capabilities
+            })),
             ThreadPresentationCapabilities {
+                can_read: true,
+                can_write: true,
+                can_start_turn: true,
+                can_respond_to_agent_requests: true,
+                can_control_cli_runtime: true,
+                can_create_task: true,
+                can_read_artifacts: true,
+                can_write_artifacts: true,
                 can_manage_thread: true,
                 can_manage_private_participants: false,
+                can_move: false,
             }
         );
         assert_eq!(
-            thread_presentation_capabilities(None, None, private_creator,),
+            thread_presentation_capabilities(None),
             ThreadPresentationCapabilities::default()
         );
+    }
+
+    #[test]
+    fn capability_snapshot_context_validation_rejects_wrong_version_or_scope() {
+        let principal_id = PrincipalId::new("P00000000000000000001").unwrap();
+        let snapshot = AuthorizationCapabilitySnapshot {
+            schema_version: 1,
+            authorization_revision: 1,
+            principal_id: principal_id.clone(),
+            role_key: "member".to_owned(),
+            global: AuthorizationGlobalCapabilities::default(),
+            workspace: Some(AuthorizationWorkspaceCapabilitySnapshot {
+                workspace_id: "workspace-a".to_owned(),
+                capabilities: AuthorizationWorkspaceCapabilities::default(),
+            }),
+            thread: None,
+        };
+
+        assert!(authorization_capability_snapshot_is_compatible(
+            &snapshot,
+            &principal_id,
+            Some("workspace-a"),
+            None,
+        ));
+        assert!(!authorization_capability_snapshot_is_compatible(
+            &snapshot,
+            &principal_id,
+            Some("workspace-b"),
+            None,
+        ));
+        let mut future = snapshot;
+        future.schema_version = 2;
         assert_eq!(
-            thread_presentation_capabilities(
-                Some(PrincipalKind::Superuser),
-                None,
-                ThreadPresentationFacts {
-                    is_user_thread: false,
-                    ..private_creator
-                },
-            ),
-            ThreadPresentationCapabilities::default()
+            principal_presentation_capabilities(&future),
+            PrincipalPresentationCapabilities::default()
         );
+        assert!(!authorization_capability_snapshot_is_compatible(
+            &future,
+            &principal_id,
+            Some("workspace-a"),
+            None,
+        ));
     }
 
     fn workspace(id: &str) -> Workspace {

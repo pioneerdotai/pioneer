@@ -50,6 +50,9 @@ impl PioneerDesktop {
         }
 
         let is_pending = self.is_mcp_pending(server.name.as_str());
+        let can_manage_capabilities = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
         let desktop_entity = cx.entity().clone();
         let status_color = Self::mcp_status_color(server.status, cx);
         let meta_grid_columns = self.mcp_details_meta_grid_columns(window);
@@ -90,72 +93,74 @@ impl PioneerDesktop {
                                     .child(Self::mcp_status_label(server.status)),
                             ),
                     )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("mcp-screen-enabled")
-                                    .xsmall()
-                                    .compact()
-                                    .h_6()
-                                    .px_3()
-                                    .when(server.policy.enabled, |this| this.primary())
-                                    .when(!server.policy.enabled, |this| this.outline())
-                                    .disabled(is_pending)
-                                    .label(t!("mcp.details.enabled").to_string())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let name = server.name.clone();
-                                        let next_enabled = !server.policy.enabled;
-                                        let implicit = server.policy.allow_implicit_invocation;
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.set_mcp_policy(
-                                                    name.clone(),
-                                                    next_enabled,
-                                                    implicit,
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            )
-                            .child(
-                                Button::new("mcp-screen-implicit")
-                                    .xsmall()
-                                    .compact()
-                                    .h_6()
-                                    .px_3()
-                                    .when(server.policy.allow_implicit_invocation, |this| {
-                                        this.primary()
-                                    })
-                                    .when(!server.policy.allow_implicit_invocation, |this| {
-                                        this.outline()
-                                    })
-                                    .disabled(is_pending)
-                                    .label(t!("mcp.details.implicit").to_string())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let name = server.name.clone();
-                                        let enabled = server.policy.enabled;
-                                        let next_implicit =
-                                            !server.policy.allow_implicit_invocation;
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.set_mcp_policy(
-                                                    name.clone(),
-                                                    enabled,
-                                                    next_implicit,
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            ),
-                    ),
+                    .when(can_manage_capabilities, |this| {
+                        this.child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Button::new("mcp-screen-enabled")
+                                        .xsmall()
+                                        .compact()
+                                        .h_6()
+                                        .px_3()
+                                        .when(server.policy.enabled, |this| this.primary())
+                                        .when(!server.policy.enabled, |this| this.outline())
+                                        .disabled(is_pending)
+                                        .label(t!("mcp.details.enabled").to_string())
+                                        .on_click({
+                                            let desktop_entity = desktop_entity.clone();
+                                            let name = server.name.clone();
+                                            let next_enabled = !server.policy.enabled;
+                                            let implicit = server.policy.allow_implicit_invocation;
+                                            move |_, _, cx| {
+                                                let _ = desktop_entity.update(cx, |view, cx| {
+                                                    view.set_mcp_policy(
+                                                        name.clone(),
+                                                        next_enabled,
+                                                        implicit,
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("mcp-screen-implicit")
+                                        .xsmall()
+                                        .compact()
+                                        .h_6()
+                                        .px_3()
+                                        .when(server.policy.allow_implicit_invocation, |this| {
+                                            this.primary()
+                                        })
+                                        .when(!server.policy.allow_implicit_invocation, |this| {
+                                            this.outline()
+                                        })
+                                        .disabled(is_pending)
+                                        .label(t!("mcp.details.implicit").to_string())
+                                        .on_click({
+                                            let desktop_entity = desktop_entity.clone();
+                                            let name = server.name.clone();
+                                            let enabled = server.policy.enabled;
+                                            let next_implicit =
+                                                !server.policy.allow_implicit_invocation;
+                                            move |_, _, cx| {
+                                                let _ = desktop_entity.update(cx, |view, cx| {
+                                                    view.set_mcp_policy(
+                                                        name.clone(),
+                                                        enabled,
+                                                        next_implicit,
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                    }),
             )
             .child(
                 v_flex()

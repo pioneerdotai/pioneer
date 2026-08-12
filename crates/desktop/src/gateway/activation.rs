@@ -13,6 +13,7 @@ use pioneer_protocol::{
 };
 use zeroize::Zeroizing;
 
+use super::is_supported_session_principal_kind;
 use super::secrets::{
     DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION, DesktopGatewaySessionSecret, DesktopSecrets,
 };
@@ -226,7 +227,7 @@ fn session_from_grant(
 ) -> Result<(DesktopGatewaySessionSecret, DesktopSessionAccessGrant)> {
     if grant.auth_protocol_version != pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION
         || expected_gateway_id.is_some_and(|expected| &grant.gateway.id != expected)
-        || grant.principal.kind != pioneer_protocol::PrincipalKind::Superuser
+        || !is_supported_session_principal_kind(&grant.principal.kind)
         || grant.device.installation_id != expected_installation_id
         || grant.device.client_kind != pioneer_protocol::ClientKind::Desktop
         || grant.device.status != pioneer_protocol::DeviceStatus::Active
@@ -426,6 +427,33 @@ mod tests {
         assert_eq!(
             endpoint.server_gateway_id.as_ref().map(GatewayId::as_str),
             Some("G00000000000000000001")
+        );
+    }
+
+    #[test]
+    fn activation_accepts_an_invited_member_session() {
+        let mut registry = registry();
+        let secrets = secrets();
+        let mut member_grant = grant();
+        member_grant.principal.kind = PrincipalKind::User;
+        member_grant.principal.display_name = "Invited Member".to_owned();
+        member_grant.principal.nickname = "invited_member".to_owned();
+
+        provision_endpoint_session(
+            &mut registry,
+            ENDPOINT_ID,
+            activation_code().as_str(),
+            &secrets,
+            |_, _, _| Ok(member_grant),
+            |_, _, _| panic!("valid member grant must not be cleaned up"),
+            |_| Ok(()),
+        )
+        .expect("provision invited member session");
+
+        assert!(
+            secrets
+                .has_gateway_session(ENDPOINT_ID)
+                .expect("inspect durable member envelope")
         );
     }
 

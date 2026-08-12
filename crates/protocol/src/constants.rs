@@ -1,5 +1,6 @@
 pub mod methods {
     pub const AUTH_ME: &str = "auth/me";
+    pub const AUTHORIZATION_CAPABILITIES: &str = "authorization/capabilities";
     pub const AUTH_PROFILE_UPDATE: &str = "auth/profile/update";
     pub const AUTH_SESSION_LIST: &str = "auth/session/list";
     pub const AUTH_SESSION_REVOKE: &str = "auth/session/revoke";
@@ -149,6 +150,7 @@ pub mod methods {
     /// excluded and listed in `RESTRICTED_AUTH_METHODS`.
     pub const NORMAL_METHODS: &[&str] = &[
         AUTH_ME,
+        AUTHORIZATION_CAPABILITIES,
         AUTH_PROFILE_UPDATE,
         AUTH_SESSION_LIST,
         AUTH_SESSION_REVOKE,

@@ -1107,6 +1107,30 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::tasks::review::TaskReviewPlanError
         ),
         schema_doc!(
+            "task_accept_params.json",
+            pioneer_protocol::TaskAcceptParams
+        ),
+        schema_doc!(
+            "task_accept_response.json",
+            pioneer_protocol::TaskAcceptResponse
+        ),
+        schema_doc!(
+            "task_revise_params.json",
+            pioneer_protocol::TaskReviseParams
+        ),
+        schema_doc!(
+            "task_revise_response.json",
+            pioneer_protocol::TaskReviseResponse
+        ),
+        schema_doc!(
+            "task_cancel_params.json",
+            pioneer_protocol::TaskCancelParams
+        ),
+        schema_doc!(
+            "task_cancel_response.json",
+            pioneer_protocol::TaskCancelResponse
+        ),
+        schema_doc!(
             "task_wait_review_display.json",
             crate::timeline::labels::TaskWaitReviewDisplay
         ),
@@ -1300,6 +1324,14 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "thread_participants_response.json",
             pioneer_protocol::ThreadParticipantsResponse
+        ),
+        schema_doc!(
+            "authorization_capabilities_params.json",
+            pioneer_protocol::AuthorizationCapabilitiesParams
+        ),
+        schema_doc!(
+            "authorization_capability_snapshot.json",
+            pioneer_protocol::AuthorizationCapabilitySnapshot
         ),
         schema_doc!(
             "thread_update_params.json",

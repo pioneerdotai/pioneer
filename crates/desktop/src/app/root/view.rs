@@ -15,6 +15,8 @@ impl Render for PioneerDesktop {
         let sheet_layer = gpui_component::Root::render_sheet_layer(window, cx);
         let dialog_layer = gpui_component::Root::render_dialog_layer(window, cx);
         let notification_layer = gpui_component::Root::render_notification_layer(window, cx);
+        let invitation_join = self.invitation_join.clone();
+        let invitation_active = invitation_join.is_some();
 
         let theme_icon = if cx.theme().mode.is_dark() {
             gpui_component::IconName::Sun
@@ -23,12 +25,13 @@ impl Render for PioneerDesktop {
         };
 
         let is_gateway_setup_required = self.is_gateway_setup_required();
-        let show_gateway_switcher = !is_gateway_setup_required
-            || self
-                .gateway
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| !runtime.endpoints().is_empty());
+        let show_gateway_switcher = !invitation_active
+            && (!is_gateway_setup_required
+                || self
+                    .gateway
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| !runtime.endpoints().is_empty()));
         let is_settings_view_active = self.main_content_view == MainContentView::Settings;
         let is_providers_view_active = self.main_content_view == MainContentView::Providers;
         let is_administration_view_active =
@@ -44,7 +47,9 @@ impl Render for PioneerDesktop {
             .is_some_and(|settings| settings.general.keepawake);
         let keepawake_available = !is_gateway_setup_required && self.gateway.settings.is_some();
 
-        let body = if is_gateway_setup_required {
+        let body = if let Some(invitation_join) = invitation_join {
+            self.render_desktop_invitation_join(invitation_join, window, cx)
+        } else if is_gateway_setup_required {
             self.render_initial_setup(window, cx)
         } else {
             let desktop_entity = cx.entity().clone();

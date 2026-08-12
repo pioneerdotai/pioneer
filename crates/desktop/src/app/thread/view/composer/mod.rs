@@ -25,8 +25,15 @@ impl PioneerDesktop {
     pub(in crate::app::thread) fn can_submit_message(&self, cx: &Context<Self>) -> bool {
         let composer_text = self.composer_state.read(cx).value();
         let effective_capabilities = self.effective_composer_capabilities();
+        let scoped_write_allowed =
+            if self.composer_turn_mode == pioneer_protocol::ThreadMode::Message {
+                self.can_write_active_thread_presentation()
+            } else {
+                self.can_start_active_thread_agent_presentation()
+            };
         can_submit_composer_message(ComposerSubmitAvailabilityInput {
-            gateway_connected: desktop_composer_transport_ready(self.gateway.connection_state),
+            gateway_connected: desktop_composer_transport_ready(self.gateway.connection_state)
+                && scoped_write_allowed,
             upload_in_progress: self.composer_upload_in_progress,
             has_active_thread: self.current_active_thread_id().is_some(),
             selected_mode: self.composer_turn_mode,

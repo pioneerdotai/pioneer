@@ -184,6 +184,7 @@ impl PioneerDesktop {
                 .settings
                 .as_ref()
                 .map(|settings| settings.voice_input.enabled),
+            self.desktop_voice_status,
         );
         desktop_voice_entry_availability_for_context(
             DesktopVoiceEntryContext {
@@ -194,10 +195,14 @@ impl PioneerDesktop {
                 active_thread: self.current_active_thread_id().is_some(),
                 model_selected: self.composer_turn_mode == ThreadMode::Message
                     || self.has_complete_composer_model_selection(),
-                conversation_can_submit: self.composer_turn_mode == ThreadMode::Message
-                    || self
-                        .active_thread_conversation()
-                        .is_some_and(|conversation| conversation.can_submit_message()),
+                conversation_can_submit: if self.composer_turn_mode == ThreadMode::Message {
+                    self.can_write_active_thread_presentation()
+                } else {
+                    self.can_start_active_thread_agent_presentation()
+                        && self
+                            .active_thread_conversation()
+                            .is_some_and(|conversation| conversation.can_submit_message())
+                },
                 upload_idle: !self.composer_upload_in_progress,
             },
             voice_input_enabled,
@@ -213,6 +218,7 @@ impl PioneerDesktop {
     ) {
         if self.desktop_voice_composer.is_active()
             || self.desktop_voice_status != VoiceStatus::Ready
+            || self.desktop_voice_entry_availability() != DesktopVoiceEntryAvailability::Ready
         {
             return;
         }
@@ -722,8 +728,18 @@ fn desktop_voice_entry_availability_for_context(
     }
 }
 
-fn effective_voice_input_enabled(pending: Option<bool>, authoritative: Option<bool>) -> bool {
-    pending.or(authoritative).unwrap_or(false)
+fn effective_voice_input_enabled(
+    pending: Option<bool>,
+    authoritative: Option<bool>,
+    status: VoiceStatus,
+) -> bool {
+    // Gateway settings are a management projection and are intentionally not
+    // available to Members. The operational voice/status endpoint is the
+    // authoritative use-time projection for them. Preserve immediate admin
+    // toggle feedback when a settings value is locally available.
+    pending
+        .or(authoritative)
+        .unwrap_or(status == VoiceStatus::Ready)
 }
 
 fn desktop_voice_error_state_from_capture_error(
@@ -750,16 +766,41 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn pending_voice_disable_hides_microphone_before_gateway_ack() {
-        assert!(!effective_voice_input_enabled(Some(false), Some(true)));
-        assert!(effective_voice_input_enabled(Some(true), Some(false)));
-        assert!(effective_voice_input_enabled(None, Some(true)));
-        assert!(!effective_voice_input_enabled(None, Some(false)));
-        assert!(!effective_voice_input_enabled(None, None));
+        assert!(!effective_voice_input_enabled(
+            Some(false),
+            Some(true),
+            VoiceStatus::Ready
+        ));
+        assert!(effective_voice_input_enabled(
+            Some(true),
+            Some(false),
+            VoiceStatus::Unavailable
+        ));
+        assert!(effective_voice_input_enabled(
+            None,
+            Some(true),
+            VoiceStatus::Ready
+        ));
+        assert!(!effective_voice_input_enabled(
+            None,
+            Some(false),
+            VoiceStatus::Ready
+        ));
+        assert!(effective_voice_input_enabled(
+            None,
+            None,
+            VoiceStatus::Ready
+        ));
+        assert!(!effective_voice_input_enabled(
+            None,
+            None,
+            VoiceStatus::Unavailable
+        ));
 
         assert_eq!(
             desktop_voice_entry_availability_for_context(
                 READY_CONTEXT,
-                effective_voice_input_enabled(Some(false), Some(true)),
+                effective_voice_input_enabled(Some(false), Some(true), VoiceStatus::Unavailable,),
                 VoiceStatus::Unavailable,
             ),
             DesktopVoiceEntryAvailability::Hidden

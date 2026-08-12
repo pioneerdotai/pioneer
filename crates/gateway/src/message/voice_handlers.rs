@@ -877,6 +877,24 @@ impl MessageProcessor {
                     }
                 ) =>
             {
+                if let crate::authorization::ProofResolution::Authorized(proof) = resolver
+                    .authorize_internal_thread_via_root(
+                        request_context.principal(),
+                        &gate,
+                        action,
+                        thread_id,
+                        Some(workspace_id),
+                    )
+                    .await
+                    .ok()?
+                {
+                    return crate::authorization::ExecutionAuthorizationAdmission::from_authorized_thread(
+                        request_context,
+                        &proof,
+                        self.authorization_invalidation_hub.current_revision(),
+                    )
+                    .ok();
+                }
                 let (access, _) = self
                     .authorize_runtime_draft_for_request(
                         request_context,

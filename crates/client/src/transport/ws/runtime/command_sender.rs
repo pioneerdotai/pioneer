@@ -188,6 +188,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::auth_me(self)
     }
 
+    pub fn authorization_capabilities(
+        &self,
+        params: AuthorizationCapabilitiesParams,
+    ) -> Result<AuthorizationCapabilitySnapshot> {
+        client_ws_commands::authorization_capabilities(self, params)
+    }
+
     pub fn auth_profile_update(
         &self,
         params: AuthProfileUpdateParams,

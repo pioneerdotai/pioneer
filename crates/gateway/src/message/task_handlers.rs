@@ -16,6 +16,114 @@ fn task_authorization_unavailable(
 }
 
 impl MessageProcessor {
+    async fn require_member_task_delivery_policy(
+        &self,
+        request_context: &RequestContext,
+        request_id: &RequestId,
+        workspace_id: &str,
+        policy: Option<&pioneer_protocol::TaskDeliveryPolicy>,
+    ) -> bool {
+        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User {
+            return true;
+        }
+        let Some(policy) = policy else {
+            return true;
+        };
+        match policy.mode {
+            pioneer_protocol::TaskDeliveryMode::None
+            | pioneer_protocol::TaskDeliveryMode::OwnerThread
+            | pioneer_protocol::TaskDeliveryMode::UserNotification => true,
+            pioneer_protocol::TaskDeliveryMode::Webhook => {
+                self.send_error(
+                    request_context.connection_id(),
+                    crate::authorization::AuthorizationExternalError::Forbidden
+                        .response(request_id.clone()),
+                )
+                .await;
+                false
+            }
+            pioneer_protocol::TaskDeliveryMode::Thread => {
+                let Some(thread_id) = policy
+                    .thread_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    self.send_error(
+                        request_context.connection_id(),
+                        JsonRpcErrorResponse::new(
+                            Some(request_id.clone()),
+                            INVALID_PARAMS_CODE,
+                            "thread delivery requires delivery_policy.thread_id",
+                        ),
+                    )
+                    .await;
+                    return false;
+                };
+                let action = ResourceAction::ThreadWrite;
+                let gate = crate::authorization::AuthorizationService::new().authorize_action(
+                    request_context.principal().kind,
+                    request_context.principal().role_key.as_ref(),
+                    action,
+                );
+                let resolver = crate::authorization::AuthorizationResolver::new(
+                    self.crud_store.as_ref().clone(),
+                );
+                let mut resolution = resolver
+                    .authorize_thread(
+                        request_context.principal(),
+                        &gate,
+                        action,
+                        thread_id,
+                        Some(workspace_id),
+                    )
+                    .await;
+                if matches!(
+                    resolution.as_ref().ok().and_then(|value| value.denial()),
+                    Some(crate::authorization::AuthorizationDecision::Deny {
+                        reason: crate::authorization::DenyReason::MissingAuthoritativeResource,
+                        ..
+                    })
+                ) {
+                    resolution = resolver
+                        .authorize_internal_thread_via_root(
+                            request_context.principal(),
+                            &gate,
+                            action,
+                            thread_id,
+                            Some(workspace_id),
+                        )
+                        .await;
+                }
+                match resolution {
+                    Ok(crate::authorization::ProofResolution::Authorized(_)) => true,
+                    Ok(crate::authorization::ProofResolution::Denied(_)) => {
+                        self.send_error(
+                            request_context.connection_id(),
+                            crate::authorization::AuthorizationExternalError::NotFound
+                                .response(request_id.clone()),
+                        )
+                        .await;
+                        false
+                    }
+                    Err(_) => {
+                        self.send_error(
+                            request_context.connection_id(),
+                            task_authorization_unavailable(
+                                request_id.clone(),
+                                action,
+                                "thread",
+                                "execution",
+                            ),
+                        )
+                        .await;
+                        false
+                    }
+                }
+            }
+        }
+    }
+
     async fn require_member_task_proof(
         &self,
         request_context: &RequestContext,
@@ -270,6 +378,17 @@ impl MessageProcessor {
                         return;
                     }
                 }
+            }
+            if !self
+                .require_member_task_delivery_policy(
+                    request_context,
+                    &request_id,
+                    authorized_thread.workspace_id(),
+                    params.delivery_policy.as_ref(),
+                )
+                .await
+            {
+                return;
             }
         }
         let mut context = match self.task_create_context_for_params(&params).await {

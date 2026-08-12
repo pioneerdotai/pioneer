@@ -4,8 +4,9 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use pioneer_client::agents_doc::scope as agents_doc_scope;
-use pioneer_client::threads::tree as thread_tree;
+use pioneer_client::threads::{scope as thread_scope, tree as thread_tree};
 use pioneer_client::workspaces::selectors as workspace_selectors;
+use pioneer_protocol::{ThreadOriginKind, ThreadVisibility};
 use tracing::warn;
 
 impl PioneerDesktop {
@@ -14,6 +15,29 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(visibility) = thread_scope::thread_create_visibility_plan(
+            self.gateway
+                .capability_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.workspace.as_ref())
+                .map(|snapshot| &snapshot.capabilities),
+            ThreadOriginKind::Collaborative,
+        )
+        .default_visibility
+        else {
+            return;
+        };
+
+        self.open_or_create_new_thread_with_visibility(visibility, window, cx);
+    }
+
+    fn open_or_create_new_thread_with_visibility(
+        &mut self,
+        visibility: ThreadVisibility,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_thread_create_visibility = visibility;
         self.set_main_content_view(MainContentView::Threads, cx);
         self.remember_active_thread_draft(cx);
 
@@ -32,6 +56,12 @@ impl PioneerDesktop {
     }
 
     pub(super) fn create_folder_from_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }
@@ -85,6 +115,12 @@ impl PioneerDesktop {
         new_name: String,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }
@@ -162,6 +198,9 @@ impl PioneerDesktop {
         new_name: String,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_manage_thread_presentation(thread_id.as_str()) {
+            return;
+        }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }
@@ -223,6 +262,12 @@ impl PioneerDesktop {
     }
 
     pub(super) fn delete_folder_from_sidebar(&mut self, folder_id: String, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }
@@ -276,6 +321,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         let Some(workspace_id) = self.sidebar_workspace_id() else {
             return;
         };
@@ -293,6 +344,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         let Some(folder) = self.thread_folder(folder_id.as_str()).cloned() else {
             return;
         };
@@ -330,6 +387,12 @@ impl PioneerDesktop {
         folder_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }
@@ -427,6 +490,12 @@ impl PioneerDesktop {
         target_folder_id: String,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }
@@ -458,6 +527,12 @@ impl PioneerDesktop {
         payload: SidebarTreeDragPayload,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+        {
+            return;
+        }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             return;
         }

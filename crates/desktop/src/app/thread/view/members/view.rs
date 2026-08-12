@@ -39,6 +39,13 @@ impl PioneerDesktop {
             .and_then(|thread_id| self.thread_coordinator(thread_id))
             .and_then(|coordinator| coordinator.thread())
             .is_some_and(|thread| thread.visibility == Some(ThreadVisibility::Private));
+        let active_thread_id = self.current_active_thread_id();
+        let capabilities =
+            if self.thread_scope_capabilities_thread_id.as_deref() == active_thread_id {
+                self.thread_scope_capabilities
+            } else {
+                Default::default()
+            };
         let directory_loading = workspace_id
             .as_ref()
             .is_some_and(|workspace_id| self.workspace_members_loading.contains(workspace_id));
@@ -73,7 +80,7 @@ impl PioneerDesktop {
         };
         let add_picker = self.render_thread_member_add_picker(
             candidates,
-            is_private && !directory_loading,
+            capabilities.can_manage_private_participants && !directory_loading,
             window,
             cx,
         );
@@ -89,7 +96,7 @@ impl PioneerDesktop {
         for member in &visible_members {
             list = list.child(self.render_thread_member_row(
                 member,
-                is_private,
+                capabilities.can_manage_private_participants,
                 current_principal_id.as_ref(),
                 cx,
             ));

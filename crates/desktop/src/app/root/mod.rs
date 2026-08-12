@@ -45,6 +45,7 @@ pub(super) use pioneer_client::{
     artifacts::actions::{ArtifactActionStatus as ThreadArtifactActionStatus, ArtifactVersionKey},
     artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
     artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
+    authorization::ThreadPresentationCapabilities,
     cli_runtime::approvals::{PendingRequest, PendingRequestState},
     composer::capabilities::{
         ComposerCapability, ComposerCapabilityKind, ComposerCapabilityTarget,
@@ -190,6 +191,7 @@ pub(super) struct GatewayCoordinator {
     pub(super) deferred_ws_events: VecDeque<pioneer_client::transport::ws::GatewayWsEvent>,
     pub(super) connection_epoch: u64,
     pub(super) session_refresh_generation: u64,
+    pub(super) current_principal_refresh_generation: u64,
     pub(super) session_refresh_in_flight: bool,
     pub(super) authorization_revision: Option<u64>,
     pub(super) connection_state: GatewayConnectionState,
@@ -207,6 +209,7 @@ pub(super) struct GatewayCoordinator {
     pub(super) auth_sessions_error: Option<String>,
     pub(super) auth_session_action_pending: Option<pioneer_protocol::AuthSessionId>,
     pub(super) current_auth: Option<AuthMeResponse>,
+    pub(super) capability_snapshot: Option<pioneer_protocol::AuthorizationCapabilitySnapshot>,
 }
 
 #[derive(Default)]
@@ -347,6 +350,7 @@ pub(super) struct DesktopComposerEditTarget {
 
 pub struct PioneerDesktop {
     pub(super) invitation_join: Option<Entity<DesktopInvitationJoinState>>,
+    pub(super) invitation_join_input_subscriptions: Vec<Subscription>,
     pub(super) thread_coordinators: HashMap<String, ThreadCoordinator>,
     /// Authoritative per-thread counts from `thread/tree`; never derived from
     /// the locally loaded timeline window.
@@ -408,6 +412,10 @@ pub struct PioneerDesktop {
     pub(super) thread_member_select_subscription: Option<Subscription>,
     pub(super) thread_member_items: Vec<ComposerMentionCandidate>,
     pub(super) thread_members_thread_id: Option<String>,
+    pub(super) thread_scope_capabilities_thread_id: Option<String>,
+    pub(super) thread_scope_capabilities_loading_thread_id: Option<String>,
+    pub(super) thread_scope_capabilities_refresh_generation: u64,
+    pub(super) thread_scope_capabilities: ThreadPresentationCapabilities,
     pub(super) thread_members: Vec<ThreadParticipantSummary>,
     pub(super) thread_members_loading: bool,
     pub(super) composer_attachments: Vec<ComposerAttachment>,

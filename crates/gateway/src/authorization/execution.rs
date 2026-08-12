@@ -1,13 +1,14 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::{
     CrudStore, PersistedThreadAccessClass, find_turn_initiator, load_device, load_principal_by_id,
     load_session,
 };
+#[cfg(test)]
+use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
     AgentExecutionBackend, AuthSessionId, CLIAgentRuntimeKind, DeviceId, GatewayId,
     PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus, ThreadVisibility,
-    TurnCapability, TurnPermissionMode, TurnPermissionProfileCap, TurnPermissionProfileSnapshot,
-    TurnSkillBinding,
+    TurnCapability, TurnPermissionProfileCap, TurnPermissionProfileSnapshot, TurnSkillBinding,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -671,6 +672,7 @@ pub(crate) struct ExecutionAuthorizationAdmission {
     root_thread_id: String,
     policy_revision: u64,
     member: bool,
+    permission_profile_cap: TurnPermissionProfileCap,
     runtime_draft: Option<RuntimeDraftMaterialization>,
 }
 
@@ -685,6 +687,7 @@ pub(crate) enum RuntimeDraftCreator {
     Member {
         gateway_id: GatewayId,
         principal_id: PrincipalId,
+        access_class: PersistedThreadAccessClass,
     },
     Superuser {
         access_class: PersistedThreadAccessClass,
@@ -704,15 +707,15 @@ impl RuntimeDraftMaterialization {
             bail!("runtime draft authorization owner does not match request");
         }
         let creator = match request.principal().kind {
-            PrincipalKind::User => {
-                if access.visibility() == Some(ThreadVisibility::Workspace) {
-                    bail!("Member runtime draft cannot be workspace-visible");
-                }
-                RuntimeDraftCreator::Member {
-                    gateway_id: request.principal().gateway_id.clone(),
-                    principal_id: request.principal().principal_id.clone(),
-                }
-            }
+            PrincipalKind::User => RuntimeDraftCreator::Member {
+                gateway_id: request.principal().gateway_id.clone(),
+                principal_id: request.principal().principal_id.clone(),
+                access_class: if access.visibility() == Some(ThreadVisibility::Workspace) {
+                    PersistedThreadAccessClass::Workspace
+                } else {
+                    PersistedThreadAccessClass::Private
+                },
+            },
             PrincipalKind::Superuser => RuntimeDraftCreator::Superuser {
                 access_class: if access.visibility() == Some(ThreadVisibility::Workspace) {
                     PersistedThreadAccessClass::Workspace
@@ -778,6 +781,12 @@ impl ExecutionAuthorizationAdmission {
         if workspace_id.is_empty() || root_thread_id.is_empty() {
             bail!("execution authorization requires exact workspace and root thread");
         }
+        let permission_profile_cap = super::AuthorizationService::new()
+            .turn_permission_profile_cap(
+                request.principal().kind,
+                request.principal().role_key.as_ref(),
+            )
+            .ok_or_else(|| anyhow!("execution authorization requires a supported role"))?;
         Ok(Self {
             initiating_principal_id: request.principal().principal_id.clone(),
             initiating_session_id: request.principal().session_id.clone(),
@@ -785,6 +794,7 @@ impl ExecutionAuthorizationAdmission {
             root_thread_id: root_thread_id.to_owned(),
             policy_revision,
             member: request.principal().kind == PrincipalKind::User,
+            permission_profile_cap,
             runtime_draft: None,
         })
     }
@@ -805,55 +815,35 @@ impl ExecutionAuthorizationAdmission {
         self.runtime_draft.as_ref()
     }
 
-    /// Member requests may keep or narrow the persisted provider/model, but
-    /// cannot rewrite the server-owned thread configuration.
+    /// Validate consistency between an explicit API backend and the provider
+    /// selected for this launch. Provider/model selection is an ordinary
+    /// thread operation; the configured provider/runtime is authorized and
+    /// resolved separately at the execution boundary.
     pub(crate) fn validate_provider_request(
         &self,
         persisted_provider: &str,
-        persisted_model: &str,
+        _persisted_model: &str,
         requested_provider: Option<&str>,
-        requested_model: Option<&str>,
+        _requested_model: Option<&str>,
         execution_backend: Option<&AgentExecutionBackend>,
     ) -> Result<()> {
-        if !self.member {
-            return Ok(());
-        }
-        if requested_provider
+        let effective_provider = requested_provider
             .map(str::trim)
-            .is_some_and(|provider| provider != persisted_provider)
-        {
-            bail!("Member cannot change the server-selected provider");
-        }
-        if requested_model
-            .map(str::trim)
-            .is_some_and(|model| model != persisted_model)
-        {
-            bail!("Member cannot change the server-selected model");
-        }
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or_else(|| persisted_provider.trim());
         if let Some(AgentExecutionBackend::ApiProvider { provider }) = execution_backend
-            && provider.trim() != persisted_provider
+            && provider.trim() != effective_provider
         {
-            bail!("Member execution backend does not match the server-selected provider");
+            bail!("execution backend does not match the selected provider");
         }
         Ok(())
-    }
-
-    pub(crate) fn permission_profile_cap(&self) -> TurnPermissionProfileCap {
-        if self.member {
-            pioneer_protocol::task_permission_cap_for_mode(TurnPermissionMode::Supervised)
-        } else {
-            pioneer_protocol::task_permission_cap_for_mode(TurnPermissionMode::FullAccess)
-        }
     }
 
     pub(crate) fn cap_permission_profile(
         &self,
         requested: &TurnPermissionProfileSnapshot,
     ) -> TurnPermissionProfileSnapshot {
-        if !self.member {
-            return requested.clone();
-        }
-        let cap = pioneer_protocol::task_permission_cap_snapshot(&self.permission_profile_cap());
+        let cap = pioneer_protocol::task_permission_cap_snapshot(&self.permission_profile_cap);
         pioneer_protocol::intersect_turn_permission_profiles(
             requested,
             &cap,
@@ -875,7 +865,7 @@ impl ExecutionAuthorizationAdmission {
             bail!("materialized execution scope differs from authorized root");
         }
         let permission_profile_cap = if self.member {
-            self.permission_profile_cap()
+            self.permission_profile_cap.clone()
         } else {
             pioneer_protocol::task_permission_cap_from_snapshot(effective_permission_profile)
         };
@@ -1272,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn member_cannot_widen_provider_or_root() {
+    fn member_can_select_provider_but_cannot_widen_permission_profile_or_root() {
         let request = member_request();
         let proof = authorized_thread(&request);
         let admission =
@@ -1280,11 +1270,47 @@ mod tests {
                 .expect("authorized admission");
         assert!(
             admission
-                .validate_provider_request("openai", "model-a", Some("other"), None, None)
+                .validate_provider_request(
+                    "openai",
+                    "model-a",
+                    Some("other"),
+                    Some("model-b"),
+                    None
+                )
+                .is_ok()
+        );
+        assert!(
+            admission
+                .validate_provider_request(
+                    "openai",
+                    "model-a",
+                    Some("other"),
+                    Some("model-b"),
+                    Some(&AgentExecutionBackend::ApiProvider {
+                        provider: "openai".to_owned(),
+                    }),
+                )
                 .is_err()
         );
-        let effective = admission
-            .cap_permission_profile(&pioneer_protocol::default_turn_permission_profile_snapshot());
+        let supervised = pioneer_protocol::compile_turn_permission_profile(
+            TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        let effective = admission.cap_permission_profile(&supervised);
+        assert_eq!(effective.mode, TurnPermissionMode::Supervised);
+        assert_eq!(effective.effective_policy, supervised.effective_policy);
+        assert_eq!(
+            effective.source,
+            pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap
+        );
+        let full_access = pioneer_protocol::compile_turn_permission_profile(
+            TurnPermissionMode::FullAccess,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        assert_eq!(
+            admission.cap_permission_profile(&full_access).mode,
+            TurnPermissionMode::Supervised
+        );
         assert!(
             admission
                 .finalize(

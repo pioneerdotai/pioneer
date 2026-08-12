@@ -68,6 +68,7 @@ async fn persist_admitted_turn_start(
             Some(RuntimeDraftCreator::Member {
                 gateway_id,
                 principal_id,
+                access_class,
             }),
             Some(admission),
         ) => crud_store
@@ -81,6 +82,7 @@ async fn persist_admitted_turn_start(
                 audit_event,
                 gateway_id,
                 principal_id,
+                *access_class,
                 admission,
             )
             .await,
@@ -115,6 +117,7 @@ async fn persist_admitted_turn_start(
             Some(RuntimeDraftCreator::Member {
                 gateway_id,
                 principal_id,
+                access_class,
             }),
             None,
         ) => {
@@ -129,6 +132,7 @@ async fn persist_admitted_turn_start(
                     audit_event,
                     gateway_id,
                     principal_id,
+                    *access_class,
                 )
                 .await
         }

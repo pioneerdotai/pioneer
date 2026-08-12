@@ -1,19 +1,89 @@
 use pioneer_protocol::{
-    AuthProfileUpdateParams, AuthSessionRevokeParams, AuthSessionTerminationReason, JsonRpcError,
-    JsonRpcErrorResponse, JsonRpcResponse, RequestId,
+    AuthProfileUpdateParams, AuthSessionRevokeParams, AuthSessionTerminationReason,
+    AuthorizationCapabilitiesParams, JsonRpcError, JsonRpcErrorResponse, JsonRpcResponse,
+    RequestId,
 };
 use serde::Serialize;
 use serde_json::json;
 use std::time::Duration;
 
 use super::MessageProcessor;
-use crate::authorization::{AuthorizationResource, AuthorizedSession, ResourceAction};
+use crate::authorization::{
+    AuthorizationCapabilitySnapshotService, AuthorizationResolver, AuthorizationResource,
+    AuthorizedSession, ResourceAction,
+};
 use crate::request_context::RequestContext;
 
 const AUTH_ERROR_JSONRPC_CODE: i64 = -32040;
 const AUTH_RESPONSE_ENQUEUE_TIMEOUT: Duration = Duration::from_millis(250);
 
 impl MessageProcessor {
+    pub(in crate::message) async fn authorization_capabilities(
+        &self,
+        context: &RequestContext,
+        authorization: &AuthorizedSession,
+        request_id: RequestId,
+        params: AuthorizationCapabilitiesParams,
+    ) {
+        if !authorized_session_matches(
+            context,
+            authorization,
+            ResourceAction::SessionReadOwn,
+            &context.principal().session_id,
+        ) {
+            self.send_auth_error(context, request_id, "authorization_unavailable")
+                .await;
+            return;
+        }
+        let invalid_scope = params
+            .workspace_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+            || params
+                .thread_id
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            || (params.thread_id.is_some() && params.workspace_id.is_none());
+        if invalid_scope {
+            self.send_error(
+                context.connection_id(),
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    pioneer_protocol::INVALID_PARAMS_CODE,
+                    "capability scope must contain non-empty identifiers and thread_id requires workspace_id",
+                ),
+            )
+            .await;
+            return;
+        }
+        let service = AuthorizationCapabilitySnapshotService::new(AuthorizationResolver::new(
+            self.crud_store.as_ref().clone(),
+        ));
+        let mut result = None;
+        for _ in 0..2 {
+            let revision = self.authorization_invalidation_hub.current_revision();
+            let snapshot = service
+                .snapshot(context.principal(), params.clone(), revision)
+                .await;
+            if self.authorization_invalidation_hub.current_revision() == revision {
+                result = Some(snapshot);
+                break;
+            }
+        }
+        match result.unwrap_or_else(|| {
+            Err(anyhow::anyhow!(
+                "authorization changed while capability snapshot was being built"
+            ))
+        }) {
+            Ok(response) => self.send_auth_result(context, request_id, &response).await,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "capability snapshot failed");
+                self.send_auth_error(context, request_id, "authorization_unavailable")
+                    .await;
+            }
+        }
+    }
+
     pub(in crate::message) async fn auth_me(
         &self,
         context: &RequestContext,

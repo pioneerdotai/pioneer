@@ -107,42 +107,49 @@ impl PioneerDesktop {
                 cx,
             ));
 
-        general_settings = match &self.gateway.settings {
-            Some(settings) => general_settings
-                .child(Self::render_settings_divider(cx))
-                .child(Self::render_keepawake_setting(
-                    settings.general.keepawake,
-                    desktop_entity.clone(),
-                    cx,
-                ))
-                .child(Self::render_settings_divider(cx))
-                .child(Self::render_preflight_model_setting(
-                    settings.general.preflight_model.clone(),
-                    desktop_entity.clone(),
-                    cx,
-                ))
-                .child(Self::render_settings_divider(cx))
-                .child(Self::render_voice_input_setting(
-                    settings.voice_input.clone(),
-                    self.voice_input_action_error.clone(),
-                    desktop_entity.clone(),
-                    window,
-                    cx,
-                ))
-                .child(Self::render_settings_divider(cx))
-                .child(Self::render_remote_access_setting(
-                    settings.remote_access.clone(),
-                    self.remote_access_settings_expanded,
-                    self.remote_access_key_input_revision,
-                    desktop_entity,
-                    window,
-                    cx,
-                )),
-            None => general_settings
-                .child(Self::render_settings_divider(cx))
-                .child(Self::render_gateway_settings_status_row(
-                    self.gateway_settings_status_message(),
-                )),
+        general_settings = if !self
+            .principal_presentation_capabilities()
+            .can_manage_gateway_settings
+        {
+            general_settings
+        } else {
+            match &self.gateway.settings {
+                Some(settings) => general_settings
+                    .child(Self::render_settings_divider(cx))
+                    .child(Self::render_keepawake_setting(
+                        settings.general.keepawake,
+                        desktop_entity.clone(),
+                        cx,
+                    ))
+                    .child(Self::render_settings_divider(cx))
+                    .child(Self::render_preflight_model_setting(
+                        settings.general.preflight_model.clone(),
+                        desktop_entity.clone(),
+                        cx,
+                    ))
+                    .child(Self::render_settings_divider(cx))
+                    .child(Self::render_voice_input_setting(
+                        settings.voice_input.clone(),
+                        self.voice_input_action_error.clone(),
+                        desktop_entity.clone(),
+                        window,
+                        cx,
+                    ))
+                    .child(Self::render_settings_divider(cx))
+                    .child(Self::render_remote_access_setting(
+                        settings.remote_access.clone(),
+                        self.remote_access_settings_expanded,
+                        self.remote_access_key_input_revision,
+                        desktop_entity,
+                        window,
+                        cx,
+                    )),
+                None => general_settings
+                    .child(Self::render_settings_divider(cx))
+                    .child(Self::render_gateway_settings_status_row(
+                        self.gateway_settings_status_message(),
+                    )),
+            }
         };
 
         v_flex()

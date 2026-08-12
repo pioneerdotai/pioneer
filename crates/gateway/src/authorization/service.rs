@@ -1,4 +1,7 @@
-use pioneer_protocol::{PrincipalKind, RoleKey};
+use pioneer_protocol::{
+    MEMBER_ROLE_KEY, PrincipalKind, RoleKey, SUPERUSER_CAPABILITY_ROLE_KEY, TurnPermissionMode,
+    TurnPermissionProfileCap,
+};
 
 use super::{
     ActionGateDecision, AllowReason, AuthorizationDecision, DenyReason, DisclosurePolicy,
@@ -56,6 +59,36 @@ pub(crate) enum ResolvedResourceAccess {
     MemberPrincipal,
 }
 
+/// Closed registry of roles implemented by this Gateway binary.
+///
+/// Adding another code-defined role is intentionally an exhaustive compiler
+/// change: register its wire key here and add its action/resource policy in
+/// `AuthorizationService`. Capability snapshots use this same registry, so a
+/// role can never be recognized by the UI projection but rejected by the RPC
+/// authorization layer (or vice versa).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltInAuthorizationRole {
+    Superuser,
+    Member,
+}
+
+impl BuiltInAuthorizationRole {
+    fn resolve(principal_kind: PrincipalKind, role_key: Option<&RoleKey>) -> Option<Self> {
+        match (principal_kind, role_key.map(RoleKey::as_str)) {
+            (PrincipalKind::Superuser, None) => Some(Self::Superuser),
+            (PrincipalKind::User, Some(MEMBER_ROLE_KEY)) => Some(Self::Member),
+            _ => None,
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Superuser => SUPERUSER_CAPABILITY_ROLE_KEY,
+            Self::Member => MEMBER_ROLE_KEY,
+        }
+    }
+}
+
 /// The single role-to-policy boundary for normal Gateway actions.
 ///
 /// This service performs only the first authorization level. A Member result
@@ -77,16 +110,72 @@ impl AuthorizationService {
         role_key: Option<&RoleKey>,
         action: ResourceAction,
     ) -> ActionGateDecision {
-        match (principal_kind, role_key) {
-            (PrincipalKind::Superuser, None) => ActionGateDecision::AllowSuperuser,
-            (PrincipalKind::Superuser, Some(_)) | (PrincipalKind::User, None) => {
-                deny_unsupported_role()
+        match BuiltInAuthorizationRole::resolve(principal_kind, role_key) {
+            Some(BuiltInAuthorizationRole::Superuser) => ActionGateDecision::AllowSuperuser,
+            Some(BuiltInAuthorizationRole::Member) => {
+                authorize_member_action(&RoleKey::member(), action)
             }
-            (PrincipalKind::User, Some(role_key)) if role_key.is_supported() => {
-                authorize_member_action(role_key, action)
-            }
-            (PrincipalKind::User, Some(_)) => deny_unsupported_role(),
+            None => deny_unsupported_role(),
         }
+    }
+
+    /// Stable identifier for a role implemented by this Gateway binary.
+    /// This is metadata only; clients must use capability bits, not this key,
+    /// for presentation or authorization decisions.
+    pub(crate) fn built_in_role_key(
+        &self,
+        principal_kind: PrincipalKind,
+        role_key: Option<&RoleKey>,
+    ) -> Option<&'static str> {
+        BuiltInAuthorizationRole::resolve(principal_kind, role_key)
+            .map(BuiltInAuthorizationRole::key)
+    }
+
+    /// Maximum agent permission profile implemented by this code-defined
+    /// role. It is shared by capability projection and execution admission so
+    /// the UI can never advertise a mode the runtime would silently widen or
+    /// reject.
+    pub(crate) fn turn_permission_profile_cap(
+        &self,
+        principal_kind: PrincipalKind,
+        role_key: Option<&RoleKey>,
+    ) -> Option<TurnPermissionProfileCap> {
+        let mode = match BuiltInAuthorizationRole::resolve(principal_kind, role_key)? {
+            BuiltInAuthorizationRole::Superuser => TurnPermissionMode::FullAccess,
+            BuiltInAuthorizationRole::Member => TurnPermissionMode::Supervised,
+        };
+        Some(pioneer_protocol::task_permission_cap_for_mode(mode))
+    }
+
+    pub(crate) fn allowed_turn_permission_modes(
+        &self,
+        principal_kind: PrincipalKind,
+        role_key: Option<&RoleKey>,
+    ) -> Vec<TurnPermissionMode> {
+        let Some(cap) = self.turn_permission_profile_cap(principal_kind, role_key) else {
+            return Vec::new();
+        };
+        let cap_snapshot = pioneer_protocol::task_permission_cap_snapshot(&cap);
+        [
+            TurnPermissionMode::FullAccess,
+            TurnPermissionMode::AutoAcceptEdits,
+            TurnPermissionMode::Supervised,
+        ]
+        .into_iter()
+        .filter(|mode| {
+            let requested = pioneer_protocol::compile_turn_permission_profile(
+                *mode,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            );
+            pioneer_protocol::intersect_turn_permission_profiles(
+                &requested,
+                &cap_snapshot,
+                pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
+            )
+            .mode
+                == *mode
+        })
+        .collect()
     }
 
     /// Completes authorization after a server-owned exact resource lookup.
@@ -106,13 +195,17 @@ impl AuthorizationService {
                 disclosure: *disclosure,
             },
             ActionGateDecision::RequireResource { role } => {
-                if !role.is_supported() {
-                    return AuthorizationDecision::Deny {
-                        reason: DenyReason::UnsupportedRole,
-                        disclosure: DisclosurePolicy::AuthenticationTerminal,
-                    };
+                match BuiltInAuthorizationRole::resolve(PrincipalKind::User, Some(role)) {
+                    Some(BuiltInAuthorizationRole::Member) => {
+                        authorize_member_resource(role, action, access)
+                    }
+                    Some(BuiltInAuthorizationRole::Superuser) | None => {
+                        AuthorizationDecision::Deny {
+                            reason: DenyReason::UnsupportedRole,
+                            disclosure: DisclosurePolicy::AuthenticationTerminal,
+                        }
+                    }
                 }
-                authorize_member_resource(role, action, access)
             }
         }
     }
@@ -341,6 +434,7 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
             action,
             ResourceAction::WorkspaceList
                 | ResourceAction::WorkspaceRead
+                | ResourceAction::WorkspaceManage
                 | ResourceAction::ThreadCreate
                 | ResourceAction::ArtifactRead
                 | ResourceAction::MemoryRead
@@ -348,7 +442,9 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
                 | ResourceAction::TaskRead
                 | ResourceAction::TaskRun
                 | ResourceAction::ProviderUse
+                | ResourceAction::McpUse
                 | ResourceAction::SkillUse
+                | ResourceAction::CliRuntimeUse
                 | ResourceAction::WorkspaceMemberList
                 | ResourceAction::WorkspaceMemberAdd
                 | ResourceAction::WorkspaceMemberRemove
@@ -358,6 +454,7 @@ const fn resource_supports_action(access: ResolvedResourceAccess, action: Resour
             ResourceAction::ThreadRead
                 | ResourceAction::ThreadWrite
                 | ResourceAction::ThreadManage
+                | ResourceAction::ThreadMove
                 | ResourceAction::ThreadParticipantsManage
                 | ResourceAction::ArtifactRead
                 | ResourceAction::ArtifactWrite
@@ -585,6 +682,19 @@ mod tests {
     fn roleless_and_unknown_users_fail_closed_with_bounded_reasons() {
         let service = AuthorizationService::new();
         let future_role = RoleKey::new("future").expect("syntactically valid role");
+
+        assert_eq!(
+            service.built_in_role_key(PrincipalKind::Superuser, None),
+            Some("superuser")
+        );
+        assert_eq!(
+            service.built_in_role_key(PrincipalKind::User, Some(&RoleKey::member())),
+            Some("member")
+        );
+        assert_eq!(
+            service.built_in_role_key(PrincipalKind::User, Some(&future_role)),
+            None
+        );
 
         for role in [None, Some(&future_role)] {
             for action in ResourceAction::ALL {

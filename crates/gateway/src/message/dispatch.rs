@@ -6,12 +6,13 @@ use pioneer_protocol::{
     ArtifactListForMessageParams, ArtifactListForThreadParams, ArtifactListForTurnParams,
     ArtifactListParams, ArtifactRestoreParams, ArtifactUploadAbortParams,
     ArtifactUploadFinishParams, ArtifactUploadStartParams, ArtifactViewGrantCreateParams,
-    AuthProfileUpdateParams, AuthSessionRevokeParams, CLIRuntimeGetParams, CLIRuntimeListParams,
-    CLIRuntimeRefreshParams, CLIRuntimeReviewStartParams, CLIRuntimeStatusParams,
-    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
-    CLIRuntimeTurnSteerParams, GatewaySettingsGetParams, GatewaySettingsUpdateParams,
-    InvitationCreateParams, InvitationListParams, InvitationRevokeParams, McpInstallParams,
-    McpListParams, McpPolicySetParams, MemberDeviceCreateParams, MemberListParams,
+    AuthProfileUpdateParams, AuthSessionRevokeParams, AuthorizationCapabilitiesParams,
+    CLIRuntimeGetParams, CLIRuntimeListModelsParams, CLIRuntimeListParams, CLIRuntimeRefreshParams,
+    CLIRuntimeReviewStartParams, CLIRuntimeStatusParams, CLIRuntimeThreadBindingGetParams,
+    CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams, CLIRuntimeTurnSteerParams,
+    GatewaySettingsGetParams, GatewaySettingsUpdateParams, InvitationCreateParams,
+    InvitationListParams, InvitationRevokeParams, McpInstallParams, McpListParams,
+    McpPolicySetParams, McpServerDetailsParams, MemberDeviceCreateParams, MemberListParams,
     MemberRemoveParams, MemberRestoreParams, MemberSuspendParams, MemoryCandidatesApproveParams,
     MemoryCandidatesDecideParams, MemoryCandidatesEditAndApproveParams, MemoryCandidatesGetParams,
     MemoryCandidatesListParams, MemoryCandidatesMergeParams, MemoryCandidatesRejectParams,
@@ -34,13 +35,13 @@ use tracing::Instrument as _;
 
 use crate::authorization::{
     AuthorizationDecision, AuthorizationExternalError, AuthorizationResolver, AuthorizationService,
-    AuthorizedArtifact, AuthorizedInvitation, AuthorizedInvitationCollection,
+    AuthorizedArtifact, AuthorizedCapability, AuthorizedInvitation, AuthorizedInvitationCollection,
     AuthorizedInvitationGrants, AuthorizedMemberDirectory, AuthorizedMemberPrincipal,
     AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn, AuthorizedWorkspace,
-    AuthorizedWorkspaceCollection, DenyReason, DisclosurePolicy, MethodAuthorizationEntry,
-    ProofResolution, RegistryLookupError, ResourceAction, ResourceResolverKind,
-    external_error_for_decision, normal_method_entry, record_authorization_unavailable,
-    record_method_decision, record_method_decision_for_action,
+    AuthorizedWorkspaceCollection, CapabilityKind, DenyReason, DisclosurePolicy,
+    MethodAuthorizationEntry, ProofResolution, RegistryLookupError, ResourceAction,
+    ResourceResolverKind, external_error_for_decision, normal_method_entry,
+    record_authorization_unavailable, record_method_decision, record_method_decision_for_action,
 };
 
 pub(super) enum RequestAdmission {
@@ -61,6 +62,7 @@ pub(super) enum RequestAdmission {
     RuntimeDraft(crate::thread::RuntimeDraftAccess),
     Turn(AuthorizedTurn),
     Artifact(AuthorizedArtifact),
+    Capability(AuthorizedCapability),
     Task(AuthorizedTask),
     TaskBatch(Vec<AuthorizedTask>),
 }
@@ -139,6 +141,13 @@ impl RequestAdmission {
     fn artifact(&self) -> Option<&AuthorizedArtifact> {
         match self {
             Self::Artifact(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn capability(&self) -> Option<&AuthorizedCapability> {
+        match self {
+            Self::Capability(proof) => Some(proof),
             _ => None,
         }
     }
@@ -450,7 +459,7 @@ impl MessageProcessor {
             let Some(initiating_thread_id) = initiating_thread_id else {
                 return Err(invalid_params());
             };
-            let resolution = resolver
+            let mut resolution = resolver
                 .authorize_thread(
                     context.principal(),
                     action_gate,
@@ -467,6 +476,31 @@ impl MessageProcessor {
                     );
                     AuthorizationExternalError::Unavailable.response(request.id.clone())
                 })?;
+            if matches!(
+                resolution.denial(),
+                Some(AuthorizationDecision::Deny {
+                    reason: DenyReason::MissingAuthoritativeResource,
+                    ..
+                })
+            ) {
+                resolution = resolver
+                    .authorize_internal_thread_via_root(
+                        context.principal(),
+                        action_gate,
+                        entry.action,
+                        initiating_thread_id.trim(),
+                        Some(params.workspace_id.trim()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        record_authorization_unavailable(
+                            entry.action.safe_name(),
+                            "thread_lineage",
+                            entry.audit.safe_name(),
+                        );
+                        AuthorizationExternalError::Unavailable.response(request.id.clone())
+                    })?;
+            }
             return match resolution {
                 ProofResolution::Authorized(proof) => {
                     if let Some(parent_task_id) = params.parent_task_id.as_deref() {
@@ -1162,6 +1196,52 @@ impl MessageProcessor {
                 }
             };
         }
+        if entry.resolver == ResourceResolverKind::Capability
+            && entry.action == ResourceAction::McpUse
+            && request.method == methods::MCP_SERVER_DETAILS
+        {
+            let params = serde_json::from_value::<McpServerDetailsParams>(
+                request.params.clone().unwrap_or_else(empty_object_value),
+            )
+            .map_err(|_| {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::ResourceScopeMismatch,
+                    disclosure: DisclosurePolicy::Validation,
+                };
+                record_method_decision(entry, &decision);
+                AuthorizationExternalError::Validation.response(request.id.clone())
+            })?;
+            let resolution = resolver
+                .authorize_persisted_capability(
+                    context.principal(),
+                    &action_gate,
+                    entry.action,
+                    params.workspace_id.trim(),
+                    CapabilityKind::McpServer,
+                    params.server_id.trim(),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        entry.resolver.safe_name(),
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            return match resolution {
+                ProofResolution::Authorized(proof) => {
+                    record_method_decision(entry, proof.decision());
+                    Ok(RequestAdmission::Capability(proof))
+                }
+                ProofResolution::Denied(decision) => {
+                    record_method_decision(entry, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            };
+        }
         match entry.resolver {
             ResourceResolverKind::WorkspaceCollection => {
                 let resolution = resolver.authorize_workspace_collection(
@@ -1267,48 +1347,82 @@ impl MessageProcessor {
             ResourceResolverKind::Workspace
                 if matches!(
                     request.method.as_str(),
-                    methods::ARTIFACT_CAPABILITIES | methods::ARTIFACT_LIST | methods::SKILLS_LIST
+                    methods::ARTIFACT_CAPABILITIES
+                        | methods::ARTIFACT_LIST
+                        | methods::SKILLS_LIST
+                        | methods::CLI_RUNTIME_LIST
+                        | methods::CLI_RUNTIME_GET
+                        | methods::CLI_RUNTIME_STATUS
+                        | methods::CLI_RUNTIME_REFRESH
+                        | methods::CLI_RUNTIME_LIST_MODELS
+                        | methods::MCP_LIST
                 ) =>
             {
-                let workspace_id = if request.method == methods::ARTIFACT_CAPABILITIES {
-                    serde_json::from_value::<ArtifactCapabilitiesParams>(
-                        request.params.clone().unwrap_or_else(empty_object_value),
-                    )
-                    .map_err(|_| {
+                let invalid_params = || {
+                    let decision = AuthorizationDecision::Deny {
+                        reason: DenyReason::ResourceScopeMismatch,
+                        disclosure: DisclosurePolicy::Validation,
+                    };
+                    record_method_decision(entry, &decision);
+                    AuthorizationExternalError::Validation.response(request.id.clone())
+                };
+                let params = request.params.clone().unwrap_or_else(empty_object_value);
+                let workspace_id = match request.method.as_str() {
+                    methods::ARTIFACT_CAPABILITIES => {
+                        serde_json::from_value::<ArtifactCapabilitiesParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::ARTIFACT_LIST => {
+                        serde_json::from_value::<ArtifactListParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::SKILLS_LIST => {
+                        serde_json::from_value::<SkillListParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::CLI_RUNTIME_LIST => {
+                        serde_json::from_value::<CLIRuntimeListParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::CLI_RUNTIME_GET => {
+                        serde_json::from_value::<CLIRuntimeGetParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::CLI_RUNTIME_STATUS => {
+                        serde_json::from_value::<CLIRuntimeStatusParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::CLI_RUNTIME_REFRESH => {
+                        serde_json::from_value::<CLIRuntimeRefreshParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::CLI_RUNTIME_LIST_MODELS => {
+                        serde_json::from_value::<CLIRuntimeListModelsParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::MCP_LIST => {
+                        serde_json::from_value::<McpListParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    _ => {
                         let decision = AuthorizationDecision::Deny {
                             reason: DenyReason::ResourceScopeMismatch,
                             disclosure: DisclosurePolicy::Validation,
                         };
                         record_method_decision(entry, &decision);
-                        AuthorizationExternalError::Validation.response(request.id.clone())
-                    })?
-                    .workspace_id
-                } else if request.method == methods::SKILLS_LIST {
-                    serde_json::from_value::<SkillListParams>(
-                        request.params.clone().unwrap_or_else(empty_object_value),
-                    )
-                    .map_err(|_| {
-                        let decision = AuthorizationDecision::Deny {
-                            reason: DenyReason::ResourceScopeMismatch,
-                            disclosure: DisclosurePolicy::Validation,
-                        };
-                        record_method_decision(entry, &decision);
-                        AuthorizationExternalError::Validation.response(request.id.clone())
-                    })?
-                    .workspace_id
-                } else {
-                    serde_json::from_value::<ArtifactListParams>(
-                        request.params.clone().unwrap_or_else(empty_object_value),
-                    )
-                    .map_err(|_| {
-                        let decision = AuthorizationDecision::Deny {
-                            reason: DenyReason::ResourceScopeMismatch,
-                            disclosure: DisclosurePolicy::Validation,
-                        };
-                        record_method_decision(entry, &decision);
-                        AuthorizationExternalError::Validation.response(request.id.clone())
-                    })?
-                    .workspace_id
+                        return Err(
+                            AuthorizationExternalError::Validation.response(request.id.clone())
+                        );
+                    }
                 };
                 let resolution = resolver
                     .authorize_workspace(
@@ -1482,7 +1596,7 @@ impl MessageProcessor {
                     record_method_decision(entry, &decision);
                     return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
                 }
-                let resolution = resolver
+                let mut resolution = resolver
                     .authorize_thread(
                         context.principal(),
                         &action_gate,
@@ -1499,6 +1613,31 @@ impl MessageProcessor {
                         );
                         AuthorizationExternalError::Unavailable.response(request.id.clone())
                     })?;
+                if matches!(
+                    resolution.denial(),
+                    Some(AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        ..
+                    })
+                ) {
+                    resolution = resolver
+                        .authorize_internal_thread_via_root(
+                            context.principal(),
+                            &action_gate,
+                            entry.action,
+                            thread_id.trim(),
+                            Some(workspace_id.trim()),
+                        )
+                        .await
+                        .map_err(|_| {
+                            record_authorization_unavailable(
+                                entry.action.safe_name(),
+                                entry.resolver.safe_name(),
+                                entry.audit.safe_name(),
+                            );
+                            AuthorizationExternalError::Unavailable.response(request.id.clone())
+                        })?;
+                }
                 return match resolution {
                     ProofResolution::Authorized(proof) => {
                         record_method_decision(entry, proof.decision());
@@ -1578,23 +1717,20 @@ impl MessageProcessor {
                         );
                         AuthorizationExternalError::Unavailable.response(request.id.clone())
                     })?;
-                if resolution.denial().is_some()
-                    && matches!(
-                        request.method.as_str(),
-                        methods::THREAD_AGENTS_DOC_GET
-                            | methods::THREAD_AGENTS_DOC_SAVE
-                            | methods::THREAD_AGENTS_DOC_ARCHIVE
-                            | methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD
-                    )
-                    && let Some(workspace_id) = expected_workspace_id
-                {
+                if matches!(
+                    resolution.denial(),
+                    Some(AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        ..
+                    })
+                ) {
                     resolution = resolver
                         .authorize_internal_thread_via_root(
                             context.principal(),
                             &action_gate,
                             entry.action,
                             thread_id.trim(),
-                            workspace_id.trim(),
+                            expected_workspace_id.map(str::trim),
                         )
                         .await
                         .map_err(|_| {
@@ -1809,7 +1945,7 @@ impl MessageProcessor {
                     record_method_decision(entry, &decision);
                     return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
                 }
-                let resolution = resolver
+                let mut resolution = resolver
                     .authorize_turn(
                         context.principal(),
                         &action_gate,
@@ -1827,6 +1963,32 @@ impl MessageProcessor {
                         );
                         AuthorizationExternalError::Unavailable.response(request.id.clone())
                     })?;
+                if matches!(
+                    resolution.denial(),
+                    Some(AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        ..
+                    })
+                ) {
+                    resolution = resolver
+                        .authorize_internal_turn_via_root(
+                            context.principal(),
+                            &action_gate,
+                            entry.action,
+                            turn_id.trim(),
+                            workspace_id.map(str::trim),
+                            thread_id.map(str::trim),
+                        )
+                        .await
+                        .map_err(|_| {
+                            record_authorization_unavailable(
+                                entry.action.safe_name(),
+                                entry.resolver.safe_name(),
+                                entry.audit.safe_name(),
+                            );
+                            AuthorizationExternalError::Unavailable.response(request.id.clone())
+                        })?;
+                }
                 return match resolution {
                     ProofResolution::Authorized(proof) => {
                         record_method_decision(entry, proof.decision());
@@ -2217,10 +2379,40 @@ impl MessageProcessor {
         request: &JsonRpcRequest,
         entry: &'static crate::authorization::MethodAuthorizationEntry,
         action: ResourceAction,
-        resolution: ProofResolution<AuthorizedThread>,
+        mut resolution: ProofResolution<AuthorizedThread>,
         thread_id: &str,
         workspace_id: &str,
     ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        if matches!(
+            resolution.denial(),
+            Some(AuthorizationDecision::Deny {
+                reason: DenyReason::MissingAuthoritativeResource,
+                ..
+            })
+        ) {
+            resolution = AuthorizationResolver::new((*self.crud_store).clone())
+                .authorize_internal_thread_via_root(
+                    context.principal(),
+                    &AuthorizationService::new().authorize_action(
+                        context.principal().kind,
+                        context.role_key(),
+                        action,
+                    ),
+                    action,
+                    thread_id,
+                    Some(workspace_id),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        action.safe_name(),
+                        "thread_lineage",
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+        }
+
         match resolution {
             ProofResolution::Authorized(proof) => {
                 record_method_decision(entry, proof.decision());
@@ -2348,7 +2540,7 @@ impl MessageProcessor {
                 let action = ResourceAction::ThreadRead;
                 let gate =
                     service.authorize_action(context.principal().kind, context.role_key(), action);
-                let resolution = resolver
+                let mut resolution = resolver
                     .authorize_thread(
                         context.principal(),
                         &gate,
@@ -2365,6 +2557,31 @@ impl MessageProcessor {
                         );
                         AuthorizationExternalError::Unavailable.response(request.id.clone())
                     })?;
+                if matches!(
+                    resolution.denial(),
+                    Some(AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        ..
+                    })
+                ) {
+                    resolution = resolver
+                        .authorize_internal_thread_via_root(
+                            context.principal(),
+                            &gate,
+                            action,
+                            params.thread_id.trim(),
+                            Some(params.workspace_id.trim()),
+                        )
+                        .await
+                        .map_err(|_| {
+                            record_authorization_unavailable(
+                                action.safe_name(),
+                                entry.resolver.safe_name(),
+                                entry.audit.safe_name(),
+                            );
+                            AuthorizationExternalError::Unavailable.response(request.id.clone())
+                        })?;
+                }
                 match resolution {
                     ProofResolution::Authorized(proof) => {
                         record_method_decision_for_action(entry, action, proof.decision());
@@ -2928,6 +3145,36 @@ impl MessageProcessor {
                             request.id,
                         )
                         .await;
+                    }
+                }
+                methods::AUTHORIZATION_CAPABILITIES => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<AuthorizationCapabilitiesParams>(params_value) {
+                        Ok(params) => {
+                            self.authorization_capabilities(
+                                &context,
+                                admission
+                                    .own_session()
+                                    .expect("central admission supplies own-session proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::AUTHORIZATION_CAPABILITIES
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
                     }
                 }
                 methods::AUTH_PROFILE_UPDATE => {
@@ -4913,8 +5160,15 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<McpServerDetailsParams>(params_value) {
                         Ok(params) => {
-                            self.mcp_server_details(&context, request.id, params)
-                                .await;
+                            self.mcp_server_details(
+                                &context,
+                                admission
+                                    .capability()
+                                    .expect("central admission supplies MCP capability proof"),
+                                request.id,
+                                params,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.send_error(

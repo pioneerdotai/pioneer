@@ -431,6 +431,16 @@ mod tests {
     }
 
     fn left_message(key: &str, author_id: &str) -> TimelineRenderRow {
+        left_message_with_profile(key, author_id, author_id, author_id, None)
+    }
+
+    fn left_message_with_profile(
+        key: &str,
+        author_id: &str,
+        display_name: &str,
+        nickname: &str,
+        avatar_revision: Option<&str>,
+    ) -> TimelineRenderRow {
         TimelineRenderRow::Timeline(TimelineRow {
             key: key.to_owned(),
             kind: TimelineRowKind::UserMessage {
@@ -444,9 +454,9 @@ mod tests {
                     mode: ThreadMode::Message,
                     author: Some(TurnAuthorSnapshot {
                         actor: PersistedActorRef::Principal(principal(author_id)),
-                        display_name: author_id.to_owned(),
-                        nickname: author_id.to_owned(),
-                        avatar_revision: None,
+                        display_name: display_name.to_owned(),
+                        nickname: nickname.to_owned(),
+                        avatar_revision: avatar_revision.map(str::to_owned),
                     }),
                     reply: None,
                     reply_state: None,
@@ -514,6 +524,51 @@ mod tests {
         );
         assert!(grouping.row_layout(0).starts_avatar_group);
         assert!(!grouping.row_layout(1).starts_avatar_group);
+    }
+
+    #[test]
+    fn profile_change_keeps_messages_in_the_same_principal_group() {
+        let rows = vec![
+            left_message_with_profile(
+                "before",
+                "PAAAAAAAAAAAAAAAAAAAA",
+                "Alice",
+                "alice",
+                Some("old-avatar"),
+            ),
+            left_message_with_profile(
+                "after",
+                "PAAAAAAAAAAAAAAAAAAAA",
+                "Alicia",
+                "alicia",
+                Some("new-avatar"),
+            ),
+        ];
+        let grouping = TimelineGrouping::build(
+            &rows,
+            &ConversationViewState::default(),
+            None,
+            TimelinePresentationContext::default(),
+            px(0.),
+        );
+
+        assert_eq!(grouping.avatar_groups.len(), 1);
+        assert_eq!(grouping.avatar_groups[0].first_row_index, 0);
+        assert_eq!(grouping.avatar_groups[0].last_row_index, 1);
+        assert!(!grouping.row_layout(1).starts_avatar_group);
+        assert_eq!(
+            grouping.row_layout(1).top_spacing,
+            TimelineRowTopSpacing::GroupMessage
+        );
+        let TimelineAvatarSource::HistoricalUser {
+            author: Some(author),
+        } = &grouping.avatar_groups[0].source
+        else {
+            panic!("first snapshot should remain the persisted fallback for the group");
+        };
+        assert_eq!(author.display_name, "Alice");
+        assert_eq!(author.nickname, "alice");
+        assert_eq!(author.avatar_revision.as_deref(), Some("old-avatar"));
     }
 
     #[test]

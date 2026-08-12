@@ -63,15 +63,18 @@ impl MessageProcessor {
 
         let mut provider_configs = std::collections::BTreeMap::new();
         for name in provider_names {
-            provider_configs.insert(name, (!member, None));
+            // `api_key_configured` is the operational availability bit used by
+            // every model selector. It does not contain the key itself and
+            // must remain true for a Member, otherwise the shared clients
+            // correctly filter the provider out as unusable. Secret-bearing
+            // proxy configuration remains redacted below.
+            provider_configs.insert(name, (true, None));
         }
         for (name, proxy_url) in provider_proxies {
             provider_configs
                 .entry(name)
-                .and_modify(|(_, existing_proxy)| {
-                    *existing_proxy = (!member).then(|| proxy_url.clone())
-                })
-                .or_insert((false, (!member).then_some(proxy_url)));
+                .and_modify(|(_, existing_proxy)| *existing_proxy = Some(proxy_url.clone()))
+                .or_insert((false, Some(proxy_url)));
         }
 
         // Local is built in, so there is no workspace secret or proxy from which to discover it.
@@ -82,6 +85,8 @@ impl MessageProcessor {
         let providers = provider_configs
             .into_iter()
             .map(|(name, (api_key_configured, proxy_url))| {
+                let operationally_configured =
+                    api_key_configured || proxy_url.is_some() || name == "local";
                 let capabilities = self
                     .provider_registry
                     .get_or_create_for_workspace(workspace_id.as_str(), name.as_str())
@@ -102,8 +107,16 @@ impl MessageProcessor {
                 ProviderSummary {
                     name,
                     capabilities,
-                    api_key_configured,
-                    proxy_url,
+                    // For Members this is deliberately an availability bit:
+                    // a workspace proxy can provide the credential even when
+                    // no local API key exists. Management clients retain the
+                    // literal API-key state and the configured proxy URL.
+                    api_key_configured: if member {
+                        operationally_configured
+                    } else {
+                        api_key_configured
+                    },
+                    proxy_url: if member { None } else { proxy_url },
                 }
             })
             .collect::<Vec<_>>();

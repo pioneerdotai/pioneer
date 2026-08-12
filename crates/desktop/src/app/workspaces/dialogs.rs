@@ -20,7 +20,11 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace_action_in_progress() {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_workspace
+            || self.workspace_action_in_progress()
+        {
             return;
         }
 
@@ -157,7 +161,11 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace_action_in_progress() {
+        if !self
+            .principal_presentation_capabilities()
+            .can_create_workspace
+            || self.workspace_action_in_progress()
+        {
             return;
         }
 

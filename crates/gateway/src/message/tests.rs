@@ -12128,13 +12128,24 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
         .register_connection(member_tx, Arc::new(member_principal))
         .await
         .expect("register Member connection");
+    let gateway_secrets = test_gateway_secrets();
+    gateway_secrets
+        .set_workspace_provider_api_key(MEMBER_WORKSPACE_ID, "openai", "member-test-secret")
+        .expect("configure an operational provider for the Member workspace");
+    gateway_secrets
+        .set_workspace_provider_proxy(
+            MEMBER_WORKSPACE_ID,
+            "anthropic",
+            "https://member-provider-proxy.invalid/v1",
+        )
+        .expect("configure a proxy-backed provider for the Member workspace");
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
         test_provider(),
         session_manager.clone(),
         workspace_manager.clone(),
         crud_store,
-        test_gateway_secrets(),
+        gateway_secrets,
         test_summary_config(),
         test_context_budget(),
         test_tool_loop_config(),
@@ -12286,6 +12297,40 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     let denied_capabilities =
         recv_error_by_id(&mut member_rx, denied_capabilities_id.as_str()).await;
     assert_eq!(denied_capabilities.error.message, "not_found");
+
+    let providers_id = generate_test_request_id("memberws", "providers");
+    processor
+        .process_request_for_connection(
+            member_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": providers_id,
+                "method": "provider/list",
+                "params": { "workspace_id": MEMBER_WORKSPACE_ID }
+            })
+            .to_string(),
+        )
+        .await;
+    let providers = recv_response_by_id(&mut member_rx, providers_id.as_str()).await;
+    let serialized_providers = serde_json::to_string(&providers).expect("serialize provider list");
+    let providers: ProviderListResponse =
+        serde_json::from_value(providers.result).expect("decode Member provider list");
+    let openai = providers
+        .providers
+        .iter()
+        .find(|provider| provider.name == "openai")
+        .expect("configured provider must be selectable by a Member");
+    assert!(openai.api_key_configured);
+    assert!(openai.proxy_url.is_none());
+    let anthropic = providers
+        .providers
+        .iter()
+        .find(|provider| provider.name == "anthropic")
+        .expect("proxy-backed provider must be selectable by a Member");
+    assert!(anthropic.api_key_configured);
+    assert!(anthropic.proxy_url.is_none());
+    assert!(!serialized_providers.contains("member-test-secret"));
+    assert!(!serialized_providers.contains("member-provider-proxy"));
 
     let skills_id = generate_test_request_id("memberws", "skills");
     processor
@@ -12921,33 +12966,32 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .expect("register another session for the allowed Member");
 
     processor
-        .send_execution_owner_notification(
+        .send_execution_initiator_notification(
             THREAD_ID,
             MEMBER_ALLOWED_ID,
             "S0000000000000000000A",
-            "test/execution-owner-only",
-            &json!({"command": "private"}),
+            crate::authorization::ResourceAction::ThreadWrite,
+            "test/native-permission-initiator-only",
+            &json!({"command": "approval"}),
         )
         .await;
     assert_eq!(
-        recv_notification_by_method(&mut allowed_rx, "test/execution-owner-only")
+        recv_notification_by_method(&mut allowed_rx, "test/native-permission-initiator-only")
             .await
             .method,
-        "test/execution-owner-only"
+        "test/native-permission-initiator-only"
     );
-    assert_eq!(
-        recv_notification_by_method(&mut superuser_rx, "test/execution-owner-only")
-            .await
-            .method,
-        "test/execution-owner-only"
+    assert!(
+        superuser_rx.try_recv().is_err(),
+        "native permission prompts must not be shown to a superuser who cannot answer them"
     );
     assert!(
         other_session_rx.try_recv().is_err(),
-        "another session of the same principal must not receive an execution approval payload"
+        "native permission prompts must remain bound to the initiating session"
     );
     assert!(
         denied_rx.try_recv().is_err(),
-        "another workspace Member must not receive an execution approval payload"
+        "native permission prompts must not leak to another workspace Member"
     );
 
     let denied_open_id = generate_test_request_id("realtimethread", "deniedopen");
@@ -34303,7 +34347,7 @@ async fn codex_steer_rejects_wrong_backend() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notifications() {
+async fn cli_runtime_request_respond_is_scoped_to_the_initiating_session() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -34345,6 +34389,18 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
         .await
         .expect("CLI runtime session should be active for native request response");
 
+    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
+    let mut foreign_principal = authenticated_test_superuser().as_ref().clone();
+    foreign_principal.session_id = pioneer_protocol::AuthSessionId::new("S00000000000000000002")
+        .expect("foreign CLI response session id");
+    let foreign_connection_id = session_manager
+        .register_connection(foreign_tx, Arc::new(foreign_principal))
+        .await
+        .expect("foreign CLI response session should register");
+    session_manager
+        .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
+        .await;
+
     let native_request = CodexJsonlRpcServerRequest {
         id: JsonlRpcId::from("codex-native-request-1"),
         method: "item/commandExecution/requestApproval".to_owned(),
@@ -34385,18 +34441,10 @@ async fn cli_runtime_request_respond_resolves_pending_and_broadcasts_notificatio
         opened_payload.request.native_request_id.as_deref(),
         Some("codex-native-request-1")
     );
-
-    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
-    let mut foreign_principal = authenticated_test_superuser().as_ref().clone();
-    foreign_principal.session_id = pioneer_protocol::AuthSessionId::new("S00000000000000000002")
-        .expect("foreign CLI response session id");
-    let foreign_connection_id = session_manager
-        .register_connection(foreign_tx, Arc::new(foreign_principal))
-        .await
-        .expect("foreign CLI response session should register");
-    session_manager
-        .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
-        .await;
+    assert!(
+        foreign_rx.try_recv().is_err(),
+        "CLI approval prompts must not be shown to a different session that cannot answer them"
+    );
     processor
         .process_request_for_connection(
             foreign_connection_id,
@@ -34600,8 +34648,7 @@ async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_permission_request_respond_resolves_native_pending_request_and_broadcasts_notifications()
- {
+async fn turn_permission_request_respond_is_scoped_to_the_initiating_session() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -34643,6 +34690,24 @@ async fn turn_permission_request_respond_resolves_native_pending_request_and_bro
         "thread_native_permission",
     )
     .await;
+    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
+    let mut foreign_principal = authenticated_test_superuser().as_ref().clone();
+    foreign_principal.session_id =
+        pioneer_protocol::AuthSessionId::new("S00000000000000000002").expect("foreign session id");
+    let foreign_connection_id = session_manager
+        .register_connection(foreign_tx, Arc::new(foreign_principal))
+        .await
+        .expect("foreign test session should register");
+    session_manager
+        .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
+        .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        foreign_connection_id,
+        workspace_id.as_str(),
+        "thread_native_permission",
+    )
+    .await;
     let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
 
     processor
@@ -34677,18 +34742,10 @@ async fn turn_permission_request_respond_resolves_native_pending_request_and_bro
         opened_params["request"]["action"],
         serde_json::json!("shell_command")
     );
-
-    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
-    let mut foreign_principal = authenticated_test_superuser().as_ref().clone();
-    foreign_principal.session_id =
-        pioneer_protocol::AuthSessionId::new("S00000000000000000002").expect("foreign session id");
-    let foreign_connection_id = session_manager
-        .register_connection(foreign_tx, Arc::new(foreign_principal))
-        .await
-        .expect("foreign test session should register");
-    session_manager
-        .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
-        .await;
+    assert!(
+        foreign_rx.try_recv().is_err(),
+        "another subscribed session must not see an approval it cannot answer"
+    );
     let foreign_response_id = "permissionforeign0001";
     processor
         .process_request_for_connection(
@@ -34754,6 +34811,10 @@ async fn turn_permission_request_respond_resolves_native_pending_request_and_bro
     assert_eq!(
         resolution,
         pioneer_tools::PermissionApprovalResolution::AllowForTurn
+    );
+    assert!(
+        foreign_rx.try_recv().is_err(),
+        "resolution must remain scoped to the initiating session"
     );
 }
 

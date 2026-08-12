@@ -50,6 +50,31 @@ fn ordered_cli_runtime_explicit_skills(
     Ok(ordered)
 }
 
+fn projected_skill_policy_state(
+    skill: &pioneer_skills::SkillDefinition,
+    effective_policy: &pioneer_skills::EffectiveSkillPolicy,
+) -> SkillPolicyState {
+    SkillPolicyState {
+        enabled: effective_policy.enabled,
+        allow_implicit_invocation: effective_policy.allow_implicit_invocation,
+        // This describes whether invocation is user-selectable for the skill
+        // itself; it is also the shared composer's selection predicate.
+        // Workspace policy administration is independently gated by
+        // SkillManage/can_manage_capabilities.
+        allow_implicit_invocation_editable: skill_implicit_invocation_editable(skill),
+    }
+}
+
+fn member_skill_is_operationally_visible(
+    skill: &pioneer_skills::SkillDefinition,
+    effective_policy: &pioneer_skills::EffectiveSkillPolicy,
+    installed_in_workspace: bool,
+) -> bool {
+    skill.is_available()
+        && effective_policy.enabled
+        && (matches!(skill.identity.source_kind, SkillSourceKind::System) || installed_in_workspace)
+}
+
 #[cfg(test)]
 mod cli_runtime_resolver_tests {
     use super::*;
@@ -117,6 +142,85 @@ mod cli_runtime_resolver_tests {
             label: Some(slug.to_owned()),
             skill_id,
         }
+    }
+
+    #[test]
+    fn member_catalog_policy_keeps_user_invocable_skills_selectable() {
+        let skill = definition("member-selectable", SkillSourceKind::User);
+        let effective_policy = pioneer_skills::EffectiveSkillPolicy {
+            enabled: true,
+            allow_implicit_invocation: false,
+        };
+
+        let projected = projected_skill_policy_state(&skill, &effective_policy);
+
+        assert!(projected.enabled);
+        assert!(projected.allow_implicit_invocation_editable);
+        assert!(pioneer_client::skills::catalog::skill_is_user_selectable(
+            &SkillListItem {
+                skill_id: skill.identity.skill_id.clone(),
+                pack: None,
+                owner: skill.identity.owner.clone(),
+                slug: skill.identity.slug.clone(),
+                source_kind: skill.identity.source_kind.as_db_value().to_owned(),
+                display_name: skill.identity.display_name.clone(),
+                description: skill.instructions.description.clone(),
+                version: skill.identity.version_hint.clone(),
+                fingerprint: skill.identity.fingerprint.clone(),
+                trust_level: "community".to_owned(),
+                install: SkillInstallState {
+                    managed: false,
+                    installed: true,
+                    lifecycle_editable: false,
+                    install_path: None,
+                    updated_at: None,
+                },
+                policy: projected,
+                health: SkillHealthSummary {
+                    status: "ok".to_owned(),
+                    dependency_failures: Vec::new(),
+                    security_blocks: Vec::new(),
+                    validation_issues: Vec::new(),
+                },
+                status: "active".to_owned(),
+                status_reason: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn member_catalog_uses_effective_policy_without_requiring_an_explicit_policy_row() {
+        let user_skill = definition("member-default-enabled", SkillSourceKind::User);
+        let system_skill = definition("member-system-enabled", SkillSourceKind::System);
+        let enabled = pioneer_skills::EffectiveSkillPolicy {
+            enabled: true,
+            allow_implicit_invocation: false,
+        };
+        let disabled = pioneer_skills::EffectiveSkillPolicy {
+            enabled: false,
+            allow_implicit_invocation: false,
+        };
+
+        assert!(member_skill_is_operationally_visible(
+            &user_skill,
+            &enabled,
+            true,
+        ));
+        assert!(member_skill_is_operationally_visible(
+            &system_skill,
+            &enabled,
+            false,
+        ));
+        assert!(!member_skill_is_operationally_visible(
+            &user_skill,
+            &enabled,
+            false,
+        ));
+        assert!(!member_skill_is_operationally_visible(
+            &user_skill,
+            &disabled,
+            true,
+        ));
     }
 
     fn resolve_for(
@@ -547,12 +651,6 @@ impl MessageProcessor {
                 return;
             }
         };
-        let member_enabled_skill_ids = workspace_policies
-            .iter()
-            .filter(|policy| policy.enabled == Some(true))
-            .map(|policy| policy.skill_id.clone())
-            .collect::<HashSet<_>>();
-
         let policy_set = self.build_policy_set(
             catalog.skills.as_slice(),
             workspace_policies.as_slice(),
@@ -594,10 +692,11 @@ impl MessageProcessor {
             .iter()
             .filter(|skill| {
                 !member
-                    || (member_enabled_skill_ids.contains(&skill.identity.skill_id)
-                        && skill.is_available()
-                        && (matches!(skill.identity.source_kind, SkillSourceKind::System)
-                            || installation_by_id.contains_key(&skill.identity.skill_id)))
+                    || member_skill_is_operationally_visible(
+                        skill,
+                        &effective_policy_for_skill(skill, &policy_set),
+                        installation_by_id.contains_key(&skill.identity.skill_id),
+                    )
             })
             .map(|skill| {
                 let installation = installation_by_id.get(&skill.identity.skill_id);
@@ -663,12 +762,7 @@ impl MessageProcessor {
                             installation.map(|item| item.updated_at_unix)
                         },
                     },
-                    policy: SkillPolicyState {
-                        enabled: effective_policy.enabled,
-                        allow_implicit_invocation: effective_policy.allow_implicit_invocation,
-                        allow_implicit_invocation_editable: !member
-                            && skill_implicit_invocation_editable(skill),
-                    },
+                    policy: projected_skill_policy_state(skill, &effective_policy),
                     health,
                     status,
                     status_reason,

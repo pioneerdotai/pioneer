@@ -9,6 +9,9 @@ use gpui_component::{
 
 impl PioneerDesktop {
     pub(crate) fn render_bottom_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let can_manage_capabilities = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
         let is_threads_view_active = matches!(
             self.main_content_view,
             MainContentView::Threads | MainContentView::AgentsDoc
@@ -86,28 +89,30 @@ impl PioneerDesktop {
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        Button::new("bottom-bar-open-mcp")
-                            .ghost()
-                            .small()
-                            .compact()
-                            .child(
-                                Icon::new(PioneerIconName::Mcp)
-                                    .size_3p5()
-                                    .opacity(0.6)
-                                    .when(is_mcp_view_active, |this| {
-                                        this.opacity(1.0).text_color(cx.theme().blue)
-                                    }),
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                if view.main_content_view == MainContentView::Mcp {
-                                    view.show_sidebar = !view.show_sidebar;
-                                } else {
-                                    view.open_mcp_screen_from_bottom_bar(cx);
-                                }
-                                cx.notify();
-                            })),
-                    )
+                    .when(can_manage_capabilities, |this| {
+                        this.child(
+                            Button::new("bottom-bar-open-mcp")
+                                .ghost()
+                                .small()
+                                .compact()
+                                .child(
+                                    Icon::new(PioneerIconName::Mcp)
+                                        .size_3p5()
+                                        .opacity(0.6)
+                                        .when(is_mcp_view_active, |this| {
+                                            this.opacity(1.0).text_color(cx.theme().blue)
+                                        }),
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if view.main_content_view == MainContentView::Mcp {
+                                        view.show_sidebar = !view.show_sidebar;
+                                    } else {
+                                        view.open_mcp_screen_from_bottom_bar(cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("bottom-bar-open-skills")
                             .ghost()

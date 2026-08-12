@@ -6,14 +6,14 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(test)]
+use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
-    MemberSummary, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey, Thread, ThreadOriginKind,
-    ThreadParticipantSummary, ThreadStatus, ThreadVisibility, WorkspaceId,
+    AuthorizationWorkspaceCapabilities, MemberSummary, PrincipalId, PrincipalStatus, Thread,
+    ThreadOriginKind, ThreadParticipantSummary, ThreadStatus, ThreadVisibility, WorkspaceId,
 };
 
-use crate::authorization::{
-    ThreadPresentationCapabilities, ThreadPresentationFacts, thread_presentation_capabilities,
-};
+use crate::authorization::ThreadPresentationCapabilities;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -43,29 +43,28 @@ pub struct ThreadCreateVisibilityPlan {
     pub options: Vec<ThreadVisibility>,
 }
 
-/// User threads default to private. Only a recognized Superuser may discover
-/// workspace-wide creation; internal/system threads expose no selector.
+/// User threads default to private. Recognized workspace Members and the
+/// Superuser may choose either user-addressable visibility; internal/system
+/// threads expose no selector.
 pub fn thread_create_visibility_plan(
-    principal_kind: Option<PrincipalKind>,
-    role_key: Option<&RoleKey>,
+    capabilities: Option<&AuthorizationWorkspaceCapabilities>,
     origin_kind: ThreadOriginKind,
 ) -> ThreadCreateVisibilityPlan {
     if !is_user_thread_origin(origin_kind) {
         return ThreadCreateVisibilityPlan::default();
     }
-
-    match (principal_kind, role_key) {
-        (Some(PrincipalKind::Superuser), None) => ThreadCreateVisibilityPlan {
-            default_visibility: Some(ThreadVisibility::Private),
-            options: vec![ThreadVisibility::Private, ThreadVisibility::Workspace],
-        },
-        (Some(PrincipalKind::User), Some(role_key)) if role_key.is_supported() => {
-            ThreadCreateVisibilityPlan {
-                default_visibility: Some(ThreadVisibility::Private),
-                options: vec![ThreadVisibility::Private],
-            }
-        }
-        _ => ThreadCreateVisibilityPlan::default(),
+    let Some(capabilities) = capabilities.filter(|value| value.can_create_thread) else {
+        return ThreadCreateVisibilityPlan::default();
+    };
+    let options = capabilities.thread_visibility_options.clone();
+    let default_visibility = options
+        .iter()
+        .copied()
+        .find(|visibility| *visibility == ThreadVisibility::Private)
+        .or_else(|| options.first().copied());
+    ThreadCreateVisibilityPlan {
+        default_visibility,
+        options,
     }
 }
 
@@ -107,26 +106,15 @@ pub struct ThreadScopePresentation {
 /// side channel.
 pub fn thread_scope_presentation(
     thread: &Thread,
-    principal_kind: Option<PrincipalKind>,
-    role_key: Option<&RoleKey>,
     current_principal_id: Option<&PrincipalId>,
-    current_principal_is_creator: bool,
+    mut capabilities: ThreadPresentationCapabilities,
     authoritative_participants: &[ThreadParticipantSummary],
     scoped_workspace_members: &[MemberSummary],
 ) -> ThreadScopePresentation {
     let is_user_thread = is_user_thread_origin(thread.origin_kind);
     let is_private = thread.visibility == Some(ThreadVisibility::Private);
     let is_closed = thread.status == ThreadStatus::Closed;
-    let mut capabilities = thread_presentation_capabilities(
-        principal_kind,
-        role_key,
-        ThreadPresentationFacts {
-            is_user_thread,
-            is_private_thread: is_private,
-            current_principal_is_creator,
-        },
-    );
-    if is_closed {
+    if !is_user_thread || is_closed {
         capabilities = ThreadPresentationCapabilities::default();
     }
 
@@ -242,7 +230,25 @@ pub fn plan_thread_scope_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{RoleKey, ThreadMode};
+    use pioneer_protocol::{PrincipalKind, RoleKey, ThreadMode};
+
+    fn create_capabilities() -> AuthorizationWorkspaceCapabilities {
+        AuthorizationWorkspaceCapabilities {
+            can_read: true,
+            can_create_thread: true,
+            can_manage: false,
+            can_use_providers: true,
+            can_use_cli_runtimes: true,
+            can_use_skills: true,
+            can_use_mcp: true,
+            can_run_tasks: true,
+            turn_permission_modes: vec![TurnPermissionMode::Supervised],
+            can_list_members: true,
+            can_add_member: true,
+            can_remove_member: false,
+            thread_visibility_options: vec![ThreadVisibility::Private, ThreadVisibility::Workspace],
+        }
+    }
 
     fn member(id: &str, status: PrincipalStatus) -> MemberSummary {
         MemberSummary {
@@ -279,26 +285,27 @@ mod tests {
     }
 
     #[test]
-    fn create_options_default_members_private_and_keep_internal_hidden() {
-        let member_plan = thread_create_visibility_plan(
-            Some(PrincipalKind::User),
-            Some(&RoleKey::member()),
-            ThreadOriginKind::User,
-        );
+    fn create_options_are_projected_from_workspace_capabilities() {
+        let capabilities = create_capabilities();
+        let member_plan =
+            thread_create_visibility_plan(Some(&capabilities), ThreadOriginKind::User);
         assert_eq!(
             member_plan.default_visibility,
             Some(ThreadVisibility::Private)
         );
-        assert_eq!(member_plan.options, vec![ThreadVisibility::Private]);
-
-        let superuser_plan = thread_create_visibility_plan(
-            Some(PrincipalKind::Superuser),
-            None,
-            ThreadOriginKind::User,
-        );
-        assert_eq!(superuser_plan.options.len(), 2);
         assert_eq!(
-            thread_create_visibility_plan(None, None, ThreadOriginKind::System),
+            member_plan.options,
+            vec![ThreadVisibility::Private, ThreadVisibility::Workspace]
+        );
+
+        let mut denied = capabilities.clone();
+        denied.can_create_thread = false;
+        assert_eq!(
+            thread_create_visibility_plan(Some(&denied), ThreadOriginKind::User),
+            ThreadCreateVisibilityPlan::default()
+        );
+        assert_eq!(
+            thread_create_visibility_plan(Some(&capabilities), ThreadOriginKind::System),
             ThreadCreateVisibilityPlan::default()
         );
     }
@@ -310,10 +317,12 @@ mod tests {
         let hidden = member("PHHHHHHHHHHHHHHHHHHHH", PrincipalStatus::Suspended);
         let projection = thread_scope_presentation(
             &thread(ThreadOriginKind::User, Some(ThreadVisibility::Private)),
-            Some(PrincipalKind::Superuser),
-            None,
             Some(&current),
-            false,
+            ThreadPresentationCapabilities {
+                can_manage_thread: true,
+                can_manage_private_participants: true,
+                ..ThreadPresentationCapabilities::default()
+            },
             &[
                 ThreadParticipantSummary {
                     principal_id: visible.principal_id.clone(),
@@ -337,10 +346,8 @@ mod tests {
     fn non_creator_and_internal_threads_fail_closed() {
         let projection = thread_scope_presentation(
             &thread(ThreadOriginKind::User, Some(ThreadVisibility::Private)),
-            Some(PrincipalKind::User),
-            Some(&RoleKey::member()),
             None,
-            false,
+            ThreadPresentationCapabilities::default(),
             &[],
             &[member("PAAAAAAAAAAAAAAAAAAAA", PrincipalStatus::Active)],
         );
@@ -349,10 +356,12 @@ mod tests {
 
         let internal = thread_scope_presentation(
             &thread(ThreadOriginKind::System, None),
-            Some(PrincipalKind::Superuser),
             None,
-            None,
-            true,
+            ThreadPresentationCapabilities {
+                can_manage_thread: true,
+                can_manage_private_participants: true,
+                ..ThreadPresentationCapabilities::default()
+            },
             &[],
             &[],
         );

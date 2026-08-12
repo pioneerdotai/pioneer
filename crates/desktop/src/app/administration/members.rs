@@ -596,6 +596,73 @@ impl PioneerDesktop {
         .detach();
     }
 
+    /// Loads the complete ACL-scoped directory used to supplement an
+    /// explicit workspace member list with implicit Superusers for mentions.
+    pub(in crate::app) fn ensure_active_thread_mention_directory_loaded(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        if self.gateway.connection_state != GatewayConnectionState::Connected
+            || self.current_active_thread_id().is_none()
+            || self.members_loading
+            || self.members_error.is_some()
+            || self.administration.member_directory_complete()
+            || !self
+                .principal_presentation_capabilities()
+                .can_view_member_directory
+        {
+            return;
+        }
+
+        self.members_loading = true;
+        let sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move {
+                        let mut pages = Vec::new();
+                        let mut cursor = None;
+                        loop {
+                            let page = sender.member_list(MemberListParams {
+                                cursor,
+                                limit: Some(100),
+                            })?;
+                            cursor = page.next_cursor.clone();
+                            pages.push(page);
+                            if cursor.is_none() {
+                                break;
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(pages)
+                    })
+                    .await;
+                let _ = this.update(&mut cx, |view, cx| {
+                    view.members_loading = false;
+                    match result {
+                        Ok(pages) => {
+                            for (index, page) in pages.into_iter().enumerate() {
+                                if index == 0 {
+                                    view.administration.apply_member_list(page);
+                                } else {
+                                    view.administration.append_member_page(page);
+                                }
+                            }
+                            view.members_error = None;
+                            view.resolve_visible_member_avatars(cx);
+                        }
+                        Err(_) => {
+                            view.members_error =
+                                Some(t!("settings.members.load_failed").to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn resolve_visible_member_avatars(&mut self, cx: &mut Context<Self>) {
         let mut members = self.administration.members().cloned().collect::<Vec<_>>();
         if let Some(workspace_id) = self

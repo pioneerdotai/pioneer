@@ -20,11 +20,12 @@ use pioneer_client::{
 };
 use pioneer_protocol::{
     AuthMeResponse, AuthRefreshGrant, AuthRefreshParams, AuthSessionStatus, ClientKind,
-    CredentialStorageOrder, DeviceStatus, PrincipalKind, generate_id,
+    CredentialStorageOrder, DeviceStatus, generate_id,
 };
 
 use crate::gateway::{
     activation::{DesktopSessionAccessGrant, revoke_session_best_effort},
+    is_supported_session_principal_kind,
     secrets::{
         DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION, DesktopGatewaySessionSecret,
         is_valid_refresh_credential,
@@ -725,7 +726,7 @@ fn rotated_session(
             != CredentialStorageOrder::PersistRefreshBeforeActivatingAccess
         || grant.gateway.id != previous.gateway_id
         || grant.principal.id != previous.principal_id
-        || grant.principal.kind != pioneer_protocol::PrincipalKind::Superuser
+        || !is_supported_session_principal_kind(&grant.principal.kind)
         || grant.session.id != previous.session_id
         || grant.session.device_id != previous.device_id
         || grant.session.token_family_id != previous.token_family_id
@@ -785,7 +786,7 @@ fn validate_gateway_session_identity(
         return Some(SessionTerminalReason::GatewayIdentityMismatch);
     }
     if me.principal.id != stored.principal_id
-        || me.principal.kind != PrincipalKind::Superuser
+        || !is_supported_session_principal_kind(&me.principal.kind)
         || me.device.id != stored.device_id
         || me.device.installation_id != expected_installation_id
         || me.device.installation_id != stored.installation_id
@@ -887,7 +888,7 @@ mod tests {
     use pioneer_keystore::MemorySecretStore;
     use pioneer_protocol::{
         AuthDeviceSnapshot, AuthSessionSnapshot, AuthSessionStatus, ClientKind, DeviceStatus,
-        TokenFamilyId,
+        PrincipalKind, TokenFamilyId,
     };
 
     use crate::gateway::{
@@ -1041,6 +1042,28 @@ mod tests {
             ),
             Some(SessionTerminalReason::GatewayIdentityMismatch)
         );
+    }
+
+    #[test]
+    fn invited_member_identity_and_refresh_are_accepted() {
+        let stored = stored_session(0);
+        let mut grant = refresh_grant(1);
+        grant.principal.kind = PrincipalKind::User;
+        grant.principal.display_name = "Invited Member".to_owned();
+        grant.principal.nickname = "invited_member".to_owned();
+
+        let mut me = auth_me(0);
+        me.principal = grant.principal.clone();
+        assert_eq!(
+            validate_gateway_session_identity(
+                Some(&stored.gateway_id),
+                "desktop-installation",
+                &stored,
+                &me,
+            ),
+            None
+        );
+        assert!(rotated_session(&stored, "desktop-installation", grant).is_ok());
     }
 
     #[test]

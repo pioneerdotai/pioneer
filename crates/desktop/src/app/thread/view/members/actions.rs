@@ -25,6 +25,11 @@ impl PioneerDesktop {
         else {
             return;
         };
+        if self.thread_scope_capabilities_thread_id.as_deref() != Some(thread_id.as_str())
+            || !self.thread_scope_capabilities.can_manage_thread
+        {
+            return;
+        }
         let workspace_id = thread.workspace_id.clone();
         let action = ThreadScopeAction::UpdateVisibility { visibility };
 
@@ -107,6 +112,13 @@ impl PioneerDesktop {
         if thread.visibility != Some(ThreadVisibility::Private) {
             return;
         }
+        if self.thread_scope_capabilities_thread_id.as_deref() != Some(thread_id.as_str())
+            || !self
+                .thread_scope_capabilities
+                .can_manage_private_participants
+        {
+            return;
+        }
         let workspace_id = thread.workspace_id.clone();
         let action = if add {
             ThreadScopeAction::AddParticipant {
@@ -174,8 +186,8 @@ mod tests {
     fn desktop_visibility_action_uses_existing_rpc_without_scope_dialog() {
         let source = include_str!("actions.rs");
         assert!(source.contains("thread_update"));
-        assert!(!source.contains("open_dialog"));
-        assert!(!source.contains("thread_participants_list"));
-        assert!(!source.contains("refresh_thread_list"));
+        assert!(!source.contains(&["open", "_dialog"].concat()));
+        assert!(!source.contains(&["thread_participants", "_list"].concat()));
+        assert!(!source.contains(&["refresh_thread", "_list"].concat()));
     }
 }

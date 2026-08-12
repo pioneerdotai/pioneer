@@ -2,10 +2,26 @@ use crate::app::root::{GatewayConnectionState, PioneerDesktop};
 use gpui::{AsyncApp, Context, WeakEntity, prelude::*};
 use pioneer_client::threads::scope::{ThreadScopeAction, ThreadScopePendingAction};
 use pioneer_protocol::{
-    ThreadParticipantChangeKind, ThreadParticipantSummary, ThreadParticipantsChangedNotification,
-    ThreadParticipantsListParams, ThreadParticipantsResponse, ThreadVisibility,
+    AuthorizationCapabilitiesParams, ThreadParticipantChangeKind, ThreadParticipantSummary,
+    ThreadParticipantsChangedNotification, ThreadParticipantsListParams,
+    ThreadParticipantsResponse,
 };
+use std::time::Duration;
 use tracing::warn;
+
+const THREAD_CAPABILITY_REFRESH_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadCapabilityRefreshDecision {
+    Complete,
+    Retry,
+    Stale,
+}
 
 impl PioneerDesktop {
     pub(in crate::app) fn toggle_thread_members_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -22,6 +38,176 @@ impl PioneerDesktop {
         self.show_thread_artifacts_sidebar = false;
         self.ensure_active_thread_members_loaded(true, cx);
         cx.notify();
+    }
+
+    /// Loads operational capabilities for every active thread independently
+    /// from the optional participants panel. Internal task/subagent threads do
+    /// not have their own user-facing participant list, but the Gateway can
+    /// still project their permissions through persisted root lineage.
+    pub(in crate::app) fn ensure_active_thread_capabilities_loaded(
+        &mut self,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.gateway.connection_state != GatewayConnectionState::Connected {
+            return;
+        }
+        let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(workspace_id) = self
+            .thread_coordinator(thread_id.as_str())
+            .and_then(|coordinator| coordinator.thread())
+            .map(|thread| thread.workspace_id.clone())
+        else {
+            return;
+        };
+        if !force && self.thread_scope_capabilities_thread_id.as_deref() == Some(thread_id.as_str())
+        {
+            return;
+        }
+        if self.thread_scope_capabilities_loading_thread_id.as_deref() == Some(thread_id.as_str()) {
+            return;
+        }
+        let Some(expected_principal_id) = self
+            .gateway
+            .current_auth
+            .as_ref()
+            .map(|auth| auth.principal.id.clone())
+        else {
+            return;
+        };
+        let is_runtime_draft = self.draft_thread_id() == Some(thread_id.as_str());
+
+        self.thread_scope_capabilities_refresh_generation = self
+            .thread_scope_capabilities_refresh_generation
+            .wrapping_add(1);
+        let generation = self.thread_scope_capabilities_refresh_generation;
+        let connection_id = self.gateway.ws_connection_id;
+        self.thread_scope_capabilities_loading_thread_id = Some(thread_id.clone());
+        let sender = self.gateway.ws_command_sender.clone();
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                for attempt in 0..=THREAD_CAPABILITY_REFRESH_RETRY_DELAYS.len() {
+                    let request_sender = sender.clone();
+                    let request_workspace_id = workspace_id.clone();
+                    let request_thread_id = thread_id.clone();
+                    let request_principal_id = expected_principal_id.clone();
+                    let result = cx
+                        .background_spawn(async move {
+                            let snapshot = request_sender.authorization_capabilities(
+                                AuthorizationCapabilitiesParams {
+                                    workspace_id: Some(request_workspace_id.clone()),
+                                    thread_id: Some(request_thread_id.clone()),
+                                },
+                            )?;
+                            anyhow::ensure!(
+                                pioneer_client::authorization::authorization_capability_snapshot_is_compatible(
+                                    &snapshot,
+                                    &request_principal_id,
+                                    Some(request_workspace_id.as_str()),
+                                    Some(request_thread_id.as_str()),
+                                ),
+                                "Gateway returned an incompatible thread capability snapshot"
+                            );
+                            anyhow::Ok(snapshot)
+                        })
+                        .await;
+
+                    let decision = this
+                        .update(&mut cx, |view, cx| {
+                            let context_matches = view.gateway.connection_state
+                                == GatewayConnectionState::Connected
+                                && view.thread_scope_capabilities_refresh_generation == generation
+                                && view.gateway.ws_connection_id == connection_id
+                                && view.current_active_thread_id() == Some(thread_id.as_str())
+                                && view
+                                    .thread_workspace_id(thread_id.as_str())
+                                    .is_some_and(|current| current == workspace_id.as_str())
+                                && view
+                                    .gateway
+                                    .current_auth
+                                    .as_ref()
+                                    .is_some_and(|auth| {
+                                        auth.principal.id == expected_principal_id
+                                    });
+                            if !context_matches {
+                                return ThreadCapabilityRefreshDecision::Stale;
+                            }
+
+                            match result {
+                                Ok(snapshot) => {
+                                    if view.gateway.authorization_revision.is_some_and(
+                                        |revision| revision > snapshot.authorization_revision,
+                                    ) || snapshot.workspace.is_none()
+                                        || (!is_runtime_draft && snapshot.thread.is_none())
+                                    {
+                                        return ThreadCapabilityRefreshDecision::Retry;
+                                    }
+                                    view.gateway.authorization_revision = Some(
+                                        view.gateway.authorization_revision.map_or(
+                                            snapshot.authorization_revision,
+                                            |revision| {
+                                                revision.max(snapshot.authorization_revision)
+                                            },
+                                        ),
+                                    );
+                                    view.thread_scope_capabilities =
+                                        pioneer_client::authorization::thread_presentation_capabilities(
+                                            snapshot
+                                                .thread
+                                                .as_ref()
+                                                .map(|thread| &thread.capabilities),
+                                        );
+                                    view.thread_scope_capabilities_thread_id =
+                                        Some(thread_id.clone());
+                                    view.thread_scope_capabilities_loading_thread_id = None;
+                                    cx.notify();
+                                    ThreadCapabilityRefreshDecision::Complete
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        attempt,
+                                        thread_id = thread_id.as_str(),
+                                        error = %format!("{error:#}"),
+                                        "thread capability refresh failed"
+                                    );
+                                    ThreadCapabilityRefreshDecision::Retry
+                                }
+                            }
+                        })
+                        .unwrap_or(ThreadCapabilityRefreshDecision::Stale);
+
+                    match decision {
+                        ThreadCapabilityRefreshDecision::Complete
+                        | ThreadCapabilityRefreshDecision::Stale => return,
+                        ThreadCapabilityRefreshDecision::Retry
+                            if attempt < THREAD_CAPABILITY_REFRESH_RETRY_DELAYS.len() =>
+                        {
+                            cx.background_executor()
+                                .timer(THREAD_CAPABILITY_REFRESH_RETRY_DELAYS[attempt])
+                                .await;
+                        }
+                        ThreadCapabilityRefreshDecision::Retry => {
+                            let _ = this.update(&mut cx, |view, _| {
+                                if view.thread_scope_capabilities_refresh_generation == generation
+                                    && view
+                                        .thread_scope_capabilities_loading_thread_id
+                                        .as_deref()
+                                        == Some(thread_id.as_str())
+                                {
+                                    view.thread_scope_capabilities_loading_thread_id = None;
+                                }
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     pub(in crate::app) fn ensure_active_thread_members_loaded(
@@ -43,10 +229,10 @@ impl PioneerDesktop {
         else {
             return;
         };
-        if thread.visibility != Some(ThreadVisibility::Private) {
-            // Workspace-visible threads use the whole workspace directory.
-            // Keep the private-participant cache unbound so switching this
-            // same thread back to private triggers an authoritative load.
+        if thread.visibility != Some(pioneer_protocol::ThreadVisibility::Private) {
+            // Workspace-visible threads use the workspace directory and
+            // internal task/subagent threads inherit their root ACL. Neither
+            // has a user-editable private participant list.
             self.thread_members_thread_id = None;
             self.thread_members.clear();
             self.thread_members_loading = false;
@@ -76,7 +262,7 @@ impl PioneerDesktop {
                 let result = cx
                     .background_spawn(async move {
                         sender.thread_participants_list(ThreadParticipantsListParams {
-                            workspace_id,
+                            workspace_id: workspace_id.clone(),
                             thread_id: thread_id.clone(),
                         })
                     })

@@ -87,6 +87,15 @@ impl PioneerDesktop {
         resolution: PendingRequestResolution,
         cx: &mut Context<Self>,
     ) {
+        let visible_in_active_scope = self
+            .active_thread_pending_requests()
+            .iter()
+            .any(|pending| pending.request_id == request.request_id);
+        if !visible_in_active_scope
+            || !self.can_respond_to_agent_requests_presentation(self.current_active_thread_id())
+        {
+            return;
+        }
         let action = match plan_pending_request_response(&request, resolution) {
             Ok(action) => action,
             Err(error) => {

@@ -10,32 +10,50 @@ use tracing::warn;
 
 impl PioneerDesktop {
     pub(in crate::app) fn open_providers_screen_from_bottom_bar(&mut self, cx: &mut Context<Self>) {
+        let can_manage = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
         self.sync_provider_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Providers, cx);
-        self.refresh_gateway_settings(cx);
         self.refresh_configured_providers(cx);
-        self.refresh_cli_providers_auto(cx);
+        if can_manage {
+            self.refresh_gateway_settings(cx);
+            self.refresh_cli_providers_auto(cx);
+        }
     }
 
     pub(in crate::app) fn sync_provider_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
+        let can_manage = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
+        if !can_manage && self.providers.filter() == ProviderFilter::Cli {
+            self.providers.set_filter(ProviderFilter::Api);
+        }
         let selected_ix = Some(selectors::provider_filter_tree_index(
             self.providers.filter(),
         ));
         let provider_tree_state = self.provider_tree_state.clone();
         provider_tree_state.update(cx, |state, cx| {
-            state.set_items(
-                vec![
-                    TreeItem::new(PROVIDERS_FILTER_API_NODE_ID, "api"),
-                    TreeItem::new(PROVIDERS_FILTER_CONNECTED_NODE_ID, "connected"),
-                    TreeItem::new(PROVIDERS_FILTER_CLI_NODE_ID, "cli"),
-                ],
-                cx,
-            );
+            let mut items = vec![
+                TreeItem::new(PROVIDERS_FILTER_API_NODE_ID, "api"),
+                TreeItem::new(PROVIDERS_FILTER_CONNECTED_NODE_ID, "connected"),
+            ];
+            if can_manage {
+                items.push(TreeItem::new(PROVIDERS_FILTER_CLI_NODE_ID, "cli"));
+            }
+            state.set_items(items, cx);
             state.set_selected_index(selected_ix, cx);
         });
     }
 
     pub(super) fn set_provider_filter(&mut self, filter: ProviderFilter, cx: &mut Context<Self>) {
+        if filter == ProviderFilter::Cli
+            && !self
+                .principal_presentation_capabilities()
+                .can_manage_capabilities
+        {
+            return;
+        }
         self.providers.set_filter(filter);
         self.sync_provider_sidebar_tree_state(cx);
         cx.notify();

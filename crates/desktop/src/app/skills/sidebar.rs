@@ -16,6 +16,9 @@ impl PioneerDesktop {
     pub(crate) fn render_skills_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
+        let can_manage = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
 
         v_flex()
             .size_full()
@@ -27,57 +30,59 @@ impl PioneerDesktop {
                     .pt_4()
                     .px_2()
                     .gap_1()
-                    .child(
-                        Button::new("skills-sidebar-install")
-                            .ghost()
-                            .justify_start()
-                            .px_2()
-                            .group("skills-sidebar-install-btn")
-                            .disabled(!is_connected)
-                            .child({
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_start()
-                                    .gap_2()
-                                    .child({
-                                        let icon_bg = cx.theme().foreground.opacity(0.075);
-                                        let icon_bg_hover = cx.theme().foreground.opacity(0.1);
-                                        div()
-                                            .id("skills-sidebar-install-icon")
-                                            .size_6()
-                                            .rounded_full()
-                                            .bg(icon_bg)
-                                            .group_hover(
-                                                "skills-sidebar-install-btn",
-                                                move |style| style.bg(icon_bg_hover),
-                                            )
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                Icon::new(IconName::Plus)
-                                                    .size_4()
-                                                    .opacity(SIDEBAR_MENU_ITEM_OPACITY),
-                                            )
-                                    })
-                                    .child(
-                                        div()
-                                            .line_height(relative(1.))
-                                            .opacity(SIDEBAR_MENU_ITEM_OPACITY)
-                                            .child(t!("skills.button.install").to_string()),
-                                    )
-                            })
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                move |_, window, cx| {
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.open_skill_install_dialog(window, cx);
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
+                    .when(can_manage, |this| {
+                        this.child(
+                            Button::new("skills-sidebar-install")
+                                .ghost()
+                                .justify_start()
+                                .px_2()
+                                .group("skills-sidebar-install-btn")
+                                .disabled(!is_connected)
+                                .child({
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_start()
+                                        .gap_2()
+                                        .child({
+                                            let icon_bg = cx.theme().foreground.opacity(0.075);
+                                            let icon_bg_hover = cx.theme().foreground.opacity(0.1);
+                                            div()
+                                                .id("skills-sidebar-install-icon")
+                                                .size_6()
+                                                .rounded_full()
+                                                .bg(icon_bg)
+                                                .group_hover(
+                                                    "skills-sidebar-install-btn",
+                                                    move |style| style.bg(icon_bg_hover),
+                                                )
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::new(IconName::Plus)
+                                                        .size_4()
+                                                        .opacity(SIDEBAR_MENU_ITEM_OPACITY),
+                                                )
+                                        })
+                                        .child(
+                                            div()
+                                                .line_height(relative(1.))
+                                                .opacity(SIDEBAR_MENU_ITEM_OPACITY)
+                                                .child(t!("skills.button.install").to_string()),
+                                        )
+                                })
+                                .on_click({
+                                    let desktop_entity = desktop_entity.clone();
+                                    move |_, window, cx| {
+                                        let _ = desktop_entity.update(cx, |view, cx| {
+                                            view.open_skill_install_dialog(window, cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    })
                     .child(
                         Button::new("skills-sidebar-update")
                             .ghost()
@@ -133,6 +138,9 @@ impl PioneerDesktop {
         let lifecycle_editable = selected_skill
             .as_ref()
             .is_some_and(|skill| skill.install.lifecycle_editable);
+        let can_manage = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
 
         v_flex()
             .size_full()
@@ -195,7 +203,7 @@ impl PioneerDesktop {
                                 }
                             }),
                     )
-                    .when(lifecycle_editable, |this| {
+                    .when(can_manage && lifecycle_editable, |this| {
                         this.child(
                             Button::new("skills-details-sidebar-update")
                                 .ghost()
@@ -250,7 +258,7 @@ impl PioneerDesktop {
                                 }),
                         )
                     })
-                    .when(lifecycle_editable, |this| {
+                    .when(can_manage && lifecycle_editable, |this| {
                         this.child(
                             Button::new("skills-details-sidebar-uninstall")
                                 .ghost()

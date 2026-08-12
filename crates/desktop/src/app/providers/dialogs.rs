@@ -26,6 +26,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let provider_id = Self::canonical_provider_id(provider_id.as_str());
         let Some(provider) = Self::provider_catalog_entry(provider_id.as_str()) else {
             return;
@@ -205,6 +211,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         self.providers.set_cli_runtime_draft(draft.clone());
 
         let id_input_state = cx.new(|cx| {

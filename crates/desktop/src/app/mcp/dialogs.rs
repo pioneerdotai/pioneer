@@ -25,6 +25,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let Some(name) = mcp_list::normalize_mcp_server_name(name.as_str()) else {
             self.mcp_error = Some(t!("mcp.error.server_name_required").to_string());
             return;
@@ -65,6 +71,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let config_input_state = cx.new(|cx| {
             let state = InputState::new(window, cx)
                 .multi_line(true)

@@ -66,6 +66,9 @@ impl PioneerDesktop {
             skill_health::skill_health_detail(&self.skills_health_details, &skill.skill_id)
                 .cloned();
         let is_pending = self.is_skill_pending(&skill.skill_id);
+        let can_manage = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
         let desktop_entity = cx.entity().clone();
         let skill_summary = skill_presentation::skill_summary_presentation(&skill);
         let version_label = skill_summary
@@ -173,74 +176,78 @@ impl PioneerDesktop {
                                     .child(status_label),
                             ),
                     )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("skill-screen-enabled")
-                                    .xsmall()
-                                    .compact()
-                                    .h_6()
-                                    .px_3()
-                                    .when(skill.policy.enabled, |this| this.primary())
-                                    .when(!skill.policy.enabled, |this| this.outline())
-                                    .disabled(is_pending)
-                                    .label(t!("skills.button.enabled").to_string())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let skill_id = skill.skill_id.clone();
-                                        let next_enabled = !skill.policy.enabled;
-                                        let allow_implicit = skill.policy.allow_implicit_invocation;
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.set_skill_policy(
-                                                    skill_id.clone(),
-                                                    next_enabled,
-                                                    allow_implicit,
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            )
-                            .child(
-                                Button::new("skill-screen-implicit")
-                                    .xsmall()
-                                    .compact()
-                                    .h_6()
-                                    .px_3()
-                                    .when(skill.policy.allow_implicit_invocation, |this| {
-                                        this.primary()
-                                    })
-                                    .when(!skill.policy.allow_implicit_invocation, |this| {
-                                        this.outline()
-                                    })
-                                    .disabled(
-                                        is_pending
-                                            || !skill.policy.allow_implicit_invocation_editable,
-                                    )
-                                    .label(t!("skills.button.implicit").to_string())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let skill_id = skill.skill_id.clone();
-                                        let enabled = skill.policy.enabled;
-                                        let next_implicit = !skill.policy.allow_implicit_invocation;
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.set_skill_policy(
-                                                    skill_id.clone(),
-                                                    enabled,
-                                                    next_implicit,
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            ),
-                    ),
+                    .when(can_manage, |this| {
+                        this.child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Button::new("skill-screen-enabled")
+                                        .xsmall()
+                                        .compact()
+                                        .h_6()
+                                        .px_3()
+                                        .when(skill.policy.enabled, |this| this.primary())
+                                        .when(!skill.policy.enabled, |this| this.outline())
+                                        .disabled(is_pending)
+                                        .label(t!("skills.button.enabled").to_string())
+                                        .on_click({
+                                            let desktop_entity = desktop_entity.clone();
+                                            let skill_id = skill.skill_id.clone();
+                                            let next_enabled = !skill.policy.enabled;
+                                            let allow_implicit =
+                                                skill.policy.allow_implicit_invocation;
+                                            move |_, _, cx| {
+                                                let _ = desktop_entity.update(cx, |view, cx| {
+                                                    view.set_skill_policy(
+                                                        skill_id.clone(),
+                                                        next_enabled,
+                                                        allow_implicit,
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("skill-screen-implicit")
+                                        .xsmall()
+                                        .compact()
+                                        .h_6()
+                                        .px_3()
+                                        .when(skill.policy.allow_implicit_invocation, |this| {
+                                            this.primary()
+                                        })
+                                        .when(!skill.policy.allow_implicit_invocation, |this| {
+                                            this.outline()
+                                        })
+                                        .disabled(
+                                            is_pending
+                                                || !skill.policy.allow_implicit_invocation_editable,
+                                        )
+                                        .label(t!("skills.button.implicit").to_string())
+                                        .on_click({
+                                            let desktop_entity = desktop_entity.clone();
+                                            let skill_id = skill.skill_id.clone();
+                                            let enabled = skill.policy.enabled;
+                                            let next_implicit =
+                                                !skill.policy.allow_implicit_invocation;
+                                            move |_, _, cx| {
+                                                let _ = desktop_entity.update(cx, |view, cx| {
+                                                    view.set_skill_policy(
+                                                        skill_id.clone(),
+                                                        enabled,
+                                                        next_implicit,
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                    }),
             )
             .child(
                 v_flex()

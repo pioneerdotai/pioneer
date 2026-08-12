@@ -90,21 +90,25 @@ impl PioneerDesktop {
         else {
             return div().into_any_element();
         };
-        let visibility_action =
-            thread
-                .visibility
-                .map(|current_visibility| match current_visibility {
-                    ThreadVisibility::Private => (
-                        t!("thread.scope.make_public").to_string(),
-                        ThreadVisibility::Workspace,
-                        PioneerIconName::Eye,
-                    ),
-                    ThreadVisibility::Workspace => (
-                        t!("thread.scope.make_private").to_string(),
-                        ThreadVisibility::Private,
-                        PioneerIconName::EyeOff,
-                    ),
-                });
+        let can_manage_thread = self.can_manage_thread_presentation(thread_id.as_str());
+        let visibility_action = can_manage_thread
+            .then(|| {
+                thread
+                    .visibility
+                    .map(|current_visibility| match current_visibility {
+                        ThreadVisibility::Private => (
+                            t!("thread.scope.make_public").to_string(),
+                            ThreadVisibility::Workspace,
+                            PioneerIconName::Eye,
+                        ),
+                        ThreadVisibility::Workspace => (
+                            t!("thread.scope.make_private").to_string(),
+                            ThreadVisibility::Private,
+                            PioneerIconName::EyeOff,
+                        ),
+                    })
+            })
+            .flatten();
         let visibility_action_disabled = self.gateway.connection_state
             != GatewayConnectionState::Connected
             || thread.status == ThreadStatus::Closed
@@ -123,16 +127,25 @@ impl PioneerDesktop {
                 let desktop_entity = desktop_entity.clone();
                 let edit_desktop_entity = desktop_entity.clone();
                 let members_desktop_entity = desktop_entity.clone();
-                let menu = menu.min_w(px(180.)).item(
-                    PopupMenuItem::new(t!("sidebar.contextmenu.thread.edit").to_string())
-                        .icon(PioneerIconName::Pen)
-                        .on_click(move |_, window, cx| {
-                            let _ = edit_desktop_entity.update(cx, |view, cx| {
-                                view.open_rename_thread_dialog(edit_thread_id.clone(), window, cx);
-                                cx.notify();
-                            });
-                        }),
-                );
+                let menu = menu.min_w(px(180.));
+                let menu = if can_manage_thread {
+                    menu.item(
+                        PopupMenuItem::new(t!("sidebar.contextmenu.thread.edit").to_string())
+                            .icon(PioneerIconName::Pen)
+                            .on_click(move |_, window, cx| {
+                                let _ = edit_desktop_entity.update(cx, |view, cx| {
+                                    view.open_rename_thread_dialog(
+                                        edit_thread_id.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                } else {
+                    menu
+                };
                 let menu = if show_members {
                     menu.item(
                         PopupMenuItem::new(t!("settings.sidebar.members").to_string())

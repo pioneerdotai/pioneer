@@ -11,6 +11,12 @@ impl PioneerDesktop {
         allow_implicit_invocation: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let Some(name) = mcp_list::normalize_mcp_server_name(name.as_str()) else {
             self.mcp_error = Some(t!("mcp.error.server_name_required").to_string());
             return;
@@ -99,6 +105,12 @@ impl PioneerDesktop {
     }
 
     pub(super) fn restart_mcp_server(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let Some(name) = mcp_list::normalize_mcp_server_name(name.as_str()) else {
             self.mcp_error = Some(t!("mcp.error.server_name_required").to_string());
             return;
@@ -176,6 +188,12 @@ impl PioneerDesktop {
     }
 
     pub(super) fn uninstall_mcp_server(&mut self, name: String, cx: &mut Context<Self>) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let Some(name) = mcp_list::normalize_mcp_server_name(name.as_str()) else {
             self.mcp_error = Some(t!("mcp.error.server_name_required").to_string());
             return;

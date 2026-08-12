@@ -2,11 +2,8 @@ use std::path::PathBuf;
 
 use gpui::{prelude::*, *};
 use gpui_component::{
-    avatar::Avatar,
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
-    spinner::Spinner,
-    theme::ActiveTheme,
     *,
 };
 use pioneer_protocol::{
@@ -16,11 +13,11 @@ use pioneer_protocol::{
 use crate::{
     app::{invitation_join::load_desktop_profile_avatar, root::PioneerDesktop},
     assets::PioneerIconName,
-    components::buttonts::default_primary_button,
+    components::profile_editor::{
+        profile_avatar, profile_editor_header, profile_editor_page, profile_identity_group,
+        profile_username_editor, profile_username_field,
+    },
 };
-
-const PROFILE_EDITOR_MAX_WIDTH_PX: f32 = 720.;
-const PROFILE_HEADER_SIDE_WIDTH_PX: f32 = 96.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProfileEditorPhase {
@@ -203,139 +200,113 @@ impl PioneerDesktop {
             )
         };
         let desktop = cx.entity().clone();
-
-        let header =
-            self.render_profile_editor_header(phase, saving, can_complete, editor.clone(), cx);
+        let title = match phase {
+            ProfileEditorPhase::Account => t!("settings.profile.edit_title"),
+            ProfileEditorPhase::Username => t!("settings.profile.edit_username_title"),
+        }
+        .to_string();
+        let header = profile_editor_header(
+            title,
+            "profile-editor-back",
+            "profile-editor-done",
+            t!("settings.profile.done").to_string(),
+            saving,
+            can_complete,
+            {
+                let editor = editor.clone();
+                let desktop = desktop.clone();
+                move |_, window, cx| {
+                    let _ = desktop.update(cx, |view, cx| match phase {
+                        ProfileEditorPhase::Account => view.close_profile_editor(cx),
+                        ProfileEditorPhase::Username => {
+                            view.cancel_profile_username_editor(editor.clone(), window, cx)
+                        }
+                    });
+                }
+            },
+            {
+                let editor = editor.clone();
+                let desktop = desktop.clone();
+                move |_, _, cx| {
+                    let _ = desktop.update(cx, |view, cx| match phase {
+                        ProfileEditorPhase::Account => view.save_profile_editor(editor.clone(), cx),
+                        ProfileEditorPhase::Username => {
+                            view.complete_profile_username_editor(editor.clone(), cx)
+                        }
+                    });
+                }
+            },
+            cx,
+        );
         let content = match phase {
-            ProfileEditorPhase::Account => v_flex()
-                .w_full()
-                .gap_6()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .items_center()
-                                .gap_3()
-                                .p_4()
-                                .rounded_2xl()
-                                .bg(cx.theme().muted)
-                                .child(
-                                    div()
-                                        .id("profile-avatar-edit")
-                                        .relative()
-                                        .flex_none()
-                                        .on_click({
-                                            let editor = editor.clone();
-                                            let desktop = desktop.clone();
-                                            move |_, _, cx| {
-                                                let _ = desktop.update(cx, |view, cx| {
-                                                    view.pick_profile_avatar(editor.clone(), cx)
-                                                });
-                                            }
-                                        })
-                                        .context_menu({
-                                            let editor = editor.clone();
-                                            let desktop = desktop.clone();
-                                            move |menu, _, _| {
-                                                let change_editor = editor.clone();
-                                                let change_desktop = desktop.clone();
-                                                let remove_editor = editor.clone();
-                                                menu.min_w(px(200.))
-                                                    .item(
-                                                        PopupMenuItem::new(
-                                                            t!("settings.profile.change_photo")
-                                                                .to_string(),
-                                                        )
-                                                        .icon(PioneerIconName::Pen)
-                                                        .disabled(saving)
-                                                        .on_click(move |_, _, cx| {
-                                                            let _ = change_desktop.update(
-                                                                cx,
-                                                                |view, cx| {
-                                                                    view.pick_profile_avatar(
-                                                                        change_editor.clone(),
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            );
-                                                        }),
-                                                    )
-                                                    .item(
-                                                        PopupMenuItem::new(
-                                                            t!("settings.profile.remove_photo")
-                                                                .to_string(),
-                                                        )
-                                                        .icon(PioneerIconName::Trash)
-                                                        .disabled(saving || !has_avatar)
-                                                        .on_click(move |_, _, cx| {
-                                                            let _ = remove_editor.update(
-                                                                cx,
-                                                                |state, cx| {
-                                                                    state.avatar =
-                                                                        ProfileAvatarEdit::Remove;
-                                                                    state.error = None;
-                                                                    cx.notify();
-                                                                },
-                                                            );
-                                                        }),
-                                                    )
-                                            }
-                                        })
-                                        .child(
-                                            Avatar::new()
-                                                .name(display_name)
-                                                .large()
-                                                .when_some(avatar_path, |avatar, path| {
-                                                    avatar.src(path)
-                                                }),
-                                        ),
+            ProfileEditorPhase::Account => {
+                let avatar = div()
+                    .id("profile-avatar-edit")
+                    .relative()
+                    .flex_none()
+                    .cursor_pointer()
+                    .on_click({
+                        let editor = editor.clone();
+                        let desktop = desktop.clone();
+                        move |_, _, cx| {
+                            let _ = desktop.update(cx, |view, cx| {
+                                view.pick_profile_avatar(editor.clone(), cx)
+                            });
+                        }
+                    })
+                    .context_menu({
+                        let editor = editor.clone();
+                        let desktop = desktop.clone();
+                        move |menu, _, _| {
+                            let change_editor = editor.clone();
+                            let change_desktop = desktop.clone();
+                            let remove_editor = editor.clone();
+                            menu.min_w(px(200.))
+                                .item(
+                                    PopupMenuItem::new(
+                                        t!("settings.profile.change_photo").to_string(),
+                                    )
+                                    .icon(PioneerIconName::Pen)
+                                    .disabled(saving)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let _ = change_desktop.update(cx, |view, cx| {
+                                                view.pick_profile_avatar(change_editor.clone(), cx)
+                                            });
+                                        },
+                                    ),
                                 )
-                                .child(
-                                    v_flex()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .child(
-                                            Input::new(&first_name)
-                                                .appearance(false)
-                                                .p_0()
-                                                .min_w_0(),
-                                        )
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .border_t_1()
-                                                .border_color(cx.theme().border),
-                                        )
-                                        .child(
-                                            Input::new(&last_name)
-                                                .appearance(false)
-                                                .p_0()
-                                                .min_w_0(),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .ml_4()
-                                .opacity(0.6)
-                                .child(t!("settings.profile.name_hint").to_string()),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .id("profile-username-row")
-                        .w_full()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .px_4()
-                        .py_4()
-                        .rounded_2xl()
-                        .bg(cx.theme().muted)
-                        .on_click({
+                                .item(
+                                    PopupMenuItem::new(
+                                        t!("settings.profile.remove_photo").to_string(),
+                                    )
+                                    .icon(PioneerIconName::Trash)
+                                    .disabled(saving || !has_avatar)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let _ = remove_editor.update(cx, |state, cx| {
+                                                state.avatar = ProfileAvatarEdit::Remove;
+                                                state.error = None;
+                                                cx.notify();
+                                            });
+                                        },
+                                    ),
+                                )
+                        }
+                    })
+                    .child(profile_avatar(display_name, avatar_path))
+                    .into_any_element();
+                v_flex()
+                    .w_full()
+                    .gap_6()
+                    .child(profile_identity_group(
+                        avatar, first_name, last_name, None, cx,
+                    ))
+                    .child(profile_username_field(
+                        "profile-username-row",
+                        nickname.read(cx).value().to_string(),
+                        None,
+                        {
                             let editor = editor.clone();
                             let desktop = desktop.clone();
                             move |_, window, cx| {
@@ -343,187 +314,24 @@ impl PioneerDesktop {
                                     view.open_profile_username_editor(editor.clone(), window, cx)
                                 });
                             }
-                        })
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_medium()
-                                .opacity(0.8)
-                                .child(t!("settings.profile.username").to_string()),
-                        )
-                        .child(
-                            h_flex()
-                                .min_w_0()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .text_sm()
-                                        .opacity(0.6)
-                                        .child(format!("@{}", nickname.read(cx).value())),
-                                )
-                                .child(Icon::new(IconName::ChevronRight).size_4().opacity(0.6)),
-                        ),
-                )
-                .into_any_element(),
-            ProfileEditorPhase::Username => v_flex()
-                .w_full()
-                .gap_6()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            Input::new(&nickname)
-                                .large()
-                                .cleanable(true)
-                                .h(px(48.))
-                                .bg(cx.theme().muted)
-                                .rounded_2xl()
-                                .border_0()
-                                .min_w_0(),
-                        )
-                        .child(
-                            div()
-                                .ml_3()
-                                .text_xs()
-                                .opacity(0.6)
-                                .line_height(relative(1.35))
-                                .child(t!("settings.profile.username_hint").to_string()),
-                        ),
-                )
-                .child(
-                    div()
-                        .ml_3()
-                        .text_xs()
-                        .opacity(0.6)
-                        .line_height(relative(1.35))
-                        .child(t!("settings.profile.username_rules").to_string()),
-                )
-                .into_any_element(),
+                        },
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+            ProfileEditorPhase::Username => profile_username_editor(nickname, None, cx),
         };
 
-        v_flex()
-            .size_full()
-            .bg(cx.theme().background)
-            .child(header)
-            .child(
-                v_flex()
-                    .id(match phase {
-                        ProfileEditorPhase::Account => "profile-account-scroll",
-                        ProfileEditorPhase::Username => "profile-username-scroll",
-                    })
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_6()
-                    .child(
-                        h_flex().w_full().justify_center().child(
-                            v_flex()
-                                .w_full()
-                                .max_w(px(PROFILE_EDITOR_MAX_WIDTH_PX))
-                                .gap_3()
-                                .child(content)
-                                .when_some(error, |body, error| {
-                                    body.child(
-                                        div().text_sm().text_color(cx.theme().danger).child(error),
-                                    )
-                                }),
-                        ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_profile_editor_header(
-        &self,
-        phase: ProfileEditorPhase,
-        saving: bool,
-        can_complete: bool,
-        editor: Entity<ProfileEditorState>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let desktop = cx.entity().clone();
-        let title = match phase {
-            ProfileEditorPhase::Account => t!("settings.profile.edit_title"),
-            ProfileEditorPhase::Username => t!("settings.profile.edit_username_title"),
-        }
-        .to_string();
-
-        h_flex()
-            .w_full()
-            .h(px(56.))
-            .items_center()
-            .px_6()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div().w(px(PROFILE_HEADER_SIDE_WIDTH_PX)).flex_none().child(
-                    default_primary_button("profile-editor-back")
-                        .w_8()
-                        .p_0()
-                        .rounded_full()
-                        .disabled(saving)
-                        .child(Icon::new(IconName::ChevronLeft).size_5())
-                        .on_click({
-                            let editor = editor.clone();
-                            let desktop = desktop.clone();
-                            move |_, window, cx| {
-                                let _ = desktop.update(cx, |view, cx| match phase {
-                                    ProfileEditorPhase::Account => view.close_profile_editor(cx),
-                                    ProfileEditorPhase::Username => view
-                                        .cancel_profile_username_editor(editor.clone(), window, cx),
-                                });
-                            }
-                        }),
-                ),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .text_center()
-                    .text_sm()
-                    .font_medium()
-                    .child(title),
-            )
-            .child(
-                h_flex()
-                    .w(px(PROFILE_HEADER_SIDE_WIDTH_PX))
-                    .flex_none()
-                    .justify_end()
-                    .child(
-                        default_primary_button("profile-editor-done")
-                            .w(px(76.))
-                            .px_0()
-                            .rounded_full()
-                            .disabled(saving || !can_complete)
-                            .child(if saving {
-                                Spinner::new().small().into_any_element()
-                            } else {
-                                div()
-                                    .text_sm()
-                                    .font_medium()
-                                    .child(t!("settings.profile.done").to_string())
-                                    .into_any_element()
-                            })
-                            .on_click({
-                                let editor = editor.clone();
-                                let desktop = desktop.clone();
-                                move |_, _, cx| {
-                                    let _ = desktop.update(cx, |view, cx| match phase {
-                                        ProfileEditorPhase::Account => {
-                                            view.save_profile_editor(editor.clone(), cx)
-                                        }
-                                        ProfileEditorPhase::Username => view
-                                            .complete_profile_username_editor(editor.clone(), cx),
-                                    });
-                                }
-                            }),
-                    ),
-            )
-            .into_any_element()
+        profile_editor_page(
+            match phase {
+                ProfileEditorPhase::Account => "profile-account-scroll",
+                ProfileEditorPhase::Username => "profile-username-scroll",
+            },
+            header,
+            content,
+            error,
+            cx,
+        )
     }
 
     fn close_profile_editor(&mut self, cx: &mut Context<Self>) {
@@ -730,7 +538,10 @@ mod tests {
             .unwrap();
         assert!(source.contains("ProfileEditorPhase::Account"));
         assert!(source.contains("ProfileEditorPhase::Username"));
-        assert!(source.contains("render_profile_editor_header"));
+        assert!(source.contains("profile_editor_header"));
+        assert!(source.contains("profile_identity_group"));
+        assert!(source.contains("profile_username_field"));
+        assert!(source.contains("profile_username_editor"));
         assert!(!source.contains("open_dialog"));
         assert!(!source.contains("close_dialog"));
     }

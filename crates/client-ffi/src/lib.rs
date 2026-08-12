@@ -133,11 +133,13 @@ use pioneer_protocol::{
     CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams,
     CLIRuntimeThreadCompactResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
-    ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams,
-    ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse,
-    ThreadReadParams, ThreadReadResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse,
-    TimelinePageAnchor, TurnMessageDeleteParams, TurnMessageDeleteResponse, TurnMessageEditParams,
-    TurnMessageEditResponse, TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
+    TaskAcceptParams, TaskAcceptResponse, TaskCancelParams, TaskCancelResponse, TaskReviseParams,
+    TaskReviseResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams,
+    ThreadAgentsDocSaveResponse, ThreadReadParams, ThreadReadResponse, ThreadTimelinePageParams,
+    ThreadTimelinePageResponse, TimelinePageAnchor, TurnMessageDeleteParams,
+    TurnMessageDeleteResponse, TurnMessageEditParams, TurnMessageEditResponse,
+    TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
     TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
     TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
     VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
@@ -556,6 +558,25 @@ impl ClientFfiRuntime {
         self.client_runtime
             .ws_command_sender()
             .auth_me()
+            .map_err(normal_auth_error)
+    }
+
+    fn gateway_authorization_capabilities(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_protocol::AuthorizationCapabilitySnapshot, ClientFfiError> {
+        let params =
+            serde_json::from_str::<pioneer_protocol::AuthorizationCapabilitiesParams>(input_json)
+                .map_err(|_| {
+                ClientFfiError::new(
+                    "invalid authorization capabilities request",
+                    "invalid_capability_scope",
+                )
+            })?;
+        self.require_initialized_and_connected()?;
+        self.client_runtime
+            .ws_command_sender()
+            .authorization_capabilities(params)
             .map_err(normal_auth_error)
     }
 
@@ -1537,6 +1558,36 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn task_accept(&self, input_json: &str) -> Result<TaskAcceptResponse, String> {
+        let params = serde_json::from_str::<TaskAcceptParams>(input_json)
+            .map_err(|error| format!("invalid task accept params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .task_accept(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn task_revise(&self, input_json: &str) -> Result<TaskReviseResponse, String> {
+        let params = serde_json::from_str::<TaskReviseParams>(input_json)
+            .map_err(|error| format!("invalid task revise params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .task_revise(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn task_cancel(&self, input_json: &str) -> Result<TaskCancelResponse, String> {
+        let params = serde_json::from_str::<TaskCancelParams>(input_json)
+            .map_err(|error| format!("invalid task cancel params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .task_cancel(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     fn voice_status(&self, input_json: &str) -> Result<VoiceStatusResponse, String> {
         let params = serde_json::from_str::<VoiceStatusParams>(input_json)
             .map_err(|error| format!("invalid voice status params: {error}"))?;
@@ -1772,9 +1823,10 @@ impl ClientFfiRuntime {
         &self,
         input_json: &str,
     ) -> Result<pioneer_client::authorization::PrincipalPresentationCapabilities, String> {
-        let auth = serde_json::from_str::<pioneer_protocol::AuthMeResponse>(input_json)
-            .map_err(|_| "invalid current principal presentation request".to_owned())?;
-        Ok(principal_capabilities(auth))
+        let snapshot =
+            serde_json::from_str::<pioneer_protocol::AuthorizationCapabilitySnapshot>(input_json)
+                .map_err(|_| "invalid capability snapshot".to_owned())?;
+        Ok(principal_capabilities(snapshot))
     }
 
     fn current_principal_presentation(
@@ -2713,6 +2765,10 @@ ffi_client_json_typed_method!(
 );
 ffi_client_json_typed_method!(pioneer_client_ffi_gateway_auth_me, gateway_auth_me);
 ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_authorization_capabilities,
+    gateway_authorization_capabilities
+);
+ffi_client_json_typed_method!(
     pioneer_client_ffi_gateway_auth_profile_update,
     gateway_auth_profile_update
 );
@@ -2850,6 +2906,9 @@ ffi_client_json_method!(
     pioneer_client_ffi_turn_permission_request_respond,
     turn_permission_request_respond
 );
+ffi_client_json_method!(pioneer_client_ffi_task_accept, task_accept);
+ffi_client_json_method!(pioneer_client_ffi_task_revise, task_revise);
+ffi_client_json_method!(pioneer_client_ffi_task_cancel, task_cancel);
 ffi_client_json_method!(pioneer_client_ffi_voice_status, voice_status);
 ffi_client_json_method!(pioneer_client_ffi_voice_session_start, voice_session_start);
 #[unsafe(no_mangle)]

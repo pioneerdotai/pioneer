@@ -7,7 +7,16 @@ use std::str::FromStr;
 use crate::PrincipalId;
 
 pub const ROLE_KEY_MAX_LEN: usize = 32;
+/// Stable capability-snapshot identifier for the built-in Superuser kind.
+/// Superusers still persist with a null `RoleKey`; this string is presentation
+/// metadata, not a user-role value.
+pub const SUPERUSER_CAPABILITY_ROLE_KEY: &str = "superuser";
 pub const MEMBER_ROLE_KEY: &str = "member";
+/// User-role keys understood by this protocol/Gateway release.
+///
+/// This is deliberately a code-defined registry for now. Persisted custom
+/// role definitions will replace it when editable roles are introduced.
+pub const BUILT_IN_USER_ROLE_KEYS: &[&str] = &[MEMBER_ROLE_KEY];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
@@ -31,7 +40,7 @@ impl RoleKey {
     }
 
     pub fn is_supported(&self) -> bool {
-        self.as_str() == MEMBER_ROLE_KEY
+        BUILT_IN_USER_ROLE_KEYS.contains(&self.as_str())
     }
 }
 

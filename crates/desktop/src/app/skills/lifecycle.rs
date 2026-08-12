@@ -73,6 +73,9 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_installed_skills(&mut self, cx: &mut Context<Self>) {
+        let include_management_health = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
         let scope = match skill_actions::plan_skill_action_scope(
             matches!(
                 self.gateway.connection_state,
@@ -101,7 +104,11 @@ impl PioneerDesktop {
                 let workspace_id_for_request = workspace_id.clone();
                 let result = cx
                     .background_spawn(async move {
-                        skill_catalog::load_skills_snapshot(&ws_sender, workspace_id_for_request)
+                        skill_catalog::load_skills_snapshot(
+                            &ws_sender,
+                            workspace_id_for_request,
+                            include_management_health,
+                        )
                     })
                     .await;
 

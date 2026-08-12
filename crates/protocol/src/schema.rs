@@ -32,16 +32,19 @@ use crate::artifact::{
 
 use crate::{
     AccessChangeKind, AccessChangedNotification, AgentDurableEvent, AgentExecutionBackend,
-    AgentMessagePhase, AgentProgressEvent, AuthMeResponse, BackendSecurityCapabilities, ByteRange,
-    CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy, CLIRuntimeAccountUpdatedNotification,
-    CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams, CLIRuntimeGetResponse,
-    CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
-    CLIRuntimeListResponse, CLIRuntimeLoginCancelParams, CLIRuntimeLoginCancelResponse,
-    CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse, CLIRuntimeLoginStartType,
-    CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeProxyDeleteParams,
-    CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams, CLIRuntimeProxySetResponse,
-    CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse, CLIRuntimeRequestKind,
-    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
+    AgentMessagePhase, AgentProgressEvent, AuthMeResponse, AuthorizationCapabilitiesParams,
+    AuthorizationCapabilitySnapshot, AuthorizationGlobalCapabilities,
+    AuthorizationThreadCapabilities, AuthorizationThreadCapabilitySnapshot,
+    AuthorizationWorkspaceCapabilities, AuthorizationWorkspaceCapabilitySnapshot,
+    BackendSecurityCapabilities, ByteRange, CLIAgentRuntimeKind, CLIAgentRuntimeSandboxPolicy,
+    CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
+    CLIRuntimeGetResponse, CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse,
+    CLIRuntimeListParams, CLIRuntimeListResponse, CLIRuntimeLoginCancelParams,
+    CLIRuntimeLoginCancelResponse, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
+    CLIRuntimeLoginStartType, CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus,
+    CLIRuntimeProxyDeleteParams, CLIRuntimeProxyDeleteResponse, CLIRuntimeProxySetParams,
+    CLIRuntimeProxySetResponse, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
+    CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
     CLIRuntimeRequestResolvedNotification, CLIRuntimeRequestRespondParams,
     CLIRuntimeRequestRespondResponse, CLIRuntimeReviewDelivery, CLIRuntimeReviewStartParams,
     CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget, CLIRuntimeStatusChangedNotification,
@@ -263,6 +266,34 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             AccessChangedNotification
         ),
         schema_doc!("auth_me_response.json", AuthMeResponse),
+        schema_doc!(
+            "authorization_capabilities_params.json",
+            AuthorizationCapabilitiesParams
+        ),
+        schema_doc!(
+            "authorization_capability_snapshot.json",
+            AuthorizationCapabilitySnapshot
+        ),
+        schema_doc!(
+            "authorization_global_capabilities.json",
+            AuthorizationGlobalCapabilities
+        ),
+        schema_doc!(
+            "authorization_workspace_capabilities.json",
+            AuthorizationWorkspaceCapabilities
+        ),
+        schema_doc!(
+            "authorization_workspace_capability_snapshot.json",
+            AuthorizationWorkspaceCapabilitySnapshot
+        ),
+        schema_doc!(
+            "authorization_thread_capabilities.json",
+            AuthorizationThreadCapabilities
+        ),
+        schema_doc!(
+            "authorization_thread_capability_snapshot.json",
+            AuthorizationThreadCapabilitySnapshot
+        ),
         schema_doc!("agent_durable_event.json", AgentDurableEvent),
         schema_doc!("agent_progress_event.json", AgentProgressEvent),
         schema_doc!("durable_event_causality_key.json", DurableEventCausalityKey),

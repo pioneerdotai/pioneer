@@ -67,6 +67,7 @@ impl PioneerDesktop {
 
         let mut view = Self {
             invitation_join: None,
+            invitation_join_input_subscriptions: Vec::new(),
             thread_coordinators: HashMap::new(),
             thread_unread: HashMap::new(),
             thread_folders: HashMap::new(),
@@ -125,6 +126,10 @@ impl PioneerDesktop {
             thread_member_select_subscription: None,
             thread_member_items: Vec::new(),
             thread_members_thread_id: None,
+            thread_scope_capabilities_thread_id: None,
+            thread_scope_capabilities_loading_thread_id: None,
+            thread_scope_capabilities_refresh_generation: 0,
+            thread_scope_capabilities: ThreadPresentationCapabilities::default(),
             thread_members: Vec::new(),
             thread_members_loading: false,
             composer_attachments: Vec::new(),
@@ -221,6 +226,7 @@ impl PioneerDesktop {
                 deferred_ws_events: VecDeque::new(),
                 connection_epoch: 0,
                 session_refresh_generation: 0,
+                current_principal_refresh_generation: 0,
                 session_refresh_in_flight: false,
                 authorization_revision: None,
                 connection_state: GatewayConnectionState::Connecting,
@@ -238,6 +244,7 @@ impl PioneerDesktop {
                 auth_sessions_error: None,
                 auth_session_action_pending: None,
                 current_auth: None,
+                capability_snapshot: None,
             },
         };
 

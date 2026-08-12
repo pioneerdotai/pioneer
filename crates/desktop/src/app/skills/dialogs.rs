@@ -20,6 +20,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         self.open_skill_source_picker(SkillSourcePickerTarget::Install, window, cx);
     }
 
@@ -29,6 +35,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         self.open_skill_source_picker(SkillSourcePickerTarget::Update { skill_id }, window, cx);
     }
 
@@ -38,6 +50,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         self.open_skill_source_picker(SkillSourcePickerTarget::UpdatePack { pack_id }, window, cx);
     }
 
@@ -48,6 +66,12 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities
+        {
+            return;
+        }
         let title = t!("skills.dialog.uninstall_pack_title", name = name.as_str()).to_string();
         let description = t!("skills.dialog.uninstall_pack_description").to_string();
         let answer = window.prompt(

@@ -38,6 +38,9 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let desktop_entity = cx.entity().clone();
+        let can_manage = self
+            .principal_presentation_capabilities()
+            .can_manage_capabilities;
         let providers_error = self.providers.error().map(str::to_owned);
         let cli_error = self.providers.cli_error().map(str::to_owned);
         let cli_login_message = self.providers.cli_login_message().map(str::to_owned);
@@ -250,6 +253,7 @@ impl PioneerDesktop {
                                                             configured_provider_names
                                                                 .contains(provider.id),
                                                             is_connected,
+                                                            can_manage,
                                                             desktop_entity.clone(),
                                                             cx,
                                                         )
@@ -306,6 +310,7 @@ impl PioneerDesktop {
         provider: ProviderCatalogEntry,
         is_configured: bool,
         is_connected: bool,
+        can_manage: bool,
         desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -374,29 +379,31 @@ impl PioneerDesktop {
                                 this.child(Icon::new(IconName::Close).size_3().opacity(0.4))
                             }),
                     )
-                    .child(
-                        div().mt_auto().child(
-                            Button::new(("provider-configure", index))
-                                .small()
-                                .ghost()
-                                .icon(PioneerIconName::Bolt)
-                                .disabled(!is_connected)
-                                .opacity(0.6)
-                                .on_click({
-                                    let provider_id = provider_id.clone();
-                                    move |_, window, cx| {
-                                        let _ = desktop_entity.update(cx, |view, cx| {
-                                            view.open_provider_configuration_dialog(
-                                                provider_id.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        ),
-                    ),
+                    .when(can_manage, |this| {
+                        this.child(
+                            div().mt_auto().child(
+                                Button::new(("provider-configure", index))
+                                    .small()
+                                    .ghost()
+                                    .icon(PioneerIconName::Bolt)
+                                    .disabled(!is_connected)
+                                    .opacity(0.6)
+                                    .on_click({
+                                        let provider_id = provider_id.clone();
+                                        move |_, window, cx| {
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                view.open_provider_configuration_dialog(
+                                                    provider_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            ),
+                        )
+                    }),
             )
             .into_any_element()
     }
