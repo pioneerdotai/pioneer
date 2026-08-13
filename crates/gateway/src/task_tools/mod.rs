@@ -158,10 +158,19 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             .await
             .map_err(|error| error.to_string())?;
 
-        // This is the sole authoritative read for the parent finalization
-        // gate.  It resolves creator identity in SQL, then asks Task Service
-        // for one zero-timeout wait snapshot rather than three independently
-        // changing queries.
+        // Fence the logical Task Service snapshot with the canonical durable
+        // aggregate revision. The wait snapshot currently spans several
+        // repository reads, so matching revisions before and after it provide
+        // an optimistic seqlock and reject a child transition between reads.
+        let revision_before = processor
+            .crud_store
+            .task_finalization_revision(context.thread_id.as_str(), context.turn_id.as_str())
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+
+        // Resolve creator identity in SQL before any limit, then ask Task
+        // Service for one zero-timeout wait snapshot rather than three
+        // independently changing queries.
         let tasks = processor
             .crud_store
             .list_tasks_created_by_turn(context.thread_id.as_str(), context.turn_id.as_str())
@@ -180,24 +189,30 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         task_ids.sort();
         task_ids.dedup();
 
-        let task_revision = tasks
-            .iter()
-            .filter(|task| {
-                task.lifecycle_policy
-                    .as_ref()
-                    .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
-                    .unwrap_or(false)
-            })
-            .map(|task| format!("{}:{}", task.id, task.revision))
-            .collect::<Vec<_>>()
-            .join("|");
+        if task_ids.len() != revision_before.attached_task_count {
+            return Err(
+                "attached-task aggregate changed while resolving creator identity".to_owned(),
+            );
+        }
         if task_ids.is_empty() {
+            let revision_after = processor
+                .crud_store
+                .task_finalization_revision(context.thread_id.as_str(), context.turn_id.as_str())
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            if revision_after != revision_before {
+                return Err(format!(
+                    "attached-task aggregate changed during empty finalization snapshot: before `{}`, after `{}`",
+                    revision_before.token, revision_after.token
+                ));
+            }
             return Ok(TaskFinalizationSnapshot {
-                revision: "tasks:0".to_owned(),
+                revision: revision_after.token,
                 ..TaskFinalizationSnapshot::default()
             });
         }
 
+        let expected_task_ids = task_ids.clone();
         let task_service = processor.task_runtime.service();
         let wait_state = task_tool_fresh_task(async move {
             task_service
@@ -214,6 +229,41 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         .await
         .map_err(|error| format!("task finalization snapshot task failed: {error}"))?
         .map_err(|error| format!("{error:#}"))?;
+
+        let mut observed_task_ids = wait_state
+            .pending
+            .iter()
+            .map(|item| item.task.id.clone())
+            .chain(
+                wait_state
+                    .review_required
+                    .iter()
+                    .map(|item| item.item.task.id.clone()),
+            )
+            .chain(wait_state.completed.iter().map(|item| item.task.id.clone()))
+            .chain(wait_state.failed.iter().map(|item| item.task.id.clone()))
+            .chain(wait_state.blocked.iter().map(|item| item.task.id.clone()))
+            .chain(wait_state.cancelled.iter().map(|item| item.task.id.clone()))
+            .collect::<Vec<_>>();
+        observed_task_ids.sort();
+        observed_task_ids.dedup();
+        if observed_task_ids != expected_task_ids {
+            return Err(format!(
+                "Task Service returned an incomplete finalization partition: expected {expected_task_ids:?}, observed {observed_task_ids:?}"
+            ));
+        }
+
+        let revision_after = processor
+            .crud_store
+            .task_finalization_revision(context.thread_id.as_str(), context.turn_id.as_str())
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        if revision_after != revision_before {
+            return Err(format!(
+                "attached-task aggregate changed during finalization snapshot: before `{}`, after `{}`",
+                revision_before.token, revision_after.token
+            ));
+        }
 
         let pending = wait_state
             .pending
@@ -272,40 +322,8 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             })
             .collect::<Vec<_>>();
 
-        // Task revisions alone do not advance for every run/Turn projection
-        // (for example a child can move Running -> WaitingReview while the
-        // task row revision is unchanged).  Include the complete returned
-        // partition in the read token so a caller can persist the exact gate
-        // it observed and detect a materially different graph on retry.
-        let mut revision_parts = vec![task_revision];
-        revision_parts.extend(wait_state.pending.iter().map(|item| {
-            format!(
-                "pending:{}:{}",
-                item.task.id,
-                item.run.as_ref().map(|run| run.id.as_str()).unwrap_or("-")
-            )
-        }));
-        revision_parts.extend(
-            wait_state
-                .review_required
-                .iter()
-                .map(|item| format!("review:{}:{}", item.item.task.id, item.candidate.id)),
-        );
-        revision_parts.extend(terminal_items.iter().map(|item| {
-            format!(
-                "terminal:{}:{}:{}",
-                item.task.id,
-                item.run.as_ref().map(|run| run.id.as_str()).unwrap_or("-"),
-                task_status_label(item.task.status)
-            )
-        }));
-
         Ok(TaskFinalizationSnapshot {
-            revision: if revision_parts.iter().all(|part| part.is_empty()) {
-                "tasks:0".to_owned()
-            } else {
-                revision_parts.join("|")
-            },
+            revision: revision_after.token,
             pending,
             review_required,
             terminal,

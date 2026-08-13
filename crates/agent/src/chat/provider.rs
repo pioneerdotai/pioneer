@@ -476,6 +476,7 @@ pub(super) async fn stream_provider_response(
                 },
             },
             generation: super::TURN_FINALIZATION_GENERATION,
+            task_finalization_revision: None,
         },
     )
     .await?;
@@ -594,6 +595,7 @@ pub(super) async fn non_stream_provider_response(
                 },
             },
             generation: super::TURN_FINALIZATION_GENERATION,
+            task_finalization_revision: None,
         },
     )
     .await?;

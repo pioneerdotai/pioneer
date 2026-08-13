@@ -2363,6 +2363,7 @@ impl MessageProcessor {
             AgentDurableEvent::TurnFinalizationPrepared {
                 notification,
                 generation,
+                task_finalization_revision,
             } => message_future(async move {
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
@@ -2370,7 +2371,12 @@ impl MessageProcessor {
                 let turn_id = notification.turn_id.clone();
                 if let Err(error) = self
                     .crud_store
-                    .prepare_turn_finalization(&notification, generation, now_timestamp_secs())
+                    .prepare_turn_finalization(
+                        &notification,
+                        generation,
+                        task_finalization_revision.as_deref(),
+                        now_timestamp_secs(),
+                    )
                     .await
                 {
                     self.report_legacy_turn_failure(

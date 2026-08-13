@@ -89,6 +89,11 @@ pub enum AgentDurableEvent {
     TurnFinalizationPrepared {
         notification: ItemCompletedNotification,
         generation: i64,
+        /// Canonical revision of the attached-task aggregate observed by the
+        /// agent immediately before accepting this final answer. `None` is
+        /// valid only for turns that own no attached tasks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_finalization_revision: Option<String>,
     },
     ItemToolRetryScheduled {
         notification: ItemToolRetryScheduledNotification,

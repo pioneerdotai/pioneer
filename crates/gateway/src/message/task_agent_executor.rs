@@ -99,7 +99,12 @@ async fn verify_durable_task_child_admission(
         .crud_store
         .get_task(task_run_turn.task_id.as_str())
         .await?
-        .ok_or_else(|| anyhow!("task `{}` is missing after child admission", task_run_turn.task_id))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "task `{}` is missing after child admission",
+                task_run_turn.task_id
+            )
+        })?;
     if task.task.status.is_terminal() {
         bail!(
             "task `{}` became terminal before child `{}` activation",
@@ -112,7 +117,12 @@ async fn verify_durable_task_child_admission(
         .crud_store
         .get_task_run(task_run_turn.run_id.as_str())
         .await?
-        .ok_or_else(|| anyhow!("task run `{}` is missing after child admission", task_run_turn.run_id))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "task run `{}` is missing after child admission",
+                task_run_turn.run_id
+            )
+        })?;
     if run.task_id != task_run_turn.task_id || run.status.is_terminal() {
         bail!(
             "task run `{}` no longer owns an active child admission",
@@ -705,14 +715,12 @@ impl TaskAgentExecutor {
             if let Err(error) =
                 verify_durable_task_child_admission(processor, &child_runtime, &execution).await
             {
-                let abort_reason = format!(
-                    "task CLI runtime child admission could not be verified: {error:#}"
-                );
+                let abort_reason =
+                    format!("task CLI runtime child admission could not be verified: {error:#}");
                 processor
                     .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
                     .await;
-                return Err(error)
-                    .context("failed to verify task CLI runtime child admission");
+                return Err(error).context("failed to verify task CLI runtime child admission");
             }
 
             let started_at = now_timestamp_secs();
@@ -2501,6 +2509,18 @@ impl TaskAgentExecutor {
                                 reason.clone(),
                             )
                             .await;
+                        processor
+                            .crud_store
+                            .mark_recovery_job_terminal(
+                                recovery_job.id.as_str(),
+                                pioneer_protocol::RecoveryJobStatus::Blocked,
+                                Some(reason.clone()),
+                                blocked_at,
+                            )
+                            .await
+                            .context(
+                                "failed to return task-owned recovery job to blocked after lock conflict",
+                            )?;
                         return Ok(Some(TaskChildResumeOutcome::Conflict { reason }));
                     }
                 }
@@ -2520,9 +2540,16 @@ impl TaskAgentExecutor {
                     .await;
                 match start_result {
                     Ok(TaskExecutorStartOutcome::Started)
-                    | Ok(TaskExecutorStartOutcome::Queued) => TaskChildResumeOutcome::Resumed {
-                        recovery_job_id: recovery_job.id,
-                    },
+                    | Ok(TaskExecutorStartOutcome::Queued) => {
+                        // The atomic aggregate transition consumed the old
+                        // recovery job before dispatch. `Started` owns the
+                        // replacement locally; `Queued` means another fenced
+                        // TaskRuntime owner already owns it. In neither case
+                        // may the generic recovery worker dispatch it again.
+                        TaskChildResumeOutcome::Resumed {
+                            recovery_job_id: recovery_job.id,
+                        }
+                    }
                     Ok(TaskExecutorStartOutcome::Rejected) | Err(_) => {
                         let reason =
                             "task child resume failed while restarting its executor".to_owned();
@@ -2548,6 +2575,18 @@ impl TaskAgentExecutor {
                                 reason.clone(),
                             )
                             .await;
+                        processor
+                            .crud_store
+                            .mark_recovery_job_terminal(
+                                recovery_job.id.as_str(),
+                                pioneer_protocol::RecoveryJobStatus::Blocked,
+                                Some(reason.clone()),
+                                blocked_at,
+                            )
+                            .await
+                            .context(
+                                "failed to return task-owned recovery job to blocked after dispatch failure",
+                            )?;
                         TaskChildResumeOutcome::Conflict { reason }
                     }
                 }

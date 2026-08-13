@@ -4564,6 +4564,69 @@ async fn execute_agent_provider_response(
                 && let Some(final_text) =
                     task_mutation_finalization_guard.deterministic_failure_message()
             {
+                let final_task_gate_snapshot = match attached_task_finalization_snapshot(
+                    task_tool_provider.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                )
+                .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        task_gate_query_failures = task_gate_query_failures.saturating_add(1);
+                        if task_gate_query_failures >= 3 {
+                            return Err((
+                                ChatTurnError::Blocked(format!(
+                                    "attached task finalization remains unavailable after bounded retries: {error}"
+                                )),
+                                current_thinking_id.clone(),
+                            ));
+                        }
+                        send_reasoning_completed(
+                            workspace_id,
+                            thread_id,
+                            turn_id,
+                            current_thinking_id.as_str(),
+                            round.reasoning.as_str(),
+                            event_tx.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                        messages.push(ChatMessage::user(format!(
+                            "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before deterministic finalization: {error}"
+                        )));
+                        current_thinking_id = start_reasoning_item(
+                            workspace_id,
+                            thread_id,
+                            turn_id,
+                            event_tx.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                        consecutive_rejected_no_tool_rounds = 0;
+                        continue;
+                    }
+                };
+
+                if let Some(snapshot) = final_task_gate_snapshot.as_ref() {
+                    let has_unobserved_terminal = snapshot.terminal.iter().any(|observation| {
+                        !observed_terminal_task_ids.contains(observation.task_id.as_str())
+                    });
+                    if !snapshot.pending.is_empty()
+                        || !snapshot.review_required.is_empty()
+                        || has_unobserved_terminal
+                    {
+                        return Err((
+                            ChatTurnError::Blocked(
+                                "deterministic finalization was fenced because attached task state still requires observation or action"
+                                    .to_owned(),
+                            ),
+                            current_thinking_id.clone(),
+                        ));
+                    }
+                }
+
                 post_turn_assistant_text = final_text.clone();
                 send_reasoning_completed(
                     workspace_id,
@@ -4575,6 +4638,33 @@ async fn execute_agent_provider_response(
                 )
                 .await
                 .map_err(|error| (error, current_thinking_id.clone()))?;
+                if let Some(snapshot) = final_task_gate_snapshot.as_ref() {
+                    emit_durable_event(
+                        event_tx.as_ref(),
+                        AgentDurableEvent::ItemCompleted {
+                            notification: ItemCompletedNotification {
+                                workspace_id: workspace_id.to_owned(),
+                                thread_id: thread_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                item: TurnItem::SystemEvent {
+                                    id: generate_id(TURN_ITEM_ID_LEN),
+                                    level: pioneer_protocol::SystemEventLevel::Info,
+                                    message: "Attached task finalization gate snapshot committed before deterministic final answer."
+                                        .to_owned(),
+                                    code: Some("task.finalization.snapshot".to_owned()),
+                                    details: Some(json!({
+                                        "revision": snapshot.revision.as_str(),
+                                        "pendingCount": snapshot.pending.len(),
+                                        "reviewRequiredCount": snapshot.review_required.len(),
+                                        "terminalCount": snapshot.terminal.len(),
+                                    })),
+                                },
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                }
                 emit_durable_event(
                     event_tx.as_ref(),
                     AgentDurableEvent::ItemStarted {
@@ -4628,6 +4718,9 @@ async fn execute_agent_provider_response(
                             },
                         },
                         generation: TURN_FINALIZATION_GENERATION,
+                        task_finalization_revision: final_task_gate_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.revision.clone()),
                     },
                 )
                 .await
@@ -5197,6 +5290,9 @@ async fn execute_agent_provider_response(
                             },
                         },
                         generation: TURN_FINALIZATION_GENERATION,
+                        task_finalization_revision: final_task_gate_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.revision.clone()),
                     },
                 )
                 .await
