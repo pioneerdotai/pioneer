@@ -35,8 +35,9 @@ use crate::{
     AgentMcpMaterializationError, AgentMcpMaterializationFailureReason,
     AgentMcpMaterializationRequest, AgentMcpResolutionDiagnostic, AgentMcpServerRef,
     AgentMcpToolProvider, AgentMcpToolRef, AgentTurnHookRuntimeContext, ExecutionCheckpointContext,
-    ExecutionWindowContinuation, ResolvedArtifactInput, RetainedProviderHistoryMessage,
-    ReviewRequiredTaskObservation, SkillContinuationAuthorizationContext, TaskToolMaterialization,
+    ExecutionWindowContinuation, PendingAttachedTask, ResolvedArtifactInput,
+    RetainedProviderHistoryMessage, ReviewRequiredTaskObservation,
+    SkillContinuationAuthorizationContext, TaskFinalizationSnapshot, TaskToolMaterialization,
     TaskToolProvider, TaskTurnContext, TerminalTaskObservation, ToolLoopConfig,
     TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
     TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
@@ -2742,6 +2743,7 @@ async fn materialize_turn_tooling(
     }
 }
 
+#[allow(dead_code)]
 async fn review_required_attached_task_observation(
     provider: Option<&Arc<dyn TaskToolProvider>>,
     workspace_id: &str,
@@ -2852,6 +2854,122 @@ fn review_required_final_answer_block_message() -> String {
     "Attached task result review is still required. Call task_accept, task_revise, or task_cancel for each pending review candidate before providing the final answer.".to_owned()
 }
 
+async fn attached_task_finalization_snapshot(
+    provider: Option<&Arc<dyn TaskToolProvider>>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<TaskFinalizationSnapshot>, String> {
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+    provider
+        .attached_task_finalization_snapshot(TaskTurnContext {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+        })
+        .await
+        .map(Some)
+}
+
+fn render_review_required_snapshot(
+    observations: &[ReviewRequiredTaskObservation],
+) -> Option<RenderedReviewRequiredObservation> {
+    let mut observations = observations.to_vec();
+    observations.truncate(MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS);
+    if observations.is_empty() {
+        return None;
+    }
+    observations.sort_by(|left, right| {
+        left.task_id
+            .cmp(&right.task_id)
+            .then_with(|| left.run_id.cmp(&right.run_id))
+            .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+    });
+    let signatures = observations
+        .iter()
+        .map(review_required_observation_signature)
+        .collect::<Vec<_>>();
+    let payload = observations
+        .iter()
+        .map(review_required_observation_payload)
+        .collect::<Vec<_>>();
+    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
+    let message = format!(
+        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
+    );
+    Some(RenderedReviewRequiredObservation {
+        signatures,
+        observations,
+        message,
+        details: json!({
+            "taskIds": payload.iter().filter_map(|value| value.get("taskId").and_then(JsonValue::as_str)).collect::<Vec<_>>(),
+            "observations": payload,
+        }),
+    })
+}
+
+fn render_pending_snapshot(pending: &[PendingAttachedTask]) -> Option<String> {
+    if pending.is_empty() {
+        return None;
+    }
+    let task_lines = pending
+        .iter()
+        .map(|task| {
+            let run = task
+                .run_id
+                .as_ref()
+                .map(|run_id| format!(", run {run_id}"))
+                .unwrap_or_default();
+            format!(
+                "- {} ({}, status {}{})",
+                task.title, task.task_id, task.status, run
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Attached tasks created by this turn are still active, so the turn cannot finish yet.\n{task_lines}\nCall task_wait for active runs, or task_cancel/task_detach when abandoning or backgrounding the work before giving the final answer."
+    ))
+}
+
+fn render_terminal_snapshot(
+    observations: &[TerminalTaskObservation],
+    observed_task_ids: &BTreeSet<String>,
+) -> Option<RenderedTaskObservation> {
+    let mut observations = observations
+        .iter()
+        .filter(|observation| !observed_task_ids.contains(observation.task_id.as_str()))
+        .take(MAX_TERMINAL_TASK_OBSERVATIONS)
+        .cloned()
+        .collect::<Vec<_>>();
+    if observations.is_empty() {
+        return None;
+    }
+    observations.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    let task_ids = observations
+        .iter()
+        .map(|observation| observation.task_id.clone())
+        .collect::<Vec<_>>();
+    let payload = observations
+        .iter()
+        .map(task_observation_payload)
+        .collect::<Vec<_>>();
+    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
+    Some(RenderedTaskObservation {
+        task_ids,
+        message: format!(
+            "Attached task results are available:\n{payload_text}\nUse these TaskRun results/errors in the next response. Full details are available with task_get."
+        ),
+        details: json!({
+            "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
+            "observations": payload,
+        }),
+    })
+}
+
+#[allow(dead_code)]
 async fn pending_attached_task_observation(
     provider: Option<&Arc<dyn TaskToolProvider>>,
     workspace_id: &str,
@@ -2902,6 +3020,7 @@ async fn pending_attached_task_observation(
     ))
 }
 
+#[allow(dead_code)]
 async fn terminal_attached_task_observation(
     provider: Option<&Arc<dyn TaskToolProvider>>,
     workspace_id: &str,
@@ -4083,17 +4202,62 @@ async fn execute_agent_provider_response(
     let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
         let mut consecutive_rejected_no_tool_rounds = 0usize;
+        let mut task_gate_query_failures = 0usize;
 
         loop {
             retain_agent_attachment_messages(&mut messages);
 
-            let review_observation = review_required_attached_task_observation(
+            let task_gate_snapshot = match attached_task_finalization_snapshot(
                 task_tool_provider.as_ref(),
                 workspace_id,
                 thread_id,
                 turn_id,
             )
-            .await;
+            .await
+            {
+                Ok(snapshot) => {
+                    task_gate_query_failures = 0;
+                    snapshot
+                }
+                Err(error) => {
+                    task_gate_query_failures = task_gate_query_failures.saturating_add(1);
+                    if task_gate_query_failures >= 3 {
+                        return Err((
+                            ChatTurnError::Blocked(format!(
+                                "attached task finalization remains unavailable after bounded retries: {error}"
+                            )),
+                            current_thinking_id.clone(),
+                        ));
+                    }
+                    let message = format!(
+                        "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before finalization: {error}"
+                    );
+                    send_reasoning_completed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        current_thinking_id.as_str(),
+                        "",
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    messages.push(ChatMessage::user(message));
+                    current_thinking_id = start_reasoning_item(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    continue;
+                }
+            };
+
+            let review_observation = task_gate_snapshot
+                .as_ref()
+                .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice()));
             if let Some(observation) = review_observation {
                 sync_review_action_tools_to_observations(
                     &mut visible_tool_names,
@@ -4136,14 +4300,9 @@ async fn execute_agent_provider_response(
                 sync_review_action_tools_to_observations(&mut visible_tool_names, &[]);
             }
 
-            if let Some(observation) = terminal_attached_task_observation(
-                task_tool_provider.as_ref(),
-                workspace_id,
-                thread_id,
-                turn_id,
-                &observed_terminal_task_ids,
-            )
-            .await
+            if let Some(observation) = task_gate_snapshot.as_ref().and_then(|snapshot| {
+                render_terminal_snapshot(snapshot.terminal.as_slice(), &observed_terminal_task_ids)
+            })
             {
                 for task_id in &observation.task_ids {
                     observed_terminal_task_ids.insert(task_id.clone());
@@ -4605,13 +4764,64 @@ async fn execute_agent_provider_response(
                     continue;
                 }
 
-                if let Some(observation) = review_required_attached_task_observation(
+                // The snapshot used to render observations at the start of
+                // the round is not sufficient as a terminal gate: a child
+                // can transition while the provider is generating its final
+                // text.  Take one fresh aggregate read immediately before
+                // evaluating review/pending/terminal state and committing
+                // the finalization snapshot event.
+                let final_task_gate_snapshot = match attached_task_finalization_snapshot(
                     task_tool_provider.as_ref(),
                     workspace_id,
                     thread_id,
                     turn_id,
                 )
                 .await
+                {
+                    Ok(snapshot) => {
+                        task_gate_query_failures = 0;
+                        snapshot
+                    }
+                    Err(error) => {
+                        task_gate_query_failures = task_gate_query_failures.saturating_add(1);
+                        if task_gate_query_failures >= 3 {
+                            return Err((
+                                ChatTurnError::Blocked(format!(
+                                    "attached task finalization remains unavailable after bounded retries: {error}"
+                                )),
+                                current_thinking_id.clone(),
+                            ));
+                        }
+                        let message = format!(
+                            "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before finalization: {error}"
+                        );
+                        send_reasoning_completed(
+                            workspace_id,
+                            thread_id,
+                            turn_id,
+                            current_thinking_id.as_str(),
+                            round.reasoning.as_str(),
+                            event_tx.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                        messages.push(ChatMessage::user(message));
+                        current_thinking_id = start_reasoning_item(
+                            workspace_id,
+                            thread_id,
+                            turn_id,
+                            event_tx.as_ref(),
+                        )
+                        .await
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                        consecutive_rejected_no_tool_rounds = 0;
+                        continue;
+                    }
+                };
+
+                if let Some(observation) = final_task_gate_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice()))
                 {
                     let has_new_signature = observation
                         .signatures
@@ -4673,13 +4883,9 @@ async fn execute_agent_provider_response(
                     continue;
                 }
 
-                if let Some(observation) = pending_attached_task_observation(
-                    task_tool_provider.as_ref(),
-                    workspace_id,
-                    thread_id,
-                    turn_id,
-                )
-                .await
+                if let Some(observation) = final_task_gate_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| render_pending_snapshot(snapshot.pending.as_slice()))
                 {
                     send_reasoning_completed(
                         workspace_id,
@@ -4720,14 +4926,9 @@ async fn execute_agent_provider_response(
                     continue;
                 }
 
-                if let Some(observation) = terminal_attached_task_observation(
-                    task_tool_provider.as_ref(),
-                    workspace_id,
-                    thread_id,
-                    turn_id,
-                    &observed_terminal_task_ids,
-                )
-                .await
+                if let Some(observation) = final_task_gate_snapshot.as_ref().and_then(|snapshot| {
+                    render_terminal_snapshot(snapshot.terminal.as_slice(), &observed_terminal_task_ids)
+                })
                 {
                     for task_id in &observation.task_ids {
                         observed_terminal_task_ids.insert(task_id.clone());
@@ -4769,6 +4970,34 @@ async fn execute_agent_provider_response(
                             .map_err(|error| (error, current_thinking_id.clone()))?;
                     consecutive_rejected_no_tool_rounds = 0;
                     continue;
+                }
+
+                if let Some(snapshot) = final_task_gate_snapshot.as_ref() {
+                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
+                    emit_durable_event(
+                        event_tx.as_ref(),
+                        AgentDurableEvent::ItemCompleted {
+                            notification: ItemCompletedNotification {
+                                workspace_id: workspace_id.to_owned(),
+                                thread_id: thread_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                item: TurnItem::SystemEvent {
+                                    id: event_item_id,
+                                    level: pioneer_protocol::SystemEventLevel::Info,
+                                    message: "Attached task finalization gate snapshot committed before final answer.".to_owned(),
+                                    code: Some("task.finalization.snapshot".to_owned()),
+                                    details: Some(json!({
+                                        "revision": snapshot.revision.as_str(),
+                                        "pendingCount": snapshot.pending.len(),
+                                        "reviewRequiredCount": snapshot.review_required.len(),
+                                        "terminalCount": snapshot.terminal.len(),
+                                    })),
+                                },
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
                 }
 
                 let deterministic_final_text =

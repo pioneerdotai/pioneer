@@ -811,7 +811,7 @@ fn fallback_description(body: &str) -> String {
         .to_owned()
 }
 
-fn fingerprint_for_content(content: &str) -> String {
+pub(crate) fn fingerprint_for_content(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     hex::encode(hasher.finalize())

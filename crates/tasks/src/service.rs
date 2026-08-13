@@ -60,6 +60,7 @@ const ID_LEN: usize = 21;
 const DEFAULT_MAX_TASK_DEPTH: i64 = 3;
 const MAX_ROOT_TASK_DEPTH_LIMIT: i64 = 10;
 const WAIT_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
+const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
 const MAX_REVISION_FEEDBACK_CHARS: usize = 16_000;
@@ -101,7 +102,33 @@ pub struct TaskRuntime {
     executors: Arc<TaskExecutorRegistry>,
     reconciler: Arc<TaskStartupReconciler>,
     scheduler_task: Mutex<Option<JoinHandle<()>>>,
+    live_reconciliation_task: Mutex<Option<JoinHandle<()>>>,
     review_timeout_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for TaskRuntime {
+    fn drop(&mut self) {
+        // Worker tasks own Arcs of the scheduler/reconciler/service rather than
+        // the runtime itself, so dropping the runtime does not cancel them by
+        // reference-counting alone.  Abort every task synchronously to keep
+        // short-lived processors (tests, reloads, and restart probes) from
+        // accumulating unbounded scheduler/reconciliation loops.
+        if let Ok(mut guard) = self.scheduler_task.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut guard) = self.live_reconciliation_task.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut guard) = self.review_timeout_task.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +198,7 @@ impl TaskRuntime {
             executors,
             reconciler,
             scheduler_task: Mutex::new(None),
+            live_reconciliation_task: Mutex::new(None),
             review_timeout_task: Mutex::new(None),
         }
     }
@@ -201,6 +229,24 @@ impl TaskRuntime {
             let scheduler = self.scheduler.clone();
             *guard = Some(tokio::spawn(async move {
                 scheduler.run().await;
+            }));
+        }
+        let mut reconciliation_guard = self.live_reconciliation_task.lock().await;
+        if reconciliation_guard.is_none() {
+            let reconciler = self.reconciler.clone();
+            *reconciliation_guard = Some(tokio::spawn(async move {
+                let mut ticks = interval(LIVE_RECONCILIATION_INTERVAL);
+                ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                ticks.tick().await;
+                loop {
+                    ticks.tick().await;
+                    if let Err(error) = reconciler.reconcile(now_timestamp_secs()).await {
+                        warn!(
+                            error = %format!("{error:#}"),
+                            "live task terminal reconciliation pass failed"
+                        );
+                    }
+                }
             }));
         }
         let mut review_timeout_guard = self.review_timeout_task.lock().await;

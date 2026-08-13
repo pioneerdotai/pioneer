@@ -2504,6 +2504,20 @@ fn newest_top_level_block(
         return incoming;
     }
 
+    // Task terminality is monotonic. A live optimistic update may carry a
+    // later client timestamp than the authoritative task projection, but it
+    // must never keep a completed/failed/blocked/cancelled task rendered as
+    // running. Conversely, a delayed non-terminal event cannot reopen a task
+    // that the server has already made terminal.
+    match (
+        existing_task.status.is_terminal(),
+        incoming_task.status.is_terminal(),
+    ) {
+        (true, false) => return existing.clone(),
+        (false, true) => return incoming,
+        _ => {}
+    }
+
     let existing_revision = (
         existing_task.updated_at,
         detached_task_status_rank(existing_task.status),
