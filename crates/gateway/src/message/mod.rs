@@ -179,7 +179,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::GatewayAuthService;
@@ -1722,10 +1722,13 @@ impl MessageProcessor {
             return;
         }
 
-        let this = self.clone();
+        let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
             let mut next_skill_upload_cleanup = 0;
             loop {
+                let Some(this) = processor.upgrade() else {
+                    break;
+                };
                 let now = now_timestamp_secs();
                 let mut transient_storage_poll_failed = false;
                 if now >= next_skill_upload_cleanup {
@@ -2074,10 +2077,13 @@ impl MessageProcessor {
             return;
         }
 
-        let this = self.clone();
+        let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
             let mut first_pass = true;
             loop {
+                let Some(this) = processor.upgrade() else {
+                    break;
+                };
                 let config = this.hook_recovery_config.read().await.clone();
                 if config.enabled && (!first_pass || config.startup_scan) {
                     this.run_hook_recovery_pass(config.clone()).await;
@@ -2136,70 +2142,114 @@ impl MessageProcessor {
         if guard.is_some() {
             return;
         }
-        let this = self.clone();
+        let processor = Arc::downgrade(self);
         let mut subscription = self
             .task_runtime
             .event_bus()
             .subscribe(pioneer_tasks::TaskEventFilter::default());
         *guard = Some(tokio::spawn(async move {
             let mut cursors_by_task: HashMap<String, i64> = HashMap::new();
+            let mut durable_replay_after_task_id: Option<String> = None;
+            let mut durable_replay = interval(Duration::from_secs(5));
+            durable_replay.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                match subscription.recv().await {
-                    pioneer_tasks::TaskEventWakeDelivery::Wake(wake) => {
-                        if let Err(error) = this
-                            .emit_committed_task_events_after_cursor(
-                                wake.task_id.as_str(),
-                                &mut cursors_by_task,
-                            )
-                            .await
-                        {
-                            warn!(
-                                task_id = %wake.task_id,
-                                event_id = %wake.event_id,
-                                sequence = wake.sequence,
-                                error = %format!("{error:#}"),
-                                "failed to fan out committed task events after wake"
-                            );
-                        }
-                    }
-                    pioneer_tasks::TaskEventWakeDelivery::Lagged(count) => {
-                        let task_ids =
-                            match this.task_runtime.service().list_task_event_task_ids().await {
-                                Ok(task_ids) => task_ids,
-                                Err(error) => {
-                                    warn!(
-                                        missed_wakes = count,
-                                        error = %format!("{error:#}"),
-                                        "failed to enumerate task event log after wake bus lag"
-                                    );
-                                    cursors_by_task.keys().cloned().collect::<Vec<_>>()
-                                }
-                            };
-                        warn!(
-                            missed_wakes = count,
-                            task_count = task_ids.len(),
-                            "task wake bus lagged; rescanning committed task event log"
-                        );
-                        for task_id in task_ids {
+                let Some(this) = processor.upgrade() else {
+                    break;
+                };
+                tokio::select! {
+                    delivery = subscription.recv() => match delivery {
+                        pioneer_tasks::TaskEventWakeDelivery::Wake(wake) => {
                             if let Err(error) = this
                                 .emit_committed_task_events_after_cursor(
-                                    task_id.as_str(),
+                                    wake.task_id.as_str(),
                                     &mut cursors_by_task,
                                 )
                                 .await
                             {
                                 warn!(
-                                    task_id = %task_id,
+                                    task_id = %wake.task_id,
+                                    event_id = %wake.event_id,
+                                    sequence = wake.sequence,
                                     error = %format!("{error:#}"),
-                                    "failed to rescan committed task events after lag"
+                                    "failed to fan out committed task events after wake; durable replay will retry"
                                 );
                             }
                         }
+                        pioneer_tasks::TaskEventWakeDelivery::Lagged(count) => {
+                            warn!(
+                                missed_wakes = count,
+                                "task wake bus lagged; durable fanout backlog will be rescanned"
+                            );
+                            if let Err(error) = this
+                                .replay_pending_task_event_fanout(
+                                    &mut cursors_by_task,
+                                    &mut durable_replay_after_task_id,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    missed_wakes = count,
+                                    error = %format!("{error:#}"),
+                                    "failed to rescan durable task event fanout backlog after lag"
+                                );
+                            }
+                        }
+                        pioneer_tasks::TaskEventWakeDelivery::Closed => break,
+                    },
+                    _ = durable_replay.tick() => {
+                        if let Err(error) = this
+                            .replay_pending_task_event_fanout(
+                                &mut cursors_by_task,
+                                &mut durable_replay_after_task_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                error = %format!("{error:#}"),
+                                "periodic durable task event fanout replay failed"
+                            );
+                        }
                     }
-                    pioneer_tasks::TaskEventWakeDelivery::Closed => break,
                 }
             }
         }));
+    }
+
+    async fn replay_pending_task_event_fanout(
+        &self,
+        cursors_by_task: &mut HashMap<String, i64>,
+        after_task_id: &mut Option<String>,
+    ) -> anyhow::Result<()> {
+        const REPLAY_BATCH_SIZE: u64 = 256;
+        let mut task_ids = self
+            .crud_store
+            .list_pending_task_event_fanout_task_ids(after_task_id.as_deref(), REPLAY_BATCH_SIZE)
+            .await?;
+        if task_ids.is_empty() && after_task_id.is_some() {
+            *after_task_id = None;
+            task_ids = self
+                .crud_store
+                .list_pending_task_event_fanout_task_ids(None, REPLAY_BATCH_SIZE)
+                .await?;
+        }
+        *after_task_id = if task_ids.len() == REPLAY_BATCH_SIZE as usize {
+            task_ids.last().cloned()
+        } else {
+            None
+        };
+        for task_id in task_ids {
+            if let Err(error) = self
+                .emit_committed_task_events_after_cursor(task_id.as_str(), cursors_by_task)
+                .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    error = %format!("{error:#}"),
+                    "failed to replay committed task events from durable fanout cursor"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn emit_committed_task_events_after_cursor(

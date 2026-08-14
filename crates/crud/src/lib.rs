@@ -118,24 +118,26 @@ use pioneer_protocol::{
     PersistedActorRef, PrincipalId, PromptManifest, ProviderFailureClass, ProviderFailureStage,
     RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, SkillId, SkillPackId,
     StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec,
-    TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt,
-    TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind, TaskGetResponse,
-    TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskAttachmentMode, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
+    TaskDeliveryAttempt, TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind,
+    TaskGetResponse, TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
     TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskStatus,
     TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
-    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode,
-    ThreadPlacement, ThreadReadResponse, ThreadStatus, ThreadVisibility, TimelineOutputPolicy,
-    ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnExecutionSecuritySnapshot,
-    TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
-    TurnItemsResponse, TurnKind, TurnMention, TurnMessageDeletedEvent, TurnMessageEditedEvent,
-    TurnMessageRevision, TurnMessageRevisionChangeKind, TurnPermissionProfileSnapshot,
-    TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
+    TaskWriteLockStatus, Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload,
+    ThreadMode, ThreadPlacement, ThreadReadResponse, ThreadStatus, ThreadVisibility,
+    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn,
+    TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
+    TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnKind, TurnMention,
+    TurnMessageDeletedEvent, TurnMessageEditedEvent, TurnMessageRevision,
+    TurnMessageRevisionChangeKind, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
+    TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
     is_anyhow_sqlite_lock, retry_with_backoff,
 };
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
@@ -166,14 +168,16 @@ use crate::convention::{
     task_executor_kind_from_db, task_owner_kind_from_db, task_owner_kind_to_db,
     task_result_candidate_status_from_db, task_result_review_decision_from_db,
     task_result_review_event_kind_from_db, task_result_reviewer_kind_from_db,
-    task_run_execution_status_from_db, task_run_status_from_db,
-    task_run_thread_binding_kind_from_db, task_run_turn_kind_from_db, task_run_turn_status_from_db,
-    task_status_from_db, task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
-    task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
-    thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
-    turn_item_type_from_db, turn_item_type_to_db, turn_kind_from_db, turn_kind_to_db,
-    turn_origin_from_db, turn_permission_mode_from_db, turn_permission_profile_source_from_db,
-    turn_status_from_db, turn_status_to_db,
+    task_run_execution_status_from_db, task_run_execution_status_to_db, task_run_status_from_db,
+    task_run_status_to_db, task_run_thread_binding_kind_from_db, task_run_turn_kind_from_db,
+    task_run_turn_status_from_db, task_run_turn_status_to_db, task_status_from_db,
+    task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
+    task_write_lock_scope_kind_from_db, task_write_lock_status_from_db,
+    task_write_lock_status_to_db, thread_mode_from_db, thread_origin_kind_from_db,
+    thread_sidebar_visibility_from_db, thread_status_from_db, turn_item_type_from_db,
+    turn_item_type_to_db, turn_kind_from_db, turn_kind_to_db, turn_origin_from_db,
+    turn_permission_mode_from_db, turn_permission_profile_source_from_db, turn_status_from_db,
+    turn_status_to_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -893,6 +897,12 @@ pub use crate::repositories::execution_admission_lease::{
 pub use crate::repositories::turn_admission::NewTurnAdmission;
 pub use crate::repositories::turn_finalization::PrepareTurnFinalizationOutcome;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskFinalizationRevision {
+    pub token: String,
+    pub attached_task_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTurnFinalization {
     pub final_item: pioneer_protocol::ItemCompletedNotification,
@@ -1422,6 +1432,28 @@ pub enum BlockedTurnRecoveryResumeOutcome {
     Resumed(RecoveryJobRecord),
     NotFound,
     MissingRuntimeSnapshot { recovery_job_id: String },
+}
+
+/// Result of reopening a task-owned blocked child turn.  This is deliberately
+/// separate from the generic recovery-job result: a task child has an
+/// aggregate owner (Task/TaskRun/TaskRunTurn/execution) that must be reopened
+/// in the same durable transaction as the child Turn and recovery job.
+#[derive(Debug, Clone)]
+pub enum TaskOwnedTurnResumeOutcome {
+    Resumed {
+        recovery_job: RecoveryJobRecord,
+        task: Task,
+        run: TaskRun,
+        task_run_turn: TaskRunTurn,
+        execution: Option<TaskRunExecution>,
+    },
+    NotFound,
+    MissingRuntimeSnapshot {
+        recovery_job_id: String,
+    },
+    Conflict {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9857,46 +9889,54 @@ impl CrudStore {
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,
         generation: i64,
+        expected_task_finalization_revision: Option<&str>,
         event_timestamp_secs: i64,
     ) -> Result<PrepareTurnFinalizationOutcome> {
         let notification = notification.clone();
+        let expected_task_finalization_revision =
+            expected_task_finalization_revision.map(str::to_owned);
         self.run_serialized_write(|| async {
-            let turn = turn::find_turn_by_thread_and_id(
-                &self.connection,
-                notification.thread_id.as_str(),
-                notification.turn_id.as_str(),
-            )
-            .await?
-            .with_context(|| {
-                format!(
-                    "turn `{}` does not exist for finalization",
-                    notification.turn_id
-                )
-            })?;
-            let status = turn_status_from_db(turn.status.as_str())
-                .context("turn finalization target has an unknown status")?;
-            if !matches!(status, TurnStatus::InProgress | TurnStatus::Completed) {
-                anyhow::bail!(
-                    "turn `{}` cannot prepare finalization from status `{:?}`",
-                    notification.turn_id,
-                    status
-                );
-            }
-            if status == TurnStatus::Completed
-                && turn_finalization::find_by_turn_id(
-                    &self.connection,
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin turn finalization preparation transaction")?;
+            let result = async {
+                let turn = turn::find_turn_by_thread_and_id(
+                    &tx,
+                    notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                 )
                 .await?
-                .is_none()
-            {
-                anyhow::bail!(
-                    "completed turn `{}` has no existing finalization intent",
-                    notification.turn_id
-                );
-            }
-            let thread =
-                thread::find_thread_by_id(&self.connection, notification.thread_id.as_str())
+                .with_context(|| {
+                    format!(
+                        "turn `{}` does not exist for finalization",
+                        notification.turn_id
+                    )
+                })?;
+                let status = turn_status_from_db(turn.status.as_str())
+                    .context("turn finalization target has an unknown status")?;
+                if !matches!(status, TurnStatus::InProgress | TurnStatus::Completed) {
+                    anyhow::bail!(
+                        "turn `{}` cannot prepare finalization from status `{:?}`",
+                        notification.turn_id,
+                        status
+                    );
+                }
+
+                let existing = turn_finalization::find_by_turn_id(
+                    &tx,
+                    notification.turn_id.as_str(),
+                )
+                .await?;
+                if status == TurnStatus::Completed && existing.is_none() {
+                    anyhow::bail!(
+                        "completed turn `{}` has no existing finalization intent",
+                        notification.turn_id
+                    );
+                }
+
+                let thread = thread::find_thread_by_id(&tx, notification.thread_id.as_str())
                     .await?
                     .with_context(|| {
                         format!(
@@ -9904,16 +9944,60 @@ impl CrudStore {
                             notification.thread_id
                         )
                     })?;
-            if thread.workspace_id != notification.workspace_id {
-                anyhow::bail!("turn finalization workspace does not match authoritative thread");
+                if thread.workspace_id != notification.workspace_id {
+                    anyhow::bail!(
+                        "turn finalization workspace does not match authoritative thread"
+                    );
+                }
+
+                // An exact replay of an already prepared intent has already
+                // crossed the task gate. Let the repository verify the item
+                // identity without rejecting it because task projections
+                // legitimately advanced after that barrier.
+                if existing.is_none() {
+                    let current = task_finalization_revision_for_connection(
+                        &tx,
+                        notification.thread_id.as_str(),
+                        notification.turn_id.as_str(),
+                    )
+                    .await?;
+                    match expected_task_finalization_revision.as_deref() {
+                        Some(expected) if expected == current.token => {}
+                        Some(expected) => anyhow::bail!(
+                            "attached-task finalization revision changed before commit: expected `{expected}`, current `{}`",
+                            current.token
+                        ),
+                        None if current.attached_task_count == 0 => {}
+                        None => anyhow::bail!(
+                            "turn `{}` owns {} attached tasks but finalization has no task revision fence",
+                            notification.turn_id,
+                            current.attached_task_count
+                        ),
+                    }
+                }
+
+                turn_finalization::prepare(
+                    &tx,
+                    &notification,
+                    generation,
+                    unix_to_datetime(event_timestamp_secs),
+                )
+                .await
             }
-            turn_finalization::prepare(
-                &self.connection,
-                &notification,
-                generation,
-                unix_to_datetime(event_timestamp_secs),
-            )
-            .await
+            .await;
+
+            match result {
+                Ok(outcome) => {
+                    tx.commit()
+                        .await
+                        .context("failed to commit turn finalization preparation transaction")?;
+                    Ok(outcome)
+                }
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    Err(error)
+                }
+            }
         })
         .await
     }
@@ -10651,6 +10735,21 @@ impl CrudStore {
         }))
     }
 
+    /// Return a canonical revision of every durable row that contributes to
+    /// the attached-task finalization gate for one parent Turn.
+    ///
+    /// The token is intentionally derived from the complete, unbounded
+    /// creator query. It is used as an optimistic fence around the Task
+    /// Service snapshot and is checked again in the transaction that prepares
+    /// the parent finalization intent.
+    pub async fn task_finalization_revision(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<TaskFinalizationRevision> {
+        task_finalization_revision_for_connection(&self.connection, thread_id, turn_id).await
+    }
+
     pub async fn insert_task_run_conversation_snapshot_if_absent(
         &self,
         snapshot: NewTaskRunConversationSnapshot,
@@ -10726,23 +10825,21 @@ impl CrudStore {
         self.list_tasks_scoped(params, None).await
     }
 
-    /// Lists the bounded Task set causally created by one exact Turn. Task
-    /// ownership is intentionally absent from this lookup: owner is actor
-    /// provenance/quota attribution, while the creating Turn is the durable
-    /// parent-turn lifecycle boundary.
+    /// Return every task causally created by one exact parent Turn. The exact
+    /// workspace/thread/turn predicate is applied in SQL before ordering, and
+    /// the lifecycle query is intentionally unbounded so a parent with many
+    /// attached children cannot finalize from a truncated snapshot.
     pub async fn list_tasks_created_by_turn(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
-        limit: u64,
     ) -> Result<Vec<Task>> {
         task_repository::list_tasks_by_creator_turn(
             &self.connection,
             workspace_id,
             thread_id,
             turn_id,
-            limit,
         )
         .await?
         .into_iter()
@@ -10977,6 +11074,14 @@ impl CrudStore {
 
     pub async fn list_task_event_task_ids(&self) -> Result<Vec<String>> {
         task_event::list_event_task_ids(&self.connection).await
+    }
+
+    pub async fn list_pending_task_event_fanout_task_ids(
+        &self,
+        after_task_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        task_event::list_pending_fanout_task_ids(&self.connection, after_task_id, limit).await
     }
 
     pub async fn get_task_event_fanout_cursor(&self, task_id: &str) -> Result<Option<i64>> {
@@ -19464,6 +19569,478 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         .await
     }
 
+    /// Atomically reopens every durable owner of a blocked task child turn.
+    ///
+    /// Generic Turn recovery is intentionally not used here.  A task child is
+    /// owned by a TaskRun aggregate; reopening only the Turn would allow the
+    /// actor to perform side effects while its task/run/execution remained
+    /// terminal.  The transaction also fences successor runs and active locks
+    /// so a resumed child cannot race a newer occurrence.
+    pub async fn resume_task_owned_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        recovery_job_id: Option<&str>,
+        now_unix: i64,
+    ) -> Result<Option<TaskOwnedTurnResumeOutcome>> {
+        self.run_serialized_write(|| async {
+            let now = unix_to_datetime(now_unix);
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin task-owned turn resume transaction")?;
+
+            let Some(task_run_turn_model) =
+                task_run_turn::find_turn_by_thread_and_turn(&tx, thread_id, turn_id).await?
+            else {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback non-task turn resume transaction")?;
+                return Ok(None);
+            };
+            let task_run_turn = task_run_turn_from_db_model(task_run_turn_model.clone())?;
+            if task_run_turn.status != TaskRunTurnStatus::Blocked {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback non-blocked task turn resume transaction")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::NotFound));
+            }
+
+            let Some(run_model) =
+                task_run::find_run_by_id(&tx, task_run_turn.run_id.as_str()).await?
+            else {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback task turn resume without run")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::NotFound));
+            };
+            let run = task_run_from_db_model(run_model.clone())?;
+            if run.status != TaskRunStatus::Blocked {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback task turn resume with non-blocked run")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::Conflict {
+                    reason: format!(
+                        "task run `{}` is {:?}; only a blocked run can be resumed",
+                        run.id, run.status
+                    ),
+                }));
+            }
+
+            let Some(task_model) =
+                task_repository::find_task_by_id(&tx, run.task_id.as_str()).await?
+            else {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback task turn resume without task")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::NotFound));
+            };
+            let current_task_status = task_status_from_db(task_model.status.as_str())
+                .with_context(|| format!("unknown task status `{}`", task_model.status))?;
+            if !matches!(
+                current_task_status,
+                TaskStatus::Blocked | TaskStatus::Scheduled
+            ) {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback task turn resume with incompatible task")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::Conflict {
+                    reason: format!(
+                        "task `{}` is {:?}; it cannot be reopened for this child",
+                        task_model.id, current_task_status
+                    ),
+                }));
+            }
+
+            let other_runs = task_run::list_runs_by_task(&tx, run.task_id.as_str()).await?;
+            if let Some(successor) = other_runs.into_iter().find(|candidate| {
+                candidate.id != run.id
+                    && (candidate.run_number > run_model.run_number
+                        || task_run_status_from_db(candidate.status.as_str())
+                            .is_some_and(|status| !status.is_terminal()))
+            }) {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback successor-conflict task resume transaction")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::Conflict {
+                    reason: format!(
+                        "task `{}` has a conflicting newer or active run `{}`",
+                        run.task_id, successor.id
+                    ),
+                }));
+            }
+
+            let run_locks = task_write_lock::list_locks_by_run(&tx, run.id.as_str()).await?;
+            let active_workspace_locks = task_write_lock::list_all_active_locks_for_workspace(
+                &tx,
+                task_model.workspace_id.as_str(),
+                now,
+            )
+            .await?;
+            if let Some(conflict) = active_workspace_locks.into_iter().find(|candidate| {
+                candidate.run_id != run.id
+                    && run_locks.iter().any(|owned| {
+                        task_write_lock_paths_overlap(
+                            owned.scope_path.as_str(),
+                            candidate.scope_path.as_str(),
+                        )
+                    })
+            }) {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback lock-conflict task resume transaction")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::Conflict {
+                    reason: format!(
+                        "task `{}` write scope conflicts with lock `{}` held by task `{}` run `{}`",
+                        run.task_id, conflict.id, conflict.task_id, conflict.run_id
+                    ),
+                }));
+            }
+
+            let Some(job) =
+                recovery_job::find_blocked_job_by_turn(&tx, turn_id, recovery_job_id).await?
+            else {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback task turn resume without recovery job")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::NotFound));
+            };
+            let item_type = turn_item_type_from_db(job.item_type.as_str())
+                .unwrap_or(TurnItemType::DynamicToolCall);
+            if item_type.is_tool_item()
+                && turn_runtime_snapshot::find_turn_runtime_snapshot(&tx, turn_id)
+                    .await?
+                    .is_none()
+            {
+                let recovery_job_id = job.id.clone();
+                tx.rollback()
+                    .await
+                    .context("failed to rollback task tool resume without runtime snapshot")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::MissingRuntimeSnapshot {
+                    recovery_job_id,
+                }));
+            }
+
+            let max_attempts = job.max_attempts.max(job.run_count.saturating_add(1));
+            if !recovery_job::resume_blocked_job(
+                &tx,
+                &job,
+                RecoveryAction::RestartTurn,
+                max_attempts,
+                now,
+            )
+            .await?
+            {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback stale task recovery resume transaction")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::NotFound));
+            }
+            recovery_terminalization_outbox::cancel_undelivered_for_job(
+                &tx,
+                job.id.as_str(),
+                "superseded by task-owned blocked Turn resume",
+                now,
+            )
+            .await?;
+            anyhow::ensure!(
+                recovery_job::mark_job_terminal(
+                    &tx,
+                    job.id.as_str(),
+                    RecoveryJobStatus::Succeeded,
+                    None,
+                    now,
+                )
+                .await?,
+                "task-owned recovery job `{}` disappeared while resume was committing",
+                job.id
+            );
+
+            let turn_model = turn::find_turn_by_thread_and_id(&tx, thread_id, turn_id)
+                .await?
+                .context("task child Turn disappeared during resume")?;
+            if turn_status_from_db(turn_model.status.as_str()) != Some(TurnStatus::Blocked) {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback task resume after child status race")?;
+                return Ok(Some(TaskOwnedTurnResumeOutcome::Conflict {
+                    reason: format!("child Turn `{turn_id}` changed while resume was committing"),
+                }));
+            }
+            anyhow::ensure!(
+                turn::update_turn_status(
+                    &tx,
+                    thread_id,
+                    turn_id,
+                    TurnStatus::InProgress,
+                    None,
+                    now
+                )
+                .await?,
+                "task child Turn `{turn_id}` was not updated while resuming"
+            );
+            turn::append_turn_status_history(
+                &tx,
+                turn_id,
+                TurnStatus::InProgress,
+                Some("blocked task child resumed with its TaskRun aggregate".to_owned()),
+                now,
+            )
+            .await?;
+
+            let blocked = task_run_status_to_db(TaskRunStatus::Blocked);
+            let reopened = task_run_status_to_db(TaskRunStatus::Running);
+            let run_update = pioneer_entity::task_run::Entity::update_many()
+                .filter(pioneer_entity::task_run::Column::Id.eq(run.id.clone()))
+                .filter(pioneer_entity::task_run::Column::Status.eq(blocked))
+                .col_expr(
+                    pioneer_entity::task_run::Column::Status,
+                    Expr::value(reopened),
+                )
+                .col_expr(
+                    pioneer_entity::task_run::Column::CompletedAt,
+                    Expr::value(None::<DateTimeWithTimeZone>),
+                )
+                .col_expr(
+                    pioneer_entity::task_run::Column::HeartbeatAt,
+                    Expr::value(Some(now)),
+                )
+                .col_expr(
+                    pioneer_entity::task_run::Column::LockedBy,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    pioneer_entity::task_run::Column::LockExpiresAt,
+                    Expr::value(None::<DateTimeWithTimeZone>),
+                )
+                .col_expr(
+                    pioneer_entity::task_run::Column::ResultJson,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    pioneer_entity::task_run::Column::ErrorJson,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    pioneer_entity::task_run::Column::UpdatedAt,
+                    Expr::value(now),
+                )
+                .exec(&tx)
+                .await?;
+            anyhow::ensure!(
+                run_update.rows_affected == 1,
+                "task run `{}` changed while resume was committing",
+                run.id
+            );
+
+            let execution_model =
+                task_run_execution::find_execution_by_run(&tx, run.id.as_str()).await?;
+            if let Some(execution) = execution_model.as_ref() {
+                let execution_update = pioneer_entity::task_run_execution::Entity::update_many()
+                    .filter(pioneer_entity::task_run_execution::Column::Id.eq(execution.id.clone()))
+                    .filter(
+                        pioneer_entity::task_run_execution::Column::Status.is_in(vec![
+                            task_run_execution_status_to_db(TaskRunExecutionStatus::Blocked),
+                            task_run_execution_status_to_db(TaskRunExecutionStatus::Failed),
+                            task_run_execution_status_to_db(TaskRunExecutionStatus::TimedOut),
+                        ]),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_run_execution::Column::Status,
+                        Expr::value(task_run_execution_status_to_db(
+                            TaskRunExecutionStatus::Reserved,
+                        )),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_run_execution::Column::WorkerId,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_run_execution::Column::LeaseUntil,
+                        Expr::value(None::<DateTimeWithTimeZone>),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_run_execution::Column::HeartbeatAt,
+                        Expr::value(None::<DateTimeWithTimeZone>),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_run_execution::Column::CompletedAt,
+                        Expr::value(None::<DateTimeWithTimeZone>),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_run_execution::Column::ResultJson,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_run_execution::Column::ErrorJson,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_run_execution::Column::UpdatedAt,
+                        Expr::value(now),
+                    )
+                    .exec(&tx)
+                    .await?;
+                anyhow::ensure!(
+                    execution_update.rows_affected == 1,
+                    "task execution `{}` changed while resume was committing",
+                    execution.id
+                );
+            }
+
+            let turn_update = pioneer_entity::task_run_turn::Entity::update_many()
+                .filter(pioneer_entity::task_run_turn::Column::Id.eq(task_run_turn.id.clone()))
+                .filter(
+                    pioneer_entity::task_run_turn::Column::Status
+                        .eq(task_run_turn_status_to_db(TaskRunTurnStatus::Blocked)),
+                )
+                .col_expr(
+                    pioneer_entity::task_run_turn::Column::Status,
+                    Expr::value(task_run_turn_status_to_db(TaskRunTurnStatus::InProgress)),
+                )
+                .col_expr(
+                    pioneer_entity::task_run_turn::Column::CompletedAt,
+                    Expr::value(None::<DateTimeWithTimeZone>),
+                )
+                .exec(&tx)
+                .await?;
+            anyhow::ensure!(
+                turn_update.rows_affected == 1,
+                "task run turn `{}` changed while resume was committing",
+                task_run_turn.id
+            );
+
+            // Reopen lock rows that belonged to this run in the same commit.
+            // Runs with no prior lock rows are handled by TaskExecutor's normal
+            // lock acquisition path after the transaction commits.
+            for lock in run_locks {
+                pioneer_entity::task_write_lock::Entity::update_many()
+                    .filter(pioneer_entity::task_write_lock::Column::Id.eq(lock.id))
+                    .col_expr(
+                        pioneer_entity::task_write_lock::Column::Status,
+                        Expr::value(task_write_lock_status_to_db(TaskWriteLockStatus::Acquired)),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_write_lock::Column::AcquiredAt,
+                        Expr::value(now),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_write_lock::Column::ExpiresAt,
+                        Expr::value(Some(unix_to_datetime(now_unix.saturating_add(3600)))),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_write_lock::Column::ReleasedAt,
+                        Expr::value(None::<DateTimeWithTimeZone>),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_write_lock::Column::Reason,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        pioneer_entity::task_write_lock::Column::UpdatedAt,
+                        Expr::value(now),
+                    )
+                    .exec(&tx)
+                    .await?;
+            }
+
+            let task_update = pioneer_entity::task::Entity::update_many()
+                .filter(pioneer_entity::task::Column::Id.eq(run.task_id.clone()))
+                .filter(pioneer_entity::task::Column::Status.is_in(vec![
+                    task_status_to_db(TaskStatus::Blocked),
+                    task_status_to_db(TaskStatus::Scheduled),
+                ]))
+                .col_expr(
+                    pioneer_entity::task::Column::Status,
+                    Expr::value(task_status_to_db(TaskStatus::Running)),
+                )
+                .col_expr(
+                    pioneer_entity::task::Column::CompletedAt,
+                    Expr::value(None::<DateTimeWithTimeZone>),
+                )
+                .col_expr(
+                    pioneer_entity::task::Column::ResultJson,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    pioneer_entity::task::Column::ErrorJson,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    pioneer_entity::task::Column::Revision,
+                    Expr::cust("revision + 1"),
+                )
+                .col_expr(pioneer_entity::task::Column::UpdatedAt, Expr::value(now))
+                .exec(&tx)
+                .await?;
+            anyhow::ensure!(
+                task_update.rows_affected == 1,
+                "task `{}` changed while resume was committing",
+                run.task_id
+            );
+
+            let task_model = task_repository::find_task_by_id(&tx, run.task_id.as_str())
+                .await?
+                .context("task disappeared after task-owned resume update")?;
+            let task = task_from_db_model(task_model)?;
+            let triggers = task_trigger::list_triggers_by_task(&tx, task.id.as_str())
+                .await?
+                .into_iter()
+                .map(task_trigger_from_db_model)
+                .collect::<Result<Vec<_>>>()?;
+            self.append_task_events_in_connection(
+                &tx,
+                vec![
+                    TaskEventPayload::TaskResumed {
+                        task: task.clone(),
+                        triggers,
+                        reason: Some("blocked task child resumed".to_owned()),
+                        resumed_at: now_unix,
+                    },
+                    TaskEventPayload::TaskRecovered {
+                        task_id: task.id.clone(),
+                        run_id: Some(run.id.clone()),
+                        message: "blocked task child aggregate reopened".to_owned(),
+                        recovered_at: now_unix,
+                    },
+                ],
+                now_unix,
+            )
+            .await?;
+
+            let recovery_job = recovery_job::find_job_by_id(&tx, job.id.as_str())
+                .await?
+                .map(recovery_job_record_from_model)
+                .context("recovery job disappeared after task-owned resume")?;
+            let updated_run = task_run::find_run_by_id(&tx, run.id.as_str())
+                .await?
+                .context("task run disappeared after task-owned resume")
+                .and_then(task_run_from_db_model)?;
+            let updated_turn = task_run_turn::find_turn_by_id(&tx, task_run_turn.id.as_str())
+                .await?
+                .context("task run turn disappeared after task-owned resume")
+                .and_then(task_run_turn_from_db_model)?;
+            let updated_execution = task_run_execution::find_execution_by_run(&tx, run.id.as_str())
+                .await?
+                .map(task_run_execution_from_db_model)
+                .transpose()?;
+
+            tx.commit()
+                .await
+                .context("failed to commit task-owned turn resume transaction")?;
+
+            Ok(Some(TaskOwnedTurnResumeOutcome::Resumed {
+                recovery_job,
+                task,
+                run: updated_run,
+                task_run_turn: updated_turn,
+                execution: updated_execution,
+            }))
+        })
+        .await
+    }
+
     pub async fn list_active_recovery_jobs(&self, limit: u64) -> Result<Vec<RecoveryJobRecord>> {
         self.run_serialized_write(|| async {
             let jobs = recovery_job::list_active_jobs(&self.connection, limit).await?;
@@ -19854,6 +20431,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         enqueue_optional_deliveries: bool,
     ) -> Result<()> {
         validate_turn_event_for_permanent_storage(&event).await?;
+        validate_turn_event_durable_owner(transaction, &event).await?;
 
         let projection_context = TurnEventProjectionContext::default();
         let claim_token = generate_id(DB_ID_LEN);
@@ -19967,6 +20545,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .context("failed to begin turn event append transaction")?;
 
         validate_turn_event_for_permanent_storage(&event).await?;
+        validate_turn_event_durable_owner(&transaction, &event).await?;
 
         let appended_event = match turn_event::append_event(&transaction, &event, created_at).await
         {
@@ -20950,6 +21529,84 @@ fn task_from_db_model(model: pioneer_entity::task::Model) -> Result<Task> {
     })
 }
 
+async fn task_finalization_revision_for_connection<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<TaskFinalizationRevision> {
+    let mut tasks =
+        task_repository::list_tasks_by_creator_turns(db, thread_id, &[turn_id.to_owned()])
+            .await?
+            .into_iter()
+            .filter_map(|model| match task_from_db_model(model.clone()) {
+                Ok(task)
+                    if task.lifecycle_policy.as_ref().is_some_and(|policy| {
+                        policy.attachment == TaskAttachmentMode::Attached
+                    }) =>
+                {
+                    Some(Ok(model))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+    tasks.sort_by(|left, right| left.id.cmp(&right.id));
+
+    if tasks.is_empty() {
+        return Ok(TaskFinalizationRevision {
+            token: "tasks:0".to_owned(),
+            attached_task_count: 0,
+        });
+    }
+
+    let task_ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
+    let mut runs = task_run::list_runs_by_tasks(db, task_ids.as_slice()).await?;
+    runs.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut executions = pioneer_entity::task_run_execution::Entity::find()
+        .filter(pioneer_entity::task_run_execution::Column::TaskId.is_in(task_ids.clone()))
+        .all(db)
+        .await
+        .context("failed to load task executions for finalization revision")?;
+    executions.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut run_turns = pioneer_entity::task_run_turn::Entity::find()
+        .filter(pioneer_entity::task_run_turn::Column::TaskId.is_in(task_ids.clone()))
+        .all(db)
+        .await
+        .context("failed to load task run turns for finalization revision")?;
+    run_turns.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut thread_bindings = pioneer_entity::task_run_thread_binding::Entity::find()
+        .filter(pioneer_entity::task_run_thread_binding::Column::TaskId.is_in(task_ids.clone()))
+        .all(db)
+        .await
+        .context("failed to load task thread bindings for finalization revision")?;
+    thread_bindings.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut candidates = pioneer_entity::task_result_candidate::Entity::find()
+        .filter(pioneer_entity::task_result_candidate::Column::TaskId.is_in(task_ids))
+        .all(db)
+        .await
+        .context("failed to load task result candidates for finalization revision")?;
+    candidates.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let encoded = serde_json::to_vec(&(
+        &tasks,
+        &runs,
+        &executions,
+        &run_turns,
+        &thread_bindings,
+        &candidates,
+    ))
+    .context("failed to encode attached-task finalization revision")?;
+    let digest = hex::encode(Sha256::digest(encoded));
+    Ok(TaskFinalizationRevision {
+        token: format!("tasks:{}:{digest}", tasks.len()),
+        attached_task_count: tasks.len(),
+    })
+}
+
 async fn hydrate_task_event_metadata<C: ConnectionTrait>(
     db: &C,
     event: &mut AppendedTaskEvent,
@@ -21258,6 +21915,15 @@ fn task_write_lock_from_db_model(
     })
 }
 
+fn task_write_lock_paths_overlap(left: &str, right: &str) -> bool {
+    if left == "." || right == "." {
+        return true;
+    }
+    let left_parts = left.split('/').collect::<Vec<_>>();
+    let right_parts = right.split('/').collect::<Vec<_>>();
+    left_parts.starts_with(right_parts.as_slice()) || right_parts.starts_with(left_parts.as_slice())
+}
+
 fn task_thread_lineage_from_db_model(
     model: pioneer_entity::thread_lineage::Model,
 ) -> TaskThreadLineage {
@@ -21357,6 +22023,30 @@ async fn validate_turn_event_for_permanent_storage(event: &TurnEventPayload) -> 
         }
         _ => Ok(()),
     }
+}
+
+async fn validate_turn_event_durable_owner<C>(
+    connection: &C,
+    event: &TurnEventPayload,
+) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    if matches!(event, TurnEventPayload::TurnStarted(_)) {
+        return Ok(());
+    }
+    if turn::find_turn_by_thread_and_id(connection, event.thread_id(), event.turn_id())
+        .await?
+        .is_none()
+    {
+        anyhow::bail!(
+            "refusing to append orphan `{}` event for missing turn `{}` in thread `{}`",
+            event.event_type(),
+            event.turn_id(),
+            event.thread_id()
+        );
+    }
+    Ok(())
 }
 
 fn validate_tool_payload_for_permanent_storage(item: &TurnItem) -> Result<()> {
@@ -21995,12 +22685,13 @@ mod tests {
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
         NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
         PrepareTurnFinalizationOutcome, PreparedClaudeProviderSessionMode, ProjectionPageAnchor,
-        ResolveCliRuntimePendingRequest, SkillAuditEventRecord, SkillDependencySnapshotRecord,
-        SkillInstallationPatch, SkillInstallationRecord, SkillPackChildDiff,
-        SkillPackInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+        RecoveryJobRecord, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
+        SkillDependencySnapshotRecord, SkillInstallationPatch, SkillInstallationRecord,
+        SkillPackChildDiff, SkillPackInstallationRecord,
+        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
-        TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskRunChildAnchor,
-        ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
+        TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskOwnedTurnResumeOutcome,
+        TaskRunChildAnchor, ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
         ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
         ThreadEpisodicCapsuleWriteState, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
         ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
@@ -22014,7 +22705,7 @@ mod tests {
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         tool_call_status, upsert_thread_timeline_block,
     };
-    use crate::repositories::{thread, turn};
+    use crate::repositories::{thread, turn, turn_finalization};
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::{
@@ -22031,14 +22722,16 @@ mod tests {
         PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
         PromptManifestProfile, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, RoleKey,
         SandboxMode, SkillId, SkillPackId, SystemEventLevel, Task, TaskAgentPrompt,
-        TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec, TaskExecutorKind,
-        TaskMetadata, TaskOwnerKind, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-        TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
-        TaskResultReviewerKind, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
-        TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-        TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec, TaskTriggerStatus,
-        TaskValue, Thread, ThreadEpisodicSourceContext, ThreadHistoryEventPayload, ThreadMode,
-        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
+        TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec, TaskAttachmentMode,
+        TaskCompletionBehavior, TaskConcurrencyConflictPolicy, TaskExecutorKind,
+        TaskLifecyclePolicy, TaskMetadata, TaskOwnerKind, TaskParentTerminalAction, TaskResult,
+        TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
+        TaskResultReviewEvent, TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun,
+        TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+        TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger,
+        TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWriteLock, TaskWriteLockScopeKind,
+        TaskWriteLockStatus, Thread, ThreadEpisodicSourceContext, ThreadHistoryEventPayload,
+        ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
         ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
         ToolOutputPolicySnapshot, ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode,
         ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind,
@@ -22052,6 +22745,7 @@ mod tests {
         TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSandboxMode, TurnStatus,
         TurnToolLoopBudgetExceededNotification, UserInput, generate_id,
     };
+    use sea_orm::sea_query::Expr;
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter,
         QueryOrder, Set, Statement, TransactionTrait,
@@ -22561,14 +23255,14 @@ mod tests {
 
         assert_eq!(
             store
-                .prepare_turn_finalization(&final_notification, 1, 1_700_000_100)
+                .prepare_turn_finalization(&final_notification, 1, None, 1_700_000_100)
                 .await
                 .expect("finalization intent should prepare"),
             PrepareTurnFinalizationOutcome::Prepared
         );
         assert_eq!(
             store
-                .prepare_turn_finalization(&final_notification, 1, 1_700_000_100)
+                .prepare_turn_finalization(&final_notification, 1, None, 1_700_000_100)
                 .await
                 .expect("exact intent replay should be idempotent"),
             PrepareTurnFinalizationOutcome::AlreadyPrepared
@@ -22582,7 +23276,7 @@ mod tests {
         }
         assert_eq!(
             store
-                .prepare_turn_finalization(&rerendered, 1, 1_700_000_100)
+                .prepare_turn_finalization(&rerendered, 1, None, 1_700_000_100)
                 .await
                 .expect("derived renderer metadata must not change provider identity"),
             PrepareTurnFinalizationOutcome::AlreadyPrepared
@@ -22645,7 +23339,7 @@ mod tests {
         }
         assert!(
             restarted
-                .prepare_turn_finalization(&conflicting, 1, 1_700_000_103)
+                .prepare_turn_finalization(&conflicting, 1, None, 1_700_000_103)
                 .await
                 .is_err(),
             "a finalization generation cannot alias different provider output"
@@ -22686,7 +23380,7 @@ mod tests {
             },
         };
         let error = store
-            .prepare_turn_finalization(&late, 1, 1_700_000_101)
+            .prepare_turn_finalization(&late, 1, None, 1_700_000_101)
             .await
             .expect_err("late finalization must not claim another terminal outcome");
         assert!(
@@ -22701,6 +23395,106 @@ mod tests {
             .await
             .expect("finalization lookup should succeed")
             .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_finalization_rejects_a_stale_attached_task_revision() {
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_native_task_fence",
+            "thr_native_task_fence",
+            "turn_native_task_fence",
+        )
+        .await;
+        let timestamp = 1_700_000_100;
+        let mut task = sample_task(timestamp);
+        task.id = "task_native_task_fence".to_owned();
+        task.workspace_id = "ws_native_task_fence".to_owned();
+        task.created_by_thread_id = Some("thr_native_task_fence".to_owned());
+        task.created_by_turn_id = Some("turn_native_task_fence".to_owned());
+        task.status = TaskStatus::Completed;
+        task.completed_at = Some(timestamp);
+        task.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment: TaskAttachmentMode::Attached,
+            on_parent_cancel: TaskParentTerminalAction::Cancel,
+            on_parent_failure: TaskParentTerminalAction::Cancel,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+        store
+            .append_task_event(
+                TaskEventPayload::TaskCreated { task: task.clone() },
+                timestamp,
+            )
+            .await
+            .expect("attached terminal task should persist");
+
+        let observed = store
+            .task_finalization_revision("thr_native_task_fence", "turn_native_task_fence")
+            .await
+            .expect("task finalization revision should load");
+        assert_eq!(observed.attached_task_count, 1);
+
+        pioneer_entity::task::Entity::update_many()
+            .filter(pioneer_entity::task::Column::Id.eq(task.id.clone()))
+            .col_expr(
+                pioneer_entity::task::Column::Revision,
+                Expr::value(task.revision + 1),
+            )
+            .col_expr(
+                pioneer_entity::task::Column::UpdatedAt,
+                Expr::value(unix_to_datetime(timestamp + 1)),
+            )
+            .exec(&store.connection)
+            .await
+            .expect("task transition should persist");
+
+        let notification = ItemCompletedNotification {
+            workspace_id: "ws_native_task_fence".to_owned(),
+            thread_id: "thr_native_task_fence".to_owned(),
+            turn_id: "turn_native_task_fence".to_owned(),
+            item: TurnItem::AgentMessage {
+                id: "final_native_task_fence".to_owned(),
+                text: "fenced answer".to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        };
+        let error = store
+            .prepare_turn_finalization(
+                &notification,
+                1,
+                Some(observed.token.as_str()),
+                timestamp + 2,
+            )
+            .await
+            .expect_err("stale task snapshot must fail closed");
+        assert!(
+            format!("{error:#}").contains("revision changed before commit"),
+            "unexpected stale task fence error: {error:#}"
+        );
+        assert!(
+            turn_finalization::find_by_turn_id(&store.connection, notification.turn_id.as_str())
+                .await
+                .expect("finalization intent lookup should succeed")
+                .is_none()
+        );
+
+        let current = store
+            .task_finalization_revision("thr_native_task_fence", "turn_native_task_fence")
+            .await
+            .expect("current task revision should load");
+        assert_eq!(
+            store
+                .prepare_turn_finalization(
+                    &notification,
+                    1,
+                    Some(current.token.as_str()),
+                    timestamp + 3,
+                )
+                .await
+                .expect("current task snapshot should prepare"),
+            PrepareTurnFinalizationOutcome::Prepared
         );
     }
 
@@ -22725,7 +23519,7 @@ mod tests {
             },
         };
         store
-            .prepare_turn_finalization(&notification, 1, 1_700_000_100)
+            .prepare_turn_finalization(&notification, 1, None, 1_700_000_100)
             .await
             .expect("finalization intent should prepare");
         store
@@ -25665,6 +26459,472 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_owned_blocked_turn_resume_reopens_the_full_aggregate() {
+        let store = test_store_with_workspace("ws_task_owned_resume").await;
+        let timestamp = 1_700_010_000;
+        let thread_id = "thread_task_owned_resume";
+        let turn_id = "turn_task_owned_resume";
+
+        let mut task = sample_task(timestamp);
+        task.id = "task_task_owned_resume".to_owned();
+        task.workspace_id = "ws_task_owned_resume".to_owned();
+        task.status = TaskStatus::Blocked;
+        let mut run = sample_task_run(timestamp);
+        run.id = "run_task_owned_resume".to_owned();
+        run.task_id = task.id.clone();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+        run.status = TaskRunStatus::Blocked;
+
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("blocked task aggregate should project");
+        let execution = store
+            .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, timestamp + 1)
+            .await
+            .expect("execution should reserve");
+        store
+            .mark_execution_terminal(
+                execution.id.as_str(),
+                TaskRunExecutionStatus::Blocked,
+                timestamp + 2,
+                None,
+                None,
+            )
+            .await
+            .expect("execution should become blocked");
+        store
+            .upsert_task_run_turn(TaskRunTurn {
+                id: "task_run_turn_task_owned_resume".to_owned(),
+                task_id: task.id.clone(),
+                run_id: run.id.clone(),
+                execution_id: Some(execution.id.clone()),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                kind: TaskRunTurnKind::Initial,
+                round: 0,
+                sequence: 0,
+                status: TaskRunTurnStatus::Blocked,
+                reviews_candidate_id: None,
+                requested_by_candidate_id: None,
+                requested_by_review_event_id: None,
+                created_at: timestamp + 2,
+                started_at: Some(timestamp + 2),
+                completed_at: Some(timestamp + 3),
+            })
+            .await
+            .expect("blocked task run turn should project");
+        pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+            id: Set(turn_id.to_owned()),
+            thread_id: Set(thread_id.to_owned()),
+            status: Set("blocked".to_owned()),
+            turn_kind: Set("conversation".to_owned()),
+            origin: Set("system".to_owned()),
+            prompt_manifest_json: Set("{}".to_owned()),
+            created_at: Set(unix_to_datetime(timestamp + 2)),
+            updated_at: Set(unix_to_datetime(timestamp + 3)),
+            ..Default::default()
+        })
+        .exec(&store.connection)
+        .await
+        .expect("blocked child turn should persist");
+
+        let job = store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                "task_owned_resume_item".to_owned(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::BlockResumable,
+                Some("task child blocked".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                0,
+                serde_json::json!({}),
+                serde_json::json!({"base_backoff_secs": 0, "max_wall_clock_secs": 60}),
+                timestamp + 4,
+            )
+            .await
+            .expect("task recovery job should enqueue");
+        store
+            .mark_recovery_job_terminal(
+                job.id.as_str(),
+                RecoveryJobStatus::Blocked,
+                Some("task child blocked".to_owned()),
+                timestamp + 5,
+            )
+            .await
+            .expect("task recovery job should become blocked");
+
+        let outcome = store
+            .resume_task_owned_turn(thread_id, turn_id, Some(job.id.as_str()), timestamp + 6)
+            .await
+            .expect("task-owned resume should commit");
+        let TaskOwnedTurnResumeOutcome::Resumed {
+            task: resumed_task,
+            run: resumed_run,
+            task_run_turn: resumed_turn,
+            execution: resumed_execution,
+            ..
+        } = outcome.expect("task lineage should select aggregate resume")
+        else {
+            panic!("expected aggregate resume outcome");
+        };
+        assert_eq!(resumed_task.status, TaskStatus::Running);
+        assert_eq!(resumed_run.status, TaskRunStatus::Running);
+        assert_eq!(resumed_turn.status, TaskRunTurnStatus::InProgress);
+        assert_eq!(
+            resumed_execution
+                .expect("execution should remain durable")
+                .status,
+            TaskRunExecutionStatus::Reserved
+        );
+        assert_eq!(
+            pioneer_entity::turn::Entity::find_by_id(turn_id.to_owned())
+                .one(&store.connection)
+                .await
+                .expect("child turn should load")
+                .expect("child turn should exist")
+                .status,
+            "in_progress"
+        );
+        assert_eq!(
+            store
+                .get_recovery_job(job.id.as_str())
+                .await
+                .expect("recovery job should load")
+                .expect("recovery job should exist")
+                .status,
+            RecoveryJobStatus::Succeeded
+        );
+    }
+
+    async fn task_owned_resume_conflict_fixture(
+        workspace_id: &str,
+        suffix: &str,
+    ) -> (CrudStore, Task, TaskRun, RecoveryJobRecord, String, String) {
+        let store = test_store_with_workspace(workspace_id).await;
+        let timestamp = 1_700_011_000;
+        let thread_id = format!("thread_task_owned_{suffix}");
+        let turn_id = format!("turn_task_owned_{suffix}");
+
+        let mut task = sample_task(timestamp);
+        task.id = format!("task_task_owned_{suffix}");
+        task.workspace_id = workspace_id.to_owned();
+        task.status = TaskStatus::Blocked;
+        let mut run = sample_task_run(timestamp);
+        run.id = format!("run_task_owned_{suffix}");
+        run.task_id = task.id.clone();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+        run.status = TaskRunStatus::Blocked;
+
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("blocked conflict fixture should project");
+        let execution = store
+            .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, timestamp + 1)
+            .await
+            .expect("conflict fixture execution should reserve");
+        store
+            .mark_execution_terminal(
+                execution.id.as_str(),
+                TaskRunExecutionStatus::Blocked,
+                timestamp + 2,
+                None,
+                None,
+            )
+            .await
+            .expect("conflict fixture execution should block");
+        store
+            .upsert_task_run_turn(TaskRunTurn {
+                id: format!("task_run_turn_task_owned_{suffix}"),
+                task_id: task.id.clone(),
+                run_id: run.id.clone(),
+                execution_id: Some(execution.id),
+                thread_id: thread_id.clone(),
+                turn_id: turn_id.clone(),
+                kind: TaskRunTurnKind::Initial,
+                round: 0,
+                sequence: 0,
+                status: TaskRunTurnStatus::Blocked,
+                reviews_candidate_id: None,
+                requested_by_candidate_id: None,
+                requested_by_review_event_id: None,
+                created_at: timestamp + 2,
+                started_at: Some(timestamp + 2),
+                completed_at: Some(timestamp + 3),
+            })
+            .await
+            .expect("conflict fixture run turn should persist");
+        pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+            id: Set(turn_id.clone()),
+            thread_id: Set(thread_id.clone()),
+            status: Set("blocked".to_owned()),
+            turn_kind: Set("conversation".to_owned()),
+            origin: Set("system".to_owned()),
+            prompt_manifest_json: Set("{}".to_owned()),
+            created_at: Set(unix_to_datetime(timestamp + 2)),
+            updated_at: Set(unix_to_datetime(timestamp + 3)),
+            ..Default::default()
+        })
+        .exec(&store.connection)
+        .await
+        .expect("conflict fixture child turn should persist");
+        let job = store
+            .enqueue_recovery_job(
+                turn_id.clone(),
+                format!("task_owned_{suffix}_item"),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::BlockResumable,
+                Some("task child blocked".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                0,
+                serde_json::json!({}),
+                serde_json::json!({"base_backoff_secs": 0, "max_wall_clock_secs": 60}),
+                timestamp + 4,
+            )
+            .await
+            .expect("conflict fixture recovery job should enqueue");
+        store
+            .mark_recovery_job_terminal(
+                job.id.as_str(),
+                RecoveryJobStatus::Blocked,
+                Some("task child blocked".to_owned()),
+                timestamp + 5,
+            )
+            .await
+            .expect("conflict fixture recovery job should block");
+
+        (store, task, run, job, thread_id, turn_id)
+    }
+
+    #[tokio::test]
+    async fn task_owned_resume_rejects_a_newer_terminal_successor() {
+        let (store, task, run, job, thread_id, turn_id) =
+            task_owned_resume_conflict_fixture("ws_task_owned_successor", "successor").await;
+        let timestamp = 1_700_011_100;
+        let mut successor = sample_task_run(timestamp);
+        successor.id = "run_task_owned_successor_newer".to_owned();
+        successor.task_id = task.id.clone();
+        successor.trigger_id = None;
+        successor.run_group_id = successor.id.clone();
+        successor.run_number = run.run_number + 1;
+        successor.status = TaskRunStatus::Succeeded;
+        successor.completed_at = Some(timestamp);
+        store
+            .append_task_event(
+                TaskEventPayload::RunCreated {
+                    run: successor,
+                    agent_spec: None,
+                },
+                timestamp,
+            )
+            .await
+            .expect("newer terminal successor should persist");
+
+        let outcome = store
+            .resume_task_owned_turn(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                Some(job.id.as_str()),
+                timestamp + 1,
+            )
+            .await
+            .expect("successor conflict should evaluate")
+            .expect("task lineage should be recognized");
+        let TaskOwnedTurnResumeOutcome::Conflict { reason } = outcome else {
+            panic!("newer terminal successor must fence blocked resume");
+        };
+        assert!(reason.contains("newer or active run"));
+        assert_eq!(
+            store
+                .get_task_run(run.id.as_str())
+                .await
+                .expect("blocked run should load")
+                .expect("blocked run should exist")
+                .status,
+            TaskRunStatus::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn task_owned_resume_rejects_an_overlapping_cross_task_workspace_lock() {
+        let (store, task, run, job, thread_id, turn_id) =
+            task_owned_resume_conflict_fixture("ws_task_owned_lock", "lock").await;
+        let timestamp = 1_700_011_200;
+        let released_lock = TaskWriteLock {
+            id: "lock_task_owned_released".to_owned(),
+            workspace_id: task.workspace_id.clone(),
+            task_id: task.id.clone(),
+            run_id: run.id.clone(),
+            scope_kind: TaskWriteLockScopeKind::Path,
+            scope_path: "src".to_owned(),
+            status: TaskWriteLockStatus::Released,
+            acquired_at: timestamp - 20,
+            expires_at: None,
+            released_at: Some(timestamp - 10),
+            conflict_policy: TaskConcurrencyConflictPolicy::Queue,
+            reason: Some("blocked child released its lock".to_owned()),
+            created_at: timestamp - 20,
+            updated_at: timestamp - 10,
+        };
+        store
+            .append_task_event(
+                TaskEventPayload::WriteLockReleased {
+                    lock: released_lock,
+                    released_at: timestamp - 10,
+                },
+                timestamp - 10,
+            )
+            .await
+            .expect("released owner lock should persist");
+
+        let mut other_task = sample_task(timestamp);
+        other_task.id = "task_task_owned_lock_other".to_owned();
+        other_task.workspace_id = task.workspace_id.clone();
+        other_task.status = TaskStatus::Running;
+        let mut other_run = sample_task_run(timestamp);
+        other_run.id = "run_task_owned_lock_other".to_owned();
+        other_run.task_id = other_task.id.clone();
+        other_run.trigger_id = None;
+        other_run.run_group_id = other_run.id.clone();
+        other_run.status = TaskRunStatus::Running;
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated {
+                        task: other_task.clone(),
+                    },
+                    TaskEventPayload::RunCreated {
+                        run: other_run.clone(),
+                        agent_spec: None,
+                    },
+                    TaskEventPayload::WriteLockAcquired {
+                        lock: TaskWriteLock {
+                            id: "lock_task_owned_other_active".to_owned(),
+                            workspace_id: task.workspace_id.clone(),
+                            task_id: other_task.id,
+                            run_id: other_run.id,
+                            scope_kind: TaskWriteLockScopeKind::Path,
+                            scope_path: "src/lib".to_owned(),
+                            status: TaskWriteLockStatus::Acquired,
+                            acquired_at: timestamp,
+                            expires_at: Some(timestamp + 3600),
+                            released_at: None,
+                            conflict_policy: TaskConcurrencyConflictPolicy::Queue,
+                            reason: None,
+                            created_at: timestamp,
+                            updated_at: timestamp,
+                        },
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("cross-task active lock should persist");
+
+        let outcome = store
+            .resume_task_owned_turn(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                Some(job.id.as_str()),
+                timestamp + 1,
+            )
+            .await
+            .expect("lock conflict should evaluate")
+            .expect("task lineage should be recognized");
+        let TaskOwnedTurnResumeOutcome::Conflict { reason } = outcome else {
+            panic!("overlapping cross-task lock must fence blocked resume");
+        };
+        assert!(reason.contains("write scope conflicts"));
+        assert_eq!(
+            store
+                .get_task_run(run.id.as_str())
+                .await
+                .expect("blocked run should load")
+                .expect("blocked run should exist")
+                .status,
+            TaskRunStatus::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tasks_created_by_turn_is_exact_and_unbounded_by_guard_page_size() {
+        let store = test_store_with_workspace("ws_creator_turn_query").await;
+        let thread_id = "thread_creator_turn_query";
+        let turn_id = "turn_creator_turn_query";
+        let other_turn_id = "turn_creator_turn_other";
+        let timestamp = 1_700_020_000;
+        let mut events = Vec::with_capacity(503);
+        for index in 0..501 {
+            let mut task = sample_task(timestamp + index);
+            task.id = format!("task_creator_query_{index:03}");
+            task.workspace_id = "ws_creator_turn_query".to_owned();
+            task.created_by_thread_id = Some(thread_id.to_owned());
+            task.created_by_turn_id = Some(turn_id.to_owned());
+            events.push(TaskEventPayload::TaskCreated { task });
+        }
+        for index in 0..2 {
+            let mut task = sample_task(timestamp + 501 + index);
+            task.id = format!("task_creator_other_{index:03}");
+            task.workspace_id = "ws_creator_turn_query".to_owned();
+            task.created_by_thread_id = Some(thread_id.to_owned());
+            task.created_by_turn_id = Some(other_turn_id.to_owned());
+            events.push(TaskEventPayload::TaskCreated { task });
+        }
+        store
+            .append_task_events(events, timestamp)
+            .await
+            .expect("creator-turn task events should project");
+
+        let tasks = store
+            .list_tasks_created_by_turn("ws_creator_turn_query", thread_id, turn_id)
+            .await
+            .expect("creator-turn query should succeed");
+        assert_eq!(tasks.len(), 501);
+        assert!(
+            tasks
+                .iter()
+                .all(|task| task.created_by_turn_id.as_deref() == Some(turn_id))
+        );
+        assert!(tasks.iter().any(|task| task.id == "task_creator_query_500"));
+        assert!(
+            !tasks
+                .iter()
+                .any(|task| task.created_by_turn_id.as_deref() == Some(other_turn_id))
+        );
+    }
+
+    #[tokio::test]
     async fn task_review_target_repositories_round_trip_and_update() {
         let store = test_store_with_workspace("ws_task_review_target_round_trip").await;
         let binding = TaskRunThreadBinding {
@@ -27213,6 +28473,14 @@ mod tests {
             Some(0),
             "the event transaction must establish a zero cursor before its first wake"
         );
+        assert_eq!(
+            store
+                .list_pending_task_event_fanout_task_ids(None, 256)
+                .await
+                .expect("durable fanout backlog should list"),
+            vec![task.id.clone()],
+            "an unacknowledged terminal/progress event must remain discoverable without a wake"
+        );
 
         store
             .advance_task_event_fanout_cursor(task.id.as_str(), created.sequence)
@@ -27224,6 +28492,14 @@ mod tests {
                 .await
                 .expect("persisted cursor should load"),
             Some(created.sequence)
+        );
+        assert!(
+            store
+                .list_pending_task_event_fanout_task_ids(None, 256)
+                .await
+                .expect("acknowledged fanout backlog should list")
+                .is_empty(),
+            "advancing the durable cursor must remove the task from replay backlog"
         );
 
         store

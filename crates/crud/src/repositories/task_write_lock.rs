@@ -89,6 +89,33 @@ pub async fn list_active_locks_for_workspace<C: ConnectionTrait>(
         .context("failed to list active task write locks")
 }
 
+/// Return the complete active lock set used by an ownership transition.
+///
+/// Ordinary diagnostics may use a bounded page, but resume fencing must not
+/// miss a conflicting lock merely because it falls beyond an arbitrary
+/// pagination guard.
+pub async fn list_all_active_locks_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<Vec<task_write_lock::Model>> {
+    task_write_lock::Entity::find()
+        .filter(task_write_lock::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            task_write_lock::Column::Status
+                .eq(task_write_lock_status_to_db(TaskWriteLockStatus::Acquired)),
+        )
+        .filter(
+            task_write_lock::Column::ExpiresAt
+                .is_null()
+                .or(task_write_lock::Column::ExpiresAt.gt(now)),
+        )
+        .order_by_asc(task_write_lock::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("failed to list complete active task write lock set")
+}
+
 pub async fn list_stale_locks<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,

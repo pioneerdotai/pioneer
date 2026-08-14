@@ -557,7 +557,13 @@ impl MessageProcessor {
 
         let mut live_receiver = self.agent_manager.subscribe_progress(thread_id).await;
 
-        let this = self.clone();
+        let this = self.task_agent_executor.processor_weak().ok();
+        #[cfg(test)]
+        let raw_this = (!this.is_some()).then_some(self as *const MessageProcessor as usize);
+        #[cfg(not(test))]
+        if this.is_none() {
+            bail!("task agent executor is not bound");
+        }
         let thread_id_owned = thread_id.to_owned();
         let handle = tokio::spawn(async move {
             loop {
@@ -567,9 +573,17 @@ impl MessageProcessor {
                         let Some(event) = durable else {
                             break;
                         };
-                        let committed = match AssertUnwindSafe(
-                            this.handle_durable_agent_event(event),
-                        )
+                        let committed = match AssertUnwindSafe(async {
+                            if let Some(weak) = &this {
+                                let Some(this) = weak.upgrade() else { return false; };
+                                this.handle_durable_agent_event(event).await
+                            } else {
+                                #[cfg(test)]
+                                { unsafe { (&*(raw_this.expect("raw listener owner") as *const MessageProcessor)).handle_durable_agent_event(event).await } }
+                                #[cfg(not(test))]
+                                { false }
+                            }
+                        })
                         .catch_unwind()
                         .await
                         {
@@ -596,7 +610,15 @@ impl MessageProcessor {
                     }, if live_receiver.is_some() => {
                         match live {
                             Some(Ok(event)) => {
-                                if AssertUnwindSafe(this.handle_progress_agent_event(event))
+                                if AssertUnwindSafe(async {
+                                    if let Some(weak) = &this {
+                                        let Some(this) = weak.upgrade() else { return; };
+                                        this.handle_progress_agent_event(event).await;
+                                    } else {
+                                        #[cfg(test)]
+                                        { unsafe { (&*(raw_this.expect("raw listener owner") as *const MessageProcessor)).handle_progress_agent_event(event).await; } }
+                                    }
+                                })
                                     .catch_unwind()
                                     .await
                                     .is_err()
@@ -621,10 +643,12 @@ impl MessageProcessor {
                     }
                 }
             }
-            this.agent_listener_tasks
-                .lock()
-                .await
-                .remove(thread_id_owned.as_str());
+            if let Some(this) = this.and_then(|weak| weak.upgrade()) {
+                this.agent_listener_tasks
+                    .lock()
+                    .await
+                    .remove(thread_id_owned.as_str());
+            }
         });
 
         listeners.insert(thread_id.to_owned(), handle);
@@ -2502,6 +2526,7 @@ impl MessageProcessor {
             AgentDurableEvent::TurnFinalizationPrepared {
                 notification,
                 generation,
+                task_finalization_revision,
             } => message_future(async move {
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;
@@ -2509,7 +2534,12 @@ impl MessageProcessor {
                 let turn_id = notification.turn_id.clone();
                 if let Err(error) = self
                     .crud_store
-                    .prepare_turn_finalization(&notification, generation, now_timestamp_secs())
+                    .prepare_turn_finalization(
+                        &notification,
+                        generation,
+                        task_finalization_revision.as_deref(),
+                        now_timestamp_secs(),
+                    )
                     .await
                 {
                     self.report_legacy_turn_failure(
@@ -5116,37 +5146,46 @@ impl MessageProcessor {
             );
         }
 
-        if let Err(error) = self
+        let task_reconciliation_succeeded = match self
             .task_agent_executor
             .reconcile_child_turn_completed(thread_id.as_str(), turn_id.as_str())
             .await
         {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to reconcile completed child task turn"
-            );
-        }
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "completed child task reconciliation is pending durable retry"
+                );
+                false
+            }
+        };
 
-        if let Err(error) = self
-            .crud_store
-            .delete_turn_llm_context_for_turn(turn_id.as_str())
-            .await
-        {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to delete turn_llm_context rows after turn completion"
-            );
+        // The child Turn is terminal, but its task aggregate may still need
+        // the immutable provider/result input.  Keep both durable records
+        // until the live/startup reconciler completes the task transition.
+        if task_reconciliation_succeeded {
+            if let Err(error) = self
+                .crud_store
+                .delete_turn_llm_context_for_turn(turn_id.as_str())
+                .await
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to delete turn_llm_context rows after turn completion"
+                );
+            }
+            self.delete_turn_runtime_snapshot_for_closed_turn(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                "completed",
+            )
+            .await;
         }
-        self.delete_turn_runtime_snapshot_for_closed_turn(
-            thread_id.as_str(),
-            turn_id.as_str(),
-            "completed",
-        )
-        .await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
@@ -5170,10 +5209,11 @@ impl MessageProcessor {
             }
         }
 
-        if self
-            .thread_manager
-            .unload_orphaned_thread_if_idle(thread_id.as_str())
-            .await
+        if task_reconciliation_succeeded
+            && self
+                .thread_manager
+                .unload_orphaned_thread_if_idle(thread_id.as_str())
+                .await
         {
             self.agent_manager
                 .retire_thread_after_terminal_commit(thread_id.as_str())
@@ -5570,7 +5610,7 @@ impl MessageProcessor {
         )
         .await;
 
-        if let Err(error) = self
+        let task_reconciliation_succeeded = match self
             .task_agent_executor
             .reconcile_child_turn_blocked(
                 thread_id.as_str(),
@@ -5579,13 +5619,17 @@ impl MessageProcessor {
             )
             .await
         {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to reconcile blocked child task turn"
-            );
-        }
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "blocked child task reconciliation is pending durable retry"
+                );
+                false
+            }
+        };
 
         if let Err(error) = self
             .recovery_coordinator
@@ -5605,10 +5649,11 @@ impl MessageProcessor {
             );
         }
 
-        if self
-            .thread_manager
-            .unload_orphaned_thread_if_idle(thread_id.as_str())
-            .await
+        if task_reconciliation_succeeded
+            && self
+                .thread_manager
+                .unload_orphaned_thread_if_idle(thread_id.as_str())
+                .await
         {
             self.agent_manager
                 .retire_thread_after_terminal_commit(thread_id.as_str())
@@ -5741,7 +5786,7 @@ impl MessageProcessor {
         )
         .await;
 
-        if let Err(error) = self
+        let task_reconciliation_succeeded = match self
             .task_agent_executor
             .reconcile_child_turn_blocked(
                 thread_id.as_str(),
@@ -5750,13 +5795,17 @@ impl MessageProcessor {
             )
             .await
         {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to reconcile blocked child task turn for unloaded turn"
-            );
-        }
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "blocked child task reconciliation is pending durable retry for unloaded turn"
+                );
+                false
+            }
+        };
 
         if let Err(error) = self
             .recovery_coordinator
@@ -5774,6 +5823,12 @@ impl MessageProcessor {
                 error = %format!("{error:#}"),
                 "failed to mark active recovery jobs blocked for unloaded turn"
             );
+        }
+
+        if !task_reconciliation_succeeded {
+            // Keep the child runtime reachable for the live/startup task
+            // reconciler; the blocked Turn itself remains resumable.
+            return false;
         }
 
         self.send_notification_to_thread_subscribers(
@@ -6066,7 +6121,7 @@ impl MessageProcessor {
             );
         }
 
-        let reconciliation = if user_cancellation {
+        let task_reconciliation_succeeded = match if user_cancellation {
             self.task_agent_executor
                 .reconcile_child_turn_cancelled(
                     thread_id.as_str(),
@@ -6090,35 +6145,40 @@ impl MessageProcessor {
                         .unwrap_or("turn interrupted"),
                 )
                 .await
+        } {
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    user_cancellation,
+                    "interrupted child task reconciliation is pending durable retry"
+                );
+                false
+            }
         };
-        if let Err(error) = reconciliation {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                user_cancellation,
-                "failed to reconcile interrupted child task turn"
-            );
-        }
 
-        if let Err(error) = self
-            .crud_store
-            .delete_turn_llm_context_for_turn(turn_id.as_str())
-            .await
-        {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to delete turn_llm_context rows after turn interruption"
-            );
+        if task_reconciliation_succeeded {
+            if let Err(error) = self
+                .crud_store
+                .delete_turn_llm_context_for_turn(turn_id.as_str())
+                .await
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to delete turn_llm_context rows after turn interruption"
+                );
+            }
+            self.delete_turn_runtime_snapshot_for_closed_turn(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                "interrupted",
+            )
+            .await;
         }
-        self.delete_turn_runtime_snapshot_for_closed_turn(
-            thread_id.as_str(),
-            turn_id.as_str(),
-            "interrupted",
-        )
-        .await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
@@ -6156,10 +6216,11 @@ impl MessageProcessor {
             }
         }
 
-        if self
-            .thread_manager
-            .unload_orphaned_thread_if_idle(thread_id.as_str())
-            .await
+        if task_reconciliation_succeeded
+            && self
+                .thread_manager
+                .unload_orphaned_thread_if_idle(thread_id.as_str())
+                .await
         {
             self.agent_manager
                 .retire_thread_after_terminal_commit(thread_id.as_str())
@@ -6304,7 +6365,7 @@ impl MessageProcessor {
             );
         }
 
-        if let Err(error) = self
+        let task_reconciliation_succeeded = match self
             .task_agent_executor
             .reconcile_child_turn_failed(
                 thread_id.as_str(),
@@ -6313,32 +6374,38 @@ impl MessageProcessor {
             )
             .await
         {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to reconcile failed child task turn"
-            );
-        }
+            Ok(reconciled) => reconciled,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed child task reconciliation is pending durable retry"
+                );
+                false
+            }
+        };
 
-        if let Err(error) = self
-            .crud_store
-            .delete_turn_llm_context_for_turn(turn_id.as_str())
-            .await
-        {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %format!("{error:#}"),
-                "failed to delete turn_llm_context rows after turn failure"
-            );
+        if task_reconciliation_succeeded {
+            if let Err(error) = self
+                .crud_store
+                .delete_turn_llm_context_for_turn(turn_id.as_str())
+                .await
+            {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to delete turn_llm_context rows after turn failure"
+                );
+            }
+            self.delete_turn_runtime_snapshot_for_closed_turn(
+                thread_id.as_str(),
+                turn_id.as_str(),
+                "failed",
+            )
+            .await;
         }
-        self.delete_turn_runtime_snapshot_for_closed_turn(
-            thread_id.as_str(),
-            turn_id.as_str(),
-            "failed",
-        )
-        .await;
         self.clear_artifact_finalization_state(turn_id.as_str())
             .await;
 
@@ -6372,10 +6439,11 @@ impl MessageProcessor {
             }
         }
 
-        if self
-            .thread_manager
-            .unload_orphaned_thread_if_idle(thread_id.as_str())
-            .await
+        if task_reconciliation_succeeded
+            && self
+                .thread_manager
+                .unload_orphaned_thread_if_idle(thread_id.as_str())
+                .await
         {
             self.agent_manager
                 .retire_thread_after_terminal_commit(thread_id.as_str())

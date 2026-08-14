@@ -447,6 +447,18 @@ pub struct TerminalTaskObservation {
     pub child_turn_id: Option<String>,
 }
 
+/// One authoritative read of all task outcomes that can prevent a parent
+/// Turn from reaching its final answer.  The revision is a durable read token
+/// supplied by the task service; callers must not interpret a failed read as
+/// an empty snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskFinalizationSnapshot {
+    pub revision: String,
+    pub pending: Vec<PendingAttachedTask>,
+    pub review_required: Vec<ReviewRequiredTaskObservation>,
+    pub terminal: Vec<TerminalTaskObservation>,
+}
+
 #[derive(Clone, Default)]
 pub struct TaskToolMaterialization {
     pub bundles: Vec<pioneer_tools::ToolExtensionBundle>,
@@ -519,6 +531,31 @@ pub trait TaskToolProvider: Send + Sync {
         &self,
         context: TaskTurnContext,
     ) -> Result<TaskToolMaterialization, String>;
+
+    /// Read the parent task gate as one logical snapshot.  The default is
+    /// retained for lightweight providers and test doubles; the Gateway
+    /// implementation overrides it with a single Task Service wait snapshot.
+    async fn attached_task_finalization_snapshot(
+        &self,
+        context: TaskTurnContext,
+    ) -> Result<TaskFinalizationSnapshot, String> {
+        let pending = self.pending_attached_tasks(context.clone()).await?;
+        let review_required = self
+            .review_required_attached_task_observations(context.clone())
+            .await?;
+        let terminal = self.terminal_attached_task_observations(context).await?;
+        Ok(TaskFinalizationSnapshot {
+            revision: format!(
+                "pending:{};review:{};terminal:{}",
+                pending.len(),
+                review_required.len(),
+                terminal.len()
+            ),
+            pending,
+            review_required,
+            terminal,
+        })
+    }
 
     async fn pending_attached_tasks(
         &self,

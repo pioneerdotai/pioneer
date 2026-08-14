@@ -1,8 +1,8 @@
 use crate::message::{MessageProcessor, now_timestamp_secs};
 use async_trait::async_trait;
 use pioneer_agent::{
-    PendingAttachedTask, ReviewRequiredTaskObservation, TaskToolMaterialization, TaskToolProvider,
-    TaskTurnContext, TerminalTaskObservation,
+    PendingAttachedTask, ReviewRequiredTaskObservation, TaskFinalizationSnapshot,
+    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, TerminalTaskObservation,
 };
 use pioneer_crud::CrudStore;
 #[cfg(test)]
@@ -52,7 +52,6 @@ const TASK_PAUSE_TOOL: &str = "task_pause";
 const TASK_RESUME_TOOL: &str = "task_resume";
 const DEFAULT_ROOT_MAX_DEPTH: i64 = 3;
 const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
-const GUARD_TASK_LIST_LIMIT: u32 = 500;
 
 type TaskToolFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -158,6 +157,191 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         Ok(TaskToolMaterialization {
             bundles: vec![bundle],
             diagnostics: Vec::new(),
+        })
+    }
+
+    async fn attached_task_finalization_snapshot(
+        &self,
+        context: TaskTurnContext,
+    ) -> Result<TaskFinalizationSnapshot, String> {
+        let processor = self.processor()?;
+        resolve_task_tool_authorization_scope(processor.as_ref(), &context)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        // Fence the logical Task Service snapshot with the canonical durable
+        // aggregate revision. The wait snapshot currently spans several
+        // repository reads, so matching revisions before and after it provide
+        // an optimistic seqlock and reject a child transition between reads.
+        let revision_before = processor
+            .crud_store
+            .task_finalization_revision(context.thread_id.as_str(), context.turn_id.as_str())
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+
+        // Resolve creator identity in SQL before any limit, then ask Task
+        // Service for one zero-timeout wait snapshot rather than three
+        // independently changing queries.
+        let tasks = processor
+            .crud_store
+            .list_tasks_created_by_turn(
+                context.workspace_id.as_str(),
+                context.thread_id.as_str(),
+                context.turn_id.as_str(),
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let mut task_ids = tasks
+            .iter()
+            .filter(|task| {
+                task.lifecycle_policy
+                    .as_ref()
+                    .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
+                    .unwrap_or(false)
+            })
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        task_ids.sort();
+        task_ids.dedup();
+
+        if task_ids.len() != revision_before.attached_task_count {
+            return Err(
+                "attached-task aggregate changed while resolving creator identity".to_owned(),
+            );
+        }
+        if task_ids.is_empty() {
+            let revision_after = processor
+                .crud_store
+                .task_finalization_revision(context.thread_id.as_str(), context.turn_id.as_str())
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+            if revision_after != revision_before {
+                return Err(format!(
+                    "attached-task aggregate changed during empty finalization snapshot: before `{}`, after `{}`",
+                    revision_before.token, revision_after.token
+                ));
+            }
+            return Ok(TaskFinalizationSnapshot {
+                revision: revision_after.token,
+                ..TaskFinalizationSnapshot::default()
+            });
+        }
+
+        let expected_task_ids = task_ids.clone();
+        let task_service = processor.task_runtime.service();
+        let wait_state = task_tool_fresh_task(async move {
+            task_service
+                .get_wait_state_snapshot(TaskWaitParams {
+                    task_ids,
+                    run_ids: Vec::new(),
+                    timeout_ms: Some(0),
+                    mode: TaskWaitMode::AllTerminalOrReviewRequired,
+                    return_completed: true,
+                    return_pending: true,
+                })
+                .await
+        })
+        .await
+        .map_err(|error| format!("task finalization snapshot task failed: {error}"))?
+        .map_err(|error| format!("{error:#}"))?;
+
+        let mut observed_task_ids = wait_state
+            .pending
+            .iter()
+            .map(|item| item.task.id.clone())
+            .chain(
+                wait_state
+                    .review_required
+                    .iter()
+                    .map(|item| item.item.task.id.clone()),
+            )
+            .chain(wait_state.completed.iter().map(|item| item.task.id.clone()))
+            .chain(wait_state.failed.iter().map(|item| item.task.id.clone()))
+            .chain(wait_state.blocked.iter().map(|item| item.task.id.clone()))
+            .chain(wait_state.cancelled.iter().map(|item| item.task.id.clone()))
+            .collect::<Vec<_>>();
+        observed_task_ids.sort();
+        observed_task_ids.dedup();
+        if observed_task_ids != expected_task_ids {
+            return Err(format!(
+                "Task Service returned an incomplete finalization partition: expected {expected_task_ids:?}, observed {observed_task_ids:?}"
+            ));
+        }
+
+        let revision_after = processor
+            .crud_store
+            .task_finalization_revision(context.thread_id.as_str(), context.turn_id.as_str())
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        if revision_after != revision_before {
+            return Err(format!(
+                "attached-task aggregate changed during finalization snapshot: before `{}`, after `{}`",
+                revision_before.token, revision_after.token
+            ));
+        }
+
+        let pending = wait_state
+            .pending
+            .iter()
+            .map(|item| PendingAttachedTask {
+                task_id: item.task.id.clone(),
+                run_id: item.run.as_ref().map(|run| run.id.clone()),
+                title: item.task.title.clone(),
+                status: task_status_label(item.task.status),
+            })
+            .collect::<Vec<_>>();
+        let mut review_required = wait_state
+            .review_required
+            .iter()
+            .map(review_required_task_observation)
+            .collect::<Vec<_>>();
+        review_required.sort_by(|left, right| {
+            left.task_id
+                .cmp(&right.task_id)
+                .then_with(|| left.run_id.cmp(&right.run_id))
+                .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+        });
+
+        let terminal_items = wait_state
+            .completed
+            .iter()
+            .chain(wait_state.failed.iter())
+            .chain(wait_state.blocked.iter())
+            .chain(wait_state.cancelled.iter())
+            .collect::<Vec<_>>();
+        let terminal = terminal_items
+            .iter()
+            .map(|item| {
+                let run = item.run.as_ref();
+                TerminalTaskObservation {
+                    task_id: item.task.id.clone(),
+                    run_id: run.map(|run| run.id.clone()),
+                    title: item.task.title.clone(),
+                    status: task_status_label(item.task.status),
+                    summary: run
+                        .and_then(|run| run.result.as_ref())
+                        .and_then(|result| result.summary.clone())
+                        .or_else(|| {
+                            item.task
+                                .result
+                                .as_ref()
+                                .and_then(|result| result.summary.clone())
+                        }),
+                    error_message: run
+                        .and_then(|run| run.error.as_ref())
+                        .map(|error| error.message.clone())
+                        .or_else(|| item.task.error.as_ref().map(|error| error.message.clone())),
+                    child_thread_id: item.child_thread_id.clone(),
+                    child_turn_id: item.child_turn_id.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(TaskFinalizationSnapshot {
+            revision: revision_after.token,
+            pending,
+            review_required,
+            terminal,
         })
     }
 
@@ -3093,7 +3277,6 @@ async fn attached_tasks_for_turn(
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
             context.turn_id.as_str(),
-            u64::from(GUARD_TASK_LIST_LIMIT),
         )
         .await?
         .into_iter()

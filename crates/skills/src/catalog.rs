@@ -4,11 +4,12 @@ use crate::compile::{
 };
 use crate::contract::{
     SkillCatalogSnapshot, SkillDependencies, SkillSourceKind, SkillTrustLevel,
-    default_skill_conformance, parse_skill_from_file,
+    default_skill_conformance, fingerprint_for_content, parse_skill_from_file,
 };
 use anyhow::{Result, bail};
 use pioneer_protocol::SkillId;
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -67,6 +68,20 @@ fn source_root_for_installation(install_path: &Path) -> PathBuf {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .unwrap_or_else(|| install_path.to_path_buf())
+}
+
+fn bundled_skill_fingerprint(entry: &BundledSkillCatalogEntry) -> String {
+    let skill_file = entry.install_path.join("SKILL.md");
+    match fs::read_to_string(skill_file) {
+        Ok(content) => fingerprint_for_content(content.replace("\r\n", "\n").as_str()),
+        Err(_) => fingerprint_for_content(
+            format!(
+                "pioneer-bundled-skill-unavailable-v1\n{}\n{}",
+                entry.skill_id, entry.slug
+            )
+            .as_str(),
+        ),
+    }
 }
 
 struct CatalogMetadata<'a> {
@@ -195,7 +210,14 @@ pub fn load_catalog(params: &SkillCatalogLoadParams) -> Result<SkillCatalogSnaps
             );
         }
         let version = None;
-        let fingerprint = String::new();
+        // Bundled skills participate in the same exact execution projection
+        // contract as installed skills. An empty placeholder passes through
+        // catalog resolution but is rejected by the Gateway only after a Turn
+        // starts, which makes otherwise valid Composer children fail before
+        // their first provider round. Derive the same normalized SKILL.md
+        // content hash used by the parser, with a stable unavailable-package
+        // identity hash so the catalog never emits an invalid fingerprint.
+        let fingerprint = bundled_skill_fingerprint(bundled);
         let metadata = CatalogMetadata {
             skill_id: &bundled.skill_id,
             owner: &bundled.owner,

@@ -200,6 +200,31 @@ pub async fn list_event_task_ids<C: ConnectionTrait>(db: &C) -> Result<Vec<Strin
         .context("failed to query task event task ids")
 }
 
+pub async fn list_pending_fanout_task_ids<C: ConnectionTrait>(
+    db: &C,
+    after_task_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<String>> {
+    let mut query = task_event_fanout_cursor::Entity::find()
+        .select_only()
+        .column(task_event_fanout_cursor::Column::TaskId)
+        .filter(Expr::cust(
+            "EXISTS (SELECT 1 FROM task_event AS pending_event \
+             WHERE pending_event.task_id = task_event_fanout_cursor.task_id \
+             AND pending_event.sequence > task_event_fanout_cursor.last_sequence)",
+        ));
+    if let Some(after_task_id) = after_task_id {
+        query = query.filter(task_event_fanout_cursor::Column::TaskId.gt(after_task_id.to_owned()));
+    }
+    query
+        .order_by_asc(task_event_fanout_cursor::Column::TaskId)
+        .limit(std::cmp::max(limit, 1))
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to query task event fanout backlog")
+}
+
 pub async fn find_fanout_cursor<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<Option<i64>> {
     Ok(
         task_event_fanout_cursor::Entity::find_by_id(task_id.to_owned())

@@ -6706,9 +6706,13 @@ impl MessageProcessor {
         }
 
         let now_unix = now_timestamp_secs();
-        let resumed_job = match self
-            .recovery_coordinator
-            .resume_blocked_turn(
+        // Task-owned child Turns have a second durable owner (TaskRun).  Let
+        // the task executor reopen that aggregate and dispatch through the
+        // native executor; generic recovery would otherwise revive only the
+        // Turn and bypass task locks/execution leases.
+        let task_owned_resume = match self
+            .task_agent_executor
+            .resume_blocked_child_turn(
                 thread_id.as_str(),
                 turn_id.as_str(),
                 recovery_job_id.as_deref(),
@@ -6716,20 +6720,7 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(Some(job)) => job,
-            Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    public_turn_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        pioneer_protocol::PublicErrorStage::Execution,
-                        format!("turn `{turn_id}` has no blocked recovery job to resume"),
-                    ),
-                )
-                .await;
-                return;
-            }
+            Ok(value) => value,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -6737,7 +6728,7 @@ impl MessageProcessor {
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         pioneer_protocol::PublicErrorStage::Execution,
-                        format!("failed to resume turn `{turn_id}`: {error:#}"),
+                        format!("failed to resume task-owned turn `{turn_id}`: {error:#}"),
                     ),
                 )
                 .await;
@@ -6745,13 +6736,13 @@ impl MessageProcessor {
             }
         };
 
-        match self.recovery_coordinator.run_ready_jobs(now_unix, 16).await {
-            Ok(events) => {
-                for event in events {
-                    self.handle_recovery_event(event, now_unix).await;
-                }
+        let resumed_job_id = match task_owned_resume {
+            Some(task_agent_executor::TaskChildResumeOutcome::Resumed { recovery_job_id }) => {
+                recovery_job_id
             }
-            Err(error) => {
+            Some(task_agent_executor::TaskChildResumeOutcome::MissingRuntimeSnapshot {
+                recovery_job_id,
+            }) => {
                 self.send_error(
                     connection_id,
                     public_turn_error(
@@ -6759,14 +6750,101 @@ impl MessageProcessor {
                         INVALID_REQUEST_CODE,
                         pioneer_protocol::PublicErrorStage::Execution,
                         format!(
-                            "turn `{turn_id}` was resumed but recovery start failed: {error:#}"
+                            "task-owned turn `{turn_id}` cannot resume: durable runtime snapshot `{recovery_job_id}` is missing"
                         ),
                     ),
                 )
                 .await;
                 return;
             }
-        }
+            Some(task_agent_executor::TaskChildResumeOutcome::Conflict { reason }) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("task-owned turn `{turn_id}` resume blocked by aggregate conflict: {reason}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            Some(task_agent_executor::TaskChildResumeOutcome::NotFound) => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "task-owned turn `{turn_id}` has no resumable blocked TaskRun aggregate"
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+            None => {
+                let resumed_job = match self
+                    .recovery_coordinator
+                    .resume_blocked_turn(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        recovery_job_id.as_deref(),
+                        now_unix,
+                    )
+                    .await
+                {
+                    Ok(Some(job)) => job,
+                    Ok(None) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!("turn `{turn_id}` has no blocked recovery job to resume"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!("failed to resume turn `{turn_id}`: {error:#}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+
+                match self.recovery_coordinator.run_ready_jobs(now_unix, 16).await {
+                    Ok(events) => {
+                        for event in events {
+                            self.handle_recovery_event(event, now_unix).await;
+                        }
+                    }
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!(
+                                    "turn `{turn_id}` was resumed but recovery start failed: {error:#}"
+                                ),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                resumed_job.id
+            }
+        };
 
         let turn = match self
             .crud_store
@@ -6808,7 +6886,7 @@ impl MessageProcessor {
                 thread_id,
                 workspace_id,
                 turn,
-                recovery_job_id: resumed_job.id,
+                recovery_job_id: resumed_job_id,
             },
         ) {
             Ok(response) => response,

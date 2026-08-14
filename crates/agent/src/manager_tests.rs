@@ -8,10 +8,11 @@ use super::{
     ExecutionTurnStatus, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
     MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
     MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask, RecoveryAttemptRequest,
-    ResolvedArtifactInput, ReviewRequiredTaskObservation, TaskToolMaterialization,
-    TaskToolProvider, TaskTurnContext, ToolLoopConfig, TurnExecutionControl,
-    TurnFinalizationContext, TurnFinalizationDecision, TurnFinalizationProvider, TurnToolContext,
-    TurnToolMaterialization, TurnToolProvider, WorkspaceSkillPolicy,
+    ResolvedArtifactInput, ReviewRequiredTaskObservation, TaskFinalizationSnapshot,
+    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
+    TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
+    WorkspaceSkillPolicy,
 };
 use futures_util::StreamExt;
 use pioneer_hooks::{
@@ -1594,6 +1595,9 @@ struct FailingTaskMutationToolProvider {
     handler: Arc<FailingTaskCreateHandler>,
 }
 
+#[derive(Default)]
+struct FailingTaskFinalizationSnapshotProvider;
+
 #[derive(Clone)]
 struct StaticTaskToolProvider {
     bundle: ToolExtensionBundle,
@@ -1869,6 +1873,52 @@ impl TaskToolProvider for FailingTaskMutationToolProvider {
             }],
             diagnostics: Vec::new(),
         })
+    }
+
+    async fn pending_attached_tasks(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<super::PendingAttachedTask>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn review_required_attached_task_observations(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<ReviewRequiredTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn terminal_attached_task_observations(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<Vec<super::TerminalTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn cleanup_attached_tasks(
+        &self,
+        _context: TaskTurnContext,
+        _reason: String,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskToolProvider for FailingTaskFinalizationSnapshotProvider {
+    async fn materialize_task_tools(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<TaskToolMaterialization, String> {
+        Ok(TaskToolMaterialization::default())
+    }
+
+    async fn attached_task_finalization_snapshot(
+        &self,
+        _context: TaskTurnContext,
+    ) -> Result<TaskFinalizationSnapshot, String> {
+        Err("injected task-service outage".to_owned())
     }
 
     async fn pending_attached_tasks(
@@ -6906,6 +6956,42 @@ async fn phase_11_review_guard_injects_after_final_answer_attempt_and_allows_acc
     assert!(
         requests.len() >= 3,
         "guard should loop after injecting review observation before accept"
+    );
+}
+
+#[tokio::test]
+async fn phase_11_task_finalization_snapshot_outage_blocks_fail_closed() {
+    let provider = Arc::new(EchoProvider::new());
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "task-gate-outage",
+        provider,
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_task_tool_provider(Some(Arc::new(FailingTaskFinalizationSnapshotProvider)))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase11_task_gate_outage",
+        "ws_phase11_task_gate_outage",
+        "turn_phase11_task_gate_outage",
+        ThreadMode::Agent,
+        "task-gate-outage",
+        "Return a short answer.",
+    )
+    .await;
+    assert_turn_blocked(
+        &observed,
+        "attached task finalization remains unavailable after bounded retries: injected task-service outage",
+    );
+    assert_eq!(
+        completed_system_event_codes(&observed)
+            .iter()
+            .filter(|code| code.as_str() == "task.finalization.snapshot")
+            .count(),
+        0,
+        "a failed authoritative read must never emit a successful finalization snapshot"
     );
 }
 

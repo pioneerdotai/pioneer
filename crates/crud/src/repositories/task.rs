@@ -263,14 +263,12 @@ pub async fn list_tasks_by_creator_turn<C: ConnectionTrait>(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
-    limit: u64,
 ) -> Result<Vec<task::Model>> {
     task::Entity::find()
         .filter(task::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(task::Column::CreatedByThreadId.eq(thread_id.to_owned()))
         .filter(task::Column::CreatedByTurnId.eq(turn_id.to_owned()))
         .order_by_asc(task::Column::CreatedAt)
-        .limit(limit)
         .all(db)
         .await
         .context("failed to list tasks by exact creator turn")
