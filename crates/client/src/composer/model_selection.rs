@@ -279,7 +279,7 @@ pub fn default_composer_turn_mode() -> ThreadMode {
 }
 
 pub fn composer_turn_mode_options() -> [ThreadMode; 3] {
-    [ThreadMode::Message, ThreadMode::Chat, ThreadMode::Agent]
+    [ThreadMode::Message, ThreadMode::Agent, ThreadMode::Chat]
 }
 
 pub fn set_composer_turn_mode(current: &mut ThreadMode, mode: ThreadMode) -> bool {
@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(mode, ThreadMode::Agent);
         assert_eq!(
             composer_turn_mode_options(),
-            [ThreadMode::Message, ThreadMode::Chat, ThreadMode::Agent]
+            [ThreadMode::Message, ThreadMode::Agent, ThreadMode::Chat]
         );
     }
 
