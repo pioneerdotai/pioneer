@@ -15,6 +15,36 @@ struct TaskTimelineChangedTarget {
 }
 
 impl MessageProcessor {
+    pub(super) async fn reconcile_terminal_task_run_occurrence_turns(
+        &self,
+        limit: u64,
+    ) -> Result<usize> {
+        let run_ids = self
+            .crud_store
+            .list_in_progress_terminal_task_run_occurrence_ids(limit)
+            .await?;
+        let mut reconciled = 0usize;
+        for run_id in run_ids {
+            let Some(run) = self.crud_store.get_task_run(run_id.as_str()).await? else {
+                continue;
+            };
+            let Some(task_response) = self.crud_store.get_task(run.task_id.as_str()).await? else {
+                continue;
+            };
+            if run.status == pioneer_protocol::TaskRunStatus::Succeeded
+                && self
+                    .task_run_awaits_owner_thread_delivery(&task_response, run.id.as_str())
+                    .await?
+            {
+                continue;
+            }
+            self.mark_task_run_occurrence_turn_terminal(&task_response, run.id.as_str())
+                .await?;
+            reconciled = reconciled.saturating_add(1);
+        }
+        Ok(reconciled)
+    }
+
     pub(super) async fn emit_task_event(
         &self,
         event: pioneer_crud::AppendedTaskEvent,
@@ -989,7 +1019,7 @@ impl MessageProcessor {
 }
 
 impl MessageProcessor {
-    async fn mark_task_run_occurrence_turn_terminal(
+    pub(super) async fn mark_task_run_occurrence_turn_terminal(
         &self,
         response: &TaskGetResponse,
         run_id: &str,

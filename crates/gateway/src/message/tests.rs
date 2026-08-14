@@ -16067,6 +16067,14 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
         .await
         .expect("accepted result delivery should run");
+    assert_eq!(
+        processor
+            .reconcile_terminal_task_run_occurrence_turns(10)
+            .await
+            .expect("terminal occurrence reconciliation should succeed"),
+        1,
+        "durable delivery state must repair a missed live fanout"
+    );
     let delivery_delivered_event = processor
         .task_runtime
         .service()

@@ -1885,6 +1885,28 @@ impl MessageProcessor {
                     continue;
                 }
 
+                match retry_transient_storage_access(|| {
+                    this.reconcile_terminal_task_run_occurrence_turns(64)
+                })
+                .await
+                {
+                    Ok(reconciled) if reconciled > 0 => {
+                        info!(
+                            reconciled,
+                            "reconciled terminal TaskRuns with in-progress parent occurrence Turns"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => record_resilience_worker_poll_error(
+                        "task parent occurrence reconciler",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    ),
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
                 if let Err(error) = retry_transient_storage_access(|| {
                     this.process_due_native_turn_event_deliveries(now, 64)
                 })

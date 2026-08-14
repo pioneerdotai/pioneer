@@ -100,6 +100,19 @@ pub async fn claim_due<C: ConnectionTrait>(
     let expired_projecting = Condition::all()
         .add(turn_event_projection_state::Column::Status.eq(PROJECTION_STATUS_PROJECTING))
         .add(turn_event_projection_state::Column::ClaimExpiresAt.lte(now));
+    // Claim only the causal head of each Turn stream. Without this predicate,
+    // every successor behind one exhausted record remains due and can occupy
+    // the whole global batch forever. Healthy Turn streams must remain
+    // independently replayable even when another stream requires operator
+    // repair.
+    let is_causal_head = sea_orm::sea_query::Expr::cust(
+        "NOT EXISTS (\
+            SELECT 1 FROM turn_event_projection_state AS predecessor \
+            WHERE predecessor.turn_id = turn_event_projection_state.turn_id \
+              AND predecessor.sequence < turn_event_projection_state.sequence \
+              AND predecessor.status <> 'projected'\
+        )",
+    );
 
     let candidates = turn_event_projection_state::Entity::find()
         .filter(
@@ -107,6 +120,7 @@ pub async fn claim_due<C: ConnectionTrait>(
                 .add(due_pending_or_failed.clone())
                 .add(expired_projecting.clone()),
         )
+        .filter(is_causal_head)
         .order_by_asc(turn_event_projection_state::Column::NextRunAt)
         .order_by_asc(turn_event_projection_state::Column::TurnId)
         .order_by_asc(turn_event_projection_state::Column::Sequence)

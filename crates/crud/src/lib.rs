@@ -137,7 +137,7 @@ use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
     is_anyhow_sqlite_lock, retry_with_backoff,
 };
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
@@ -11134,6 +11134,38 @@ impl CrudStore {
             .transpose()
     }
 
+    /// Find TaskRun occurrence Turns whose authoritative TaskRun is already
+    /// terminal. These rows are repaired by the Gateway after confirming that
+    /// any owner-thread delivery has also reached a terminal state.
+    pub async fn list_in_progress_terminal_task_run_occurrence_ids(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<String>> {
+        let terminal_run_ids = Query::select()
+            .column(pioneer_entity::task_run::Column::Id)
+            .from(pioneer_entity::task_run::Entity)
+            .and_where(pioneer_entity::task_run::Column::Status.is_in([
+                task_run_status_to_db(TaskRunStatus::Succeeded),
+                task_run_status_to_db(TaskRunStatus::Failed),
+                task_run_status_to_db(TaskRunStatus::Blocked),
+                task_run_status_to_db(TaskRunStatus::Cancelled),
+                task_run_status_to_db(TaskRunStatus::TimedOut),
+            ]))
+            .to_owned();
+        let turns = pioneer_entity::turn::Entity::find()
+            .filter(pioneer_entity::turn::Column::TurnKind.eq(turn_kind_to_db(TurnKind::TaskRun)))
+            .filter(
+                pioneer_entity::turn::Column::Status.eq(turn_status_to_db(TurnStatus::InProgress)),
+            )
+            .filter(pioneer_entity::turn::Column::Id.in_subquery(terminal_run_ids))
+            .order_by_asc(pioneer_entity::turn::Column::UpdatedAt)
+            .limit(limit)
+            .all(&self.connection)
+            .await
+            .context("failed to list terminal TaskRuns with in-progress occurrence Turns")?;
+        Ok(turns.into_iter().map(|turn| turn.id).collect())
+    }
+
     pub async fn reserve_execution_for_run(
         &self,
         run_id: &str,
@@ -20857,51 +20889,62 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         let now = unix_to_datetime(now_unix);
         let claim_expires_at =
             unix_to_datetime(now_unix.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
-        let claimed = self
-            .run_serialized_write(|| {
-                turn_event_projection_state::claim_due(
-                    &self.connection,
-                    now,
-                    claim_expires_at,
-                    limit,
-                )
-            })
-            .await?;
+        let mut summary = TurnProjectionReplaySummary::default();
+        let mut remaining = limit;
 
-        let mut summary = TurnProjectionReplaySummary {
-            claimed: claimed.len(),
-            ..TurnProjectionReplaySummary::default()
-        };
+        // `claim_due` returns at most the causal head of each Turn. Refill the
+        // batch after projecting those heads so one healthy stream can still
+        // make full use of the replay budget without letting a poisoned stream
+        // monopolize it.
+        while remaining > 0 {
+            let claimed = self
+                .run_serialized_write(|| {
+                    turn_event_projection_state::claim_due(
+                        &self.connection,
+                        now,
+                        claim_expires_at,
+                        remaining,
+                    )
+                })
+                .await?;
+            if claimed.is_empty() {
+                break;
+            }
+            let claimed_count = u64::try_from(claimed.len()).unwrap_or(u64::MAX);
+            summary.claimed = summary.claimed.saturating_add(claimed.len());
 
-        for claimed_projection in claimed {
-            let event_id = claimed_projection.state.event_id.clone();
-            let thread_id = claimed_projection.state.thread_id.clone();
-            let turn_id = claimed_projection.state.turn_id.clone();
-            let claim_token = claimed_projection.claim_token.clone();
-            let attempt_count = claimed_projection.state.attempt_count;
+            for claimed_projection in claimed {
+                let event_id = claimed_projection.state.event_id.clone();
+                let thread_id = claimed_projection.state.thread_id.clone();
+                let turn_id = claimed_projection.state.turn_id.clone();
+                let claim_token = claimed_projection.claim_token.clone();
+                let attempt_count = claimed_projection.state.attempt_count;
 
-            let Some(appended_event) = turn_event::find_event_by_id(&self.connection, &event_id)
-                .await
-                .with_context(|| {
-                    format!("failed to load raw turn event `{event_id}` for projection replay")
-                })?
-            else {
-                let marked = self
-                    .run_serialized_write(|| {
-                        self.mark_turn_event_projection_failure_once(
-                            event_id.clone(),
-                            claim_token.clone(),
-                            attempt_count,
-                            "raw turn_event row is missing for projection replay".to_owned(),
-                            now_unix,
-                            true,
-                        )
-                    })
-                    .await?;
-                summary.missing_events += 1;
-                if marked {
-                    summary.exhausted += 1;
-                    summary
+                let Some(appended_event) =
+                    turn_event::find_event_by_id(&self.connection, &event_id)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to load raw turn event `{event_id}` for projection replay"
+                            )
+                        })?
+                else {
+                    let marked = self
+                        .run_serialized_write(|| {
+                            self.mark_turn_event_projection_failure_once(
+                                event_id.clone(),
+                                claim_token.clone(),
+                                attempt_count,
+                                "raw turn_event row is missing for projection replay".to_owned(),
+                                now_unix,
+                                true,
+                            )
+                        })
+                        .await?;
+                    summary.missing_events += 1;
+                    if marked {
+                        summary.exhausted += 1;
+                        summary
                         .exhausted_records
                         .push(TurnProjectionReplayExhaustedRecord {
                             event_id: event_id.clone(),
@@ -20910,91 +20953,30 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                             error_message: "raw turn_event row is missing for projection replay"
                                 .to_owned(),
                         });
-                }
-                continue;
-            };
-
-            let projection_context = match deserialize_turn_event_projection_context(
-                claimed_projection.state.projection_context_json.as_str(),
-                event_id.as_str(),
-            ) {
-                Ok(context) => context,
-                Err(error) => {
-                    let error_message = format!("{error:#}");
-                    let marked = self
-                        .run_serialized_write(|| {
-                            self.mark_turn_event_projection_failure_once(
-                                event_id.clone(),
-                                claim_token.clone(),
-                                attempt_count,
-                                error_message.clone(),
-                                now_unix,
-                                true,
-                            )
-                        })
-                        .await?;
-                    if marked {
-                        summary.exhausted += 1;
-                        summary
-                            .exhausted_records
-                            .push(TurnProjectionReplayExhaustedRecord {
-                                event_id: event_id.clone(),
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                                error_message,
-                            });
                     }
                     continue;
-                }
-            };
+                };
 
-            let projected = self
-                .run_serialized_write(|| {
-                    self.project_claimed_turn_event_once(
-                        appended_event.clone(),
-                        projection_context.clone(),
-                        claim_token.clone(),
-                        now,
-                    )
-                })
-                .await;
-
-            match projected {
-                Ok(TurnEventProjectionOutcome::Projected) => {
-                    summary.projected += 1;
-                }
-                Ok(TurnEventProjectionOutcome::DeferredByPredecessor) => {
-                    let released = self
-                        .run_serialized_write(|| {
-                            self.mark_turn_event_projection_pending_once(
-                                event_id.clone(),
-                                claim_token.clone(),
-                                now_unix,
-                            )
-                        })
-                        .await?;
-                    if released {
-                        summary.deferred += 1;
-                    }
-                }
-                Err(error) => {
-                    let error_message = format!("{error:#}");
-                    let will_exhaust =
-                        attempt_count.saturating_add(1) >= TURN_EVENT_PROJECTION_MAX_ATTEMPTS;
-                    let marked = self
-                        .run_serialized_write(|| {
-                            self.mark_turn_event_projection_failure_once(
-                                event_id.clone(),
-                                claim_token.clone(),
-                                attempt_count,
-                                error_message.clone(),
-                                now_unix,
-                                false,
-                            )
-                        })
-                        .await?;
-                    if marked {
-                        if will_exhaust {
+                let projection_context = match deserialize_turn_event_projection_context(
+                    claimed_projection.state.projection_context_json.as_str(),
+                    event_id.as_str(),
+                ) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let error_message = format!("{error:#}");
+                        let marked = self
+                            .run_serialized_write(|| {
+                                self.mark_turn_event_projection_failure_once(
+                                    event_id.clone(),
+                                    claim_token.clone(),
+                                    attempt_count,
+                                    error_message.clone(),
+                                    now_unix,
+                                    true,
+                                )
+                            })
+                            .await?;
+                        if marked {
                             summary.exhausted += 1;
                             summary
                                 .exhausted_records
@@ -21004,12 +20986,76 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                                     turn_id: turn_id.clone(),
                                     error_message,
                                 });
-                        } else {
-                            summary.failed += 1;
+                        }
+                        continue;
+                    }
+                };
+
+                let projected = self
+                    .run_serialized_write(|| {
+                        self.project_claimed_turn_event_once(
+                            appended_event.clone(),
+                            projection_context.clone(),
+                            claim_token.clone(),
+                            now,
+                        )
+                    })
+                    .await;
+
+                match projected {
+                    Ok(TurnEventProjectionOutcome::Projected) => {
+                        summary.projected += 1;
+                    }
+                    Ok(TurnEventProjectionOutcome::DeferredByPredecessor) => {
+                        let released = self
+                            .run_serialized_write(|| {
+                                self.mark_turn_event_projection_pending_once(
+                                    event_id.clone(),
+                                    claim_token.clone(),
+                                    now_unix,
+                                )
+                            })
+                            .await?;
+                        if released {
+                            summary.deferred += 1;
+                        }
+                    }
+                    Err(error) => {
+                        let error_message = format!("{error:#}");
+                        let will_exhaust =
+                            attempt_count.saturating_add(1) >= TURN_EVENT_PROJECTION_MAX_ATTEMPTS;
+                        let marked = self
+                            .run_serialized_write(|| {
+                                self.mark_turn_event_projection_failure_once(
+                                    event_id.clone(),
+                                    claim_token.clone(),
+                                    attempt_count,
+                                    error_message.clone(),
+                                    now_unix,
+                                    false,
+                                )
+                            })
+                            .await?;
+                        if marked {
+                            if will_exhaust {
+                                summary.exhausted += 1;
+                                summary.exhausted_records.push(
+                                    TurnProjectionReplayExhaustedRecord {
+                                        event_id: event_id.clone(),
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        error_message,
+                                    },
+                                );
+                            } else {
+                                summary.failed += 1;
+                            }
                         }
                     }
                 }
             }
+
+            remaining = remaining.saturating_sub(claimed_count);
         }
 
         Ok(summary)
@@ -29829,9 +29875,9 @@ mod tests {
             .replay_due_turn_event_projections(timestamp + 10, 10)
             .await
             .expect("projection replay should succeed");
-        assert_eq!(deferred_replay.claimed, 1);
+        assert_eq!(deferred_replay.claimed, 0);
         assert_eq!(deferred_replay.projected, 0);
-        assert_eq!(deferred_replay.deferred, 1);
+        assert_eq!(deferred_replay.deferred, 0);
         assert_eq!(deferred_replay.failed, 0);
         assert_eq!(deferred_replay.exhausted, 0);
 
@@ -29852,8 +29898,8 @@ mod tests {
             .await
             .expect("ordered projection replay should succeed");
         assert_eq!(replay.claimed, 2);
-        assert_eq!(replay.projected, 1);
-        assert_eq!(replay.deferred, 1);
+        assert_eq!(replay.projected, 2);
+        assert_eq!(replay.deferred, 0);
         assert_eq!(replay.failed, 0);
         assert_eq!(replay.exhausted, 0);
 
@@ -29861,8 +29907,8 @@ mod tests {
             .replay_due_turn_event_projections(timestamp + 40, 10)
             .await
             .expect("dependent projection replay should succeed");
-        assert_eq!(final_replay.claimed, 1);
-        assert_eq!(final_replay.projected, 1);
+        assert_eq!(final_replay.claimed, 0);
+        assert_eq!(final_replay.projected, 0);
         assert_eq!(final_replay.deferred, 0);
         assert_eq!(final_replay.failed, 0);
         assert_eq!(final_replay.exhausted, 0);
