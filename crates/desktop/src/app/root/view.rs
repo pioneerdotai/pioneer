@@ -6,6 +6,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
     resizable::{h_resizable, resizable_panel},
+    separator::Separator,
     theme::{ActiveTheme, Theme, ThemeMode},
     v_flex,
 };
@@ -46,6 +47,10 @@ impl Render for PioneerDesktop {
             .as_ref()
             .is_some_and(|settings| settings.general.keepawake);
         let keepawake_available = !is_gateway_setup_required && self.gateway.settings.is_some();
+        let show_task_notifications = !is_gateway_setup_required
+            && self
+                .principal_presentation_capabilities()
+                .can_read_own_notifications;
 
         let body = if let Some(invitation_join) = invitation_join {
             self.render_desktop_invitation_join(invitation_join, window, cx)
@@ -152,13 +157,18 @@ impl Render for PioneerDesktop {
                                 .child(
                                     h_flex()
                                         .h_full()
-                                        .gap_2()
+                                        .gap_0p5()
                                         .items_center()
-                                        // .child(if !is_gateway_setup_required {
-                                        //     Separator::vertical().mr_1().into_any_element()
-                                        // } else {
-                                        //     div().into_any_element()
-                                        // })
+                                        .child(if show_task_notifications {
+                                            self.render_task_user_notifications_button(cx)
+                                        } else {
+                                            div().into_any_element()
+                                        })
+                                        .child(if show_task_notifications {
+                                            Separator::vertical().h_4().mx_0p5().into_any_element()
+                                        } else {
+                                            div().into_any_element()
+                                        })
                                         .child(
                                             h_flex()
                                                 .gap_0p5()
