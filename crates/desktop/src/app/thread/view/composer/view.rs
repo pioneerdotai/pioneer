@@ -10,7 +10,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     IconName,
     button::*,
-    input::Input,
+    input::Textarea,
     menu::{DropdownMenu, PopupMenuItem},
     spinner::Spinner,
     theme::ActiveTheme,
@@ -315,7 +315,7 @@ impl PioneerDesktop {
                                     .child(if desktop_voice_hold_ui_active {
                                         self.render_desktop_voice_hold_prompt(cx)
                                     } else {
-                                        Input::new(&composer_state)
+                                        Textarea::new(&composer_state)
                                             .appearance(false)
                                             .disabled(
                                                 desktop_voice_context_locked

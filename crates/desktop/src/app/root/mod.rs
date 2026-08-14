@@ -34,7 +34,7 @@ use crate::{
 pub(super) use desktop_update::DesktopUpdateUiState;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    VirtualListScrollHandle, combobox::ComboboxState, input::InputState, table::TableState,
+    VirtualListScrollHandle, combobox::ComboboxState, input::TextareaState, table::TableState,
     tree::TreeState,
 };
 pub(super) use pioneer_client::{
@@ -406,7 +406,7 @@ pub struct PioneerDesktop {
     pub(super) workspace_action_in_progress: bool,
     pub(super) last_active_thread_by_workspace: HashMap<String, String>,
     pub(super) draft_thread_by_workspace: HashMap<String, String>,
-    pub(super) composer_state: Entity<InputState>,
+    pub(super) composer_state: Entity<TextareaState>,
     pub(super) composer_input_subscription: Option<Subscription>,
     pub(super) composer_mention_select: Entity<ComboboxState<MemberPickerDelegate>>,
     pub(super) composer_mention_select_subscription: Option<Subscription>,

@@ -4,7 +4,7 @@ use crate::app::{
     sidebar::agents_doc_tree_node_key,
 };
 use gpui::{prelude::*, *};
-use gpui_component::{input::InputState, theme::ActiveTheme};
+use gpui_component::{input::EditorState, theme::ActiveTheme};
 
 impl PioneerDesktop {
     pub(crate) fn render_agents_doc_editor(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -60,12 +60,14 @@ impl PioneerDesktop {
         }
 
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("markdown")
-                .searchable(true)
-                .soft_wrap(true)
+            let state = EditorState::new("markdown", window, cx)
                 .line_number(true)
-                .default_value("")
+                .default_value("");
+            // The typed editor facade does not expose soft-wrap configuration yet.
+            state
+                .base_state()
+                .update(cx, |state, cx| state.set_soft_wrap(true, window, cx));
+            state
         });
         let editor_workspace_id = workspace_id.clone();
         let editor_folder_id = folder_id.clone();

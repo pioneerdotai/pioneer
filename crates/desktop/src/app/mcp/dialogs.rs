@@ -5,7 +5,7 @@ use gpui_component::{
     StyledExt, WindowExt,
     dialog::DialogFooter,
     form::{field, v_form},
-    input::{Input, InputState},
+    input::{Textarea, TextareaState},
     *,
 };
 use pioneer_client::mcp::{
@@ -78,8 +78,7 @@ impl PioneerDesktop {
             return;
         }
         let config_input_state = cx.new(|cx| {
-            let state = InputState::new(window, cx)
-                .multi_line(true)
+            let state = TextareaState::new(window, cx)
                 .auto_grow(5, 14)
                 .placeholder(MCP_CONFIG_PLACEHOLDER.to_owned());
             state
@@ -291,7 +290,7 @@ impl PioneerDesktop {
                                 .child(
                                     field()
                                         .label(t!("mcp.dialog.config_json").to_string())
-                                        .child(Input::new(&config_input_state).min_w_0()),
+                                        .child(Textarea::new(&config_input_state).min_w_0()),
                                 )
                                 .when_some(field_error_message, |this, error| {
                                     this.child(

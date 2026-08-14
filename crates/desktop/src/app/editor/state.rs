@@ -6,7 +6,7 @@ use super::content::{
 use crate::gateway::GatewayWsCommandSender;
 use anyhow::Error;
 use gpui::{prelude::*, *};
-use gpui_component::input::{InputEvent, InputState};
+use gpui_component::input::{EditorState, InputEvent};
 use pioneer_client::agents_doc::autosave::{
     AGENTS_DOC_AUTOSAVE_DELAY, AgentsDocAutosaveDecision, AgentsDocAutosaveState,
     AgentsDocEditorLoadState, AgentsDocEditorSaveState,
@@ -21,7 +21,7 @@ pub(in crate::app) struct AgentsDocEditor {
     pub(super) folder_id: Option<String>,
     pub(super) explicit_doc: Option<ThreadAgentsDocPayload>,
     pub(super) effective_doc: Option<ThreadAgentsDocResolvedPayload>,
-    pub(super) input: Entity<InputState>,
+    pub(super) input: Entity<EditorState>,
     pub(super) load_state: AgentsDocEditorLoadState,
     pub(super) autosave: AgentsDocAutosaveState,
     suppress_input_change_count: usize,
@@ -34,7 +34,7 @@ impl AgentsDocEditor {
     pub(super) fn new(
         workspace_id: String,
         folder_id: Option<String>,
-        input: Entity<InputState>,
+        input: Entity<EditorState>,
         ws_sender: GatewayWsCommandSender,
         window_handle: AnyWindowHandle,
         window: &Window,
@@ -107,7 +107,7 @@ impl AgentsDocEditor {
     fn apply_load_response(
         &mut self,
         response: ThreadAgentsDocGetResponse,
-        input: Entity<InputState>,
+        input: Entity<EditorState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -122,7 +122,7 @@ impl AgentsDocEditor {
 
     fn set_input_value_suppressed(
         &mut self,
-        input: Entity<InputState>,
+        input: Entity<EditorState>,
         value: String,
         window: &mut Window,
         cx: &mut Context<Self>,

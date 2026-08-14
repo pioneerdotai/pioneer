@@ -6,7 +6,7 @@ use gpui_component::{
     button::*,
     dialog::DialogFooter,
     form::{field, v_form},
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     switch::Switch,
     theme::ActiveTheme,
     *,
@@ -45,8 +45,7 @@ impl PioneerDesktop {
             .provider_proxy_url(provider.id)
             .map(str::to_owned);
         let api_key_input_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 7)
                 .placeholder(t!("providers.dialog.api_key_placeholder").to_string())
         });
@@ -193,7 +192,7 @@ impl PioneerDesktop {
                                 .child(
                                     field()
                                         .label(t!("providers.dialog.api_key_label").to_string())
-                                        .child(Input::new(&api_key_input_state).min_w_0()),
+                                        .child(Textarea::new(&api_key_input_state).min_w_0()),
                                 )
                                 .child(
                                     field()

@@ -8,7 +8,7 @@ use gpui_component::{
     button::*,
     dialog::DialogFooter,
     form::{Field, field, v_form},
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     scroll::ScrollableElement,
     theme::ActiveTheme,
     *,
@@ -20,6 +20,50 @@ use pioneer_client::cli_runtime::approvals::{
     present_pending_request,
 };
 use std::rc::Rc;
+
+#[derive(Clone)]
+enum PendingRequestAnswerInput {
+    SingleLine(Entity<InputState>),
+    MultiLine(Entity<TextareaState>),
+}
+
+impl PendingRequestAnswerInput {
+    fn value(&self, cx: &App) -> String {
+        match self {
+            Self::SingleLine(input) => input.read(cx).value().to_string(),
+            Self::MultiLine(input) => input.read(cx).value().to_string(),
+        }
+    }
+
+    fn focus(&self, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::SingleLine(input) => {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+            Self::MultiLine(input) => {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+        }
+    }
+
+    fn set_value(&self, value: String, window: &mut Window, cx: &mut App) {
+        match self {
+            Self::SingleLine(input) => {
+                input.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+            Self::MultiLine(input) => {
+                input.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+        }
+    }
+
+    fn render(&self) -> AnyElement {
+        match self {
+            Self::SingleLine(input) => Input::new(input).min_w_0().into_any_element(),
+            Self::MultiLine(input) => Textarea::new(input).min_w_0().into_any_element(),
+        }
+    }
+}
 
 impl PioneerDesktop {
     pub(super) fn render_pending_request_card(
@@ -150,16 +194,20 @@ impl PioneerDesktop {
         let inputs = questions
             .iter()
             .map(|question| {
-                let input = cx.new(|cx| {
-                    let mut state = InputState::new(window, cx).placeholder("Answer");
-                    if question.is_secret {
-                        state = state.masked(true);
-                    }
-                    if question.options.is_empty() {
-                        state = state.multi_line(true).auto_grow(1, 4);
-                    }
-                    state
-                });
+                let input = if question.options.is_empty() && !question.is_secret {
+                    PendingRequestAnswerInput::MultiLine(cx.new(|cx| {
+                        TextareaState::new(window, cx)
+                            .auto_grow(1, 4)
+                            .placeholder("Answer")
+                    }))
+                } else {
+                    let is_secret = question.is_secret;
+                    PendingRequestAnswerInput::SingleLine(cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("Answer")
+                            .masked(is_secret)
+                    }))
+                };
                 (question.id.clone(), input)
             })
             .collect::<Vec<_>>();
@@ -174,7 +222,7 @@ impl PioneerDesktop {
             move |cx| {
                 let answers = inputs
                     .iter()
-                    .map(|(id, input)| (id.clone(), input.read(cx).value().to_string()));
+                    .map(|(id, input)| (id.clone(), input.value(cx)));
                 let resolution = pending_request_answered_resolution(answers);
 
                 let _ = desktop_entity.update(cx, |view, cx| {
@@ -187,7 +235,7 @@ impl PioneerDesktop {
 
         window.open_dialog(cx, move |dialog, window, cx| {
             if let Some((_, first_input)) = inputs.first() {
-                first_input.update(cx, |state, cx| state.focus(window, cx));
+                first_input.focus(window, cx);
             }
 
             dialog
@@ -335,7 +383,7 @@ fn pending_request_action_element_prefix(kind: PendingRequestActionKind) -> &'st
 
 fn render_user_input_question(
     question: PendingRequestUserInputQuestion,
-    input: Entity<InputState>,
+    input: PendingRequestAnswerInput,
     cx: &mut App,
 ) -> Field {
     let label = question
@@ -367,16 +415,14 @@ fn render_user_input_question(
                                 let input = input.clone();
                                 let label = option.label.clone();
                                 move |_, window, cx| {
-                                    input.update(cx, |state, cx| {
-                                        state.set_value(label.clone(), window, cx)
-                                    });
+                                    input.set_value(label.clone(), window, cx);
                                 }
                             })
                             .into_any_element()
                         })),
                 )
             })
-            .child(Input::new(&input).min_w_0())
+            .child(input.render())
             .when(question.is_secret, |this| {
                 this.child(
                     div()

@@ -24,8 +24,7 @@ impl PioneerDesktop {
             )
         });
         let composer_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 13)
                 .placeholder(t!("chat.composer.placeholder").to_string())
         });

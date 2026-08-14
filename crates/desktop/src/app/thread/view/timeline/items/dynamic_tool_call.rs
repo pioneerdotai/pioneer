@@ -15,7 +15,7 @@ use gpui_component::{
     dialog::DialogFooter,
     form::{field, v_form},
     h_flex,
-    input::{Input, InputState},
+    input::{Textarea, TextareaState},
     spinner::Spinner,
     v_flex, *,
 };
@@ -576,8 +576,7 @@ impl PioneerDesktop {
         }
 
         let feedback_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(3, 8)
                 .placeholder(t!("timeline.task_review.revision_feedback_placeholder").to_string())
         });
@@ -662,7 +661,7 @@ impl PioneerDesktop {
                         .child(
                             field()
                                 .label(t!("timeline.task_review.feedback_label").to_string())
-                                .child(Input::new(&feedback_state).min_w_0()),
+                                .child(Textarea::new(&feedback_state).min_w_0()),
                         )
                         .when_some(error, |this, error| {
                             this.child(
