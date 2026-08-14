@@ -1717,28 +1717,84 @@ async fn resume_codex_thread_with_exact_isolation(
         return Err(error.into());
     }
     let open_params = codex_read_only_thread_open_params(params, persisted_cwd);
-    let Some(required_bridge) = required_bridge else {
-        return client
+    let expected_cwd = open_params.cwd.clone();
+    let resume_result = match required_bridge {
+        None => client
             .thread_resume_at_path(native_thread_id, open_params, stable_rollout_path, timeout)
             .await
-            .context("Codex thread/resume failed after isolation attestation");
+            .context("Codex thread/resume failed after isolation attestation"),
+        Some(required_bridge) => tokio::try_join!(
+            async {
+                client
+                    .thread_resume_at_path(
+                        native_thread_id,
+                        open_params,
+                        stable_rollout_path,
+                        timeout,
+                    )
+                    .await
+                    .context("Codex thread/resume failed after isolation attestation")
+            },
+            required_bridge.ensure_ready(timeout),
+        )
+        .map(|(opened, ())| opened),
     };
-    let outcome = tokio::try_join!(
-        async {
-            client
-                .thread_resume_at_path(native_thread_id, open_params, stable_rollout_path, timeout)
-                .await
-                .context("Codex thread/resume failed after isolation attestation")
-        },
-        required_bridge.ensure_ready(timeout),
-    );
-    match outcome {
-        Ok((opened, ())) => Ok(opened),
+    let opened = match resume_result {
+        Ok(opened) => opened,
         Err(error) => {
-            required_bridge.fail_closed().await;
+            if let Some(required_bridge) = required_bridge {
+                required_bridge.fail_closed().await;
+            }
+            return Err(error);
+        }
+    };
+    match verify_oversized_codex_resume(
+        client,
+        opened,
+        native_thread_id,
+        expected_cwd.as_str(),
+        timeout,
+    )
+    .await
+    {
+        Ok(opened) => Ok(opened),
+        Err(error) => {
+            if let Some(required_bridge) = required_bridge {
+                required_bridge.fail_closed().await;
+            }
             Err(error)
         }
     }
+}
+
+async fn verify_oversized_codex_resume(
+    client: &CodexAppServerClient,
+    mut opened: CodexThreadOpenSnapshot,
+    expected_native_thread_id: &str,
+    expected_cwd: &str,
+    timeout: Duration,
+) -> Result<CodexThreadOpenSnapshot> {
+    if !opened.response_was_oversized {
+        return Ok(opened);
+    }
+    let verified = client
+        .thread_read_metadata(expected_native_thread_id, timeout)
+        .await
+        .context("Codex thread/read failed after discarding oversized thread/resume history")?;
+    if verified.native_thread_id != expected_native_thread_id || verified.cwd != expected_cwd {
+        bail!("Codex thread/resume post-verification returned mismatched native-thread metadata");
+    }
+    opened.native_thread_id = verified.native_thread_id.clone();
+    opened.cwd = Some(verified.cwd.clone());
+    opened.raw = serde_json::json!({
+        "thread": {
+            "id": verified.native_thread_id,
+            "cwd": verified.cwd,
+            "path": verified.rollout_path,
+        }
+    });
+    opened.response_was_oversized = false;
+    Ok(opened)
 }
 
 async fn attest_codex_exact_isolation(
@@ -3424,6 +3480,65 @@ mod tests {
         )
         .await;
         assert!(resume.await.expect("resume task should join").is_ok());
+    }
+
+    #[tokio::test]
+    async fn codex_thread_resume_postverifies_after_discarding_oversized_history() {
+        let mut fake = FakeCodexIsolationServer::new();
+        let client = fake.client.clone();
+        let resume = tokio::spawn(async move {
+            resume_codex_thread_with_exact_isolation(
+                &client,
+                "native-thread",
+                thread_open_params("/new-request-cwd"),
+                &empty_attestation(),
+                None,
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        let thread_read = fake.read_request().await;
+        fake.write_result(
+            thread_read["id"].clone(),
+            json!({ "thread": { "id": "native-thread", "cwd": "/persisted-cwd" } }),
+        )
+        .await;
+        let config_read = fake.read_request().await;
+        fake.write_result(config_read["id"].clone(), safe_empty_config_read_result())
+            .await;
+        let thread_resume = fake.read_request().await;
+        assert_eq!(thread_resume["method"], json!("thread/resume"));
+        fake.write_result(
+            thread_resume["id"].clone(),
+            json!({
+                "thread": {
+                    "id": "native-thread",
+                    "cwd": "/persisted-cwd",
+                    "turns": ["x".repeat(1024 * 1024 + 256)]
+                }
+            }),
+        )
+        .await;
+
+        let postverify = fake.read_request().await;
+        assert_eq!(postverify["method"], json!("thread/read"));
+        assert_eq!(postverify["params"]["includeTurns"], json!(false));
+        fake.write_result(
+            postverify["id"].clone(),
+            json!({ "thread": { "id": "native-thread", "cwd": "/persisted-cwd" } }),
+        )
+        .await;
+
+        let opened = resume
+            .await
+            .expect("resume task should join")
+            .expect("oversized history should be discarded and verified");
+        assert_eq!(opened.native_thread_id, "native-thread");
+        assert_eq!(opened.cwd.as_deref(), Some("/persisted-cwd"));
+        assert!(!opened.response_was_oversized);
+        assert!(opened.raw["thread"].get("turns").is_none());
     }
 
     #[tokio::test]

@@ -17,9 +17,9 @@ pub use mcp_config::{
 };
 
 use crate::driver::{
-    JsonlRpcDecodeError, JsonlRpcError, JsonlRpcId, JsonlRpcIncomingMessage, JsonlRpcNotification,
-    JsonlRpcRequest, JsonlRpcResponse, read_jsonl_rpc_message_with_budget, write_jsonl_rpc_message,
-    write_jsonl_rpc_request,
+    JsonlRpcDecodeError, JsonlRpcDecodeErrorKind, JsonlRpcError, JsonlRpcId,
+    JsonlRpcIncomingMessage, JsonlRpcNotification, JsonlRpcRequest, JsonlRpcResponse,
+    decode_jsonl_rpc_frame_with_budget, write_jsonl_rpc_message, write_jsonl_rpc_request,
 };
 use crate::input::CLIRuntimeTurnInputItem;
 use crate::process::{
@@ -3364,6 +3364,7 @@ pub struct CodexThreadOpenSnapshot {
     pub cwd: Option<String>,
     pub model: Option<String>,
     pub raw: JsonValue,
+    pub response_was_oversized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3821,6 +3822,10 @@ fn decode_codex_thread_open_response(
     method: &str,
     raw: JsonValue,
 ) -> Result<CodexThreadOpenSnapshot, CodexJsonlRpcClientError> {
+    let response_was_oversized = raw
+        .get("_pioneerOversizedResponseDiscarded")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
     let response: CodexThreadOpenResponse =
         serde_json::from_value(raw.clone()).map_err(|error| CodexJsonlRpcClientError::Decode {
             method: method.to_owned(),
@@ -3853,6 +3858,7 @@ fn decode_codex_thread_open_response(
         cwd: cwd_from_thread.or(cwd),
         model: model_from_thread.or(model),
         raw,
+        response_was_oversized,
     })
 }
 
@@ -4675,12 +4681,14 @@ enum CodexJsonlRpcCommand {
 
 enum CodexJsonlRpcIncoming {
     Message(JsonlRpcIncomingMessage),
+    OversizedSuccessResponse { id: JsonlRpcId, total_bytes: usize },
     DecodeError(JsonlRpcDecodeError),
     Closed,
 }
 
 struct PendingCodexJsonlRpcRequest {
     response_tx: oneshot::Sender<Result<JsonValue, CodexJsonlRpcClientError>>,
+    oversized_success_fallback: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4866,11 +4874,58 @@ async fn run_codex_jsonl_rpc_reader<R>(
 ) where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
+    let codec = crate::BoundedNativeEventCodec::new(native_event_budget);
     loop {
-        match read_jsonl_rpc_message_with_budget(&mut reader, native_event_budget).await {
-            Ok(Some(message)) => {
+        match codec
+            .read_frame_or_drain_if(&mut reader, |prefix| {
+                decode_oversized_codex_success_response_prefix(
+                    prefix,
+                    native_event_budget.max_frame_bytes,
+                )
+                .is_ok()
+            })
+            .await
+        {
+            Ok(Some(crate::BoundedNativeFrame::Complete(frame))) => {
+                let message =
+                    match decode_jsonl_rpc_frame_with_budget(frame.as_slice(), native_event_budget)
+                    {
+                        Ok(message) => message,
+                        Err(error) => {
+                            let _ = incoming_tx
+                                .send(CodexJsonlRpcIncoming::DecodeError(error))
+                                .await;
+                            return;
+                        }
+                    };
                 if incoming_tx
                     .send(CodexJsonlRpcIncoming::Message(message))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(Some(crate::BoundedNativeFrame::Oversized {
+                prefix,
+                total_bytes,
+                last_non_whitespace,
+            })) => {
+                let id = match decode_oversized_codex_success_response(
+                    prefix.as_slice(),
+                    last_non_whitespace,
+                    native_event_budget.max_frame_bytes,
+                ) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        let _ = incoming_tx
+                            .send(CodexJsonlRpcIncoming::DecodeError(error))
+                            .await;
+                        return;
+                    }
+                };
+                if incoming_tx
+                    .send(CodexJsonlRpcIncoming::OversizedSuccessResponse { id, total_bytes })
                     .await
                     .is_err()
                 {
@@ -4883,12 +4938,89 @@ async fn run_codex_jsonl_rpc_reader<R>(
             }
             Err(error) => {
                 let _ = incoming_tx
-                    .send(CodexJsonlRpcIncoming::DecodeError(error))
+                    .send(CodexJsonlRpcIncoming::DecodeError(
+                        JsonlRpcDecodeError::new(
+                            JsonlRpcDecodeErrorKind::InvalidMessage,
+                            error.to_string(),
+                        ),
+                    ))
                     .await;
                 return;
             }
         }
     }
+}
+
+fn decode_oversized_codex_success_response(
+    prefix: &[u8],
+    last_non_whitespace: Option<u8>,
+    max_frame_bytes: usize,
+) -> Result<JsonlRpcId, JsonlRpcDecodeError> {
+    if last_non_whitespace != Some(b'}') {
+        return Err(JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            format!(
+                "native JSONL frame exceeds {max_frame_bytes} bytes and is not a complete response"
+            ),
+        ));
+    }
+    decode_oversized_codex_success_response_prefix(prefix, max_frame_bytes)
+}
+
+fn decode_oversized_codex_success_response_prefix(
+    prefix: &[u8],
+    max_frame_bytes: usize,
+) -> Result<JsonlRpcId, JsonlRpcDecodeError> {
+    let prefix = std::str::from_utf8(prefix).map_err(|_| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            "oversized native JSONL response prefix is not UTF-8",
+        )
+    })?;
+    let Some(after_id) = prefix.trim_start().strip_prefix("{\"id\":") else {
+        return Err(JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            format!(
+                "native JSONL frame exceeds {max_frame_bytes} bytes outside a success response"
+            ),
+        ));
+    };
+    let Some(result_separator) = after_id.find(",\"result\":") else {
+        return Err(JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            format!(
+                "native JSONL frame exceeds {max_frame_bytes} bytes outside a success response"
+            ),
+        ));
+    };
+    serde_json::from_str::<JsonlRpcId>(&after_id[..result_separator]).map_err(|_| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            "oversized native JSONL response has an invalid id",
+        )
+    })
+}
+
+fn oversized_codex_success_fallback(request: &JsonlRpcRequest) -> Option<JsonValue> {
+    if request.method != "thread/resume" {
+        return None;
+    }
+    let params = request.params.as_ref()?.as_object()?;
+    let thread_id = params.get("threadId")?.as_str()?.trim();
+    if thread_id.is_empty() {
+        return None;
+    }
+    let mut thread = serde_json::Map::new();
+    thread.insert("id".to_owned(), JsonValue::String(thread_id.to_owned()));
+    for field in ["cwd", "model"] {
+        if let Some(value) = params.get(field).cloned() {
+            thread.insert(field.to_owned(), value);
+        }
+    }
+    Some(json!({
+        "thread": JsonValue::Object(thread),
+        "_pioneerOversizedResponseDiscarded": true,
+    }))
 }
 
 async fn run_codex_jsonl_rpc_worker<W>(
@@ -4918,7 +5050,15 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             continue;
                         }
 
-                        pending.insert(id.clone(), PendingCodexJsonlRpcRequest { response_tx });
+                        let oversized_success_fallback =
+                            oversized_codex_success_fallback(&request);
+                        pending.insert(
+                            id.clone(),
+                            PendingCodexJsonlRpcRequest {
+                                response_tx,
+                                oversized_success_fallback,
+                            },
+                        );
                         if let Err(error) = write_jsonl_rpc_request(&mut writer, &request).await {
                             let write_error = CodexJsonlRpcClientError::TransportClosed {
                                 message: format!("failed to write codex jsonl-rpc request: {error}"),
@@ -4994,6 +5134,35 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             server_request_timeout,
                             &mut writer,
                         ).await;
+                    }
+                    Some(CodexJsonlRpcIncoming::OversizedSuccessResponse { id, total_bytes }) => {
+                        let Some(pending_request) = pending.remove(&id) else {
+                            complete_all_codex_server_requests(
+                                &mut writer,
+                                &mut pending_server_requests,
+                                CodexServerRequestTerminalState::Shutdown,
+                            ).await;
+                            break CodexJsonlRpcClientError::TransportClosed {
+                                message: format!(
+                                    "discarded oversized codex jsonl-rpc response ({total_bytes} bytes) did not match a pending request"
+                                ),
+                            };
+                        };
+                        let Some(fallback) = pending_request.oversized_success_fallback else {
+                            let error = CodexJsonlRpcClientError::TransportClosed {
+                                message: format!(
+                                    "codex jsonl-rpc response for request {id} exceeds the native event budget ({total_bytes} bytes)"
+                                ),
+                            };
+                            let _ = pending_request.response_tx.send(Err(error.clone()));
+                            complete_all_codex_server_requests(
+                                &mut writer,
+                                &mut pending_server_requests,
+                                CodexServerRequestTerminalState::Shutdown,
+                            ).await;
+                            break error;
+                        };
+                        let _ = pending_request.response_tx.send(Ok(fallback));
                     }
                     Some(CodexJsonlRpcIncoming::DecodeError(error)) => {
                         complete_all_codex_server_requests(
@@ -5360,6 +5529,27 @@ mod tests {
             notification_capacity,
             server_request_capacity,
             diagnostic_capacity,
+        );
+        (client, BufReader::new(server_read), server_write)
+    }
+
+    fn client_pair_with_budget(
+        native_event_budget: crate::NativeEventBudget,
+    ) -> (
+        CodexJsonlRpcClient,
+        BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let (client_read, client_write) = split(client_stream);
+        let (server_read, server_write) = split(server_stream);
+        let client = CodexJsonlRpcClient::new_with_channel_capacity_and_budget(
+            BufReader::new(client_read),
+            client_write,
+            DEFAULT_INCOMING_QUEUE_CAPACITY,
+            DEFAULT_INCOMING_QUEUE_CAPACITY,
+            DEFAULT_COMMAND_QUEUE_CAPACITY,
+            native_event_budget,
         );
         (client, BufReader::new(server_read), server_write)
     }
@@ -7664,6 +7854,118 @@ while read line; do :; done
         assert_eq!(snapshot.native_thread_id, "codex-thread-existing");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-5.1"));
+        assert!(!snapshot.response_was_oversized);
+    }
+
+    #[tokio::test]
+    async fn codex_thread_resume_discards_oversized_history_and_keeps_transport_aligned() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_json_depth: 16,
+            max_json_nodes: 128,
+            max_string_bytes: 128,
+            max_journal_payload_bytes: 256,
+            ..crate::NativeEventBudget::default()
+        };
+        let (rpc, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let client = CodexAppServerClient::new(rpc);
+        let resume_client = client.clone();
+        let resume = tokio::spawn(async move {
+            resume_client
+                .thread_resume(
+                    "codex-thread-large",
+                    CodexThreadStartParams {
+                        cwd: "/tmp/project".to_owned(),
+                        approval_policy: "never".to_owned(),
+                        ephemeral: false,
+                        sandbox: Some("read-only".to_owned()),
+                        permissions: None,
+                        model: Some("gpt-test".to_owned()),
+                        service_tier: None,
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+
+        let request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"id\":{},\"result\":{{\"thread\":{{\"id\":\"codex-thread-large\",\"cwd\":\"/tmp/project\",\"turns\":[\"{}\"]}}}}}}\n",
+            request["id"],
+            "history".repeat(256),
+        );
+        assert!(payload.len() > budget.max_frame_bytes);
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write oversized resume response");
+
+        let snapshot = resume
+            .await
+            .expect("resume task should join")
+            .expect("oversized resume history should be discarded");
+        assert_eq!(snapshot.native_thread_id, "codex-thread-large");
+        assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(snapshot.model.as_deref(), Some("gpt-test"));
+        assert!(snapshot.response_was_oversized);
+
+        let metadata_client = client.clone();
+        let metadata = tokio::spawn(async move {
+            metadata_client
+                .thread_read_metadata("codex-thread-large", Duration::from_secs(2))
+                .await
+        });
+        let request = read_server_line(&mut server_reader).await;
+        assert_eq!(request["method"], json!("thread/read"));
+        let response = format!(
+            "{{\"id\":{},\"result\":{{\"thread\":{{\"id\":\"codex-thread-large\",\"cwd\":\"/tmp/project\"}}}}}}\n",
+            request["id"]
+        );
+        server_writer
+            .write_all(response.as_bytes())
+            .await
+            .expect("write metadata response");
+        assert_eq!(
+            metadata
+                .await
+                .expect("metadata task should join")
+                .expect("transport should remain aligned")
+                .native_thread_id,
+            "codex-thread-large"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_codex_notification_still_fails_closed() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_json_depth: 16,
+            max_json_nodes: 128,
+            max_string_bytes: 128,
+            max_journal_payload_bytes: 256,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        });
+        let _request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"{}\"}}}}\n",
+            "x".repeat(512)
+        );
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write oversized notification");
+        let error = pending
+            .await
+            .expect("pending task should join")
+            .expect_err("oversized notification must close the transport");
+        assert!(error.to_string().contains("exceeds 256 bytes"));
     }
 
     fn codex_account_probe_config(root: &Path, executable: &Path) -> CodexAccountProbeConfig {

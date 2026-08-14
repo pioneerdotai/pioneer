@@ -7401,6 +7401,53 @@ impl MessageProcessor {
         self.process_request(&context, payload).await;
     }
 
+    pub(super) async fn cleanup_abandoned_runtime_draft_artifacts(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) {
+        let artifact_ids = match pioneer_crud::list_abandoned_runtime_draft_artifact_ids(
+            &self.crud_store.database_connection(),
+            workspace_id,
+            thread_id,
+        )
+        .await
+        {
+            Ok(artifact_ids) => artifact_ids,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    thread_id,
+                    error = %format!("{error:#}"),
+                    "failed to resolve abandoned runtime draft artifacts"
+                );
+                return;
+            }
+        };
+        for artifact_id in artifact_ids {
+            match self
+                .artifact_service
+                .delete_artifact(workspace_id, artifact_id.as_str())
+                .await
+            {
+                Ok(_) => {
+                    self.cancel_artifact_streams(workspace_id, artifact_id.as_str());
+                    debug!(
+                        workspace_id,
+                        thread_id, artifact_id, "deleted abandoned runtime draft artifact"
+                    );
+                }
+                Err(error) => warn!(
+                    workspace_id,
+                    thread_id,
+                    artifact_id,
+                    error = %format!("{error:#}"),
+                    "failed to delete abandoned runtime draft artifact"
+                ),
+            }
+        }
+    }
+
     pub async fn connection_closed(&self, connection_id: ConnectionId) {
         self.artifact_uploads.abort_connection(connection_id).await;
         self.skill_upload_owners
@@ -7424,14 +7471,29 @@ impl MessageProcessor {
             );
         }
 
-        let removed_thread_ids = self.thread_manager.connection_closed(connection_id).await;
-        if removed_thread_ids.is_empty() {
+        let removed_threads = self
+            .thread_manager
+            .connection_closed_with_runtime_details(connection_id)
+            .await;
+        if removed_threads.is_empty() {
             return;
         }
 
-        for thread_id in &removed_thread_ids {
-            self.teardown_agent_thread(thread_id).await;
+        for thread in &removed_threads {
+            self.teardown_agent_thread(thread.thread_id.as_str()).await;
+            if thread.was_runtime_draft {
+                self.cleanup_abandoned_runtime_draft_artifacts(
+                    thread.workspace_id.as_str(),
+                    thread.thread_id.as_str(),
+                )
+                .await;
+            }
         }
+
+        let removed_thread_ids = removed_threads
+            .iter()
+            .map(|thread| thread.thread_id.as_str())
+            .collect::<Vec<_>>();
 
         debug!(
             connection_id,

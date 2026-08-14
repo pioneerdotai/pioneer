@@ -90,6 +90,13 @@ pub struct ThreadUnsubscribeOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnloadedThreadRuntime {
+    pub(crate) thread_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) was_runtime_draft: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ThreadSubscriptionIdentity {
     pub(crate) principal_id: PrincipalId,
     pub(crate) session_id: AuthSessionId,
@@ -1483,8 +1490,11 @@ impl ThreadManager {
         true
     }
 
-    pub async fn connection_closed(&self, connection_id: ConnectionId) -> Vec<String> {
-        let mut removed_thread_ids = Vec::new();
+    pub(crate) async fn connection_closed_with_runtime_details(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Vec<UnloadedThreadRuntime> {
+        let mut removed_threads = Vec::new();
 
         let mut state = self.state.write().await;
 
@@ -1504,12 +1514,29 @@ impl ThreadManager {
             };
 
             if should_remove {
-                state.threads.remove(&thread_id);
-                removed_thread_ids.push(thread_id);
+                if let Some(entry) = state.threads.remove(&thread_id) {
+                    removed_threads.push(UnloadedThreadRuntime {
+                        thread_id,
+                        workspace_id: entry.thread.workspace_id,
+                        was_runtime_draft: matches!(
+                            entry.lifecycle,
+                            ThreadEntryLifecycle::RuntimeDraft { .. }
+                        ),
+                    });
+                }
             }
         }
 
-        removed_thread_ids
+        removed_threads
+    }
+
+    #[cfg(test)]
+    pub async fn connection_closed(&self, connection_id: ConnectionId) -> Vec<String> {
+        self.connection_closed_with_runtime_details(connection_id)
+            .await
+            .into_iter()
+            .map(|thread| thread.thread_id)
+            .collect()
     }
 
     pub async fn thread_unsubscribe(

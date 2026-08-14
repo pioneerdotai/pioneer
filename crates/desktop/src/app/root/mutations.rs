@@ -20,22 +20,11 @@ impl PioneerDesktop {
             .and_then(|snapshot| snapshot.workspace.as_ref())
             .map(|workspace| workspace.execution_draft_policy.clone())
         else {
-            let had_sensitive_draft = self.composer_selected_provider.is_some()
-                || self.composer_selected_model.is_some()
-                || !self.composer_capabilities.is_empty()
-                || !self.composer_skill_selections.is_empty()
-                || !self.composer_attachments.is_empty();
-            self.composer_selected_provider = None;
-            self.composer_selected_model = None;
-            self.composer_selected_reasoning_effort = None;
-            self.composer_capabilities.clear();
-            self.composer_skill_selections.clear();
-            self.composer_attachments.clear();
+            // Projection invalidation is a temporary fail-closed fence while
+            // the replacement snapshot is fetched. Keep the user's draft so
+            // the fresh policy can reconcile it, but remove the fingerprint
+            // required by every submit path until that reconciliation occurs.
             self.composer_authorization_fingerprint = None;
-            if had_sensitive_draft {
-                self.composer_upload_error =
-                    Some("Composer selections were cleared after an authorization change".into());
-            }
             return;
         };
 

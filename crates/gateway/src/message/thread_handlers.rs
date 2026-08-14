@@ -1984,6 +1984,17 @@ impl MessageProcessor {
             .thread_manager
             .thread_unsubscribe(connection_id, &params.thread_id)
             .await;
+        if let Some(closed_notification) = outcome.closed_notification.as_ref() {
+            self.teardown_agent_thread(closed_notification.thread_id.as_str())
+                .await;
+            if let Some(access) = runtime_draft_access.as_ref() {
+                self.cleanup_abandoned_runtime_draft_artifacts(
+                    access.workspace_id(),
+                    access.thread_id(),
+                )
+                .await;
+            }
+        }
 
         let response = match JsonRpcResponse::from_result(request_id, &outcome.response) {
             Ok(response) => response,
@@ -2032,8 +2043,6 @@ impl MessageProcessor {
             )
             .await;
         }
-
-        self.teardown_agent_thread(closed_thread_id.as_str()).await;
     }
 }
 

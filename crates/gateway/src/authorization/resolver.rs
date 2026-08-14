@@ -3,9 +3,9 @@ use pioneer_crud::{
     CrudStore, PersistedCapabilityScopeKind, PersistedThreadAccessClass,
     find_active_workspace_for_principal, find_thread_membership, find_workspace_membership,
     resolve_artifact_authorization_scope, resolve_persisted_capability_authorization_scope,
-    resolve_session_authorization_scope, resolve_task_authorization_scope,
-    resolve_thread_authorization_scope, resolve_turn_authorization_scope,
-    resolve_workspace_authorization_scope,
+    resolve_runtime_draft_artifact_authorization_scope, resolve_session_authorization_scope,
+    resolve_task_authorization_scope, resolve_thread_authorization_scope,
+    resolve_turn_authorization_scope, resolve_workspace_authorization_scope,
 };
 use pioneer_protocol::{
     AuthSessionId, InvitationId, PrincipalId, PrincipalKind, PrincipalStatus, ThreadVisibility,
@@ -590,6 +590,67 @@ impl AuthorizationResolver {
                 }),
             )
             .map(AuthorizedThread))
+    }
+
+    /// Authorizes a completed composer upload through the exact connection-
+    /// owned runtime draft that accepted it. The artifact must still be an
+    /// exclusive `draft_upload` created by the same principal.
+    pub(crate) async fn authorize_runtime_draft_artifact(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        action: ResourceAction,
+        artifact_id: &str,
+        access: &RuntimeDraftAccess,
+    ) -> Result<ProofResolution<AuthorizedArtifact>> {
+        let thread = self
+            .authorize_runtime_draft(principal, action_gate, action, access)
+            .await?;
+        let ProofResolution::Authorized(thread) = thread else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let Some(scope) = resolve_runtime_draft_artifact_authorization_scope(
+            &self.store.database_connection(),
+            artifact_id,
+            access.workspace_id(),
+            access.thread_id(),
+            &principal.principal_id,
+        )
+        .await?
+        else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let Some(workspace_id) = resource_id(WorkspaceResourceId::new(scope.workspace_id)) else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let Some(thread_id) = resource_id(ThreadResourceId::new(scope.thread_id)) else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let Some(artifact_id) = resource_id(ArtifactResourceId::new(scope.artifact_id)) else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let AuthorizationProofCore {
+            principal_id,
+            action,
+            decision,
+            collaboration_root_thread_id,
+            thread_access,
+            ..
+        } = thread.0;
+        Ok(ProofResolution::Authorized(AuthorizedArtifact(
+            AuthorizationProofCore {
+                principal_id,
+                action,
+                resource: AuthorizationResource::Artifact {
+                    workspace_id,
+                    thread_id: Some(thread_id),
+                    artifact_id,
+                },
+                decision,
+                collaboration_root_thread_id,
+                thread_access,
+            },
+        )))
     }
 
     /// Resolves an internal child only through its persisted root lineage and

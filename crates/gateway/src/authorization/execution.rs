@@ -703,18 +703,36 @@ impl ExecutionAdmissionService {
                 principal.role_key.as_ref(),
                 ResourceAction::ArtifactRead,
             );
-            let resolved = self
-                .resolver
-                .authorize_artifact(
-                    principal,
-                    &gate,
-                    ResourceAction::ArtifactRead,
-                    artifact.artifact_id.as_str(),
-                    Some(request.workspace_id.as_str()),
-                    Some(request.root_thread_id.as_str()),
-                )
-                .await
-                .context("failed to resolve execution artifact grant")?;
+            let resolved = match runtime_draft {
+                Some(access)
+                    if access.workspace_id() == request.workspace_id
+                        && access.thread_id() == request.root_thread_id =>
+                {
+                    self.resolver
+                        .authorize_runtime_draft_artifact(
+                            principal,
+                            &gate,
+                            ResourceAction::ArtifactRead,
+                            artifact.artifact_id.as_str(),
+                            access,
+                        )
+                        .await
+                }
+                Some(_) => bail!("runtime draft differs from the execution artifact root"),
+                None => {
+                    self.resolver
+                        .authorize_artifact(
+                            principal,
+                            &gate,
+                            ResourceAction::ArtifactRead,
+                            artifact.artifact_id.as_str(),
+                            Some(request.workspace_id.as_str()),
+                            Some(request.root_thread_id.as_str()),
+                        )
+                        .await
+                }
+            }
+            .context("failed to resolve execution artifact grant")?;
             if !matches!(resolved, ProofResolution::Authorized(_)) {
                 bail!("selected artifact is outside the execution root");
             }

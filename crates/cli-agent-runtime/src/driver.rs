@@ -187,7 +187,7 @@ impl JsonlRpcDecodeError {
         self.kind
     }
 
-    fn new(kind: JsonlRpcDecodeErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: JsonlRpcDecodeErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -278,7 +278,15 @@ where
     else {
         return Ok(None);
     };
-    let line = std::str::from_utf8(&line).map_err(|_| {
+    decode_jsonl_rpc_frame_with_budget(&line, budget).map(Some)
+}
+
+pub(crate) fn decode_jsonl_rpc_frame_with_budget(
+    frame: &[u8],
+    budget: crate::NativeEventBudget,
+) -> Result<JsonlRpcIncomingMessage, JsonlRpcDecodeError> {
+    let codec = crate::BoundedNativeEventCodec::new(budget);
+    let line = std::str::from_utf8(frame).map_err(|_| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::InvalidMessage,
             "jsonl-rpc line is not UTF-8",
@@ -291,7 +299,7 @@ where
     codec.validate_value(&raw).map_err(|error| {
         JsonlRpcDecodeError::new(JsonlRpcDecodeErrorKind::InvalidMessage, error.to_string())
     })?;
-    Ok(Some(message))
+    Ok(message)
 }
 
 pub fn decode_jsonl_rpc_line(line: &str) -> Result<JsonlRpcIncomingMessage, JsonlRpcDecodeError> {

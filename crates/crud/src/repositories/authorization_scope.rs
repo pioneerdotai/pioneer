@@ -51,6 +51,14 @@ pub struct ArtifactAuthorizationScope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeDraftArtifactAuthorizationScope {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub artifact_id: String,
+    pub workspace_is_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskAuthorizationScope {
     pub workspace_id: String,
     pub root_thread_id: Option<String>,
@@ -205,7 +213,9 @@ pub async fn resolve_artifact_authorization_scope<C: ConnectionTrait>(
         if binding.workspace_id != model.workspace_id {
             return Ok(None);
         }
-        if let Some(thread_id) = binding.thread_id {
+        let is_thread_bound_draft_upload =
+            binding.binding_kind == "draft_upload" && binding.thread_id.is_some();
+        if let Some(thread_id) = binding.thread_id.as_ref() {
             let Some(root_thread_id) = artifact_authorization_root_thread_id(
                 db,
                 model.workspace_id.as_str(),
@@ -217,27 +227,33 @@ pub async fn resolve_artifact_authorization_scope<C: ConnectionTrait>(
             };
             thread_ids.insert(root_thread_id);
         }
-        if let Some(turn_id) = binding.turn_id {
-            let Some(scope) = resolve_turn_authorization_scope(
+        if let Some(turn_id) = binding.turn_id.as_ref() {
+            let scope = resolve_turn_authorization_scope(
                 db,
                 turn_id.as_str(),
                 Some(&model.workspace_id),
                 None,
             )
-            .await?
-            else {
-                return Ok(None);
-            };
-            let Some(root_thread_id) = artifact_authorization_root_thread_id(
-                db,
-                model.workspace_id.as_str(),
-                scope.thread_id.as_str(),
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
-            thread_ids.insert(root_thread_id);
+            .await?;
+            if let Some(scope) = scope {
+                let Some(root_thread_id) = artifact_authorization_root_thread_id(
+                    db,
+                    model.workspace_id.as_str(),
+                    scope.thread_id.as_str(),
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                thread_ids.insert(root_thread_id);
+            } else {
+                // Draft uploads are intentionally bound to a planned turn ID
+                // before that turn is materialized. The already-validated
+                // thread binding is the authorization root during this gap.
+                if !is_thread_bound_draft_upload {
+                    return Ok(None);
+                }
+            }
         }
         if let Some(task_id) = binding.task_id {
             let Some(scope) = resolve_task_authorization_scope(
@@ -309,6 +325,115 @@ pub async fn resolve_artifact_authorization_scope<C: ConnectionTrait>(
         workspace_is_active: workspace.is_active,
         thread,
     }))
+}
+
+/// Resolves an upload owned by an exact runtime-only draft. This intentionally
+/// does not fall back to the generic artifact resolver: until the first Turn
+/// commits there is no persisted Thread from which to derive authorization.
+pub async fn resolve_runtime_draft_artifact_authorization_scope<C: ConnectionTrait>(
+    db: &C,
+    artifact_id: &str,
+    expected_workspace_id: &str,
+    expected_thread_id: &str,
+    expected_creator_principal_id: &PrincipalId,
+) -> Result<Option<RuntimeDraftArtifactAuthorizationScope>> {
+    let Some(model) = artifact::Entity::find_by_id(artifact_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to resolve runtime draft artifact authorization scope")?
+    else {
+        return Ok(None);
+    };
+    if model.workspace_id != expected_workspace_id
+        || model.primary_thread_id.as_deref() != Some(expected_thread_id)
+        || model.status != "ready"
+        || model.deleted_at.is_some()
+        || model.created_by_kind != "user"
+        || model.created_by_actor_id.as_deref() != Some(expected_creator_principal_id.as_str())
+    {
+        return Ok(None);
+    }
+    let Some(workspace) = resolve_workspace_authorization_scope(db, expected_workspace_id).await?
+    else {
+        return Ok(None);
+    };
+    let bindings = artifact_binding::Entity::find()
+        .filter(artifact_binding::Column::ArtifactId.eq(model.id.clone()))
+        .all(db)
+        .await
+        .context("failed to load runtime draft artifact authorization bindings")?;
+    if !runtime_draft_bindings_are_exact(
+        bindings.as_slice(),
+        expected_workspace_id,
+        expected_thread_id,
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(RuntimeDraftArtifactAuthorizationScope {
+        workspace_id: model.workspace_id,
+        thread_id: expected_thread_id.to_owned(),
+        artifact_id: model.id,
+        workspace_is_active: workspace.is_active,
+    }))
+}
+
+/// Lists only completed uploads that belong exclusively to an abandoned
+/// runtime draft. A persisted Thread makes cleanup a no-op, so a concurrent
+/// successful first-turn materialization wins over disconnect cleanup.
+pub async fn list_abandoned_runtime_draft_artifact_ids<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<Vec<String>> {
+    if thread::Entity::find_by_id(thread_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to check runtime draft persistence before artifact cleanup")?
+        .is_some()
+    {
+        return Ok(Vec::new());
+    }
+    let mut candidates = artifact::Entity::find()
+        .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(artifact::Column::PrimaryThreadId.eq(thread_id.to_owned()))
+        .filter(artifact::Column::DeletedAt.is_null())
+        .all(db)
+        .await
+        .context("failed to list abandoned runtime draft artifact candidates")?;
+    candidates.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut artifact_ids = Vec::new();
+    for candidate in candidates {
+        let bindings = artifact_binding::Entity::find()
+            .filter(artifact_binding::Column::ArtifactId.eq(candidate.id.clone()))
+            .all(db)
+            .await
+            .context("failed to load abandoned runtime draft artifact bindings")?;
+        if runtime_draft_bindings_are_exact(bindings.as_slice(), workspace_id, thread_id) {
+            artifact_ids.push(candidate.id);
+        }
+    }
+    Ok(artifact_ids)
+}
+
+fn runtime_draft_bindings_are_exact(
+    bindings: &[artifact_binding::Model],
+    workspace_id: &str,
+    thread_id: &str,
+) -> bool {
+    !bindings.is_empty()
+        && bindings.iter().all(|binding| {
+            binding.workspace_id == workspace_id
+                && binding.thread_id.as_deref() == Some(thread_id)
+                && binding.binding_kind == "draft_upload"
+                && binding.direction == "input"
+                && binding.role.as_deref() == Some("user")
+                && binding.message_id.is_none()
+                && binding.turn_item_id.is_none()
+                && binding.tool_call_id.is_none()
+                && binding.task_id.is_none()
+                && binding.task_run_id.is_none()
+        })
 }
 
 async fn artifact_authorization_root_thread_id<C: ConnectionTrait>(

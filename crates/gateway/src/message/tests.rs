@@ -23439,6 +23439,88 @@ async fn connection_closed_discards_unmaterialized_runtime_draft() {
     );
 }
 
+async fn upload_runtime_draft_attachment(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    thread_id: &str,
+    planned_turn_id: &str,
+    attachment: &[u8],
+) -> pioneer_protocol::ArtifactRef {
+    let start_request_id = generate_test_request_id("draftupload", "start");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": start_request_id,
+                "method": "artifact/upload/start",
+                "params": {
+                    "workspace_id": workspace_id,
+                    "thread_id": thread_id,
+                    "planned_turn_id": planned_turn_id,
+                    "client_attachment_id": pioneer_protocol::generate_id(21),
+                    "file_name": "draft.txt",
+                    "mime_type": "text/plain",
+                    "size_bytes": attachment.len() as u64,
+                    "sha256": hex::encode(Sha256::digest(attachment)),
+                    "source_kind": "user_composer"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let start_response = recv_response_by_id(rx, start_request_id.as_str()).await;
+    let upload: ArtifactUploadStartResponse = serde_json::from_value(start_response.result)
+        .expect("runtime draft upload/start response should decode");
+
+    let header = ArtifactUploadChunkHeader {
+        workspace_id: workspace_id.to_owned(),
+        upload_id: upload.upload_id.clone(),
+        offset: 0,
+        len: attachment.len() as u64,
+        chunk_sha256: Some(hex::encode(Sha256::digest(attachment))),
+    };
+    let frame = upload_binary_test_frame(
+        super::artifacts::ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC,
+        &header,
+        attachment,
+    );
+    processor
+        .process_binary_frame_for_connection(connection_id, frame.as_slice())
+        .await
+        .expect("runtime draft artifact chunk should reach binary dispatch");
+    let ack = recv_notification_by_method(rx, events::ARTIFACT_UPLOAD_CHUNK_ACK).await;
+    let ack: pioneer_protocol::ArtifactUploadChunkAckNotification =
+        serde_json::from_value(ack.params.expect("runtime draft artifact ack params"))
+            .expect("runtime draft artifact ack should decode");
+    assert_eq!(ack.upload_id, upload.upload_id);
+    assert_eq!(ack.received_bytes, attachment.len() as u64);
+
+    let finish_request_id = generate_test_request_id("draftupload", "finish");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": finish_request_id,
+                "method": "artifact/upload/finish",
+                "params": {
+                    "workspace_id": workspace_id,
+                    "upload_id": upload.upload_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let finish_response = recv_response_by_id(rx, finish_request_id.as_str()).await;
+    let finished: ArtifactUploadFinishResponse = serde_json::from_value(finish_response.result)
+        .expect("runtime draft upload/finish response should decode");
+    assert!(!finished.artifact.artifact_id.is_empty());
+    finished.artifact
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persistence() {
     let (tx, mut rx) = mpsc::channel(16);
@@ -23458,6 +23540,7 @@ async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persis
         test_tool_loop_config(),
     );
     let thread_id = "thr_runtime_draft_upload";
+    let planned_turn_id = "turn_runtime_draft_upload";
     let attachment = b"runtime draft attachment";
 
     processor
@@ -23478,74 +23561,16 @@ async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persis
     let _ = recv_response_by_id(&mut rx, "draftuploadthread0001").await;
     let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "draftuploadstart00001",
-                "method": "artifact/upload/start",
-                "params": {
-                    "workspace_id": workspace_id,
-                    "thread_id": thread_id,
-                    "planned_turn_id": "turn_runtime_draft_upload",
-                    "client_attachment_id": "attachment-runtime-draft",
-                    "file_name": "draft.txt",
-                    "mime_type": "text/plain",
-                    "size_bytes": attachment.len() as u64,
-                    "sha256": hex::encode(Sha256::digest(attachment)),
-                    "source_kind": "user_composer"
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let start_response = recv_response_by_id(&mut rx, "draftuploadstart00001").await;
-    let upload: ArtifactUploadStartResponse = serde_json::from_value(start_response.result)
-        .expect("runtime draft upload/start response should decode");
-
-    let header = ArtifactUploadChunkHeader {
-        workspace_id: workspace_id.clone(),
-        upload_id: upload.upload_id.clone(),
-        offset: 0,
-        len: attachment.len() as u64,
-        chunk_sha256: Some(hex::encode(Sha256::digest(attachment))),
-    };
-    let frame = upload_binary_test_frame(
-        super::artifacts::ARTIFACT_UPLOAD_CHUNK_FRAME_MAGIC,
-        &header,
+    let artifact = upload_runtime_draft_attachment(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        planned_turn_id,
         attachment,
-    );
-    processor
-        .process_binary_frame_for_connection(connection_id, frame.as_slice())
-        .await
-        .expect("runtime draft artifact chunk should reach binary dispatch");
-    let ack = recv_notification_by_method(&mut rx, events::ARTIFACT_UPLOAD_CHUNK_ACK).await;
-    let ack: pioneer_protocol::ArtifactUploadChunkAckNotification =
-        serde_json::from_value(ack.params.expect("runtime draft artifact ack params"))
-            .expect("runtime draft artifact ack should decode");
-    assert_eq!(ack.upload_id, upload.upload_id);
-    assert_eq!(ack.received_bytes, attachment.len() as u64);
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "draftuploadfinish0001",
-                "method": "artifact/upload/finish",
-                "params": {
-                    "workspace_id": workspace_id,
-                    "upload_id": upload.upload_id
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let finish_response = recv_response_by_id(&mut rx, "draftuploadfinish0001").await;
-    let finished: ArtifactUploadFinishResponse = serde_json::from_value(finish_response.result)
-        .expect("runtime draft upload/finish response should decode");
-    assert!(!finished.artifact.artifact_id.is_empty());
+    )
+    .await;
 
     assert!(
         crud_store
@@ -23554,6 +23579,132 @@ async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persis
             .expect("runtime draft persistence lookup should succeed")
             .is_none(),
         "completed attachment upload must not materialize an empty draft thread"
+    );
+
+    let turn_request_id = generate_test_request_id("draftupload", "turn");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": turn_request_id,
+                "method": "turn/start",
+                "params": {
+                    "thread_id": thread_id,
+                    "turn_id": planned_turn_id,
+                    "input": [
+                        { "type": "text", "text": "read the attachment" },
+                        {
+                            "type": "artifact",
+                            "artifactId": artifact.artifact_id,
+                            "versionId": artifact.version_id
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (_response, _started) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        turn_request_id.as_str(),
+        events::TURN_STARTED,
+    )
+    .await;
+    assert!(
+        crud_store
+            .get_thread_model(thread_id)
+            .await
+            .expect("materialized runtime draft lookup should succeed")
+            .is_some(),
+        "first turn with a completed draft upload must materialize the Thread"
+    );
+    assert!(
+        crud_store
+            .get_turn(thread_id, planned_turn_id)
+            .await
+            .expect("materialized runtime draft Turn lookup should succeed")
+            .is_some(),
+        "first turn with a completed draft upload must materialize the Turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_closed_deletes_completed_upload_for_abandoned_runtime_draft() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thr_abandoned_draft_upload";
+    let planned_turn_id = "turn_abandoned_upload";
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "abandoneddraftthread1",
+                "method": "thread/start",
+                "params": {
+                    "thread_id": thread_id,
+                    "workspace_id": workspace_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_by_id(&mut rx, "abandoneddraftthread1").await;
+    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+
+    let artifact = upload_runtime_draft_attachment(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        planned_turn_id,
+        b"abandoned runtime draft attachment",
+    )
+    .await;
+    assert!(
+        crud_store
+            .get_thread_model(thread_id)
+            .await
+            .expect("abandoned runtime draft lookup should succeed")
+            .is_none(),
+        "upload must not persist an empty Thread"
+    );
+
+    processor.connection_closed(connection_id).await;
+
+    assert!(!thread_manager.has_thread(thread_id).await);
+    assert!(
+        crud_store
+            .get_thread_model(thread_id)
+            .await
+            .expect("post-cleanup runtime draft lookup should succeed")
+            .is_none()
+    );
+    let deleted = processor
+        .artifact_service
+        .get_artifact(workspace_id.as_str(), artifact.artifact_id.as_str(), None)
+        .await
+        .expect("abandoned draft artifact should remain inspectable as deleted");
+    assert_eq!(
+        deleted.artifact.status,
+        pioneer_protocol::ArtifactStatus::Deleted
     );
 }
 
@@ -26006,6 +26157,16 @@ async fn thread_unsubscribe_returns_status_and_closed_notification() {
     let thread_id = thread_response.thread.id;
     let workspace_id = thread_response.thread.workspace_id;
     let _started_notification = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
+    let draft_artifact = upload_runtime_draft_attachment(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id.as_str(),
+        "turn_unsubscribed_draft",
+        b"unsubscribe cleanup attachment",
+    )
+    .await;
 
     let unsubscribe_request = json!({
         "jsonrpc": "2.0",
@@ -26054,6 +26215,19 @@ async fn thread_unsubscribe_returns_status_and_closed_notification() {
 
     assert_eq!(closed.workspace_id, workspace_id);
     assert!(!thread_manager.has_thread(&closed.thread_id).await);
+    let deleted = processor
+        .artifact_service
+        .get_artifact(
+            workspace_id.as_str(),
+            draft_artifact.artifact_id.as_str(),
+            None,
+        )
+        .await
+        .expect("unsubscribed runtime draft artifact should remain inspectable as deleted");
+    assert_eq!(
+        deleted.artifact.status,
+        pioneer_protocol::ArtifactStatus::Deleted
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
