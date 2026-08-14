@@ -1,5 +1,5 @@
 use super::*;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use pioneer_protocol::{
     ItemUpdatedNotification, TaskAttachmentMode, TaskDeliveryStatus, TaskEventPayload,
     TaskExecutorKind, TaskGetResponse, TaskRescheduleReason, TaskResultCandidateStatus,
@@ -15,13 +15,104 @@ struct TaskTimelineChangedTarget {
 }
 
 impl MessageProcessor {
+    pub(super) async fn reconcile_terminal_task_child_turns(&self, limit: u64) -> Result<usize> {
+        let turns = self
+            .crud_store
+            .list_unreconciled_terminal_task_child_turns(limit)
+            .await?;
+        let mut reconciled = 0usize;
+        let mut errors = Vec::new();
+        for turn in turns {
+            let result = match turn.status {
+                TurnStatus::Completed => {
+                    self.task_agent_executor
+                        .reconcile_child_turn_completed(
+                            turn.thread_id.as_str(),
+                            turn.turn_id.as_str(),
+                        )
+                        .await
+                }
+                TurnStatus::Failed => {
+                    let error = turn.error.as_deref().unwrap_or("child turn failed");
+                    self.task_agent_executor
+                        .reconcile_child_turn_failed(
+                            turn.thread_id.as_str(),
+                            turn.turn_id.as_str(),
+                            error,
+                        )
+                        .await
+                }
+                TurnStatus::Interrupted => {
+                    let reason = turn
+                        .error
+                        .as_deref()
+                        .unwrap_or("child turn was interrupted");
+                    self.task_agent_executor
+                        .reconcile_child_turn_cancelled(
+                            turn.thread_id.as_str(),
+                            turn.turn_id.as_str(),
+                            reason,
+                        )
+                        .await
+                }
+                TurnStatus::Blocked => {
+                    let reason = turn.error.as_deref().unwrap_or("child turn was blocked");
+                    self.task_agent_executor
+                        .reconcile_child_turn_blocked(
+                            turn.thread_id.as_str(),
+                            turn.turn_id.as_str(),
+                            reason,
+                        )
+                        .await
+                }
+                TurnStatus::InProgress => continue,
+            };
+            match result {
+                Ok(true) => {
+                    if turn.status != TurnStatus::Blocked {
+                        if let Err(error) = self
+                            .crud_store
+                            .delete_turn_llm_context_for_turn(turn.turn_id.as_str())
+                            .await
+                        {
+                            warn!(
+                                thread_id = turn.thread_id.as_str(),
+                                turn_id = turn.turn_id.as_str(),
+                                error = %format!("{error:#}"),
+                                "failed to delete child Turn LLM context after durable task reconciliation"
+                            );
+                        }
+                        self.delete_turn_runtime_snapshot_for_closed_turn(
+                            turn.thread_id.as_str(),
+                            turn.turn_id.as_str(),
+                            "durably reconciled",
+                        )
+                        .await;
+                    }
+                    reconciled = reconciled.saturating_add(1);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    errors.push(format!("{}/{}: {error:#}", turn.thread_id, turn.turn_id))
+                }
+            }
+        }
+        if !errors.is_empty() {
+            bail!(
+                "terminal task child reconciliation failed: {}",
+                errors.join("; ")
+            );
+        }
+        Ok(reconciled)
+    }
+
     pub(super) async fn reconcile_terminal_task_run_occurrence_turns(
         &self,
         limit: u64,
     ) -> Result<usize> {
         let run_ids = self
             .crud_store
-            .list_in_progress_terminal_task_run_occurrence_ids(limit)
+            .list_mismatched_terminal_task_run_occurrence_ids(limit)
             .await?;
         let mut reconciled = 0usize;
         for run_id in run_ids {
@@ -1066,7 +1157,7 @@ impl MessageProcessor {
         else {
             return Ok(());
         };
-        if turn.turn_kind != TurnKind::TaskRun || turn.status != TurnStatus::InProgress {
+        if turn.turn_kind != TurnKind::TaskRun || turn.status == status {
             return Ok(());
         }
 

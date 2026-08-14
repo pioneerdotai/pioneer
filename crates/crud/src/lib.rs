@@ -137,7 +137,7 @@ use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
     is_anyhow_sqlite_lock, retry_with_backoff,
 };
-use sea_orm::sea_query::{Expr, Query};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
@@ -1009,6 +1009,18 @@ pub struct IncompleteNativeTurnAdmissionRecord {
 pub struct InProgressNativeTurnRecord {
     pub thread_id: String,
     pub turn_id: String,
+}
+
+/// A terminal task-owned child Turn whose TaskRun aggregate has not yet
+/// consumed the terminal outcome. The row itself is the durable retry token:
+/// reconciliation can be repeated without depending on a process-local
+/// completion callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreconciledTerminalTaskChildTurnRecord {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub status: TurnStatus,
+    pub error: Option<String>,
 }
 
 /// Active execution row inspected by the startup authority-integrity worker.
@@ -3332,6 +3344,7 @@ impl CrudStore {
                 self.connection.get_database_backend(),
                 "SELECT t.thread_id, t.id AS turn_id FROM \"turn\" t \
                  WHERE t.status = 'in_progress' \
+                   AND t.turn_kind = 'conversation' \
                    AND NOT EXISTS (SELECT 1 FROM turn_runtime_snapshot s WHERE s.turn_id = t.id) \
                    AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_binding c WHERE c.turn_id = t.id) \
                  ORDER BY t.created_at ASC, t.id ASC LIMIT ?"
@@ -3363,6 +3376,7 @@ impl CrudStore {
                 self.connection.get_database_backend(),
                 "SELECT t.thread_id, t.id AS turn_id FROM \"turn\" t \
                  WHERE t.status = 'in_progress' \
+                   AND t.turn_kind = 'conversation' \
                    AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_binding c WHERE c.turn_id = t.id) \
                  ORDER BY t.updated_at ASC, t.id ASC LIMIT ?"
                     .to_owned(),
@@ -3375,6 +3389,53 @@ impl CrudStore {
                 Ok(InProgressNativeTurnRecord {
                     thread_id: row.try_get("", "thread_id")?,
                     turn_id: row.try_get("", "turn_id")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_unreconciled_terminal_task_child_turns(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<UnreconciledTerminalTaskChildTurnRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "SELECT t.thread_id, t.id AS turn_id, t.status, t.error \
+                 FROM task_run r \
+                 INNER JOIN task task_row ON task_row.id = r.task_id \
+                 INNER JOIN task_run_turn trt ON trt.run_id = r.id \
+                 INNER JOIN \"turn\" t \
+                    ON t.id = trt.turn_id AND t.thread_id = trt.thread_id \
+                 WHERE r.status IN ('queued', 'starting', 'running', 'waiting', 'waiting_review') \
+                   AND task_row.status IN \
+                       ('draft', 'scheduled', 'queued', 'running', 'waiting', 'waiting_review') \
+                   AND (trt.status = 'in_progress' \
+                        OR (trt.status = 'candidate_created' AND r.status <> 'waiting_review')) \
+                   AND t.turn_kind = 'conversation' \
+                   AND t.status IN ('completed', 'failed', 'interrupted', 'blocked') \
+                 ORDER BY t.updated_at ASC, t.id ASC LIMIT ?"
+                    .to_owned(),
+                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
+            ))
+            .await
+            .context(
+                "failed to list terminal task child turns awaiting aggregate reconciliation",
+            )?;
+        rows.into_iter()
+            .map(|row| {
+                let status = row.try_get::<String>("", "status")?;
+                let status = turn_status_from_db(status.as_str())
+                    .with_context(|| format!("task child turn has unknown status `{status}`"))?;
+                Ok(UnreconciledTerminalTaskChildTurnRecord {
+                    thread_id: row.try_get("", "thread_id")?,
+                    turn_id: row.try_get("", "turn_id")?,
+                    status,
+                    error: row.try_get("", "error")?,
                 })
             })
             .collect()
@@ -11134,36 +11195,37 @@ impl CrudStore {
             .transpose()
     }
 
-    /// Find TaskRun occurrence Turns whose authoritative TaskRun is already
-    /// terminal. These rows are repaired by the Gateway after confirming that
-    /// any owner-thread delivery has also reached a terminal state.
-    pub async fn list_in_progress_terminal_task_run_occurrence_ids(
+    /// Find TaskRun occurrence Turns that disagree with their authoritative
+    /// terminal TaskRun. This includes false terminalization by generic Turn
+    /// recovery, not only occurrences left `in_progress`.
+    pub async fn list_mismatched_terminal_task_run_occurrence_ids(
         &self,
         limit: u64,
     ) -> Result<Vec<String>> {
-        let terminal_run_ids = Query::select()
-            .column(pioneer_entity::task_run::Column::Id)
-            .from(pioneer_entity::task_run::Entity)
-            .and_where(pioneer_entity::task_run::Column::Status.is_in([
-                task_run_status_to_db(TaskRunStatus::Succeeded),
-                task_run_status_to_db(TaskRunStatus::Failed),
-                task_run_status_to_db(TaskRunStatus::Blocked),
-                task_run_status_to_db(TaskRunStatus::Cancelled),
-                task_run_status_to_db(TaskRunStatus::TimedOut),
-            ]))
-            .to_owned();
-        let turns = pioneer_entity::turn::Entity::find()
-            .filter(pioneer_entity::turn::Column::TurnKind.eq(turn_kind_to_db(TurnKind::TaskRun)))
-            .filter(
-                pioneer_entity::turn::Column::Status.eq(turn_status_to_db(TurnStatus::InProgress)),
-            )
-            .filter(pioneer_entity::turn::Column::Id.in_subquery(terminal_run_ids))
-            .order_by_asc(pioneer_entity::turn::Column::UpdatedAt)
-            .limit(limit)
-            .all(&self.connection)
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "SELECT occurrence.id AS run_id \
+                 FROM \"turn\" occurrence \
+                 INNER JOIN task_run run ON run.id = occurrence.id \
+                 WHERE occurrence.turn_kind = 'task_run' \
+                   AND ((run.status = 'succeeded' AND occurrence.status <> 'completed') \
+                     OR (run.status IN ('failed', 'timed_out') AND occurrence.status <> 'failed') \
+                     OR (run.status = 'blocked' AND occurrence.status <> 'blocked') \
+                     OR (run.status = 'cancelled' AND occurrence.status <> 'interrupted')) \
+                 ORDER BY occurrence.updated_at ASC, occurrence.id ASC LIMIT ?"
+                    .to_owned(),
+                [i64::try_from(limit).unwrap_or(i64::MAX).into()],
+            ))
             .await
-            .context("failed to list terminal TaskRuns with in-progress occurrence Turns")?;
-        Ok(turns.into_iter().map(|turn| turn.id).collect())
+            .context("failed to list TaskRun occurrence Turns with mismatched terminal state")?;
+        rows.into_iter()
+            .map(|row| row.try_get("", "run_id").map_err(Into::into))
+            .collect()
     }
 
     pub async fn reserve_execution_for_run(

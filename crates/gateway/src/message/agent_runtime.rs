@@ -853,7 +853,7 @@ impl MessageProcessor {
             .retain(|key, _| !key.starts_with(prefix.as_str()));
     }
 
-    async fn delete_turn_runtime_snapshot_for_closed_turn(
+    pub(super) async fn delete_turn_runtime_snapshot_for_closed_turn(
         &self,
         thread_id: &str,
         turn_id: &str,

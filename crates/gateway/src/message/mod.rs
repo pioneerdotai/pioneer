@@ -1886,6 +1886,28 @@ impl MessageProcessor {
                 }
 
                 match retry_transient_storage_access(|| {
+                    this.reconcile_terminal_task_child_turns(64)
+                })
+                .await
+                {
+                    Ok(reconciled) if reconciled > 0 => {
+                        info!(
+                            reconciled,
+                            "reconciled terminal child Turns with their TaskRun aggregates"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => record_resilience_worker_poll_error(
+                        "task child terminal reconciler",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    ),
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                match retry_transient_storage_access(|| {
                     this.reconcile_terminal_task_run_occurrence_turns(64)
                 })
                 .await
@@ -1893,7 +1915,7 @@ impl MessageProcessor {
                     Ok(reconciled) if reconciled > 0 => {
                         info!(
                             reconciled,
-                            "reconciled terminal TaskRuns with in-progress parent occurrence Turns"
+                            "reconciled terminal TaskRuns with mismatched parent occurrence Turns"
                         );
                     }
                     Ok(_) => {}

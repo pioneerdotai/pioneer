@@ -137,34 +137,15 @@ impl TaskStartupReconciler {
             TaskRunStatus::WaitingReview => "waiting-review run is recoverable after startup",
             _ => return Ok(false),
         };
-        let mut emitted_recovery_event = false;
-        if !self
-            .recovery_event_exists(
-                run.task_id.as_str(),
-                Some(run.id.as_str()),
-                recovery_message,
-            )
-            .await?
-        {
-            let appended = self
-                .projector
-                .append_event(
-                    TaskEventPayload::TaskRecovered {
-                        task_id: run.task_id.clone(),
-                        run_id: Some(run.id.clone()),
-                        message: recovery_message.to_owned(),
-                        recovered_at: now,
-                    },
-                    now,
-                )
-                .await?;
-            self.event_bus.publish(appended).await;
-            emitted_recovery_event = true;
-        }
         if run.status == TaskRunStatus::Queued {
-            return Ok(emitted_recovery_event);
+            return self
+                .emit_recovery_event_if_missing(run, recovery_message, now)
+                .await;
         }
         if run.status == TaskRunStatus::WaitingReview {
+            let emitted_recovery_event = self
+                .emit_recovery_event_if_missing(run, recovery_message, now)
+                .await?;
             let handle = TaskExecutionHandle::new(
                 self.store.clone(),
                 self.event_bus.clone(),
@@ -205,8 +186,14 @@ impl TaskStartupReconciler {
             .claim_execution_at(execution.id.as_str(), worker_id.as_str(), now, lease_until)
             .await?
         else {
-            return Ok(emitted_recovery_event);
+            // A valid execution lease proves that this run is currently
+            // owned. Live reconciliation must not label or restart it as
+            // recovered merely because its status is Running.
+            return Ok(false);
         };
+        let emitted_recovery_event = self
+            .emit_recovery_event_if_missing(run, recovery_message, now)
+            .await?;
         let handle = TaskExecutionHandle::new(
             self.store.clone(),
             self.event_bus.clone(),
@@ -235,6 +222,38 @@ impl TaskStartupReconciler {
         }
 
         Ok(emitted_recovery_event)
+    }
+
+    async fn emit_recovery_event_if_missing(
+        &self,
+        run: &TaskRun,
+        recovery_message: &str,
+        now: i64,
+    ) -> TaskRuntimeResult<bool> {
+        if self
+            .recovery_event_exists(
+                run.task_id.as_str(),
+                Some(run.id.as_str()),
+                recovery_message,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        let appended = self
+            .projector
+            .append_event(
+                TaskEventPayload::TaskRecovered {
+                    task_id: run.task_id.clone(),
+                    run_id: Some(run.id.clone()),
+                    message: recovery_message.to_owned(),
+                    recovered_at: now,
+                },
+                now,
+            )
+            .await?;
+        self.event_bus.publish(appended).await;
+        Ok(true)
     }
 
     async fn recovery_event_exists(
