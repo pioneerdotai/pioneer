@@ -252,6 +252,28 @@
       ]
     },
     {
+      "description": "Complete accepted provider response captured before terminal Turn\npublication. Gateway persists this intent and later commits the item\ntogether with TurnCompleted in one transaction.",
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "kind": {
+          "type": "string",
+          "const": "turn_finalization_prepared"
+        },
+        "notification": {
+          "$ref": "#/$defs/ItemCompletedNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "notification",
+        "generation"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "kind": {
@@ -1038,6 +1060,9 @@
         "thread_id": {
           "type": "string"
         },
+        "tool_no_progress": {
+          "$ref": "#/$defs/ExecutionCheckpointToolNoProgressState"
+        },
         "tools": {
           "$ref": "#/$defs/ExecutionCheckpointToolSummary"
         },
@@ -1206,6 +1231,96 @@
         "item_type",
         "status",
         "metadata"
+      ]
+    },
+    "ExecutionCheckpointToolNoProgressExactVariant": {
+      "type": "object",
+      "properties": {
+        "arguments_fingerprint": {
+          "type": "string"
+        },
+        "timeout_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "arguments_fingerprint",
+        "timeout_count"
+      ]
+    },
+    "ExecutionCheckpointToolNoProgressState": {
+      "description": "Language-neutral state used to prevent a model from repeatedly spending time on a tool\nstrategy that has already timed out. Only hashes and structural features are persisted; raw\ncommand arguments are intentionally excluded from the checkpoint.",
+      "type": "object",
+      "properties": {
+        "strategies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExecutionCheckpointToolNoProgressStrategy"
+          }
+        },
+        "truncated": {
+          "description": "True when older no-progress evidence was deterministically compacted to keep the\nexecution checkpoint within its durable wire budget.",
+          "type": "boolean"
+        }
+      }
+    },
+    "ExecutionCheckpointToolNoProgressStrategy": {
+      "type": "object",
+      "properties": {
+        "cumulative_timeout_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "exact_variants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExecutionCheckpointToolNoProgressExactVariant"
+          }
+        },
+        "executable": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exhausted": {
+          "type": "boolean"
+        },
+        "strategy_id": {
+          "type": "string"
+        },
+        "structural_features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "structural_fingerprint": {
+          "type": "string"
+        },
+        "timeout_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "warning_emitted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "strategy_id",
+        "tool_name",
+        "structural_fingerprint",
+        "timeout_count",
+        "cumulative_timeout_ms",
+        "warning_emitted",
+        "exhausted"
       ]
     },
     "ExecutionCheckpointToolSummary": {
@@ -2000,6 +2115,12 @@
         "ask",
         "deny"
       ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "PromptManifest": {
       "type": "object",
@@ -2877,6 +2998,12 @@
             "string",
             "null"
           ]
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -2901,6 +3028,12 @@
           "$ref": "#/$defs/TaskAgentInputReferenceKind"
         },
         "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "versionId": {
           "type": [
             "string",
             "null"
@@ -7002,10 +7135,19 @@
       ]
     },
     "ThreadMode": {
-      "type": "string",
-      "enum": [
-        "Chat",
-        "Agent"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Message",
+            "Agent"
+          ]
+        },
+        {
+          "description": "Compatibility default for pre-Epic-6 persisted and wire values. New\nuser-thread creation selects `Message` explicitly.",
+          "type": "string",
+          "const": "Chat"
+        }
       ]
     },
     "TimelineOutputPolicy": {
@@ -10199,6 +10341,12 @@
             "$ref": "#/$defs/UserInput"
           }
         },
+        "mentioned_principal_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PrincipalId"
+          }
+        },
         "mode": {
           "anyOf": [
             {
@@ -10239,6 +10387,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "reply_to_turn_id": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "sandbox_policy": {

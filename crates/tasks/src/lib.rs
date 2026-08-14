@@ -1,3 +1,4 @@
+mod admission;
 mod error;
 mod event_bus;
 mod executor;
@@ -30,7 +31,8 @@ pub use invariant::{
 };
 pub use notifications::TaskNotificationMapper;
 pub use policy::{
-    TaskCreateContext, TaskMutationContext, TaskRunConversationSnapshotSeed, TaskWaitContext,
+    TaskCreateContext, TaskExecutionAdmissionSeed, TaskMutationContext,
+    TaskRunConversationSnapshotSeed, TaskWaitContext,
 };
 pub use projector::TaskProjector;
 pub use reconciliation::{ReconciliationReport, TaskStartupReconciler};

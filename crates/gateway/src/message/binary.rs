@@ -104,7 +104,7 @@ impl MessageProcessor {
                         context.role_key(),
                         registration.action,
                     ) {
-                        ActionGateDecision::AllowSuperuser => AuthorizationDecision::AllowSuperuser,
+                        ActionGateDecision::AllowAbsolute => AuthorizationDecision::AllowAbsolute,
                         ActionGateDecision::RequireResource { .. } => AuthorizationDecision::Deny {
                             reason: DenyReason::MissingAuthoritativeResource,
                             disclosure: registration.disclosure,
@@ -161,11 +161,7 @@ impl MessageProcessor {
         else {
             return missing_binary_resource();
         };
-        let action = if session.planned_turn_id.is_some() {
-            ResourceAction::ThreadWrite
-        } else {
-            ResourceAction::ArtifactWrite
-        };
+        let action = ResourceAction::ArtifactCreateThread;
         let service = AuthorizationService::new();
         let gate = service.authorize_action(
             request_context.principal().kind,
@@ -229,7 +225,7 @@ impl MessageProcessor {
         else {
             return missing_binary_resource();
         };
-        let action = ResourceAction::ThreadWrite;
+        let action = ResourceAction::ProviderUse;
         let service = AuthorizationService::new();
         let gate = service.authorize_action(
             request_context.principal().kind,
@@ -435,7 +431,7 @@ pub(in crate::message) fn decode_gateway_voice_chunk_frame(
     payload: &[u8],
 ) -> Result<GatewayVoiceChunkFrame, VoiceError> {
     if payload.len() > MAX_GATEWAY_VOICE_CHUNK_BYTES + 512 {
-        return Err(voice_frame_error(
+        return Err(voice_frame_resource_error(
             VoiceErrorKind::InvalidSession,
             format!(
                 "voice frame exceeds maximum size: {} > {}",
@@ -449,7 +445,7 @@ pub(in crate::message) fn decode_gateway_voice_chunk_frame(
     validate_gateway_voice_chunk_header(&decoded.header)?;
 
     if decoded.audio_payload.len() > MAX_GATEWAY_VOICE_CHUNK_BYTES {
-        return Err(voice_frame_error(
+        return Err(voice_frame_resource_error(
             VoiceErrorKind::InvalidSession,
             format!(
                 "voice audio payload exceeds maximum size: {} > {}",
@@ -502,7 +498,7 @@ fn validate_gateway_voice_chunk_header(header: &VoiceChunkFrameHeader) -> Result
     if let Some(duration_ms) = header.duration_ms
         && duration_ms > VOICE_AUDIO_MAX_CHUNK_DURATION_MS
     {
-        return Err(voice_frame_error(
+        return Err(voice_frame_resource_error(
             VoiceErrorKind::StaleChunk,
             format!(
                 "voice chunk duration exceeds maximum: {}ms > {}ms",
@@ -544,9 +540,43 @@ fn map_voice_frame_decode_error(error: VoiceFrameDecodeError) -> VoiceError {
 }
 
 fn voice_frame_error(kind: VoiceErrorKind, message: impl Into<String>) -> VoiceError {
+    let public_code = match kind {
+        VoiceErrorKind::GatewayBusy
+        | VoiceErrorKind::ModelUnavailable
+        | VoiceErrorKind::ModelDownloading => pioneer_protocol::PublicErrorCode::Unavailable,
+        VoiceErrorKind::Cancelled => pioneer_protocol::PublicErrorCode::Conflict,
+        VoiceErrorKind::TranscriptionFailed | VoiceErrorKind::Unknown => {
+            pioneer_protocol::PublicErrorCode::Internal
+        }
+        VoiceErrorKind::MicrophonePermissionBlocked
+        | VoiceErrorKind::DeviceUnavailable
+        | VoiceErrorKind::InvalidSession
+        | VoiceErrorKind::StaleChunk
+        | VoiceErrorKind::SequenceGap
+        | VoiceErrorKind::NoSpeech => pioneer_protocol::PublicErrorCode::InvalidInput,
+    };
+    let public_error = crate::public_error::map_agent_failure(
+        public_code,
+        pioneer_protocol::PublicErrorStage::Admission,
+        message.into(),
+    );
     VoiceError {
         kind,
-        message: message.into(),
+        message: public_error.message.clone(),
+        public_error: Some(public_error),
+    }
+}
+
+fn voice_frame_resource_error(kind: VoiceErrorKind, message: impl Into<String>) -> VoiceError {
+    let public_error = crate::public_error::map_agent_failure(
+        pioneer_protocol::PublicErrorCode::ResourceExhausted,
+        pioneer_protocol::PublicErrorStage::Admission,
+        message.into(),
+    );
+    VoiceError {
+        kind,
+        message: public_error.message.clone(),
+        public_error: Some(public_error),
     }
 }
 
@@ -617,11 +647,7 @@ mod tests {
             .expect_err("truncated header should fail");
 
         assert_eq!(error.kind, VoiceErrorKind::InvalidSession);
-        assert!(
-            error.message.contains("header is out of bounds"),
-            "unexpected error message: {}",
-            error.message
-        );
+        assert_eq!(error.message, "The request is invalid.");
     }
 
     #[test]
@@ -648,11 +674,7 @@ mod tests {
             .expect_err("oversized payload should fail");
 
         assert_eq!(error.kind, VoiceErrorKind::InvalidSession);
-        assert!(
-            error.message.contains("exceeds maximum size"),
-            "unexpected error message: {}",
-            error.message
-        );
+        assert_eq!(error.message, "The operation exceeds its resource budget.");
     }
 
     #[test]
@@ -683,11 +705,7 @@ mod tests {
             .expect_err("long duration should fail");
 
         assert_eq!(error.kind, VoiceErrorKind::StaleChunk);
-        assert!(
-            error.message.contains("duration exceeds maximum"),
-            "unexpected error message: {}",
-            error.message
-        );
+        assert_eq!(error.message, "The operation exceeds its resource budget.");
     }
 
     fn voice_frame(session_id: &str, sequence: u64, audio: &[u8]) -> Result<Vec<u8>, String> {

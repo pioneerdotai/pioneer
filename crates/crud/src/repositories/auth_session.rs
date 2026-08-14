@@ -1346,7 +1346,7 @@ pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
             };
             if !valid_provenance {
                 violations.push(format!(
-                    "Member session `{}` has no exact invitation or recovery provenance",
+                    "User session `{}` has no exact invitation or recovery provenance",
                     row.id
                 ));
             }
@@ -1548,7 +1548,7 @@ fn is_supported_active_auth_owner(owner: &gateway_principal::Model) -> bool {
             .role_key
             .as_deref()
             .and_then(|value| RoleKey::new(value).ok())
-            .is_some_and(|role| role.is_supported()),
+            .is_some(),
         _ => false,
     }
 }
@@ -1958,12 +1958,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invariant_scan_rejects_active_sessions_for_inactive_or_unsupported_members() {
+    async fn invariant_scan_rejects_active_sessions_for_inactive_or_malformed_users() {
         for mutation in [
             "UPDATE gateway_principal SET kind='user', role_key='member', status='suspended'",
             "UPDATE gateway_principal SET kind='user', role_key='member', status='removed'",
             "UPDATE gateway_principal SET kind='user', role_key=NULL, status='active'",
-            "UPDATE gateway_principal SET kind='user', role_key='viewer', status='active'",
+            "UPDATE gateway_principal SET kind='user', role_key='Viewer', status='active'",
         ] {
             let db = valid_auth_fixture().await;
             db.execute_unprepared("PRAGMA ignore_check_constraints = ON")
@@ -1981,6 +1981,22 @@ mod tests {
                 report.violations
             );
         }
+
+        let db = valid_auth_fixture().await;
+        db.execute_unprepared(
+            "UPDATE gateway_principal SET kind='user', role_key='viewer', status='active'",
+        )
+        .await
+        .unwrap();
+        let report = scan_auth_persistence_invariants(&db).await.unwrap();
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|value| value.contains("inactive or unsupported owner")),
+            "a structurally valid future role must not be rejected by persistence: {:?}",
+            report.violations
+        );
     }
 
     #[tokio::test]
@@ -2082,13 +2098,14 @@ mod tests {
 
         db.execute_unprepared(
             "INSERT INTO invitation(
-                id,gateway_id,created_by_principal_id,created_by_session_id,status,token_hash,
+                id,gateway_id,created_by_principal_id,created_by_session_id,target_role_key,
+                status,token_hash,
                 token_format_version,expires_at,accepted_at,revoked_at,expired_at,
                 accepted_principal_id,accepted_device_id,accepted_session_id,revoke_reason,
                 created_at,updated_at
              ) VALUES(
                 'I00000000000000000001','G00000000000000000001',
-                'P00000000000000000001','S00000000000000000001','accepted',NULL,1,
+                'P00000000000000000001','S00000000000000000001','member','accepted',NULL,1,
                 '2026-01-08 00:00:00 +00:00','2026-01-01 00:00:01 +00:00',NULL,NULL,
                 'P00000000000000000002','D00000000000000000002',
                 'S00000000000000000002',NULL,

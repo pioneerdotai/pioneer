@@ -14,6 +14,7 @@ pub(crate) mod authorization_persistence;
 pub(crate) mod authorization_scope;
 pub(crate) mod canonical_turn_event;
 pub mod cli_runtime_binding;
+pub mod execution_admission_lease;
 pub mod hook_run;
 pub(crate) mod identity;
 pub(crate) mod invitation;
@@ -22,6 +23,7 @@ pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub(crate) mod membership;
 pub mod policy;
+pub(crate) mod policy_generation;
 pub(crate) mod principal_avatar;
 pub mod recovery_job;
 pub mod recovery_terminalization_outbox;
@@ -40,6 +42,7 @@ pub mod task_agent_spec;
 pub mod task_delivery;
 pub mod task_dependency;
 pub mod task_event;
+pub(crate) mod task_execution_admission;
 pub mod task_result_candidate;
 pub mod task_result_review_event;
 pub mod task_run;
@@ -70,6 +73,7 @@ pub mod turn_mcp_binding;
 pub mod turn_mcp_projection;
 pub mod turn_runtime_snapshot;
 pub mod turn_skill_binding;
+pub(crate) mod user_notification_outbox;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionWriteOutcome {

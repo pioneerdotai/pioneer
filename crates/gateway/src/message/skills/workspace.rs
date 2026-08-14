@@ -201,7 +201,7 @@ impl MessageProcessor {
         load_skills_catalog_from_store(self.crud_store.as_ref(), workspace_id, context).await
     }
 
-    pub(super) fn build_policy_set(
+    pub(crate) fn build_policy_set(
         &self,
         skills: &[pioneer_skills::SkillDefinition],
         workspace_policies: &[WorkspaceSkillPolicyRecord],
@@ -373,6 +373,7 @@ impl MessageProcessor {
         pack_changes: Vec<SkillPackChangedItem>,
         created_at: i64,
     ) {
+        self.publish_resource_selector_change(workspace_id).await;
         let notification = skill_projection_changed_notification(
             workspace_id,
             self.next_skills_snapshot_version(),

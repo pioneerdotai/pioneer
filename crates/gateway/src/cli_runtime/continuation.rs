@@ -65,6 +65,7 @@ pub(crate) struct CliSessionLaunchSpec {
     pub(crate) options: CLIAgentRuntimeSessionStartOptions,
     pub(crate) mcp: CliMcpSessionLaunch,
     pub(crate) continuation: CliProviderContinuation,
+    pub(crate) native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
 }
 
 impl CliSessionLaunchSpec {
@@ -77,6 +78,7 @@ impl CliSessionLaunchSpec {
             options,
             mcp,
             continuation: CliProviderContinuation::CodexRpcThread { native_thread_id },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         }
     }
 
@@ -99,6 +101,7 @@ impl CliSessionLaunchSpec {
             continuation: CliProviderContinuation::ClaudeNew {
                 provider_session_id,
             },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         }
     }
 
@@ -113,7 +116,16 @@ impl CliSessionLaunchSpec {
             continuation: CliProviderContinuation::ClaudeResume {
                 provider_session_id,
             },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         }
+    }
+
+    pub(crate) fn with_native_event_budget(
+        mut self,
+        budget: pioneer_cli_agent_runtime::NativeEventBudget,
+    ) -> Self {
+        self.native_event_budget = budget;
+        self
     }
 }
 
@@ -123,6 +135,7 @@ impl CliSessionLaunchSpec {
 pub(crate) fn requires_restart(old: &CliSessionLaunchSpec, new: &CliSessionLaunchSpec) -> bool {
     restart_relevant_options_changed(&old.options, &new.options)
         || old.mcp != new.mcp
+        || old.native_event_budget != new.native_event_budget
         || continuation_identity_changed(&old.continuation, &new.continuation)
 }
 
@@ -205,6 +218,21 @@ mod tests {
     }
 
     #[test]
+    fn native_event_budget_change_is_a_process_restart_trigger() {
+        let first =
+            CliSessionLaunchSpec::unmanaged_codex(CLIAgentRuntimeSessionStartOptions::default());
+        let narrowed =
+            first
+                .clone()
+                .with_native_event_budget(pioneer_cli_agent_runtime::NativeEventBudget {
+                    max_frame_bytes: 4_096,
+                    max_string_bytes: 1_024,
+                    ..pioneer_cli_agent_runtime::NativeEventBudget::default()
+                });
+        assert!(requires_restart(&first, &narrowed));
+    }
+
+    #[test]
     fn claude_mode_change_preserves_stable_provider_identity() {
         let provider_session_id = Uuid::new_v4();
         let first = CliSessionLaunchSpec {
@@ -213,6 +241,7 @@ mod tests {
             continuation: CliProviderContinuation::ClaudeNew {
                 provider_session_id,
             },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         };
         let resumed = CliSessionLaunchSpec {
             options: CLIAgentRuntimeSessionStartOptions::default(),
@@ -220,6 +249,7 @@ mod tests {
             continuation: CliProviderContinuation::ClaudeResume {
                 provider_session_id,
             },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         };
         assert!(!requires_restart(&first, &resumed));
     }

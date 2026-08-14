@@ -25,6 +25,13 @@ impl PioneerDesktop {
         let Some(thread_id) = active_thread_id else {
             return;
         };
+        if !self
+            .artifact_presentation_policy_for_thread(thread_id.as_str())
+            .can_list
+        {
+            self.thread_artifacts.clear_error(thread_id.as_str());
+            return;
+        }
         if !self.is_thread_materialized_for_artifacts(thread_id.as_str()) {
             self.thread_artifacts.clear_error(thread_id.as_str());
             return;
@@ -38,6 +45,13 @@ impl PioneerDesktop {
         force: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .artifact_presentation_policy_for_thread(thread_id.as_str())
+            .can_list
+        {
+            self.thread_artifacts.clear_error(thread_id.as_str());
+            return;
+        }
         let plan = client_artifact_state::plan_thread_artifacts_refresh(
             &self.thread_artifacts,
             thread_id.as_str(),
@@ -189,6 +203,9 @@ impl PioneerDesktop {
         artifact_id: String,
         cx: &mut Context<Self>,
     ) {
+        if !self.active_artifact_presentation_policy().can_open {
+            return;
+        }
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
         let artifact_missing_from_cache = !self
             .thread_artifacts
@@ -220,7 +237,8 @@ impl PioneerDesktop {
         artifact: &ArtifactRef,
         cx: &mut Context<Self>,
     ) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected
+        if !self.active_artifact_presentation_policy().can_open
+            || self.gateway.connection_state != GatewayConnectionState::Connected
             || !self.thread_artifacts.should_load_preview(artifact)
         {
             return;

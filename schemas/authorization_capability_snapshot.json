@@ -1,0 +1,782 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorizationCapabilitySnapshot",
+  "type": "object",
+  "properties": {
+    "authorization_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "global": {
+      "$ref": "#/$defs/AuthorizationGlobalCapabilities"
+    },
+    "principal_id": {
+      "$ref": "#/$defs/PrincipalId"
+    },
+    "role": {
+      "$ref": "#/$defs/AuthorizationRolePresentation"
+    },
+    "role_key": {
+      "description": "Stable built-in role identifier. Clients may display this value but\nmust never derive permissions from it.",
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "thread": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AuthorizationThreadCapabilitySnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "workspace": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AuthorizationWorkspaceCapabilitySnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authorization_revision",
+    "principal_id",
+    "role_key",
+    "role",
+    "global"
+  ],
+  "$defs": {
+    "AuthorizationAgentPermissionOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "locked": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationPermissionLock"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "description",
+        "mode",
+        "effective_policy"
+      ]
+    },
+    "AuthorizationCliModelGrant": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "runtime_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "runtime_id",
+        "model"
+      ]
+    },
+    "AuthorizationExecutionDraftPolicyProjection": {
+      "type": "object",
+      "properties": {
+        "can_attach_artifacts": {
+          "type": "boolean"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "mcp_invocation_limits": {
+          "$ref": "#/$defs/McpInvocationResourceLimits"
+        },
+        "permission_options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationAgentPermissionOption"
+          }
+        },
+        "resources": {
+          "$ref": "#/$defs/AuthorizationOperationalResourceProjection"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "resources",
+        "permission_options",
+        "can_attach_artifacts",
+        "mcp_invocation_limits"
+      ]
+    },
+    "AuthorizationExecutionResourceLimits": {
+      "type": "object",
+      "properties": {
+        "max_active_executions": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_queued_tasks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_scheduled_tasks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_active_executions",
+        "max_queued_tasks",
+        "max_scheduled_tasks"
+      ]
+    },
+    "AuthorizationGlobalCapabilities": {
+      "type": "object",
+      "properties": {
+        "can_create_invitation": {
+          "type": "boolean"
+        },
+        "can_create_workspace": {
+          "type": "boolean"
+        },
+        "can_manage_all_threads": {
+          "type": "boolean"
+        },
+        "can_manage_capabilities": {
+          "type": "boolean"
+        },
+        "can_manage_cli_runtimes": {
+          "type": "boolean"
+        },
+        "can_manage_gateway_settings": {
+          "type": "boolean"
+        },
+        "can_manage_mcp": {
+          "type": "boolean"
+        },
+        "can_manage_member_lifecycle": {
+          "type": "boolean"
+        },
+        "can_manage_own_sessions": {
+          "type": "boolean"
+        },
+        "can_manage_providers": {
+          "type": "boolean"
+        },
+        "can_manage_skills": {
+          "type": "boolean"
+        },
+        "can_view_invitations": {
+          "type": "boolean"
+        },
+        "can_view_member_directory": {
+          "type": "boolean"
+        },
+        "invitation_role_options": {
+          "description": "Roles this principal may assign through a new invitation. The Gateway\nowns both availability and presentation; clients never manufacture a\nrole key from a local enum or principal kind.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationInvitationRoleOption"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "can_create_workspace",
+        "can_manage_gateway_settings",
+        "can_manage_capabilities",
+        "can_manage_providers",
+        "can_manage_mcp",
+        "can_manage_skills",
+        "can_manage_cli_runtimes",
+        "can_manage_all_threads",
+        "can_view_invitations",
+        "can_create_invitation",
+        "can_view_member_directory",
+        "can_manage_member_lifecycle",
+        "can_manage_own_sessions"
+      ]
+    },
+    "AuthorizationInvitationRoleOption": {
+      "type": "object",
+      "properties": {
+        "is_default": {
+          "type": "boolean"
+        },
+        "role": {
+          "$ref": "#/$defs/AuthorizationRolePresentation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "is_default"
+      ]
+    },
+    "AuthorizationOperationalResourceProjection": {
+      "type": "object",
+      "properties": {
+        "cli_models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationCliModelGrant"
+          }
+        },
+        "cli_models_all": {
+          "description": "Same contract as `provider_models_all`, scoped to allowed CLI runtimes.",
+          "type": "boolean"
+        },
+        "cli_runtimes": {
+          "$ref": "#/$defs/AuthorizationResourceSelector"
+        },
+        "fingerprint": {
+          "description": "Opaque receipt over role policy, workspace and authorization revision.",
+          "type": "string"
+        },
+        "mcp_servers": {
+          "$ref": "#/$defs/AuthorizationResourceSelector"
+        },
+        "provider_models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationProviderModelGrant"
+          }
+        },
+        "provider_models_all": {
+          "description": "`true` means every model of an allowed provider; `false` means the\nexact grants below. The flag preserves the distinction between an\nunrestricted model set and an intentionally empty one.",
+          "type": "boolean"
+        },
+        "providers": {
+          "$ref": "#/$defs/AuthorizationResourceSelector"
+        },
+        "skills": {
+          "$ref": "#/$defs/AuthorizationResourceSelector"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "providers",
+        "provider_models_all",
+        "cli_runtimes",
+        "cli_models_all",
+        "skills",
+        "mcp_servers"
+      ]
+    },
+    "AuthorizationPermissionLock": {
+      "type": "object",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "reason"
+      ]
+    },
+    "AuthorizationProviderModelGrant": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
+    "AuthorizationResourceSelector": {
+      "description": "Role-scoped constraints used by discovery and exact admission. `all=true`\nmeans every operationally enabled resource of that kind; otherwise only\nthe listed stable identifiers are visible and usable.",
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "boolean"
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "all"
+      ]
+    },
+    "AuthorizationRolePresentation": {
+      "description": "Server-owned presentation metadata for the authenticated role. The key is\ndeliberately open-ended: clients display this object but never derive\nauthorization decisions from it.",
+      "type": "object",
+      "properties": {
+        "built_in": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "display_name",
+        "description",
+        "built_in"
+      ]
+    },
+    "AuthorizationThreadCapabilities": {
+      "type": "object",
+      "properties": {
+        "can_bind_artifacts": {
+          "type": "boolean"
+        },
+        "can_cancel_agent_execution": {
+          "type": "boolean"
+        },
+        "can_cancel_tasks": {
+          "type": "boolean"
+        },
+        "can_control_cli_runtime": {
+          "type": "boolean"
+        },
+        "can_create_task": {
+          "type": "boolean"
+        },
+        "can_delete_own_message": {
+          "type": "boolean"
+        },
+        "can_edit_own_message": {
+          "type": "boolean"
+        },
+        "can_manage": {
+          "type": "boolean"
+        },
+        "can_manage_agents_document": {
+          "type": "boolean"
+        },
+        "can_manage_private_participants": {
+          "type": "boolean"
+        },
+        "can_move": {
+          "type": "boolean"
+        },
+        "can_observe_agent_execution": {
+          "type": "boolean"
+        },
+        "can_observe_agent_requests": {
+          "type": "boolean"
+        },
+        "can_read": {
+          "type": "boolean"
+        },
+        "can_read_agents_document": {
+          "type": "boolean"
+        },
+        "can_read_artifacts": {
+          "type": "boolean"
+        },
+        "can_respond_to_agent_requests": {
+          "type": "boolean"
+        },
+        "can_resume_agent_execution": {
+          "type": "boolean"
+        },
+        "can_review_tasks": {
+          "type": "boolean"
+        },
+        "can_start_turn": {
+          "type": "boolean"
+        },
+        "can_steer_agent_execution": {
+          "type": "boolean"
+        },
+        "can_write": {
+          "type": "boolean"
+        },
+        "can_write_artifacts": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "can_read",
+        "can_write",
+        "can_edit_own_message",
+        "can_delete_own_message",
+        "can_start_turn",
+        "can_observe_agent_execution",
+        "can_cancel_agent_execution",
+        "can_resume_agent_execution",
+        "can_steer_agent_execution",
+        "can_observe_agent_requests",
+        "can_respond_to_agent_requests",
+        "can_control_cli_runtime",
+        "can_create_task",
+        "can_review_tasks",
+        "can_cancel_tasks",
+        "can_read_artifacts",
+        "can_write_artifacts",
+        "can_bind_artifacts",
+        "can_read_agents_document",
+        "can_manage_agents_document",
+        "can_manage",
+        "can_manage_private_participants",
+        "can_move"
+      ]
+    },
+    "AuthorizationThreadCapabilitySnapshot": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/AuthorizationThreadCapabilities"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "capabilities"
+      ]
+    },
+    "AuthorizationWorkspaceCapabilities": {
+      "type": "object",
+      "properties": {
+        "agent_permission_options": {
+          "description": "Server-compiled UX presets after intersection with the immutable role\nceiling. Clients render these policies and locked fields verbatim.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationAgentPermissionOption"
+          }
+        },
+        "can_acknowledge_own_notifications": {
+          "description": "Acknowledge rows from the authenticated principal's durable Task\nnotification inbox in this workspace.",
+          "type": "boolean"
+        },
+        "can_add_member": {
+          "type": "boolean"
+        },
+        "can_create_thread": {
+          "type": "boolean"
+        },
+        "can_list_members": {
+          "type": "boolean"
+        },
+        "can_manage": {
+          "type": "boolean"
+        },
+        "can_read": {
+          "type": "boolean"
+        },
+        "can_read_artifacts": {
+          "type": "boolean"
+        },
+        "can_read_own_notifications": {
+          "description": "Read the authenticated principal's durable Task notification inbox in\nthis workspace. The Gateway still filters every row by recipient.",
+          "type": "boolean"
+        },
+        "can_remove_member": {
+          "type": "boolean"
+        },
+        "can_run_tasks": {
+          "type": "boolean"
+        },
+        "can_use_cli_runtimes": {
+          "type": "boolean"
+        },
+        "can_use_mcp": {
+          "type": "boolean"
+        },
+        "can_use_providers": {
+          "type": "boolean"
+        },
+        "can_use_skills": {
+          "type": "boolean"
+        },
+        "can_write_artifacts": {
+          "type": "boolean"
+        },
+        "execution_limits": {
+          "description": "Server-enforced aggregate execution limits for this principal. These\nare presentation only; every durable start reserves a Gateway lease.",
+          "$ref": "#/$defs/AuthorizationExecutionResourceLimits"
+        },
+        "thread_visibility_options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadVisibility"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "can_read",
+        "can_create_thread",
+        "can_manage",
+        "can_read_own_notifications",
+        "can_acknowledge_own_notifications",
+        "can_use_providers",
+        "can_use_cli_runtimes",
+        "can_use_skills",
+        "can_use_mcp",
+        "can_run_tasks",
+        "can_read_artifacts",
+        "can_write_artifacts",
+        "execution_limits",
+        "agent_permission_options",
+        "can_list_members",
+        "can_add_member",
+        "can_remove_member",
+        "thread_visibility_options"
+      ]
+    },
+    "AuthorizationWorkspaceCapabilitySnapshot": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/AuthorizationWorkspaceCapabilities"
+        },
+        "execution_draft_policy": {
+          "$ref": "#/$defs/AuthorizationExecutionDraftPolicyProjection"
+        },
+        "operational_resources": {
+          "$ref": "#/$defs/AuthorizationOperationalResourceProjection"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "capabilities",
+        "operational_resources",
+        "execution_draft_policy"
+      ]
+    },
+    "McpInvocationResourceLimits": {
+      "description": "Server-owned MCP invocation envelope. Clients may present these limits,\nwhile the Gateway enforces the same immutable values for every backend.",
+      "type": "object",
+      "properties": {
+        "max_arguments_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_arguments_depth": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_concurrent_calls": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_queued_calls": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_decoded_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_depth": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_media": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_tokens": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_wire_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_timeout_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "profile_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile_version",
+        "max_arguments_bytes",
+        "max_arguments_depth",
+        "max_result_wire_bytes",
+        "max_result_decoded_bytes",
+        "max_result_depth",
+        "max_result_tokens",
+        "max_result_media",
+        "max_timeout_ms",
+        "max_concurrent_calls",
+        "max_queued_calls"
+      ]
+    },
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ThreadVisibility": {
+      "description": "User-selectable visibility for ordinary user threads.\n\nInternal task/system threads deliberately have no public selectable value.",
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace"
+      ]
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    }
+  }
+}

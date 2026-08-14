@@ -6,14 +6,17 @@ use pioneer_entity::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliRuntimePendingRequestStatus {
     Pending,
+    ResponseAccepted,
+    Delivering,
+    DeliveryFailed,
     Answered,
     Resolved,
     Cancelled,
@@ -21,9 +24,23 @@ pub enum CliRuntimePendingRequestStatus {
 }
 
 impl CliRuntimePendingRequestStatus {
+    pub const fn is_open(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::ResponseAccepted | Self::Delivering | Self::DeliveryFailed
+        )
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        !self.is_open()
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::ResponseAccepted => "response_accepted",
+            Self::Delivering => "delivering",
+            Self::DeliveryFailed => "delivery_failed",
             Self::Answered => "answered",
             Self::Resolved => "resolved",
             Self::Cancelled => "cancelled",
@@ -34,6 +51,9 @@ impl CliRuntimePendingRequestStatus {
     fn from_db(value: &str) -> Result<Self> {
         match value {
             "pending" => Ok(Self::Pending),
+            "response_accepted" => Ok(Self::ResponseAccepted),
+            "delivering" => Ok(Self::Delivering),
+            "delivery_failed" => Ok(Self::DeliveryFailed),
             "answered" => Ok(Self::Answered),
             "resolved" => Ok(Self::Resolved),
             "cancelled" => Ok(Self::Cancelled),
@@ -384,6 +404,12 @@ pub struct CliRuntimePendingRequestRecord {
     pub status: CliRuntimePendingRequestStatus,
     pub response_json: Option<String>,
     pub authorization_binding: Option<CliRuntimeRequestAuthorizationBinding>,
+    pub responding_principal_id: Option<String>,
+    pub responding_session_id: Option<String>,
+    pub response_authorization_revision: Option<i64>,
+    pub delivery_attempts: i64,
+    pub delivery_error: Option<String>,
+    pub response_contains_secret: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub resolved_at: Option<DateTimeWithTimeZone>,
@@ -423,6 +449,27 @@ pub struct ResolveCliRuntimePendingRequest {
     pub resolved_at: DateTimeWithTimeZone,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptCliRuntimePendingRequestResponse {
+    pub request_id: String,
+    pub response_json: Option<String>,
+    pub responding_principal_id: String,
+    pub responding_session_id: String,
+    pub response_authorization_revision: i64,
+    pub response_contains_secret: bool,
+    pub updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionCliRuntimePendingRequestDelivery {
+    pub request_id: String,
+    pub expected_status: CliRuntimePendingRequestStatus,
+    pub status: CliRuntimePendingRequestStatus,
+    pub delivery_error: Option<String>,
+    pub updated_at: DateTimeWithTimeZone,
+    pub resolved_at: Option<DateTimeWithTimeZone>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliRuntimePendingRequestListFilter {
     pub workspace_id: Option<String>,
@@ -430,9 +477,28 @@ pub struct CliRuntimePendingRequestListFilter {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub status: Option<CliRuntimePendingRequestStatus>,
+    pub open_only: bool,
     pub initiating_principal_id: Option<String>,
     pub initiating_session_id: Option<String>,
+    /// Exclusive stable keyset cursor `(created_at, request_id)`.
+    pub after: Option<(DateTimeWithTimeZone, String)>,
     pub limit: Option<u64>,
+}
+
+/// Repository-level safety ceiling. Callers that need a complete scan must
+/// advance `after`; omitting `limit` never permits an unbounded allocation.
+pub const CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX: u64 = 256;
+
+const fn bounded_pending_request_page_limit(requested: Option<u64>) -> u64 {
+    let requested = match requested {
+        Some(requested) => requested,
+        None => CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX,
+    };
+    if requested < CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX {
+        requested
+    } else {
+        CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1427,6 +1493,46 @@ pub async fn open_pending_request<C: ConnectionTrait>(
     create_pending_request(db, request).await
 }
 
+/// Enforces per-execution human-interaction capacity in the same serialized
+/// transaction that opens the request. A handler preflight is racy because
+/// concurrent provider callbacks can both observe the same remaining slot.
+pub async fn ensure_pending_request_capacity<C: ConnectionTrait>(
+    db: &C,
+    request_id: &str,
+    turn_id: &str,
+    max_pending_requests: usize,
+) -> Result<()> {
+    if max_pending_requests == 0 {
+        return Err(anyhow!(
+            "execution human-interaction capacity must be greater than zero"
+        ));
+    }
+    if find_pending_request(db, request_id).await?.is_some() {
+        // Idempotent replay does not consume another slot and must remain
+        // repairable when the execution is already at its boundary.
+        return Ok(());
+    }
+    let max_pending_requests = u64::try_from(max_pending_requests)
+        .context("execution human-interaction capacity exceeds the durable range")?;
+    let open_requests = cli_runtime_pending_request::Entity::find()
+        .filter(cli_runtime_pending_request::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(cli_runtime_pending_request::Column::Status.is_in([
+            CliRuntimePendingRequestStatus::Pending.as_str(),
+            CliRuntimePendingRequestStatus::ResponseAccepted.as_str(),
+            CliRuntimePendingRequestStatus::Delivering.as_str(),
+            CliRuntimePendingRequestStatus::DeliveryFailed.as_str(),
+        ]))
+        .count(db)
+        .await
+        .context("failed to count open CLI runtime pending requests")?;
+    if open_requests >= max_pending_requests {
+        return Err(anyhow!(
+            "execution already has the maximum {max_pending_requests} pending human interactions"
+        ));
+    }
+    Ok(())
+}
+
 pub async fn find_pending_request<C: ConnectionTrait>(
     db: &C,
     request_id: &str,
@@ -1459,6 +1565,14 @@ pub async fn list_pending_requests<C: ConnectionTrait>(
     if let Some(status) = filter.status {
         query = query.filter(cli_runtime_pending_request::Column::Status.eq(status.as_str()));
     }
+    if filter.open_only {
+        query = query.filter(cli_runtime_pending_request::Column::Status.is_in([
+            CliRuntimePendingRequestStatus::Pending.as_str(),
+            CliRuntimePendingRequestStatus::ResponseAccepted.as_str(),
+            CliRuntimePendingRequestStatus::Delivering.as_str(),
+            CliRuntimePendingRequestStatus::DeliveryFailed.as_str(),
+        ]));
+    }
     if let Some(initiating_principal_id) = filter.initiating_principal_id {
         query = query.filter(
             cli_runtime_pending_request::Column::InitiatingPrincipalId.eq(initiating_principal_id),
@@ -1469,12 +1583,24 @@ pub async fn list_pending_requests<C: ConnectionTrait>(
             cli_runtime_pending_request::Column::InitiatingSessionId.eq(initiating_session_id),
         );
     }
-    if let Some(limit) = filter.limit {
-        query = query.limit(limit);
+    if let Some((created_at, request_id)) = filter.after {
+        query = query.filter(
+            Condition::any()
+                .add(cli_runtime_pending_request::Column::CreatedAt.gt(created_at.clone()))
+                .add(
+                    Condition::all()
+                        .add(cli_runtime_pending_request::Column::CreatedAt.eq(created_at))
+                        .add(cli_runtime_pending_request::Column::RequestId.gt(request_id)),
+                ),
+        );
     }
+
+    let limit = bounded_pending_request_page_limit(filter.limit);
 
     query
         .order_by_asc(cli_runtime_pending_request::Column::CreatedAt)
+        .order_by_asc(cli_runtime_pending_request::Column::RequestId)
+        .limit(limit)
         .all(db)
         .await
         .context("failed to list CLI runtime pending requests")?
@@ -1517,6 +1643,160 @@ pub async fn resolve_pending_request<C: ConnectionTrait>(
     .context("failed to resolve CLI runtime pending request")?;
 
     find_pending_request(db, resolution.request_id.as_str()).await
+}
+
+pub async fn accept_pending_request_response<C: ConnectionTrait>(
+    db: &C,
+    response: AcceptCliRuntimePendingRequestResponse,
+) -> Result<Option<CliRuntimePendingRequestRecord>> {
+    if response.responding_principal_id.trim().is_empty()
+        || response.responding_session_id.trim().is_empty()
+        || response.response_authorization_revision < 0
+    {
+        return Err(anyhow!(
+            "CLI runtime pending request responder provenance is invalid"
+        ));
+    }
+    let result = cli_runtime_pending_request::Entity::update_many()
+        .col_expr(
+            cli_runtime_pending_request::Column::Status,
+            sea_orm::sea_query::Expr::value(
+                CliRuntimePendingRequestStatus::ResponseAccepted
+                    .as_str()
+                    .to_owned(),
+            ),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::ResponseJson,
+            sea_orm::sea_query::Expr::value(response.response_json),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::RespondingPrincipalId,
+            sea_orm::sea_query::Expr::value(Some(response.responding_principal_id)),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::RespondingSessionId,
+            sea_orm::sea_query::Expr::value(Some(response.responding_session_id)),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::ResponseAuthorizationRevision,
+            sea_orm::sea_query::Expr::value(Some(response.response_authorization_revision)),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::ResponseContainsSecret,
+            sea_orm::sea_query::Expr::value(response.response_contains_secret),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::DeliveryError,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(response.updated_at),
+        )
+        .filter(cli_runtime_pending_request::Column::RequestId.eq(response.request_id.clone()))
+        .filter(
+            cli_runtime_pending_request::Column::Status
+                .eq(CliRuntimePendingRequestStatus::Pending.as_str()),
+        )
+        .exec(db)
+        .await
+        .context("failed to accept CLI runtime pending request response")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+    find_pending_request(db, response.request_id.as_str()).await
+}
+
+pub async fn transition_pending_request_delivery<C: ConnectionTrait>(
+    db: &C,
+    transition: TransitionCliRuntimePendingRequestDelivery,
+) -> Result<Option<CliRuntimePendingRequestRecord>> {
+    let valid = matches!(
+        (transition.expected_status, transition.status),
+        (
+            CliRuntimePendingRequestStatus::ResponseAccepted
+                | CliRuntimePendingRequestStatus::DeliveryFailed,
+            CliRuntimePendingRequestStatus::Delivering,
+        ) | (
+            CliRuntimePendingRequestStatus::ResponseAccepted,
+            CliRuntimePendingRequestStatus::DeliveryFailed
+                | CliRuntimePendingRequestStatus::Pending,
+        ) | (
+            CliRuntimePendingRequestStatus::Delivering,
+            CliRuntimePendingRequestStatus::DeliveryFailed
+                | CliRuntimePendingRequestStatus::Answered
+                | CliRuntimePendingRequestStatus::Resolved
+                | CliRuntimePendingRequestStatus::Cancelled
+                | CliRuntimePendingRequestStatus::Expired
+                | CliRuntimePendingRequestStatus::Pending,
+        )
+    );
+    if !valid {
+        return Err(anyhow!(
+            "invalid CLI runtime request delivery transition `{}` -> `{}`",
+            transition.expected_status.as_str(),
+            transition.status.as_str()
+        ));
+    }
+
+    let mut update = cli_runtime_pending_request::Entity::update_many()
+        .col_expr(
+            cli_runtime_pending_request::Column::Status,
+            sea_orm::sea_query::Expr::value(transition.status.as_str().to_owned()),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::DeliveryError,
+            sea_orm::sea_query::Expr::value(transition.delivery_error.clone()),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(transition.updated_at),
+        )
+        .col_expr(
+            cli_runtime_pending_request::Column::ResolvedAt,
+            sea_orm::sea_query::Expr::value(transition.resolved_at),
+        );
+    if transition.status == CliRuntimePendingRequestStatus::Delivering {
+        update = update.col_expr(
+            cli_runtime_pending_request::Column::DeliveryAttempts,
+            sea_orm::sea_query::Expr::col(cli_runtime_pending_request::Column::DeliveryAttempts)
+                .add(1),
+        );
+    }
+    if transition.status == CliRuntimePendingRequestStatus::Pending {
+        update = update
+            .col_expr(
+                cli_runtime_pending_request::Column::ResponseJson,
+                sea_orm::sea_query::Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                cli_runtime_pending_request::Column::RespondingPrincipalId,
+                sea_orm::sea_query::Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                cli_runtime_pending_request::Column::RespondingSessionId,
+                sea_orm::sea_query::Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                cli_runtime_pending_request::Column::ResponseAuthorizationRevision,
+                sea_orm::sea_query::Expr::value(Option::<i64>::None),
+            )
+            .col_expr(
+                cli_runtime_pending_request::Column::ResponseContainsSecret,
+                sea_orm::sea_query::Expr::value(false),
+            );
+    }
+    let result = update
+        .filter(cli_runtime_pending_request::Column::RequestId.eq(transition.request_id.clone()))
+        .filter(cli_runtime_pending_request::Column::Status.eq(transition.expected_status.as_str()))
+        .exec(db)
+        .await
+        .context("failed to transition CLI runtime pending request delivery")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+    find_pending_request(db, transition.request_id.as_str()).await
 }
 
 pub async fn cancel_pending_request<C: ConnectionTrait>(
@@ -1655,6 +1935,12 @@ async fn update_pending_request_metadata<C: ConnectionTrait>(
         payload_json: Set(request.payload_json),
         status: Set(CliRuntimePendingRequestStatus::Pending.as_str().to_owned()),
         response_json: Set(None),
+        responding_principal_id: Set(None),
+        responding_session_id: Set(None),
+        response_authorization_revision: Set(None),
+        delivery_attempts: Set(0),
+        delivery_error: Set(None),
+        response_contains_secret: Set(false),
         updated_at: Set(request.updated_at),
         resolved_at: Set(None),
         ..Default::default()
@@ -1839,6 +2125,12 @@ fn active_pending_request_from_new(
         initiating_session_id: Set(None),
         initiating_session_generation: Set(None),
         authorization_context_fingerprint: Set(None),
+        responding_principal_id: Set(None),
+        responding_session_id: Set(None),
+        response_authorization_revision: Set(None),
+        delivery_attempts: Set(0),
+        delivery_error: Set(None),
+        response_contains_secret: Set(false),
         created_at: Set(request.created_at),
         updated_at: Set(request.updated_at),
         resolved_at: Set(None),
@@ -2144,6 +2436,12 @@ fn pending_request_record_from_model(
         status: CliRuntimePendingRequestStatus::from_db(model.status.as_str())?,
         response_json: model.response_json,
         authorization_binding,
+        responding_principal_id: model.responding_principal_id,
+        responding_session_id: model.responding_session_id,
+        response_authorization_revision: model.response_authorization_revision,
+        delivery_attempts: model.delivery_attempts,
+        delivery_error: model.delivery_error,
+        response_contains_secret: model.response_contains_secret,
         created_at: model.created_at,
         updated_at: model.updated_at,
         resolved_at: model.resolved_at,
@@ -2167,4 +2465,24 @@ fn native_event_record_from_model(
         sequence: model.sequence,
         created_at: model.created_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_request_repository_limit_is_always_server_bounded() {
+        assert_eq!(
+            bounded_pending_request_page_limit(None),
+            CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX
+        );
+        assert_eq!(bounded_pending_request_page_limit(Some(7)), 7);
+        assert_eq!(
+            bounded_pending_request_page_limit(Some(
+                CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX.saturating_add(1)
+            )),
+            CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX
+        );
+    }
 }

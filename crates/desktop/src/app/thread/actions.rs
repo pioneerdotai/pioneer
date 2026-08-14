@@ -27,6 +27,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_steer_active_thread_agent_presentation() {
+            return;
+        }
         let snapshot = self.client_snapshot().active_thread;
         let (Some(thread_id), Some(workspace_id), Some(turn_id)) = (
             snapshot.thread_id.clone(),
@@ -186,6 +189,9 @@ impl PioneerDesktop {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.active_artifact_presentation_policy().can_attach {
+            return;
+        }
         let Some(target_thread_id) = self.current_active_thread_id().map(str::to_owned) else {
             return;
         };
@@ -273,9 +279,24 @@ impl PioneerDesktop {
     }
 
     pub(super) fn submit_composer_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reconcile_composer_draft_with_capabilities();
+        if self
+            .gateway
+            .capability_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.workspace.as_ref())
+            .is_none()
+        {
+            cx.notify();
+            return;
+        }
         if !self.can_submit_message(cx) {
             return;
         }
+        let Some(authorization_fingerprint) = self.composer_authorization_fingerprint.clone()
+        else {
+            return;
+        };
 
         let composer_state = self.composer_state.clone();
         let selected_mode = self.composer_turn_mode;
@@ -396,6 +417,18 @@ impl PioneerDesktop {
                         .await;
 
                     let _ = this.update_in(&mut cx, move |view, window, cx| {
+                        if view.composer_authorization_fingerprint.as_deref()
+                            != Some(authorization_fingerprint.as_str())
+                        {
+                            view.composer_upload_in_progress = false;
+                            view.reconcile_composer_draft_with_capabilities();
+                            view.composer_upload_error = Some(
+                                "Composer policy changed before submission; review the updated selections"
+                                    .to_owned(),
+                            );
+                            cx.notify();
+                            return;
+                        }
                         let prepared = match prepare_result {
                             Ok(prepared) => prepared,
                             Err(_error) => {
@@ -614,6 +647,9 @@ impl PioneerDesktop {
     }
 
     pub(super) fn stop_active_turn(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_cancel_active_thread_agent_presentation() {
+            return;
+        }
         let Some(thread_id) = self.active_thread_id.clone() else {
             return;
         };

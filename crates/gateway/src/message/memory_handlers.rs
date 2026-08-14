@@ -1,6 +1,8 @@
 use super::*;
 use anyhow::{Result, anyhow};
-use pioneer_memory::{MemoryOperationContext, MemoryReadPolicy, MemorySourceAccessPolicy};
+use pioneer_memory::{
+    MemoryMutationBoundary, MemoryOperationContext, MemoryReadPolicy, MemorySourceAccessPolicy,
+};
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCandidatesApproveParams, MemoryCandidatesApproveResponse,
     MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
@@ -155,7 +157,7 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         let actor = authenticated_memory_request_actor(request_context);
         bind_authenticated_memory_remember_actor(&mut params, actor.clone());
-        let context = match self.memory_context(request_context, Some(actor)).await {
+        let mut context = match self.memory_context(request_context, Some(actor)).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_memory_service_error(
@@ -168,6 +170,19 @@ impl MessageProcessor {
                 return;
             }
         };
+        if let Err(error) = self
+            .authorize_scoped_memory_remember(request_context, &mut context, &mut params)
+            .await
+        {
+            self.send_memory_service_error(
+                connection_id,
+                request_id,
+                methods::MEMORY_REMEMBER,
+                error,
+            )
+            .await;
+            return;
+        }
         let notify_context = context.clone();
 
         let response = match self
@@ -208,7 +223,7 @@ impl MessageProcessor {
     ) {
         let connection_id = request_context.connection_id();
         params.actor = Some(authenticated_memory_request_actor(request_context));
-        let context = match self
+        let mut context = match self
             .memory_context(request_context, params.actor.clone())
             .await
         {
@@ -226,6 +241,19 @@ impl MessageProcessor {
         };
         let reason = params.reason.clone();
         let dry_run = params.dry_run;
+        if let Err(error) = self
+            .authorize_scoped_memory_forget(request_context, &mut context, &params)
+            .await
+        {
+            self.send_memory_service_error(
+                connection_id,
+                request_id,
+                methods::MEMORY_FORGET,
+                error,
+            )
+            .await;
+            return;
+        }
 
         let response = match self
             .run_memory_request(methods::MEMORY_FORGET, |service| async move {
@@ -720,7 +748,11 @@ impl MessageProcessor {
         let mut context = self
             .memory_runtime
             .operation_context(Some(workspace_id.clone()), actor);
-        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+        if crate::authorization::AuthorizationService::new().runtime_principal_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration)
+        {
             let accessible_threads = self
                 .crud_store
                 .list_accessible_threads_for_principal(
@@ -743,6 +775,178 @@ impl MessageProcessor {
             );
         }
         Ok(context)
+    }
+
+    async fn authorize_scoped_memory_remember(
+        &self,
+        request_context: &RequestContext,
+        context: &mut MemoryOperationContext,
+        params: &mut MemoryRememberParams,
+    ) -> Result<()> {
+        if !request_uses_scoped_collaboration_policy(request_context) {
+            return Ok(());
+        }
+        let workspace_id = context
+            .workspace_id
+            .as_deref()
+            .context("memory mutation has no workspace scope")?;
+        let source_thread_id = params
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.source_thread_id.as_deref())
+            .context("collaborative memory creation requires a source thread")?
+            .to_owned();
+        match params.scope.kind {
+            MemoryScopeKind::Thread if params.scope.key == source_thread_id => {}
+            MemoryScopeKind::User | MemoryScopeKind::Workspace | MemoryScopeKind::Agent => {
+                return Err(anyhow!(
+                    "personal, workspace, and agent memory require a separate authorization scope"
+                ));
+            }
+            MemoryScopeKind::Task => {
+                return Err(anyhow!(
+                    "direct task memory mutation requires an execution-owned memory context"
+                ));
+            }
+            MemoryScopeKind::Thread => {
+                return Err(anyhow!("memory scope does not match its authorized source"));
+            }
+        }
+        let root_thread_id = self
+            .authorize_scoped_memory_source_thread(
+                request_context,
+                workspace_id,
+                source_thread_id.as_str(),
+                crate::authorization::ResourceAction::MemoryCreateThread,
+            )
+            .await?;
+        // A keyed remember is an atomic upsert, and a supersession both
+        // creates a replacement and mutates an existing record. Requiring the
+        // update action up front prevents a concurrent create from turning a
+        // create-only grant into an unauthorized update.
+        if params.key.is_some() || params.supersedes.is_some() {
+            let update_root = self
+                .authorize_scoped_memory_source_thread(
+                    request_context,
+                    workspace_id,
+                    source_thread_id.as_str(),
+                    crate::authorization::ResourceAction::MemoryUpdateThread,
+                )
+                .await?;
+            if update_root != root_thread_id {
+                return Err(anyhow!("memory upsert authority changed during admission"));
+            }
+        }
+        params.scope.key = root_thread_id.clone();
+        if let Some(provenance) = params.provenance.as_mut() {
+            provenance.source_thread_id = Some(root_thread_id.clone());
+        }
+        context.thread_id = Some(root_thread_id.clone());
+        context.mutation_boundary = MemoryMutationBoundary::thread_capsule(root_thread_id, None);
+        Ok(())
+    }
+
+    async fn authorize_scoped_memory_forget(
+        &self,
+        request_context: &RequestContext,
+        context: &mut MemoryOperationContext,
+        params: &MemoryForgetParams,
+    ) -> Result<()> {
+        if !request_uses_scoped_collaboration_policy(request_context) {
+            return Ok(());
+        }
+        let service = self.memory_runtime.service();
+        let record = match &params.target {
+            pioneer_protocol::MemoryForgetTarget::Id { memory_id } => {
+                service
+                    .get(
+                        context.clone(),
+                        MemoryGetParams {
+                            memory_id: memory_id.clone(),
+                            include_deleted: false,
+                        },
+                    )
+                    .await?
+                    .record
+            }
+            pioneer_protocol::MemoryForgetTarget::ScopedKey {
+                scope,
+                namespace,
+                key,
+            } => {
+                service
+                    .get_by_key(
+                        context.clone(),
+                        scope.clone(),
+                        namespace.clone(),
+                        key.clone(),
+                    )
+                    .await?
+                    .record
+            }
+        }
+        .context("memory is not available in the collaboration scope")?;
+        let source_thread_id = record
+            .provenance
+            .source_thread_id
+            .as_deref()
+            .context("workspace-global memory requires moderator authority")?;
+        let workspace_id = context
+            .workspace_id
+            .as_deref()
+            .context("memory mutation has no workspace scope")?;
+        let root_thread_id = self
+            .authorize_scoped_memory_source_thread(
+                request_context,
+                workspace_id,
+                source_thread_id,
+                crate::authorization::ResourceAction::MemoryForgetThread,
+            )
+            .await?;
+        if record.scope.kind != MemoryScopeKind::Thread || record.scope.key != root_thread_id {
+            return Err(anyhow!(
+                "workspace-global and cross-capsule memory require separate authority"
+            ));
+        }
+        context.thread_id = Some(root_thread_id.clone());
+        context.mutation_boundary = MemoryMutationBoundary::thread_capsule(root_thread_id, None);
+        Ok(())
+    }
+
+    async fn authorize_scoped_memory_source_thread(
+        &self,
+        request_context: &RequestContext,
+        workspace_id: &str,
+        source_thread_id: &str,
+        action: crate::authorization::ResourceAction,
+    ) -> Result<String> {
+        let root_thread_id = self
+            .crud_store
+            .get_task_thread_lineage(source_thread_id)
+            .await?
+            .map(|lineage| lineage.root_thread_id)
+            .unwrap_or_else(|| source_thread_id.to_owned());
+        let principal = request_context.principal();
+        let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            action,
+        );
+        match crate::authorization::AuthorizationResolver::new(self.crud_store.as_ref().clone())
+            .authorize_thread(
+                principal,
+                &action_gate,
+                action,
+                root_thread_id.as_str(),
+                Some(workspace_id),
+            )
+            .await?
+        {
+            crate::authorization::ProofResolution::Authorized(_) => Ok(root_thread_id),
+            crate::authorization::ProofResolution::Denied(_) => Err(anyhow!(
+                "memory is outside the authorized collaboration root"
+            )),
+        }
     }
 
     async fn send_memory_response<T: Serialize>(
@@ -1156,14 +1360,18 @@ impl MessageProcessor {
     }
 }
 
-fn authenticated_memory_request_actor(_request_context: &RequestContext) -> MemoryActor {
-    // The legacy protocol field remains decodable for compatibility, but an
-    // RPC cannot choose its own actor kind or identifier. Epic 2 intentionally
-    // does not copy the stable PrincipalId into the pre-existing memory rows.
+fn authenticated_memory_request_actor(request_context: &RequestContext) -> MemoryActor {
     MemoryActor {
         kind: MemoryActorKind::User,
-        id: None,
+        id: Some(request_context.principal().principal_id.to_string()),
     }
+}
+
+fn request_uses_scoped_collaboration_policy(request_context: &RequestContext) -> bool {
+    crate::authorization::AuthorizationService::new().runtime_principal_policy(
+        request_context.principal().kind,
+        request_context.principal().role_key.as_ref(),
+    ) == Some(crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration)
 }
 
 fn bind_authenticated_memory_remember_actor(params: &mut MemoryRememberParams, actor: MemoryActor) {
@@ -1202,7 +1410,7 @@ mod tests {
     };
 
     #[test]
-    fn rpc_memory_actor_is_server_derived_and_contains_no_client_identifier() {
+    fn rpc_memory_actor_is_server_derived_from_authenticated_principal() {
         let connection = ConnectionContext::new(17, authenticated_test_superuser());
         let context = RequestContext::new(
             &connection,
@@ -1213,7 +1421,10 @@ mod tests {
         let actor = authenticated_memory_request_actor(&context);
 
         assert_eq!(actor.kind, MemoryActorKind::User);
-        assert_eq!(actor.id, None);
+        assert_eq!(
+            actor.id.as_deref(),
+            Some(authenticated_test_superuser().principal_id.as_str())
+        );
     }
 
     #[test]

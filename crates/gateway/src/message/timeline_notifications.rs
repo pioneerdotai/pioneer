@@ -188,7 +188,7 @@ impl MessageProcessor {
             return;
         };
         let approval_block_id = approval_block_id(turn_id, request.request_id.as_str());
-        let is_pending = request.status == StoredCliRuntimePendingRequestStatus::Pending;
+        let is_pending = request.status.is_open();
         let (changed_block_ids, removed_block_ids) = if is_pending {
             (vec![work_block_id(turn_id), approval_block_id], Vec::new())
         } else {
@@ -222,7 +222,7 @@ impl MessageProcessor {
         }
 
         let block_id = approval_block_id(turn_id, request.request_id.as_str());
-        let is_pending = request.status == StoredCliRuntimePendingRequestStatus::Pending;
+        let is_pending = request.status.is_open();
         for ancestor_thread_id in ancestor_thread_ids {
             let (changed_block_ids, removed_block_ids) = if is_pending {
                 (vec![block_id.clone()], Vec::new())

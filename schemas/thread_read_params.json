@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadReadParams",
+  "type": "object",
+  "properties": {
+    "thread_id": {
+      "type": "string"
+    },
+    "through_turn_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id",
+    "through_turn_id"
+  ]
+}

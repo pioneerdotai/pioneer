@@ -139,28 +139,41 @@ impl PioneerDesktop {
 
                             match result {
                                 Ok(snapshot) => {
-                                    if view.gateway.authorization_revision.is_some_and(
-                                        |revision| revision > snapshot.authorization_revision,
-                                    ) || snapshot.workspace.is_none()
-                                        || (!is_runtime_draft && snapshot.thread.is_none())
+                                    if view.gateway.authorization_projections.accept(snapshot)
+                                        != pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
                                     {
                                         return ThreadCapabilityRefreshDecision::Retry;
                                     }
-                                    view.gateway.authorization_revision = Some(
-                                        view.gateway.authorization_revision.map_or(
-                                            snapshot.authorization_revision,
-                                            |revision| {
-                                                revision.max(snapshot.authorization_revision)
-                                            },
-                                        ),
-                                    );
+                                    view.gateway.authorization_revision = view
+                                        .gateway
+                                        .authorization_projections
+                                        .accepted_revision();
+                                    let coherent = view
+                                        .gateway
+                                        .authorization_projections
+                                        .snapshot(
+                                            Some(workspace_id.as_str()),
+                                            (!is_runtime_draft).then_some(thread_id.as_str()),
+                                        );
                                     view.thread_scope_capabilities =
                                         pioneer_client::authorization::thread_presentation_capabilities(
-                                            snapshot
+                                            coherent
+                                                .as_ref()
+                                                .and_then(|snapshot| snapshot
                                                 .thread
                                                 .as_ref()
-                                                .map(|thread| &thread.capabilities),
+                                                .map(|thread| &thread.capabilities)),
                                         );
+                                    view.gateway.capability_snapshot = view
+                                        .gateway
+                                        .authorization_projections
+                                        .snapshot(Some(workspace_id.as_str()), None)
+                                        .or_else(|| {
+                                            view.gateway
+                                                .authorization_projections
+                                                .snapshot(None, None)
+                                        });
+                                    view.reconcile_composer_draft_with_capabilities();
                                     view.thread_scope_capabilities_thread_id =
                                         Some(thread_id.clone());
                                     view.thread_scope_capabilities_loading_thread_id = None;

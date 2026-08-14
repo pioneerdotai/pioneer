@@ -3,11 +3,11 @@ use crate::{
     AccessChangedNotification, ArtifactCreatedNotification, ArtifactDeletedNotification,
     ArtifactProjectionUpdatedNotification, ArtifactUpdatedNotification,
     ArtifactUploadProgressNotification, AuthAccessExpiringNotification,
-    AuthSessionRevokedNotification, CLIRuntimeAccountUpdatedNotification,
-    CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
-    CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
-    ContextCompressedNotification, ContextCompressingNotification,
-    GatewayRemoteAccessStatusChangedNotification,
+    AuthSessionRevokedNotification, AuthorizationProjectionChangedNotification,
+    CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification,
+    CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolvedNotification,
+    CLIRuntimeStatusChangedNotification, ContextCompressedNotification,
+    ContextCompressingNotification, GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification,
     GatewayVoiceInputStatusChangedNotification, InvitationChangedNotification,
     ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
@@ -28,18 +28,18 @@ use crate::{
     TaskResumedNotification, TaskRunCompletedNotification, TaskRunCreatedNotification,
     TaskRunFailedNotification, TaskRunStartedNotification, TaskScheduledNotification,
     TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskUpdatedNotification,
-    ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
-    ThreadClosedNotification, ThreadParticipantsChangedNotification,
-    ThreadReadCursorChangedNotification, ThreadStartedNotification,
-    ThreadTimelineBlocksChangedNotification, ThreadTreeChangedNotification,
-    ThreadUpdatedNotification, TurnBlockedNotification, TurnCompletedNotification,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnFailedNotification,
-    TurnPermissionRequestOpenedNotification, TurnPermissionRequestResolvedNotification,
-    TurnStartedNotification, TurnToolLoopBudgetExceededNotification,
-    TurnWorkItemsChangedNotification, TurnWorkStateChangedNotification,
-    VoiceSessionResultNotification, WorkspaceChangedNotification,
+    TaskUserNotificationDeliveredNotification, ThreadAgentsDocChangedNotification,
+    ThreadArtifactsChangedNotification, ThreadClosedNotification,
+    ThreadParticipantsChangedNotification, ThreadReadCursorChangedNotification,
+    ThreadStartedNotification, ThreadTimelineBlocksChangedNotification,
+    ThreadTreeChangedNotification, ThreadUpdatedNotification, TurnBlockedNotification,
+    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
+    TurnFailedNotification, TurnPermissionRequestOpenedNotification,
+    TurnPermissionRequestResolvedNotification, TurnStartedNotification,
+    TurnToolLoopBudgetExceededNotification, TurnWorkItemsChangedNotification,
+    TurnWorkStateChangedNotification, VoiceSessionResultNotification, WorkspaceChangedNotification,
     WorkspaceMembersChangedNotification,
 };
 use schemars::JsonSchema;
@@ -65,6 +65,7 @@ pub struct UnknownGatewayNotification {
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum GatewayNotification {
     AccessChanged(AccessChangedNotification),
+    AuthorizationProjectionChanged(AuthorizationProjectionChangedNotification),
     AuthSessionRevoked(AuthSessionRevokedNotification),
     AuthAccessExpiring(AuthAccessExpiringNotification),
     InvitationChanged(InvitationChangedNotification),
@@ -144,6 +145,7 @@ pub enum GatewayNotification {
     TaskDeliveryDelivered(TaskDeliveryDeliveredNotification),
     TaskDeliveryFailed(TaskDeliveryFailedNotification),
     TaskDeliveryCancelled(TaskDeliveryCancelledNotification),
+    TaskUserNotificationDelivered(TaskUserNotificationDeliveredNotification),
     TaskTreeChanged(TaskTreeChangedTaskNotification),
     TaskRecovered(TaskRecoveredNotification),
     MemoryChanged(MemoryChangedNotification),
@@ -181,6 +183,14 @@ impl GatewayNotification {
             events::ACCESS_CHANGED => {
                 match serde_json::from_value::<AccessChangedNotification>(params.clone()) {
                     Ok(notification) => Some(Self::AccessChanged(notification)),
+                    Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
+                }
+            }
+            events::AUTHORIZATION_PROJECTION_CHANGED => {
+                match serde_json::from_value::<AuthorizationProjectionChangedNotification>(
+                    params.clone(),
+                ) {
+                    Ok(notification) => Some(Self::AuthorizationProjectionChanged(notification)),
                     Err(_) => Some(Self::Unknown(unknown_notification(method, params))),
                 }
             }
@@ -641,6 +651,11 @@ impl GatewayNotification {
                 serde_json::from_value::<TaskDeliveryCancelledNotification>(params)
                     .ok()
                     .map(Self::TaskDeliveryCancelled)
+            }
+            events::TASK_USER_NOTIFICATION_DELIVERED => {
+                serde_json::from_value::<TaskUserNotificationDeliveredNotification>(params)
+                    .ok()
+                    .map(Self::TaskUserNotificationDelivered)
             }
             events::TASK_TREE_CHANGED => {
                 serde_json::from_value::<TaskTreeChangedTaskNotification>(params)
@@ -1335,7 +1350,7 @@ mod tests {
                 authorization_revision: 7,
                 workspace_id: "ws_123".to_owned(),
                 thread_id: Some("thread_123".to_owned()),
-                access_lost: Some(false),
+                outcome: crate::AccessChangeOutcome::Retained,
                 change: AccessChangeKind::ThreadVisibility,
             },
         )
@@ -1348,6 +1363,38 @@ mod tests {
         assert_eq!(serialized["params"]["authorization_revision"], 7);
         assert_eq!(serialized["params"]["thread_id"], "thread_123");
         assert!(serialized["params"].get("principal_id").is_none());
+    }
+
+    #[test]
+    fn maps_typed_authorization_projection_change_without_policy_contents() {
+        let notification = JsonRpcNotification::from_params(
+            events::AUTHORIZATION_PROJECTION_CHANGED,
+            &crate::AuthorizationProjectionChangedNotification {
+                policy_generation: crate::PolicyGeneration::new(8).unwrap(),
+                change: crate::AuthorizationChangeKind::ThreadAcl,
+                affected: crate::AuthorizationChangeScope::PrincipalThread {
+                    principal_id: crate::PrincipalId::new("P00000000000000000001").unwrap(),
+                    workspace_id: "ws_123".to_owned(),
+                    thread_id: "thread_123".to_owned(),
+                },
+            },
+        )
+        .expect("notification should encode");
+
+        let mapped =
+            GatewayNotification::from_jsonrpc(notification).expect("notification should map");
+        assert!(matches!(
+            mapped,
+            GatewayNotification::AuthorizationProjectionChanged(_)
+        ));
+        let serialized = serde_json::to_value(mapped).expect("notification should serialize");
+        assert_eq!(serialized["params"]["policy_generation"], 8);
+        assert_eq!(
+            serialized["params"]["affected"]["scope"],
+            "principal_thread"
+        );
+        assert!(serialized["params"].get("actions").is_none());
+        assert!(serialized["params"].get("policy").is_none());
     }
 
     #[test]

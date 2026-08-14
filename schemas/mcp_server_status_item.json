@@ -17,12 +17,6 @@
     },
     "status": {
       "$ref": "#/$defs/McpServerStatus"
-    },
-    "status_reason": {
-      "type": [
-        "string",
-        "null"
-      ]
     }
   },
   "required": [
@@ -51,12 +45,6 @@
     "McpRuntimeStatus": {
       "type": "object",
       "properties": {
-        "last_error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "last_seen_at": {
           "type": [
             "integer",

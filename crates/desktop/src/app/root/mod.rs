@@ -74,8 +74,9 @@ pub(super) use pioneer_client::{
 use pioneer_protocol::{
     ArtifactRef, AuthMeResponse, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
     McpServerDetailsResponse, PrincipalId, SkillHealthItem, SkillId, SkillListItem, SkillPackId,
-    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadParticipantSummary,
-    ThreadPlacement, ThreadVisibility, TurnPermissionMode, VoiceStatus, Workspace, WorkspaceId,
+    TaskUserNotification, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
+    ThreadParticipantSummary, ThreadPlacement, ThreadVisibility, TurnPermissionMode, VoiceStatus,
+    Workspace, WorkspaceId,
 };
 #[cfg(test)]
 pub(crate) use queries::{
@@ -194,6 +195,8 @@ pub(super) struct GatewayCoordinator {
     pub(super) current_principal_refresh_generation: u64,
     pub(super) session_refresh_in_flight: bool,
     pub(super) authorization_revision: Option<u64>,
+    pub(super) authorization_projections:
+        pioneer_client::authorization::AuthorizationProjectionStore,
     pub(super) connection_state: GatewayConnectionState,
     pub(super) status: String,
     pub(super) status_level: GatewayStatusLevel,
@@ -421,6 +424,7 @@ pub struct PioneerDesktop {
     pub(super) composer_attachments: Vec<ComposerAttachment>,
     pub(super) composer_capabilities: Vec<ComposerCapability>,
     pub(super) composer_skill_selections: Vec<ComposerSkillSelection>,
+    pub(super) composer_authorization_fingerprint: Option<String>,
     pub(super) composer_upload_in_progress: bool,
     pub(super) composer_upload_error: Option<String>,
     pub(super) composer_turn_mode: ThreadMode,
@@ -497,6 +501,13 @@ pub struct PioneerDesktop {
     pub(super) semantic_timeline_pending:
         HashMap<SemanticTimelineRequestKey, SemanticTimelineRequestAction>,
     pub(super) task_review_actions: TaskReviewActionState,
+    pub(super) task_user_notifications_workspace_id: Option<String>,
+    pub(super) task_user_notifications: Vec<TaskUserNotification>,
+    pub(super) task_user_notifications_next_cursor: Option<String>,
+    pub(super) task_user_notifications_loading: bool,
+    pub(super) task_user_notifications_refresh_requested: bool,
+    pub(super) task_user_notifications_refresh_generation: u64,
+    pub(super) task_user_notifications_error: Option<String>,
     pub(super) thread_artifacts: ThreadArtifactsState,
     pub(super) artifact_download_cancellations:
         HashMap<ArtifactVersionKey, tokio_util::sync::CancellationToken>,

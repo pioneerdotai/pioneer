@@ -1122,6 +1122,18 @@ pub enum PermissionApprovalResolution {
 
 #[async_trait]
 pub trait PermissionApprovalBroker: Send + Sync {
+    /// Reprojects the immutable turn permission profile through the current
+    /// server-owned authorization policy immediately before a tool side
+    /// effect. Local/static brokers keep the admitted profile unchanged;
+    /// Gateway brokers may only return an equal or narrower profile.
+    async fn revalidate_permission_context(
+        &self,
+        context: &PermissionEvaluationContext,
+        _invocation: &ToolInvocation,
+    ) -> Result<PermissionEvaluationContext, String> {
+        Ok(context.clone())
+    }
+
     async fn request_approval(
         &self,
         context: &PermissionEvaluationContext,

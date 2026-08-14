@@ -62,6 +62,7 @@ pub struct PreparedComposerTurn {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct PrepareVoiceComposerSnapshotRequest {
+    pub authorization_fingerprint: String,
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
@@ -1720,6 +1721,7 @@ mod tests {
             &transport,
             &file_system,
             PrepareVoiceComposerSnapshotRequest {
+                authorization_fingerprint: "fixture-policy".to_owned(),
                 workspace_id: "ws_1".to_owned(),
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),

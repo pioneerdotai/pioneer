@@ -112,6 +112,22 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::presentation::ClientCurrentPrincipalPresentationRequest
         ),
         schema_doc!(
+            "client_authorization_projection_accept_request.json",
+            crate::presentation::ClientAuthorizationProjectionAcceptRequest
+        ),
+        schema_doc!(
+            "client_authorization_projection_accept_result.json",
+            crate::presentation::ClientAuthorizationProjectionAcceptResult
+        ),
+        schema_doc!(
+            "client_artifact_presentation_policy_request.json",
+            crate::presentation::ClientArtifactPresentationPolicyRequest
+        ),
+        schema_doc!(
+            "client_execution_draft_reconcile_request.json",
+            crate::presentation::ClientExecutionDraftReconcileRequest
+        ),
+        schema_doc!(
             "client_gateway_session_lifecycle_request.json",
             crate::auth::ClientGatewaySessionLifecycleRequest
         ),

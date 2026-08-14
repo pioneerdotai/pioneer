@@ -80,6 +80,7 @@ impl PioneerDesktop {
             if self.gateway.connection_state != GatewayConnectionState::Connected {
                 self.gateway.current_auth = None;
                 self.gateway.capability_snapshot = None;
+                self.clear_task_user_notification_inbox();
                 self.administration.clear_for_session_termination();
                 self.member_avatar_state.clear();
                 self.members_loading = false;

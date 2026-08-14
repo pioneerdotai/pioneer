@@ -108,6 +108,9 @@ impl PioneerDesktop {
             ClientRuntimeNotification::AccessChanged(notification) => {
                 self.apply_access_changed_notification(notification, cx);
             }
+            ClientRuntimeNotification::AuthorizationProjectionChanged(notification) => {
+                self.apply_authorization_projection_changed_notification(notification, cx);
+            }
             ClientRuntimeNotification::AdministrationChanged(event) => {
                 self.apply_administration_event(event, cx);
             }
@@ -169,6 +172,9 @@ impl PioneerDesktop {
             ClientRuntimeNotification::PendingRequests { reduction } => {
                 self.apply_pending_requests_reduction(reduction, cx);
             }
+            ClientRuntimeNotification::TaskUserNotificationDelivered(notification) => {
+                self.apply_task_user_notification_delivered(notification, cx);
+            }
             ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification) => {
                 self.apply_remote_access_status_changed(notification.status, cx);
             }
@@ -188,6 +194,18 @@ impl PioneerDesktop {
                 self.apply_workspace_preference_reduction(preference);
             }
         }
+    }
+
+    fn apply_task_user_notification_delivered(
+        &mut self,
+        _notification: pioneer_protocol::TaskUserNotificationDeliveredNotification,
+        cx: &mut Context<Self>,
+    ) {
+        // The websocket event is only a live invalidation hint. Durable inbox
+        // reconciliation is performed by the Task notification controller so
+        // reconnect and foreground recovery use the same server-owned source.
+        self.refresh_task_user_notifications(cx);
+        cx.notify();
     }
 
     fn apply_administration_event(&mut self, event: AdministrationEvent, cx: &mut Context<Self>) {
@@ -263,28 +281,15 @@ impl PioneerDesktop {
         let administration_invalidation = self.administration.apply_access_changed(&notification);
 
         self.gateway.authorization_revision = Some(plan.authorization_revision);
-        let active_thread_projection_affected =
-            active_thread_id.as_deref().is_some_and(|active_thread_id| {
-                self.thread_workspace_id(active_thread_id)
-                    == Some(notification.workspace_id.as_str())
-                    && notification
-                        .thread_id
-                        .as_deref()
-                        .is_none_or(|thread_id| thread_id == active_thread_id)
-            });
-        if active_thread_projection_affected {
-            self.invalidate_active_thread_capability_projection();
-        }
-        // The root snapshot is global + workspace scoped. A thread-scoped ACL
-        // change cannot revoke any of those bits, so keep the last verified
-        // projection visible while the new authorization revision is fetched.
-        // Clearing it here made every Member-created thread temporarily turn
-        // off models, Skills, MCP and the rest of the agent UI. Workspace
-        // membership changes can alter the projection itself and still fail
-        // closed until their replacement snapshot arrives.
-        if desktop_access_change_invalidates_workspace_capability_snapshot(&notification) {
-            self.gateway.capability_snapshot = None;
-        }
+        self.gateway
+            .authorization_projections
+            .invalidate_for_revision(plan.authorization_revision);
+        // A newer revision is one atomic fence across global, workspace and
+        // thread projections. No capability from the previous generation may
+        // remain readable while its replacement is fetched.
+        self.invalidate_active_thread_capability_projection();
+        self.gateway.capability_snapshot = None;
+        self.reconcile_composer_draft_with_capabilities();
         if plan.clear_active_thread || plan.clear_active_workspace {
             self.thread_scope_pending = Default::default();
             self.thread_scope_error = None;
@@ -292,7 +297,7 @@ impl PioneerDesktop {
             self.message_revision_loading = false;
             self.message_mutation_pending = false;
         }
-        if notification.access_lost != Some(false) {
+        if notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked {
             apply_desktop_workspace_catalog_invalidation(
                 &mut self.workspaces,
                 &mut self.preferred_workspace_id,
@@ -314,7 +319,8 @@ impl PioneerDesktop {
         self.thread_unread
             .retain(|thread_id, _| !invalidated_thread_ids.contains(thread_id.as_str()));
         let workspace_wide = plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
-        let workspace_access_lost = workspace_wide && notification.access_lost != Some(false);
+        let workspace_access_lost = workspace_wide
+            && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
         self.task_thread_navigation_stack.retain(|entry| {
             !(workspace_access_lost && entry.workspace_id == plan.workspace_id)
                 && !invalidated_thread_ids.contains(entry.parent_thread_id.as_str())
@@ -407,6 +413,41 @@ impl PioneerDesktop {
             self.apply_administration_refetches(administration_invalidation.effects, cx);
         }
         self.refresh_current_principal(cx);
+        cx.notify();
+    }
+
+    fn apply_authorization_projection_changed_notification(
+        &mut self,
+        notification: pioneer_protocol::AuthorizationProjectionChangedNotification,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = notification.policy_generation.get();
+        if self
+            .gateway
+            .authorization_revision
+            // `access/changed` and the typed projection event intentionally
+            // share one durable generation for the same ACL commit. The
+            // access event can arrive first, so equality must still apply the
+            // typed, exact-scope cache invalidation.
+            .is_some_and(|current| current > generation)
+        {
+            return;
+        }
+        self.gateway.authorization_revision = Some(generation);
+        self.gateway
+            .authorization_projections
+            .invalidate_for_revision(generation);
+
+        self.gateway.capability_snapshot = None;
+        self.invalidate_active_thread_capability_projection();
+        self.reconcile_composer_draft_with_capabilities();
+        // The durable generation is a fail-closed fence, not merely a cache
+        // hint.  Once old projections are removed, immediately rebuild both
+        // active scopes from the Gateway so a connected client cannot remain
+        // indefinitely disabled (or retain a stale draft) until an unrelated
+        // lifecycle event happens to refresh it.
+        self.refresh_current_principal(cx);
+        self.ensure_active_thread_capabilities_loaded(true, cx);
         cx.notify();
     }
 
@@ -768,6 +809,46 @@ impl PioneerDesktop {
     }
 }
 
+#[cfg(test)]
+fn desktop_authorization_projection_effects(
+    affected: &pioneer_protocol::AuthorizationChangeScope,
+    active_workspace_id: Option<&str>,
+    active_thread_id: Option<&str>,
+) -> (bool, bool) {
+    match affected {
+        pioneer_protocol::AuthorizationChangeScope::Global
+        | pioneer_protocol::AuthorizationChangeScope::Role { .. }
+        | pioneer_protocol::AuthorizationChangeScope::Principal { .. } => (true, true),
+        pioneer_protocol::AuthorizationChangeScope::PrincipalWorkspace { workspace_id, .. } => {
+            let active = active_workspace_id == Some(workspace_id.as_str());
+            (active, active)
+        }
+        pioneer_protocol::AuthorizationChangeScope::PrincipalThread {
+            workspace_id,
+            thread_id,
+            ..
+        } => (
+            false,
+            active_workspace_id == Some(workspace_id.as_str())
+                && active_thread_id == Some(thread_id.as_str()),
+        ),
+        pioneer_protocol::AuthorizationChangeScope::Invitation { .. } => (false, false),
+        pioneer_protocol::AuthorizationChangeScope::Workspace { workspace_id }
+        | pioneer_protocol::AuthorizationChangeScope::ResourceSelector { workspace_id, .. } => {
+            let active = active_workspace_id == Some(workspace_id.as_str());
+            (active, active)
+        }
+        pioneer_protocol::AuthorizationChangeScope::Thread {
+            workspace_id,
+            thread_id,
+        } => (
+            false,
+            active_workspace_id == Some(workspace_id.as_str())
+                && active_thread_id == Some(thread_id.as_str()),
+        ),
+    }
+}
+
 fn desktop_thread_authorization_scopes(
     coordinators: &std::collections::HashMap<String, crate::app::thread::ThreadCoordinator>,
 ) -> Vec<ThreadAuthorizationScope> {
@@ -780,6 +861,7 @@ fn desktop_thread_authorization_scopes(
         .collect()
 }
 
+#[cfg(test)]
 fn desktop_access_change_invalidates_workspace_capability_snapshot(
     notification: &pioneer_protocol::AccessChangedNotification,
 ) -> bool {
@@ -807,7 +889,57 @@ mod access_change_tests {
     use pioneer_protocol::{AccessChangeKind, AccessChangedNotification};
     use std::collections::HashMap;
 
-    #[test]
+    #[::core::prelude::v1::test]
+    fn policy_generation_change_invalidates_only_the_exact_desktop_scope() {
+        let principal_id = pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap();
+        assert_eq!(
+            desktop_authorization_projection_effects(
+                &pioneer_protocol::AuthorizationChangeScope::PrincipalThread {
+                    principal_id: principal_id.clone(),
+                    workspace_id: "workspace-active".to_owned(),
+                    thread_id: "thread-active".to_owned(),
+                },
+                Some("workspace-active"),
+                Some("thread-active"),
+            ),
+            (false, true)
+        );
+        assert_eq!(
+            desktop_authorization_projection_effects(
+                &pioneer_protocol::AuthorizationChangeScope::PrincipalThread {
+                    principal_id,
+                    workspace_id: "workspace-active".to_owned(),
+                    thread_id: "thread-other".to_owned(),
+                },
+                Some("workspace-active"),
+                Some("thread-active"),
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            desktop_authorization_projection_effects(
+                &pioneer_protocol::AuthorizationChangeScope::Workspace {
+                    workspace_id: "workspace-active".to_owned(),
+                },
+                Some("workspace-active"),
+                Some("thread-active"),
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            desktop_authorization_projection_effects(
+                &pioneer_protocol::AuthorizationChangeScope::Invitation {
+                    invitation_id: pioneer_protocol::InvitationId::new("I00000000000000000001",)
+                        .unwrap(),
+                },
+                Some("workspace-active"),
+                Some("thread-active"),
+            ),
+            (false, false)
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn thread_scoped_access_changes_retain_verified_workspace_capabilities() {
         for change in [
             AccessChangeKind::ThreadCreated,
@@ -821,7 +953,7 @@ mod access_change_tests {
                         authorization_revision: 2,
                         workspace_id: "workspace-member".to_owned(),
                         thread_id: Some("thread-member".to_owned()),
-                        access_lost: Some(false),
+                        outcome: pioneer_protocol::AccessChangeOutcome::Retained,
                         change,
                     },
                 ),
@@ -835,7 +967,7 @@ mod access_change_tests {
                     authorization_revision: 3,
                     workspace_id: "workspace-member".to_owned(),
                     thread_id: None,
-                    access_lost: Some(false),
+                    outcome: pioneer_protocol::AccessChangeOutcome::Retained,
                     change: AccessChangeKind::WorkspaceMembership,
                 },
             )
@@ -872,7 +1004,7 @@ mod access_change_tests {
                 authorization_revision: 9,
                 workspace_id: "workspace-protected".to_owned(),
                 thread_id: None,
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: AccessChangeKind::WorkspaceMembership,
             },
             Some(8),
@@ -901,7 +1033,7 @@ mod access_change_tests {
                 authorization_revision: 4,
                 workspace_id: "workspace-superuser".to_owned(),
                 thread_id: Some("thread-superuser".to_owned()),
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: AccessChangeKind::ThreadVisibility,
             },
             Some(4),
@@ -924,7 +1056,7 @@ mod access_change_tests {
                 authorization_revision: 5,
                 workspace_id: "workspace-affected".to_owned(),
                 thread_id: Some("thread-affected".to_owned()),
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: AccessChangeKind::ThreadParticipantRemoved,
             },
             Some(4),
@@ -1025,6 +1157,15 @@ mod access_change_tests {
         assert!(production_source.contains("self.administration.apply_event(&event)"));
         assert!(
             production_source.contains("self.administration.apply_access_changed(&notification)")
+        );
+        assert!(
+            production_source.contains(
+                "ClientRuntimeNotification::AuthorizationProjectionChanged(notification)"
+            )
+        );
+        assert!(production_source.contains("self.refresh_current_principal(cx)"));
+        assert!(
+            production_source.contains("self.ensure_active_thread_capabilities_loaded(true, cx)")
         );
         assert!(
             !production_source

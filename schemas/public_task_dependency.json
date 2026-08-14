@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskDependency",
+  "type": "object",
+  "properties": {
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "dependsOnTaskId": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "taskId",
+    "dependsOnTaskId",
+    "kind",
+    "createdAt"
+  ]
+}

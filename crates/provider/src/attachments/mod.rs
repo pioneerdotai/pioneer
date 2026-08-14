@@ -18,15 +18,33 @@ use crate::types::{
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use std::sync::Arc;
 use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
+
+const ATTACHMENT_BLOCKING_MAX_CONCURRENCY: usize = 16;
+const ATTACHMENT_BLOCKING_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+
+static ATTACHMENT_BLOCKING_GOVERNOR: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn attachment_blocking_governor() -> Arc<tokio::sync::Semaphore> {
+    ATTACHMENT_BLOCKING_GOVERNOR
+        .get_or_init(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                ATTACHMENT_BLOCKING_MAX_CONCURRENCY,
+            ))
+        })
+        .clone()
+}
 
 pub use normalize::infer_mime_from_reference;
 pub use registry::{
     ArtifactExternalRefCacheBackend, ArtifactExternalRefLookupRequest,
-    ArtifactExternalRefStoreRequest, lookup_uploaded_reference_with_artifact,
-    model_family_for_model, set_artifact_external_ref_cache_backend, store_uploaded_reference,
-    upload_registry_key,
+    ArtifactExternalRefStoreRequest, lookup_uploaded_reference_with_artifact_for_authority,
+    model_family_for_model, set_artifact_external_ref_cache_backend,
+    store_uploaded_reference_for_authority, upload_registry_key_for_authority,
 };
+pub use runtime::AttachmentOperationAuthority;
 pub use runtime::AttachmentOperationError;
 pub use types::{
     ArtifactExternalRefCachePolicy, AttachmentBudgetReport, AttachmentCircuitBreakerPolicy,
@@ -84,6 +102,40 @@ pub fn prepare_messages_for_provider(
     prepare_messages_for_provider_with_config(provider_name, capabilities, messages, &config)
 }
 
+/// Runs filesystem, DNS, blocking HTTP and retry materialization outside the
+/// async worker pool. The bounded queue is the Gateway-wide ceiling; the
+/// durable execution governor provides principal/role/workspace fairness
+/// before a Turn can reach this stage.
+pub async fn prepare_messages_for_provider_async(
+    provider_name: &str,
+    capabilities: &ProviderCapabilities,
+    messages: &[ChatMessage],
+) -> Result<PreparedProviderMessages> {
+    let authority_fingerprint = runtime::current_authority_fingerprint()?;
+    let permit = tokio::time::timeout(
+        ATTACHMENT_BLOCKING_QUEUE_TIMEOUT,
+        attachment_blocking_governor().acquire_owned(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("attachment materialization queue deadline exceeded"))?
+    .map_err(|_| anyhow::anyhow!("attachment materialization governor is closed"))?;
+    let provider_name = provider_name.to_owned();
+    let capabilities = capabilities.clone();
+    let messages = messages.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        runtime::with_blocking_authority_scope(authority_fingerprint, || {
+            prepare_messages_for_provider(
+                provider_name.as_str(),
+                &capabilities,
+                messages.as_slice(),
+            )
+        })
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("attachment materialization worker failed: {error}"))?
+}
+
 pub fn prepare_messages_for_provider_with_config(
     provider_name: &str,
     capabilities: &ProviderCapabilities,
@@ -121,8 +173,20 @@ fn prepare_messages_impl(
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
 ) -> Result<PreparedProviderMessages> {
+    let attachment_count = messages
+        .iter()
+        .flat_map(|message| message.content_parts.iter())
+        .filter(|part| !matches!(part, MessageContentPart::Text { .. }))
+        .count();
+    if attachment_count > config.max_attachments_per_request {
+        return Err(AttachmentPipelineError::attachment_count_exceeded(
+            attachment_count,
+            config.max_attachments_per_request,
+        )
+        .into());
+    }
     let mut prepared_messages = Vec::with_capacity(messages.len());
-    let mut attachments = Vec::new();
+    let mut attachments = Vec::with_capacity(attachment_count);
 
     for (message_index, message) in messages.iter().enumerate() {
         let mut rendered_parts = Vec::new();
@@ -181,6 +245,17 @@ fn prepare_messages_impl(
                         config,
                     )?);
                 }
+            }
+            let materialized_total_bytes = attachments
+                .iter()
+                .map(|attachment| attachment.bytes.as_ref().map_or(0, Vec::len))
+                .sum();
+            if materialized_total_bytes > config.max_total_bytes_per_request {
+                return Err(AttachmentPipelineError::attachment_total_budget_exceeded(
+                    materialized_total_bytes,
+                    config.max_total_bytes_per_request,
+                )
+                .into());
             }
         }
 
@@ -243,7 +318,13 @@ fn resolve_attachment(
         .into());
     }
 
-    let resolved_source = resolve_attachment_source(provider_name, attachment, kind, config)?;
+    let resolved_source = resolve_attachment_source(
+        provider_name,
+        attachment,
+        kind,
+        config,
+        config.max_bytes_per_attachment,
+    )?;
     let mime = reconcile_mime(
         attachment.mime_type.as_str(),
         resolved_source.bytes.as_deref(),

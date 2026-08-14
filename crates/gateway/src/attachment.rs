@@ -64,7 +64,11 @@ impl ArtifactExternalRefCacheBackend for CrudArtifactExternalRefCacheBackend {
                     workspace_id: artifact.workspace_id,
                     artifact_id: artifact.artifact_id,
                     artifact_version_id: artifact.artifact_version_id,
-                    provider: request.provider,
+                    provider: format!(
+                        "{}@{}",
+                        request.provider.trim(),
+                        request.authority_fingerprint.trim()
+                    ),
                     model_family: Some(request.model_family),
                     transport_kind: request.transport_kind.as_str().to_owned(),
                 },
@@ -73,6 +77,10 @@ impl ArtifactExternalRefCacheBackend for CrudArtifactExternalRefCacheBackend {
                 expires_at_unix_ms: Some(request.expires_at_unix_ms),
                 metadata: std::collections::BTreeMap::from([
                     ("registry_key".to_owned(), json!(request.registry_key)),
+                    (
+                        "provider_authority_fingerprint".to_owned(),
+                        json!(request.authority_fingerprint),
+                    ),
                     ("sha256".to_owned(), json!(request.sha256)),
                     ("mime_type".to_owned(), json!(request.mime_type)),
                     ("size_bytes".to_owned(), json!(request.size_bytes)),
@@ -97,7 +105,14 @@ fn external_ref_key(
         workspace_id: artifact.workspace_id.clone(),
         artifact_id: artifact.artifact_id.clone(),
         artifact_version_id: artifact.artifact_version_id.clone(),
-        provider: request.provider.clone(),
+        // The schema predates provider authority generations. Namespace the
+        // durable provider key by the non-secret fingerprint so rotations can
+        // coexist safely without treating an old opaque file id as current.
+        provider: format!(
+            "{}@{}",
+            request.provider.trim(),
+            request.authority_fingerprint.trim()
+        ),
         model_family: Some(request.model_family.clone()),
         transport_kind: request.transport_kind.as_str().to_owned(),
     }
@@ -107,8 +122,27 @@ fn external_ref_key(
 mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
-    use pioneer_provider::{AttachmentTransportKind, attachments::upload_registry_key};
+    use pioneer_provider::{
+        AttachmentTransportKind, attachments::upload_registry_key_for_authority,
+    };
     use sea_orm::Database;
+
+    const TEST_AUTHORITY_FINGERPRINT: &str = "test-authority-generation-a";
+
+    fn upload_registry_key(
+        provider: &str,
+        model_family: &str,
+        transport_kind: AttachmentTransportKind,
+        sha256: &str,
+    ) -> String {
+        upload_registry_key_for_authority(
+            provider,
+            model_family,
+            transport_kind,
+            sha256,
+            TEST_AUTHORITY_FINGERPRINT,
+        )
+    }
 
     async fn setup_backend() -> CrudArtifactExternalRefCacheBackend {
         let connection = Database::connect("sqlite::memory:")
@@ -142,6 +176,7 @@ mod tests {
         backend
             .store_uploaded_reference(ArtifactExternalRefStoreRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "aabbccdd".to_owned(),
@@ -161,6 +196,7 @@ mod tests {
         let hit = backend
             .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "aabbccdd".to_owned(),
@@ -186,6 +222,7 @@ mod tests {
         backend
             .store_uploaded_reference(ArtifactExternalRefStoreRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "expired".to_owned(),
@@ -205,6 +242,7 @@ mod tests {
         let hit = backend
             .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "expired".to_owned(),
@@ -230,6 +268,7 @@ mod tests {
         backend
             .store_uploaded_reference(ArtifactExternalRefStoreRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "artifactsha".to_owned(),
@@ -255,6 +294,7 @@ mod tests {
         let hit = backend
             .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "different-sha".to_owned(),
@@ -280,6 +320,7 @@ mod tests {
         backend
             .store_uploaded_reference(ArtifactExternalRefStoreRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "expired-artifact".to_owned(),
@@ -305,6 +346,7 @@ mod tests {
         let hit = backend
             .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "missing-registry".to_owned(),
@@ -330,6 +372,7 @@ mod tests {
         backend
             .store_uploaded_reference(ArtifactExternalRefStoreRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "workspace-a".to_owned(),
@@ -355,6 +398,7 @@ mod tests {
         let hit = backend
             .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
                 provider: "openai".to_owned(),
+                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
                 model_family: "gpt-4.1-mini".to_owned(),
                 transport_kind: AttachmentTransportKind::Upload,
                 sha256: "workspace-b".to_owned(),

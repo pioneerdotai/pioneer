@@ -1,3 +1,4 @@
+mod budget;
 mod catalog;
 mod client;
 mod config;
@@ -10,6 +11,10 @@ mod runtime;
 mod secrets;
 mod validation;
 
+pub use budget::{
+    McpInvocationBudget, McpInvocationBudgetError, validate_mcp_arguments, validate_mcp_result,
+    validate_mcp_result_parts,
+};
 pub use catalog::McpCatalogSnapshot;
 pub use client::rmcp_adapter::RmcpRuntimeConnector;
 pub use config::{InstallParseContext, McpInstallPlan, McpInstallPlanItem, parse_install_config};

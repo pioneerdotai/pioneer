@@ -227,6 +227,12 @@
         "deny"
       ]
     },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "SandboxMode": {
       "type": "string",
       "enum": [
@@ -402,6 +408,12 @@
             "string",
             "null"
           ]
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -426,6 +438,12 @@
           "$ref": "#/$defs/TaskAgentInputReferenceKind"
         },
         "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "versionId": {
           "type": [
             "string",
             "null"
@@ -1519,10 +1537,19 @@
       ]
     },
     "ThreadMode": {
-      "type": "string",
-      "enum": [
-        "Chat",
-        "Agent"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Message",
+            "Agent"
+          ]
+        },
+        {
+          "description": "Compatibility default for pre-Epic-6 persisted and wire values. New\nuser-thread creation selects `Message` explicitly.",
+          "type": "string",
+          "const": "Chat"
+        }
       ]
     },
     "ToolPermissionPolicySnapshot": {
@@ -2113,6 +2140,12 @@
             "$ref": "#/$defs/UserInput"
           }
         },
+        "mentioned_principal_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PrincipalId"
+          }
+        },
         "mode": {
           "anyOf": [
             {
@@ -2153,6 +2186,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "reply_to_turn_id": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "sandbox_policy": {

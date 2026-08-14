@@ -1,6 +1,6 @@
 use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
-    ensure_no_unrendered_attachments, prepare_messages_for_provider,
+    ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
 use crate::reasoning_registry;
 use crate::tools::stream::{IncrementalLineDecoder, sse_data};
@@ -489,11 +489,12 @@ impl crate::traits::Provider for AnthropicProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 
@@ -618,11 +619,12 @@ impl crate::traits::Provider for AnthropicProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let (system, messages) = Self::prepare_messages(&prepared)?;
 

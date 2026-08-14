@@ -591,7 +591,7 @@ impl MessageProcessor {
                 kind,
                 mime_type,
                 created_by_kind: ArtifactCreatedByKind::User,
-                created_by_actor_id: None,
+                created_by_actor_id: Some(session.owner.principal_id.to_string()),
                 binding,
                 metadata,
             })
@@ -837,12 +837,37 @@ impl MessageProcessor {
         request_context: &RequestContext,
         session: &ArtifactUploadSession,
     ) -> bool {
+        if !self
+            .revalidate_artifact_upload_action(
+                request_context,
+                session,
+                crate::authorization::ResourceAction::ArtifactCreateThread,
+            )
+            .await
+        {
+            return false;
+        }
+        if session.thread_id.is_some()
+            && !self
+                .revalidate_artifact_upload_action(
+                    request_context,
+                    session,
+                    crate::authorization::ResourceAction::ArtifactBindThread,
+                )
+                .await
+        {
+            return false;
+        }
+        true
+    }
+
+    async fn revalidate_artifact_upload_action(
+        &self,
+        request_context: &RequestContext,
+        session: &ArtifactUploadSession,
+        action: crate::authorization::ResourceAction,
+    ) -> bool {
         let service = crate::authorization::AuthorizationService::new();
-        let action = if session.planned_turn_id.is_some() {
-            crate::authorization::ResourceAction::ThreadWrite
-        } else {
-            crate::authorization::ResourceAction::ArtifactWrite
-        };
         let gate = service.authorize_action(
             request_context.principal().kind,
             request_context.role_key(),

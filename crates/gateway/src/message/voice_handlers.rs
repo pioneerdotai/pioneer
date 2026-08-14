@@ -23,16 +23,16 @@ impl MessageProcessor {
         if let Some(workspace_id) = params.workspace_id.as_deref()
             && workspace_id.trim().is_empty()
         {
-            self.send_error(
+            self.send_voice_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `workspace_id` must not be empty",
-                        methods::VOICE_STATUS
-                    ),
-                ),
+                request_id,
+                INVALID_PARAMS_CODE,
+                methods::VOICE_STATUS,
+                VoiceError {
+                    kind: VoiceErrorKind::InvalidSession,
+                    message: "`workspace_id` must not be empty".to_owned(),
+                    public_error: None,
+                },
             )
             .await;
             return;
@@ -77,16 +77,16 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         if let Err(message) = validate_voice_start_params(&params) {
-            self.send_error(
+            self.send_voice_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: {message}",
-                        methods::VOICE_SESSION_START
-                    ),
-                ),
+                request_id,
+                INVALID_PARAMS_CODE,
+                methods::VOICE_SESSION_START,
+                VoiceError {
+                    kind: VoiceErrorKind::InvalidSession,
+                    message,
+                    public_error: None,
+                },
             )
             .await;
             return;
@@ -107,6 +107,7 @@ impl MessageProcessor {
                 VoiceError {
                     kind: VoiceErrorKind::InvalidSession,
                     message: "voice session target is unavailable".to_owned(),
+                    public_error: None,
                 },
             )
             .await;
@@ -148,6 +149,7 @@ impl MessageProcessor {
                         "connection already has active voice session `{}`",
                         active_session.session_id
                     ),
+                    public_error: None,
                 },
             )
             .await;
@@ -247,16 +249,16 @@ impl MessageProcessor {
         let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         let request_actor = request_context.persisted_actor();
         if let Err(message) = validate_voice_finalize_params(&params) {
-            self.send_error(
+            self.send_voice_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: {message}",
-                        methods::VOICE_SESSION_FINALIZE
-                    ),
-                ),
+                request_id,
+                INVALID_PARAMS_CODE,
+                methods::VOICE_SESSION_FINALIZE,
+                VoiceError {
+                    kind: VoiceErrorKind::InvalidSession,
+                    message,
+                    public_error: None,
+                },
             )
             .await;
             return;
@@ -313,6 +315,7 @@ impl MessageProcessor {
                 VoiceError {
                     kind: VoiceErrorKind::InvalidSession,
                     message: "voice session target is unavailable".to_owned(),
+                    public_error: None,
                 },
             )
             .await;
@@ -392,6 +395,7 @@ impl MessageProcessor {
                                 error: Some(VoiceError {
                                     kind: VoiceErrorKind::InvalidSession,
                                     message: "voice session target is unavailable".to_owned(),
+                                    public_error: None,
                                 }),
                             },
                         )
@@ -399,7 +403,7 @@ impl MessageProcessor {
                         return;
                     }
                 };
-                let mut turn_params =
+                let turn_params =
                     match voice_turn_start_params_from_transcript(&params.context, transcript) {
                         Ok(turn_params) => turn_params,
                         Err(no_speech) => {
@@ -450,17 +454,6 @@ impl MessageProcessor {
                     .await;
                     return;
                 }
-                if execution_admission.is_member() {
-                    let requested = pioneer_protocol::resolve_turn_permission_profile(
-                        turn_params.permission_profile.as_ref(),
-                    );
-                    let effective = execution_admission.cap_permission_profile(&requested);
-                    turn_params.permission_profile =
-                        Some(pioneer_protocol::TurnPermissionProfileSelection {
-                            mode: effective.mode,
-                        });
-                }
-
                 let thread = match self
                     .thread_manager
                     .thread_get(turn_params.thread_id.trim())
@@ -481,6 +474,7 @@ impl MessageProcessor {
                                         "thread `{}` is not loaded",
                                         turn_params.thread_id.trim()
                                     ),
+                                    public_error: None,
                                 }),
                             },
                         )
@@ -505,6 +499,7 @@ impl MessageProcessor {
                             error: Some(VoiceError {
                                 kind: VoiceErrorKind::InvalidSession,
                                 message: error.to_string(),
+                                public_error: None,
                             }),
                         },
                     )
@@ -520,7 +515,7 @@ impl MessageProcessor {
                         request_actor.clone(),
                         turn_params,
                         thread,
-                        Some(execution_admission),
+                        execution_admission,
                         super::turn_handlers::TurnStartSuccessResponse::VoiceSessionFinalizeAccepted {
                             session_id: session.session_id.clone(),
                         },
@@ -543,7 +538,9 @@ impl MessageProcessor {
                                 turn_params,
                                 runtime_id,
                                 runtime_kind,
-                                Some(execution_admission),
+                                super::turn_handlers::TurnExecutionAuthority::Fresh(
+                                    execution_admission,
+                                ),
                                 super::turn_handlers::TurnStartSuccessResponse::VoiceSessionFinalizeAccepted {
                                     session_id: session.session_id.clone(),
                                 },
@@ -557,6 +554,7 @@ impl MessageProcessor {
                                 message: format!(
                                     "ACP agent runtime `{runtime_id}` is not supported"
                                 ),
+                                public_error: None,
                             };
                             self.send_voice_session_result_notification(
                                 connection_id,
@@ -580,11 +578,19 @@ impl MessageProcessor {
                     .prepare_api_provider_turn_start(
                         connection_id,
                         request_actor,
-                        (request_context.principal().kind == pioneer_protocol::PrincipalKind::User)
-                            .then(|| request_context.principal().principal_id.clone()),
+                        (crate::authorization::AuthorizationService::new()
+                            .runtime_principal_policy(
+                                request_context.principal().kind,
+                                request_context.principal().role_key.as_ref(),
+                            )
+                            == Some(
+                                crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
+                            ))
+                        .then(|| request_context.principal().principal_id.clone()),
                         turn_params,
                         requested_reasoning_effort.as_deref(),
-                        Some(execution_admission),
+                        crate::authorization::ExecutionAdmissionEntryPoint::VoiceTurn,
+                        execution_admission,
                     )
                     .await
                 {
@@ -595,6 +601,7 @@ impl MessageProcessor {
                             message: format!(
                                 "failed to start voice turn after transcription: {message}"
                             ),
+                            public_error: None,
                         };
                         self.send_voice_session_result_notification(
                             connection_id,
@@ -648,6 +655,7 @@ impl MessageProcessor {
                                 kind: VoiceErrorKind::Unknown,
                                 message: "failed to commit native voice turn start lifecycle"
                                     .to_owned(),
+                                public_error: None,
                             }),
                         },
                     )
@@ -725,16 +733,16 @@ impl MessageProcessor {
         let connection_id = request_context.connection_id();
         let owner = AuthenticatedTransferOwner::from_request_context(request_context);
         if params.session_id.trim().is_empty() {
-            self.send_error(
+            self.send_voice_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_PARAMS_CODE,
-                    format!(
-                        "invalid params for `{}`: `session_id` is required",
-                        methods::VOICE_SESSION_CANCEL
-                    ),
-                ),
+                request_id,
+                INVALID_PARAMS_CODE,
+                methods::VOICE_SESSION_CANCEL,
+                VoiceError {
+                    kind: VoiceErrorKind::InvalidSession,
+                    message: "`session_id` is required".to_owned(),
+                    public_error: None,
+                },
             )
             .await;
             return;
@@ -772,6 +780,7 @@ impl MessageProcessor {
                 VoiceError {
                     kind: VoiceErrorKind::InvalidSession,
                     message: "voice session target is unavailable".to_owned(),
+                    public_error: None,
                 },
             )
             .await;
@@ -842,7 +851,22 @@ impl MessageProcessor {
         thread_id: &str,
     ) -> Option<crate::authorization::ExecutionAuthorizationAdmission> {
         let service = crate::authorization::AuthorizationService::new();
-        let action = crate::authorization::ResourceAction::ThreadWrite;
+        let action = crate::authorization::ResourceAction::AgentTurnStart;
+        let authorization_revision = match self.current_authorization_revision().await {
+            Ok(revision) => revision,
+            Err(error) => {
+                crate::authorization::record_authorization_unavailable(
+                    action.safe_name(),
+                    "thread",
+                    "voice_admission",
+                );
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "voice admission policy generation is unavailable"
+                );
+                return None;
+            }
+        };
         let gate = service.authorize_action(
             request_context.principal().kind,
             request_context.role_key(),
@@ -864,7 +888,7 @@ impl MessageProcessor {
                 crate::authorization::ExecutionAuthorizationAdmission::from_authorized_thread(
                     request_context,
                     &proof,
-                    self.authorization_invalidation_hub.current_revision(),
+                    authorization_revision,
                 )
                 .ok()
             }
@@ -891,7 +915,7 @@ impl MessageProcessor {
                     return crate::authorization::ExecutionAuthorizationAdmission::from_authorized_thread(
                         request_context,
                         &proof,
-                        self.authorization_invalidation_hub.current_revision(),
+                        authorization_revision,
                     )
                     .ok();
                 }
@@ -907,7 +931,7 @@ impl MessageProcessor {
                 crate::authorization::ExecutionAuthorizationAdmission::from_authorized_runtime_draft(
                     request_context,
                     access,
-                    self.authorization_invalidation_hub.current_revision(),
+                    authorization_revision,
                 )
                 .ok()
             }
@@ -954,6 +978,7 @@ impl MessageProcessor {
                     "thread `{}` is not loaded for voice session start",
                     thread_id
                 ),
+                public_error: None,
             });
         };
         if thread.workspace_id != workspace_id {
@@ -963,6 +988,7 @@ impl MessageProcessor {
                     "voice context workspace `{}` does not match thread `{}` workspace `{}`",
                     workspace_id, thread_id, thread.workspace_id
                 ),
+                public_error: None,
             });
         }
 
@@ -978,6 +1004,7 @@ impl MessageProcessor {
                     "connection workspace `{connection_workspace_id}` does not match voice context workspace `{}`",
                     workspace_id
                 ),
+                public_error: None,
             });
         }
 
@@ -993,6 +1020,7 @@ impl MessageProcessor {
                     "connection `{connection_id}` is not subscribed to thread `{}`",
                     thread_id
                 ),
+                public_error: None,
             });
         }
 
@@ -1032,12 +1060,14 @@ impl MessageProcessor {
                     .map_err(|error| VoiceError {
                         kind: VoiceErrorKind::TranscriptionFailed,
                         message: format!("failed to initialize gateway voice VAD: {error:#}"),
+                        public_error: None,
                     })?;
             let mut vad =
                 SmoothedVoiceVad::new(detector, VoiceVadConfig::default()).map_err(|error| {
                     VoiceError {
                         kind: VoiceErrorKind::TranscriptionFailed,
                         message: format!("failed to initialize gateway voice VAD: {error:#}"),
+                        public_error: None,
                     }
                 })?;
             let vad_outcome = vad
@@ -1045,6 +1075,7 @@ impl MessageProcessor {
                 .map_err(|error| VoiceError {
                     kind: VoiceErrorKind::TranscriptionFailed,
                     message: format!("failed to segment voice audio: {error:#}"),
+                    public_error: None,
                 })?;
             PreparedSpeechBuffer::from_vad_outcome(audio.audio_format.sample_rate_hz, vad_outcome)
         };
@@ -1063,6 +1094,7 @@ impl MessageProcessor {
             return Err(VoiceError {
                 kind: VoiceErrorKind::ModelUnavailable,
                 message: "Voice Input is not configured".to_owned(),
+                public_error: None,
             });
         };
         match transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer) {
@@ -1092,9 +1124,11 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    crate::public_error::agent_rpc_error(
                         None,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorCode::Internal,
+                        pioneer_protocol::PublicErrorStage::Delivery,
                         format!("failed to encode `{method}` response: {error}"),
                     ),
                 )
@@ -1117,8 +1151,14 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         thread_id: &str,
-        notification: VoiceSessionResultNotification,
+        mut notification: VoiceSessionResultNotification,
     ) {
+        if let Some(error) = notification.error.take() {
+            notification.error = Some(voice_error_at_public_boundary(
+                error,
+                pioneer_protocol::PublicErrorStage::Execution,
+            ));
+        }
         self.send_thread_scoped_notification_to_connections(
             thread_id,
             events::VOICE_SESSION_RESULT,
@@ -1136,6 +1176,8 @@ impl MessageProcessor {
         method: &'static str,
         error: VoiceError,
     ) {
+        let error =
+            voice_error_at_public_boundary(error, pioneer_protocol::PublicErrorStage::Admission);
         let mut response = JsonRpcErrorResponse::new(
             Some(request_id),
             code,
@@ -1153,12 +1195,41 @@ impl MessageProcessor {
     }
 }
 
+fn voice_error_at_public_boundary(
+    mut error: VoiceError,
+    stage: pioneer_protocol::PublicErrorStage,
+) -> VoiceError {
+    if error.public_error.is_none() {
+        let public_code = match error.kind {
+            VoiceErrorKind::ModelUnavailable
+            | VoiceErrorKind::ModelDownloading
+            | VoiceErrorKind::GatewayBusy => pioneer_protocol::PublicErrorCode::Unavailable,
+            VoiceErrorKind::MicrophonePermissionBlocked
+            | VoiceErrorKind::DeviceUnavailable
+            | VoiceErrorKind::InvalidSession
+            | VoiceErrorKind::StaleChunk
+            | VoiceErrorKind::SequenceGap
+            | VoiceErrorKind::NoSpeech => pioneer_protocol::PublicErrorCode::InvalidInput,
+            VoiceErrorKind::Cancelled => pioneer_protocol::PublicErrorCode::Conflict,
+            VoiceErrorKind::TranscriptionFailed | VoiceErrorKind::Unknown => {
+                pioneer_protocol::PublicErrorCode::Internal
+            }
+        };
+        let public_error =
+            crate::public_error::map_agent_failure(public_code, stage, error.message);
+        error.message = public_error.message.clone();
+        error.public_error = Some(public_error);
+    }
+    error
+}
+
 fn voice_runtime_error(
     runtime: &pioneer_protocol::GatewayVoiceInputRuntimeSnapshot,
 ) -> Option<VoiceError> {
     runtime.error.as_ref().map(|message| VoiceError {
         kind: VoiceErrorKind::ModelUnavailable,
         message: message.clone(),
+        public_error: None,
     })
 }
 
@@ -1275,6 +1346,7 @@ fn ensure_voice_finalize_context_matches_session(
                 "voice finalize context does not match session `{}`",
                 session.session_id
             ),
+            public_error: None,
         });
     }
 
@@ -1294,6 +1366,7 @@ fn voice_error_for_unavailable_model(status: VoiceStatus, error: Option<VoiceErr
     VoiceError {
         kind,
         message: format!("voice model is not ready; current status is {status:?}"),
+        public_error: None,
     }
 }
 
@@ -1315,6 +1388,7 @@ fn voice_error_for_no_speech(
             "No speech detected. Hold the microphone and try again. reason={:?}, samples={}{}",
             no_speech.reason, no_speech.total_samples, signal_suffix
         ),
+        public_error: None,
     }
 }
 

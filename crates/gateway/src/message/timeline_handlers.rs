@@ -26,6 +26,39 @@ const TURN_WORK_ITEMS_GET_MAX_IDS: usize = 200;
 const TURN_WORK_SNAPSHOT_MAX_ATTEMPTS: usize = 4;
 const TIMELINE_REPLY_TEXT_MAX_CHARS: usize = 280;
 
+fn timeline_public_error(
+    request_id: Option<RequestId>,
+    jsonrpc_code: i64,
+    diagnostic: impl std::fmt::Display,
+) -> JsonRpcErrorResponse {
+    let public_code = if jsonrpc_code == INVALID_PARAMS_CODE {
+        pioneer_protocol::PublicErrorCode::InvalidInput
+    } else {
+        pioneer_protocol::PublicErrorCode::Internal
+    };
+    crate::public_error::agent_rpc_error(
+        request_id,
+        jsonrpc_code,
+        public_code,
+        pioneer_protocol::PublicErrorStage::Observation,
+        diagnostic,
+    )
+}
+
+fn timeline_delivery_error(
+    request_id: Option<RequestId>,
+    jsonrpc_code: i64,
+    diagnostic: impl std::fmt::Display,
+) -> JsonRpcErrorResponse {
+    crate::public_error::agent_rpc_error(
+        request_id,
+        jsonrpc_code,
+        pioneer_protocol::PublicErrorCode::Internal,
+        pioneer_protocol::PublicErrorStage::Delivery,
+        diagnostic,
+    )
+}
+
 struct ThreadTimelineRowsPage {
     rows: Vec<thread_timeline_block::Model>,
     has_more_before: bool,
@@ -153,7 +186,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_delivery_error(
                         None,
                         INVALID_REQUEST_CODE,
                         format!("failed to encode response: {error}"),
@@ -208,7 +241,7 @@ impl MessageProcessor {
         if params.thread_id.trim().is_empty() {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                timeline_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -259,7 +292,7 @@ impl MessageProcessor {
             Ok(None) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("thread `{}` was not found", params.thread_id),
@@ -271,7 +304,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load thread: {error:#}"),
@@ -290,16 +323,54 @@ impl MessageProcessor {
             return;
         }
 
-        let approval_scope = (!authorization.decision().is_absolute_superuser()).then(|| {
-            ThreadTimelineApprovalScope {
-                initiating_principal_id: request_context.principal().principal_id.to_string(),
-                initiating_session_id: request_context.principal().session_id.to_string(),
-            }
-        });
+        let approval_action = crate::authorization::ResourceAction::AgentRequestObserve;
+        let approval_gate = crate::authorization::AuthorizationService::new().authorize_action(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            approval_action,
+        );
+        let approval_resolver =
+            crate::authorization::AuthorizationResolver::new(self.crud_store.as_ref().clone());
+        let mut approval_resolution = approval_resolver
+            .authorize_thread(
+                request_context.principal(),
+                &approval_gate,
+                approval_action,
+                params.thread_id.as_str(),
+                Some(authorization.workspace_id()),
+            )
+            .await;
+        if matches!(
+            approval_resolution
+                .as_ref()
+                .ok()
+                .and_then(|resolution| resolution.denial()),
+            Some(crate::authorization::AuthorizationDecision::Deny {
+                reason: crate::authorization::DenyReason::MissingAuthoritativeResource,
+                ..
+            })
+        ) {
+            approval_resolution = approval_resolver
+                .authorize_internal_thread_via_root(
+                    request_context.principal(),
+                    &approval_gate,
+                    approval_action,
+                    params.thread_id.as_str(),
+                    Some(authorization.workspace_id()),
+                )
+                .await;
+        }
+        let can_observe_agent_requests = matches!(
+            approval_resolution,
+            Ok(crate::authorization::ProofResolution::Authorized(_))
+        );
+        let approval_scope = ThreadTimelineApprovalScope {
+            can_observe_agent_requests,
+        };
         let rows_page = match self
             .load_thread_timeline_rows(
                 params.thread_id.as_str(),
-                approval_scope.as_ref(),
+                Some(&approval_scope),
                 anchor,
                 limit,
             )
@@ -309,7 +380,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load thread timeline page: {error:#}"),
@@ -329,7 +400,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to encode timeline cursors: {error:#}"),
@@ -343,14 +414,14 @@ impl MessageProcessor {
         let requested_thread_id = params.thread_id.clone();
         let workspace_id = thread_model.workspace_id.clone();
         let mut blocks = match self
-            .thread_timeline_blocks_from_rows(rows_page.rows, approval_scope.as_ref())
+            .thread_timeline_blocks_from_rows(rows_page.rows, Some(&approval_scope))
             .await
         {
             Ok(blocks) => blocks,
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to materialize thread timeline blocks: {error:#}"),
@@ -364,7 +435,7 @@ impl MessageProcessor {
             .descendant_pending_request_blocks(
                 workspace_id.as_str(),
                 requested_thread_id.as_str(),
-                approval_scope.as_ref(),
+                Some(&approval_scope),
             )
             .await
         {
@@ -372,7 +443,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load descendant pending approvals: {error:#}"),
@@ -400,7 +471,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_delivery_error(
                         None,
                         INVALID_REQUEST_CODE,
                         format!("failed to encode response: {error}"),
@@ -441,7 +512,7 @@ impl MessageProcessor {
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                timeline_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -497,7 +568,7 @@ impl MessageProcessor {
             Ok(Some(_)) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -514,7 +585,7 @@ impl MessageProcessor {
             Ok(None) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
@@ -529,7 +600,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load turn work projection: {error:#}"),
@@ -548,7 +619,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load turn work page: {error:#}"),
@@ -568,7 +639,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to encode turn work cursors: {error:#}"),
@@ -590,7 +661,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to materialize turn work block: {error:#}"),
@@ -621,7 +692,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_delivery_error(
                         None,
                         INVALID_REQUEST_CODE,
                         format!("failed to encode response: {error}"),
@@ -670,7 +741,7 @@ impl MessageProcessor {
         {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                timeline_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -701,7 +772,7 @@ impl MessageProcessor {
             Ok(Some(_)) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -718,7 +789,7 @@ impl MessageProcessor {
             Ok(None) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
@@ -733,7 +804,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load turn work projection: {error:#}"),
@@ -752,7 +823,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load turn work items: {error:#}"),
@@ -783,7 +854,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    timeline_delivery_error(
                         None,
                         INVALID_REQUEST_CODE,
                         format!("failed to encode response: {error}"),
@@ -1408,6 +1479,9 @@ impl MessageProcessor {
         thread_id: &str,
         approval_scope: Option<&ThreadTimelineApprovalScope>,
     ) -> Result<Vec<TimelineBlock>> {
+        if approval_scope.is_some_and(|scope| !scope.can_observe_agent_requests) {
+            return Ok(Vec::new());
+        }
         let descendant_thread_ids = self.descendant_task_thread_ids(thread_id).await?;
         if descendant_thread_ids.is_empty() {
             return Ok(Vec::new());
@@ -1420,11 +1494,7 @@ impl MessageProcessor {
                 .list_cli_runtime_pending_requests(CliRuntimePendingRequestListFilter {
                     workspace_id: Some(workspace_id.to_owned()),
                     thread_id: Some(descendant_thread_id),
-                    status: Some(StoredCliRuntimePendingRequestStatus::Pending),
-                    initiating_principal_id: approval_scope
-                        .map(|scope| scope.initiating_principal_id.clone()),
-                    initiating_session_id: approval_scope
-                        .map(|scope| scope.initiating_session_id.clone()),
+                    open_only: true,
                     ..Default::default()
                 })
                 .await?;
@@ -1543,7 +1613,7 @@ impl MessageProcessor {
                 format!("failed to load CLI runtime pending request `{request_id}`")
             })?;
         let Some(record) = record else {
-            if approval_scope.is_some() {
+            if approval_scope.is_some_and(|scope| !scope.can_observe_agent_requests) {
                 return Ok(None);
             }
             return Ok(Some(TimelineBlockKind::PendingRequest {
@@ -2063,27 +2133,16 @@ fn parse_cli_runtime_pending_request_status(value: &str) -> CLIRuntimePendingReq
 }
 
 fn cli_runtime_pending_request_visible_to_scope(
-    record: &CliRuntimePendingRequestRecord,
+    _record: &CliRuntimePendingRequestRecord,
     approval_scope: Option<&ThreadTimelineApprovalScope>,
 ) -> bool {
-    let Some(approval_scope) = approval_scope else {
-        // The caller may omit the scope only after central authorization has
-        // proven the absolute Superuser bypass.
-        return true;
-    };
-    record
-        .authorization_binding
-        .as_ref()
-        .is_some_and(|binding| {
-            binding.initiating_principal_id == approval_scope.initiating_principal_id
-                && binding.initiating_session_id == approval_scope.initiating_session_id
-        })
+    approval_scope.is_none_or(|scope| scope.can_observe_agent_requests)
 }
 
 fn pending_request_proxy_block(
     record: CliRuntimePendingRequestRecord,
 ) -> Result<Option<TimelineBlock>> {
-    if record.status != StoredCliRuntimePendingRequestStatus::Pending {
+    if record.status.is_terminal() {
         return Ok(None);
     }
     let Some(turn_id) = record.turn_id.clone() else {
@@ -2234,6 +2293,12 @@ mod timeline_handler_unit_tests {
                 initiating_session_generation: 0,
                 authorization_context_fingerprint: "a".repeat(64),
             }),
+            responding_principal_id: None,
+            responding_session_id: None,
+            response_authorization_revision: None,
+            delivery_attempts: 0,
+            delivery_error: None,
+            response_contains_secret: false,
             created_at: now,
             updated_at: now,
             resolved_at: None,
@@ -2241,36 +2306,26 @@ mod timeline_handler_unit_tests {
     }
 
     #[test]
-    fn approval_payload_visibility_is_exact_principal_and_session() {
+    fn approval_payload_visibility_follows_atomic_observe_action_not_initiator_identity() {
         let record = pending_request_for("principal-a", "session-a");
-        let exact = ThreadTimelineApprovalScope {
-            initiating_principal_id: "principal-a".to_owned(),
-            initiating_session_id: "session-a".to_owned(),
+        let observer = ThreadTimelineApprovalScope {
+            can_observe_agent_requests: true,
         };
-        let other_session = ThreadTimelineApprovalScope {
-            initiating_principal_id: "principal-a".to_owned(),
-            initiating_session_id: "session-b".to_owned(),
-        };
-        let other_principal = ThreadTimelineApprovalScope {
-            initiating_principal_id: "principal-b".to_owned(),
-            initiating_session_id: "session-a".to_owned(),
+        let reader_without_agent_observe = ThreadTimelineApprovalScope {
+            can_observe_agent_requests: false,
         };
 
         assert!(cli_runtime_pending_request_visible_to_scope(
             &record,
-            Some(&exact)
+            Some(&observer)
         ));
         assert!(!cli_runtime_pending_request_visible_to_scope(
             &record,
-            Some(&other_session)
-        ));
-        assert!(!cli_runtime_pending_request_visible_to_scope(
-            &record,
-            Some(&other_principal)
+            Some(&reader_without_agent_observe)
         ));
         assert!(
             cli_runtime_pending_request_visible_to_scope(&record, None),
-            "central absolute-Superuser admission may observe management approvals"
+            "trusted internal projections may include already-authorized approvals"
         );
     }
 

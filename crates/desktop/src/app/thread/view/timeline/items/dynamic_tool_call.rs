@@ -332,22 +332,17 @@ impl PioneerDesktop {
         details.into_any_element()
     }
 
-    fn can_manage_task_review_item(&self, item: &TaskWaitReviewDisplayItem) -> bool {
-        let presentation = self.principal_presentation_capabilities();
-        let can_respond_to_agent_requests =
-            self.can_respond_to_agent_requests_presentation(self.current_active_thread_id());
-        let principal_id = self
-            .gateway
-            .current_auth
-            .as_ref()
-            .map(|auth| auth.principal.id.as_str());
-
-        task_review::task_review_item_is_manageable_by(
-            item,
-            principal_id,
-            presentation.can_manage_all_threads,
-            can_respond_to_agent_requests,
-        )
+    fn task_review_presentation_capabilities(
+        &self,
+    ) -> task_review::TaskReviewPresentationCapabilities {
+        self.current_active_thread_id()
+            .and_then(|thread_id| self.thread_presentation_capabilities(thread_id))
+            .map_or_else(Default::default, |capabilities| {
+                task_review::TaskReviewPresentationCapabilities {
+                    can_review: capabilities.can_review_tasks,
+                    can_cancel: capabilities.can_cancel_tasks,
+                }
+            })
     }
 
     fn render_task_wait_review_controls(
@@ -355,10 +350,14 @@ impl PioneerDesktop {
         review: &TaskWaitReviewDisplay,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let review_capabilities = self.task_review_presentation_capabilities();
         let actionable_items = review
             .items
             .iter()
-            .filter(|item| item.user_controls_allowed() && self.can_manage_task_review_item(item))
+            .filter(|item| {
+                item.user_controls_allowed()
+                    && task_review::task_review_item_is_manageable_by(item, review_capabilities)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if actionable_items.is_empty() {
@@ -368,19 +367,22 @@ impl PioneerDesktop {
         let mut controls = v_flex().w_full().gap_2();
         for item in actionable_items {
             let candidate_id = item.candidate_id.clone();
-            let accept_enabled = task_review::task_review_action_enabled(
+            let accept_enabled = task_review::task_review_action_authorized_and_enabled(
                 &item,
                 task_review::TaskReviewAction::Accept,
+                review_capabilities,
                 &self.task_review_actions,
             );
-            let revise_enabled = task_review::task_review_action_enabled(
+            let revise_enabled = task_review::task_review_action_authorized_and_enabled(
                 &item,
                 task_review::TaskReviewAction::Revise,
+                review_capabilities,
                 &self.task_review_actions,
             );
-            let cancel_enabled = task_review::task_review_action_enabled(
+            let cancel_enabled = task_review::task_review_action_authorized_and_enabled(
                 &item,
                 task_review::TaskReviewAction::Cancel,
+                review_capabilities,
                 &self.task_review_actions,
             );
             let error = self

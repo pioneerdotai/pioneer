@@ -5,6 +5,38 @@ const MCP_DETAILS_AUDIT_LIMIT: u64 = 50;
 const MCP_DETAILS_BINDING_LIMIT: u64 = 50;
 
 impl MessageProcessor {
+    async fn mcp_operator_details_allowed(
+        &self,
+        request_context: &RequestContext,
+        workspace_id: &str,
+        server_id: &str,
+    ) -> bool {
+        let service = crate::authorization::AuthorizationService::new();
+        let action = crate::authorization::ResourceAction::McpReadOperator;
+        let gate = service.authorize_action(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            action,
+        );
+        match gate {
+            crate::authorization::ActionGateDecision::AllowAbsolute => true,
+            crate::authorization::ActionGateDecision::Deny { .. } => false,
+            crate::authorization::ActionGateDecision::RequireResource { .. } => matches!(
+                crate::authorization::AuthorizationResolver::new(self.crud_store.as_ref().clone())
+                    .authorize_persisted_capability(
+                        request_context.principal(),
+                        &gate,
+                        action,
+                        workspace_id,
+                        crate::authorization::CapabilityKind::McpServer,
+                        server_id,
+                    )
+                    .await,
+                Ok(crate::authorization::ProofResolution::Authorized(_))
+            ),
+        }
+    }
+
     pub(crate) async fn mcp_server_details(
         &self,
         request_context: &RequestContext,
@@ -13,7 +45,6 @@ impl MessageProcessor {
         params: McpServerDetailsParams,
     ) {
         let connection_id = request_context.connection_id();
-        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
         let workspace_id = match self
             .validate_mcp_workspace(
                 connection_id,
@@ -112,6 +143,13 @@ impl MessageProcessor {
             .runtime_snapshot(row.scope_kind.as_str(), row.scope_key.as_str())
             .await;
         let runtime = runtime_snapshots.get(server_id.as_str());
+        let management_allowed = self
+            .mcp_operator_details_allowed(
+                request_context,
+                workspace_id.as_str(),
+                server_id.as_str(),
+            )
+            .await;
         let server =
             match list_item_from_record_with_catalog_and_runtime(&row, catalog.as_ref(), runtime) {
                 Ok(server) => server,
@@ -134,7 +172,7 @@ impl MessageProcessor {
         // Members need the catalog to select and understand an MCP server.
         // Management audit and cross-turn binding history are not part of
         // that operational capability and may reveal other users' activity.
-        let audit = if member {
+        let audit = if !management_allowed {
             Vec::new()
         } else {
             match self
@@ -163,7 +201,7 @@ impl MessageProcessor {
             }
         };
 
-        let recent_bindings = if member {
+        let recent_bindings = if !management_allowed {
             Vec::new()
         } else {
             match self
@@ -192,15 +230,78 @@ impl MessageProcessor {
             }
         };
 
-        let health = health_details_from_runtime(&server, runtime);
+        let management = if management_allowed {
+            let health = health_details_from_runtime(&server, runtime);
+            let management = McpManagementDetails {
+                scope: match protocol_scope_kind(row.scope_kind.as_str()) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            mcp_error(
+                                Some(request_id.clone()),
+                                INVALID_REQUEST_CODE,
+                                MCP_ERROR_INTERNAL,
+                                "failed to map MCP management scope",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                },
+                source_kind: match protocol_source_kind(row.source_kind.as_str()) {
+                    Ok(source_kind) => source_kind,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            mcp_error(
+                                Some(request_id.clone()),
+                                INVALID_REQUEST_CODE,
+                                MCP_ERROR_INTERNAL,
+                                "failed to map MCP management source",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                },
+                transport: match transport_summary(
+                    row.transport_kind.as_str(),
+                    row.transport_json.as_str(),
+                ) {
+                    Ok(transport) => transport,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            mcp_error(
+                                Some(request_id.clone()),
+                                INVALID_REQUEST_CODE,
+                                MCP_ERROR_INTERNAL,
+                                "failed to map MCP management transport",
+                                json!({"error": format!("{error:#}")}),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                },
+                fingerprint: row.fingerprint.clone(),
+                health,
+                audit,
+                recent_bindings,
+            };
+            Some(management)
+        } else {
+            None
+        };
         let response_payload = McpServerDetailsResponse {
             snapshot_version: self.current_mcp_snapshot_version(),
             generated_at: now_timestamp_secs(),
             server,
-            catalog: catalog_details(catalog.as_ref()),
-            health,
-            audit,
-            recent_bindings,
+            catalog: catalog_details(catalog.as_ref(), management_allowed),
+            management,
         };
         let response = match JsonRpcResponse::from_result(request_id.clone(), &response_payload) {
             Ok(response) => response,
@@ -237,8 +338,8 @@ fn health_details_from_runtime(
     McpServerHealthDetails {
         runtime: server.runtime.clone(),
         status: server.status,
-        status_reason: server.status_reason.clone(),
-        last_error: server.runtime.last_error.clone(),
+        status_reason: runtime.and_then(|runtime| runtime.status_reason.clone()),
+        last_error: runtime.and_then(|runtime| runtime.last_error.clone()),
         retry_attempt: runtime.map(|runtime| runtime.retry_attempt),
         next_retry_at: runtime.and_then(|runtime| runtime.next_retry_at_unix),
         catalog_version: runtime.and_then(|runtime| runtime.catalog_version.clone()),
@@ -246,7 +347,10 @@ fn health_details_from_runtime(
     }
 }
 
-fn catalog_details(catalog: Option<&McpServerCatalogSnapshotRecord>) -> McpServerCatalogDetails {
+fn catalog_details(
+    catalog: Option<&McpServerCatalogSnapshotRecord>,
+    management_allowed: bool,
+) -> McpServerCatalogDetails {
     let Some(catalog) = catalog else {
         return McpServerCatalogDetails {
             catalog_version: None,
@@ -263,20 +367,34 @@ fn catalog_details(catalog: Option<&McpServerCatalogSnapshotRecord>) -> McpServe
     McpServerCatalogDetails {
         catalog_version: Some(catalog.catalog_version.clone()),
         generated_at: Some(catalog.generated_at_unix),
-        server_info: parse_json_value(catalog.server_info_json.as_str()),
-        server_instructions_hash: catalog.server_instructions_hash.clone(),
+        server_info: if management_allowed {
+            parse_json_value(catalog.server_info_json.as_str())
+        } else {
+            JsonValue::Object(JsonMap::new())
+        },
+        server_instructions_hash: management_allowed
+            .then(|| catalog.server_instructions_hash.clone())
+            .flatten(),
         tools: parse_json_array(catalog.tools_json.as_str())
             .into_iter()
             .filter_map(tool_catalog_item)
             .collect(),
-        resources: parse_json_array(catalog.resources_json.as_str())
-            .into_iter()
-            .map(resource_catalog_item)
-            .collect(),
-        resource_templates: parse_json_array(catalog.resource_templates_json.as_str())
-            .into_iter()
-            .map(resource_template_catalog_item)
-            .collect(),
+        resources: management_allowed
+            .then(|| {
+                parse_json_array(catalog.resources_json.as_str())
+                    .into_iter()
+                    .map(resource_catalog_item)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        resource_templates: management_allowed
+            .then(|| {
+                parse_json_array(catalog.resource_templates_json.as_str())
+                    .into_iter()
+                    .map(resource_template_catalog_item)
+                    .collect()
+            })
+            .unwrap_or_default(),
         prompts: parse_json_array(catalog.prompts_json.as_str())
             .into_iter()
             .filter_map(prompt_catalog_item)

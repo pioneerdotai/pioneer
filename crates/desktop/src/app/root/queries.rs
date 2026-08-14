@@ -93,6 +93,18 @@ impl PioneerDesktop {
             .is_some_and(|capabilities| capabilities.can_start_turn)
     }
 
+    pub(in crate::app) fn can_cancel_active_thread_agent_presentation(&self) -> bool {
+        self.current_active_thread_id()
+            .and_then(|thread_id| self.thread_presentation_capabilities(thread_id))
+            .is_some_and(|capabilities| capabilities.can_cancel_agent_execution)
+    }
+
+    pub(in crate::app) fn can_steer_active_thread_agent_presentation(&self) -> bool {
+        self.current_active_thread_id()
+            .and_then(|thread_id| self.thread_presentation_capabilities(thread_id))
+            .is_some_and(|capabilities| capabilities.can_steer_agent_execution)
+    }
+
     pub(in crate::app) fn can_respond_to_agent_requests_presentation(
         &self,
         thread_id: Option<&str>,
@@ -108,14 +120,73 @@ impl PioneerDesktop {
             .is_some_and(|capabilities| capabilities.can_respond_to_agent_requests)
     }
 
-    pub(in crate::app) fn allowed_composer_permission_modes(
+    pub(in crate::app) fn artifact_presentation_policy_for_thread(
         &self,
-    ) -> Vec<pioneer_protocol::TurnPermissionMode> {
+        thread_id: &str,
+    ) -> pioneer_client::artifacts::presentation::ArtifactPresentationPolicy {
+        let connected = self.gateway.connection_state == GatewayConnectionState::Connected;
+        if self.draft_thread_id() == Some(thread_id) {
+            let workspace = self
+                .gateway
+                .capability_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.workspace.as_ref())
+                .map(|workspace| &workspace.capabilities);
+            return pioneer_client::artifacts::presentation::artifact_presentation_policy(
+                workspace.is_some_and(|capabilities| capabilities.can_read_artifacts),
+                self.gateway
+                    .capability_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.workspace.as_ref())
+                    .is_some_and(|workspace| workspace.execution_draft_policy.can_attach_artifacts),
+                connected,
+            );
+        }
+        let capabilities = self.thread_presentation_capabilities(thread_id);
+        pioneer_client::artifacts::presentation::artifact_presentation_policy(
+            capabilities.is_some_and(|capabilities| capabilities.can_read_artifacts),
+            capabilities.is_some_and(|capabilities| {
+                capabilities.can_write_artifacts && capabilities.can_bind_artifacts
+            }),
+            connected,
+        )
+    }
+
+    pub(in crate::app) fn active_artifact_presentation_policy(
+        &self,
+    ) -> pioneer_client::artifacts::presentation::ArtifactPresentationPolicy {
+        self.current_active_thread_id().map_or_else(
+            || {
+                pioneer_client::artifacts::presentation::artifact_presentation_policy(
+                    false, false, false,
+                )
+            },
+            |thread_id| self.artifact_presentation_policy_for_thread(thread_id),
+        )
+    }
+
+    pub(in crate::app) fn authorized_composer_permission_options(
+        &self,
+    ) -> Vec<pioneer_client::composer::permissions::ComposerPermissionModeOption> {
         self.gateway
             .capability_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.workspace.as_ref())
-            .map(|workspace| workspace.capabilities.turn_permission_modes.clone())
+            .map(|workspace| {
+                pioneer_client::composer::permissions::authorized_composer_permission_mode_options(
+                    workspace.capabilities.agent_permission_options.as_slice(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    pub(in crate::app) fn authorized_invitation_role_options(
+        &self,
+    ) -> &[pioneer_protocol::AuthorizationInvitationRoleOption] {
+        self.gateway
+            .capability_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.global.invitation_role_options.as_slice())
             .unwrap_or_default()
     }
 

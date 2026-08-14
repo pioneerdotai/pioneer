@@ -67,15 +67,25 @@ fn mcp_error(
     message: impl Into<String>,
     details: serde_json::Value,
 ) -> JsonRpcErrorResponse {
+    let message = message.into();
+    let public_code = match code {
+        MCP_ERROR_INVALID_REQUEST => pioneer_protocol::PublicErrorCode::InvalidInput,
+        MCP_ERROR_NOT_FOUND => pioneer_protocol::PublicErrorCode::NotFound,
+        _ => pioneer_protocol::PublicErrorCode::Internal,
+    };
+    let public_error = crate::public_error::map_agent_failure(
+        public_code,
+        pioneer_protocol::PublicErrorStage::Discovery,
+        format!("{code}: {message}; details={details}"),
+    );
     JsonRpcErrorResponse {
         jsonrpc: pioneer_protocol::JSONRPC_VERSION.to_owned(),
         id: request_id,
         error: pioneer_protocol::JsonRpcError {
             code: jsonrpc_code,
-            message: message.into(),
+            message: public_error.message.clone(),
             data: Some(json!({
-                "code": code,
-                "details": details,
+                "public_error": public_error,
             })),
         },
     }
@@ -178,37 +188,20 @@ fn list_item_from_record_with_catalog_and_runtime(
                 McpRuntimeState::Disabled
             }
         });
-    let status_reason = runtime
-        .and_then(|runtime| runtime.status_reason.clone())
-        .or_else(|| {
-            if record.enabled {
-                Some("runtime supervisor has not started this server yet".to_owned())
-            } else {
-                Some("server is disabled".to_owned())
-            }
-        });
-
     Ok(McpListItem {
         id: record.id.clone().unwrap_or_default(),
         name: record.name.clone(),
         display_name: record.display_name.clone(),
         scope: protocol_scope_kind(record.scope_kind.as_str())?,
-        source_kind: protocol_source_kind(record.source_kind.as_str())?,
-        transport: transport_summary(
-            record.transport_kind.as_str(),
-            record.transport_json.as_str(),
-        )?,
         policy: McpPolicyState {
             enabled: record.enabled,
             allow_implicit_invocation: record.allow_implicit_invocation,
         },
         required: record.required,
-        fingerprint: record.fingerprint.clone(),
         runtime: McpRuntimeStatus {
             state: runtime_state,
             live: runtime.map(|runtime| runtime.live).unwrap_or(false),
             last_seen_at: runtime.and_then(|runtime| runtime.last_seen_at_unix),
-            last_error: runtime.and_then(|runtime| runtime.last_error.clone()),
         },
         tools_count: catalog
             .map(|catalog| count_json_array(catalog.tools_json.as_str()))
@@ -223,7 +216,6 @@ fn list_item_from_record_with_catalog_and_runtime(
             .map(|catalog| count_json_array(catalog.prompts_json.as_str()))
             .unwrap_or(0),
         status: McpServerStatus::from(runtime_state),
-        status_reason,
     })
 }
 
@@ -284,6 +276,8 @@ impl MessageProcessor {
         if changed.is_empty() {
             return;
         }
+
+        self.publish_resource_selector_change(workspace_id).await;
 
         let snapshot_version = self.next_mcp_snapshot_version();
         let notification = McpChangedNotification {

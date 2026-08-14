@@ -248,11 +248,13 @@ impl PioneerDesktop {
                                             .child(format!("@{}", member.nickname,)),
                                     ),
                             )
-                            .child(div().truncate().text_xs().opacity(0.6).child(format!(
-                                "{} · {}",
-                                member_kind_label(member.kind),
-                                status
-                            ))),
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .opacity(0.6)
+                                    .child(format!("{} · {}", member.role.display_name, status)),
+                            ),
                     ),
             )
             .when(workspace_tags.len() > 0, |row| {
@@ -1098,14 +1100,6 @@ fn member_status_label(status: PrincipalStatus) -> String {
         PrincipalStatus::Active => t!("settings.members.status_active"),
         PrincipalStatus::Suspended => t!("settings.members.status_suspended"),
         PrincipalStatus::Removed => t!("settings.members.status_removed"),
-    }
-    .to_string()
-}
-
-fn member_kind_label(kind: PrincipalKind) -> String {
-    match kind {
-        PrincipalKind::Superuser => t!("settings.members.kind_superuser"),
-        PrincipalKind::User => t!("settings.members.kind_user"),
     }
     .to_string()
 }

@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::{
     AuthorizationDecision, BinaryAuthorizationEntry, DenyReason, DisclosurePolicy,
-    MethodAuthorizationEntry, ResourceAction,
+    MethodAuthorizationEntry, ResourceAction, observed_policy_generation,
 };
 
 const AUTHORIZATION_UNAVAILABLE_CODE: i64 = -32603;
@@ -209,8 +209,15 @@ fn record_decision_fields(
     audit_class_name: &'static str,
     decision: &AuthorizationDecision,
 ) {
+    let policy_role = match decision {
+        AuthorizationDecision::AllowAbsolute => "absolute_role",
+        AuthorizationDecision::AllowPolicy { role, .. } => role.as_str(),
+        AuthorizationDecision::Deny { .. } => "unresolved",
+    };
+    let policy_generation = observed_policy_generation();
+    let policy_fingerprint = super::RoleDefinitionRegistry::new().policy_fingerprint();
     let (decision_name, reason_name) = match decision {
-        AuthorizationDecision::AllowSuperuser => ("allow", "absolute_superuser"),
+        AuthorizationDecision::AllowAbsolute => ("allow", "absolute_role"),
         AuthorizationDecision::AllowPolicy { reason, .. } => ("allow", reason.safe_name()),
         AuthorizationDecision::Deny { reason, disclosure } => {
             AUTHORIZATION_COUNTERS
@@ -257,6 +264,9 @@ fn record_decision_fields(
         authorization_decision = decision_name,
         authorization_reason = reason_name,
         authorization_audit_class = audit_class_name,
+        authorization_policy_generation = policy_generation,
+        authorization_policy_role = policy_role,
+        authorization_policy_fingerprint = %policy_fingerprint,
         "authorization audit decision"
     );
 }
@@ -269,12 +279,17 @@ pub(crate) fn record_authorization_unavailable(
     AUTHORIZATION_COUNTERS
         .unavailable
         .fetch_add(1, Ordering::Relaxed);
+    let policy_generation = observed_policy_generation();
+    let policy_fingerprint = super::RoleDefinitionRegistry::new().policy_fingerprint();
     tracing::warn!(
         authorization_action = action_name,
         authorization_resource_kind = resource_kind_name,
         authorization_decision = "deny",
         authorization_reason = "authorization_unavailable",
         authorization_audit_class = audit_class_name,
+        authorization_policy_generation = policy_generation,
+        authorization_policy_role = "unresolved",
+        authorization_policy_fingerprint = %policy_fingerprint,
         "authorization audit decision"
     );
 }
@@ -297,7 +312,14 @@ pub(crate) fn record_subscription_evictions(count: usize) {
     );
 }
 
-pub(crate) fn record_stale_policy_revision() {
+pub(crate) fn record_stale_policy_revision(
+    admitted_generation: u64,
+    current_generation: u64,
+    admitted_role: &str,
+    current_role: &str,
+    admitted_fingerprint: &str,
+    current_fingerprint: &str,
+) {
     AUTHORIZATION_COUNTERS.stale.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
         authorization_action = "execution_revalidate",
@@ -305,6 +327,12 @@ pub(crate) fn record_stale_policy_revision() {
         authorization_decision = "revalidate",
         authorization_reason = "stale_authorization_revision",
         authorization_audit_class = "lifecycle",
+        authorization_admitted_generation = admitted_generation,
+        authorization_policy_generation = current_generation,
+        authorization_admitted_role = admitted_role,
+        authorization_policy_role = current_role,
+        authorization_admitted_policy_fingerprint = admitted_fingerprint,
+        authorization_policy_fingerprint = current_fingerprint,
         "authorization lifecycle metric"
     );
 }
@@ -396,7 +424,7 @@ mod tests {
     fn lifecycle_counters_cover_subscription_and_private_source_rejections() {
         let before = authorization_counter_snapshot();
         record_subscription_evictions(2);
-        record_stale_policy_revision();
+        record_stale_policy_revision(7, 8, "member", "member", &"a".repeat(64), &"b".repeat(64));
         record_private_self_improvement_source_rejection();
         let after = authorization_counter_snapshot();
 

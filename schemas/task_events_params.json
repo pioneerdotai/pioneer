@@ -10,6 +10,14 @@
       ],
       "format": "int64"
     },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
     "taskId": {
       "type": "string"
     }

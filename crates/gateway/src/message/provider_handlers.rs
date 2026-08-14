@@ -20,7 +20,10 @@ impl MessageProcessor {
         else {
             return;
         };
-        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
+        let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator);
 
         let provider_names = match self
             .gateway_secrets
@@ -84,6 +87,13 @@ impl MessageProcessor {
 
         let providers = provider_configs
             .into_iter()
+            .filter(|(name, _)| {
+                crate::authorization::AuthorizationService::new().provider_allowed(
+                    request_context.principal().kind,
+                    request_context.principal().role_key.as_ref(),
+                    name.as_str(),
+                )
+            })
             .map(|(name, (api_key_configured, proxy_url))| {
                 let operationally_configured =
                     api_key_configured || proxy_url.is_some() || name == "local";
@@ -166,7 +176,10 @@ impl MessageProcessor {
         else {
             return;
         };
-        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
+        let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator);
 
         if params.provider.trim().is_empty() {
             self.send_error(
@@ -179,6 +192,18 @@ impl MessageProcessor {
                         methods::PROVIDER_MODELS_LIST
                     ),
                 ),
+            )
+            .await;
+            return;
+        }
+        if !crate::authorization::AuthorizationService::new().provider_allowed(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            params.provider.trim(),
+        ) {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
@@ -219,10 +244,18 @@ impl MessageProcessor {
                 let protocol_models = models
                     .into_iter()
                     .map(provider_model_info_to_protocol)
+                    .filter(|model| {
+                        crate::authorization::AuthorizationService::new().provider_model_allowed(
+                            request_context.principal().kind,
+                            request_context.principal().role_key.as_ref(),
+                            params.provider.as_str(),
+                            model.id.as_str(),
+                        )
+                    })
                     .collect();
 
                 let result = ProviderListModelsResponse {
-                    provider: params.provider,
+                    provider: params.provider.clone(),
                     models: protocol_models,
                 };
 
@@ -286,7 +319,10 @@ impl MessageProcessor {
         else {
             return;
         };
-        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
+        let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator);
 
         if params.provider.trim().is_empty() {
             self.send_error(
@@ -299,6 +335,18 @@ impl MessageProcessor {
                         methods::PROVIDER_EMBEDDING_MODELS_LIST
                     ),
                 ),
+            )
+            .await;
+            return;
+        }
+        if !crate::authorization::AuthorizationService::new().provider_allowed(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            params.provider.trim(),
+        ) {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
@@ -337,10 +385,19 @@ impl MessageProcessor {
         match provider.list_embedding_models().await {
             Ok(models) => {
                 let result = ProviderListModelsResponse {
-                    provider: params.provider,
+                    provider: params.provider.clone(),
                     models: models
                         .into_iter()
                         .map(provider_model_info_to_protocol)
+                        .filter(|model| {
+                            crate::authorization::AuthorizationService::new()
+                                .provider_model_allowed(
+                                    request_context.principal().kind,
+                                    request_context.principal().role_key.as_ref(),
+                                    params.provider.as_str(),
+                                    model.id.as_str(),
+                                )
+                        })
                         .collect(),
                 };
 
@@ -404,7 +461,10 @@ impl MessageProcessor {
         else {
             return;
         };
-        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
+        let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator);
 
         if params.provider.trim().is_empty() {
             self.send_error(
@@ -417,6 +477,18 @@ impl MessageProcessor {
                         methods::PROVIDER_TRANSCRIPTION_MODELS_LIST
                     ),
                 ),
+            )
+            .await;
+            return;
+        }
+        if !crate::authorization::AuthorizationService::new().provider_allowed(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            params.provider.trim(),
+        ) {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
@@ -455,10 +527,19 @@ impl MessageProcessor {
         match provider.list_transcription_models().await {
             Ok(models) => {
                 let result = ProviderListModelsResponse {
-                    provider: params.provider,
+                    provider: params.provider.clone(),
                     models: models
                         .into_iter()
                         .map(provider_model_info_to_protocol)
+                        .filter(|model| {
+                            crate::authorization::AuthorizationService::new()
+                                .provider_model_allowed(
+                                    request_context.principal().kind,
+                                    request_context.principal().role_key.as_ref(),
+                                    params.provider.as_str(),
+                                    model.id.as_str(),
+                                )
+                        })
                         .collect(),
                 };
 
@@ -729,6 +810,8 @@ impl MessageProcessor {
                 self.provider_registry
                     .invalidate(normalized_provider.as_str());
             }
+            self.publish_resource_selector_change(workspace_id.as_str())
+                .await;
         }
 
         let response = ProviderConfigureResponse {
@@ -860,6 +943,8 @@ impl MessageProcessor {
         if raw_provider != normalized_provider {
             self.provider_registry.invalidate(&normalized_provider);
         }
+        self.publish_resource_selector_change(workspace_id.as_str())
+            .await;
 
         let response = ProviderSetApiKeyResponse {
             provider: normalized_provider,
@@ -970,6 +1055,8 @@ impl MessageProcessor {
             if raw_provider != normalized_provider {
                 self.provider_registry.invalidate(&normalized_provider);
             }
+            self.publish_resource_selector_change(workspace_id.as_str())
+                .await;
         }
 
         let response = ProviderDeleteApiKeyResponse {

@@ -35,6 +35,8 @@ pub struct Model {
     pub last_error: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(has_one)]
+    pub user_notification_outbox: HasOne<super::user_notification_outbox::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

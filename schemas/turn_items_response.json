@@ -10,8 +10,18 @@
         "$ref": "#/$defs/TurnItemEvent"
       }
     },
+    "has_more": {
+      "type": "boolean"
+    },
     "last_sequence": {
       "type": "integer",
+      "format": "int64"
+    },
+    "next_cursor": {
+      "type": [
+        "integer",
+        "null"
+      ],
       "format": "int64"
     },
     "thread_id": {
@@ -28,7 +38,8 @@
     "thread_id",
     "workspace_id",
     "turn_id",
-    "last_sequence"
+    "last_sequence",
+    "has_more"
   ],
   "$defs": {
     "AgentMessagePhase": {

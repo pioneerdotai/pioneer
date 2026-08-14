@@ -1,6 +1,8 @@
+#[cfg(test)]
+use crate::attachments::prepare_messages_for_provider;
 use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
-    ensure_no_unrendered_attachments, prepare_messages_for_provider,
+    ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
 use crate::reasoning_registry;
 use crate::tools::stream::{IncrementalLineDecoder, sse_data};
@@ -676,13 +678,14 @@ impl crate::traits::Provider for GeminiProvider {
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let model = request.model.clone();
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request
                 .rendered_messages_with_compiled_sections()
                 .as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 
@@ -737,13 +740,14 @@ impl crate::traits::Provider for GeminiProvider {
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
         let model = request.model.clone();
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request
                 .rendered_messages_with_compiled_sections()
                 .as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = Self::build_request_from_prepared(&request, &prepared)?;
 

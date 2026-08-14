@@ -3,13 +3,6 @@
   "title": "McpServerDetailsResponse",
   "type": "object",
   "properties": {
-    "audit": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/McpAuditEventSummary"
-      }
-    },
     "catalog": {
       "$ref": "#/$defs/McpServerCatalogDetails"
     },
@@ -17,15 +10,16 @@
       "type": "integer",
       "format": "int64"
     },
-    "health": {
-      "$ref": "#/$defs/McpServerHealthDetails"
-    },
-    "recent_bindings": {
-      "type": "array",
-      "default": [],
-      "items": {
-        "$ref": "#/$defs/McpTurnBindingSummary"
-      }
+    "management": {
+      "description": "Management-only configuration and diagnostics. Omitted unless the\ncaller may manage the selected MCP installation.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpManagementDetails"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "server": {
       "$ref": "#/$defs/McpListItem"
@@ -40,8 +34,7 @@
     "snapshot_version",
     "generated_at",
     "server",
-    "catalog",
-    "health"
+    "catalog"
   ],
   "$defs": {
     "McpAuditEventSummary": {
@@ -116,9 +109,6 @@
             "null"
           ]
         },
-        "fingerprint": {
-          "type": "string"
-        },
         "id": {
           "type": "string"
         },
@@ -152,42 +142,69 @@
         "scope": {
           "$ref": "#/$defs/McpScopeKind"
         },
-        "source_kind": {
-          "$ref": "#/$defs/McpSourceKind"
-        },
         "status": {
           "$ref": "#/$defs/McpServerStatus"
-        },
-        "status_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "tools_count": {
           "type": "integer",
           "format": "uint",
           "minimum": 0
-        },
-        "transport": {
-          "$ref": "#/$defs/McpTransportSummary"
         }
       },
       "required": [
         "id",
         "name",
         "scope",
-        "source_kind",
-        "transport",
         "policy",
         "required",
-        "fingerprint",
         "runtime",
         "tools_count",
         "resources_count",
         "resource_templates_count",
         "prompts_count",
         "status"
+      ]
+    },
+    "McpManagementDetails": {
+      "description": "Configuration and diagnostics intentionally excluded from the operational\nMCP capability returned by discovery endpoints.",
+      "type": "object",
+      "properties": {
+        "audit": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpAuditEventSummary"
+          }
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/McpServerHealthDetails"
+        },
+        "recent_bindings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/McpTurnBindingSummary"
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "source_kind": {
+          "$ref": "#/$defs/McpSourceKind"
+        },
+        "transport": {
+          "$ref": "#/$defs/McpTransportSummary"
+        }
+      },
+      "required": [
+        "scope",
+        "source_kind",
+        "transport",
+        "fingerprint",
+        "health"
       ]
     },
     "McpPolicyState": {
@@ -322,12 +339,6 @@
     "McpRuntimeStatus": {
       "type": "object",
       "properties": {
-        "last_error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "last_seen_at": {
           "type": [
             "integer",

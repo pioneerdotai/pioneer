@@ -6,6 +6,9 @@
     "approval": {
       "$ref": "#/$defs/TurnApprovalScopePolicySnapshot"
     },
+    "authority_cap": {
+      "$ref": "#/$defs/TurnAgentAuthorityCapSnapshot"
+    },
     "backend": {
       "$ref": "#/$defs/TurnSecurityBackendSnapshot"
     },
@@ -63,6 +66,7 @@
     "approval",
     "backend",
     "enforcement",
+    "authority_cap",
     "created_at_unix_ms"
   ],
   "$defs": {
@@ -184,6 +188,46 @@
         "dynamic_skill_tool",
         "computer_use",
         "task_subagent"
+      ]
+    },
+    "TurnAgentAuthorityCapSnapshot": {
+      "description": "Immutable server-owned maximum authority for consent-driven mutations of a\nturn security snapshot. User approval may only narrow this cap.",
+      "type": "object",
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/TurnApprovalScopePolicySnapshot"
+        },
+        "filesystem": {
+          "$ref": "#/$defs/TurnFilesystemSandboxPolicy"
+        },
+        "network": {
+          "$ref": "#/$defs/TurnNetworkPolicySnapshot"
+        },
+        "process": {
+          "$ref": "#/$defs/TurnProcessPolicySnapshot"
+        },
+        "resource_binding_id": {
+          "type": "string"
+        },
+        "resource_binding_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "version",
+        "resource_binding_id",
+        "resource_binding_revision",
+        "filesystem",
+        "network",
+        "process",
+        "approval"
       ]
     },
     "TurnApprovalScopePolicySnapshot": {

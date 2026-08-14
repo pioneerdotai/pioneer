@@ -150,15 +150,25 @@ impl PioneerDesktop {
 
                             match result {
                                 Ok((auth, snapshot)) => {
-                                    if view.gateway.authorization_revision.is_some_and(|revision| {
-                                        revision > snapshot.authorization_revision
-                                    }) {
+                                    if view.gateway.authorization_projections.accept(snapshot)
+                                        != pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
+                                    {
                                         return CurrentPrincipalRefreshDecision::Retry;
                                     }
                                     view.gateway.current_auth = Some(auth);
-                                    view.gateway.authorization_revision =
-                                        Some(snapshot.authorization_revision);
-                                    view.gateway.capability_snapshot = Some(snapshot);
+                                    view.gateway.authorization_revision = view
+                                        .gateway
+                                        .authorization_projections
+                                        .accepted_revision();
+                                    view.gateway.capability_snapshot = view
+                                        .gateway
+                                        .authorization_projections
+                                        .snapshot(workspace_id.as_deref(), None)
+                                        .or_else(|| {
+                                            view.gateway
+                                                .authorization_projections
+                                                .snapshot(None, None)
+                                        });
                                     view.reconcile_composer_permission_mode_with_capabilities();
 
                                     let capabilities =
@@ -179,6 +189,7 @@ impl PioneerDesktop {
                                         view.set_main_content_view(MainContentView::Threads, cx);
                                     }
                                     view.resolve_current_principal_avatar(cx);
+                                    view.refresh_task_user_notifications(cx);
                                     view.sync_settings_sidebar_tree_state(cx);
                                     view.sync_administration_sidebar_tree_state(cx);
                                     if view.main_content_view == MainContentView::Administration {

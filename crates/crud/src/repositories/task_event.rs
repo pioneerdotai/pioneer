@@ -172,6 +172,7 @@ pub async fn list_events_for_task<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
     after_sequence: Option<i64>,
+    limit: Option<u64>,
 ) -> Result<Vec<task_event::Model>> {
     let mut query = task_event::Entity::find()
         .filter(task_event::Column::TaskId.eq(task_id.to_owned()))
@@ -179,6 +180,9 @@ pub async fn list_events_for_task<C: ConnectionTrait>(
 
     if let Some(after_sequence) = after_sequence {
         query = query.filter(task_event::Column::Sequence.gt(after_sequence));
+    }
+    if let Some(limit) = limit {
+        query = query.limit(limit);
     }
 
     query.all(db).await.context("failed to query task events")

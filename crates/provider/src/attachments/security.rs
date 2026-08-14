@@ -2,7 +2,7 @@ use crate::attachments::errors::AttachmentPipelineError;
 use crate::attachments::observability;
 use crate::attachments::types::AttachmentSecurityPolicy;
 use anyhow::Result;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -22,9 +22,20 @@ pub fn canonicalize_path(
         )
     })?;
 
-    // Allowlist semantics are list-driven.
-    // Empty list means "allow all"; non-empty list means strict allowlist.
-    if !policy.allowed_path_roots.is_empty() {
+    if policy.enforce_path_allowlist {
+        if policy.allowed_path_roots.is_empty() {
+            return enforce_or_dry_run(
+                provider_name,
+                "path:[redacted]",
+                "path allowlist is enabled but has no roots",
+                policy,
+                AttachmentPipelineError::unsupported_attachment_source(
+                    "path_allowlist_has_no_roots",
+                ),
+            )
+            .map(|_| canonical);
+        }
+
         let mut allowed = false;
         for root in &policy.allowed_path_roots {
             let root_canonical = match root.canonicalize() {
@@ -40,7 +51,7 @@ pub fn canonicalize_path(
         if !allowed {
             return enforce_or_dry_run(
                 provider_name,
-                format!("path:{trimmed}").as_str(),
+                "path:[redacted]",
                 "path is outside allowed_path_roots",
                 policy,
                 AttachmentPipelineError::unsupported_attachment_source(
@@ -153,29 +164,57 @@ pub fn resolve_and_validate_host(
     port: Option<u16>,
     policy: &AttachmentSecurityPolicy,
 ) -> Result<()> {
+    resolve_and_validate_host_addresses(provider_name, host, port, policy).map(|_| ())
+}
+
+pub fn resolve_and_validate_host_addresses(
+    provider_name: &str,
+    host: &str,
+    port: Option<u16>,
+    policy: &AttachmentSecurityPolicy,
+) -> Result<Vec<SocketAddr>> {
     let port = port.unwrap_or(443);
 
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return validate_ip(provider_name, ip, policy);
+        validate_ip(provider_name, ip, policy)?;
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
     let resolved = (host, port).to_socket_addrs().map_err(|error| {
         AttachmentPipelineError::url_source_blocked(format!("dns resolve failed: {error}"))
     })?;
 
-    let mut saw_any = false;
+    let mut addresses = Vec::new();
     for addr in resolved {
-        saw_any = true;
         validate_ip(provider_name, addr.ip(), policy)?;
+        if !addresses.contains(&addr) {
+            addresses.push(addr);
+        }
     }
 
-    if !saw_any {
+    if addresses.is_empty() {
         return Err(AttachmentPipelineError::url_source_blocked(
             "dns resolve returned no addresses",
         )
         .into());
     }
 
+    Ok(addresses)
+}
+
+pub fn validate_connected_peer(
+    provider_name: &str,
+    peer: SocketAddr,
+    pinned_addresses: &[SocketAddr],
+    policy: &AttachmentSecurityPolicy,
+) -> Result<()> {
+    validate_ip(provider_name, peer.ip(), policy)?;
+    if !pinned_addresses.iter().any(|address| *address == peer) {
+        return Err(AttachmentPipelineError::url_source_blocked(
+            "connected peer does not match the pinned DNS decision",
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -282,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_path_allowlist_does_not_restrict_when_enforced() {
+    fn empty_path_allowlist_fails_closed_when_enforced() {
         let tmp = std::env::temp_dir().join(format!(
             "pioneer-attachments-empty-allowlist-{}",
             std::process::id()
@@ -295,12 +334,13 @@ mod tests {
         policy.enforce_path_allowlist = true;
         policy.allowed_path_roots = Vec::new();
 
-        canonicalize_path("test", file.to_string_lossy().as_ref(), &policy)
-            .expect("empty allowed_path_roots should not restrict paths");
+        let error = canonicalize_path("test", file.to_string_lossy().as_ref(), &policy)
+            .expect_err("enabled empty path allowlist must fail closed");
+        assert!(error.to_string().contains("UNSUPPORTED_ATTACHMENT_SOURCE"));
     }
 
     #[test]
-    fn non_empty_path_allowlist_restricts_even_when_enforce_flag_is_false() {
+    fn disabled_path_allowlist_does_not_restrict_even_when_roots_are_present() {
         let temp_dir = std::env::temp_dir().join("pioneer-path-allowlist-list-driven");
         std::fs::create_dir_all(temp_dir.as_path()).expect("create temp dir");
         let target = temp_dir.join("sample.bin");
@@ -310,8 +350,7 @@ mod tests {
         policy.enforce_path_allowlist = false;
         policy.allowed_path_roots = vec![std::env::temp_dir().join("pioneer-some-other-root")];
 
-        let err = canonicalize_path("test", target.to_string_lossy().as_ref(), &policy)
-            .expect_err("non-empty allowed_path_roots must restrict paths");
-        assert!(err.to_string().contains("UNSUPPORTED_ATTACHMENT_SOURCE"));
+        canonicalize_path("test", target.to_string_lossy().as_ref(), &policy)
+            .expect("disabled allowlist must not silently enforce configured roots");
     }
 }

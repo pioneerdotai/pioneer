@@ -3,6 +3,9 @@
   "title": "InvitationCreateParams",
   "type": "object",
   "properties": {
+    "role_key": {
+      "$ref": "#/$defs/RoleKey"
+    },
     "workspace_ids": {
       "type": "array",
       "items": {
@@ -14,9 +17,16 @@
   },
   "additionalProperties": false,
   "required": [
+    "role_key",
     "workspace_ids"
   ],
   "$defs": {
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
     "WorkspaceId": {
       "type": "string",
       "maxLength": 21,

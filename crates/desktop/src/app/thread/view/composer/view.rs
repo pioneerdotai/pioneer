@@ -130,7 +130,8 @@ impl PioneerDesktop {
         let active_turn_state =
             desktop_composer_active_turn_state(&active_thread_snapshot, gateway_connected);
         let is_cancelling = active_turn_state.is_cancelling;
-        let can_stop = active_turn_state.can_stop;
+        let can_stop =
+            active_turn_state.can_stop && self.can_cancel_active_thread_agent_presentation();
         let has_in_flight_turn = active_turn_state.has_in_flight_turn;
         let composer_text = composer_state.read(cx).value().trim().to_owned();
         let can_send = if let Some(target) = self.composer_edit_target.as_ref() {
@@ -165,7 +166,7 @@ impl PioneerDesktop {
                 .as_deref()
                 .is_some_and(|thread_id| {
                     self.thread_presentation_capabilities(thread_id)
-                        .is_some_and(|capabilities| capabilities.can_control_cli_runtime)
+                        .is_some_and(|capabilities| capabilities.can_steer_agent_execution)
                 })
             && !is_cancelling
             && !self.composer_upload_in_progress
@@ -550,15 +551,17 @@ impl PioneerDesktop {
             self.can_start_active_thread_agent_presentation()
         };
         let desktop_entity = cx.entity().clone();
-        let disabled = self.composer_upload_in_progress
-            || self.message_mutation_pending
-            || self.composer_edit_target.is_some()
-            || self.desktop_voice_context_locked()
-            || !scoped_action_allowed;
         let capabilities = self.principal_presentation_capabilities();
         let can_start_agent = self.can_start_active_thread_agent_presentation();
         let can_use_skills = capabilities.can_use_skills && can_start_agent;
         let can_use_mcp = capabilities.can_use_mcp && can_start_agent;
+        let can_attach = self.active_artifact_presentation_policy().can_attach;
+        let disabled = self.composer_upload_in_progress
+            || self.message_mutation_pending
+            || self.composer_edit_target.is_some()
+            || self.desktop_voice_context_locked()
+            || !scoped_action_allowed
+            || !(can_attach || can_use_skills || can_use_mcp);
         Button::new("composer-add-attachment")
             .small()
             .ghost()
@@ -566,19 +569,24 @@ impl PioneerDesktop {
             .child(Icon::new(IconName::Plus).size_5().opacity(0.6))
             .disabled(disabled)
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                let menu = menu.min_w(px(196.)).item(Self::composer_add_menu_item(
-                    t!("chat.composer.add_menu.files").to_string().into(),
-                    PioneerIconName::Paperclip,
-                    {
-                        let desktop_entity = desktop_entity.clone();
-                        move |window, cx| {
-                            let _ = desktop_entity.update(cx, |view, cx| {
-                                view.open_composer_file_picker(window, cx);
-                                cx.notify();
-                            });
-                        }
-                    },
-                ));
+                let menu = menu.min_w(px(196.));
+                let menu = if can_attach {
+                    menu.item(Self::composer_add_menu_item(
+                        t!("chat.composer.add_menu.files").to_string().into(),
+                        PioneerIconName::Paperclip,
+                        {
+                            let desktop_entity = desktop_entity.clone();
+                            move |window, cx| {
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.open_composer_file_picker(window, cx);
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    ))
+                } else {
+                    menu
+                };
 
                 if message_mode {
                     return menu;

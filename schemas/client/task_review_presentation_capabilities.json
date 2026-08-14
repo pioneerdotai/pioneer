@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskReviewPresentationCapabilities",
+  "description": "Exact Task action vocabulary projected by the Gateway for the active\nthread. Candidate state is intersected separately from authorization so a\nrole cannot acquire review authority from ownership or another capability.",
+  "type": "object",
+  "properties": {
+    "can_cancel": {
+      "type": "boolean"
+    },
+    "can_review": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "can_review",
+    "can_cancel"
+  ]
+}

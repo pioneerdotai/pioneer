@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(untagged)]
@@ -261,14 +261,37 @@ pub async fn read_jsonl_rpc_message<R>(
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut line = String::new();
-    let bytes_read = reader.read_line(&mut line).await.map_err(|error| {
+    read_jsonl_rpc_message_with_budget(reader, crate::NativeEventBudget::default()).await
+}
+
+pub async fn read_jsonl_rpc_message_with_budget<R>(
+    reader: &mut R,
+    budget: crate::NativeEventBudget,
+) -> Result<Option<JsonlRpcIncomingMessage>, JsonlRpcDecodeError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let codec = crate::BoundedNativeEventCodec::new(budget);
+    let Some(line) = codec.read_frame(reader).await.map_err(|error| {
+        JsonlRpcDecodeError::new(JsonlRpcDecodeErrorKind::InvalidMessage, error.to_string())
+    })?
+    else {
+        return Ok(None);
+    };
+    let line = std::str::from_utf8(&line).map_err(|_| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            "jsonl-rpc line is not UTF-8",
+        )
+    })?;
+    let message = decode_jsonl_rpc_line(line)?;
+    let raw = serde_json::from_str::<JsonValue>(line.trim_end_matches(['\r', '\n'])).map_err(
+        |error| JsonlRpcDecodeError::new(JsonlRpcDecodeErrorKind::MalformedJson, error.to_string()),
+    )?;
+    codec.validate_value(&raw).map_err(|error| {
         JsonlRpcDecodeError::new(JsonlRpcDecodeErrorKind::InvalidMessage, error.to_string())
     })?;
-    if bytes_read == 0 {
-        return Ok(None);
-    }
-    decode_jsonl_rpc_line(&line).map(Some)
+    Ok(Some(message))
 }
 
 pub fn decode_jsonl_rpc_line(line: &str) -> Result<JsonlRpcIncomingMessage, JsonlRpcDecodeError> {

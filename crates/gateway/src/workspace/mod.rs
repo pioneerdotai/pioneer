@@ -95,7 +95,7 @@ impl WorkspaceManager {
                 "workspace list authorization proof action mismatch".to_owned(),
             ));
         }
-        if proof.decision().is_absolute_superuser() {
+        if proof.decision().is_absolute() {
             return self.list_workspaces().await;
         }
         self.run_with_retry(|| async {
@@ -242,7 +242,7 @@ impl WorkspaceManager {
                 "workspace default authorization proof action mismatch".to_owned(),
             ));
         }
-        if proof.decision().is_absolute_superuser() {
+        if proof.decision().is_absolute() {
             return self.ensure_default_workspace().await.map(Some);
         }
         self.run_with_retry(|| async {
@@ -342,7 +342,7 @@ impl WorkspaceManager {
                 "workspace selection authorization proof action mismatch".to_owned(),
             ));
         }
-        let make_current = proof.decision().is_absolute_superuser() && requested_make_current;
+        let make_current = proof.decision().is_absolute() && requested_make_current;
         self.select_workspace(proof.workspace_id(), make_current)
             .await
     }

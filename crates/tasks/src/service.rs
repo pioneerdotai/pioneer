@@ -1,4 +1,5 @@
 use crate::TaskRuntimeResult;
+use crate::admission::TaskAdmissionNormalizer;
 use crate::event_bus::{TaskEventBus, TaskEventFilter, TaskEventWakeDelivery};
 use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRegistry,
@@ -34,23 +35,24 @@ use pioneer_protocol::{
     TaskEventPayload, TaskEventsParams, TaskEventsResponse, TaskExecutorKind, TaskGetParams,
     TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskListResponse, TaskOwnerKind,
     TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse, TaskRescheduleParams,
-    TaskRescheduleResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
-    TaskResultReviewerKind, TaskResumeParams, TaskResumeResponse, TaskReviseParams,
-    TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus,
-    TaskThreadLineage, TaskTree, TaskTreeParams, TaskTreeResponse, TaskTrigger, TaskTriggerKind,
-    TaskTriggerStatus, TaskUpdateParams, TaskUpdateResponse, TaskValue, TaskWaitItem, TaskWaitMode,
-    TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse,
-    TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock,
-    TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
+    TaskRescheduleResponse, TaskResourceBudget, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResumeParams, TaskResumeResponse,
+    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTree, TaskTreeParams, TaskTreeResponse,
+    TaskTrigger, TaskTriggerKind, TaskTriggerStatus, TaskUpdateParams, TaskUpdateResponse,
+    TaskValue, TaskWaitItem, TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason,
+    TaskWaitParams, TaskWaitResponse, TaskWaitReviewAction, TaskWaitReviewItem,
+    TaskWaitRevisionBlockedReason, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
+    TaskWriteLockStatus, generate_id,
 };
 use serde_json::{Value as JsonValue, json};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Component, Path};
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
@@ -63,6 +65,10 @@ const WAIT_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
 const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
 const MAX_REVISION_FEEDBACK_CHARS: usize = 16_000;
+const MAX_WAIT_GOVERNOR_SCOPES: usize = 1_024;
+
+static TASK_WAIT_GOVERNORS: OnceLock<StdMutex<HashMap<String, Weak<tokio::sync::Semaphore>>>> =
+    OnceLock::new();
 const MAX_REVISION_ADDITIONAL_INSTRUCTION_CHARS: usize = 4_000;
 
 type TaskServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -1509,11 +1515,36 @@ impl TaskService {
         context: TaskCreateContext,
         params: TaskCreateParams,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
-        validate_create_params(&params)?;
+        let resource_budget = context
+            .task_resource_budget
+            .or_else(|| {
+                context
+                    .execution_admission
+                    .as_ref()
+                    .map(|seed| seed.task_resources)
+            })
+            .unwrap_or_default();
+        validate_create_params(&params, resource_budget)?;
         self.validate_review_policy_create_gate(&params)?;
+        match (
+            params.executor_kind == TaskExecutorKind::Agent,
+            context.execution_admission.is_some(),
+        ) {
+            (true, false) => {
+                bail!("agent Task requires an explicit execution authorization admission")
+            }
+            (false, true) => {
+                bail!("non-agent Task cannot carry an agent execution authorization admission")
+            }
+            (true, true) | (false, false) => {}
+        }
         let now = now_timestamp_secs();
         let parent = self
-            .parent_context(params.parent_task_id.as_deref())
+            .parent_context(
+                params.parent_task_id.as_deref(),
+                params.workspace_id.as_str(),
+                params.created_by_thread_id.as_deref(),
+            )
             .await?;
         let trigger_kind = params.trigger.spec.kind();
         TaskTriggerCalculator::validate(&params.trigger.spec)?;
@@ -1625,6 +1656,11 @@ impl TaskService {
             created_at: now,
             updated_at: now,
         });
+        TaskAdmissionNormalizer::new(resource_budget).validate_durable(
+            &task,
+            Some(&trigger),
+            agent_spec.as_ref(),
+        )?;
 
         let mut events = vec![
             TaskEventPayload::TaskCreated { task: task.clone() },
@@ -1705,7 +1741,51 @@ impl TaskService {
                 }
                 (None, _) => None,
             };
-        let appended = match self.append_events(events, now).await {
+        let execution_admission = context
+            .execution_admission
+            .map(|seed| {
+                if seed.workspace_id != task.workspace_id {
+                    bail!("Task execution admission belongs to another workspace");
+                }
+                Ok(pioneer_crud::NewTaskExecutionAdmission {
+                    task_id: task.id.clone(),
+                    workspace_id: seed.workspace_id,
+                    root_thread_id: seed.root_thread_id,
+                    initiating_principal_id: seed.initiating_principal_id.clone(),
+                    authorization_context_json: seed.authorization_context_json,
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    execution_lease: Some(pioneer_crud::NewExecutionAdmissionLease {
+                        id: format!("quota:task:{}", task.id),
+                        subject_kind: "task".to_owned(),
+                        subject_id: task.id.clone(),
+                        operation_class: if matches!(
+                            trigger_kind,
+                            TaskTriggerKind::ScheduledAt
+                                | TaskTriggerKind::Interval
+                                | TaskTriggerKind::Cron
+                        ) {
+                            pioneer_crud::ExecutionAdmissionClass::ScheduledTask
+                        } else {
+                            pioneer_crud::ExecutionAdmissionClass::QueuedTask
+                        },
+                        principal_id: seed.initiating_principal_id,
+                        role_key: seed.role_key,
+                        workspace_id: task.workspace_id.clone(),
+                        policy_fingerprint: seed.policy_fingerprint,
+                        policy: seed.execution_resources,
+                    }),
+                })
+            })
+            .transpose()?;
+        let append_result = match execution_admission {
+            Some(admission) => {
+                self.projector
+                    .append_events_with_execution_admission(events, now, admission)
+                    .await
+            }
+            None => self.append_events(events, now).await,
+        };
+        let appended = match append_result {
             Ok(appended) => appended,
             Err(error) => {
                 if let Some(run_id) = inserted_conversation_snapshot_run_id.as_deref() {
@@ -1745,17 +1825,38 @@ impl TaskService {
 
     pub async fn wait_tasks(
         &self,
-        _context: TaskWaitContext,
+        context: TaskWaitContext,
         mut params: TaskWaitParams,
     ) -> TaskRuntimeResult<TaskWaitResponse> {
+        let budget = context.task_resource_budget.unwrap_or_default();
         if params.task_ids.is_empty() && params.run_ids.is_empty() {
             bail!("`task_ids` or `run_ids` is required");
         }
+        let target_count = params.task_ids.len().saturating_add(params.run_ids.len());
+        if target_count > budget.max_wait_targets {
+            bail!(
+                "task wait has {target_count} targets; maximum is {}",
+                budget.max_wait_targets
+            );
+        }
+        params.timeout_ms = Some(
+            params
+                .timeout_ms
+                .unwrap_or(budget.max_wait_duration_ms)
+                .min(budget.max_wait_duration_ms)
+                .max(1),
+        );
         if !params.return_completed && !params.return_pending {
             params.return_completed = true;
             params.return_pending = true;
         }
 
+        let scope = self.wait_scope_key(&context, &params).await?;
+        let governor = task_wait_governor(scope.as_str(), budget.max_concurrent_waits)?;
+        let _wait_permit = timeout(Duration::from_secs(1), governor.acquire_owned())
+            .await
+            .map_err(|_| anyhow!("task wait concurrency budget is exhausted"))?
+            .map_err(|_| anyhow!("task wait governor is closed"))?;
         let plan = self.build_wait_target_plan(&params).await?;
         let initial = self.collect_wait_state_for_plan(&plan).await?;
         if wait_condition_satisfied(&initial) {
@@ -1802,18 +1903,46 @@ impl TaskService {
             }
         };
 
-        if let Some(timeout_ms) = params.timeout_ms {
-            match timeout(Duration::from_millis(timeout_ms), wait_future).await {
-                Ok(response) => response,
-                Err(_) => {
-                    let mut response = self.collect_wait_state_for_plan(&plan).await?;
-                    response.timed_out = true;
-                    Ok(response)
-                }
+        let timeout_ms = params
+            .timeout_ms
+            .expect("Task wait admission always establishes a deadline");
+        match timeout(Duration::from_millis(timeout_ms), wait_future).await {
+            Ok(response) => response,
+            Err(_) => {
+                let mut response = self.collect_wait_state_for_plan(&plan).await?;
+                response.timed_out = true;
+                ensure_response_budget(&response, budget.max_response_bytes, "task wait")?;
+                Ok(response)
             }
-        } else {
-            wait_future.await
         }
+    }
+
+    async fn wait_scope_key(
+        &self,
+        context: &TaskWaitContext,
+        params: &TaskWaitParams,
+    ) -> TaskRuntimeResult<String> {
+        let actor = context.actor_id.as_deref().unwrap_or("internal");
+        let task_id = if let Some(task_id) = params.task_ids.first() {
+            Some(task_id.clone())
+        } else if let Some(run_id) = params.run_ids.first() {
+            self.store
+                .get_task_run(run_id.as_str())
+                .await?
+                .map(|run| run.task_id)
+        } else {
+            None
+        };
+        let workspace = if let Some(task_id) = task_id {
+            self.store
+                .get_task(task_id.as_str())
+                .await?
+                .map(|response| response.task.workspace_id)
+                .unwrap_or_else(|| "missing".to_owned())
+        } else {
+            "missing".to_owned()
+        };
+        Ok(format!("{actor}:{workspace}"))
     }
 
     pub async fn get_wait_state_snapshot(
@@ -2051,10 +2180,11 @@ impl TaskService {
 
     pub async fn update_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskUpdateParams,
     ) -> TaskRuntimeResult<TaskUpdateResponse> {
-        validate_update_params(&params)?;
+        let resource_budget = context.task_resource_budget.unwrap_or_default();
+        validate_update_params(&params, resource_budget)?;
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
@@ -2367,6 +2497,12 @@ impl TaskService {
             }
         }
 
+        TaskAdmissionNormalizer::new(resource_budget).validate_durable(
+            &task,
+            updated_trigger.as_ref().or(current_trigger.as_ref()),
+            updated_agent_spec.as_ref().or(base_agent_spec.as_ref()),
+        )?;
+
         if changed_fields.is_empty() {
             return Ok(TaskUpdateResponse {
                 task,
@@ -2564,7 +2700,19 @@ impl TaskService {
         &self,
         params: TaskAgendaParams,
     ) -> TaskRuntimeResult<TaskAgendaResponse> {
-        Ok(self.store.list_task_agenda(params).await?)
+        self.list_agenda_with_budget(params, TaskResourceBudget::default())
+            .await
+    }
+
+    pub async fn list_agenda_with_budget(
+        &self,
+        mut params: TaskAgendaParams,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskAgendaResponse> {
+        params.limit = Some(clamp_task_page_limit(params.limit, budget.max_page_items));
+        let response = self.store.list_task_agenda(params).await?;
+        ensure_response_budget(&response, budget.max_response_bytes, "task agenda")?;
+        Ok(response)
     }
 
     pub async fn list_agenda_scoped(
@@ -2572,17 +2720,42 @@ impl TaskService {
         params: TaskAgendaParams,
         access: &TaskRootAccessFilter,
     ) -> TaskRuntimeResult<TaskAgendaResponse> {
-        Ok(self
+        self.list_agenda_scoped_with_budget(params, access, TaskResourceBudget::default())
+            .await
+    }
+
+    pub async fn list_agenda_scoped_with_budget(
+        &self,
+        mut params: TaskAgendaParams,
+        access: &TaskRootAccessFilter,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskAgendaResponse> {
+        params.limit = Some(clamp_task_page_limit(params.limit, budget.max_page_items));
+        let response = self
             .store
             .list_task_agenda_scoped(params, Some(access))
-            .await?)
+            .await?;
+        ensure_response_budget(&response, budget.max_response_bytes, "task agenda")?;
+        Ok(response)
     }
 
     pub async fn list_deliveries(
         &self,
         params: TaskDeliveriesParams,
     ) -> TaskRuntimeResult<TaskDeliveriesResponse> {
-        Ok(self.store.list_task_deliveries(params).await?)
+        self.list_deliveries_with_budget(params, TaskResourceBudget::default())
+            .await
+    }
+
+    pub async fn list_deliveries_with_budget(
+        &self,
+        mut params: TaskDeliveriesParams,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskDeliveriesResponse> {
+        params.limit = Some(clamp_task_page_limit(params.limit, budget.max_page_items));
+        let response = self.store.list_task_deliveries(params).await?;
+        ensure_response_budget(&response, budget.max_response_bytes, "task deliveries")?;
+        Ok(response)
     }
 
     pub async fn list_deliveries_scoped(
@@ -2590,10 +2763,23 @@ impl TaskService {
         params: TaskDeliveriesParams,
         access: &TaskRootAccessFilter,
     ) -> TaskRuntimeResult<TaskDeliveriesResponse> {
-        Ok(self
+        self.list_deliveries_scoped_with_budget(params, access, TaskResourceBudget::default())
+            .await
+    }
+
+    pub async fn list_deliveries_scoped_with_budget(
+        &self,
+        mut params: TaskDeliveriesParams,
+        access: &TaskRootAccessFilter,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskDeliveriesResponse> {
+        params.limit = Some(clamp_task_page_limit(params.limit, budget.max_page_items));
+        let response = self
             .store
             .list_task_deliveries_scoped(params, Some(access))
-            .await?)
+            .await?;
+        ensure_response_budget(&response, budget.max_response_bytes, "task deliveries")?;
+        Ok(response)
     }
 
     pub async fn start_delivery(
@@ -2730,16 +2916,35 @@ impl TaskService {
     }
 
     pub async fn get_task(&self, params: TaskGetParams) -> TaskRuntimeResult<TaskGetResponse> {
-        self.store
+        self.get_task_with_budget(params, TaskResourceBudget::default())
+            .await
+    }
+
+    pub async fn get_task_with_budget(
+        &self,
+        params: TaskGetParams,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskGetResponse> {
+        let response = self
+            .store
             .get_task(params.task_id.as_str())
             .await?
-            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))
+            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))?;
+        ensure_response_budget(&response, budget.max_response_bytes, "task get")?;
+        Ok(response)
     }
 
     pub async fn list_tasks(&self, params: TaskListParams) -> TaskRuntimeResult<TaskListResponse> {
-        Ok(TaskListResponse {
-            tasks: self.store.list_tasks(params).await?,
-        })
+        self.list_tasks_with_budget(params, TaskResourceBudget::default())
+            .await
+    }
+
+    pub async fn list_tasks_with_budget(
+        &self,
+        params: TaskListParams,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskListResponse> {
+        self.list_tasks_with_access(params, None, budget).await
     }
 
     pub async fn list_tasks_scoped(
@@ -2747,29 +2952,94 @@ impl TaskService {
         params: TaskListParams,
         access: &TaskRootAccessFilter,
     ) -> TaskRuntimeResult<TaskListResponse> {
-        Ok(TaskListResponse {
-            tasks: self.store.list_tasks_scoped(params, Some(access)).await?,
-        })
+        self.list_tasks_scoped_with_budget(params, access, TaskResourceBudget::default())
+            .await
+    }
+
+    pub async fn list_tasks_scoped_with_budget(
+        &self,
+        params: TaskListParams,
+        access: &TaskRootAccessFilter,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskListResponse> {
+        self.list_tasks_with_access(params, Some(access), budget)
+            .await
+    }
+
+    async fn list_tasks_with_access(
+        &self,
+        mut params: TaskListParams,
+        access: Option<&TaskRootAccessFilter>,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskListResponse> {
+        let requested = params
+            .limit
+            .map(|limit| limit as usize)
+            .unwrap_or(budget.max_page_items)
+            .min(budget.max_page_items)
+            .max(1);
+        let cursor = params.cursor.unwrap_or_default();
+        params.limit = Some((requested.saturating_add(1)) as u32);
+        let mut tasks = self.store.list_tasks_scoped(params, access).await?;
+        let has_more = tasks.len() > requested;
+        tasks.truncate(requested);
+        let response = TaskListResponse {
+            next_cursor: has_more.then_some(cursor.saturating_add(tasks.len() as u64)),
+            tasks,
+        };
+        ensure_response_budget(&response, budget.max_response_bytes, "task list")?;
+        Ok(response)
     }
 
     pub async fn get_task_tree(
         &self,
         params: TaskTreeParams,
     ) -> TaskRuntimeResult<TaskTreeResponse> {
-        self.store
-            .get_task_tree(params.task_id.as_str())
+        self.get_task_tree_with_budget(params, TaskResourceBudget::default())
+            .await
+    }
+
+    pub async fn get_task_tree_with_budget(
+        &self,
+        params: TaskTreeParams,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskTreeResponse> {
+        let tree = self
+            .store
+            .get_task_tree_bounded(params.task_id.as_str(), budget.max_tree_nodes)
             .await?
-            .map(|tree| TaskTreeResponse { tree })
-            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))
+            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))?;
+        validate_tree_depth(&tree, budget.max_tree_depth)?;
+        let response = TaskTreeResponse { tree };
+        ensure_response_budget(&response, budget.max_response_bytes, "task tree")?;
+        Ok(response)
     }
 
     pub async fn get_task_events(
         &self,
         params: TaskEventsParams,
     ) -> TaskRuntimeResult<TaskEventsResponse> {
-        self.store
-            .get_task_events(params.task_id.as_str(), params.after_sequence)
+        self.get_task_events_with_budget(params, TaskResourceBudget::default())
             .await
+    }
+
+    pub async fn get_task_events_with_budget(
+        &self,
+        params: TaskEventsParams,
+        budget: TaskResourceBudget,
+    ) -> TaskRuntimeResult<TaskEventsResponse> {
+        let limit = params
+            .limit
+            .map(|limit| limit as usize)
+            .unwrap_or(budget.max_event_page_items)
+            .min(budget.max_event_page_items)
+            .max(1);
+        let response = self
+            .store
+            .get_task_events_page(params.task_id.as_str(), params.after_sequence, limit)
+            .await?;
+        ensure_response_budget(&response, budget.max_response_bytes, "task events")?;
+        Ok(response)
     }
 
     pub async fn list_task_events_after(
@@ -3089,9 +3359,33 @@ impl TaskService {
     async fn parent_context(
         &self,
         parent_task_id: Option<&str>,
+        workspace_id: &str,
+        initiating_thread_id: Option<&str>,
     ) -> TaskRuntimeResult<ParentContext> {
         if let Some(parent_task_id) = parent_task_id {
             if let Some(parent) = self.store.get_task(parent_task_id).await? {
+                if parent.task.workspace_id != workspace_id {
+                    bail!("parent task belongs to another workspace");
+                }
+                let parent_thread_id = parent
+                    .task
+                    .created_by_thread_id
+                    .as_deref()
+                    .or_else(|| {
+                        (parent.task.owner_kind == TaskOwnerKind::Thread)
+                            .then_some(parent.task.owner_id.as_deref())
+                            .flatten()
+                    })
+                    .ok_or_else(|| anyhow!("parent task has no collaboration root"))?;
+                let initiating_thread_id = initiating_thread_id
+                    .ok_or_else(|| anyhow!("child task has no initiating collaboration root"))?;
+                let parent_root = self.collaboration_root_thread_id(parent_thread_id).await?;
+                let child_root = self
+                    .collaboration_root_thread_id(initiating_thread_id)
+                    .await?;
+                if parent_root != child_root {
+                    bail!("parent task belongs to another collaboration capsule");
+                }
                 let parent_spec = parent.agent_specs.last();
                 let parent_depth = parent_spec.map(|spec| spec.depth).unwrap_or(0);
                 let max_depth = parent_spec
@@ -3116,6 +3410,15 @@ impl TaskService {
             depth: 1,
             max_depth: DEFAULT_MAX_TASK_DEPTH,
         })
+    }
+
+    async fn collaboration_root_thread_id(&self, thread_id: &str) -> TaskRuntimeResult<String> {
+        Ok(self
+            .store
+            .get_task_thread_lineage(thread_id)
+            .await?
+            .map(|lineage| lineage.root_thread_id)
+            .unwrap_or_else(|| thread_id.to_owned()))
     }
 
     async fn collect_wait_state(
@@ -3320,7 +3623,11 @@ impl TaskService {
         response.total_count = response
             .total_count
             .saturating_add(response.non_waitable_count);
-
+        ensure_response_budget(
+            &response,
+            TaskResourceBudget::default().max_response_bytes,
+            "task wait",
+        )?;
         Ok(response)
     }
 
@@ -3816,7 +4123,11 @@ fn write_lock_paths_overlap(left: &str, right: &str) -> bool {
     left_parts.starts_with(right_parts.as_slice()) || right_parts.starts_with(left_parts.as_slice())
 }
 
-fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
+fn validate_create_params(
+    params: &TaskCreateParams,
+    resource_budget: TaskResourceBudget,
+) -> TaskRuntimeResult<()> {
+    TaskAdmissionNormalizer::new(resource_budget).validate_create(params)?;
     if params.workspace_id.trim().is_empty() {
         bail!("workspace_id is required");
     }
@@ -3925,7 +4236,11 @@ fn validate_composer_work_create_params(params: &TaskCreateParams) -> TaskRuntim
     Ok(())
 }
 
-fn validate_update_params(params: &TaskUpdateParams) -> TaskRuntimeResult<()> {
+fn validate_update_params(
+    params: &TaskUpdateParams,
+    resource_budget: TaskResourceBudget,
+) -> TaskRuntimeResult<()> {
+    TaskAdmissionNormalizer::new(resource_budget).validate_update(params)?;
     required_trimmed(params.task_id.as_str(), "task_id")?;
     if params.clear_input && (params.input_text.is_some() || params.input.is_some()) {
         bail!("task update cannot clear and set input in the same request");
@@ -4326,8 +4641,8 @@ fn validate_review_event_actor(
 }
 
 fn validate_user_can_review_task(user_id: &str, task: &Task) -> TaskRuntimeResult<()> {
-    if task.owner_kind == TaskOwnerKind::User && task.owner_id.as_deref() != Some(user_id) {
-        bail!("user `{user_id}` cannot review task `{}`", task.id);
+    if user_id.trim().is_empty() {
+        bail!("task `{}` review requires an exact user actor", task.id);
     }
     Ok(())
 }
@@ -4724,6 +5039,77 @@ fn empty_wait_response(mode: TaskWaitMode) -> TaskWaitResponse {
 
 fn usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn task_wait_governor(
+    scope: &str,
+    max_concurrent_waits: usize,
+) -> TaskRuntimeResult<Arc<tokio::sync::Semaphore>> {
+    if max_concurrent_waits == 0 {
+        bail!("task wait concurrency budget must be positive");
+    }
+    let governors = TASK_WAIT_GOVERNORS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut governors = governors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    governors.retain(|_, governor| governor.strong_count() > 0);
+    if let Some(governor) = governors.get(scope).and_then(Weak::upgrade) {
+        return Ok(governor);
+    }
+    if governors.len() >= MAX_WAIT_GOVERNOR_SCOPES {
+        bail!("task wait governor scope budget is exhausted");
+    }
+    let governor = Arc::new(tokio::sync::Semaphore::new(max_concurrent_waits));
+    governors.insert(scope.to_owned(), Arc::downgrade(&governor));
+    Ok(governor)
+}
+
+fn validate_tree_depth(tree: &TaskTree, maximum: usize) -> TaskRuntimeResult<()> {
+    let mut stack = vec![(tree, 1usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > maximum {
+            bail!("task tree exceeds server depth budget of {maximum}");
+        }
+        stack.extend(node.children.iter().map(|child| (child, depth + 1)));
+    }
+    Ok(())
+}
+
+fn clamp_task_page_limit(requested: Option<u32>, maximum: usize) -> u32 {
+    let maximum = maximum.min(u32::MAX as usize).max(1) as u32;
+    requested.unwrap_or(maximum).max(1).min(maximum)
+}
+
+fn ensure_response_budget<T: serde::Serialize>(
+    response: &T,
+    maximum: usize,
+    operation: &str,
+) -> TaskRuntimeResult<()> {
+    struct Counter {
+        bytes: usize,
+        maximum: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self.bytes.checked_add(buffer.len()).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::FileTooLarge, "response size overflow")
+            })?;
+            if self.bytes > self.maximum {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    "response budget exceeded",
+                ));
+            }
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, maximum };
+    serde_json::to_writer(&mut counter, response)
+        .map_err(|_| anyhow!("{operation} response exceeds server byte budget"))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

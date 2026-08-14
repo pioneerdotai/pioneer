@@ -50,7 +50,10 @@ impl MessageProcessor {
             .mcp_service
             .runtime_snapshot("workspace", workspace_id.as_str())
             .await;
-        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
+        let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator);
         let mut servers = Vec::with_capacity(rows.len());
         for row in &rows {
             let catalog = match row.id.as_deref() {
@@ -103,6 +106,13 @@ impl MessageProcessor {
             // usable capabilities, not a management inventory. Disabled
             // installations remain visible only to Gateway administrators.
             if member && !item.policy.enabled {
+                continue;
+            }
+            if !crate::authorization::AuthorizationService::new().mcp_server_allowed(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
+                item.id.as_str(),
+            ) {
                 continue;
             }
             servers.push(item);

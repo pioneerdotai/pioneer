@@ -51,7 +51,9 @@ use pioneer_protocol::{
     SkillsUpdateResponse, SkillsUploadAbortParams, SkillsUploadAbortResponse,
     SkillsUploadFinishParams, SkillsUploadFinishResponse, SkillsUploadStartParams,
     SkillsUploadStartResponse, TaskAcceptParams, TaskAcceptResponse, TaskCancelParams,
-    TaskCancelResponse, TaskReviseParams, TaskReviseResponse, ThreadAgentsDocArchiveParams,
+    TaskCancelResponse, TaskReviseParams, TaskReviseResponse,
+    TaskUserNotificationAcknowledgeParams, TaskUserNotificationAcknowledgeResponse,
+    TaskUserNotificationListParams, TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
     ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocResolveForThreadResponse,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFolderCreateParams,
@@ -1016,14 +1018,64 @@ where
     send_json_rpc_request_typed(transport, methods::TURN_GET, &params, RPC_REQUEST_TIMEOUT)
 }
 
-pub fn turn_items<TTransport>(
+pub fn turn_items_page<TTransport>(
     transport: &TTransport,
     params: TurnItemsParams,
 ) -> Result<TurnItemsResponse>
 where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
-    send_json_rpc_request_typed(transport, methods::TURN_ITEMS, &params, RPC_REQUEST_TIMEOUT)
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_ITEMS_PAGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn task_user_notification_list<TTransport>(
+    transport: &TTransport,
+    params: TaskUserNotificationListParams,
+) -> Result<TaskUserNotificationListResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::TASK_USER_NOTIFICATION_LIST,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::TASK_USER_NOTIFICATION_LIST,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn task_user_notification_acknowledge<TTransport>(
+    transport: &TTransport,
+    params: TaskUserNotificationAcknowledgeParams,
+) -> Result<TaskUserNotificationAcknowledgeResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.workspace_id.as_str(),
+        "workspace_id",
+        methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE,
+    )?;
+    require_non_empty_field(
+        params.notification_id.as_str(),
+        "notification_id",
+        methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
 }
 
 pub fn turn_work_page<TTransport>(
@@ -2825,7 +2877,13 @@ mod tests {
         let principal_id = "PAAAAAAAAAAAAAAAAAAAA";
         let invitation_id = "IAAAAAAAAAAAAAAAAAAAA";
 
-        let _ = invitation_create(&transport, params(json!({"workspace_ids": [workspace_id]})));
+        let _ = invitation_create(
+            &transport,
+            params(json!({
+                "role_key": "member",
+                "workspace_ids": [workspace_id]
+            })),
+        );
         let _ = invitation_list(&transport, InvitationListParams::default());
         let _ = invitation_revoke(&transport, params(json!({"invitation_id": invitation_id})));
         let _ = member_list(&transport, MemberListParams::default());

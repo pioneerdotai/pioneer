@@ -1,0 +1,343 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorizationExecutionDraftPolicyProjection",
+  "type": "object",
+  "properties": {
+    "can_attach_artifacts": {
+      "type": "boolean"
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "mcp_invocation_limits": {
+      "$ref": "#/$defs/McpInvocationResourceLimits"
+    },
+    "permission_options": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AuthorizationAgentPermissionOption"
+      }
+    },
+    "resources": {
+      "$ref": "#/$defs/AuthorizationOperationalResourceProjection"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "fingerprint",
+    "resources",
+    "permission_options",
+    "can_attach_artifacts",
+    "mcp_invocation_limits"
+  ],
+  "$defs": {
+    "AuthorizationAgentPermissionOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "locked": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationPermissionLock"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "description",
+        "mode",
+        "effective_policy"
+      ]
+    },
+    "AuthorizationCliModelGrant": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "runtime_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "runtime_id",
+        "model"
+      ]
+    },
+    "AuthorizationOperationalResourceProjection": {
+      "type": "object",
+      "properties": {
+        "cli_models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationCliModelGrant"
+          }
+        },
+        "cli_models_all": {
+          "description": "Same contract as `provider_models_all`, scoped to allowed CLI runtimes.",
+          "type": "boolean"
+        },
+        "cli_runtimes": {
+          "$ref": "#/$defs/AuthorizationResourceSelector"
+        },
+        "fingerprint": {
+          "description": "Opaque receipt over role policy, workspace and authorization revision.",
+          "type": "string"
+        },
+        "mcp_servers": {
+          "$ref": "#/$defs/AuthorizationResourceSelector"
+        },
+        "provider_models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationProviderModelGrant"
+          }
+        },
+        "provider_models_all": {
+          "description": "`true` means every model of an allowed provider; `false` means the\nexact grants below. The flag preserves the distinction between an\nunrestricted model set and an intentionally empty one.",
+          "type": "boolean"
+        },
+        "providers": {
+          "$ref": "#/$defs/AuthorizationResourceSelector"
+        },
+        "skills": {
+          "$ref": "#/$defs/AuthorizationResourceSelector"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "providers",
+        "provider_models_all",
+        "cli_runtimes",
+        "cli_models_all",
+        "skills",
+        "mcp_servers"
+      ]
+    },
+    "AuthorizationPermissionLock": {
+      "type": "object",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "reason"
+      ]
+    },
+    "AuthorizationProviderModelGrant": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
+    "AuthorizationResourceSelector": {
+      "description": "Role-scoped constraints used by discovery and exact admission. `all=true`\nmeans every operationally enabled resource of that kind; otherwise only\nthe listed stable identifiers are visible and usable.",
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "boolean"
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "all"
+      ]
+    },
+    "McpInvocationResourceLimits": {
+      "description": "Server-owned MCP invocation envelope. Clients may present these limits,\nwhile the Gateway enforces the same immutable values for every backend.",
+      "type": "object",
+      "properties": {
+        "max_arguments_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_arguments_depth": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_concurrent_calls": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_queued_calls": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_decoded_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_depth": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_media": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_tokens": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_result_wire_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_timeout_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "profile_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile_version",
+        "max_arguments_bytes",
+        "max_arguments_depth",
+        "max_result_wire_bytes",
+        "max_result_decoded_bytes",
+        "max_result_depth",
+        "max_result_tokens",
+        "max_result_media",
+        "max_timeout_ms",
+        "max_concurrent_calls",
+        "max_queued_calls"
+      ]
+    },
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    }
+  }
+}

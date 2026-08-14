@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use pioneer_entity::{
     artifact, artifact_binding, auth_session, mcp_server_installation, skill_workspace_policy,
-    task, task_run, thread, thread_lineage, turn, workspace,
+    task, task_execution_admission, task_run, thread, thread_lineage, turn, workspace,
 };
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
 use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter};
@@ -453,7 +453,7 @@ pub async fn resolve_task_authorization_scope<C: ConnectionTrait>(
         model.clone()
     };
 
-    let mut root_thread_id = root.created_by_thread_id.clone().or_else(|| {
+    let mut creating_thread_id = root.created_by_thread_id.clone().or_else(|| {
         (root.owner_kind == "thread")
             .then(|| root.owner_id.clone())
             .flatten()
@@ -463,15 +463,36 @@ pub async fn resolve_task_authorization_scope<C: ConnectionTrait>(
             db,
             turn_id.as_str(),
             Some(model.workspace_id.as_str()),
-            root_thread_id.as_deref(),
+            creating_thread_id.as_deref(),
         )
         .await?
         else {
             return Ok(None);
         };
-        root_thread_id.get_or_insert(turn_scope.thread_id);
+        creating_thread_id.get_or_insert(turn_scope.thread_id);
     }
+
+    // `created_by_thread_id` is exact causal provenance and may identify an
+    // internal child. Authorization belongs to that child's durable
+    // collaboration root, never to the initiating principal and never to the
+    // internal row itself.
+    let root_thread_id = match creating_thread_id.as_deref() {
+        Some(thread_id) => {
+            artifact_authorization_root_thread_id(db, model.workspace_id.as_str(), thread_id)
+                .await?
+        }
+        None => None,
+    };
     if expected_root_thread_id.is_some_and(|expected| root_thread_id.as_deref() != Some(expected)) {
+        return Ok(None);
+    }
+
+    if let Some(admission) = task_execution_admission::Entity::find_by_id(model.id.clone())
+        .one(db)
+        .await
+        .context("failed to resolve Task execution admission authority")?
+        && root_thread_id.as_deref() != Some(admission.root_thread_id.as_str())
+    {
         return Ok(None);
     }
     let root_thread = match root_thread_id.as_deref() {
@@ -485,6 +506,9 @@ pub async fn resolve_task_authorization_scope<C: ConnectionTrait>(
             else {
                 return Ok(None);
             };
+            if scope.access_class == PersistedThreadAccessClass::Internal {
+                return Ok(None);
+            }
             Some(scope)
         }
         None => None,
@@ -537,17 +561,17 @@ pub async fn resolve_persisted_capability_authorization_scope<C: ConnectionTrait
     };
     let enabled = match kind {
         PersistedCapabilityScopeKind::Skill => {
-            // The policy row is the durable workspace grant. The exact live
-            // package or learned-version identity is resolved by the skill
-            // projection boundary because bundled system skills deliberately
-            // have no `skill_installation` row.
+            // Absence of an override inherits the server-owned global default;
+            // an explicit false is the only durable local deny. The exact
+            // effective policy and live package identity are resolved by the
+            // shared skill projection boundary.
             skill_workspace_policy::Entity::find()
                 .filter(skill_workspace_policy::Column::WorkspaceId.eq(workspace_id.to_owned()))
                 .filter(skill_workspace_policy::Column::SkillId.eq(capability_id.to_owned()))
                 .one(db)
                 .await
                 .context("failed to resolve workspace skill capability policy")?
-                .is_some_and(|policy| policy.enabled == Some(true))
+                .map_or(true, |policy| policy.enabled != Some(false))
         }
         PersistedCapabilityScopeKind::McpServer => {
             let Some(server) = mcp_server_installation::Entity::find()

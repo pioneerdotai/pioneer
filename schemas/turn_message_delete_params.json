@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnMessageDeleteParams",
+  "type": "object",
+  "properties": {
+    "expected_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id",
+    "turn_id",
+    "expected_revision"
+  ]
+}

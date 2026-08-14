@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskResultCandidate",
+  "type": "object",
+  "properties": {
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "id": {
+      "type": "string"
+    },
+    "result": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PublicTaskResult"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "round": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "runId": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskResultCandidateStatus"
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "updatedAt": {
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "required": [
+    "id",
+    "taskId",
+    "runId",
+    "round",
+    "status",
+    "createdAt",
+    "updatedAt"
+  ],
+  "$defs": {
+    "PublicTaskArtifact": {
+      "type": "object",
+      "properties": {
+        "artifactId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "PublicTaskResult": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PublicTaskArtifact"
+          }
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TaskResultCandidateStatus": {
+      "type": "string",
+      "enum": [
+        "pending_review",
+        "accepted",
+        "rejected",
+        "superseded",
+        "extraction_failed",
+        "cancelled"
+      ]
+    }
+  }
+}

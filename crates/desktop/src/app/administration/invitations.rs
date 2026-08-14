@@ -15,7 +15,7 @@ use pioneer_client::{
 };
 use pioneer_protocol::{
     InvitationCreateParams, InvitationId, InvitationListParams, InvitationRevokeParams,
-    InvitationSummary, WorkspaceId,
+    InvitationSummary, RoleKey, WorkspaceId,
 };
 use std::collections::HashSet;
 
@@ -33,15 +33,17 @@ enum InvitationDialogPhase {
 struct InvitationDialogState {
     phase: InvitationDialogPhase,
     selected: HashSet<String>,
+    selected_role_key: Option<String>,
     creating: bool,
     error: Option<String>,
 }
 
 impl InvitationDialogState {
-    fn new() -> Self {
+    fn new(selected_role_key: Option<String>) -> Self {
         Self {
             phase: InvitationDialogPhase::Create,
             selected: HashSet::new(),
+            selected_role_key,
             creating: false,
             error: None,
         }
@@ -59,6 +61,7 @@ impl InvitationDialogState {
     fn clear(&mut self) {
         self.phase = InvitationDialogPhase::Closed;
         self.selected.clear();
+        self.selected_role_key = None;
         self.creating = false;
         self.error = None;
     }
@@ -70,6 +73,7 @@ impl std::fmt::Debug for InvitationDialogState {
             .debug_struct("InvitationDialogState")
             .field("phase", &"[redacted]")
             .field("selected_count", &self.selected.len())
+            .field("has_selected_role", &self.selected_role_key.is_some())
             .field("creating", &self.creating)
             .finish()
     }
@@ -181,6 +185,7 @@ impl PioneerDesktop {
                 .disabled(
                     self.gateway.connection_state != GatewayConnectionState::Connected
                         || self.workspaces.is_empty()
+                        || self.authorized_invitation_role_options().is_empty()
                         || self.administration.pending_action()
                             != &pioneer_client::administration::AdministrationPendingAction::Idle,
                 )
@@ -272,22 +277,29 @@ impl PioneerDesktop {
             return;
         }
 
-        let workspace_ids = {
+        let (role_key, workspace_ids) = {
             let snapshot = state.read(cx);
             if snapshot.creating || !matches!(&snapshot.phase, InvitationDialogPhase::Create) {
                 return;
             }
-            snapshot
+            let role_key = snapshot
+                .selected_role_key
+                .as_deref()
+                .and_then(|value| RoleKey::new(value.to_owned()).ok());
+            let workspace_ids = snapshot
                 .selected
                 .iter()
                 .cloned()
                 .map(WorkspaceId::new)
-                .collect::<Result<Vec<_>, _>>()
+                .collect::<Result<Vec<_>, _>>();
+            (role_key, workspace_ids)
         };
 
-        let params = workspace_ids
-            .ok()
-            .and_then(|workspace_ids| InvitationCreateParams::new(workspace_ids).ok());
+        let params = role_key
+            .zip(workspace_ids.ok())
+            .and_then(|(role_key, workspace_ids)| {
+                InvitationCreateParams::new_for_role(role_key, workspace_ids).ok()
+            });
         let Some(params) = params else {
             state.update(cx, |state, cx| {
                 state.error = Some(t!("settings.invitations.invalid_selection").to_string());
@@ -436,7 +448,12 @@ impl PioneerDesktop {
             .iter()
             .map(|workspace| (workspace.id.clone(), workspace.name.clone()))
             .collect::<Vec<_>>();
-        let state = cx.new(|_| InvitationDialogState::new());
+        let role_options = self.authorized_invitation_role_options().to_vec();
+        let selected_role_key = role_options
+            .iter()
+            .find(|option| option.is_default)
+            .map(|option| option.role.key.clone());
+        let state = cx.new(|_| InvitationDialogState::new(selected_role_key));
         let desktop = cx.entity().clone();
 
         window.open_dialog(cx, move |dialog, window, cx| {
@@ -452,6 +469,52 @@ impl PioneerDesktop {
                         .pb_5()
                         .gap_4()
                         .items_start()
+                        .child(
+                            field()
+                                .w_full()
+                                .items_start()
+                                .label(t!("settings.invitations.role").to_string())
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .justify_start()
+                                        .flex_wrap()
+                                        .gap_1p5()
+                                        .children(role_options.iter().enumerate().map(
+                                            |(index, option)| {
+                                                let role_key = option.role.key.clone();
+                                                let selected =
+                                                    snapshot.selected_role_key.as_deref()
+                                                        == Some(role_key.as_str());
+                                                Toggle::new(("invitation-role-toggle", index))
+                                                    .small()
+                                                    .checked(selected)
+                                                    .disabled(snapshot.creating)
+                                                    .label(option.role.display_name.clone())
+                                                    .rounded_full()
+                                                    .h_8()
+                                                    .px_3()
+                                                    .text_sm()
+                                                    .when(!selected, |toggle| {
+                                                        toggle
+                                                            .border_1()
+                                                            .border_color(cx.theme().border)
+                                                    })
+                                                    .on_click({
+                                                        let state = state.clone();
+                                                        move |_, _, cx| {
+                                                            state.update(cx, |state, cx| {
+                                                                state.selected_role_key =
+                                                                    Some(role_key.clone());
+                                                                state.error = None;
+                                                                cx.notify();
+                                                            });
+                                                        }
+                                                    })
+                                            },
+                                        )),
+                                ),
+                        )
                         .child(
                             field()
                                 .w_full()
@@ -562,7 +625,11 @@ impl PioneerDesktop {
                                     }),
                             )
                             .loading(snapshot.creating)
-                            .disabled(snapshot.selected.is_empty() || snapshot.creating)
+                            .disabled(
+                                snapshot.selected.is_empty()
+                                    || snapshot.selected_role_key.is_none()
+                                    || snapshot.creating,
+                            )
                             .on_click({
                                 let desktop = desktop.clone();
                                 let state = state.clone();
@@ -765,7 +832,7 @@ mod tests {
         let source = include_str!("invitations.rs");
         assert!(source.contains("can_view_invitations"));
         assert!(source.contains("invitation_next_cursor"));
-        assert!(source.contains("InvitationCreateParams::new"));
+        assert!(source.contains("InvitationCreateParams::new_for_role"));
         assert!(source.contains("CredentialPresentationForm::new"));
         assert!(source.contains("confirm_revoke_invitation"));
         assert!(source.contains("finish_conflicted_action"));

@@ -44,10 +44,11 @@ impl PioneerDesktop {
                 .into_any_element();
         };
 
-        match details {
-            Some(details) => self.sync_mcp_details_tables(details.audit.as_slice(), cx),
-            None => self.sync_mcp_details_tables(&[], cx),
-        }
+        let audit = details
+            .and_then(|details| details.management.as_ref())
+            .map(|management| management.audit.as_slice())
+            .unwrap_or(&[]);
+        self.sync_mcp_details_tables(audit, cx);
 
         let is_pending = self.is_mcp_pending(server.name.as_str());
         let can_manage_capabilities = self
@@ -325,7 +326,9 @@ impl PioneerDesktop {
         grid_columns: u16,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let health = details.map(|details| &details.health);
+        let health = details
+            .and_then(|details| details.management.as_ref())
+            .map(|management| &management.health);
         let health_rows = mcp_presentation::mcp_health_rows(server, details);
 
         let mut grid = div().w_full().grid().grid_cols(grid_columns).gap_4();
@@ -510,7 +513,8 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let audit = details
-            .map(|details| details.audit.as_slice())
+            .and_then(|details| details.management.as_ref())
+            .map(|management| management.audit.as_slice())
             .unwrap_or(&[]);
         let content = if audit.is_empty() {
             None

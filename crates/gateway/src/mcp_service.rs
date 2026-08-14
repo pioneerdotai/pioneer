@@ -54,7 +54,8 @@ use crate::turn_mcp::{
 use crate::{
     auth::GatewayAuthService,
     authorization::{
-        ActionGateDecision, AuthorizationInvalidationHub, AuthorizationService, ResourceAction,
+        ActionGateDecision, AuthorizationInvalidationHub, AuthorizationService,
+        ExecutionLeaseRegistry, ResourceAction,
     },
 };
 
@@ -66,6 +67,8 @@ pub(crate) struct McpService {
 struct McpServiceInner {
     crud_store: Arc<CrudStore>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
+    execution_leases: Arc<ExecutionLeaseRegistry>,
+    invocation_governor: Arc<crate::turn_mcp::invoker::McpInvocationGovernor>,
     session_manager: Arc<SessionManager>,
     auth_service: RwLock<Option<Arc<GatewayAuthService>>>,
     gateway_secrets: Arc<GatewaySecrets>,
@@ -212,12 +215,17 @@ impl McpService {
         gateway_secrets: Arc<GatewaySecrets>,
         snapshot_version: Arc<AtomicU64>,
         authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
+        execution_leases: Arc<ExecutionLeaseRegistry>,
     ) -> Self {
         let projection_persistence = TurnMcpPersistenceCoordinator::new(crud_store.clone());
         Self {
             inner: Arc::new(McpServiceInner {
                 crud_store,
                 authorization_invalidation_hub,
+                execution_leases,
+                invocation_governor: Arc::new(
+                    crate::turn_mcp::invoker::McpInvocationGovernor::default(),
+                ),
                 session_manager,
                 auth_service: RwLock::new(None),
                 gateway_secrets,
@@ -320,6 +328,8 @@ impl McpService {
             shared.clone(),
             shared,
             self.inner.authorization_invalidation_hub.clone(),
+            self.inner.execution_leases.clone(),
+            self.inner.invocation_governor.clone(),
         )
     }
 
@@ -1708,6 +1718,7 @@ impl McpService {
                             .call_tool(
                                 raw_tool_name.as_str(),
                                 arguments,
+                                pioneer_mcp::McpInvocationBudget::default(),
                                 Duration::from_millis(command.request.timeout_ms.max(1)),
                                 command.cancellation,
                             )
@@ -1827,12 +1838,24 @@ impl McpService {
                     state: protocol_runtime_state(snapshot.state),
                     live: snapshot.live,
                     last_seen_at: snapshot.last_seen_at_unix,
-                    last_error: snapshot.last_error.clone(),
                 },
                 status: McpServerStatus::from(protocol_runtime_state(snapshot.state)),
-                status_reason: snapshot.status_reason.clone(),
             },
         };
+        let policy_change = self
+            .inner
+            .authorization_invalidation_hub
+            .publish_change(
+                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
+                pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
+                    workspace_id: row.scope_key.clone(),
+                    selector: "mcp_runtime_status".to_owned(),
+                },
+            )
+            .await
+            .expect("MCP status change must advance durable policy generation");
+        self.send_workspace_authorization_notification(row.scope_key.as_str(), &policy_change)
+            .await;
         self.send_management_notification(events::MCP_SERVER_STATUS_CHANGED, &notification)
             .await;
     }
@@ -1906,6 +1929,20 @@ impl McpService {
             resource_templates_count: catalog.resource_templates_count(),
             prompts_count: catalog.prompts_count(),
         };
+        let policy_change = self
+            .inner
+            .authorization_invalidation_hub
+            .publish_change(
+                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
+                pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
+                    workspace_id: row.scope_key.clone(),
+                    selector: "mcp_catalog".to_owned(),
+                },
+            )
+            .await
+            .expect("MCP catalog change must advance durable policy generation");
+        self.send_workspace_authorization_notification(row.scope_key.as_str(), &policy_change)
+            .await;
         self.send_management_notification(events::MCP_SERVER_CATALOG_CHANGED, &notification)
             .await;
     }
@@ -2044,6 +2081,111 @@ impl McpService {
         }
     }
 
+    async fn send_workspace_authorization_notification<T: Serialize>(
+        &self,
+        workspace_id: &str,
+        payload: &T,
+    ) {
+        let candidates = self.inner.session_manager.connection_ids().await;
+        let initially_authorized = self
+            .authorized_workspace_notification_recipients(workspace_id, candidates)
+            .await;
+        if initially_authorized.is_empty() {
+            return;
+        }
+        let serialization_authorized = self
+            .authorized_workspace_notification_recipients(workspace_id, initially_authorized)
+            .await;
+        if serialization_authorized.is_empty() {
+            return;
+        }
+        let notification = match JsonRpcNotification::from_params(
+            events::AUTHORIZATION_PROJECTION_CHANGED,
+            payload,
+        ) {
+            Ok(notification) => notification,
+            Err(error) => {
+                error!(error = %error, "failed to encode MCP authorization notification");
+                return;
+            }
+        };
+        let serialized = match serde_json::to_string(&notification) {
+            Ok(payload) => payload,
+            Err(error) => {
+                error!(error = %error, "failed to serialize MCP authorization notification");
+                return;
+            }
+        };
+        let authorized = self
+            .authorized_workspace_notification_recipients(workspace_id, serialization_authorized)
+            .await;
+        for connection_id in authorized {
+            if let Err(error) = self
+                .inner
+                .session_manager
+                .send_text(connection_id, serialized.clone())
+                .await
+            {
+                warn!(
+                    connection_id,
+                    error = %format!("{error:#}"),
+                    "failed to send MCP authorization notification"
+                );
+            }
+        }
+    }
+
+    async fn authorized_workspace_notification_recipients(
+        &self,
+        workspace_id: &str,
+        candidate_connection_ids: Vec<u64>,
+    ) -> Vec<u64> {
+        let auth_service = self
+            .inner
+            .auth_service
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let authorization_service = AuthorizationService::new();
+        let resolver = crate::authorization::AuthorizationResolver::new(
+            self.inner.crud_store.as_ref().clone(),
+        );
+        let mut connection_ids = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .inner
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if let Some(auth_service) = auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
+            let action = ResourceAction::WorkspaceRead;
+            let gate = authorization_service.authorize_action(
+                principal.kind,
+                principal.role_key.as_ref(),
+                action,
+            );
+            if matches!(
+                resolver
+                    .authorize_workspace(principal.as_ref(), &gate, action, workspace_id)
+                    .await,
+                Ok(crate::authorization::ProofResolution::Authorized(_))
+            ) {
+                connection_ids.push(connection_id);
+            }
+        }
+        connection_ids
+    }
+
     async fn authorized_management_notification_recipients(
         &self,
         candidate_connection_ids: Vec<u64>,
@@ -2078,7 +2220,7 @@ impl McpService {
                 principal.role_key.as_ref(),
                 ResourceAction::McpManage,
             );
-            if action_gate == ActionGateDecision::AllowSuperuser {
+            if action_gate == ActionGateDecision::AllowAbsolute {
                 connection_ids.push(connection_id);
             }
         }
@@ -2364,7 +2506,13 @@ impl TurnMcpValidatedExecution for McpService {
                 ),
                 parameters: validated.current_tool.canonical_schema.clone(),
                 annotations,
-                timeout_ms: Some(validated.current_tool.effective_timeout_ms),
+                timeout_ms: Some(
+                    validated
+                        .current_tool
+                        .effective_timeout_ms
+                        .min(validated.invocation_limits.max_timeout_ms)
+                        .max(1),
+                ),
                 selection_reason: validated.binding.selection_reason.clone(),
                 capability_id: validated.binding.capability_id.clone(),
             };
@@ -2509,6 +2657,7 @@ impl McpService {
                 "provider_schema_fingerprint": validated.binding.provider_schema_fingerprint.as_str(),
                 "annotations_digest": validated.binding.annotations_digest.as_str(),
                 "runtime_generation": validated.binding.runtime_generation,
+                "mcp_resource_profile_version": validated.invocation_limits.profile_version,
                 "is_error": is_error,
                 "duration_ms": duration_ms,
             })
@@ -3038,7 +3187,9 @@ mod tests {
     use crate::auth::AuthenticatedSessionPrincipal;
     use crate::authorization::ExecutionAuthorizationContext;
     use crate::bootstrap::bootstrap;
-    use crate::session::test_support::authenticated_test_superuser;
+    use crate::session::test_support::{
+        authenticated_test_superuser, ensure_test_superuser_execution_authority,
+    };
     use crate::turn_mcp::invoker::{
         GatewayTurnMcpInvoker, TurnMcpInvocation, TurnMcpInvocationError,
         TurnMcpInvocationErrorCode, TurnMcpInvocationOrigin, TurnMcpInvoker,
@@ -3047,15 +3198,18 @@ mod tests {
     use crate::turn_mcp::result::CanonicalMcpToolResult;
     use crate::workspace::DEFAULT_WORKSPACE_ID;
     use migration::{Migrator, MigratorTrait};
-    use pioneer_crud::{CliRuntimeTurnMcpMetadata, NewCliRuntimeTurnBinding};
+    use pioneer_crud::{
+        CliRuntimeTurnMcpMetadata, NewCliRuntimeTurnBinding, NewTaskExecutionAdmission,
+    };
     use pioneer_entity::turn;
     use pioneer_keystore::MemorySecretStore;
     use pioneer_protocol::{
         AuthSessionId, DeviceId, GatewayId, PermissionBehavior, PrincipalId, PrincipalKind,
-        RoleKey, SandboxMode, TaskEventPayload, TaskThreadLineage, Thread, ThreadMode,
-        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, Turn,
-        TurnExecutionSecuritySnapshot, TurnNetworkPolicySnapshot, TurnPermissionMode,
-        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus,
+        RoleKey, SandboxMode, Task, TaskEventPayload, TaskExecutorKind, TaskOwnerKind, TaskRun,
+        TaskRunStatus, TaskStatus, Thread, ThreadLineage, ThreadMode, ThreadOriginKind,
+        ThreadSidebarVisibility, ThreadStatus, Turn, TurnExecutionSecuritySnapshot,
+        TurnNetworkPolicySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
+        TurnPermissionProfileSource, TurnStatus,
     };
     use sea_orm::{ConnectionTrait, Database, EntityTrait};
     use std::collections::BTreeMap;
@@ -3273,6 +3427,7 @@ mod tests {
             &mut self,
             raw_tool_name: &str,
             arguments: JsonValue,
+            _budget: pioneer_mcp::McpInvocationBudget,
             _timeout: Duration,
             _cancellation: CancellationToken,
         ) -> Result<McpToolCallResult, McpRuntimeError> {
@@ -3309,6 +3464,7 @@ mod tests {
             &mut self,
             raw_tool_name: &str,
             arguments: JsonValue,
+            _budget: pioneer_mcp::McpInvocationBudget,
             _timeout: Duration,
             cancellation: CancellationToken,
         ) -> Result<McpToolCallResult, McpRuntimeError> {
@@ -3368,6 +3524,7 @@ mod tests {
             gateway_secrets.clone(),
             Arc::new(AtomicU64::new(1)),
             Arc::new(AuthorizationInvalidationHub::default()),
+            Arc::new(ExecutionLeaseRegistry::default()),
         );
         (
             service,
@@ -3456,8 +3613,13 @@ mod tests {
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         };
+        ensure_test_superuser_execution_authority(crud_store).await;
+        let execution_principal = authenticated_test_superuser();
+        let execution_actor = pioneer_protocol::PersistedActorRef::Principal(
+            execution_principal.principal_id.clone(),
+        );
         crud_store
-            .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
+            .upsert_thread_model(&thread, execution_actor.clone())
             .await
             .expect("test thread should persist");
         crud_store
@@ -3466,7 +3628,7 @@ mod tests {
                 SandboxMode::FullAccess,
                 &turn,
                 &[],
-                pioneer_protocol::PersistedActorRef::System,
+                execution_actor,
             )
             .await
             .expect("test turn should persist before MCP projection");
@@ -3475,8 +3637,27 @@ mod tests {
             .await
             .expect("MCP background turn provenance query should succeed")
             .expect("MCP background turn should exist");
-        assert_eq!(persisted.initiated_by_actor_kind.as_deref(), Some("system"));
-        assert_eq!(persisted.initiated_by_actor_id, None);
+        assert_eq!(
+            persisted.initiated_by_actor_kind.as_deref(),
+            Some("principal")
+        );
+        assert_eq!(
+            persisted.initiated_by_actor_id.as_deref(),
+            Some(execution_principal.principal_id.as_str())
+        );
+        let execution_context = ExecutionAuthorizationContext::for_test(
+            execution_principal.as_ref(),
+            workspace_id,
+            thread_id,
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            None,
+        )
+        .to_persisted_json()
+        .expect("test MCP execution context should serialize");
+        crud_store
+            .set_turn_execution_authorization_context(turn_id, execution_context.as_str())
+            .await
+            .expect("test MCP execution context should persist");
     }
 
     async fn seed_mcp_installation(
@@ -3694,6 +3875,20 @@ mod tests {
             turn_id.as_str(),
         )
         .await;
+        ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+        let execution_context = ExecutionAuthorizationContext::for_test(
+            authenticated_test_superuser().as_ref(),
+            workspace_id.as_str(),
+            thread_id.as_str(),
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            None,
+        )
+        .to_persisted_json()
+        .expect("test MCP execution context should serialize");
+        crud_store
+            .set_turn_execution_authorization_context(turn_id.as_str(), execution_context.as_str())
+            .await
+            .expect("test MCP execution context should persist");
         service.set_connector_for_tests(connector);
         let installation_id =
             seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
@@ -3733,6 +3928,8 @@ mod tests {
             Arc::new(service.clone()),
             execution.clone(),
             service.inner.authorization_invalidation_hub.clone(),
+            service.inner.execution_leases.clone(),
+            service.inner.invocation_governor.clone(),
         );
         TestTurnMcpInvokerFixture {
             service,
@@ -3758,7 +3955,7 @@ mod tests {
             .database_connection()
             .execute_unprepared(
                 format!(
-                    "INSERT INTO gateway_identity(\
+                    "INSERT OR IGNORE INTO gateway_identity(\
                         id,singleton_key,identity_bootstrap_version,auth_schema_version,\
                         created_at,updated_at\
                      ) VALUES(\
@@ -3853,6 +4050,7 @@ mod tests {
                 fixture.workspace_id.as_str(),
                 MCP_TURN_PROJECTION_VERSION,
                 fixture.manifest_hash.as_str(),
+                &[],
             )
             .expect("Member execution should bind the frozen MCP projection");
         let context_json = context
@@ -4242,27 +4440,118 @@ mod tests {
             child_turn_id,
         )
         .await;
+        const MEMBER_PRINCIPAL_ID: &str = "P0000000000000000000A";
+        let task_id = "task_turn_mcp_task_child";
+        let run_id = "run_turn_mcp_task_child";
+        let parent_context = fixture
+            .crud_store
+            .get_turn_execution_authorization_context(fixture.turn_id.as_str())
+            .await
+            .expect("parent execution authorization context should load")
+            .expect("parent execution authorization context should exist");
         fixture
             .crud_store
-            .append_task_event(
-                TaskEventPayload::TaskThreadLineageCreated {
-                    task_id: "task_turn_mcp_task_child".to_owned(),
-                    run_id: "run_turn_mcp_task_child".to_owned(),
-                    lineage: TaskThreadLineage {
-                        child_thread_id: child_thread_id.to_owned(),
-                        parent_thread_id: fixture.thread_id.clone(),
-                        root_thread_id: fixture.thread_id.clone(),
-                        depth: 1,
-                        origin_kind: Some("task_run".to_owned()),
-                        created_by_thread_id: Some(fixture.thread_id.clone()),
-                        created_by_turn_id: Some(fixture.turn_id.clone()),
-                        created_at: 1_700_000_001,
+            .database_connection()
+            .execute_unprepared(
+                format!(
+                    "UPDATE thread SET access_class='internal' WHERE id='{child_thread_id}'; \
+                     UPDATE turn SET initiated_by_actor_kind='principal', \
+                     initiated_by_actor_id='{MEMBER_PRINCIPAL_ID}' WHERE id='{child_turn_id}'"
+                )
+                .as_str(),
+            )
+            .await
+            .expect("task child actor provenance should persist");
+        fixture
+            .crud_store
+            .append_task_events_with_execution_admission(
+                vec![
+                    TaskEventPayload::TaskCreated {
+                        task: Task {
+                            id: task_id.to_owned(),
+                            workspace_id: fixture.workspace_id.clone(),
+                            owner_kind: TaskOwnerKind::Thread,
+                            owner_id: Some(fixture.thread_id.clone()),
+                            created_by_thread_id: Some(fixture.thread_id.clone()),
+                            created_by_turn_id: Some(fixture.turn_id.clone()),
+                            root_task_id: Some(task_id.to_owned()),
+                            parent_task_id: None,
+                            executor_kind: TaskExecutorKind::Agent,
+                            status: TaskStatus::Running,
+                            title: "MCP child authority fixture".to_owned(),
+                            goal: "Prove exact inherited MCP projection".to_owned(),
+                            priority: 0,
+                            lifecycle_policy: None,
+                            delivery_policy: None,
+                            retry_policy: None,
+                            timeout_policy: None,
+                            concurrency_policy: None,
+                            metadata: None,
+                            result: None,
+                            error: None,
+                            revision: 1,
+                            created_at: 1_700_000_001,
+                            updated_at: 1_700_000_001,
+                            completed_at: None,
+                        },
                     },
-                },
+                    TaskEventPayload::RunCreated {
+                        run: TaskRun {
+                            id: run_id.to_owned(),
+                            task_id: task_id.to_owned(),
+                            trigger_id: None,
+                            parent_run_id: None,
+                            run_group_id: "run_group_turn_mcp_task_child".to_owned(),
+                            attempt_number: 1,
+                            retry_of_run_id: None,
+                            ready_at: Some(1_700_000_001),
+                            run_number: 1,
+                            status: TaskRunStatus::Running,
+                            executor_kind: TaskExecutorKind::Agent,
+                            started_at: Some(1_700_000_001),
+                            completed_at: None,
+                            heartbeat_at: None,
+                            locked_by: None,
+                            lock_expires_at: None,
+                            result: None,
+                            error: None,
+                            created_at: 1_700_000_001,
+                            updated_at: 1_700_000_001,
+                        },
+                        agent_spec: None,
+                    },
+                    TaskEventPayload::ChildThreadLinked {
+                        lineage: ThreadLineage {
+                            child_thread_id: child_thread_id.to_owned(),
+                            child_turn_id: child_turn_id.to_owned(),
+                            parent_thread_id: fixture.thread_id.clone(),
+                            parent_turn_id: Some(fixture.turn_id.clone()),
+                            task_id: task_id.to_owned(),
+                            task_run_id: run_id.to_owned(),
+                            root_thread_id: fixture.thread_id.clone(),
+                            depth: 1,
+                            created_at: 1_700_000_001,
+                        },
+                    },
+                ],
                 1_700_000_001,
+                NewTaskExecutionAdmission {
+                    task_id: task_id.to_owned(),
+                    workspace_id: fixture.workspace_id.clone(),
+                    root_thread_id: fixture.thread_id.clone(),
+                    initiating_principal_id: MEMBER_PRINCIPAL_ID.to_owned(),
+                    authorization_context_json: parent_context.clone(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    execution_lease: None,
+                },
             )
             .await
             .expect("task child lineage should persist");
+        fixture
+            .crud_store
+            .set_turn_execution_authorization_context(child_turn_id, parent_context.as_str())
+            .await
+            .expect("task child execution authorization context should persist");
 
         let child_projection = fixture
             .service
@@ -4294,18 +4583,6 @@ mod tests {
             )
             .await
             .expect("task child security snapshot should persist");
-        let parent_context = fixture
-            .crud_store
-            .get_turn_execution_authorization_context(fixture.turn_id.as_str())
-            .await
-            .expect("parent execution authorization context should load")
-            .expect("parent execution authorization context should exist");
-        fixture
-            .crud_store
-            .set_turn_execution_authorization_context(child_turn_id, parent_context.as_str())
-            .await
-            .expect("task child execution authorization context should persist");
-
         let mut invocation = native_mcp_invocation(&fixture);
         invocation.thread_id = child_thread_id.to_owned();
         invocation.turn_id = child_turn_id.to_owned();
@@ -4321,16 +4598,30 @@ mod tests {
     async fn turn_mcp_invoker_rejects_projection_not_bound_to_execution_context() {
         let fixture = turn_mcp_invoker_fixture().await;
         let context = json!({
-            "version": 1,
+            "version": 3,
             "initiating_principal_id": "P0000000000000000000A",
             "initiating_session_id": "S0000000000000000000A",
             "workspace_id": fixture.workspace_id.as_str(),
             "root_thread_id": fixture.thread_id.as_str(),
             "policy_revision": 1,
+            "role_key": "member",
+            "policy_fingerprint": crate::authorization::RoleDefinitionRegistry::new()
+                .policy_fingerprint(),
             "capability_projection_fingerprint": "a".repeat(64),
             "permission_profile_cap": pioneer_protocol::task_permission_cap_for_mode(
                 TurnPermissionMode::Supervised,
             ),
+            "grant_manifest": {
+                "version": 1,
+                "entry_point": "interactive_turn",
+                "operational_projection_fingerprint": "c".repeat(64),
+                "actions": ["agent_turn_start", "mcp_use", "provider_use"],
+                "provider": {
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "authority_fingerprint": "d".repeat(64),
+                },
+            },
             "mcp_projection": {
                 "version": MCP_TURN_PROJECTION_VERSION,
                 "manifest_hash": "b".repeat(64),

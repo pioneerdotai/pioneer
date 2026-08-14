@@ -114,6 +114,12 @@
             "string",
             "null"
           ]
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -138,6 +144,12 @@
           "$ref": "#/$defs/TaskAgentInputReferenceKind"
         },
         "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "versionId": {
           "type": [
             "string",
             "null"

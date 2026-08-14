@@ -78,7 +78,6 @@ pub fn apply_mcp_server_status_changed_to_catalog(
         if server.id == notification.server.id {
             server.runtime = notification.server.runtime.clone();
             server.status = notification.server.status;
-            server.status_reason = notification.server.status_reason.clone();
         }
     }
 }
@@ -89,10 +88,10 @@ pub fn apply_mcp_server_status_changed_to_details(
 ) {
     details.server.runtime = notification.server.runtime.clone();
     details.server.status = notification.server.status;
-    details.server.status_reason = notification.server.status_reason.clone();
-    details.health.runtime = notification.server.runtime.clone();
-    details.health.status = notification.server.status;
-    details.health.status_reason = notification.server.status_reason.clone();
+    if let Some(management) = details.management.as_mut() {
+        management.health.runtime = notification.server.runtime.clone();
+        management.health.status = notification.server.status;
+    }
 }
 
 pub fn reduce_mcp_server_catalog_changed_notification(
@@ -130,9 +129,9 @@ pub fn apply_mcp_server_catalog_changed_to_catalog(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind, McpServerCatalogDetails,
-        McpServerHealthDetails, McpServerStatus, McpServerStatusItem, McpSourceKind,
-        McpTransportSummary,
+        McpManagementDetails, McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
+        McpServerCatalogDetails, McpServerHealthDetails, McpServerStatus, McpServerStatusItem,
+        McpSourceKind, McpTransportSummary,
     };
 
     fn mcp_runtime(state: McpRuntimeState, live: bool) -> McpRuntimeStatus {
@@ -140,7 +139,6 @@ mod tests {
             state,
             live,
             last_seen_at: None,
-            last_error: None,
         }
     }
 
@@ -150,23 +148,17 @@ mod tests {
             name: id.to_owned(),
             display_name: None,
             scope: McpScopeKind::Workspace,
-            source_kind: McpSourceKind::Config,
-            transport: McpTransportSummary::Stdio {
-                command: "server".to_owned(),
-            },
             policy: McpPolicyState {
                 enabled: true,
                 allow_implicit_invocation: false,
             },
             required: false,
-            fingerprint: "fingerprint".to_owned(),
             runtime: mcp_runtime(McpRuntimeState::Ready, true),
             tools_count: 1,
             resources_count: 2,
             resource_templates_count: 3,
             prompts_count: 4,
             status,
-            status_reason: None,
         }
     }
 
@@ -185,18 +177,26 @@ mod tests {
                 resource_templates: Vec::new(),
                 prompts: Vec::new(),
             },
-            health: McpServerHealthDetails {
-                runtime: mcp_runtime(McpRuntimeState::Ready, true),
-                status: McpServerStatus::Ready,
-                status_reason: None,
-                last_error: None,
-                retry_attempt: None,
-                next_retry_at: None,
-                catalog_version: None,
-                stderr_tail: None,
-            },
-            audit: Vec::new(),
-            recent_bindings: Vec::new(),
+            management: Some(McpManagementDetails {
+                scope: McpScopeKind::Workspace,
+                source_kind: McpSourceKind::Config,
+                transport: McpTransportSummary::Stdio {
+                    command: "server".to_owned(),
+                },
+                fingerprint: "fingerprint".to_owned(),
+                health: McpServerHealthDetails {
+                    runtime: mcp_runtime(McpRuntimeState::Ready, true),
+                    status: McpServerStatus::Ready,
+                    status_reason: None,
+                    last_error: None,
+                    retry_attempt: None,
+                    next_retry_at: None,
+                    catalog_version: None,
+                    stderr_tail: None,
+                },
+                audit: Vec::new(),
+                recent_bindings: Vec::new(),
+            }),
         }
     }
 
@@ -253,7 +253,6 @@ mod tests {
                 scope_kind: McpScopeKind::Workspace,
                 runtime: mcp_runtime(McpRuntimeState::Failed, false),
                 status: McpServerStatus::Failed,
-                status_reason: Some("crashed".to_owned()),
             },
         };
 
@@ -283,10 +282,11 @@ mod tests {
 
         assert_eq!(servers[0].runtime.state, McpRuntimeState::Failed);
         assert_eq!(servers[0].status, McpServerStatus::Failed);
-        assert_eq!(servers[0].status_reason.as_deref(), Some("crashed"));
         assert_eq!(details.server.status, McpServerStatus::Failed);
-        assert_eq!(details.health.runtime.state, McpRuntimeState::Failed);
-        assert_eq!(details.health.status_reason.as_deref(), Some("crashed"));
+        assert_eq!(
+            details.management.expect("management").health.runtime.state,
+            McpRuntimeState::Failed
+        );
     }
 
     #[test]

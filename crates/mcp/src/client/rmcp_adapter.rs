@@ -241,6 +241,7 @@ impl McpRuntimeSession for RmcpRuntimeSession {
         &mut self,
         raw_tool_name: &str,
         arguments: serde_json::Value,
+        budget: crate::McpInvocationBudget,
         timeout: Duration,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<McpToolCallResult, McpRuntimeError> {
@@ -252,6 +253,12 @@ impl McpRuntimeSession for RmcpRuntimeSession {
                 "MCP tools/call cancelled before transport dispatch",
             ));
         }
+        crate::validate_mcp_arguments(&arguments, budget).map_err(|error| {
+            McpRuntimeError::failed(format!(
+                "MCP tools/call rejected before transport dispatch: {}",
+                error.reason_code()
+            ))
+        })?;
         let arguments = match arguments {
             serde_json::Value::Object(map) => map,
             serde_json::Value::Null => JsonObject::new(),
@@ -342,13 +349,20 @@ impl McpRuntimeSession for RmcpRuntimeSession {
                 McpRuntimeError::failed(format!("failed to encode MCP tool metadata: {error}"))
             })?;
 
-        Ok(McpToolCallResult {
+        let result = McpToolCallResult {
             content,
             structured_content: result.structured_content,
             is_error: result.is_error.unwrap_or(false),
             duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             meta,
-        })
+        };
+        crate::validate_mcp_result(&result, budget).map_err(|error| {
+            McpRuntimeError::failed(format!(
+                "MCP tools/call result rejected at transport boundary: {}",
+                error.reason_code()
+            ))
+        })?;
+        Ok(result)
     }
 
     async fn shutdown(&mut self) {

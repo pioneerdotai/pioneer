@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadScopeMutationPlan",
+  "type": "object",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/ThreadScopeAction"
+    },
+    "refetch": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadScopeRefetch"
+      }
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "$ref": "#/$defs/WorkspaceId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "action",
+    "refetch"
+  ],
+  "$defs": {
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ThreadScopeAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "list_participants"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "add_participant"
+            },
+            "principal_id": {
+              "$ref": "#/$defs/PrincipalId"
+            }
+          },
+          "required": [
+            "kind",
+            "principal_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "remove_participant"
+            },
+            "principal_id": {
+              "$ref": "#/$defs/PrincipalId"
+            }
+          },
+          "required": [
+            "kind",
+            "principal_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "update_visibility"
+            },
+            "visibility": {
+              "$ref": "#/$defs/ThreadVisibility"
+            }
+          },
+          "required": [
+            "kind",
+            "visibility"
+          ]
+        }
+      ]
+    },
+    "ThreadScopeRefetch": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "participants",
+        "workspace_members"
+      ]
+    },
+    "ThreadVisibility": {
+      "description": "User-selectable visibility for ordinary user threads.\n\nInternal task/system threads deliberately have no public selectable value.",
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace"
+      ]
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

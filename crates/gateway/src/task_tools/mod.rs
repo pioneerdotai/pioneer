@@ -5,21 +5,22 @@ use pioneer_agent::{
     TaskTurnContext, TerminalTaskObservation,
 };
 use pioneer_crud::CrudStore;
+#[cfg(test)]
+use pioneer_protocol::PrincipalKind;
 use pioneer_protocol::{
-    ItemCompletedNotification, ItemUpdatedNotification, PrincipalKind, Task, TaskAcceptParams,
-    TaskAcceptResponse, TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt,
-    TaskAgentResultContract, TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode,
-    TaskCancelParams, TaskCancelScope, TaskCompletionBehavior, TaskCreateParams,
-    TaskCreateResponse, TaskDeliveryMode, TaskDeliveryPolicy, TaskDependencyTriggerPolicy,
-    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskGetParams,
-    TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor, TaskMetadata,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
-    TaskResultCandidateStatus, TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy,
-    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunStatus, TaskRunThreadBindingKind,
-    TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput,
-    TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse,
-    TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem,
-    TurnItemEventPayload, constants::events,
+    ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAcceptParams, TaskAcceptResponse,
+    TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract,
+    TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode, TaskCancelParams, TaskCancelScope,
+    TaskCompletionBehavior, TaskCreateParams, TaskCreateResponse, TaskDeliveryMode,
+    TaskDeliveryPolicy, TaskDependencyTriggerPolicy, TaskDetachParams, TaskError, TaskExecutorKind,
+    TaskExternalTriggerFilter, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
+    TaskManualActor, TaskMetadata, TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams,
+    TaskRescheduleParams, TaskResult, TaskResultCandidateStatus, TaskResultReviewerKind,
+    TaskResumeParams, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
+    TaskRunStatus, TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger,
+    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem,
+    TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, TaskWaitParams, ToolCallStatus,
+    ToolStoragePayload, TurnItem, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -130,9 +131,16 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         context: TaskTurnContext,
     ) -> Result<TaskToolMaterialization, String> {
         let processor = self.processor()?;
-        resolve_task_tool_authorization_scope(processor.as_ref(), &context)
+        let authorization = resolve_task_tool_authorization_scope(processor.as_ref(), &context)
             .await
             .map_err(|error| error.to_string())?;
+        let can_create = authorization
+            .authorize_root_action(
+                processor.crud_store.as_ref(),
+                crate::authorization::ResourceAction::TaskCreate,
+            )
+            .await
+            .is_ok();
         let handler = Arc::new(TaskToolHandler {
             processor,
             context,
@@ -141,6 +149,9 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         let mut bundle = ToolExtensionBundle::default();
         for configured in task_tool_specs() {
             let name = configured.spec.name.clone();
+            if name == TASK_CREATE_TOOL && !can_create {
+                continue;
+            }
             bundle.specs.push(configured);
             bundle.handlers.push((name, handler.clone()));
         }
@@ -355,51 +366,195 @@ struct TaskToolHandler {
 }
 
 #[derive(Clone)]
-enum TaskToolAuthorizationScope {
-    Unrestricted,
-    Member {
-        principal: crate::auth::AuthenticatedSessionPrincipal,
-        workspace_id: String,
-        root_thread_id: String,
-    },
+struct TaskToolAuthorizationScope {
+    principal: crate::auth::AuthenticatedSessionPrincipal,
+    workspace_id: String,
+    root_thread_id: String,
+}
+
+struct TaskToolObservationAdmission {
+    budget: pioneer_protocol::TaskResourceBudget,
+    _permit: crate::authorization::ObservationAdmissionPermit,
 }
 
 impl TaskToolAuthorizationScope {
-    fn task_root_access_filter(&self) -> Option<pioneer_crud::TaskRootAccessFilter> {
-        match self {
-            Self::Unrestricted => None,
-            Self::Member { root_thread_id, .. } => Some(pioneer_crud::TaskRootAccessFilter {
-                allowed_root_thread_ids: vec![root_thread_id.clone()],
-            }),
+    async fn acquire_observation_page(
+        &self,
+        processor: &MessageProcessor,
+    ) -> Result<TaskToolObservationAdmission, ToolError> {
+        let policy = crate::authorization::AuthorizationService::new();
+        let role_key = policy
+            .resolved_role_key(self.principal.kind, self.principal.role_key.as_ref())
+            .ok_or_else(task_tool_authorization_error)?;
+        let observation_policy = policy
+            .observation_resource_policy(self.principal.kind, self.principal.role_key.as_ref())
+            .ok_or_else(task_tool_authorization_error)?;
+        let budget = policy
+            .task_resource_budget(self.principal.kind, self.principal.role_key.as_ref())
+            .ok_or_else(task_tool_authorization_error)?;
+        let permit = processor
+            .observation_governor()
+            .acquire_page(
+                self.principal.principal_id.as_str(),
+                role_key,
+                self.workspace_id.as_str(),
+                observation_policy,
+            )
+            .await
+            .map_err(|_| task_tool_authorization_error())?;
+        Ok(TaskToolObservationAdmission {
+            budget,
+            _permit: permit,
+        })
+    }
+
+    async fn authorize_root_action(
+        &self,
+        store: &CrudStore,
+        action: crate::authorization::ResourceAction,
+    ) -> Result<(), ToolError> {
+        let principal = &self.principal;
+        let workspace_id = &self.workspace_id;
+        let root_thread_id = &self.root_thread_id;
+        let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            action,
+        );
+        match crate::authorization::AuthorizationResolver::new(store.clone())
+            .authorize_thread(
+                principal,
+                &action_gate,
+                action,
+                root_thread_id.as_str(),
+                Some(workspace_id.as_str()),
+            )
+            .await
+        {
+            Ok(crate::authorization::ProofResolution::Authorized(proof)) => {
+                crate::authorization::record_task_tool_decision(action, proof.decision());
+                Ok(())
+            }
+            Ok(crate::authorization::ProofResolution::Denied(decision)) => {
+                crate::authorization::record_task_tool_decision(action, &decision);
+                Err(task_tool_authorization_error())
+            }
+            Err(_) => {
+                crate::authorization::record_authorization_unavailable(
+                    action.safe_name(),
+                    "thread",
+                    "tool",
+                );
+                Err(task_tool_authorization_error())
+            }
         }
+    }
+
+    async fn authorize_execution_intent(
+        &self,
+        processor: &MessageProcessor,
+        params: &TaskCreateParams,
+    ) -> Result<Option<pioneer_tasks::TaskExecutionAdmissionSeed>, ToolError> {
+        let principal = &self.principal;
+        let workspace_id = &self.workspace_id;
+        let root_thread_id = &self.root_thread_id;
+        if params.executor_kind != pioneer_protocol::TaskExecutorKind::Agent {
+            return Ok(None);
+        }
+        let thread = processor
+            .crud_store
+            .get_thread_by_id(root_thread_id.as_str())
+            .await
+            .map_err(|_| task_tool_authorization_error())?
+            .filter(|thread| thread.workspace_id == *workspace_id)
+            .ok_or_else(task_tool_authorization_error)?;
+        let mut request = crate::authorization::ExecutionAdmissionRequest::for_task(
+            params,
+            root_thread_id,
+            thread.model_provider.as_str(),
+            thread.model.as_str(),
+            None,
+        )
+        .map_err(|_| task_tool_authorization_error())?;
+        if !matches!(
+            request.execution_backend,
+            Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
+                | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. })
+        ) {
+            request.provider_authority_fingerprint = Some(
+                processor
+                    .provider_registry()
+                    .authority_fingerprint_for_workspace(
+                        workspace_id.as_str(),
+                        request.provider.as_str(),
+                    )
+                    .as_str()
+                    .to_owned(),
+            );
+        }
+        let revision = processor
+            .current_authorization_revision()
+            .await
+            .map_err(|_| task_tool_authorization_error())?;
+        let requested_permission_cap = params
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.permission_cap.as_ref());
+        let context = crate::authorization::ExecutionAdmissionService::new(
+            processor.crud_store.as_ref().clone(),
+        )
+        .admit_context(principal, revision, &request, requested_permission_cap)
+        .await
+        .map_err(|_| task_tool_authorization_error())?;
+        Ok(Some(pioneer_tasks::TaskExecutionAdmissionSeed {
+            workspace_id: context.workspace_id().to_owned(),
+            root_thread_id: context.root_thread_id().to_owned(),
+            initiating_principal_id: context.initiating_principal_id().to_string(),
+            authorization_context_json: context
+                .to_persisted_json()
+                .map_err(|_| task_tool_authorization_error())?,
+            role_key: context.role_key().to_owned(),
+            policy_fingerprint: context.policy_fingerprint().to_owned(),
+            execution_resources: crate::authorization::AuthorizationService::new()
+                .execution_resource_policy(principal.kind, principal.role_key.as_ref())
+                .ok_or_else(task_tool_authorization_error)?,
+            task_resources: crate::authorization::AuthorizationService::new()
+                .task_resource_budget(principal.kind, principal.role_key.as_ref())
+                .ok_or_else(task_tool_authorization_error)?,
+        }))
+    }
+
+    fn task_root_access_filter(&self) -> Option<pioneer_crud::TaskRootAccessFilter> {
+        Some(pioneer_crud::TaskRootAccessFilter {
+            allowed_root_thread_ids: vec![self.root_thread_id.clone()],
+        })
     }
 
     fn mutation_context(
         &self,
         turn_context: &TaskTurnContext,
     ) -> pioneer_tasks::TaskMutationContext {
-        let mut context = match self {
-            Self::Unrestricted => pioneer_tasks::TaskMutationContext::default(),
-            Self::Member { principal, .. } => {
-                pioneer_tasks::TaskMutationContext::user(principal.principal_id.to_string())
-            }
-        };
+        let mut context =
+            pioneer_tasks::TaskMutationContext::user(self.principal.principal_id.to_string());
         context.thread_id = Some(turn_context.thread_id.clone());
         context.turn_id = Some(turn_context.turn_id.clone());
+        context.task_resource_budget = crate::authorization::AuthorizationService::new()
+            .task_resource_budget(self.principal.kind, self.principal.role_key.as_ref());
         context
     }
 
-    fn constrain_create_params(&self, params: &mut TaskCreateParams) {
-        if let Self::Member {
-            principal,
-            workspace_id,
-            ..
-        } = self
-        {
-            params.workspace_id = workspace_id.clone();
-            params.owner_kind = TaskOwnerKind::User;
-            params.owner_id = Some(principal.principal_id.to_string());
+    fn wait_context(&self) -> pioneer_tasks::TaskWaitContext {
+        pioneer_tasks::TaskWaitContext {
+            actor_id: Some(self.principal.principal_id.to_string()),
+            task_resource_budget: crate::authorization::AuthorizationService::new()
+                .task_resource_budget(self.principal.kind, self.principal.role_key.as_ref()),
         }
+    }
+
+    fn constrain_create_params(&self, params: &mut TaskCreateParams) {
+        params.workspace_id = self.workspace_id.clone();
+        params.owner_kind = TaskOwnerKind::User;
+        params.owner_id = Some(self.principal.principal_id.to_string());
     }
 
     async fn authorize_task(
@@ -408,14 +563,9 @@ impl TaskToolAuthorizationScope {
         task_id: &str,
         action: crate::authorization::ResourceAction,
     ) -> Result<(), ToolError> {
-        let Self::Member {
-            principal,
-            workspace_id,
-            root_thread_id,
-        } = self
-        else {
-            return Ok(());
-        };
+        let principal = &self.principal;
+        let workspace_id = &self.workspace_id;
+        let root_thread_id = &self.root_thread_id;
         let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
             principal.kind,
             principal.role_key.as_ref(),
@@ -486,14 +636,8 @@ impl TaskToolAuthorizationScope {
         store: &CrudStore,
         policy: Option<&TaskDeliveryPolicy>,
     ) -> Result<(), ToolError> {
-        let Self::Member {
-            principal,
-            workspace_id,
-            ..
-        } = self
-        else {
-            return Ok(());
-        };
+        let principal = &self.principal;
+        let workspace_id = &self.workspace_id;
         let Some(policy) = policy else {
             return Ok(());
         };
@@ -513,7 +657,7 @@ impl TaskToolAuthorizationScope {
                             "thread delivery requires deliveryPolicy.threadId",
                         )
                     })?;
-                let action = crate::authorization::ResourceAction::ThreadWrite;
+                let action = crate::authorization::ResourceAction::MessageCreate;
                 let gate = crate::authorization::AuthorizationService::new().authorize_action(
                     principal.kind,
                     principal.role_key.as_ref(),
@@ -566,7 +710,7 @@ impl TaskToolAuthorizationScope {
                 }
             }
             TaskDeliveryMode::Webhook => Err(ToolError::invalid_arguments(
-                "webhook task delivery is unavailable to a Member execution",
+                "webhook task delivery is unavailable to a scoped execution",
             )),
         }
     }
@@ -586,30 +730,30 @@ async fn resolve_task_tool_authorization_scope(
             context.thread_id.as_str(),
             context.turn_id.as_str(),
             None,
-            crate::authorization::ResourceAction::ThreadWrite,
+            crate::authorization::ResourceAction::AgentTurnStart,
         )
         .await
         .map_err(|_| {
             crate::authorization::record_authorization_unavailable(
-                crate::authorization::ResourceAction::ThreadWrite.safe_name(),
+                crate::authorization::ResourceAction::AgentTurnStart.safe_name(),
                 "thread",
                 "tool",
             );
             task_tool_authorization_error()
         })?;
-    let Some(current) = current else {
-        // System-owned and pre-Epic-4 Superuser turns have no user execution
-        // envelope and retain the legacy internal tool boundary.
-        return Ok(TaskToolAuthorizationScope::Unrestricted);
-    };
-    if current.principal().kind == PrincipalKind::User {
-        return Ok(TaskToolAuthorizationScope::Member {
-            principal: current.principal().clone(),
-            workspace_id: current.authorization().workspace_id().to_owned(),
-            root_thread_id: current.authorization().thread_id().to_owned(),
-        });
+    if current.resource_boundary()
+        != crate::authorization::ExecutionResourceBoundary::RootThreadCapsule
+    {
+        return Err(task_tool_authorization_error());
     }
-    Ok(TaskToolAuthorizationScope::Unrestricted)
+    Ok(TaskToolAuthorizationScope {
+        principal: current.principal().clone(),
+        workspace_id: current.authorization().workspace_id().to_owned(),
+        root_thread_id: current
+            .authorization()
+            .collaboration_root_thread_id()
+            .to_owned(),
+    })
 }
 
 #[derive(Default)]
@@ -739,6 +883,12 @@ impl TaskToolHandler {
         invocation: ToolInvocation,
         authorization: &TaskToolAuthorizationScope,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        authorization
+            .authorize_root_action(
+                self.processor.crud_store.as_ref(),
+                crate::authorization::ResourceAction::TaskCreate,
+            )
+            .await?;
         let input: TaskCreateToolInput = decode_tool_args(invocation.clone())?;
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
@@ -749,7 +899,10 @@ impl TaskToolHandler {
             return Ok(function_output(output));
         }
         let params = self.create_params(input, authorization).await?;
-        let create_context = self
+        let execution_admission = authorization
+            .authorize_execution_intent(self.processor.as_ref(), &params)
+            .await?;
+        let mut create_context = self
             .processor
             .task_create_context_for_params(&params)
             .await
@@ -758,6 +911,13 @@ impl TaskToolHandler {
                     "failed to freeze detached Task context: {error:#}"
                 ))
             })?;
+        create_context.execution_admission = execution_admission;
+        if let Some(seed) = create_context.execution_admission.as_ref() {
+            self.processor
+                .validate_task_execution_admission_seed(seed)
+                .await
+                .map_err(|_| task_tool_authorization_error())?;
+        }
         let service = self.processor.task_runtime.service();
         let response =
             match task_tool_fresh_task(
@@ -819,7 +979,7 @@ impl TaskToolHandler {
             .processor
             .task_runtime
             .service()
-            .wait_tasks(pioneer_tasks::TaskWaitContext::default(), params)
+            .wait_tasks(authorization.wait_context(), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
@@ -942,7 +1102,7 @@ impl TaskToolHandler {
             .authorize_task(
                 self.processor.crud_store.as_ref(),
                 params.task_id.as_str(),
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskReview,
             )
             .await?;
         let cache_key = self.mutation_cache_key(&invocation);
@@ -1002,7 +1162,7 @@ impl TaskToolHandler {
             .authorize_task(
                 self.processor.crud_store.as_ref(),
                 params.task_id.as_str(),
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskReview,
             )
             .await?;
         let cache_key = self.mutation_cache_key(&invocation);
@@ -1055,7 +1215,7 @@ impl TaskToolHandler {
             .authorize_task(
                 self.processor.crud_store.as_ref(),
                 params.task_id.as_str(),
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskCancel,
             )
             .await?;
         let cache_key = self.mutation_cache_key(&invocation);
@@ -1090,7 +1250,7 @@ impl TaskToolHandler {
             .authorize_task(
                 self.processor.crud_store.as_ref(),
                 task_id.as_str(),
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskScheduleManage,
             )
             .await?;
         let params = self.update_params(input).await?;
@@ -1132,7 +1292,7 @@ impl TaskToolHandler {
             .authorize_task(
                 self.processor.crud_store.as_ref(),
                 params.task_id.as_str(),
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskDetach,
             )
             .await?;
         let response = self
@@ -1152,6 +1312,15 @@ impl TaskToolHandler {
         invocation: ToolInvocation,
         authorization: &TaskToolAuthorizationScope,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        authorization
+            .authorize_root_action(
+                self.processor.crud_store.as_ref(),
+                crate::authorization::ResourceAction::TaskRead,
+            )
+            .await?;
+        let observation = authorization
+            .acquire_observation_page(self.processor.as_ref())
+            .await?;
         let input: TaskListToolInput = decode_tool_args(invocation)?;
         let owner_kind = input.owner_kind;
         let owner_id = normalize_task_list_owner_id(
@@ -1163,7 +1332,8 @@ impl TaskToolHandler {
             .limit
             .unwrap_or(DEFAULT_TASK_LIST_LIMIT)
             .max(1)
-            .min(100);
+            .min(100)
+            .min(observation.budget.max_page_items.min(u32::MAX as usize) as u32);
         let current_execution_task_id = self
             .processor
             .crud_store
@@ -1184,11 +1354,20 @@ impl TaskToolHandler {
             // Fetch one extra row so hiding the current orchestration task does
             // not reduce the caller-requested result count.
             limit: Some(requested_limit.saturating_add(1)),
+            cursor: None,
         };
         let service = self.processor.task_runtime.service();
         let response = match authorization.task_root_access_filter() {
-            Some(access) => service.list_tasks_scoped(params, &access).await,
-            None => service.list_tasks(params).await,
+            Some(access) => {
+                service
+                    .list_tasks_scoped_with_budget(params, &access, observation.budget)
+                    .await
+            }
+            None => {
+                service
+                    .list_tasks_with_budget(params, observation.budget)
+                    .await
+            }
         }
         .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let tasks = task_list_summaries(
@@ -1213,27 +1392,21 @@ impl TaskToolHandler {
                 crate::authorization::ResourceAction::TaskRead,
             )
             .await?;
+        let observation = authorization
+            .acquire_observation_page(self.processor.as_ref())
+            .await?;
         let response = self
             .processor
             .task_runtime
             .service()
-            .get_task(params)
+            .get_task_with_budget(params, observation.budget)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        let lineages = task_get_legacy_lineage_output(&response);
-        let payload = json!({
-            "task": response.task,
-            "triggers": task_trigger_details_output(&response.triggers),
-            "runs": response.runs,
-            "agentSpecs": response.agent_specs,
-            "dependencies": response.dependencies,
-            "lineage": lineages,
-            "threadLineage": response.thread_lineage,
-            "taskRunThreadBindings": response.task_run_thread_bindings,
-            "taskRunTurns": response.task_run_turns,
-            "resultCandidates": response.result_candidates,
-            "resultReviewEvents": response.result_review_events,
-        });
+        let payload =
+            serde_json::to_value(crate::task_projection::project_task_get(&response, false))
+                .map_err(|error| {
+                    ToolError::execution_failed(format!("failed to project task: {error}"))
+                })?;
         Ok(function_output(payload))
     }
 
@@ -1248,7 +1421,7 @@ impl TaskToolHandler {
             .authorize_task(
                 self.processor.crud_store.as_ref(),
                 params.task_id.as_str(),
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskScheduleManage,
             )
             .await?;
         let cache_key = self.mutation_cache_key(&invocation);
@@ -1286,7 +1459,7 @@ impl TaskToolHandler {
             .authorize_task(
                 self.processor.crud_store.as_ref(),
                 params.task_id.as_str(),
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskScheduleManage,
             )
             .await?;
         let cache_key = self.mutation_cache_key(&invocation);
@@ -1324,7 +1497,7 @@ impl TaskToolHandler {
             .authorize_task(
                 self.processor.crud_store.as_ref(),
                 params.task_id.as_str(),
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskScheduleManage,
             )
             .await?;
         let cache_key = self.mutation_cache_key(&invocation);
@@ -1452,23 +1625,14 @@ impl TaskToolHandler {
         else {
             return Ok(None);
         };
-        let Some(parent_events) = self
+        let parent_items = self
             .processor
             .crud_store
-            .get_turn_item_events(
-                self.context.thread_id.as_str(),
-                self.context.turn_id.as_str(),
-            )
+            .list_turn_items_by_type(self.context.turn_id.as_str(), "dynamic_tool_call")
             .await
-            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
-        else {
-            return Ok(None);
-        };
+            .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
-        for event in parent_events.events.into_iter().rev() {
-            let TurnItemEventPayload::ItemCompleted { item, .. } = event.payload else {
-                continue;
-            };
+        for item in parent_items.into_iter().rev() {
             let TurnItem::DynamicToolCall {
                 id,
                 tool_name,
@@ -2923,23 +3087,16 @@ async fn attached_tasks_for_turn(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
 ) -> anyhow::Result<Vec<Task>> {
-    let response = processor
-        .task_runtime
-        .service()
-        .list_tasks(TaskListParams {
-            workspace_id: context.workspace_id.clone(),
-            owner_kind: Some(TaskOwnerKind::Thread),
-            owner_id: Some(context.thread_id.clone()),
-            parent_task_id: None,
-            root_task_id: None,
-            status: None,
-            limit: Some(GUARD_TASK_LIST_LIMIT),
-        })
-        .await?;
-    Ok(response
-        .tasks
+    Ok(processor
+        .crud_store
+        .list_tasks_created_by_turn(
+            context.workspace_id.as_str(),
+            context.thread_id.as_str(),
+            context.turn_id.as_str(),
+            u64::from(GUARD_TASK_LIST_LIMIT),
+        )
+        .await?
         .into_iter()
-        .filter(|task| task.created_by_turn_id.as_deref() == Some(context.turn_id.as_str()))
         .filter(|task| {
             task.lifecycle_policy
                 .as_ref()
@@ -2953,24 +3110,17 @@ async fn observed_terminal_task_ids(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
 ) -> anyhow::Result<BTreeSet<String>> {
-    let Some(parent_events) = processor
+    let parent_items = processor
         .crud_store
-        .get_turn_item_events(context.thread_id.as_str(), context.turn_id.as_str())
-        .await?
-    else {
-        return Ok(BTreeSet::new());
-    };
+        .list_turn_items_by_type(context.turn_id.as_str(), "system_event")
+        .await?;
     let mut task_ids = BTreeSet::new();
-    for event in parent_events.events {
-        let TurnItemEventPayload::ItemCompleted {
-            item:
-                TurnItem::SystemEvent {
-                    code,
-                    details: Some(details),
-                    ..
-                },
+    for item in parent_items {
+        let TurnItem::SystemEvent {
+            code,
+            details: Some(details),
             ..
-        } = event.payload
+        } = item
         else {
             continue;
         };
@@ -3037,21 +3187,13 @@ async fn prior_wait_calls_for_signature(
     signature: &TaskWaitSignature,
     current_call_id: &str,
 ) -> anyhow::Result<Vec<PriorWaitCall>> {
-    let Some(parent_events) = processor
+    let parent_items = processor
         .crud_store
-        .get_turn_item_events(context.thread_id.as_str(), context.turn_id.as_str())
-        .await?
-    else {
-        return Ok(Vec::new());
-    };
+        .list_turn_items_by_type(context.turn_id.as_str(), "dynamic_tool_call")
+        .await?;
 
     let mut prior_calls = Vec::<PriorWaitCall>::new();
-    for event in parent_events.events {
-        let item = match event.payload {
-            TurnItemEventPayload::ItemCompleted { item, .. }
-            | TurnItemEventPayload::ItemUpdated { item, .. } => item,
-            _ => continue,
-        };
+    for item in parent_items {
         let Some(prior) = prior_wait_call_from_item(item, signature, current_call_id) else {
             continue;
         };
@@ -3187,6 +3329,7 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
 }
 
 fn task_accept_tool_output(response: &TaskAcceptResponse, final_answer_allowed: bool) -> JsonValue {
+    let result = crate::task_projection::project_result(&response.result);
     json!({
         "accepted": response.accepted,
         "alreadyAccepted": response.already_accepted,
@@ -3198,8 +3341,8 @@ fn task_accept_tool_output(response: &TaskAcceptResponse, final_answer_allowed: 
         "candidateStatus": candidate_status_label(response.candidate.status),
         "reviewEventId": response.review_event.id,
         "reviewerKind": reviewer_kind_label(response.review_event.reviewer_kind),
-        "summary": response.result.summary,
-        "result": response.result,
+        "summary": result.summary,
+        "result": result,
         "childThreadId": response.child_thread_id,
         "childTurnId": response.child_turn_id,
         "taskTerminal": response.task.status.is_terminal(),
@@ -3420,7 +3563,6 @@ fn task_update_tool_output(response: &TaskUpdateResponse) -> JsonValue {
         "task": task_summary(&response.task),
         "changedFields": &response.changed_fields,
         "trigger": response.trigger.as_ref().map(task_trigger_detail_output),
-        "agentSpec": &response.agent_spec,
         "revision": response.task.revision,
     })
 }
@@ -3429,24 +3571,12 @@ fn task_wait_tool_output(
     response: &pioneer_protocol::TaskWaitResponse,
     signature: &TaskWaitSignature,
 ) -> JsonValue {
-    json!({
-        "waitSignature": signature.to_json(),
-        "mode": wait_mode_label(response.mode),
-        "totalCount": response.total_count,
-        "terminalCount": response.terminal_count,
-        "pendingCount": response.pending_count,
-        "reviewRequiredCount": response.review_required_count,
-        "blockedCount": response.blocked_count,
-        "completed": response.completed.iter().map(wait_item_output).collect::<Vec<_>>(),
-        "failed": response.failed.iter().map(wait_item_output).collect::<Vec<_>>(),
-        "blocked": response.blocked.iter().map(wait_item_output).collect::<Vec<_>>(),
-        "cancelled": response.cancelled.iter().map(wait_item_output).collect::<Vec<_>>(),
-        "reviewRequired": response.review_required.iter().map(review_required_item_output).collect::<Vec<_>>(),
-        "pending": response.pending.iter().map(wait_item_output).collect::<Vec<_>>(),
-        "nonWaitable": response.non_waitable.iter().map(non_waitable_item_output).collect::<Vec<_>>(),
-        "nonWaitableCount": response.non_waitable_count,
-        "timedOut": response.timed_out,
-    })
+    let mut output = serde_json::to_value(crate::task_projection::project_task_wait(response))
+        .unwrap_or_else(|_| json!({}));
+    if let Some(object) = output.as_object_mut() {
+        object.insert("waitSignature".to_owned(), signature.to_json());
+    }
+    output
 }
 
 fn task_wait_guard_output(
@@ -3579,76 +3709,6 @@ fn wait_mode_label(mode: pioneer_protocol::TaskWaitMode) -> &'static str {
     }
 }
 
-fn wait_item_output(item: &pioneer_protocol::TaskWaitItem) -> JsonValue {
-    let run = item.run.as_ref();
-    json!({
-        "taskId": item.task.id,
-        "runId": run.map(|run| run.id.clone()),
-        "status": wait_item_status(&item.task, run),
-        "summary": run.and_then(|run| run.result.as_ref()).and_then(|result| result.summary.clone()).or_else(|| item.task.result.as_ref().and_then(|result| result.summary.clone())),
-        "result": run.and_then(|run| run.result.clone()).or_else(|| item.task.result.clone()),
-        "error": run.and_then(|run| run.error.clone()).or_else(|| item.task.error.clone()),
-        "childThreadId": item.child_thread_id,
-        "childTurnId": item.child_turn_id,
-    })
-}
-
-fn review_required_item_output(item: &pioneer_protocol::TaskWaitReviewItem) -> JsonValue {
-    let run = item.item.run.as_ref();
-    let candidate = &item.candidate;
-    let owner_principal_id = (item.item.task.owner_kind == TaskOwnerKind::User)
-        .then(|| item.item.task.owner_id.clone())
-        .flatten();
-    let review_mode = item
-        .review_policy
-        .as_ref()
-        .map(|policy| review_mode_label(policy.mode));
-    let user_approval_required = item
-        .review_policy
-        .as_ref()
-        .is_some_and(|policy| policy.mode == pioneer_protocol::TaskAgentReviewMode::UserApproval);
-    let summary = candidate.summary.clone().or_else(|| {
-        candidate
-            .result
-            .as_ref()
-            .and_then(|result| result.summary.clone())
-    });
-    let allowed_actions = item
-        .allowed_actions
-        .iter()
-        .copied()
-        .map(wait_review_action_label)
-        .collect::<Vec<_>>();
-    json!({
-        "taskId": item.item.task.id,
-        "ownerPrincipalId": owner_principal_id,
-        "runId": run.map(|run| run.id.clone()).unwrap_or_else(|| candidate.run_id.clone()),
-        "title": item.item.task.title,
-        "status": wait_item_status(&item.item.task, run),
-        "candidateId": candidate.id,
-        "candidateStatus": candidate_status_label(candidate.status),
-        "reviewMode": review_mode,
-        "userApprovalRequired": user_approval_required,
-        "reviewPolicy": item.review_policy,
-        "round": candidate.round,
-        "summary": summary,
-        "resultPreview": result_preview(candidate.result.as_ref()),
-        "result": candidate.result,
-        "extractionError": candidate.extraction_error,
-        "extractionErrorPreview": error_preview(candidate.extraction_error.as_ref()),
-        "diagnostics": candidate.diagnostics,
-        "childThreadId": item.item.child_thread_id,
-        "childTurnId": item.item.child_turn_id,
-        "permissionMode": item.item.permission_profile.as_ref().map(|profile| profile.mode.as_str()),
-        "permissionSource": item.item.permission_profile.as_ref().map(|profile| profile.source.as_str()),
-        "maxRevisionRounds": item.max_revision_rounds,
-        "remainingRevisionRounds": item.remaining_revision_rounds,
-        "allowedActions": allowed_actions,
-        "revisionBlockedReason": item.revision_blocked_reason.map(wait_revision_blocked_reason_label),
-        "recommendation": review_required_recommendation(item),
-    })
-}
-
 fn review_required_task_observation(
     item: &pioneer_protocol::TaskWaitReviewItem,
 ) -> ReviewRequiredTaskObservation {
@@ -3692,78 +3752,6 @@ fn review_required_task_observation(
     }
 }
 
-fn non_waitable_item_output(item: &pioneer_protocol::TaskWaitNonWaitableItem) -> JsonValue {
-    json!({
-        "item": wait_item_output(&item.item),
-        "reason": match item.reason {
-            pioneer_protocol::TaskWaitNonWaitableReason::FutureScheduledTaskWithoutActiveRun => {
-                "future_scheduled_task_without_active_run"
-            }
-        },
-        "nextFireAt": item.next_fire_at,
-    })
-}
-
-fn task_get_legacy_lineage_output(response: &TaskGetResponse) -> Vec<JsonValue> {
-    response
-        .task_run_thread_bindings
-        .iter()
-        .filter(|binding| binding.binding_kind == TaskRunThreadBindingKind::PrimaryExecutor)
-        .filter_map(|binding| {
-            let lineage = response
-                .thread_lineage
-                .iter()
-                .find(|lineage| lineage.child_thread_id == binding.thread_id)?;
-            let child_turn_id = task_get_legacy_child_turn_id(response, binding);
-            Some(json!({
-                "childThreadId": lineage.child_thread_id.clone(),
-                "childTurnId": child_turn_id,
-                "parentThreadId": lineage.parent_thread_id.clone(),
-                "parentTurnId": lineage.created_by_turn_id.clone(),
-                "taskId": binding.task_id.clone(),
-                "taskRunId": binding.run_id.clone(),
-                "rootThreadId": lineage.root_thread_id.clone(),
-                "depth": lineage.depth,
-                "createdAt": lineage.created_at,
-            }))
-        })
-        .collect()
-}
-
-fn task_get_legacy_child_turn_id(
-    response: &TaskGetResponse,
-    binding: &pioneer_protocol::TaskRunThreadBinding,
-) -> Option<String> {
-    response
-        .result_candidates
-        .iter()
-        .rev()
-        .find(|candidate| {
-            candidate.run_id == binding.run_id
-                && candidate.thread_id == binding.thread_id
-                && candidate.status == TaskResultCandidateStatus::Accepted
-        })
-        .map(|candidate| candidate.task_run_turn_id.as_str())
-        .and_then(|task_run_turn_id| {
-            response
-                .task_run_turns
-                .iter()
-                .find(|turn| turn.id == task_run_turn_id)
-        })
-        .or_else(|| {
-            response
-                .task_run_turns
-                .iter()
-                .filter(|turn| turn.run_id == binding.run_id && turn.thread_id == binding.thread_id)
-                .max_by(|left, right| {
-                    left.sequence
-                        .cmp(&right.sequence)
-                        .then_with(|| left.created_at.cmp(&right.created_at))
-                })
-        })
-        .map(|turn| turn.turn_id.clone())
-}
-
 fn wait_item_status(task: &Task, run: Option<&TaskRun>) -> String {
     if let Some(run) = run {
         return run_status_label(run.status);
@@ -3783,13 +3771,6 @@ fn reviewer_kind_label(kind: TaskResultReviewerKind) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase())
-}
-
-fn review_mode_label(mode: pioneer_protocol::TaskAgentReviewMode) -> String {
-    serde_json::to_value(mode)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| format!("{mode:?}").to_ascii_lowercase())
 }
 
 fn wait_review_action_label(action: pioneer_protocol::TaskWaitReviewAction) -> &'static str {
@@ -3813,39 +3794,9 @@ fn wait_revision_blocked_reason_label(
     }
 }
 
-fn review_required_recommendation(item: &pioneer_protocol::TaskWaitReviewItem) -> &'static str {
-    let can_accept = item
-        .allowed_actions
-        .contains(&pioneer_protocol::TaskWaitReviewAction::TaskAccept);
-    let can_revise = item
-        .allowed_actions
-        .contains(&pioneer_protocol::TaskWaitReviewAction::TaskRevise);
-    match (can_accept, can_revise) {
-        (true, true) => "call_task_accept_or_task_revise",
-        (true, false) => "call_task_accept_or_task_cancel",
-        (false, true) => "call_task_revise_or_task_cancel",
-        (false, false) => "call_task_cancel",
-    }
-}
-
 fn task_summary(task: &Task) -> JsonValue {
-    json!({
-        "taskId": task.id,
-        "title": task.title,
-        "status": task_status_label(task.status),
-        "ownerKind": owner_kind_label(task.owner_kind),
-        "ownerId": task.owner_id,
-        "parentTaskId": task.parent_task_id,
-        "rootTaskId": task.root_task_id,
-        "attachment": task.lifecycle_policy.as_ref().map(|policy| match policy.attachment {
-            TaskAttachmentMode::Attached => "attached",
-            TaskAttachmentMode::Detached => "detached",
-        }),
-        "createdByThreadId": task.created_by_thread_id,
-        "createdByTurnId": task.created_by_turn_id,
-        "createdAt": task.created_at,
-        "updatedAt": task.updated_at,
-    })
+    serde_json::to_value(crate::task_projection::project_task(task))
+        .unwrap_or_else(|_| json!({ "taskId": task.id }))
 }
 
 fn task_list_summaries(
@@ -4080,7 +4031,20 @@ fn result_preview(result: Option<&TaskResult>) -> Option<String> {
 }
 
 fn error_preview(error: Option<&TaskError>) -> Option<String> {
-    error.map(|error| bounded_preview(error.message.as_str(), 240))
+    error.map(|error| {
+        match error.class {
+            pioneer_protocol::TaskErrorClass::Cancelled => "Task was cancelled.",
+            pioneer_protocol::TaskErrorClass::Timeout => "Task execution timed out.",
+            pioneer_protocol::TaskErrorClass::Validation => "Task input is invalid.",
+            pioneer_protocol::TaskErrorClass::Dependency => "A task dependency is unavailable.",
+            pioneer_protocol::TaskErrorClass::Policy => "Task execution is not permitted.",
+            pioneer_protocol::TaskErrorClass::Provider
+            | pioneer_protocol::TaskErrorClass::Tool
+            | pioneer_protocol::TaskErrorClass::Internal
+            | pioneer_protocol::TaskErrorClass::Unknown => "Task execution failed.",
+        }
+        .to_owned()
+    })
 }
 
 pub(crate) fn task_progress_preview(message: &str) -> Option<String> {
@@ -4089,7 +4053,7 @@ pub(crate) fn task_progress_preview(message: &str) -> Option<String> {
         return None;
     }
 
-    Some(bounded_preview(trimmed, 240))
+    Some("Task progress updated.".to_owned())
 }
 
 fn bounded_preview(value: &str, max_chars: usize) -> String {
@@ -4125,13 +4089,6 @@ fn run_status_label(status: TaskRunStatus) -> String {
 }
 
 fn trigger_kind_label(kind: TaskTriggerKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase())
-}
-
-fn owner_kind_label(kind: TaskOwnerKind) -> String {
     serde_json::to_value(kind)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
@@ -4236,7 +4193,7 @@ mod tests {
             .await
             .expect("materialize two private task roots");
         let store = CrudStore::new(harness.database.clone());
-        let scope = TaskToolAuthorizationScope::Member {
+        let scope = TaskToolAuthorizationScope {
             principal: crate::auth::AuthenticatedSessionPrincipal {
                 gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
                     .expect("gateway id"),
@@ -4267,7 +4224,7 @@ mod tests {
             .authorize_task(
                 &store,
                 "K0000000000000000000A",
-                crate::authorization::ResourceAction::TaskManage,
+                crate::authorization::ResourceAction::TaskReview,
             )
             .await
             .expect("initiating Member may manage its task");
@@ -4303,7 +4260,7 @@ mod tests {
             .await
             .expect("create isolated Epic 4 delivery fixture");
         let store = CrudStore::new(harness.database.clone());
-        let scope = TaskToolAuthorizationScope::Member {
+        let scope = TaskToolAuthorizationScope {
             principal: crate::auth::AuthenticatedSessionPrincipal {
                 gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
                     .expect("gateway id"),
@@ -4321,6 +4278,65 @@ mod tests {
             workspace_id: WORKSPACE_RED_ID.to_owned(),
             root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
         };
+        let parent_turn_id = "U0000000000000000000A";
+        let root_thread = store
+            .get_thread_model(THREAD_RED_PRIVATE_A_ID)
+            .await
+            .expect("delivery root lookup should succeed")
+            .expect("delivery root should exist");
+        store
+            .materialize_turn_start(
+                &root_thread,
+                pioneer_protocol::SandboxMode::FullAccess,
+                &pioneer_protocol::Turn {
+                    id: parent_turn_id.to_owned(),
+                    status: pioneer_protocol::TurnStatus::InProgress,
+                    turn_kind: pioneer_protocol::TurnKind::Conversation,
+                    origin: pioneer_protocol::TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
+                    ),
+                },
+                &[],
+                pioneer_protocol::PersistedActorRef::Principal(
+                    scope.principal.principal_id.clone(),
+                ),
+            )
+            .await
+            .expect("delivery parent turn should persist");
+        let parent_authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+            &scope.principal,
+            WORKSPACE_RED_ID,
+            THREAD_RED_PRIVATE_A_ID,
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            None,
+        )
+        .to_persisted_json()
+        .expect("delivery parent authority should serialize");
+        assert!(
+            store
+                .set_turn_execution_authorization_context(parent_turn_id, &parent_authority)
+                .await
+                .expect("delivery parent authority should persist")
+        );
+        harness
+            .database
+            .execute_unprepared(
+                format!(
+                    "UPDATE thread_lineage SET created_by_turn_id='{parent_turn_id}' \
+                     WHERE child_thread_id='{THREAD_RED_INTERNAL_ID}'"
+                )
+                .as_str(),
+            )
+            .await
+            .expect("delivery child lineage should reference its typed parent execution");
         let policy =
             |mode, thread_id: Option<&str>, webhook_url: Option<&str>| TaskDeliveryPolicy {
                 mode,
@@ -4396,7 +4412,7 @@ mod tests {
     fn member_task_tool_creation_is_owned_by_the_initiating_principal() {
         let principal_id =
             pioneer_protocol::PrincipalId::new("P0000000000000000000A").expect("principal id");
-        let scope = TaskToolAuthorizationScope::Member {
+        let scope = TaskToolAuthorizationScope {
             principal: crate::auth::AuthenticatedSessionPrincipal {
                 gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
                     .expect("gateway id"),
@@ -4631,66 +4647,7 @@ mod tests {
     }
 
     #[test]
-    fn task_get_legacy_lineage_output_is_derived_from_target_rows() {
-        let mut response = sample_task_response(
-            TaskStatus::Completed,
-            vec![sample_run(TaskRunStatus::Succeeded)],
-            None,
-        );
-        let run_id = response.runs[0].id.clone();
-        response
-            .thread_lineage
-            .push(pioneer_protocol::TaskThreadLineage {
-                child_thread_id: "child_thread_target".to_owned(),
-                parent_thread_id: "parent_thread".to_owned(),
-                root_thread_id: "parent_thread".to_owned(),
-                depth: 1,
-                origin_kind: Some("task_run".to_owned()),
-                created_by_thread_id: Some("parent_thread".to_owned()),
-                created_by_turn_id: Some("parent_turn".to_owned()),
-                created_at: 123,
-            });
-        response
-            .task_run_thread_bindings
-            .push(pioneer_protocol::TaskRunThreadBinding {
-                id: "binding_target".to_owned(),
-                task_id: response.task.id.clone(),
-                run_id: run_id.clone(),
-                execution_id: None,
-                thread_id: "child_thread_target".to_owned(),
-                binding_kind: TaskRunThreadBindingKind::PrimaryExecutor,
-                created_at: 123,
-            });
-        response.task_run_turns.push(pioneer_protocol::TaskRunTurn {
-            id: "turn_target".to_owned(),
-            task_id: response.task.id.clone(),
-            run_id,
-            execution_id: None,
-            thread_id: "child_thread_target".to_owned(),
-            turn_id: "child_turn_target".to_owned(),
-            kind: pioneer_protocol::TaskRunTurnKind::Initial,
-            round: 0,
-            sequence: 0,
-            status: pioneer_protocol::TaskRunTurnStatus::CandidateCreated,
-            reviews_candidate_id: None,
-            requested_by_candidate_id: None,
-            requested_by_review_event_id: None,
-            created_at: 123,
-            started_at: Some(123),
-            completed_at: Some(124),
-        });
-
-        let output = task_get_legacy_lineage_output(&response);
-
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0]["childThreadId"], "child_thread_target");
-        assert_eq!(output[0]["childTurnId"], "child_turn_target");
-        assert_eq!(output[0]["taskId"], response.task.id);
-        assert_eq!(output[0]["taskRunId"], response.runs[0].id);
-    }
-
-    #[test]
-    fn task_wait_tool_output_renders_review_required_candidate() {
+    fn task_wait_tool_output_uses_safe_review_projection() {
         let mut response = sample_review_wait_response(
             vec![
                 pioneer_protocol::TaskWaitReviewAction::TaskAccept,
@@ -4714,23 +4671,23 @@ mod tests {
         assert_eq!(output["reviewRequiredCount"], 1);
         assert_eq!(output["completed"].as_array().unwrap().len(), 0);
         let review = &output["reviewRequired"][0];
-        assert_eq!(review["taskId"], "task_1234567890123456");
-        assert_eq!(review["ownerPrincipalId"], "principal_member");
-        assert_eq!(review["runId"], "run_12345678901234567");
-        assert_eq!(review["status"], "waiting_review");
-        assert_eq!(review["candidateId"], "candidate_123456789012");
-        assert_eq!(review["candidateStatus"], "pending_review");
-        assert_eq!(review["summary"], "candidate summary");
-        assert_eq!(review["childThreadId"], "thread_child12345678");
-        assert_eq!(review["childTurnId"], "turn_child123456789");
+        assert_eq!(review["item"]["task"]["id"], "task_1234567890123456");
+        assert_eq!(review["item"]["task"]["ownerId"], "principal_member");
+        assert_eq!(review["item"]["run"]["id"], "run_12345678901234567");
+        assert_eq!(review["item"]["task"]["status"], "waiting_review");
+        assert_eq!(review["candidate"]["id"], "candidate_123456789012");
+        assert_eq!(review["candidate"]["status"], "pending_review");
+        assert_eq!(review["candidate"]["summary"], "candidate summary");
         assert_eq!(review["remainingRevisionRounds"], 1);
         assert_eq!(
             review["allowedActions"],
             json!(["task_accept", "task_revise", "task_cancel"])
         );
         assert_eq!(review["revisionBlockedReason"], JsonValue::Null);
-        assert_eq!(review["recommendation"], "call_task_accept_or_task_revise");
-        assert_eq!(review["diagnostics"], json!(["used fallback text result"]));
+        assert!(review.get("reviewPolicy").is_none());
+        assert!(review.get("diagnostics").is_none());
+        assert!(review["item"].get("childThreadId").is_none());
+        assert!(review["item"].get("childTurnId").is_none());
     }
 
     #[test]
@@ -4913,7 +4870,7 @@ mod tests {
             review["revisionBlockedReason"],
             "max_revision_rounds_reached"
         );
-        assert_eq!(review["recommendation"], "call_task_accept_or_task_cancel");
+        assert!(review.get("recommendation").is_none());
     }
 
     fn sample_task_turn_item() -> TaskTurnItem {
@@ -5309,8 +5266,26 @@ mod tests {
             thread_id: "thread_12345678901234".to_owned(),
             turn_id: "turn_123456789012345".to_owned(),
         };
+        let scope = TaskToolAuthorizationScope {
+            principal: crate::auth::AuthenticatedSessionPrincipal {
+                gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
+                    .expect("gateway id"),
+                principal_id: pioneer_protocol::PrincipalId::new("P0000000000000000000A")
+                    .expect("principal id"),
+                kind: PrincipalKind::User,
+                role_key: Some(pioneer_protocol::RoleKey::member()),
+                device_id: pioneer_protocol::DeviceId::new("D0000000000000000000A")
+                    .expect("device id"),
+                session_id: pioneer_protocol::AuthSessionId::new("S0000000000000000000A")
+                    .expect("session id"),
+                access_jti: "task-tool-test".to_owned(),
+                access_expires_at_unix: u64::MAX,
+            },
+            workspace_id: turn_context.workspace_id.clone(),
+            root_thread_id: turn_context.thread_id.clone(),
+        };
 
-        let context = TaskToolAuthorizationScope::Unrestricted.mutation_context(&turn_context);
+        let context = scope.mutation_context(&turn_context);
 
         assert_eq!(context.thread_id, Some(turn_context.thread_id));
         assert_eq!(context.turn_id, Some(turn_context.turn_id));
@@ -5329,8 +5304,8 @@ mod tests {
             task_list_summaries(&[current, first, second], Some("task_current_execution"), 2);
 
         assert_eq!(summaries.len(), 2);
-        assert_eq!(summaries[0]["taskId"], "task_visible_first");
-        assert_eq!(summaries[1]["taskId"], "task_visible_second");
+        assert_eq!(summaries[0]["id"], "task_visible_first");
+        assert_eq!(summaries[1]["id"], "task_visible_second");
     }
 
     #[test]

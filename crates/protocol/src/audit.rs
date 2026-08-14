@@ -4,7 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    AuditEventId, AuthSessionId, DeviceId, GatewayId, PrincipalId, WorkspaceId,
+    AuditEventId, AuthSessionId, DeviceId, GatewayId, PolicyGeneration, PrincipalId, RoleKey,
+    WorkspaceId,
     invitation::{INVITATION_MAX_WORKSPACE_GRANTS, INVITATION_MIN_WORKSPACE_GRANTS},
 };
 
@@ -184,6 +185,10 @@ pub struct AuditEvent {
     pub workspace_id: Option<WorkspaceId>,
     pub metadata_version: u32,
     pub metadata: BoundedServerGeneratedMetadata,
+    pub policy_generation: PolicyGeneration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_role_key: Option<RoleKey>,
+    pub policy_fingerprint: String,
     pub created_at: i64,
 }
 

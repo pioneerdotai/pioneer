@@ -9,15 +9,12 @@
       "format": "uint64",
       "minimum": 0
     },
-    "access_lost": {
-      "description": "Whether this particular connection actually lost access to the scope.",
-      "type": [
-        "boolean",
-        "null"
-      ]
-    },
     "change": {
       "$ref": "#/$defs/AccessChangeKind"
+    },
+    "outcome": {
+      "description": "Server-resolved result for this exact recipient and affected scope.",
+      "$ref": "#/$defs/AccessChangeOutcome"
     },
     "thread_id": {
       "description": "Exact affected thread when the committed ACL mutation is thread-scoped.\n\nThis is an opaque server-owned identifier, not protected thread\ncontent. It is omitted for workspace-wide changes and lets clients\nevict only the affected thread instead of discarding unrelated\nworkspace state.",
@@ -33,6 +30,7 @@
   "required": [
     "authorization_revision",
     "workspace_id",
+    "outcome",
     "change"
   ],
   "$defs": {
@@ -45,6 +43,14 @@
         "thread_visibility",
         "thread_participant_added",
         "thread_participant_removed"
+      ]
+    },
+    "AccessChangeOutcome": {
+      "description": "Authoritative access result for the recipient of an access-change event.\nThis is required: omission is a protocol incompatibility, never a legacy\nsecurity mode.",
+      "type": "string",
+      "enum": [
+        "retained",
+        "revoked"
       ]
     }
   }

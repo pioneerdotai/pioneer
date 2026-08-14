@@ -61,11 +61,30 @@ impl MessageProcessor {
         ));
         let mut result = None;
         for _ in 0..2 {
-            let revision = self.authorization_invalidation_hub.current_revision();
+            let revision = match self.current_authorization_revision().await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "capability snapshot policy generation is unavailable"
+                    );
+                    break;
+                }
+            };
             let snapshot = service
                 .snapshot(context.principal(), params.clone(), revision)
                 .await;
-            if self.authorization_invalidation_hub.current_revision() == revision {
+            let current_revision = match self.current_authorization_revision().await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "capability snapshot consistency fence is unavailable"
+                    );
+                    break;
+                }
+            };
+            if current_revision == revision {
                 result = Some(snapshot);
                 break;
             }

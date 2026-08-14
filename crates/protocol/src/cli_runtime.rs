@@ -503,6 +503,8 @@ pub struct CLIRuntimeThreadBindingGetParams {
 pub struct CLIRuntimeThreadBindingGetResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<CLIRuntimeThreadBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management: Option<CLIRuntimeThreadBindingManagement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -511,12 +513,18 @@ pub struct CLIRuntimeThreadBinding {
     pub thread_id: String,
     pub runtime_id: String,
     pub runtime_kind: CLIAgentRuntimeKind,
+    pub status: String,
+}
+
+/// Operator-only native session metadata, structurally separate from the
+/// operational binding consumed by Desktop and Mobile.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CLIRuntimeThreadBindingManagement {
     pub native_thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_model: Option<String>,
-    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -535,9 +543,6 @@ pub struct CLIRuntimeThreadForkResponse {
     pub runtime_id: String,
     pub source_thread_id: String,
     pub thread: Thread,
-    pub native_thread_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -552,9 +557,6 @@ pub struct CLIRuntimeThreadCompactResponse {
     pub workspace_id: String,
     pub runtime_id: String,
     pub thread_id: String,
-    pub native_thread_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -572,10 +574,6 @@ pub struct CLIRuntimeTurnSteerResponse {
     pub runtime_id: String,
     pub thread_id: String,
     pub turn_id: String,
-    pub native_thread_id: String,
-    pub native_turn_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -629,12 +627,7 @@ pub struct CLIRuntimeReviewStartResponse {
     pub turn_id: Option<String>,
     pub delivery: CLIRuntimeReviewDelivery,
     pub target: CLIRuntimeReviewTarget,
-    pub native_thread_id: String,
     pub review_thread_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_turn_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -811,10 +804,22 @@ pub enum CLIRuntimeRequestKind {
 #[serde(rename_all = "snake_case")]
 pub enum CLIRuntimePendingRequestStatus {
     Pending,
+    ResponseAccepted,
+    Delivering,
+    DeliveryFailed,
     Answered,
     Resolved,
     Cancelled,
     Expired,
+}
+
+impl CLIRuntimePendingRequestStatus {
+    pub const fn is_open(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::ResponseAccepted | Self::Delivering | Self::DeliveryFailed
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -849,6 +854,37 @@ pub struct CLIRuntimeAppsChangedNotification {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn operational_cli_contracts_do_not_contain_native_identity_or_host_state() {
+        let binding = CLIRuntimeThreadBindingGetResponse {
+            binding: Some(CLIRuntimeThreadBinding {
+                workspace_id: "workspace-1".to_owned(),
+                thread_id: "thread-1".to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+                status: "active".to_owned(),
+            }),
+            management: None,
+        };
+        let steer = CLIRuntimeTurnSteerResponse {
+            workspace_id: "workspace-1".to_owned(),
+            runtime_id: "codex".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+        };
+
+        for value in [
+            serde_json::to_value(binding).expect("binding serializes"),
+            serde_json::to_value(steer).expect("steer serializes"),
+        ] {
+            let encoded = value.to_string();
+            assert!(!encoded.contains("native_thread_id"));
+            assert!(!encoded.contains("native_turn_id"));
+            assert!(!encoded.contains("native_cwd"));
+            assert!(!encoded.contains("raw"));
+        }
+    }
 
     #[test]
     fn cli_runtime_mcp_adapter_readiness_round_trips_as_typed_internal_evidence() {

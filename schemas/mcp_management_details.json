@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpManagementDetails",
+  "description": "Configuration and diagnostics intentionally excluded from the operational\nMCP capability returned by discovery endpoints.",
+  "type": "object",
+  "properties": {
+    "audit": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/McpAuditEventSummary"
+      }
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "health": {
+      "$ref": "#/$defs/McpServerHealthDetails"
+    },
+    "recent_bindings": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/McpTurnBindingSummary"
+      }
+    },
+    "scope": {
+      "$ref": "#/$defs/McpScopeKind"
+    },
+    "source_kind": {
+      "$ref": "#/$defs/McpSourceKind"
+    },
+    "transport": {
+      "$ref": "#/$defs/McpTransportSummary"
+    }
+  },
+  "required": [
+    "scope",
+    "source_kind",
+    "transport",
+    "fingerprint",
+    "health"
+  ],
+  "$defs": {
+    "McpAuditEventSummary": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "callable_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "details": {
+          "default": null
+        },
+        "raw_tool_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_installation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_name": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "server_name",
+        "action",
+        "decision",
+        "created_at"
+      ]
+    },
+    "McpRuntimeState": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpRuntimeStatus": {
+      "type": "object",
+      "properties": {
+        "last_seen_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "live": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/McpRuntimeState"
+        }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "McpServerHealthDetails": {
+      "type": "object",
+      "properties": {
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next_retry_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "retry_attempt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runtime": {
+          "$ref": "#/$defs/McpRuntimeStatus"
+        },
+        "status": {
+          "$ref": "#/$defs/McpServerStatus"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stderr_tail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "runtime",
+        "status"
+      ]
+    },
+    "McpServerStatus": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpSourceKind": {
+      "type": "string",
+      "enum": [
+        "config"
+      ]
+    },
+    "McpTransportSummary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "stdio"
+            }
+          },
+          "required": [
+            "kind",
+            "command"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "streamable_http"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "url"
+          ]
+        }
+      ]
+    },
+    "McpTurnBindingSummary": {
+      "type": "object",
+      "properties": {
+        "callable_name": {
+          "type": "string"
+        },
+        "capability_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog_version": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "raw_tool_name": {
+          "type": "string"
+        },
+        "selection_reason": {
+          "type": "string"
+        },
+        "server_installation_id": {
+          "type": "string"
+        },
+        "server_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server_installation_id",
+        "server_name",
+        "raw_tool_name",
+        "callable_name",
+        "catalog_version",
+        "fingerprint",
+        "selection_reason"
+      ]
+    }
+  }
+}

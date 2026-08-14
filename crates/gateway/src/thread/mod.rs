@@ -820,6 +820,24 @@ impl ThreadManager {
             .await
     }
 
+    pub async fn turn_start_with_user_metadata_and_permission_profile(
+        &self,
+        connection_id: ConnectionId,
+        params: TurnStartParams,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+        mentions: Vec<pioneer_protocol::TurnMention>,
+    ) -> Result<TurnStartOutcome> {
+        self.turn_start_for_actor_with_permission_profile(
+            Some(connection_id),
+            params,
+            Some(permission_profile),
+            author,
+            mentions,
+        )
+        .await
+    }
+
     pub async fn system_turn_start_with_permission_profile(
         &self,
         params: TurnStartParams,
@@ -860,6 +878,8 @@ impl ThreadManager {
         author: Option<pioneer_protocol::TurnAuthorSnapshot>,
         mentions: Vec<pioneer_protocol::TurnMention>,
     ) -> Result<TurnStartOutcome> {
+        pioneer_protocol::validate_turn_execution_envelope(&params)
+            .map_err(|message| anyhow!(message))?;
         let thread_id = params.thread_id.trim();
         if thread_id.is_empty() {
             bail!("`thread_id` is required for `turn/start`");

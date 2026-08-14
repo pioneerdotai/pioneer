@@ -3,10 +3,6 @@
   "title": "CLIRuntimeThreadCompactResponse",
   "type": "object",
   "properties": {
-    "native_thread_id": {
-      "type": "string"
-    },
-    "raw": true,
     "runtime_id": {
       "type": "string"
     },
@@ -20,7 +16,6 @@
   "required": [
     "workspace_id",
     "runtime_id",
-    "thread_id",
-    "native_thread_id"
+    "thread_id"
   ]
 }

@@ -11,9 +11,7 @@ use sea_orm::{
 use serde_json::json;
 
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
-use crate::repositories::cli_runtime_binding::{
-    CliRuntimePendingRequestRecord, CliRuntimePendingRequestStatus,
-};
+use crate::repositories::cli_runtime_binding::CliRuntimePendingRequestRecord;
 use crate::repositories::thread_timeline_projection as timeline_repository;
 use crate::repositories::{task, thread, turn};
 use crate::timeline_projection::{ProjectionPlacement, classify_turn_item_row_for_turn};
@@ -150,7 +148,7 @@ pub(crate) async fn project_cli_runtime_pending_request<C: ConnectionTrait>(
         return Ok(());
     };
 
-    if request.status != CliRuntimePendingRequestStatus::Pending {
+    if request.status.is_terminal() {
         timeline_repository::delete_thread_timeline_block(
             db,
             approval_block_id(turn_model.id.as_str(), request.request_id.as_str()).as_str(),

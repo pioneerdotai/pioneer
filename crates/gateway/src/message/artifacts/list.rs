@@ -33,11 +33,11 @@ impl ArtifactListAuthorization<'_> {
         }
     }
 
-    fn is_superuser(&self) -> bool {
+    fn has_absolute_authority(&self) -> bool {
         match self {
-            Self::Workspace(proof) => proof.decision().is_absolute_superuser(),
-            Self::Thread(proof) => proof.decision().is_absolute_superuser(),
-            Self::Turn(proof) => proof.decision().is_absolute_superuser(),
+            Self::Workspace(proof) => proof.decision().is_absolute(),
+            Self::Thread(proof) => proof.decision().is_absolute(),
+            Self::Turn(proof) => proof.decision().is_absolute(),
         }
     }
 
@@ -110,7 +110,7 @@ impl MessageProcessor {
         let mut filter = match self.filter_from_artifact_list_params(params, method).await {
             Ok(filter) => filter,
             Err(error) => {
-                if !authorization.is_superuser() {
+                if !authorization.has_absolute_authority() {
                     self.send_error(
                         connection_id,
                         artifact_list_authorization_unavailable(&authorization, request_id),
@@ -130,7 +130,7 @@ impl MessageProcessor {
                 return;
             }
         };
-        if !authorization.is_superuser() {
+        if !authorization.has_absolute_authority() {
             let authorized_roots = match &authorization {
                 ArtifactListAuthorization::Workspace(_) => {
                     let threads = match pioneer_crud::list_accessible_threads_for_principal(
@@ -365,7 +365,7 @@ impl MessageProcessor {
                 return;
             }
         };
-        if !authorization.decision().is_absolute_superuser()
+        if !authorization.decision().is_absolute()
             && authorization.thread_id() != Some(target_root.as_str())
         {
             self.send_error(

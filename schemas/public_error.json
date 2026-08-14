@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicError",
+  "description": "Stable, bounded failure presentation shared by RPC, voice and task\nexecution surfaces. Raw source chains are never part of this type.",
+  "type": "object",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/PublicErrorCode"
+    },
+    "correlation_id": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "retry_after_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "stage": {
+      "$ref": "#/$defs/PublicErrorStage"
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "version",
+    "code",
+    "stage",
+    "message",
+    "retryable",
+    "correlation_id"
+  ],
+  "$defs": {
+    "PublicErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_input",
+        "policy_denied",
+        "not_found",
+        "conflict",
+        "resource_exhausted",
+        "unavailable",
+        "timeout",
+        "internal"
+      ]
+    },
+    "PublicErrorStage": {
+      "type": "string",
+      "enum": [
+        "discovery",
+        "admission",
+        "preparation",
+        "execution",
+        "persistence",
+        "delivery",
+        "observation"
+      ]
+    }
+  }
+}

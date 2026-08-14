@@ -3,8 +3,8 @@ use pioneer_config::GatewayMemoryConfig;
 use pioneer_crud::CrudStore;
 use pioneer_memory::hooks::MemoryTurnContext;
 use pioneer_memory::{
-    MemoryOperationContext, MemoryReadPolicy, MemoryService, MemoryServiceConfig,
-    MemorySourceAccessPolicy, MemvidMemoryBackend,
+    MemoryMutationBoundary, MemoryOperationContext, MemoryReadPolicy, MemoryService,
+    MemoryServiceConfig, MemorySourceAccessPolicy, MemvidMemoryBackend,
 };
 use pioneer_protocol::MemoryActor;
 use std::path::Path;
@@ -111,7 +111,7 @@ impl GatewayMemoryRuntime {
         &self,
         turn: &MemoryTurnContext,
         actor: Option<MemoryActor>,
-        member_restricted: bool,
+        scoped_collaboration: bool,
     ) -> MemoryOperationContext {
         let conversation_thread_id = turn.effective_conversation_thread_id().to_owned();
         let mut context = MemoryOperationContext {
@@ -124,7 +124,7 @@ impl GatewayMemoryRuntime {
             allow_global_agent: self.context_defaults.allow_global_agent,
             ..MemoryOperationContext::default()
         };
-        if member_restricted {
+        if scoped_collaboration {
             context.allow_global_user = false;
             context.allow_global_agent = false;
             context.read_policy = Some(MemoryReadPolicy {
@@ -133,8 +133,15 @@ impl GatewayMemoryRuntime {
                 allow_secret_like: false,
                 allow_regulated: false,
             });
-            context.source_access =
-                MemorySourceAccessPolicy::accessible_threads([conversation_thread_id]);
+            context.source_access = MemorySourceAccessPolicy::accessible_threads([
+                conversation_thread_id,
+                turn.thread_id.clone(),
+            ]);
+            context.mutation_boundary = MemoryMutationBoundary::thread_capsule_with_sources(
+                turn.effective_conversation_thread_id(),
+                turn.task_id.clone(),
+                [turn.thread_id.clone()],
+            );
         }
         context
     }

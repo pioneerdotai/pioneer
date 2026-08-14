@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadReadCursor",
+  "type": "object",
+  "properties": {
+    "sort_key": {
+      "type": "string"
+    },
+    "through_turn_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "through_turn_id",
+    "sort_key"
+  ]
+}

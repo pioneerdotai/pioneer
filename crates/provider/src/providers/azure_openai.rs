@@ -1,7 +1,7 @@
 use crate::{
     attachments::{
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
-        ensure_no_unrendered_attachments, prepare_messages_for_provider,
+        ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
     },
     reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
@@ -647,11 +647,12 @@ impl crate::traits::Provider for AzureOpenAiProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = ApiChatRequest {
             messages: Self::convert_messages(&prepared)?,
@@ -736,11 +737,12 @@ impl crate::traits::Provider for AzureOpenAiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = ApiChatRequest {
             messages: Self::convert_messages(&prepared)?,

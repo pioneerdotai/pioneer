@@ -21,6 +21,9 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub metadata_json: String,
     pub created_at: DateTimeWithTimeZone,
+    pub policy_generation: i64,
+    pub policy_role_key: Option<String>,
+    pub policy_fingerprint: String,
     #[sea_orm(
         belongs_to,
         from = "actor_session_id",

@@ -33,7 +33,7 @@ pub(crate) async fn load_active_agent_skill_overlay(
     Ok(entries)
 }
 
-pub(crate) async fn load_member_agent_skill_overlay(
+pub(crate) async fn load_scoped_agent_skill_overlay(
     store: &CrudStore,
     principal_id: &pioneer_protocol::PrincipalId,
     workspace_id: &str,
@@ -307,7 +307,7 @@ mod tests {
             .await
             .expect("Member membership must be removable");
         assert!(
-            load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+            load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
                 .await
                 .expect("missing workspace membership must fail closed without error")
                 .is_empty()
@@ -332,7 +332,7 @@ mod tests {
             .await
             .expect("source thread must become workspace-visible");
         assert!(
-            load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+            load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
                 .await
                 .expect("missing policy must fail closed without error")
                 .is_empty()
@@ -350,7 +350,7 @@ mod tests {
             )
             .await
             .expect("explicit workspace policy must persist");
-        let eligible = load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+        let eligible = load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
             .await
             .expect("workspace-only learned version must resolve");
         assert_eq!(eligible.len(), 1);
@@ -364,7 +364,7 @@ mod tests {
             .await
             .expect("source thread must become private");
         assert!(
-            load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+            load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
                 .await
                 .expect("private provenance must fail closed without error")
                 .is_empty()
@@ -380,7 +380,7 @@ mod tests {
             .await
             .expect("Member membership revoke must persist");
         assert!(
-            load_member_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+            load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
                 .await
                 .expect("revoked membership must invalidate overlay without error")
                 .is_empty()

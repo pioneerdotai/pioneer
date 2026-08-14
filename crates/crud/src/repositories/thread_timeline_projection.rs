@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{
-    cli_runtime_pending_request, thread_timeline_block, thread_timeline_projection_meta,
-    turn_work_item_projection, turn_work_projection,
+    thread_timeline_block, thread_timeline_projection_meta, turn_work_item_projection,
+    turn_work_projection,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{OnConflict, Query, SelectStatement};
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Set, Statement,
@@ -77,16 +77,16 @@ pub struct ThreadTimelineBlockRecord {
     pub updated_at: DateTimeWithTimeZone,
 }
 
-/// Exact execution owner allowed to observe CLI approval payloads embedded in
-/// an otherwise shared thread timeline.
+/// Server-resolved presentation grant for approval payloads embedded in a
+/// shared thread timeline.
 ///
-/// `None` at the query boundary is reserved for an absolute Superuser. An
-/// ordinary Member always supplies both values, allowing the approval
-/// predicate to run in SQL before ordering and pagination.
+/// The grant is action-based, not initiator-based: every current collaborator
+/// whose role grants `AgentRequestObserve` sees every pending interaction in
+/// the root thread capsule. A narrower future role can still read the ordinary
+/// timeline while approval rows remain filtered before ordering/pagination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadTimelineApprovalScope {
-    pub initiating_principal_id: String,
-    pub initiating_session_id: String,
+    pub can_observe_agent_requests: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,33 +507,11 @@ pub async fn count_unread_user_message_blocks_for_threads<C: ConnectionTrait>(
 }
 
 fn thread_timeline_approval_visibility(approval_scope: &ThreadTimelineApprovalScope) -> Condition {
-    Condition::any()
-        .add(thread_timeline_block::Column::BlockKind.ne(BLOCK_KIND_APPROVAL))
-        .add(
-            Condition::all()
-                .add(thread_timeline_block::Column::BlockKind.eq(BLOCK_KIND_APPROVAL))
-                .add(
-                    thread_timeline_block::Column::SourceKey
-                        .in_subquery(pending_request_ids_for_execution_owner(approval_scope)),
-                ),
-        )
-}
-
-fn pending_request_ids_for_execution_owner(
-    approval_scope: &ThreadTimelineApprovalScope,
-) -> SelectStatement {
-    Query::select()
-        .column(cli_runtime_pending_request::Column::RequestId)
-        .from(cli_runtime_pending_request::Entity)
-        .and_where(
-            cli_runtime_pending_request::Column::InitiatingPrincipalId
-                .eq(approval_scope.initiating_principal_id.clone()),
-        )
-        .and_where(
-            cli_runtime_pending_request::Column::InitiatingSessionId
-                .eq(approval_scope.initiating_session_id.clone()),
-        )
-        .to_owned()
+    if approval_scope.can_observe_agent_requests {
+        Condition::all()
+    } else {
+        Condition::all().add(thread_timeline_block::Column::BlockKind.ne(BLOCK_KIND_APPROVAL))
+    }
 }
 
 pub async fn count_thread_timeline_blocks<C: ConnectionTrait>(

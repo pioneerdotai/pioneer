@@ -5,6 +5,92 @@ use pioneer_crud::{
 use pioneer_protocol::{MemoryActor, MemoryScope, MemoryScopeKind};
 use std::collections::BTreeSet;
 
+/// Server-derived mutation boundary for durable memory.
+///
+/// Read visibility and mutation authority are deliberately separate. A caller
+/// may be allowed to recall workspace-visible knowledge while only being
+/// allowed to create, update, or forget memory owned by one collaboration
+/// capsule. Keeping this fact in the domain-service context makes direct RPC,
+/// agent tools, and post-turn hooks share the same enforcement point.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum MemoryMutationBoundary {
+    #[default]
+    Unrestricted,
+    ThreadCapsule {
+        root_thread_id: String,
+        task_id: Option<String>,
+        authorized_source_thread_ids: BTreeSet<String>,
+    },
+}
+
+impl MemoryMutationBoundary {
+    pub fn thread_capsule(root_thread_id: impl Into<String>, task_id: Option<String>) -> Self {
+        let root_thread_id = root_thread_id.into();
+        let authorized_source_thread_ids = BTreeSet::from([root_thread_id.clone()]);
+        Self::ThreadCapsule {
+            root_thread_id,
+            task_id,
+            authorized_source_thread_ids,
+        }
+    }
+
+    pub fn thread_capsule_with_sources(
+        root_thread_id: impl Into<String>,
+        task_id: Option<String>,
+        source_thread_ids: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let root_thread_id = root_thread_id.into();
+        let mut authorized_source_thread_ids: BTreeSet<String> =
+            source_thread_ids.into_iter().collect();
+        authorized_source_thread_ids.insert(root_thread_id.clone());
+        Self::ThreadCapsule {
+            root_thread_id,
+            task_id,
+            authorized_source_thread_ids,
+        }
+    }
+
+    pub fn validate_scope(
+        &self,
+        scope: &MemoryScope,
+        source_thread_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Self::ThreadCapsule {
+            root_thread_id,
+            task_id,
+            authorized_source_thread_ids,
+        } = self
+        else {
+            return Ok(());
+        };
+
+        if !source_thread_id
+            .is_some_and(|source_thread_id| authorized_source_thread_ids.contains(source_thread_id))
+        {
+            anyhow::bail!("memory mutation provenance is outside the authorized thread capsule");
+        }
+
+        match scope.kind {
+            MemoryScopeKind::Thread if scope.key == *root_thread_id => Ok(()),
+            MemoryScopeKind::Task
+                if task_id
+                    .as_deref()
+                    .is_some_and(|authorized_task_id| scope.key == authorized_task_id) =>
+            {
+                Ok(())
+            }
+            MemoryScopeKind::Thread | MemoryScopeKind::Task => {
+                anyhow::bail!("memory mutation scope is outside the authorized thread capsule")
+            }
+            MemoryScopeKind::User | MemoryScopeKind::Workspace | MemoryScopeKind::Agent => {
+                anyhow::bail!(
+                    "personal, workspace, and agent memory require a separate authorization scope"
+                )
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemorySourceAccessPolicy {
     accessible_thread_ids: Option<BTreeSet<String>>,
@@ -55,6 +141,7 @@ pub struct MemoryOperationContext {
     pub allow_global_agent: bool,
     pub read_policy: Option<MemoryReadPolicy>,
     pub source_access: MemorySourceAccessPolicy,
+    pub mutation_boundary: MemoryMutationBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,5 +373,78 @@ fn push_scope_if_searchable(
 fn push_unique_scope(scopes: &mut Vec<MemoryScope>, scope: MemoryScope) {
     if !scopes.iter().any(|candidate| candidate == &scope) {
         scopes.push(scope);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope(kind: MemoryScopeKind, key: &str) -> MemoryScope {
+        MemoryScope {
+            kind,
+            key: key.to_owned(),
+        }
+    }
+
+    #[test]
+    fn thread_capsule_mutation_boundary_is_exact_and_not_workspace_wide() {
+        let boundary = MemoryMutationBoundary::thread_capsule("thread-root", None);
+
+        assert!(
+            boundary
+                .validate_scope(
+                    &scope(MemoryScopeKind::Thread, "thread-root"),
+                    Some("thread-root")
+                )
+                .is_ok()
+        );
+        assert!(
+            boundary
+                .validate_scope(
+                    &scope(MemoryScopeKind::Workspace, "workspace-a"),
+                    Some("thread-root")
+                )
+                .is_err()
+        );
+        assert!(
+            boundary
+                .validate_scope(
+                    &scope(MemoryScopeKind::Thread, "thread-other"),
+                    Some("thread-other")
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn thread_capsule_allows_only_its_active_task_scope() {
+        let boundary =
+            MemoryMutationBoundary::thread_capsule("thread-root", Some("task-current".to_owned()));
+
+        assert!(
+            boundary
+                .validate_scope(
+                    &scope(MemoryScopeKind::Task, "task-current"),
+                    Some("thread-root")
+                )
+                .is_ok()
+        );
+        assert!(
+            boundary
+                .validate_scope(
+                    &scope(MemoryScopeKind::Task, "task-other"),
+                    Some("thread-root")
+                )
+                .is_err()
+        );
+        assert!(
+            boundary
+                .validate_scope(
+                    &scope(MemoryScopeKind::Task, "task-current"),
+                    Some("thread-other")
+                )
+                .is_err()
+        );
     }
 }

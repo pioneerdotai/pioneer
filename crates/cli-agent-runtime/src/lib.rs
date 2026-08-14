@@ -33,3 +33,7 @@ mod tests {
         assert_eq!(crate::CLI_AGENT_RUNTIME_BOUNDARY, "cli-agent-runtime");
     }
 }
+mod native_event;
+pub use native_event::{
+    BoundedNativeEventCodec, NativeEventBudget, NativeIngressError, NativeIngressErrorKind,
+};

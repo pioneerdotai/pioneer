@@ -159,7 +159,11 @@ impl MessageProcessor {
         params: ThreadStartParams,
     ) {
         let connection_id = request_context.connection_id();
-        if authorization.action() != ResourceAction::ThreadCreate
+        let expected_action = match params.visibility.unwrap_or(ThreadVisibility::Private) {
+            ThreadVisibility::Private => ResourceAction::ThreadCreatePrivate,
+            ThreadVisibility::Workspace => ResourceAction::ThreadCreateWorkspace,
+        };
+        if authorization.action() != expected_action
             || authorization.workspace_id() != params.workspace_id.trim()
         {
             self.send_error(
@@ -552,7 +556,7 @@ impl MessageProcessor {
                 return;
             }
         };
-        if !authorization.decision().is_absolute_superuser() {
+        if !authorization.decision().is_absolute() {
             retain_accessible_thread_agents_doc_summaries(
                 &mut agents_docs,
                 &folders,
@@ -746,7 +750,7 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         identity: &ThreadSubscriptionIdentity,
     ) -> Result<Vec<pioneer_protocol::Thread>, anyhow::Error> {
-        let persisted_threads = if authorization.decision().is_absolute_superuser() {
+        let persisted_threads = if authorization.decision().is_absolute() {
             self.crud_store
                 .list_threads_for_workspace(authorization.workspace_id(), limit)
                 .await?
@@ -912,14 +916,14 @@ impl MessageProcessor {
             ThreadVisibility::Private => PersistedThreadAccessClass::Private,
             ThreadVisibility::Workspace => PersistedThreadAccessClass::Workspace,
         });
-        let member_principal_id = (!authorization.decision().is_absolute_superuser())
-            .then(|| authorization.principal_id());
+        let scoped_principal_id =
+            (!authorization.decision().is_absolute()).then(|| authorization.principal_id());
         let changed = match self
             .crud_store
             .update_user_thread_management(
                 authorization.workspace_id(),
                 authorization.thread_id(),
-                member_principal_id,
+                scoped_principal_id,
                 name,
                 access_class,
                 params.archived,
@@ -1099,8 +1103,8 @@ impl MessageProcessor {
             .await;
             return;
         }
-        let absolute_superuser = authorization.decision().is_absolute_superuser();
-        let acting_member = (!absolute_superuser).then(|| authorization.principal_id());
+        let absolute_authority = authorization.decision().is_absolute();
+        let acting_scoped_principal = (!absolute_authority).then(|| authorization.principal_id());
         let actor = request_context.persisted_actor();
         let gateway_id = &request_context.principal().gateway_id;
 
@@ -1159,7 +1163,7 @@ impl MessageProcessor {
                         gateway_id,
                         authorization.workspace_id(),
                         authorization.thread_id(),
-                        acting_member,
+                        acting_scoped_principal,
                         &target,
                         actor,
                     )
@@ -1217,7 +1221,7 @@ impl MessageProcessor {
                         gateway_id,
                         authorization.workspace_id(),
                         authorization.thread_id(),
-                        acting_member,
+                        acting_scoped_principal,
                         &target,
                     )
                     .await

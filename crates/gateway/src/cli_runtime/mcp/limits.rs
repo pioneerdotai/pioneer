@@ -118,13 +118,14 @@ pub(crate) struct CliMcpFacadeLimits {
 
 impl Default for CliMcpFacadeLimits {
     fn default() -> Self {
+        let invocation = pioneer_mcp::McpInvocationBudget::default();
         Self {
             max_frame_bytes: MAX_FRAME_PAYLOAD_BYTES,
-            max_arguments_bytes: 128 * 1024,
-            max_arguments_depth: 32,
-            max_result_bytes: 1024 * 1024,
-            max_result_images: 8,
-            max_result_tokens: 64 * 1024,
+            max_arguments_bytes: invocation.max_arguments_bytes,
+            max_arguments_depth: invocation.max_arguments_depth,
+            max_result_bytes: invocation.max_result_wire_bytes,
+            max_result_images: invocation.max_result_media,
+            max_result_tokens: invocation.max_result_tokens,
             max_active_calls: 8,
             max_queued_calls: 16,
             max_ledger_entries: 64,

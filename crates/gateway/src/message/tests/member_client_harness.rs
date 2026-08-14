@@ -221,7 +221,13 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
         .expect("connect internal Member client");
     let processor = MessageProcessor::new(
         Arc::new(ThreadManager::new("o4-mini", "openai")),
-        test_provider(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            Arc::new(DelayedProvider {
+                delay: Duration::from_secs(2),
+                text: "member harness delayed response".to_owned(),
+            }),
+        )),
         session_manager.clone(),
         workspace_manager,
         crud_store.clone(),
@@ -312,15 +318,7 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
         workspace_turn.turn.permission_profile.mode,
         pioneer_protocol::TurnPermissionMode::Supervised
     );
-    let terminal = recv_turn_terminal_notification(&mut member_rx).await;
-    assert_eq!(
-        terminal.method,
-        events::TURN_COMPLETED,
-        "Member agent turn must complete successfully, got params={:?}",
-        terminal.params
-    );
-
-    for (suffix, requested_resolution) in [("allow", "allow_for_turn"), ("deny", "deny")] {
+    for (suffix, requested_resolution) in [("allow", "allow_once"), ("deny", "deny")] {
         let permission_request_id = format!("member-permission-{suffix}");
         let response_request_id = generate_test_request_id("memberpermission", suffix);
         let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
@@ -381,9 +379,9 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
             .await
             .expect("Member permission decision must reach the running agent");
         match requested_resolution {
-            "allow_for_turn" => assert_eq!(
+            "allow_once" => assert_eq!(
                 broker_resolution,
-                pioneer_tools::PermissionApprovalResolution::AllowForTurn
+                pioneer_tools::PermissionApprovalResolution::AllowOnce
             ),
             "deny" => assert!(matches!(
                 broker_resolution,
@@ -392,6 +390,13 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
             _ => unreachable!(),
         }
     }
+    let terminal = recv_turn_terminal_notification(&mut member_rx).await;
+    assert_eq!(
+        terminal.method,
+        events::TURN_COMPLETED,
+        "Member agent turn must complete successfully, got params={:?}",
+        terminal.params
+    );
 
     crud_store
         .database_connection()
@@ -427,6 +432,65 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
         ))
         .await
         .expect("materialize Member-visible internal child lineage");
+    let child_parent_turn_id = "U0000000000000000000R";
+    let child_root = crud_store
+        .get_thread_model(INTERNAL_ROOT_THREAD_ID)
+        .await
+        .expect("child root lookup should succeed")
+        .expect("child root should exist");
+    crud_store
+        .materialize_turn_start(
+            &child_root,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: child_parent_turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: default_test_permission_profile(),
+            },
+            &[],
+            PersistedActorRef::Principal(member_principal.principal_id.clone()),
+        )
+        .await
+        .expect("child root parent turn should persist");
+    let child_parent_authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+        member_principal.as_ref(),
+        affected_workspace_id.as_str(),
+        INTERNAL_ROOT_THREAD_ID,
+        &default_test_permission_profile(),
+        None,
+    )
+    .to_persisted_json()
+    .expect("child root parent authority should serialize");
+    assert!(
+        crud_store
+            .set_turn_execution_authorization_context(
+                child_parent_turn_id,
+                child_parent_authority.as_str(),
+            )
+            .await
+            .expect("child root parent authority should persist")
+    );
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            format!(
+                "UPDATE thread_lineage SET created_by_turn_id='{child_parent_turn_id}' \
+                 WHERE child_thread_id='{INTERNAL_CHILD_THREAD_ID}'"
+            )
+            .as_str(),
+        )
+        .await
+        .expect("child lineage should reference its typed parent execution");
 
     let child_get_id = generate_test_request_id("memberclient", "childget");
     processor
@@ -594,7 +658,10 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
         access_changed.authorization_revision,
         signal.authorization_revision
     );
-    assert_eq!(access_changed.access_lost, Some(true));
+    assert_eq!(
+        access_changed.outcome,
+        pioneer_protocol::AccessChangeOutcome::Revoked
+    );
 
     let plan = apply_access_changed_to_client_state(&mut client_state, &access_changed);
     assert!(plan.apply);

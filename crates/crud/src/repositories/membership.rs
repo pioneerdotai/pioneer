@@ -308,7 +308,6 @@ pub async fn find_shared_workspace_principal_for_principal<C: ConnectionTrait>(
     gateway_principal::Entity::find_by_id(target_principal_id.to_string())
         .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
         .filter(gateway_principal::Column::Kind.eq(principal_kind_to_db(PrincipalKind::User)))
-        .filter(gateway_principal::Column::RoleKey.eq(pioneer_protocol::MEMBER_ROLE_KEY))
         .filter(gateway_principal::Column::Status.is_in(["active", "suspended"]))
         .filter(
             gateway_principal::Column::Id
@@ -356,10 +355,6 @@ pub async fn list_member_directory_page<C: ConnectionTrait>(
                         .add(
                             gateway_principal::Column::Kind
                                 .eq(principal_kind_to_db(PrincipalKind::User)),
-                        )
-                        .add(
-                            gateway_principal::Column::RoleKey
-                                .eq(pioneer_protocol::MEMBER_ROLE_KEY),
                         )
                         .add(gateway_principal::Column::Status.is_in(["active", "suspended"]))
                         .add(
@@ -432,7 +427,6 @@ pub async fn list_workspace_member_principals_page<C: ConnectionTrait>(
     let mut query = gateway_principal::Entity::find()
         .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
         .filter(gateway_principal::Column::Kind.eq(principal_kind_to_db(PrincipalKind::User)))
-        .filter(gateway_principal::Column::RoleKey.eq(pioneer_protocol::MEMBER_ROLE_KEY))
         .filter(gateway_principal::Column::Status.is_in(["active", "suspended"]))
         .filter(gateway_principal::Column::Id.in_subquery(member_ids));
     if let Some(cursor) = cursor {
@@ -776,7 +770,7 @@ async fn validate_member_principal<C: ConnectionTrait>(
         .transpose()
         .context("membership target has an invalid persisted role key")?;
     if principal_kind_from_db(model.kind.as_str())? != PrincipalKind::User
-        || !role.as_ref().is_some_and(RoleKey::is_supported)
+        || role.is_none()
         || principal_status_from_db(model.status.as_str())? != PrincipalStatus::Active
     {
         bail!("membership target is not an eligible ordinary Member principal");
@@ -798,7 +792,7 @@ async fn validate_persisted_member_principal<C: ConnectionTrait>(
         .context("membership target has an invalid persisted role key")?;
     let status = principal_status_from_db(model.status.as_str())?;
     if principal_kind_from_db(model.kind.as_str())? != PrincipalKind::User
-        || !role.as_ref().is_some_and(RoleKey::is_supported)
+        || role.is_none()
         || !matches!(status, PrincipalStatus::Active | PrincipalStatus::Suspended)
     {
         bail!("persisted membership target is not an ordinary Member principal");
@@ -832,7 +826,7 @@ pub(crate) async fn private_thread_participant_target_is_eligible<C: ConnectionT
     let status_is_eligible = status == PrincipalStatus::Active
         || (allow_suspended && status == PrincipalStatus::Suspended);
     if principal_kind_from_db(model.kind.as_str())? != PrincipalKind::User
-        || !role.as_ref().is_some_and(RoleKey::is_supported)
+        || role.is_none()
         || !status_is_eligible
     {
         return Ok(false);
@@ -2298,7 +2292,11 @@ mod tests {
                 id: Set(id.to_string()),
                 gateway_id: Set(fixture.gateway_id.to_string()),
                 kind: Set("user".to_owned()),
-                role_key: Set(Some("member".to_owned())),
+                role_key: Set(Some(if id == &shared_id {
+                    "synthetic_executor".to_owned()
+                } else {
+                    "member".to_owned()
+                })),
                 status: Set("active".to_owned()),
                 display_name: Set(nickname.to_owned()),
                 nickname: Set(nickname.to_owned()),
@@ -2374,16 +2372,18 @@ mod tests {
             "an unrelated row sorted first must not consume the authorized page"
         );
 
-        assert!(
-            find_shared_workspace_principal_for_principal(
-                &fixture.database,
-                &fixture.gateway_id,
-                &fixture.member_id,
-                &shared_id,
-            )
-            .await
-            .expect("resolve suspended shared profile")
-            .is_some()
+        let shared_profile = find_shared_workspace_principal_for_principal(
+            &fixture.database,
+            &fixture.gateway_id,
+            &fixture.member_id,
+            &shared_id,
+        )
+        .await
+        .expect("resolve suspended shared profile")
+        .expect("synthetic registered role remains directory-visible");
+        assert_eq!(
+            shared_profile.role_key.as_deref(),
+            Some("synthetic_executor")
         );
         assert!(
             find_shared_workspace_principal_for_principal(

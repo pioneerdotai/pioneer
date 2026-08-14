@@ -49,6 +49,9 @@
       "type": "string",
       "enum": [
         "pending",
+        "response_accepted",
+        "delivering",
+        "delivery_failed",
         "answered",
         "resolved",
         "cancelled",

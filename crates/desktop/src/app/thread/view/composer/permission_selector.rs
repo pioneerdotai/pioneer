@@ -8,9 +8,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
-use pioneer_client::composer::{
-    permissions as composer_permissions, state_machine::ComposerDomainAction,
-};
+use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_protocol::TurnPermissionMode;
 
 impl PioneerDesktop {
@@ -31,16 +29,26 @@ impl PioneerDesktop {
     }
 
     pub(super) fn render_composer_permission_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        let allowed_modes = self.allowed_composer_permission_modes();
-        let selected_mode = if allowed_modes.contains(&self.composer_permission_mode) {
+        let options = self.authorized_composer_permission_options();
+        let selected_mode = if options
+            .iter()
+            .any(|option| option.mode == self.composer_permission_mode)
+        {
             self.composer_permission_mode
         } else {
-            allowed_modes
+            options
                 .last()
-                .copied()
+                .map(|option| option.mode)
                 .unwrap_or(TurnPermissionMode::Supervised)
         };
-        let selected_option = composer_permissions::composer_permission_mode_option(selected_mode);
+        let selected_option = options
+            .iter()
+            .find(|option| option.mode == selected_mode)
+            .cloned();
+        let selected_label = selected_option
+            .as_ref()
+            .map(|option| option.label.clone())
+            .unwrap_or_default();
         let trigger_icon = Self::composer_permission_icon(selected_mode);
         let desktop_entity = cx.entity();
 
@@ -70,7 +78,7 @@ impl PioneerDesktop {
                     .disabled(
                         self.desktop_voice_context_locked()
                             || !self.can_start_active_thread_agent_presentation()
-                            || allowed_modes.is_empty(),
+                            || options.is_empty(),
                     )
                     .child(
                         h_flex()
@@ -85,7 +93,7 @@ impl PioneerDesktop {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .text_ellipsis()
-                                    .child(selected_option.label),
+                                    .child(selected_label),
                             )
                             .font_medium(),
                     ),
@@ -160,12 +168,10 @@ impl PioneerDesktop {
                             .into_any_element()
                     };
 
-                v_flex().w(px(320.)).gap_1().children(
-                    composer_permissions::composer_permission_mode_options()
-                        .into_iter()
-                        .filter(|option| allowed_modes.contains(&option.mode))
-                        .map(render_option),
-                )
+                v_flex()
+                    .w(px(320.))
+                    .gap_1()
+                    .children(options.iter().cloned().map(render_option))
             })
             .into_any_element()
     }

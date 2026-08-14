@@ -90,5 +90,54 @@
     "status": "unavailable",
     "reason": "required security capabilities unavailable: filesystem, network, process"
   },
+  "authority_cap": {
+    "version": 1,
+    "resource_binding_id": "phase44-unavailable",
+    "resource_binding_revision": 1,
+    "filesystem": {
+      "kind": "restricted",
+      "entries": [
+        {
+          "path": {
+            "kind": "workspace_root"
+          },
+          "access": "write",
+          "provenance": "workspace",
+          "resolved_path": "/workspace/project"
+        }
+      ]
+    },
+    "network": {
+      "mode": "disabled",
+      "allow_localhost": false,
+      "allow_unix_sockets": false
+    },
+    "process": {
+      "shell": {
+        "enabled": true,
+        "allow_stdin": true,
+        "allow_session_inheritance": true
+      },
+      "environment": {
+        "inherit": true,
+        "denied_patterns": [
+          ".*TOKEN.*",
+          ".*SECRET.*",
+          ".*PASSWORD.*"
+        ]
+      },
+      "timeout": {
+        "max_duration_ms": 1800000
+      },
+      "command_risk": {}
+    },
+    "approval": {
+      "allow_once": true,
+      "allow_for_turn": true,
+      "allow_for_session": false,
+      "allow_always": false,
+      "request_permissions": true
+    }
+  },
   "created_at_unix_ms": 1700000003000
 }

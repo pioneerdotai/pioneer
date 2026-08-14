@@ -152,7 +152,7 @@ mod tests {
                 authorization_revision: 11,
                 workspace_id: "workspace_a".to_owned(),
                 thread_id: Some("thread_a".to_owned()),
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: pioneer_protocol::AccessChangeKind::ThreadParticipantRemoved,
             });
         let event = ClientEvent::GatewayNotification(notification);
@@ -166,6 +166,7 @@ mod tests {
                         "authorization_revision": 11,
                         "workspace_id": "workspace_a",
                         "thread_id": "thread_a",
+                        "outcome": "revoked",
                         "change": "thread_participant_removed"
                     }
                 }

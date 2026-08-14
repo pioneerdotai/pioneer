@@ -2933,6 +2933,9 @@ impl MemoryService {
         let Some(row) = row else {
             return Ok(Vec::new());
         };
+        context
+            .mutation_boundary
+            .validate_scope(&row.scope, row.source_thread_id.as_deref())?;
         if self.row_control_plane_visible(&row, context, &[], now) {
             Ok(vec![row])
         } else {
@@ -4288,6 +4291,9 @@ fn validate_memory_write_source(
     source_thread_id: Option<&str>,
     sensitivity: MemorySensitivity,
 ) -> Result<()> {
+    context
+        .mutation_boundary
+        .validate_scope(scope, source_thread_id)?;
     if !context.source_access.requires_authoritative_provenance() {
         return Ok(());
     }
@@ -4305,9 +4311,12 @@ fn validate_memory_write_source(
         bail!("member memory requires provenance from an accessible source thread");
     }
     if scope.kind == MemoryScopeKind::Thread
-        && source_thread_id.is_some_and(|thread_id| thread_id != scope.key)
+        && context
+            .thread_id
+            .as_deref()
+            .is_none_or(|root_thread_id| root_thread_id != scope.key)
     {
-        bail!("thread memory provenance does not match its source thread");
+        bail!("thread memory scope is outside its authorized collaboration capsule");
     }
     Ok(())
 }

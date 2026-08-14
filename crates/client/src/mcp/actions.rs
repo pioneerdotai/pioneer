@@ -226,7 +226,9 @@ pub fn apply_local_mcp_policy(
             details.server.policy.allow_implicit_invocation = allow_implicit_invocation;
             if !enabled {
                 details.server.status = McpServerStatus::Disabled;
-                details.health.status = McpServerStatus::Disabled;
+                if let Some(management) = details.management.as_mut() {
+                    management.health.status = McpServerStatus::Disabled;
+                }
             }
         }
     }
@@ -413,9 +415,9 @@ pub fn mcp_install_response_field_issues(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        McpInstallResult, McpLifecycleAuditSummary, McpPolicyState, McpRuntimeState,
-        McpRuntimeStatus, McpServerCatalogDetails, McpServerHealthDetails, McpSourceKind,
-        McpTransportSummary, McpValidationDiagnostic,
+        McpInstallResult, McpLifecycleAuditSummary, McpManagementDetails, McpPolicyState,
+        McpRuntimeState, McpRuntimeStatus, McpServerCatalogDetails, McpServerHealthDetails,
+        McpSourceKind, McpTransportSummary, McpValidationDiagnostic,
     };
 
     fn server(id: &str, name: &str) -> McpListItem {
@@ -424,28 +426,21 @@ mod tests {
             name: name.to_owned(),
             display_name: None,
             scope: McpScopeKind::Workspace,
-            source_kind: McpSourceKind::Config,
-            transport: McpTransportSummary::Stdio {
-                command: "node".to_owned(),
-            },
             policy: McpPolicyState {
                 enabled: true,
                 allow_implicit_invocation: false,
             },
             required: false,
-            fingerprint: format!("{id}:{name}:fingerprint"),
             runtime: McpRuntimeStatus {
                 state: McpRuntimeState::Ready,
                 live: true,
                 last_seen_at: None,
-                last_error: None,
             },
             tools_count: 1,
             resources_count: 0,
             resource_templates_count: 0,
             prompts_count: 0,
             status: McpServerStatus::Ready,
-            status_reason: None,
         }
     }
 
@@ -454,16 +449,26 @@ mod tests {
         McpServerDetailsResponse {
             snapshot_version: 1,
             generated_at: 10,
-            health: McpServerHealthDetails {
-                runtime: server.runtime.clone(),
-                status: server.status,
-                status_reason: None,
-                last_error: None,
-                retry_attempt: None,
-                next_retry_at: None,
-                catalog_version: None,
-                stderr_tail: None,
-            },
+            management: Some(McpManagementDetails {
+                scope: McpScopeKind::Workspace,
+                source_kind: McpSourceKind::Config,
+                transport: McpTransportSummary::Stdio {
+                    command: "node".to_owned(),
+                },
+                fingerprint: format!("{id}:{name}:fingerprint"),
+                health: McpServerHealthDetails {
+                    runtime: server.runtime.clone(),
+                    status: server.status,
+                    status_reason: None,
+                    last_error: None,
+                    retry_attempt: None,
+                    next_retry_at: None,
+                    catalog_version: None,
+                    stderr_tail: None,
+                },
+                audit: Vec::new(),
+                recent_bindings: Vec::new(),
+            }),
             server,
             catalog: McpServerCatalogDetails {
                 catalog_version: None,
@@ -475,8 +480,6 @@ mod tests {
                 resource_templates: Vec::new(),
                 prompts: Vec::new(),
             },
-            audit: Vec::new(),
-            recent_bindings: Vec::new(),
         }
     }
 
@@ -553,7 +556,10 @@ mod tests {
         assert_eq!(servers[0].status, McpServerStatus::Disabled);
         let details = details.expect("details");
         assert_eq!(details.server.policy.enabled, false);
-        assert_eq!(details.health.status, McpServerStatus::Disabled);
+        assert_eq!(
+            details.management.expect("management").health.status,
+            McpServerStatus::Disabled
+        );
     }
 
     #[test]

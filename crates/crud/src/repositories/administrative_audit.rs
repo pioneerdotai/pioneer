@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use pioneer_entity::audit_event;
 use pioneer_protocol::{
     AUDIT_METADATA_VERSION_V1, AuditAction, AuditEventDomain, AuditEventId, AuditTargetKind,
-    AuthSessionId, BoundedServerGeneratedMetadata, GatewayId, PrincipalId, WorkspaceId,
+    AuthSessionId, BoundedServerGeneratedMetadata, GatewayId, PolicyGeneration, PrincipalId,
+    RoleKey, WorkspaceId,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{ActiveModelTrait, DatabaseTransaction, Set};
@@ -18,6 +19,9 @@ pub struct NewAdministrativeAuditEvent {
     pub target_id: String,
     pub workspace_id: Option<WorkspaceId>,
     pub metadata: BoundedServerGeneratedMetadata,
+    pub policy_generation: PolicyGeneration,
+    pub policy_role_key: Option<RoleKey>,
+    pub policy_fingerprint: String,
     pub created_at: DateTimeWithTimeZone,
 }
 
@@ -41,6 +45,10 @@ pub async fn insert_administrative_audit_event(
         workspace_id: Set(event.workspace_id.map(|id| id.to_string())),
         metadata_version: Set(i64::from(AUDIT_METADATA_VERSION_V1)),
         metadata_json: Set(metadata_json),
+        policy_generation: Set(i64::try_from(event.policy_generation.get())
+            .context("administrative audit policy generation exceeds SQLite INTEGER")?),
+        policy_role_key: Set(event.policy_role_key.map(|role| role.to_string())),
+        policy_fingerprint: Set(event.policy_fingerprint),
         created_at: Set(event.created_at),
     }
     .insert(transaction)

@@ -285,21 +285,30 @@ pub fn mcp_capability_counts_from_counts(
 }
 
 pub fn mcp_overview_rows(
-    server: &McpListItem,
+    _server: &McpListItem,
     details: Option<&McpServerDetailsResponse>,
 ) -> Vec<McpDetailMetaRow> {
+    let management = details.and_then(|details| details.management.as_ref());
     vec![
         McpDetailMetaRow {
             kind: McpDetailMetaKind::Source,
-            value: McpDetailValue::Source(mcp_source_label(server.source_kind)),
+            value: management
+                .map(|management| McpDetailValue::Source(mcp_source_label(management.source_kind)))
+                .unwrap_or(McpDetailValue::Empty),
         },
         McpDetailMetaRow {
             kind: McpDetailMetaKind::Scope,
-            value: McpDetailValue::Scope(mcp_scope_label(server.scope)),
+            value: management
+                .map(|management| McpDetailValue::Scope(mcp_scope_label(management.scope)))
+                .unwrap_or(McpDetailValue::Empty),
         },
         McpDetailMetaRow {
             kind: McpDetailMetaKind::Transport,
-            value: McpDetailValue::Transport(mcp_transport_presentation(&server.transport)),
+            value: management
+                .map(|management| {
+                    McpDetailValue::Transport(mcp_transport_presentation(&management.transport))
+                })
+                .unwrap_or(McpDetailValue::Empty),
         },
         McpDetailMetaRow {
             kind: McpDetailMetaKind::Loaded,
@@ -314,7 +323,9 @@ pub fn mcp_health_rows(
     server: &McpListItem,
     details: Option<&McpServerDetailsResponse>,
 ) -> Vec<McpDetailMetaRow> {
-    let health = details.map(|details| &details.health);
+    let health = details
+        .and_then(|details| details.management.as_ref())
+        .map(|management| &management.health);
     vec![
         McpDetailMetaRow {
             kind: McpDetailMetaKind::Runtime,
@@ -348,14 +359,8 @@ pub fn mcp_health_rows(
         },
         McpDetailMetaRow {
             kind: McpDetailMetaKind::LastError,
-            value: server
-                .runtime
-                .last_error
-                .as_deref()
-                .and_then(non_empty_text)
-                .or_else(|| {
-                    health.and_then(|health| optional_non_empty_text(health.last_error.as_deref()))
-                })
+            value: health
+                .and_then(|health| optional_non_empty_text(health.last_error.as_deref()))
                 .map(McpDetailValue::Text)
                 .unwrap_or(McpDetailValue::Empty),
         },
@@ -512,7 +517,8 @@ pub fn optional_non_empty_text(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        McpPolicyState, McpRuntimeStatus, McpServerCatalogDetails, McpServerHealthDetails,
+        McpManagementDetails, McpPolicyState, McpRuntimeStatus, McpServerCatalogDetails,
+        McpServerHealthDetails,
     };
 
     fn runtime(state: McpRuntimeState, live: bool) -> McpRuntimeStatus {
@@ -520,7 +526,6 @@ mod tests {
             state,
             live,
             last_seen_at: None,
-            last_error: None,
         }
     }
 
@@ -530,23 +535,17 @@ mod tests {
             name: id.to_owned(),
             display_name: None,
             scope: McpScopeKind::Workspace,
-            source_kind: McpSourceKind::Config,
-            transport: McpTransportSummary::Stdio {
-                command: "node".to_owned(),
-            },
             policy: McpPolicyState {
                 enabled: true,
                 allow_implicit_invocation: false,
             },
             required: false,
-            fingerprint: "fingerprint".to_owned(),
             runtime: runtime(McpRuntimeState::Ready, true),
             tools_count: 1,
             resources_count: 2,
             resource_templates_count: 0,
             prompts_count: 4,
             status: McpServerStatus::Ready,
-            status_reason: None,
         }
     }
 
@@ -554,16 +553,26 @@ mod tests {
         McpServerDetailsResponse {
             snapshot_version: 1,
             generated_at: 1_717_000_000,
-            health: McpServerHealthDetails {
-                runtime: server.runtime.clone(),
-                status: server.status,
-                status_reason: None,
-                last_error: None,
-                retry_attempt: Some(3),
-                next_retry_at: Some(1_717_000_500),
-                catalog_version: None,
-                stderr_tail: None,
-            },
+            management: Some(McpManagementDetails {
+                scope: McpScopeKind::Workspace,
+                source_kind: McpSourceKind::Config,
+                transport: McpTransportSummary::Stdio {
+                    command: "node".to_owned(),
+                },
+                fingerprint: "fingerprint".to_owned(),
+                health: McpServerHealthDetails {
+                    runtime: server.runtime.clone(),
+                    status: server.status,
+                    status_reason: None,
+                    last_error: None,
+                    retry_attempt: Some(3),
+                    next_retry_at: Some(1_717_000_500),
+                    catalog_version: None,
+                    stderr_tail: None,
+                },
+                audit: Vec::new(),
+                recent_bindings: Vec::new(),
+            }),
             server,
             catalog: McpServerCatalogDetails {
                 catalog_version: None,
@@ -575,8 +584,6 @@ mod tests {
                 resource_templates: Vec::new(),
                 prompts: Vec::new(),
             },
-            audit: Vec::new(),
-            recent_bindings: Vec::new(),
         }
     }
 
@@ -596,7 +603,12 @@ mod tests {
             McpPresentationTone::Success
         );
         assert_eq!(
-            mcp_transport_presentation(&server.transport),
+            mcp_transport_presentation(
+                &details(server.clone())
+                    .management
+                    .expect("management")
+                    .transport,
+            ),
             McpTransportPresentation::Stdio {
                 command: "node".to_owned()
             }
@@ -624,8 +636,13 @@ mod tests {
     fn overview_and_health_rows_preserve_raw_values_for_shell_formatting() {
         let mut server = server("server_a");
         server.runtime.last_seen_at = Some(1_717_000_100);
-        server.runtime.last_error = Some("runtime failed".to_owned());
-        let details = details(server.clone());
+        let mut details = details(server.clone());
+        details
+            .management
+            .as_mut()
+            .expect("management")
+            .health
+            .last_error = Some("runtime failed".to_owned());
 
         let overview = mcp_overview_rows(&server, Some(&details));
         assert_eq!(

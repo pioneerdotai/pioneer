@@ -1,6 +1,6 @@
 use crate::attachments::{
     PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes,
-    ensure_no_unrendered_attachments, prepare_messages_for_provider,
+    ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
 };
 use crate::reasoning_registry;
 use crate::types::{
@@ -854,13 +854,14 @@ impl crate::traits::Provider for BedrockProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request
                 .rendered_messages_with_compiled_sections()
                 .as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let bedrock_request = Self::build_request(&request, &prepared)?;
 

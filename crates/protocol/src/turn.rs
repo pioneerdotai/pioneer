@@ -394,6 +394,19 @@ pub struct TurnPermissionProfileCap {
 
 pub const TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
+/// Immutable server-owned maximum authority for consent-driven mutations of a
+/// turn security snapshot. User approval may only narrow this cap.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct TurnAgentAuthorityCapSnapshot {
+    pub version: u32,
+    pub resource_binding_id: String,
+    pub resource_binding_revision: u64,
+    pub filesystem: TurnFilesystemSandboxPolicy,
+    pub network: TurnNetworkPolicySnapshot,
+    pub process: TurnProcessPolicySnapshot,
+    pub approval: TurnApprovalScopePolicySnapshot,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct TurnExecutionSecuritySnapshot {
     pub schema_version: u32,
@@ -406,6 +419,7 @@ pub struct TurnExecutionSecuritySnapshot {
     pub approval: TurnApprovalScopePolicySnapshot,
     pub backend: TurnSecurityBackendSnapshot,
     pub enforcement: TurnSecurityEnforcementStatus,
+    pub authority_cap: TurnAgentAuthorityCapSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_cap: Option<TurnSecurityParentCapSnapshot>,
     pub created_at_unix_ms: i64,
@@ -422,6 +436,8 @@ impl TurnExecutionSecuritySnapshot {
             TurnPermissionProfileSource::Composer,
         );
         let network = TurnNetworkPolicySnapshot::enabled();
+        let process = TurnProcessPolicySnapshot::unrestricted();
+        let approval = TurnApprovalScopePolicySnapshot::full_access();
         Self {
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
@@ -435,10 +451,19 @@ impl TurnExecutionSecuritySnapshot {
                 backend_requirement: SandboxBackendRequirement::Optional,
                 backend_preference: Vec::new(),
             },
-            process: TurnProcessPolicySnapshot::unrestricted(),
-            approval: TurnApprovalScopePolicySnapshot::full_access(),
+            process: process.clone(),
+            approval: approval.clone(),
             backend: TurnSecurityBackendSnapshot::native_unrestricted(),
             enforcement: TurnSecurityEnforcementStatus::Active,
+            authority_cap: TurnAgentAuthorityCapSnapshot {
+                version: 1,
+                resource_binding_id: "unrestricted".to_owned(),
+                resource_binding_revision: 0,
+                filesystem: TurnFilesystemSandboxPolicy::unrestricted(),
+                network: network.clone(),
+                process,
+                approval,
+            },
             parent_cap: None,
             created_at_unix_ms,
             permission_profile,
@@ -453,6 +478,16 @@ impl TurnExecutionSecuritySnapshot {
         created_at_unix_ms: i64,
     ) -> Self {
         let network = TurnNetworkPolicySnapshot::disabled();
+        let process = TurnProcessPolicySnapshot::restricted();
+        let approval = TurnApprovalScopePolicySnapshot::supervised();
+        let maximum_roots = read_roots
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.access = TurnFilesystemAccess::Write;
+                entry
+            })
+            .collect();
         Self {
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
@@ -469,10 +504,22 @@ impl TurnExecutionSecuritySnapshot {
                 backend_requirement: SandboxBackendRequirement::Required,
                 backend_preference: vec![SandboxBackendKind::Nono],
             },
-            process: TurnProcessPolicySnapshot::restricted(),
-            approval: TurnApprovalScopePolicySnapshot::supervised(),
+            process: process.clone(),
+            approval: approval.clone(),
             backend: TurnSecurityBackendSnapshot::native_required(SandboxBackendKind::Nono),
             enforcement: TurnSecurityEnforcementStatus::Active,
+            authority_cap: TurnAgentAuthorityCapSnapshot {
+                version: 1,
+                resource_binding_id: "restricted".to_owned(),
+                resource_binding_revision: 0,
+                filesystem: TurnFilesystemSandboxPolicy {
+                    kind: TurnFilesystemSandboxKind::Restricted,
+                    entries: maximum_roots,
+                },
+                network: network.clone(),
+                process,
+                approval,
+            },
             parent_cap: None,
             created_at_unix_ms,
             permission_profile,
@@ -487,6 +534,9 @@ impl TurnExecutionSecuritySnapshot {
         created_at_unix_ms: i64,
     ) -> Self {
         let network = TurnNetworkPolicySnapshot::disabled();
+        let process = TurnProcessPolicySnapshot::restricted();
+        let approval = TurnApprovalScopePolicySnapshot::auto_accept_edits();
+        let maximum_roots = read_write_roots.clone();
         Self {
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
@@ -503,10 +553,22 @@ impl TurnExecutionSecuritySnapshot {
                 backend_requirement: SandboxBackendRequirement::Required,
                 backend_preference: vec![SandboxBackendKind::Nono],
             },
-            process: TurnProcessPolicySnapshot::restricted(),
-            approval: TurnApprovalScopePolicySnapshot::auto_accept_edits(),
+            process: process.clone(),
+            approval: approval.clone(),
             backend: TurnSecurityBackendSnapshot::native_required(SandboxBackendKind::Nono),
             enforcement: TurnSecurityEnforcementStatus::Active,
+            authority_cap: TurnAgentAuthorityCapSnapshot {
+                version: 1,
+                resource_binding_id: "restricted".to_owned(),
+                resource_binding_revision: 0,
+                filesystem: TurnFilesystemSandboxPolicy {
+                    kind: TurnFilesystemSandboxKind::Restricted,
+                    entries: maximum_roots,
+                },
+                network: network.clone(),
+                process,
+                approval,
+            },
             parent_cap: None,
             created_at_unix_ms,
             permission_profile,
@@ -776,13 +838,9 @@ impl TurnEnvironmentPolicy {
 
     pub fn restricted() -> Self {
         Self {
-            inherit: true,
+            inherit: false,
             allowed_vars: Vec::new(),
-            denied_patterns: vec![
-                ".*TOKEN.*".to_owned(),
-                ".*SECRET.*".to_owned(),
-                ".*PASSWORD.*".to_owned(),
-            ],
+            denied_patterns: Vec::new(),
         }
     }
 }
@@ -1438,6 +1496,95 @@ pub const TURN_MESSAGE_REVISION_CURSOR_MAX_BYTES: usize = 1_024;
 pub const TURN_MESSAGE_INPUT_MAX_BYTES: usize = 1_048_576;
 pub const TURN_MESSAGE_INPUT_MAX_ITEMS: usize = 128;
 pub const TURN_MESSAGE_MENTION_MAX_COUNT: usize = 64;
+pub const TURN_EXECUTION_INPUT_MAX_ITEMS: usize = 128;
+pub const TURN_EXECUTION_INPUT_MAX_BYTES: usize = 1_048_576;
+pub const TURN_EXECUTION_CAPABILITY_MAX_COUNT: usize = 64;
+pub const TURN_EXECUTION_MENTION_MAX_COUNT: usize = 64;
+pub const TURN_EXECUTION_TEXT_ELEMENT_MAX_COUNT: usize = 4_096;
+pub const TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT: usize = 64;
+pub const TURN_EXECUTION_REQUEST_MAX_BYTES: usize = 2_097_152;
+
+/// Shared semantic envelope for interactive, voice, Task child and recovery
+/// Turn starts. It performs a streaming serialization count so internal
+/// callers cannot allocate an additional unbounded JSON buffer merely to
+/// discover that the request is oversized.
+pub fn validate_turn_execution_envelope(params: &TurnStartParams) -> Result<(), &'static str> {
+    if params.input.len() > TURN_EXECUTION_INPUT_MAX_ITEMS {
+        return Err("Turn input exceeds the item limit");
+    }
+    if params.capabilities.len() > TURN_EXECUTION_CAPABILITY_MAX_COUNT {
+        return Err("Turn capabilities exceed the item limit");
+    }
+    if params.mentioned_principal_ids.len() > TURN_EXECUTION_MENTION_MAX_COUNT {
+        return Err("Turn mentions exceed the item limit");
+    }
+
+    let mut text_elements = 0usize;
+    let mut attachment_references = 0usize;
+    for input in &params.input {
+        match input {
+            UserInput::Text {
+                text,
+                text_elements: elements,
+            } => {
+                if text.len() > TURN_EXECUTION_INPUT_MAX_BYTES {
+                    return Err("Turn text exceeds the byte limit");
+                }
+                text_elements = text_elements.saturating_add(elements.len());
+            }
+            UserInput::Image { .. }
+            | UserInput::LocalImage { .. }
+            | UserInput::File { .. }
+            | UserInput::LocalFile { .. }
+            | UserInput::Audio { .. }
+            | UserInput::LocalAudio { .. }
+            | UserInput::Video { .. }
+            | UserInput::LocalVideo { .. }
+            | UserInput::Artifact { .. } => {
+                attachment_references = attachment_references.saturating_add(1);
+            }
+            UserInput::Mention { .. } => {}
+        }
+    }
+    if text_elements > TURN_EXECUTION_TEXT_ELEMENT_MAX_COUNT {
+        return Err("Turn text elements exceed the item limit");
+    }
+    if attachment_references > TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT {
+        return Err("Turn attachment references exceed the item limit");
+    }
+
+    let mut counter = BoundedJsonByteCounter::new(TURN_EXECUTION_REQUEST_MAX_BYTES);
+    serde_json::to_writer(&mut counter, params)
+        .map_err(|_| "Turn request exceeds the byte limit")?;
+    Ok(())
+}
+
+struct BoundedJsonByteCounter {
+    bytes: usize,
+    limit: usize,
+}
+
+impl BoundedJsonByteCounter {
+    const fn new(limit: usize) -> Self {
+        Self { bytes: 0, limit }
+    }
+}
+
+impl std::io::Write for BoundedJsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        if self.bytes > self.limit {
+            return Err(std::io::Error::other(
+                "serialized Turn request is too large",
+            ));
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Validates the shared content shape used by initial Message send and edit.
 /// Resource existence and ACL remain storage-layer checks.
@@ -1698,6 +1845,10 @@ pub struct TurnGetResponse {
 pub struct TurnItemsParams {
     pub thread_id: String,
     pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequence: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -1708,6 +1859,9 @@ pub struct TurnItemsResponse {
     #[serde(default)]
     pub events: Vec<TurnItemEvent>,
     pub last_sequence: i64,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -4738,6 +4892,10 @@ mod tests {
         assert_eq!(encoded["sandbox"]["backend_requirement"], "optional");
         assert_eq!(encoded["process"]["shell"]["enabled"], true);
         assert_eq!(encoded["enforcement"], json!({ "status": "active" }));
+        assert_eq!(
+            encoded["authority_cap"]["resource_binding_id"],
+            "unrestricted"
+        );
         assert!(encoded.get("sandbox").is_some());
 
         let decoded: TurnExecutionSecuritySnapshot =
@@ -4748,6 +4906,19 @@ mod tests {
             decoded.sandbox.filesystem.kind,
             TurnFilesystemSandboxKind::Unrestricted
         );
+    }
+
+    #[test]
+    fn execution_security_snapshot_rejects_a_missing_authority_cap() {
+        let snapshot =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/workspace/project", 1_700);
+        let mut encoded = serde_json::to_value(snapshot).expect("snapshot should serialize");
+        encoded
+            .as_object_mut()
+            .expect("snapshot should be an object")
+            .remove("authority_cap");
+
+        assert!(serde_json::from_value::<TurnExecutionSecuritySnapshot>(encoded).is_err());
     }
 
     #[test]
@@ -6400,6 +6571,7 @@ mod tests {
             "approval",
             "backend",
             "enforcement",
+            "authority_cap",
             "created_at_unix_ms",
         ] {
             assert!(

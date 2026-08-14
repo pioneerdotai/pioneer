@@ -141,7 +141,7 @@ where
         .iter()
         .map(|value| value.to_ascii_uppercase())
         .collect::<BTreeSet<_>>();
-    let allow_list_active = !allowed_vars.is_empty();
+    let allow_list_active = !policy.inherit || !allowed_vars.is_empty();
 
     let mut host_environment = host_environment.into_iter().collect::<BTreeMap<_, _>>();
     for (key, value) in invocation_environment {
@@ -370,8 +370,9 @@ mod tests {
         )
         .expect("plan should build");
 
-        assert_eq!(plan.environment.get("SAFE_VALUE"), Some(&"ok".to_owned()));
+        assert!(!plan.environment.contains_key("SAFE_VALUE"));
         assert!(!plan.environment.contains_key("API_TOKEN"));
+        assert!(plan.removed_environment.contains(&"SAFE_VALUE".to_owned()));
         assert!(plan.removed_environment.contains(&"API_TOKEN".to_owned()));
         assert!(plan.removed_environment.contains(&"DB_PASSWORD".to_owned()));
     }

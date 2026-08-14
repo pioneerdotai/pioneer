@@ -3,8 +3,8 @@ use crate::{
         AttachmentOperationError, AttachmentPipelineConfig, AttachmentTransportKind,
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
         default_attachment_pipeline_config, ensure_no_unrendered_attachments,
-        lookup_uploaded_reference_with_artifact, model_family_for_model,
-        prepare_messages_for_provider, runtime, store_uploaded_reference,
+        lookup_uploaded_reference_with_artifact_for_authority, model_family_for_model,
+        prepare_messages_for_provider_async, runtime, store_uploaded_reference_for_authority,
     },
     reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
@@ -26,6 +26,7 @@ use futures_util::stream::BoxStream;
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
@@ -59,6 +60,7 @@ const OPENAI_EMBEDDING_MODELS: &[OpenAiEmbeddingModelDefinition] = &[
 pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
+    authority_fingerprint: String,
     timeout_policy: ProviderTimeoutPolicy,
     client: Client,
 }
@@ -347,6 +349,19 @@ impl OpenAiProvider {
         Self::with_base_url_and_timeout_policy(api_key, BASE_URL, timeout_policy)
     }
 
+    pub(crate) fn with_timeout_policy_and_authority(
+        api_key: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+        authority_fingerprint: impl Into<String>,
+    ) -> Self {
+        Self::with_base_url_timeout_policy_and_authority(
+            api_key,
+            BASE_URL,
+            timeout_policy,
+            authority_fingerprint,
+        )
+    }
+
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self::with_base_url_and_timeout_policy(api_key, base_url, ProviderTimeoutPolicy::default())
     }
@@ -356,9 +371,35 @@ impl OpenAiProvider {
         base_url: impl Into<String>,
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
+        let api_key = api_key.into();
+        let base_url = base_url.into();
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"pioneer-provider-authority-v1");
+        digest.update([0]);
+        digest.update(b"<direct-openai>");
+        digest.update([0]);
+        digest.update(api_key.as_bytes());
+        digest.update([0]);
+        digest.update(base_url.as_bytes());
+        let authority_fingerprint = hex::encode(digest.finalize());
+        Self::with_base_url_timeout_policy_and_authority(
+            api_key,
+            base_url,
+            timeout_policy,
+            authority_fingerprint,
+        )
+    }
+
+    fn with_base_url_timeout_policy_and_authority(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+        authority_fingerprint: impl Into<String>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
+            authority_fingerprint: authority_fingerprint.into(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
@@ -370,8 +411,12 @@ impl OpenAiProvider {
         config: &AttachmentPipelineConfig,
     ) -> Result<String> {
         let bytes = attachment_bytes(attachment)?.to_vec();
-        let operation_key = format!("openai.upload.{}", attachment.sha256);
         let endpoint = format!("{}/files", self.base_url);
+        let operation_authority = runtime::AttachmentOperationAuthority::new(
+            self.authority_fingerprint.as_str(),
+            "upload_file",
+            format!("{}#{}", endpoint, attachment.sha256),
+        );
         let idempotency_key = Self::upload_idempotency_key(attachment);
         let file_name = attachment.name.clone();
         let mime_type = attachment.mime_type.clone();
@@ -382,7 +427,7 @@ impl OpenAiProvider {
         runtime::execute_with_retry_async(
             "openai",
             "upload_file",
-            operation_key.as_str(),
+            &operation_authority,
             &config.runtime,
             move |_| {
                 let payload = bytes.clone();
@@ -442,12 +487,13 @@ impl OpenAiProvider {
         config: &AttachmentPipelineConfig,
     ) -> Result<String> {
         let model_family = model_family_for_model(model);
-        if let Some(file_id) = lookup_uploaded_reference_with_artifact(
+        if let Some(file_id) = lookup_uploaded_reference_with_artifact_for_authority(
             config,
             "openai",
             model_family.as_str(),
             AttachmentTransportKind::Upload,
             attachment.sha256.as_str(),
+            self.authority_fingerprint.as_str(),
             attachment.artifact.as_ref(),
         )
         .await?
@@ -456,13 +502,14 @@ impl OpenAiProvider {
         }
 
         let file_id = self.upload_file(attachment, config).await?;
-        store_uploaded_reference(
+        store_uploaded_reference_for_authority(
             config,
             "openai",
             model_family.as_str(),
             AttachmentTransportKind::Upload,
             attachment,
             file_id.as_str(),
+            self.authority_fingerprint.as_str(),
         )
         .await?;
         Ok(file_id)
@@ -760,6 +807,10 @@ impl crate::traits::Provider for OpenAiProvider {
         "openai"
     }
 
+    fn authority_fingerprint(&self) -> Option<&str> {
+        Some(self.authority_fingerprint.as_str())
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             streaming: true,
@@ -783,11 +834,12 @@ impl crate::traits::Provider for OpenAiProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let prepared = self
             .materialize_upload_references(request.model.as_str(), prepared)
@@ -878,11 +930,12 @@ impl crate::traits::Provider for OpenAiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let prepared = self
             .materialize_upload_references(request.model.as_str(), prepared)

@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadScopePresentation",
+  "type": "object",
+  "properties": {
+    "candidate_members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadParticipantRow"
+      }
+    },
+    "capabilities": {
+      "$ref": "#/$defs/ThreadPresentationCapabilities"
+    },
+    "is_closed": {
+      "type": "boolean"
+    },
+    "is_user_thread": {
+      "type": "boolean"
+    },
+    "participants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadParticipantRow"
+      }
+    },
+    "show_workspace_explanation": {
+      "type": "boolean"
+    },
+    "visibility": {
+      "$ref": "#/$defs/ThreadVisibilityPresentation"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "visibility",
+    "is_user_thread",
+    "is_closed",
+    "capabilities",
+    "participants",
+    "candidate_members",
+    "show_workspace_explanation"
+  ],
+  "$defs": {
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ThreadParticipantRow": {
+      "type": "object",
+      "properties": {
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "can_remove": {
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "is_current_principal": {
+          "type": "boolean"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principal_id",
+        "display_name",
+        "nickname",
+        "is_current_principal",
+        "can_remove"
+      ]
+    },
+    "ThreadPresentationCapabilities": {
+      "type": "object",
+      "properties": {
+        "can_bind_artifacts": {
+          "type": "boolean"
+        },
+        "can_cancel_agent_execution": {
+          "type": "boolean"
+        },
+        "can_cancel_tasks": {
+          "type": "boolean"
+        },
+        "can_control_cli_runtime": {
+          "type": "boolean"
+        },
+        "can_create_task": {
+          "type": "boolean"
+        },
+        "can_manage_private_participants": {
+          "type": "boolean"
+        },
+        "can_manage_thread": {
+          "type": "boolean"
+        },
+        "can_move": {
+          "type": "boolean"
+        },
+        "can_observe_agent_execution": {
+          "type": "boolean"
+        },
+        "can_read": {
+          "type": "boolean"
+        },
+        "can_read_artifacts": {
+          "type": "boolean"
+        },
+        "can_respond_to_agent_requests": {
+          "type": "boolean"
+        },
+        "can_resume_agent_execution": {
+          "type": "boolean"
+        },
+        "can_review_tasks": {
+          "type": "boolean"
+        },
+        "can_start_turn": {
+          "type": "boolean"
+        },
+        "can_steer_agent_execution": {
+          "type": "boolean"
+        },
+        "can_write": {
+          "type": "boolean"
+        },
+        "can_write_artifacts": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "can_read",
+        "can_write",
+        "can_start_turn",
+        "can_observe_agent_execution",
+        "can_cancel_agent_execution",
+        "can_resume_agent_execution",
+        "can_steer_agent_execution",
+        "can_respond_to_agent_requests",
+        "can_control_cli_runtime",
+        "can_create_task",
+        "can_review_tasks",
+        "can_cancel_tasks",
+        "can_read_artifacts",
+        "can_write_artifacts",
+        "can_bind_artifacts",
+        "can_manage_thread",
+        "can_manage_private_participants",
+        "can_move"
+      ]
+    },
+    "ThreadVisibilityPresentation": {
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace",
+        "unknown"
+      ]
+    }
+  }
+}

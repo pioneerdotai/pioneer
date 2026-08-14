@@ -256,6 +256,9 @@
       "type": "string",
       "enum": [
         "pending",
+        "response_accepted",
+        "delivering",
+        "delivery_failed",
         "answered",
         "resolved",
         "cancelled",
@@ -547,6 +550,44 @@
         "user"
       ]
     },
+    "PersistedActorRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "SkillId": {
       "type": "string",
       "maxLength": 21,
@@ -749,6 +790,22 @@
         "byte_range"
       ]
     },
+    "ThreadMode": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Message",
+            "Agent"
+          ]
+        },
+        {
+          "description": "Compatibility default for pre-Epic-6 persisted and wire values. New\nuser-thread creation selects `Message` explicitly.",
+          "type": "string",
+          "const": "Chat"
+        }
+      ]
+    },
     "TimelineBlockKind": {
       "oneOf": [
         {
@@ -759,6 +816,24 @@
               "items": {
                 "$ref": "#/$defs/UserMessageAttachment"
               }
+            },
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TurnAuthorSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "deleted": {
+              "type": "boolean",
+              "default": false
+            },
+            "edited": {
+              "type": "boolean",
+              "default": false
             },
             "inputs": {
               "type": "array",
@@ -776,6 +851,32 @@
             "kind": {
               "type": "string",
               "const": "user_message"
+            },
+            "mentions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TurnMention"
+              }
+            },
+            "mode": {
+              "$ref": "#/$defs/ThreadMode",
+              "default": "Chat"
+            },
+            "reply": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TimelineReplySummary"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "revision": {
+              "type": "integer",
+              "format": "uint64",
+              "default": 0,
+              "minimum": 0
             },
             "text": {
               "type": "string",
@@ -921,6 +1022,67 @@
         "value"
       ]
     },
+    "TimelineReplySummary": {
+      "type": "object",
+      "properties": {
+        "author": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnAuthorSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deleted": {
+          "type": "boolean",
+          "default": false
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId"
+      ]
+    },
+    "TurnAuthorSnapshot": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/PersistedActorRef"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        }
+      },
+      "required": [
+        "actor",
+        "display_name",
+        "nickname"
+      ]
+    },
     "TurnMcpServerCapabilitySummary": {
       "type": "object",
       "properties": {
@@ -969,6 +1131,24 @@
         "serverName",
         "rawToolName",
         "scopeKind"
+      ]
+    },
+    "TurnMention": {
+      "type": "object",
+      "properties": {
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "nickname"
       ]
     },
     "TurnSkillCapabilitySummary": {

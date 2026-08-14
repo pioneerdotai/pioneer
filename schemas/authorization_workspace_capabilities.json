@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorizationWorkspaceCapabilities",
+  "type": "object",
+  "properties": {
+    "agent_permission_options": {
+      "description": "Server-compiled UX presets after intersection with the immutable role\nceiling. Clients render these policies and locked fields verbatim.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AuthorizationAgentPermissionOption"
+      }
+    },
+    "can_acknowledge_own_notifications": {
+      "description": "Acknowledge rows from the authenticated principal's durable Task\nnotification inbox in this workspace.",
+      "type": "boolean"
+    },
+    "can_add_member": {
+      "type": "boolean"
+    },
+    "can_create_thread": {
+      "type": "boolean"
+    },
+    "can_list_members": {
+      "type": "boolean"
+    },
+    "can_manage": {
+      "type": "boolean"
+    },
+    "can_read": {
+      "type": "boolean"
+    },
+    "can_read_artifacts": {
+      "type": "boolean"
+    },
+    "can_read_own_notifications": {
+      "description": "Read the authenticated principal's durable Task notification inbox in\nthis workspace. The Gateway still filters every row by recipient.",
+      "type": "boolean"
+    },
+    "can_remove_member": {
+      "type": "boolean"
+    },
+    "can_run_tasks": {
+      "type": "boolean"
+    },
+    "can_use_cli_runtimes": {
+      "type": "boolean"
+    },
+    "can_use_mcp": {
+      "type": "boolean"
+    },
+    "can_use_providers": {
+      "type": "boolean"
+    },
+    "can_use_skills": {
+      "type": "boolean"
+    },
+    "can_write_artifacts": {
+      "type": "boolean"
+    },
+    "execution_limits": {
+      "description": "Server-enforced aggregate execution limits for this principal. These\nare presentation only; every durable start reserves a Gateway lease.",
+      "$ref": "#/$defs/AuthorizationExecutionResourceLimits"
+    },
+    "thread_visibility_options": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadVisibility"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "can_read",
+    "can_create_thread",
+    "can_manage",
+    "can_read_own_notifications",
+    "can_acknowledge_own_notifications",
+    "can_use_providers",
+    "can_use_cli_runtimes",
+    "can_use_skills",
+    "can_use_mcp",
+    "can_run_tasks",
+    "can_read_artifacts",
+    "can_write_artifacts",
+    "execution_limits",
+    "agent_permission_options",
+    "can_list_members",
+    "can_add_member",
+    "can_remove_member",
+    "thread_visibility_options"
+  ],
+  "$defs": {
+    "AuthorizationAgentPermissionOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "locked": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthorizationPermissionLock"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "description",
+        "mode",
+        "effective_policy"
+      ]
+    },
+    "AuthorizationExecutionResourceLimits": {
+      "type": "object",
+      "properties": {
+        "max_active_executions": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_queued_tasks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_scheduled_tasks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_active_executions",
+        "max_queued_tasks",
+        "max_scheduled_tasks"
+      ]
+    },
+    "AuthorizationPermissionLock": {
+      "type": "object",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "reason"
+      ]
+    },
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "ThreadVisibility": {
+      "description": "User-selectable visibility for ordinary user threads.\n\nInternal task/system threads deliberately have no public selectable value.",
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace"
+      ]
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    }
+  }
+}

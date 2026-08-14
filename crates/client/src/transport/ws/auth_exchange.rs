@@ -803,6 +803,7 @@ mod tests {
                 display_name: "Owner".to_owned(),
                 nickname: "owner".to_owned(),
             },
+            role_key: pioneer_protocol::RoleKey::member(),
             workspaces: vec![InvitationWorkspaceSummary {
                 workspace_id: WorkspaceId::new("W00000000000000000001").unwrap(),
                 name: "Workspace".to_owned(),

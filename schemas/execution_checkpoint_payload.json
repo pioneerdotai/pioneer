@@ -23,6 +23,9 @@
     "thread_id": {
       "type": "string"
     },
+    "tool_no_progress": {
+      "$ref": "#/$defs/ExecutionCheckpointToolNoProgressState"
+    },
     "tools": {
       "$ref": "#/$defs/ExecutionCheckpointToolSummary"
     },
@@ -226,6 +229,96 @@
         "item_type",
         "status",
         "metadata"
+      ]
+    },
+    "ExecutionCheckpointToolNoProgressExactVariant": {
+      "type": "object",
+      "properties": {
+        "arguments_fingerprint": {
+          "type": "string"
+        },
+        "timeout_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "arguments_fingerprint",
+        "timeout_count"
+      ]
+    },
+    "ExecutionCheckpointToolNoProgressState": {
+      "description": "Language-neutral state used to prevent a model from repeatedly spending time on a tool\nstrategy that has already timed out. Only hashes and structural features are persisted; raw\ncommand arguments are intentionally excluded from the checkpoint.",
+      "type": "object",
+      "properties": {
+        "strategies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExecutionCheckpointToolNoProgressStrategy"
+          }
+        },
+        "truncated": {
+          "description": "True when older no-progress evidence was deterministically compacted to keep the\nexecution checkpoint within its durable wire budget.",
+          "type": "boolean"
+        }
+      }
+    },
+    "ExecutionCheckpointToolNoProgressStrategy": {
+      "type": "object",
+      "properties": {
+        "cumulative_timeout_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "exact_variants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExecutionCheckpointToolNoProgressExactVariant"
+          }
+        },
+        "executable": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exhausted": {
+          "type": "boolean"
+        },
+        "strategy_id": {
+          "type": "string"
+        },
+        "structural_features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "structural_fingerprint": {
+          "type": "string"
+        },
+        "timeout_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "warning_emitted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "strategy_id",
+        "tool_name",
+        "structural_fingerprint",
+        "timeout_count",
+        "cumulative_timeout_ms",
+        "warning_emitted",
+        "exhausted"
       ]
     },
     "ExecutionCheckpointToolSummary": {

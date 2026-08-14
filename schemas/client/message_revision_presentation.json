@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MessageRevisionPresentation",
+  "type": "object",
+  "properties": {
+    "change_kind": {
+      "$ref": "#/$defs/TurnMessageRevisionChangeKind"
+    },
+    "changed_by": {
+      "$ref": "#/$defs/PersistedActorRef"
+    },
+    "content_redacted": {
+      "type": "boolean"
+    },
+    "created_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "mentions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnMention"
+      }
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "revision",
+    "change_kind",
+    "changed_by",
+    "created_at",
+    "content_redacted"
+  ],
+  "$defs": {
+    "PersistedActorRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TurnMention": {
+      "type": "object",
+      "properties": {
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "nickname"
+      ]
+    },
+    "TurnMessageRevisionChangeKind": {
+      "type": "string",
+      "enum": [
+        "edit",
+        "delete"
+      ]
+    }
+  }
+}

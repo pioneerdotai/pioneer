@@ -38,6 +38,12 @@
       "format": "uint32",
       "minimum": 0
     },
+    "owner_principal_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "permission_mode": {
       "type": [
         "string",

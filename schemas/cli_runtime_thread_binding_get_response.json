@@ -12,6 +12,16 @@
           "type": "null"
         }
       ]
+    },
+    "management": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CLIRuntimeThreadBindingManagement"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "$defs": {
@@ -25,21 +35,6 @@
     "CLIRuntimeThreadBinding": {
       "type": "object",
       "properties": {
-        "native_cwd": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "native_model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "native_thread_id": {
-          "type": "string"
-        },
         "runtime_id": {
           "type": "string"
         },
@@ -61,8 +56,31 @@
         "thread_id",
         "runtime_id",
         "runtime_kind",
-        "native_thread_id",
         "status"
+      ]
+    },
+    "CLIRuntimeThreadBindingManagement": {
+      "description": "Operator-only native session metadata, structurally separate from the\noperational binding consumed by Desktop and Mobile.",
+      "type": "object",
+      "properties": {
+        "native_cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "native_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "native_thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "native_thread_id"
       ]
     }
   }

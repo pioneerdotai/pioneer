@@ -218,8 +218,7 @@ impl MessageProcessor {
         params: WorkspaceSelectParams,
     ) {
         let connection_id = request_context.connection_id();
-        let changes_global_current =
-            proof.decision().is_absolute_superuser() && params.make_current;
+        let changes_global_current = proof.decision().is_absolute() && params.make_current;
         let was_current = if changes_global_current {
             self.workspace_manager
                 .select_workspace(proof.workspace_id(), false)

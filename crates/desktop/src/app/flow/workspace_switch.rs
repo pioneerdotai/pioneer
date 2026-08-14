@@ -22,6 +22,7 @@ impl PioneerDesktop {
                 .clone(),
         );
         self.set_preferred_workspace_id(Some(reduction.selected.set_preferred_workspace_id));
+        self.clear_task_user_notification_inbox();
         self.refresh_current_principal(cx);
         if reduction.clear_thread_list_loading {
             self.thread_list_loading = false;

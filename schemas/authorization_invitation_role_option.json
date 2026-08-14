@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorizationInvitationRoleOption",
+  "type": "object",
+  "properties": {
+    "is_default": {
+      "type": "boolean"
+    },
+    "role": {
+      "$ref": "#/$defs/AuthorizationRolePresentation"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "role",
+    "is_default"
+  ],
+  "$defs": {
+    "AuthorizationRolePresentation": {
+      "description": "Server-owned presentation metadata for the authenticated role. The key is\ndeliberately open-ended: clients display this object but never derive\nauthorization decisions from it.",
+      "type": "object",
+      "properties": {
+        "built_in": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "display_name",
+        "description",
+        "built_in"
+      ]
+    }
+  }
+}

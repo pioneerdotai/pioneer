@@ -861,12 +861,20 @@ mod tests {
                 "artifact-b",
             )
             .unwrap();
+        let affected_principal_id =
+            pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap();
         let signal = AccessChangeSignal {
             authorization_revision: 7,
+            change: pioneer_protocol::AuthorizationProjectionChangedNotification {
+                policy_generation: pioneer_protocol::PolicyGeneration::new(7).unwrap(),
+                change: pioneer_protocol::AuthorizationChangeKind::WorkspaceAcl,
+                affected: pioneer_protocol::AuthorizationChangeScope::PrincipalWorkspace {
+                    principal_id: affected_principal_id.clone(),
+                    workspace_id: "workspace-a".to_owned(),
+                },
+            },
             kind: AccessChangeKind::WorkspaceMembership,
-            affected_principal_id: Some(
-                pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
-            ),
+            affected_principal_id: Some(affected_principal_id),
             workspace_id: "workspace-a".to_owned(),
             thread_id: None,
         };

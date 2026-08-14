@@ -499,7 +499,10 @@ impl MessageProcessor {
         params: SkillListParams,
     ) {
         let connection_id = request_context.connection_id();
-        let member = request_context.principal().kind == pioneer_protocol::PrincipalKind::User;
+        let member = crate::authorization::AuthorizationService::new().role_disclosure_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator);
         let workspace_id = match self
             .validate_skills_workspace(
                 connection_id,
@@ -691,12 +694,16 @@ impl MessageProcessor {
             .skills
             .iter()
             .filter(|skill| {
-                !member
+                crate::authorization::AuthorizationService::new().skill_allowed(
+                    request_context.principal().kind,
+                    request_context.principal().role_key.as_ref(),
+                    skill.identity.skill_id.as_str(),
+                ) && (!member
                     || member_skill_is_operationally_visible(
                         skill,
                         &effective_policy_for_skill(skill, &policy_set),
                         installation_by_id.contains_key(&skill.identity.skill_id),
-                    )
+                    ))
             })
             .map(|skill| {
                 let installation = installation_by_id.get(&skill.identity.skill_id);

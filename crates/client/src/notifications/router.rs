@@ -919,7 +919,7 @@ mod tests {
         CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
         CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
         ExecutionWindowStatus, ItemDeltaStream, McpChangedNotification, McpListItem,
-        McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
+        McpManagementDetails, McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
         McpServerCatalogChangedNotification, McpServerCatalogDetails, McpServerDetailsResponse,
         McpServerHealthDetails, McpServerStatus, McpServerStatusChangedNotification,
         McpServerStatusItem, McpSourceKind, McpTransportSummary, RecoveryAction, RecoveryJobStatus,
@@ -969,7 +969,6 @@ mod tests {
             state,
             live,
             last_seen_at: None,
-            last_error: None,
         }
     }
 
@@ -979,23 +978,17 @@ mod tests {
             name: id.to_owned(),
             display_name: None,
             scope: McpScopeKind::Workspace,
-            source_kind: McpSourceKind::Config,
-            transport: McpTransportSummary::Stdio {
-                command: "server".to_owned(),
-            },
             policy: McpPolicyState {
                 enabled: true,
                 allow_implicit_invocation: false,
             },
             required: false,
-            fingerprint: "fingerprint".to_owned(),
             runtime: mcp_runtime(McpRuntimeState::Ready, true),
             tools_count: 1,
             resources_count: 2,
             resource_templates_count: 3,
             prompts_count: 4,
             status,
-            status_reason: None,
         }
     }
 
@@ -1014,18 +1007,26 @@ mod tests {
                 resource_templates: Vec::new(),
                 prompts: Vec::new(),
             },
-            health: McpServerHealthDetails {
-                runtime: mcp_runtime(McpRuntimeState::Ready, true),
-                status: McpServerStatus::Ready,
-                status_reason: None,
-                last_error: None,
-                retry_attempt: None,
-                next_retry_at: None,
-                catalog_version: None,
-                stderr_tail: None,
-            },
-            audit: Vec::new(),
-            recent_bindings: Vec::new(),
+            management: Some(McpManagementDetails {
+                scope: McpScopeKind::Workspace,
+                source_kind: McpSourceKind::Config,
+                transport: McpTransportSummary::Stdio {
+                    command: "server".to_owned(),
+                },
+                fingerprint: "fingerprint".to_owned(),
+                health: McpServerHealthDetails {
+                    runtime: mcp_runtime(McpRuntimeState::Ready, true),
+                    status: McpServerStatus::Ready,
+                    status_reason: None,
+                    last_error: None,
+                    retry_attempt: None,
+                    next_retry_at: None,
+                    catalog_version: None,
+                    stderr_tail: None,
+                },
+                audit: Vec::new(),
+                recent_bindings: Vec::new(),
+            }),
         }
     }
 
@@ -1711,7 +1712,6 @@ mod tests {
                 scope_kind: McpScopeKind::Workspace,
                 runtime: mcp_runtime(McpRuntimeState::Failed, false),
                 status: McpServerStatus::Failed,
-                status_reason: Some("crashed".to_owned()),
             },
         };
 
@@ -1731,7 +1731,10 @@ mod tests {
         apply_mcp_server_status_changed_to_details(&mut details, &status_notification);
         assert_eq!(servers[0].status, McpServerStatus::Failed);
         assert_eq!(details.server.status, McpServerStatus::Failed);
-        assert_eq!(details.health.status_reason.as_deref(), Some("crashed"));
+        assert_eq!(
+            details.management.expect("management").health.status,
+            McpServerStatus::Failed
+        );
 
         let catalog_notification = McpServerCatalogChangedNotification {
             workspace_id: "ws_a".to_owned(),

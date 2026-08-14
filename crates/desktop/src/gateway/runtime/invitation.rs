@@ -323,6 +323,13 @@ mod tests {
                 display_name: "Member".to_owned(),
                 nickname: "member".to_owned(),
                 role_key: Some(RoleKey::member()),
+                role: pioneer_protocol::AuthorizationRolePresentation {
+                    key: "member".to_owned(),
+                    display_name: "Member".to_owned(),
+                    description: "Workspace collaborator".to_owned(),
+                    built_in: true,
+                },
+                lifecycle_managed: true,
                 status: PrincipalStatus::Active,
                 avatar_revision: None,
             },

@@ -152,6 +152,9 @@ impl PioneerDesktop {
             .map(|question| {
                 let input = cx.new(|cx| {
                     let mut state = InputState::new(window, cx).placeholder("Answer");
+                    if question.is_secret {
+                        state = state.masked(true);
+                    }
                     if question.options.is_empty() {
                         state = state.multi_line(true).auto_grow(1, 4);
                     }

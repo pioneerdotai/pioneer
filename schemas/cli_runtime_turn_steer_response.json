@@ -3,13 +3,6 @@
   "title": "CLIRuntimeTurnSteerResponse",
   "type": "object",
   "properties": {
-    "native_thread_id": {
-      "type": "string"
-    },
-    "native_turn_id": {
-      "type": "string"
-    },
-    "raw": true,
     "runtime_id": {
       "type": "string"
     },
@@ -27,8 +20,6 @@
     "workspace_id",
     "runtime_id",
     "thread_id",
-    "turn_id",
-    "native_thread_id",
-    "native_turn_id"
+    "turn_id"
   ]
 }

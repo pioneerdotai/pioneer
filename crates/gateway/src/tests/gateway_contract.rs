@@ -843,7 +843,7 @@ mod tests {
             PROTOCOL_VERSION_V1,
             pioneer_protocol::PIONEER_PROTOCOL_VERSION
         );
-        assert_eq!(ROUTE_CONTRACTS.len(), 8);
+        assert_eq!(ROUTE_CONTRACTS.len(), 9);
         assert!(
             ROUTE_CONTRACTS
                 .iter()

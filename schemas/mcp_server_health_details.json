@@ -72,12 +72,6 @@
     "McpRuntimeStatus": {
       "type": "object",
       "properties": {
-        "last_error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "last_seen_at": {
           "type": [
             "integer",

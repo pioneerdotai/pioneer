@@ -18,7 +18,7 @@ pub use mcp_config::{
 
 use crate::driver::{
     JsonlRpcDecodeError, JsonlRpcError, JsonlRpcId, JsonlRpcIncomingMessage, JsonlRpcNotification,
-    JsonlRpcRequest, JsonlRpcResponse, read_jsonl_rpc_message, write_jsonl_rpc_message,
+    JsonlRpcRequest, JsonlRpcResponse, read_jsonl_rpc_message_with_budget, write_jsonl_rpc_message,
     write_jsonl_rpc_request,
 };
 use crate::input::CLIRuntimeTurnInputItem;
@@ -110,6 +110,28 @@ impl CodexJsonlRpcClient {
         R: AsyncBufRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        Self::new_with_channel_capacity_and_budget(
+            reader,
+            writer,
+            notification_capacity,
+            server_request_capacity,
+            diagnostic_capacity,
+            crate::NativeEventBudget::default(),
+        )
+    }
+
+    pub fn new_with_channel_capacity_and_budget<R, W>(
+        reader: R,
+        writer: W,
+        notification_capacity: usize,
+        server_request_capacity: usize,
+        diagnostic_capacity: usize,
+        native_event_budget: crate::NativeEventBudget,
+    ) -> Self
+    where
+        R: AsyncBufRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
         Self::new_with_server_request_policy(
             reader,
             writer,
@@ -117,6 +139,7 @@ impl CodexJsonlRpcClient {
             server_request_capacity,
             diagnostic_capacity,
             DEFAULT_SERVER_REQUEST_TIMEOUT,
+            native_event_budget,
         )
     }
 
@@ -127,6 +150,7 @@ impl CodexJsonlRpcClient {
         server_request_capacity: usize,
         diagnostic_capacity: usize,
         server_request_timeout: Duration,
+        native_event_budget: crate::NativeEventBudget,
     ) -> Self
     where
         R: AsyncBufRead + Send + Unpin + 'static,
@@ -152,7 +176,11 @@ impl CodexJsonlRpcClient {
             },
         );
 
-        tokio::spawn(run_codex_jsonl_rpc_reader(reader, incoming_tx));
+        tokio::spawn(run_codex_jsonl_rpc_reader(
+            reader,
+            incoming_tx,
+            native_event_budget,
+        ));
         tokio::spawn(run_codex_jsonl_rpc_worker(
             writer,
             command_rx,
@@ -4834,11 +4862,12 @@ fn truncate_codex_progress_delta(delta: &mut String, max_bytes: usize) -> bool {
 async fn run_codex_jsonl_rpc_reader<R>(
     mut reader: R,
     incoming_tx: mpsc::Sender<CodexJsonlRpcIncoming>,
+    native_event_budget: crate::NativeEventBudget,
 ) where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
     loop {
-        match read_jsonl_rpc_message(&mut reader).await {
+        match read_jsonl_rpc_message_with_budget(&mut reader, native_event_budget).await {
             Ok(Some(message)) => {
                 if incoming_tx
                     .send(CodexJsonlRpcIncoming::Message(message))
@@ -5352,6 +5381,7 @@ mod tests {
             DEFAULT_INCOMING_QUEUE_CAPACITY,
             DEFAULT_COMMAND_QUEUE_CAPACITY,
             timeout,
+            crate::NativeEventBudget::default(),
         );
         (client, BufReader::new(server_read), server_write)
     }

@@ -63,19 +63,14 @@ pub struct McpListItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub scope: McpScopeKind,
-    pub source_kind: McpSourceKind,
-    pub transport: McpTransportSummary,
     pub policy: McpPolicyState,
     pub required: bool,
-    pub fingerprint: String,
     pub runtime: McpRuntimeStatus,
     pub tools_count: usize,
     pub resources_count: usize,
     pub resource_templates_count: usize,
     pub prompts_count: usize,
     pub status: McpServerStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -145,6 +140,20 @@ pub struct McpServerDetailsResponse {
     pub generated_at: i64,
     pub server: McpListItem,
     pub catalog: McpServerCatalogDetails,
+    /// Management-only configuration and diagnostics. Omitted unless the
+    /// caller may manage the selected MCP installation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management: Option<McpManagementDetails>,
+}
+
+/// Configuration and diagnostics intentionally excluded from the operational
+/// MCP capability returned by discovery endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct McpManagementDetails {
+    pub scope: McpScopeKind,
+    pub source_kind: McpSourceKind,
+    pub transport: McpTransportSummary,
+    pub fingerprint: String,
     pub health: McpServerHealthDetails,
     #[serde(default)]
     pub audit: Vec<McpAuditEventSummary>,
@@ -312,8 +321,6 @@ pub struct McpRuntimeStatus {
     pub live: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -359,8 +366,6 @@ pub struct McpServerStatusItem {
     pub scope_kind: McpScopeKind,
     pub runtime: McpRuntimeStatus,
     pub status: McpServerStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -500,6 +505,48 @@ impl McpChangedAction {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn operational_mcp_item_has_no_management_transport_or_diagnostics() {
+        let item = McpListItem {
+            id: "mcp-1".to_owned(),
+            name: "search".to_owned(),
+            display_name: Some("Search".to_owned()),
+            scope: McpScopeKind::Workspace,
+            policy: McpPolicyState {
+                enabled: true,
+                allow_implicit_invocation: false,
+            },
+            required: false,
+            runtime: McpRuntimeStatus {
+                state: McpRuntimeState::Ready,
+                live: true,
+                last_seen_at: Some(1),
+            },
+            tools_count: 1,
+            resources_count: 0,
+            resource_templates_count: 0,
+            prompts_count: 0,
+            status: McpServerStatus::Ready,
+        };
+        let encoded = serde_json::to_string(&item).expect("MCP item serializes");
+
+        for forbidden in [
+            "transport",
+            "command",
+            "url",
+            "fingerprint",
+            "status_reason",
+            "last_error",
+            "stderr",
+            "recent_bindings",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "operational MCP projection leaked {forbidden}: {encoded}"
+            );
+        }
+    }
 
     #[test]
     fn install_params_default_to_workspace_scope() {

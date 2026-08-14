@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 use crate::{
     AuthSecretString, AuthSessionGrant, ClientInstallationDescriptor, GatewayBaseUrl, GatewayId,
     GatewayTransportSecurity, InvitationId, MemberSummary, NewMemberProfile, PioneerAppUrlScheme,
-    PrincipalId, PrincipalKind, WorkspaceId,
+    PrincipalId, PrincipalKind, RoleKey, WorkspaceId,
 };
 
 pub const INVITATION_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -300,22 +300,30 @@ pub struct InvitationWorkspaceGrant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "InvitationCreateParamsWire")]
 pub struct InvitationCreateParams {
+    pub role_key: RoleKey,
     #[schemars(length(min = 1, max = 64))]
     pub workspace_ids: Vec<WorkspaceId>,
 }
 
 impl InvitationCreateParams {
-    pub fn new(mut workspace_ids: Vec<WorkspaceId>) -> Result<Self, InvitationParamsError> {
+    pub fn new_for_role(
+        role_key: RoleKey,
+        mut workspace_ids: Vec<WorkspaceId>,
+    ) -> Result<Self, InvitationParamsError> {
         workspace_ids.sort();
         workspace_ids.dedup();
         validate_workspace_count(workspace_ids.len())?;
-        Ok(Self { workspace_ids })
+        Ok(Self {
+            role_key,
+            workspace_ids,
+        })
     }
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct InvitationCreateParamsWire {
+    role_key: RoleKey,
     #[schemars(length(min = 1, max = 64))]
     workspace_ids: Vec<WorkspaceId>,
 }
@@ -324,7 +332,7 @@ impl TryFrom<InvitationCreateParamsWire> for InvitationCreateParams {
     type Error = InvitationParamsError;
 
     fn try_from(value: InvitationCreateParamsWire) -> Result<Self, Self::Error> {
-        Self::new(value.workspace_ids)
+        Self::new_for_role(value.role_key, value.workspace_ids)
     }
 }
 
@@ -345,6 +353,7 @@ pub struct InvitationWorkspaceSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InvitationSummary {
     pub invitation_id: InvitationId,
+    pub role_key: RoleKey,
     pub status: InvitationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoke_reason: Option<InvitationRevokeReason>,
@@ -427,6 +436,7 @@ pub struct InvitationPreviewResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_display_name: Option<String>,
     pub inviter: InvitationInviterSummary,
+    pub role_key: RoleKey,
     pub workspaces: Vec<InvitationWorkspaceSummary>,
     pub expires_at_unix: u64,
     pub transport: InvitationTransportSecurity,
@@ -513,7 +523,9 @@ mod tests {
         InvitationPresentation, InvitationRevokeParams, InvitationRevokeReason, InvitationStatus,
         InvitationTransportSecurity, InvitationWorkspaceGrant,
     };
-    use crate::{GatewayBaseUrl, GatewayId, InvitationId, PioneerAppUrlScheme, WorkspaceId};
+    use crate::{
+        GatewayBaseUrl, GatewayId, InvitationId, PioneerAppUrlScheme, RoleKey, WorkspaceId,
+    };
     use serde_json::json;
 
     #[test]
@@ -716,12 +728,15 @@ mod tests {
     }
 
     #[test]
-    fn invitation_create_params_are_canonical_bounded_and_have_no_authority_fields() {
-        let params = InvitationCreateParams::new(vec![
-            WorkspaceId::new("W00000000000000000002").unwrap(),
-            WorkspaceId::new("W00000000000000000001").unwrap(),
-            WorkspaceId::new("W00000000000000000001").unwrap(),
-        ])
+    fn invitation_create_params_are_canonical_bounded_and_carry_a_syntactic_target_role() {
+        let params = InvitationCreateParams::new_for_role(
+            RoleKey::member(),
+            vec![
+                WorkspaceId::new("W00000000000000000002").unwrap(),
+                WorkspaceId::new("W00000000000000000001").unwrap(),
+                WorkspaceId::new("W00000000000000000001").unwrap(),
+            ],
+        )
         .unwrap();
         assert_eq!(
             params
@@ -731,9 +746,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["W00000000000000000001", "W00000000000000000002"]
         );
-        assert!(InvitationCreateParams::new(Vec::new()).is_err());
+        assert_eq!(params.role_key, RoleKey::member());
+        let operator = InvitationCreateParams::new_for_role(
+            RoleKey::new("operator").unwrap(),
+            vec![WorkspaceId::new("W00000000000000000001").unwrap()],
+        )
+        .unwrap();
+        assert_eq!(operator.role_key.as_str(), "operator");
         assert!(
-            InvitationCreateParams::new(
+            serde_json::from_value::<InvitationCreateParams>(json!({
+                "workspace_ids": ["W00000000000000000001"]
+            }))
+            .is_err(),
+            "target role is an explicit modern wire contract"
+        );
+        assert!(InvitationCreateParams::new_for_role(RoleKey::member(), Vec::new()).is_err());
+        assert!(
+            InvitationCreateParams::new_for_role(
+                RoleKey::member(),
                 (0..=INVITATION_MAX_WORKSPACE_GRANTS)
                     .map(|index| WorkspaceId::new(format!("W{index:020}")).unwrap())
                     .collect(),

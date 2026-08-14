@@ -91,45 +91,91 @@ pub(crate) enum TaskResource {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum CapabilityResource {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum AgentsDocumentResource {}
+
 pub(crate) type WorkspaceResourceId = ResourceId<WorkspaceResource>;
 pub(crate) type ThreadResourceId = ResourceId<ThreadResource>;
 pub(crate) type TurnResourceId = ResourceId<TurnResource>;
 pub(crate) type ArtifactResourceId = ResourceId<ArtifactResource>;
 pub(crate) type TaskResourceId = ResourceId<TaskResource>;
 pub(crate) type CapabilityResourceId = ResourceId<CapabilityResource>;
+pub(crate) type AgentsDocumentResourceId = ResourceId<AgentsDocumentResource>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ResourceAction {
     GatewayManage,
     WorkspaceList,
     WorkspaceRead,
     WorkspaceCreate,
     WorkspaceManage,
-    ThreadCreate,
+    ThreadCreatePrivate,
+    ThreadCreateWorkspace,
     ThreadRead,
-    ThreadWrite,
+    MessageCreate,
+    MessageEditOwn,
+    MessageDeleteOwn,
+    AgentTurnStart,
+    AgentExecutionObserve,
+    AgentExecutionCancel,
+    AgentExecutionResume,
+    AgentExecutionSteer,
+    AgentRequestObserve,
+    AgentRequestRespond,
+    ChildObserve,
+    ChildWrite,
+    ChildStart,
+    ChildControl,
+    ChildRespond,
+    ChildTaskCreate,
+    ChildArtifactRead,
+    ChildArtifactWrite,
+    AgentsDocumentRead,
+    AgentsDocumentManage,
     ThreadManage,
     ThreadMove,
     ThreadParticipantsManage,
     ArtifactRead,
-    ArtifactWrite,
+    ArtifactCreateThread,
+    ArtifactBindThread,
+    ArtifactDeleteThread,
+    ArtifactDeleteOwn,
+    ArtifactManageWorkspace,
     ArtifactDelete,
     MemoryRead,
-    MemoryWrite,
+    MemoryCreateThread,
+    MemoryUpdateThread,
+    MemoryForgetThread,
+    MemoryForgetWorkspace,
+    MemoryModerateWorkspace,
     TaskRead,
-    TaskRun,
-    TaskManage,
+    TaskReadOperator,
+    TaskCreate,
+    TaskReview,
+    TaskCancel,
+    TaskScheduleManage,
+    TaskDetach,
+    ProviderDiscover,
     ProviderUse,
     ProviderManage,
+    McpDiscover,
     McpUse,
+    McpReadOperator,
     McpManage,
+    SkillDiscover,
     SkillUse,
     SkillManage,
+    CliRuntimeDiscover,
     CliRuntimeUse,
+    CliRuntimeReadOperator,
+    CliRuntimeControl,
+    CliThreadFork,
     CliRuntimeManage,
     SessionReadOwn,
     SessionRevokeOwn,
     ProfileUpdateOwn,
+    NotificationReadOwn,
+    NotificationAcknowledgeOwn,
     InvitationCreate,
     InvitationList,
     InvitationRevoke,
@@ -145,38 +191,79 @@ pub(crate) enum ResourceAction {
 }
 
 impl ResourceAction {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 42] = [
+    pub(crate) const ALL: [Self; 84] = [
         Self::GatewayManage,
         Self::WorkspaceList,
         Self::WorkspaceRead,
         Self::WorkspaceCreate,
         Self::WorkspaceManage,
-        Self::ThreadCreate,
+        Self::ThreadCreatePrivate,
+        Self::ThreadCreateWorkspace,
         Self::ThreadRead,
-        Self::ThreadWrite,
+        Self::MessageCreate,
+        Self::MessageEditOwn,
+        Self::MessageDeleteOwn,
+        Self::AgentTurnStart,
+        Self::AgentExecutionObserve,
+        Self::AgentExecutionCancel,
+        Self::AgentExecutionResume,
+        Self::AgentExecutionSteer,
+        Self::AgentRequestObserve,
+        Self::AgentRequestRespond,
+        Self::ChildObserve,
+        Self::ChildWrite,
+        Self::ChildStart,
+        Self::ChildControl,
+        Self::ChildRespond,
+        Self::ChildTaskCreate,
+        Self::ChildArtifactRead,
+        Self::ChildArtifactWrite,
+        Self::AgentsDocumentRead,
+        Self::AgentsDocumentManage,
         Self::ThreadManage,
         Self::ThreadMove,
         Self::ThreadParticipantsManage,
         Self::ArtifactRead,
-        Self::ArtifactWrite,
+        Self::ArtifactCreateThread,
+        Self::ArtifactBindThread,
+        Self::ArtifactDeleteThread,
+        Self::ArtifactDeleteOwn,
+        Self::ArtifactManageWorkspace,
         Self::ArtifactDelete,
         Self::MemoryRead,
-        Self::MemoryWrite,
+        Self::MemoryCreateThread,
+        Self::MemoryUpdateThread,
+        Self::MemoryForgetThread,
+        Self::MemoryForgetWorkspace,
+        Self::MemoryModerateWorkspace,
         Self::TaskRead,
-        Self::TaskRun,
-        Self::TaskManage,
+        Self::TaskReadOperator,
+        Self::TaskCreate,
+        Self::TaskReview,
+        Self::TaskCancel,
+        Self::TaskScheduleManage,
+        Self::TaskDetach,
+        Self::ProviderDiscover,
         Self::ProviderUse,
         Self::ProviderManage,
+        Self::McpDiscover,
         Self::McpUse,
+        Self::McpReadOperator,
         Self::McpManage,
+        Self::SkillDiscover,
         Self::SkillUse,
         Self::SkillManage,
+        Self::CliRuntimeDiscover,
         Self::CliRuntimeUse,
+        Self::CliRuntimeReadOperator,
+        Self::CliRuntimeControl,
+        Self::CliThreadFork,
         Self::CliRuntimeManage,
         Self::SessionReadOwn,
         Self::SessionRevokeOwn,
         Self::ProfileUpdateOwn,
+        Self::NotificationReadOwn,
+        Self::NotificationAcknowledgeOwn,
         Self::InvitationCreate,
         Self::InvitationList,
         Self::InvitationRevoke,
@@ -198,31 +285,73 @@ impl ResourceAction {
             Self::WorkspaceRead => "workspace_read",
             Self::WorkspaceCreate => "workspace_create",
             Self::WorkspaceManage => "workspace_manage",
-            Self::ThreadCreate => "thread_create",
+            Self::ThreadCreatePrivate => "thread_create_private",
+            Self::ThreadCreateWorkspace => "thread_create_workspace",
             Self::ThreadRead => "thread_read",
-            Self::ThreadWrite => "thread_write",
+            Self::MessageCreate => "message_create",
+            Self::MessageEditOwn => "message_edit_own",
+            Self::MessageDeleteOwn => "message_delete_own",
+            Self::AgentTurnStart => "agent_turn_start",
+            Self::AgentExecutionObserve => "agent_execution_observe",
+            Self::AgentExecutionCancel => "agent_execution_cancel",
+            Self::AgentExecutionResume => "agent_execution_resume",
+            Self::AgentExecutionSteer => "agent_execution_steer",
+            Self::AgentRequestObserve => "agent_request_observe",
+            Self::AgentRequestRespond => "agent_request_respond",
+            Self::ChildObserve => "child_observe",
+            Self::ChildWrite => "child_write",
+            Self::ChildStart => "child_start",
+            Self::ChildControl => "child_control",
+            Self::ChildRespond => "child_respond",
+            Self::ChildTaskCreate => "child_task_create",
+            Self::ChildArtifactRead => "child_artifact_read",
+            Self::ChildArtifactWrite => "child_artifact_write",
+            Self::AgentsDocumentRead => "agents_document_read",
+            Self::AgentsDocumentManage => "agents_document_manage",
             Self::ThreadManage => "thread_manage",
             Self::ThreadMove => "thread_move",
             Self::ThreadParticipantsManage => "thread_participants_manage",
             Self::ArtifactRead => "artifact_read",
-            Self::ArtifactWrite => "artifact_write",
+            Self::ArtifactCreateThread => "artifact_create_thread",
+            Self::ArtifactBindThread => "artifact_bind_thread",
+            Self::ArtifactDeleteThread => "artifact_delete_thread",
+            Self::ArtifactDeleteOwn => "artifact_delete_own",
+            Self::ArtifactManageWorkspace => "artifact_manage_workspace",
             Self::ArtifactDelete => "artifact_delete",
             Self::MemoryRead => "memory_read",
-            Self::MemoryWrite => "memory_write",
+            Self::MemoryCreateThread => "memory_create_thread",
+            Self::MemoryUpdateThread => "memory_update_thread",
+            Self::MemoryForgetThread => "memory_forget_thread",
+            Self::MemoryForgetWorkspace => "memory_forget_workspace",
+            Self::MemoryModerateWorkspace => "memory_moderate_workspace",
             Self::TaskRead => "task_read",
-            Self::TaskRun => "task_run",
-            Self::TaskManage => "task_manage",
+            Self::TaskReadOperator => "task_read_operator",
+            Self::TaskCreate => "task_create",
+            Self::TaskReview => "task_review",
+            Self::TaskCancel => "task_cancel",
+            Self::TaskScheduleManage => "task_schedule_manage",
+            Self::TaskDetach => "task_detach",
+            Self::ProviderDiscover => "provider_discover",
             Self::ProviderUse => "provider_use",
             Self::ProviderManage => "provider_manage",
+            Self::McpDiscover => "mcp_discover",
             Self::McpUse => "mcp_use",
+            Self::McpReadOperator => "mcp_read_operator",
             Self::McpManage => "mcp_manage",
+            Self::SkillDiscover => "skill_discover",
             Self::SkillUse => "skill_use",
             Self::SkillManage => "skill_manage",
+            Self::CliRuntimeDiscover => "cli_runtime_discover",
             Self::CliRuntimeUse => "cli_runtime_use",
+            Self::CliRuntimeReadOperator => "cli_runtime_read_operator",
+            Self::CliRuntimeControl => "cli_runtime_control",
+            Self::CliThreadFork => "cli_thread_fork",
             Self::CliRuntimeManage => "cli_runtime_manage",
             Self::SessionReadOwn => "session_read_own",
             Self::SessionRevokeOwn => "session_revoke_own",
             Self::ProfileUpdateOwn => "profile_update_own",
+            Self::NotificationReadOwn => "notification_read_own",
+            Self::NotificationAcknowledgeOwn => "notification_acknowledge_own",
             Self::InvitationCreate => "invitation_create",
             Self::InvitationList => "invitation_list",
             Self::InvitationRevoke => "invitation_revoke",
@@ -238,11 +367,47 @@ impl ResourceAction {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn from_safe_name(value: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|action| action.safe_name() == value)
+    }
+}
+
+/// Maps an operation on an internal execution child to the independent
+/// collaboration capability that must additionally be granted by the role.
+pub(crate) const fn execution_child_policy_action(
+    action: ResourceAction,
+) -> Option<ResourceAction> {
+    match action {
+        ResourceAction::ThreadRead
+        | ResourceAction::AgentExecutionObserve
+        | ResourceAction::AgentRequestObserve
+        | ResourceAction::TaskRead
+        | ResourceAction::TaskReadOperator
+        | ResourceAction::CliRuntimeReadOperator => Some(ResourceAction::ChildObserve),
+        ResourceAction::MessageCreate
+        | ResourceAction::MemoryRead
+        | ResourceAction::MemoryCreateThread
+        | ResourceAction::MemoryUpdateThread
+        | ResourceAction::MemoryForgetThread => Some(ResourceAction::ChildWrite),
+        ResourceAction::AgentTurnStart
+        | ResourceAction::ProviderUse
+        | ResourceAction::McpUse
+        | ResourceAction::SkillUse => Some(ResourceAction::ChildStart),
+        ResourceAction::AgentExecutionCancel
+        | ResourceAction::AgentExecutionResume
+        | ResourceAction::AgentExecutionSteer
+        | ResourceAction::CliRuntimeUse
+        | ResourceAction::CliRuntimeControl
+        | ResourceAction::CliThreadFork => Some(ResourceAction::ChildControl),
+        ResourceAction::AgentRequestRespond => Some(ResourceAction::ChildRespond),
+        ResourceAction::TaskCreate => Some(ResourceAction::ChildTaskCreate),
+        ResourceAction::ArtifactRead => Some(ResourceAction::ChildArtifactRead),
+        ResourceAction::ArtifactCreateThread | ResourceAction::ArtifactBindThread => {
+            Some(ResourceAction::ChildArtifactWrite)
+        }
+        _ => None,
     }
 }
 
@@ -283,6 +448,11 @@ pub(crate) enum AuthorizationResource {
         workspace_id: WorkspaceResourceId,
         kind: CapabilityKind,
         id: CapabilityResourceId,
+    },
+    AgentsDocument {
+        workspace_id: WorkspaceResourceId,
+        folder_id: Option<AgentsDocumentResourceId>,
+        revision: Option<i64>,
     },
     InvitationGrantSet(Vec<WorkspaceResourceId>),
     InvitationCollection(GatewayId),
@@ -381,7 +551,7 @@ impl DisclosurePolicy {
 /// server-resolved resource decision is still required.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ActionGateDecision {
-    AllowSuperuser,
+    AllowAbsolute,
     RequireResource {
         role: RoleKey,
     },
@@ -393,17 +563,17 @@ pub(crate) enum ActionGateDecision {
 
 impl ActionGateDecision {
     pub(crate) const fn permits_resource_resolution(&self) -> bool {
-        matches!(self, Self::AllowSuperuser | Self::RequireResource { .. })
+        matches!(self, Self::AllowAbsolute | Self::RequireResource { .. })
     }
 
     pub(crate) const fn is_final_allow(&self) -> bool {
-        matches!(self, Self::AllowSuperuser)
+        matches!(self, Self::AllowAbsolute)
     }
 
     #[cfg(test)]
     pub(crate) const fn safe_name(&self) -> &'static str {
         match self {
-            Self::AllowSuperuser => "allow_superuser",
+            Self::AllowAbsolute => "allow_absolute",
             Self::RequireResource { .. } => "require_resource",
             Self::Deny { .. } => "deny",
         }
@@ -412,7 +582,7 @@ impl ActionGateDecision {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AuthorizationDecision {
-    AllowSuperuser,
+    AllowAbsolute,
     AllowPolicy {
         role: RoleKey,
         reason: AllowReason,
@@ -425,11 +595,11 @@ pub(crate) enum AuthorizationDecision {
 
 impl AuthorizationDecision {
     pub(crate) const fn is_allowed(&self) -> bool {
-        matches!(self, Self::AllowSuperuser | Self::AllowPolicy { .. })
+        matches!(self, Self::AllowAbsolute | Self::AllowPolicy { .. })
     }
 
-    pub(crate) const fn is_absolute_superuser(&self) -> bool {
-        matches!(self, Self::AllowSuperuser)
+    pub(crate) const fn is_absolute(&self) -> bool {
+        matches!(self, Self::AllowAbsolute)
     }
 }
 

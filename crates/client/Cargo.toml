@@ -8,7 +8,6 @@ authors.workspace = true
 [features]
 default = []
 schema = ["dep:schemars"]
-test-support = []
 
 [[bin]]
 name = "schema"

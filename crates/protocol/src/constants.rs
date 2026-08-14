@@ -51,7 +51,7 @@ pub mod methods {
     pub const TURN_CANCEL: &str = "turn/cancel";
     pub const TURN_RESUME: &str = "turn/resume";
     pub const TURN_GET: &str = "turn/get";
-    pub const TURN_ITEMS: &str = "turn/items";
+    pub const TURN_ITEMS_PAGE: &str = "turn/items/page";
     pub const TURN_WORK_PAGE: &str = "turn/work/page";
     pub const TURN_WORK_ITEMS_GET: &str = "turn/work/items/get";
     pub const TURN_PERMISSION_REQUEST_RESPOND: &str = "turn/permission/request/respond";
@@ -118,6 +118,8 @@ pub mod methods {
     pub const TASK_RESUME: &str = "task/resume";
     pub const TASK_AGENDA: &str = "task/agenda";
     pub const TASK_DELIVERIES: &str = "task/deliveries";
+    pub const TASK_USER_NOTIFICATION_LIST: &str = "task/user_notification/list";
+    pub const TASK_USER_NOTIFICATION_ACKNOWLEDGE: &str = "task/user_notification/acknowledge";
     pub const MEMORY_SEARCH: &str = "memory/search";
     pub const MEMORY_GET: &str = "memory/get";
     pub const MEMORY_LIST: &str = "memory/list";
@@ -197,7 +199,7 @@ pub mod methods {
         TURN_CANCEL,
         TURN_RESUME,
         TURN_GET,
-        TURN_ITEMS,
+        TURN_ITEMS_PAGE,
         TURN_WORK_PAGE,
         TURN_WORK_ITEMS_GET,
         TURN_PERMISSION_REQUEST_RESPOND,
@@ -263,6 +265,8 @@ pub mod methods {
         TASK_RESUME,
         TASK_AGENDA,
         TASK_DELIVERIES,
+        TASK_USER_NOTIFICATION_LIST,
+        TASK_USER_NOTIFICATION_ACKNOWLEDGE,
         MEMORY_SEARCH,
         MEMORY_GET,
         MEMORY_LIST,
@@ -303,6 +307,7 @@ pub mod methods {
 
 pub mod events {
     pub const ACCESS_CHANGED: &str = "access/changed";
+    pub const AUTHORIZATION_PROJECTION_CHANGED: &str = "authorization/projection_changed";
     pub const INVITATION_CHANGED: &str = "invitation/changed";
     pub const MEMBER_CHANGED: &str = "member/changed";
     pub const WORKSPACE_MEMBERS_CHANGED: &str = "workspace/members_changed";
@@ -409,6 +414,7 @@ pub mod events {
     pub const TASK_DELIVERY_DELIVERED: &str = "task/delivery/delivered";
     pub const TASK_DELIVERY_FAILED: &str = "task/delivery/failed";
     pub const TASK_DELIVERY_CANCELLED: &str = "task/delivery/cancelled";
+    pub const TASK_USER_NOTIFICATION_DELIVERED: &str = "task/user_notification/delivered";
     pub const TASK_WRITE_LOCK_ACQUIRED: &str = "task/write_lock/acquired";
     pub const TASK_WRITE_LOCK_EXTENDED: &str = "task/write_lock/extended";
     pub const TASK_WRITE_LOCK_RELEASED: &str = "task/write_lock/released";

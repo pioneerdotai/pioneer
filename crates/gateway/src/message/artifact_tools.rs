@@ -57,16 +57,36 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
         context: TurnToolContext,
     ) -> Result<TurnToolMaterialization, String> {
         let processor = self.processor()?;
-        processor
+        let can_read = processor
             .revalidate_tool_execution_authorization(
                 context.workspace_id.as_str(),
                 context.thread_id.as_str(),
                 context.turn_id.as_str(),
                 None,
-                crate::authorization::ResourceAction::ThreadRead,
+                crate::authorization::ResourceAction::ArtifactRead,
             )
             .await
-            .map_err(|_| "artifacts are unavailable for the current execution".to_owned())?;
+            .is_ok();
+        let can_prepare = processor
+            .revalidate_tool_execution_authorization(
+                context.workspace_id.as_str(),
+                context.thread_id.as_str(),
+                context.turn_id.as_str(),
+                None,
+                crate::authorization::ResourceAction::ArtifactCreateThread,
+            )
+            .await
+            .is_ok();
+        let can_register = processor
+            .revalidate_tool_execution_authorization(
+                context.workspace_id.as_str(),
+                context.thread_id.as_str(),
+                context.turn_id.as_str(),
+                None,
+                crate::authorization::ResourceAction::ArtifactBindThread,
+            )
+            .await
+            .is_ok();
         let artifact_state = processor
             .artifact_tool_state_for_turn(context.turn_id.as_str())
             .await;
@@ -91,12 +111,24 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
         let mut bundle = ToolExtensionBundle::default();
         for configured in artifact_tool_specs() {
             let name = configured.spec.name.clone();
+            let allowed = match name.as_str() {
+                ARTIFACT_READ_TOOL => can_read,
+                ARTIFACT_PREPARE_TOOL => can_prepare,
+                ARTIFACT_REGISTER_TOOL => can_register,
+                _ => false,
+            };
+            if !allowed {
+                continue;
+            }
             bundle.specs.push(configured);
             bundle.handlers.push((name, artifact_handler.clone()));
         }
 
         Ok(TurnToolMaterialization {
-            bundles: vec![bundle],
+            bundles: (!bundle.specs.is_empty())
+                .then_some(bundle)
+                .into_iter()
+                .collect(),
             diagnostics: Vec::new(),
         })
     }
@@ -143,15 +175,10 @@ impl ToolHandler for GatewayAuthorizedArtifactToolHandler {
         invocation: ToolInvocation,
         trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let (thread_action, artifact_action) = match invocation.tool_name.as_str() {
-            ARTIFACT_READ_TOOL => (
-                crate::authorization::ResourceAction::ThreadRead,
-                crate::authorization::ResourceAction::ArtifactRead,
-            ),
-            ARTIFACT_PREPARE_TOOL | ARTIFACT_REGISTER_TOOL => (
-                crate::authorization::ResourceAction::ThreadWrite,
-                crate::authorization::ResourceAction::ArtifactWrite,
-            ),
+        let artifact_action = match invocation.tool_name.as_str() {
+            ARTIFACT_READ_TOOL => crate::authorization::ResourceAction::ArtifactRead,
+            ARTIFACT_PREPARE_TOOL => crate::authorization::ResourceAction::ArtifactCreateThread,
+            ARTIFACT_REGISTER_TOOL => crate::authorization::ResourceAction::ArtifactBindThread,
             _ => return self.inner.handle(invocation, trace).await,
         };
         let current = self
@@ -161,23 +188,18 @@ impl ToolHandler for GatewayAuthorizedArtifactToolHandler {
                 self.context.thread_id.as_str(),
                 self.context.turn_id.as_str(),
                 None,
-                thread_action,
+                artifact_action,
             )
             .await
             .map_err(|_| artifact_tool_authorization_error())?;
 
-        if let Some(current) = current.as_ref() {
-            crate::authorization::record_tool_decision(
-                artifact_action,
-                "artifact",
-                current.authorization().decision(),
-            );
-        }
+        crate::authorization::record_tool_decision(
+            artifact_action,
+            "artifact",
+            current.authorization().decision(),
+        );
 
-        if invocation.tool_name == ARTIFACT_READ_TOOL
-            && let Some(current) = current
-            && current.principal().kind == pioneer_protocol::PrincipalKind::User
-        {
+        if invocation.tool_name == ARTIFACT_READ_TOOL {
             let artifact_id = artifact_read_id(&invocation)?;
             let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
                 current.principal().kind,

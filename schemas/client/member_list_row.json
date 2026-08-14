@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemberListRow",
+  "type": "object",
+  "properties": {
+    "actions": {
+      "$ref": "#/$defs/MemberPresentationActions"
+    },
+    "avatar_revision": {
+      "description": "Revision-addressed key for the authenticated HTTP avatar cache.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/PrincipalKind"
+    },
+    "lifecycle_managed": {
+      "type": "boolean"
+    },
+    "nickname": {
+      "type": "string"
+    },
+    "principal_id": {
+      "$ref": "#/$defs/PrincipalId"
+    },
+    "role": {
+      "$ref": "#/$defs/AuthorizationRolePresentation"
+    },
+    "role_key": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RoleKey"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "status": {
+      "$ref": "#/$defs/MemberPresentationStatus"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "principal_id",
+    "kind",
+    "display_name",
+    "nickname",
+    "role",
+    "lifecycle_managed",
+    "status",
+    "actions"
+  ],
+  "$defs": {
+    "AuthorizationRolePresentation": {
+      "description": "Server-owned presentation metadata for the authenticated role. The key is\ndeliberately open-ended: clients display this object but never derive\nauthorization decisions from it.",
+      "type": "object",
+      "properties": {
+        "built_in": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "display_name",
+        "description",
+        "built_in"
+      ]
+    },
+    "MemberPresentationActions": {
+      "type": "object",
+      "properties": {
+        "can_add_to_workspace": {
+          "type": "boolean"
+        },
+        "can_create_recovery_device": {
+          "type": "boolean"
+        },
+        "can_remove": {
+          "type": "boolean"
+        },
+        "can_remove_from_workspace": {
+          "type": "boolean"
+        },
+        "can_restore": {
+          "type": "boolean"
+        },
+        "can_suspend": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "can_suspend",
+        "can_restore",
+        "can_remove",
+        "can_create_recovery_device",
+        "can_add_to_workspace",
+        "can_remove_from_workspace"
+      ]
+    },
+    "MemberPresentationStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "suspended",
+        "removed",
+        "unknown"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "superuser",
+        "user"
+      ]
+    },
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    }
+  }
+}

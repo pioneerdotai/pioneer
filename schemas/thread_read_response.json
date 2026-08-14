@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadReadResponse",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "$ref": "#/$defs/ThreadReadCursor"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "unread_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "cursor",
+    "unread_count"
+  ],
+  "$defs": {
+    "ThreadReadCursor": {
+      "type": "object",
+      "properties": {
+        "sort_key": {
+          "type": "string"
+        },
+        "through_turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "through_turn_id",
+        "sort_key"
+      ]
+    }
+  }
+}

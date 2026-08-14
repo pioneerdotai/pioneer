@@ -9,6 +9,7 @@ mod lifecycle_setup;
 mod notifications_view;
 mod popover_view;
 mod session_refresh;
+mod task_user_notifications;
 mod thread_list;
 mod thread_start_execute;
 mod thread_start_queue;

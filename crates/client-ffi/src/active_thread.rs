@@ -136,6 +136,10 @@ pub struct ClientActiveThreadEventResult {
     pub access_changed: Option<ClientAccessChangedLifecycle>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub administration_refetch: Vec<AdministrationRefetch>,
+    /// A live hint that the durable exact-recipient Task inbox changed. The
+    /// shell reconciles the inbox through the list RPC, including reconnect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_user_notification: Option<pioneer_protocol::TaskUserNotificationDeliveredNotification>,
 }
 
 /// Payload-safe bridge projection of the shared Rust access-change plan.
@@ -203,6 +207,7 @@ pub struct ClientActiveThreadSendTextResult {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientPrepareVoiceComposerSnapshotRequest {
+    pub authorization_fingerprint: String,
     #[serde(default)]
     pub thread_id: Option<String>,
     #[serde(default)]
@@ -336,6 +341,7 @@ struct ClientFfiNotificationReduction {
     semantic_timeline_patch: SemanticTimelineCachePatch,
     access_changed: Option<ClientAccessChangedLifecycle>,
     administration_refetch: Vec<AdministrationRefetch>,
+    task_user_notification: Option<pioneer_protocol::TaskUserNotificationDeliveredNotification>,
 }
 
 impl ClientFfiActiveThreadState {
@@ -538,6 +544,7 @@ impl ClientFfiActiveThreadState {
             semantic_timeline_patch: notification_reduction.semantic_timeline_patch,
             access_changed: notification_reduction.access_changed,
             administration_refetch: notification_reduction.administration_refetch,
+            task_user_notification: notification_reduction.task_user_notification,
         })
     }
 
@@ -859,6 +866,7 @@ impl ClientFfiActiveThreadState {
         request: ClientPrepareVoiceComposerSnapshotRequest,
     ) -> anyhow::Result<PreparedVoiceComposerSnapshot> {
         let ClientPrepareVoiceComposerSnapshotRequest {
+            authorization_fingerprint,
             thread_id,
             workspace_id: _workspace_id,
             turn_id,
@@ -954,6 +962,7 @@ impl ClientFfiActiveThreadState {
             &runtime.ws_command_sender(),
             &ClientFfiFileSystem,
             PrepareVoiceComposerSnapshotRequest {
+                authorization_fingerprint,
                 workspace_id,
                 thread_id,
                 turn_id,
@@ -1187,6 +1196,10 @@ impl ClientFfiActiveThreadState {
                 ..Default::default()
             });
         }
+        if let GatewayNotification::AuthorizationProjectionChanged(notification) = notification {
+            self.apply_authorization_projection_changed(&notification)?;
+            return Ok(ClientFfiNotificationReduction::default());
+        }
 
         let (active_thread_id, active_workspace_id, notification_thread_workspace_matches) = {
             let inner = self
@@ -1353,6 +1366,7 @@ impl ClientFfiActiveThreadState {
                 SemanticTimelineCachePatch::default()
             }
             ClientRuntimeNotification::WorkspaceRefresh(_)
+            | ClientRuntimeNotification::AuthorizationProjectionChanged(_)
             | ClientRuntimeNotification::SkillsRefresh(_)
             | ClientRuntimeNotification::McpRefresh(_)
             | ClientRuntimeNotification::McpServerStatusChanged(_)
@@ -1396,13 +1410,97 @@ impl ClientFfiActiveThreadState {
                 inner.pending_requests.apply(reduction);
                 SemanticTimelineCachePatch::default()
             }
+            ClientRuntimeNotification::TaskUserNotificationDelivered(notification) => {
+                return Ok(ClientFfiNotificationReduction {
+                    task_user_notification: Some(notification),
+                    ..Default::default()
+                });
+            }
         };
 
         Ok(ClientFfiNotificationReduction {
             semantic_timeline_patch,
             access_changed: None,
             administration_refetch: Vec::new(),
+            task_user_notification: None,
         })
+    }
+
+    fn apply_authorization_projection_changed(
+        &self,
+        notification: &pioneer_protocol::AuthorizationProjectionChangedNotification,
+    ) -> anyhow::Result<()> {
+        let generation = notification.policy_generation.get();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+        if inner
+            .authorization_revision
+            // An ACL commit emits both `access/changed` and this typed event
+            // at the same generation. Apply equality so the second event can
+            // invalidate exact authorization-derived state.
+            .is_some_and(|current| current > generation)
+        {
+            return Ok(());
+        }
+
+        let affected_thread_ids = match &notification.affected {
+            pioneer_protocol::AuthorizationChangeScope::Global
+            | pioneer_protocol::AuthorizationChangeScope::Role { .. }
+            | pioneer_protocol::AuthorizationChangeScope::Principal { .. } => {
+                inner.coordinators.keys().cloned().collect::<Vec<_>>()
+            }
+            pioneer_protocol::AuthorizationChangeScope::PrincipalWorkspace {
+                workspace_id, ..
+            } => inner
+                .coordinators
+                .iter()
+                .filter(|(_, coordinator)| coordinator.workspace_id == *workspace_id)
+                .map(|(thread_id, _)| thread_id.clone())
+                .collect(),
+            pioneer_protocol::AuthorizationChangeScope::PrincipalThread {
+                workspace_id,
+                thread_id,
+                ..
+            } => inner
+                .coordinators
+                .get(thread_id)
+                .filter(|coordinator| coordinator.workspace_id == *workspace_id)
+                .map(|_| vec![thread_id.clone()])
+                .unwrap_or_default(),
+            pioneer_protocol::AuthorizationChangeScope::Invitation { .. } => Vec::new(),
+            pioneer_protocol::AuthorizationChangeScope::Workspace { workspace_id }
+            | pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
+                workspace_id, ..
+            } => inner
+                .coordinators
+                .iter()
+                .filter(|(_, coordinator)| coordinator.workspace_id == *workspace_id)
+                .map(|(thread_id, _)| thread_id.clone())
+                .collect(),
+            pioneer_protocol::AuthorizationChangeScope::Thread {
+                workspace_id,
+                thread_id,
+            } => inner
+                .coordinators
+                .get(thread_id)
+                .filter(|coordinator| coordinator.workspace_id == *workspace_id)
+                .map(|_| vec![thread_id.clone()])
+                .unwrap_or_default(),
+        };
+        for thread_id in &affected_thread_ids {
+            remove_thread_session_state(&mut inner, thread_id);
+        }
+        if inner
+            .active_thread_id
+            .as_ref()
+            .is_some_and(|active| affected_thread_ids.contains(active))
+        {
+            clear_active_thread(&mut inner);
+        }
+        inner.authorization_revision = Some(generation);
+        Ok(())
     }
 
     fn apply_access_changed(
@@ -1445,7 +1543,7 @@ impl ClientFfiActiveThreadState {
                 }
                 let workspace_access_lost = plan.change
                     == pioneer_protocol::AccessChangeKind::WorkspaceMembership
-                    && notification.access_lost != Some(false);
+                    && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
                 let draft_removed = workspace_access_lost
                     && inner
                         .draft_thread_by_workspace
@@ -2862,6 +2960,7 @@ mod tests {
         }))
         .expect("text request");
         let voice: ClientPrepareVoiceComposerSnapshotRequest = serde_json::from_value(json!({
+            "authorization_fingerprint": "fixture-policy",
             "permission_mode": "supervised",
             "skill_selections": [selection],
             "skill_picker": picker
@@ -2879,6 +2978,7 @@ mod tests {
     #[test]
     fn voice_prepare_request_decodes_explicit_turn_id() {
         let request: ClientPrepareVoiceComposerSnapshotRequest = serde_json::from_value(json!({
+            "authorization_fingerprint": "fixture-policy",
             "thread_id": "thread_a",
             "workspace_id": "ws_a",
             "turn_id": "turn_voice_a",
@@ -2968,7 +3068,7 @@ mod tests {
                     authorization_revision: 7,
                     workspace_id: "workspace_revoked".to_owned(),
                     thread_id: None,
-                    access_lost: None,
+                    outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                     change: AccessChangeKind::WorkspaceMembership,
                 },
             )
@@ -3062,7 +3162,7 @@ mod tests {
                     authorization_revision: 8,
                     workspace_id: "workspace_affected".to_owned(),
                     thread_id: Some("thread_revoked".to_owned()),
-                    access_lost: None,
+                    outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                     change: AccessChangeKind::ThreadParticipantRemoved,
                 },
             )
@@ -3118,7 +3218,7 @@ mod tests {
                     authorization_revision: 9,
                     workspace_id: "workspace_current".to_owned(),
                     thread_id: Some("thread_current".to_owned()),
-                    access_lost: Some(false),
+                    outcome: pioneer_protocol::AccessChangeOutcome::Retained,
                     change: AccessChangeKind::ThreadVisibility,
                 },
             )
@@ -3154,7 +3254,7 @@ mod tests {
                     authorization_revision: 8,
                     workspace_id: "workspace_current".to_owned(),
                     thread_id: Some("thread_current".to_owned()),
-                    access_lost: None,
+                    outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                     change: AccessChangeKind::ThreadVisibility,
                 },
             )
@@ -3212,6 +3312,87 @@ mod tests {
         assert!(inner.coordinators.is_empty());
         assert!(inner.semantic_timelines.threads_by_id.is_empty());
         assert!(inner.pending_requests.requests().is_empty());
+    }
+
+    #[test]
+    fn policy_generation_change_invalidates_only_the_exact_mobile_scope() {
+        let state = ClientFfiActiveThreadState::default();
+        {
+            let mut inner = state.inner.lock().expect("active thread state");
+            inner.authorization_revision = Some(40);
+            inner.active_thread_id = Some("thread_affected".to_owned());
+            inner.coordinators.insert(
+                "thread_affected".to_owned(),
+                ThreadCoordinator::new(thread("thread_affected", "workspace_shared")),
+            );
+            inner.coordinators.insert(
+                "thread_kept".to_owned(),
+                ThreadCoordinator::new(thread("thread_kept", "workspace_shared")),
+            );
+        }
+
+        state
+            .apply_authorization_projection_changed(
+                &pioneer_protocol::AuthorizationProjectionChangedNotification {
+                    policy_generation: pioneer_protocol::PolicyGeneration::new(41).unwrap(),
+                    change: pioneer_protocol::AuthorizationChangeKind::ThreadAcl,
+                    affected: pioneer_protocol::AuthorizationChangeScope::PrincipalThread {
+                        principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000001")
+                            .unwrap(),
+                        workspace_id: "workspace_shared".to_owned(),
+                        thread_id: "thread_affected".to_owned(),
+                    },
+                },
+            )
+            .expect("typed policy invalidation");
+
+        let inner = state.inner.lock().expect("active thread state");
+        assert_eq!(inner.authorization_revision, Some(41));
+        assert!(inner.active_thread_id.is_none());
+        assert!(!inner.coordinators.contains_key("thread_affected"));
+        assert!(inner.coordinators.contains_key("thread_kept"));
+        drop(inner);
+
+        {
+            let mut inner = state.inner.lock().expect("active thread state");
+            inner.coordinators.insert(
+                "thread_same_generation".to_owned(),
+                ThreadCoordinator::new(thread("thread_same_generation", "workspace_shared")),
+            );
+        }
+        state
+            .apply_authorization_projection_changed(
+                &pioneer_protocol::AuthorizationProjectionChangedNotification {
+                    policy_generation: pioneer_protocol::PolicyGeneration::new(41).unwrap(),
+                    change: pioneer_protocol::AuthorizationChangeKind::ThreadAcl,
+                    affected: pioneer_protocol::AuthorizationChangeScope::Thread {
+                        workspace_id: "workspace_shared".to_owned(),
+                        thread_id: "thread_same_generation".to_owned(),
+                    },
+                },
+            )
+            .expect("typed event paired with access event at the same generation");
+        assert!(
+            !state
+                .inner
+                .lock()
+                .expect("active thread state")
+                .coordinators
+                .contains_key("thread_same_generation")
+        );
+
+        state
+            .apply_authorization_projection_changed(
+                &pioneer_protocol::AuthorizationProjectionChangedNotification {
+                    policy_generation: pioneer_protocol::PolicyGeneration::new(40).unwrap(),
+                    change: pioneer_protocol::AuthorizationChangeKind::RolePolicy,
+                    affected: pioneer_protocol::AuthorizationChangeScope::Global,
+                },
+            )
+            .expect("stale typed invalidation");
+        let inner = state.inner.lock().expect("active thread state");
+        assert_eq!(inner.authorization_revision, Some(41));
+        assert!(inner.coordinators.contains_key("thread_kept"));
     }
 
     #[test]

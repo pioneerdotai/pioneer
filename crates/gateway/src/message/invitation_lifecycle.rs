@@ -17,9 +17,24 @@ impl InvitationAcceptPostCommitHook for MessageProcessor {
             accepted_principal_id = %committed.accepted_principal_id,
             "publishing committed invitation acceptance lifecycle"
         );
-        let mut revision = 0;
+        let role_change = self
+            .authorization_invalidation_hub
+            .publish_change(
+                pioneer_protocol::AuthorizationChangeKind::RoleAssignment,
+                pioneer_protocol::AuthorizationChangeScope::Principal {
+                    principal_id: committed.accepted_principal_id.clone(),
+                },
+            )
+            .await
+            .expect("invitation acceptance must publish durable role assignment");
+        self.send_notification_to_authorized_member_connections(
+            &committed.accepted_principal_id,
+            events::AUTHORIZATION_PROJECTION_CHANGED,
+            &role_change,
+        )
+        .await;
         for workspace_id in &committed.workspace_ids {
-            revision = self
+            let revision = self
                 .publish_committed_authorization_invalidation(
                     AccessChangeKind::WorkspaceMembership,
                     Some(committed.accepted_principal_id.clone()),
@@ -38,6 +53,11 @@ impl InvitationAcceptPostCommitHook for MessageProcessor {
             )
             .await;
         }
+        let revision = self
+            .publish_invitation_selector_change(&committed.invitation_id)
+            .await
+            .policy_generation
+            .get();
         self.send_scoped_invitation_changed_notification(&committed.invitation_id, revision)
             .await;
         self.send_notification_to_authorized_member_connections(
@@ -53,8 +73,10 @@ impl InvitationAcceptPostCommitHook for MessageProcessor {
 
     async fn invitation_changed(&self, invitation_id: pioneer_protocol::InvitationId) {
         let revision = self
-            .authorization_invalidation_hub
-            .advance_snapshot_revision();
+            .publish_invitation_selector_change(&invitation_id)
+            .await
+            .policy_generation
+            .get();
         self.send_scoped_invitation_changed_notification(&invitation_id, revision)
             .await;
     }

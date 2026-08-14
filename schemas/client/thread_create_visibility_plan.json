@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadCreateVisibilityPlan",
+  "type": "object",
+  "properties": {
+    "default_visibility": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadVisibility"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadVisibility"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "options"
+  ],
+  "$defs": {
+    "ThreadVisibility": {
+      "description": "User-selectable visibility for ordinary user threads.\n\nInternal task/system threads deliberately have no public selectable value.",
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace"
+      ]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorizationResourceSelector",
+  "description": "Role-scoped constraints used by discovery and exact admission. `all=true`\nmeans every operationally enabled resource of that kind; otherwise only\nthe listed stable identifiers are visible and usable.",
+  "type": "object",
+  "properties": {
+    "all": {
+      "type": "boolean"
+    },
+    "ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "all"
+  ]
+}

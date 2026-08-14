@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadParticipantsResponse",
+  "type": "object",
+  "properties": {
+    "changed": {
+      "type": "boolean",
+      "default": false
+    },
+    "participant_ids": {
+      "description": "Compatibility list retained for clients predating participant summary\nDTOs.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/PrincipalId"
+      }
+    },
+    "participants": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ThreadParticipantSummary"
+      }
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id"
+  ],
+  "$defs": {
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ThreadParticipantSummary": {
+      "type": "object",
+      "properties": {
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id"
+      ]
+    }
+  }
+}

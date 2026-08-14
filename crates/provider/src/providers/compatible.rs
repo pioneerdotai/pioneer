@@ -1,7 +1,9 @@
+#[cfg(test)]
+use crate::attachments::prepare_messages_for_provider;
 use crate::{
     attachments::{
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
-        ensure_no_unrendered_attachments, prepare_messages_for_provider,
+        ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
@@ -956,6 +958,23 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    async fn build_chat_request_async(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        let capabilities =
+            <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
+        let prepared = prepare_messages_for_provider_async(
+            self.name.as_str(),
+            &capabilities,
+            request.rendered_messages_with_compiled_prompt().as_slice(),
+        )
+        .await?;
+        self.build_chat_request_from_prepared(request, stream, prepared)
+    }
+
+    #[cfg(test)]
     fn build_chat_request(&self, request: ChatRequest, stream: bool) -> Result<ApiChatRequest> {
         let capabilities =
             <OpenAiCompatibleProvider as crate::traits::Provider>::capabilities(self);
@@ -964,6 +983,15 @@ impl OpenAiCompatibleProvider {
             &capabilities,
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )?;
+        self.build_chat_request_from_prepared(request, stream, prepared)
+    }
+
+    fn build_chat_request_from_prepared(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+        prepared: PreparedProviderMessages,
+    ) -> Result<ApiChatRequest> {
         ensure_no_unrendered_attachments(self.name.as_str(), &prepared)?;
         Ok(ApiChatRequest {
             model: request.model,
@@ -1037,7 +1065,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let api_request = self.build_chat_request(request, false)?;
+        let api_request = self.build_chat_request_async(request, false).await?;
 
         let request_builder = self
             .authorized_post(&self.chat_completions_url())
@@ -1117,7 +1145,7 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let api_request = self.build_chat_request(request, true)?;
+        let api_request = self.build_chat_request_async(request, true).await?;
 
         let request_builder = self
             .authorized_post(&self.chat_completions_url())

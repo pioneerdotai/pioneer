@@ -111,7 +111,8 @@ mod tests {
     use crate::gateway::{timings::GatewayWsTimings, types::GatewayEndpointKind};
     use crate::transport::ws::GatewayWsConnectSpec;
     use pioneer_protocol::{
-        AccessChangeKind, GatewayNotification, TurnItem, WorkspaceChangeKind, constants::events,
+        AccessChangeKind, AccessChangeOutcome, GatewayNotification, TurnItem, WorkspaceChangeKind,
+        constants::events,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -340,6 +341,7 @@ mod tests {
             "params": {
                 "authorization_revision": 19,
                 "workspace_id": "ws_revoked",
+                "outcome": "revoked",
                 "change": "workspace_membership"
             }
         })
@@ -366,6 +368,7 @@ mod tests {
         };
         assert_eq!(notification.authorization_revision, 19);
         assert_eq!(notification.workspace_id, "ws_revoked");
+        assert_eq!(notification.outcome, AccessChangeOutcome::Revoked);
         assert_eq!(notification.change, AccessChangeKind::WorkspaceMembership);
     }
 

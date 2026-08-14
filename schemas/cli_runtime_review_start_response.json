@@ -6,16 +6,6 @@
     "delivery": {
       "$ref": "#/$defs/CLIRuntimeReviewDelivery"
     },
-    "native_thread_id": {
-      "type": "string"
-    },
-    "native_turn_id": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "raw": true,
     "review_thread_id": {
       "type": "string"
     },
@@ -44,7 +34,6 @@
     "thread_id",
     "delivery",
     "target",
-    "native_thread_id",
     "review_thread_id"
   ],
   "$defs": {

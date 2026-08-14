@@ -4,13 +4,17 @@ use pioneer_crud::{CrudStore, TurnMcpBindingRecord};
 use pioneer_protocol::TurnStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::authorization::{
     AuthorizationInvalidationHub, AuthorizationResolver, AuthorizationService, CapabilityKind,
-    ExecutionAuthorizationContext, ProofResolution, ResourceAction,
+    ExecutionAuthorizationContext, ExecutionLeaseRegistry, ProofResolution, ResourceAction,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +61,7 @@ pub(crate) enum TurnMcpInvocationErrorCode {
     ToolDrift,
     SecuritySnapshotUnavailable,
     PermissionDenied,
+    ResourceExhausted,
     Cancelled,
     TimedOut,
     ExecutionFailed,
@@ -79,6 +84,7 @@ impl TurnMcpInvocationErrorCode {
             Self::ToolDrift => "tool_drift",
             Self::SecuritySnapshotUnavailable => "security_snapshot_unavailable",
             Self::PermissionDenied => "permission_denied",
+            Self::ResourceExhausted => "resource_exhausted",
             Self::Cancelled => "cancelled",
             Self::TimedOut => "timed_out",
             Self::ExecutionFailed => "execution_failed",
@@ -131,12 +137,128 @@ pub(crate) struct CurrentMcpToolIdentity {
     pub(crate) runtime_generation: u64,
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct ValidatedTurnMcpInvocation {
     pub(crate) invocation: TurnMcpInvocation,
     pub(crate) manifest_hash: String,
     pub(crate) binding: TurnMcpBindingRecord,
     pub(crate) current_tool: CurrentMcpToolIdentity,
+    pub(crate) invocation_budget: pioneer_mcp::McpInvocationBudget,
+    pub(crate) invocation_limits: pioneer_protocol::McpInvocationResourceLimits,
+    _concurrency_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+pub(crate) struct McpInvocationGovernor {
+    states: Mutex<HashMap<String, Arc<McpInvocationTurnState>>>,
+}
+
+struct McpInvocationTurnState {
+    capacity: usize,
+    semaphore: Arc<Semaphore>,
+    queued: AtomicUsize,
+}
+
+impl McpInvocationTurnState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            semaphore: Arc::new(Semaphore::new(capacity)),
+            queued: AtomicUsize::new(0),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.semaphore.available_permits() == self.capacity
+            && self.queued.load(Ordering::Acquire) == 0
+    }
+}
+
+struct McpInvocationQueueGuard {
+    state: Arc<McpInvocationTurnState>,
+}
+
+impl Drop for McpInvocationQueueGuard {
+    fn drop(&mut self) {
+        self.state.queued.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl McpInvocationGovernor {
+    fn state_for(
+        &self,
+        turn_id: &str,
+        capacity: usize,
+    ) -> Result<Arc<McpInvocationTurnState>, TurnMcpInvocationError> {
+        let mut states = self
+            .states
+            .lock()
+            .map_err(|_| internal_error("MCP invocation governor is unavailable"))?;
+        states.retain(|key, state| key == turn_id || !state.is_idle());
+        if let Some(state) = states.get(turn_id) {
+            if state.capacity == capacity {
+                return Ok(state.clone());
+            }
+            if !state.is_idle() {
+                return Err(invocation_error(
+                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                    "MCP invocation resource policy changed while calls were active",
+                ));
+            }
+        }
+        let state = Arc::new(McpInvocationTurnState::new(capacity));
+        states.insert(turn_id.to_owned(), state.clone());
+        Ok(state)
+    }
+
+    async fn acquire(
+        &self,
+        turn_id: &str,
+        limits: pioneer_protocol::McpInvocationResourceLimits,
+        cancellation: &CancellationToken,
+    ) -> Result<OwnedSemaphorePermit, TurnMcpInvocationError> {
+        if !limits.is_valid() {
+            return Err(internal_error("MCP invocation resource policy is invalid"));
+        }
+        let state = self.state_for(turn_id, limits.max_concurrent_calls)?;
+        if let Ok(permit) = state.semaphore.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+
+        state
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < limits.max_queued_calls).then_some(queued + 1)
+            })
+            .map_err(|_| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::ResourceExhausted,
+                    "MCP invocation queue is full for this turn",
+                )
+            })?;
+        let queue_guard = McpInvocationQueueGuard {
+            state: state.clone(),
+        };
+        let acquire = tokio::time::timeout(
+            Duration::from_millis(limits.max_timeout_ms),
+            state.semaphore.clone().acquire_owned(),
+        );
+        let permit = tokio::select! {
+            _ = cancellation.cancelled() => Err(invocation_error(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "MCP invocation was cancelled while waiting for capacity",
+            )),
+            result = acquire => match result {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(_)) => Err(internal_error("MCP invocation governor was closed")),
+                Err(_) => Err(invocation_error(
+                    TurnMcpInvocationErrorCode::TimedOut,
+                    "MCP invocation timed out while waiting for capacity",
+                )),
+            },
+        };
+        drop(queue_guard);
+        permit
+    }
 }
 
 #[async_trait]
@@ -171,6 +293,8 @@ pub(crate) struct GatewayTurnMcpInvoker {
     runtime_view: Arc<dyn TurnMcpRuntimeView>,
     execution: Arc<dyn TurnMcpValidatedExecution>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
+    execution_leases: Arc<ExecutionLeaseRegistry>,
+    invocation_governor: Arc<McpInvocationGovernor>,
 }
 
 impl GatewayTurnMcpInvoker {
@@ -179,20 +303,35 @@ impl GatewayTurnMcpInvoker {
         runtime_view: Arc<dyn TurnMcpRuntimeView>,
         execution: Arc<dyn TurnMcpValidatedExecution>,
         authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
+        execution_leases: Arc<ExecutionLeaseRegistry>,
+        invocation_governor: Arc<McpInvocationGovernor>,
     ) -> Self {
         Self {
             crud_store,
             runtime_view,
             execution,
             authorization_invalidation_hub,
+            execution_leases,
+            invocation_governor,
         }
     }
 
     async fn validate(
         &self,
         invocation: TurnMcpInvocation,
+        cancellation: &CancellationToken,
     ) -> Result<ValidatedTurnMcpInvocation, TurnMcpInvocationError> {
         validate_required_identity(&invocation)?;
+        pioneer_mcp::validate_mcp_arguments(
+            &invocation.arguments,
+            pioneer_mcp::McpInvocationBudget::default(),
+        )
+        .map_err(|error| {
+            invocation_error(
+                TurnMcpInvocationErrorCode::InvalidRequest,
+                format!("MCP invocation rejected: {}", error.reason_code()),
+            )
+        })?;
         let turn = self
             .crud_store
             .get_turn(invocation.thread_id.as_str(), invocation.turn_id.as_str())
@@ -263,8 +402,26 @@ impl GatewayTurnMcpInvoker {
             ));
         }
 
-        self.revalidate_execution_authorization(&invocation, &projection, &binding)
+        let invocation_limits = self
+            .revalidate_execution_authorization(&invocation, &projection, &binding)
             .await?;
+        let invocation_budget = pioneer_mcp::McpInvocationBudget {
+            max_arguments_bytes: invocation_limits.max_arguments_bytes,
+            max_arguments_depth: invocation_limits.max_arguments_depth,
+            max_result_wire_bytes: invocation_limits.max_result_wire_bytes,
+            max_result_decoded_bytes: invocation_limits.max_result_decoded_bytes,
+            max_result_depth: invocation_limits.max_result_depth,
+            max_result_tokens: invocation_limits.max_result_tokens,
+            max_result_media: invocation_limits.max_result_media,
+        };
+        pioneer_mcp::validate_mcp_arguments(&invocation.arguments, invocation_budget).map_err(
+            |error| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::InvalidRequest,
+                    format!("MCP invocation rejected: {}", error.reason_code()),
+                )
+            },
+        )?;
         self.validate_origin_session(&invocation, &projection.manifest_hash, &binding)
             .await?;
         let current_tool = self
@@ -272,12 +429,19 @@ impl GatewayTurnMcpInvoker {
             .current_tool_identity(invocation.workspace_id.as_str(), &binding)
             .await?;
         validate_frozen_identity(&binding, &current_tool)?;
+        let concurrency_permit = self
+            .invocation_governor
+            .acquire(invocation.turn_id.as_str(), invocation_limits, cancellation)
+            .await?;
 
         Ok(ValidatedTurnMcpInvocation {
             invocation,
             manifest_hash: projection.manifest_hash,
             binding,
             current_tool,
+            invocation_budget,
+            invocation_limits,
+            _concurrency_permit: concurrency_permit,
         })
     }
 
@@ -286,33 +450,18 @@ impl GatewayTurnMcpInvoker {
         invocation: &TurnMcpInvocation,
         projection: &pioneer_crud::TurnMcpProjectionRecord,
         binding: &TurnMcpBindingRecord,
-    ) -> Result<(), TurnMcpInvocationError> {
-        let Some(context_json) = self
-            .crud_store
-            .get_turn_execution_authorization_context(invocation.turn_id.as_str())
-            .await
-            .map_err(|_| internal_error("failed to load MCP execution authorization context"))?
-        else {
-            crate::authorization::ensure_contextless_execution_is_trusted(
-                self.crud_store.as_ref(),
-                invocation.turn_id.as_str(),
+    ) -> Result<pioneer_protocol::McpInvocationResourceLimits, TurnMcpInvocationError> {
+        let context = ExecutionAuthorizationContext::load_for_turn(
+            self.crud_store.as_ref(),
+            invocation.turn_id.as_str(),
+        )
+        .await
+        .map_err(|_| {
+            invocation_error(
+                TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                "MCP execution authorization context is invalid",
             )
-            .await
-            .map_err(|_| {
-                invocation_error(
-                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
-                    "MCP execution authorization context is unavailable",
-                )
-            })?;
-            return Ok(());
-        };
-        let context = ExecutionAuthorizationContext::from_persisted_json(context_json.as_str())
-            .map_err(|_| {
-                invocation_error(
-                    TurnMcpInvocationErrorCode::ProjectionUnavailable,
-                    "MCP execution authorization context is invalid",
-                )
-            })?;
+        })?;
         let projection_version = u32::try_from(projection.projection_version).map_err(|_| {
             invocation_error(
                 TurnMcpInvocationErrorCode::ProjectionUnavailable,
@@ -331,14 +480,24 @@ impl GatewayTurnMcpInvoker {
                     "MCP projection is stale or is not bound to this execution",
                 )
             })?;
-        let revalidated = context
-            .revalidate_for_turn_scope(
+        let revalidated = self
+            .execution_leases
+            .revalidate_for_turn(
                 self.crud_store.as_ref(),
+                &context,
                 invocation.workspace_id.as_str(),
                 invocation.thread_id.as_str(),
                 invocation.turn_id.as_str(),
-                ResourceAction::ThreadWrite,
-                self.authorization_invalidation_hub.current_revision(),
+                ResourceAction::McpUse,
+                self.authorization_invalidation_hub
+                    .current_revision()
+                    .await
+                    .map_err(|_| {
+                        invocation_error(
+                            TurnMcpInvocationErrorCode::ProjectionUnavailable,
+                            "MCP authorization policy generation is unavailable",
+                        )
+                    })?,
             )
             .await
             .map_err(|_| {
@@ -370,7 +529,34 @@ impl GatewayTurnMcpInvoker {
                 "current MCP workspace policy no longer permits this server",
             ));
         }
-        Ok(())
+        let admitted_limits = context
+            .effective_mcp_invocation_resource_limits()
+            .map_err(|_| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::PermissionDenied,
+                    "execution MCP resource policy is no longer valid",
+                )
+            })?;
+        let collaborator_limits = AuthorizationService::new()
+            .mcp_invocation_resource_limits(
+                revalidated.principal().kind,
+                revalidated.principal().role_key.as_ref(),
+            )
+            .ok_or_else(|| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::PermissionDenied,
+                    "current collaborator has no MCP resource policy",
+                )
+            })?;
+        let effective_limits = admitted_limits
+            .intersect(collaborator_limits)
+            .ok_or_else(|| {
+                invocation_error(
+                    TurnMcpInvocationErrorCode::PermissionDenied,
+                    "MCP resource policies are incompatible",
+                )
+            })?;
+        Ok(effective_limits)
     }
 
     async fn validate_origin_session(
@@ -463,8 +649,24 @@ impl TurnMcpInvoker for GatewayTurnMcpInvoker {
         invocation: TurnMcpInvocation,
         cancellation: CancellationToken,
     ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
-        let validated = self.validate(invocation).await?;
-        self.execution.execute(validated, cancellation).await
+        let validated = self.validate(invocation, &cancellation).await?;
+        let invocation_budget = validated.invocation_budget;
+        let result = self.execution.execute(validated, cancellation).await?;
+        pioneer_mcp::validate_mcp_result_parts(
+            &result.content,
+            result.structured_content.as_ref(),
+            result.is_error,
+            result.duration_ms,
+            result.meta.as_ref(),
+            invocation_budget,
+        )
+        .map_err(|error| {
+            invocation_error(
+                TurnMcpInvocationErrorCode::ResultInvalid,
+                format!("MCP result rejected: {}", error.reason_code()),
+            )
+        })?;
+        Ok(result)
     }
 }
 
@@ -521,4 +723,117 @@ fn invocation_error(
 
 fn internal_error(message: impl Into<String>) -> TurnMcpInvocationError {
     invocation_error(TurnMcpInvocationErrorCode::Internal, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn narrow_limits() -> pioneer_protocol::McpInvocationResourceLimits {
+        pioneer_protocol::McpInvocationResourceLimits {
+            max_timeout_ms: 2_000,
+            max_concurrent_calls: 1,
+            max_queued_calls: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for_queued_call(governor: &McpInvocationGovernor, turn_id: &str) {
+        for _ in 0..100 {
+            let queued = governor
+                .states
+                .lock()
+                .expect("governor lock")
+                .get(turn_id)
+                .map(|state| state.queued.load(Ordering::Acquire))
+                .unwrap_or(0);
+            if queued == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("queued MCP invocation was not registered");
+    }
+
+    #[tokio::test]
+    async fn governor_enforces_role_owned_active_and_queue_limits_per_turn() {
+        let governor = Arc::new(McpInvocationGovernor::default());
+        let limits = narrow_limits();
+        let first = governor
+            .acquire("turn-a", limits, &CancellationToken::new())
+            .await
+            .expect("first invocation acquires the active slot");
+
+        let queued_governor = governor.clone();
+        let queued = tokio::spawn(async move {
+            queued_governor
+                .acquire("turn-a", limits, &CancellationToken::new())
+                .await
+        });
+        wait_for_queued_call(governor.as_ref(), "turn-a").await;
+
+        let saturated = governor
+            .acquire("turn-a", limits, &CancellationToken::new())
+            .await;
+        assert!(matches!(
+            saturated,
+            Err(TurnMcpInvocationError {
+                code: TurnMcpInvocationErrorCode::ResourceExhausted,
+                ..
+            })
+        ));
+
+        let independent = governor
+            .acquire("turn-b", limits, &CancellationToken::new())
+            .await
+            .expect("a different turn has an independent budget");
+        drop(independent);
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("queued invocation should resume")
+            .expect("queued task should not panic")
+            .expect("queued invocation should acquire the released slot");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn governor_cancellation_removes_the_queued_reservation() {
+        let governor = Arc::new(McpInvocationGovernor::default());
+        let limits = narrow_limits();
+        let first = governor
+            .acquire("turn-a", limits, &CancellationToken::new())
+            .await
+            .expect("first invocation acquires the active slot");
+        let cancellation = CancellationToken::new();
+        let queued_governor = governor.clone();
+        let queued_cancellation = cancellation.clone();
+        let queued = tokio::spawn(async move {
+            queued_governor
+                .acquire("turn-a", limits, &queued_cancellation)
+                .await
+        });
+        wait_for_queued_call(governor.as_ref(), "turn-a").await;
+        cancellation.cancel();
+        let result = queued.await.expect("queued task should not panic");
+        assert!(matches!(
+            result,
+            Err(TurnMcpInvocationError {
+                code: TurnMcpInvocationErrorCode::Cancelled,
+                ..
+            })
+        ));
+        assert_eq!(
+            governor
+                .states
+                .lock()
+                .expect("governor lock")
+                .get("turn-a")
+                .expect("turn state")
+                .queued
+                .load(Ordering::Acquire),
+            0
+        );
+        drop(first);
+    }
 }

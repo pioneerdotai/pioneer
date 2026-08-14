@@ -36,6 +36,13 @@ pub struct Model {
     pub initiating_session_generation: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
     pub authorization_context_fingerprint: Option<String>,
+    pub responding_principal_id: Option<String>,
+    pub responding_session_id: Option<String>,
+    pub response_authorization_revision: Option<i64>,
+    pub delivery_attempts: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub delivery_error: Option<String>,
+    pub response_contains_secret: bool,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

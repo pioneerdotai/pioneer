@@ -979,7 +979,14 @@ mod tests {
             kind: PrincipalKind::User,
             display_name: "Alice".to_owned(),
             nickname: "alice".to_owned(),
-            role_key: None,
+            role_key: Some(pioneer_protocol::RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
             status: PrincipalStatus::Active,
             avatar_revision: Some("a".repeat(64)),
         };
@@ -990,7 +997,14 @@ mod tests {
             nickname: "bob".to_owned(),
             avatar_revision: None,
             kind: PrincipalKind::User,
-            role_key: None,
+            role_key: Some(pioneer_protocol::RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
         };
         let candidates = composer_mention_candidates([active.clone(), active.clone(), suspended]);
         assert_eq!(candidates.len(), 1);
@@ -1030,7 +1044,14 @@ mod tests {
             kind: PrincipalKind::User,
             display_name: "Current".to_owned(),
             nickname: "current".to_owned(),
-            role_key: None,
+            role_key: Some(pioneer_protocol::RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
             status: PrincipalStatus::Active,
             avatar_revision: None,
         };
@@ -1039,7 +1060,14 @@ mod tests {
             kind: PrincipalKind::User,
             display_name: "Workspace Member".to_owned(),
             nickname: "workspace_member".to_owned(),
-            role_key: None,
+            role_key: Some(pioneer_protocol::RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
             status: PrincipalStatus::Active,
             avatar_revision: None,
         };
@@ -1055,6 +1083,13 @@ mod tests {
             display_name: "Root".to_owned(),
             nickname: "root".to_owned(),
             role_key: None,
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "superuser".to_owned(),
+                display_name: "Superuser".to_owned(),
+                description: "Gateway administrator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: false,
             status: PrincipalStatus::Active,
             avatar_revision: Some("c".repeat(64)),
         };
@@ -1063,7 +1098,14 @@ mod tests {
             kind: PrincipalKind::User,
             display_name: "Other Workspace".to_owned(),
             nickname: "other".to_owned(),
-            role_key: None,
+            role_key: Some(pioneer_protocol::RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
             status: PrincipalStatus::Active,
             avatar_revision: None,
         };

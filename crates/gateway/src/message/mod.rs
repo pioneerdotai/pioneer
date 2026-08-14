@@ -98,9 +98,10 @@ use pioneer_protocol::{
     CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams,
     CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBinding,
     CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
-    CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
-    CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, ContextCompressedNotification,
-    ContextCompressingNotification, GatewayRemoteAccessStatusChangedNotification,
+    CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
+    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
+    ContextCompressedNotification, ContextCompressingNotification,
+    GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification, GatewayVoiceInputSettings,
     GatewayVoiceInputStatusChangedNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
     ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
@@ -109,15 +110,15 @@ use pioneer_protocol::{
     McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
     McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
     McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
-    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
-    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
-    McpRuntimeStatus, McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
-    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
-    McpServerStatus, McpSourceKind, McpToolAnnotationSummary, McpToolCatalogItem,
-    McpTransportSummary, McpTurnBindingSummary, McpUninstallParams, McpUninstallResponse,
-    McpValidationDiagnostic, PARSE_ERROR_CODE, ProviderConfigureParams, ProviderConfigureResponse,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderListModelsParams,
-    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    McpListResponse, McpManagementDetails, McpPolicySetParams, McpPolicySetResponse,
+    McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem,
+    McpRuntimeState, McpRuntimeStatus, McpServerCatalogDetails, McpServerDetailsParams,
+    McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy, McpServerRestartParams,
+    McpServerRestartResponse, McpServerStatus, McpSourceKind, McpToolAnnotationSummary,
+    McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary, McpUninstallParams,
+    McpUninstallResponse, McpValidationDiagnostic, PARSE_ERROR_CODE, ProviderConfigureParams,
+    ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
+    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
     ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
     ProviderSummary, ProviderSummaryCapabilities, ReasoningCapabilitySource, RequestId,
@@ -410,6 +411,8 @@ pub struct MessageProcessor {
     provider_registry: Arc<ProviderRegistry>,
     session_manager: Arc<SessionManager>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
+    execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
+    observation_governor: Arc<crate::authorization::ObservationAdmissionGovernor>,
     artifact_stream_invalidation:
         Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
     view_grant_service: Arc<StdRwLock<Option<Weak<crate::view_grants::ViewGrantService>>>>,
@@ -572,7 +575,6 @@ struct PendingNativePermissionApprovalRequest {
     turn_id: String,
     initiating_principal_id: pioneer_protocol::PrincipalId,
     initiating_session_id: pioneer_protocol::AuthSessionId,
-    initiating_session_generation: i64,
     authorization_context_fingerprint: String,
     request: TurnPermissionApprovalRequest,
     respond_to: oneshot::Sender<pioneer_tools::PermissionApprovalResolution>,
@@ -640,7 +642,11 @@ impl MessageProcessor {
             Err(_) => 0,
         };
         let mcp_snapshot_version = Arc::new(AtomicU64::new(0));
-        let authorization_invalidation_hub = Arc::new(AuthorizationInvalidationHub::default());
+        let authorization_invalidation_hub =
+            Arc::new(AuthorizationInvalidationHub::durable(crud_store.clone()));
+        let execution_leases = Arc::new(crate::authorization::ExecutionLeaseRegistry::default());
+        let observation_governor =
+            Arc::new(crate::authorization::ObservationAdmissionGovernor::default());
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
         let task_runtime = Arc::new(TaskRuntime::new_with_config(
             crud_store.clone(),
@@ -652,6 +658,7 @@ impl MessageProcessor {
             gateway_secrets.clone(),
             mcp_snapshot_version.clone(),
             authorization_invalidation_hub.clone(),
+            execution_leases.clone(),
         ));
         let normalized_tool_loop_config = tool_loop_config.normalized();
         let memory_loop_config =
@@ -679,7 +686,8 @@ impl MessageProcessor {
                 ),
                 normalized_tool_loop_config.clone(),
             )
-            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone()),
+            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
+            .with_execution_leases(execution_leases.clone()),
         );
         let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
             resilience_config
@@ -745,6 +753,8 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             authorization_invalidation_hub,
+            execution_leases,
+            observation_governor,
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
@@ -974,15 +984,57 @@ impl MessageProcessor {
         workspace_id: impl Into<String>,
         thread_id: Option<String>,
     ) -> AccessChangeSignal {
-        let signal = self.authorization_invalidation_hub.publish(
-            kind,
-            affected_principal_id,
-            workspace_id,
-            thread_id,
-        );
+        let signal = self
+            .authorization_invalidation_hub
+            .publish(kind, affected_principal_id, workspace_id, thread_id)
+            .await
+            .expect("committed ACL change must advance durable policy generation");
         self.apply_committed_authorization_invalidation(&signal)
             .await;
         signal
+    }
+
+    async fn publish_resource_selector_change(
+        &self,
+        workspace_id: &str,
+    ) -> pioneer_protocol::AuthorizationProjectionChangedNotification {
+        let change = self
+            .authorization_invalidation_hub
+            .publish_change(
+                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
+                pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
+                    workspace_id: workspace_id.to_owned(),
+                    selector: "workspace_capability_catalog".to_owned(),
+                },
+            )
+            .await
+            .expect("resource selector change must advance durable policy generation");
+        self.send_notification_to_authorized_workspace_connections(
+            workspace_id,
+            pioneer_protocol::constants::events::AUTHORIZATION_PROJECTION_CHANGED,
+            &change,
+        )
+        .await;
+        change
+    }
+
+    async fn publish_invitation_selector_change(
+        &self,
+        invitation_id: &pioneer_protocol::InvitationId,
+    ) -> pioneer_protocol::AuthorizationProjectionChangedNotification {
+        let change = self
+            .authorization_invalidation_hub
+            .publish_change(
+                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
+                pioneer_protocol::AuthorizationChangeScope::Invitation {
+                    invitation_id: invitation_id.clone(),
+                },
+            )
+            .await
+            .expect("invitation selector change must advance durable policy generation");
+        self.send_scoped_invitation_authorization_changed_notification(invitation_id, &change)
+            .await;
+        change
     }
 
     #[cfg(test)]
@@ -1295,15 +1347,32 @@ impl MessageProcessor {
         *worker = Some(tokio::spawn(async move {
             while let Some(event) = request_rx.recv().await {
                 let Some(processor) = processor.upgrade() else {
-                    if let crate::permissions::GatewayPermissionApprovalEvent::Open(request) = event
-                    {
-                        let _ = request
-                            .respond_to
-                            .send(pioneer_tools::PermissionApprovalResolution::Cancelled);
+                    match event {
+                        crate::permissions::GatewayPermissionApprovalEvent::Revalidate(request) => {
+                            let _ = request.respond_to.send(Err(
+                                "tool permission authority processor is unavailable".to_owned(),
+                            ));
+                        }
+                        crate::permissions::GatewayPermissionApprovalEvent::Open(request) => {
+                            let _ = request
+                                .respond_to
+                                .send(pioneer_tools::PermissionApprovalResolution::Cancelled);
+                        }
+                        crate::permissions::GatewayPermissionApprovalEvent::Cancelled {
+                            ..
+                        }
+                        | crate::permissions::GatewayPermissionApprovalEvent::Expired { .. } => {}
                     }
                     break;
                 };
                 match event {
+                    crate::permissions::GatewayPermissionApprovalEvent::Revalidate(request) => {
+                        let result = processor
+                            .revalidate_native_tool_permission_context(&request.context)
+                            .await
+                            .map_err(|error| format!("{error:#}"));
+                        let _ = request.respond_to.send(result);
+                    }
                     crate::permissions::GatewayPermissionApprovalEvent::Open(request) => {
                         processor.open_native_permission_request(request).await;
                     }
@@ -1312,6 +1381,11 @@ impl MessageProcessor {
                     } => {
                         processor
                             .cancel_native_permission_request(request_id.as_str())
+                            .await;
+                    }
+                    crate::permissions::GatewayPermissionApprovalEvent::Expired { request_id } => {
+                        processor
+                            .expire_native_permission_request(request_id.as_str())
                             .await;
                     }
                 }
@@ -1416,6 +1490,84 @@ impl MessageProcessor {
         self.provider_registry.clone()
     }
 
+    pub(crate) fn observation_governor(
+        &self,
+    ) -> Arc<crate::authorization::ObservationAdmissionGovernor> {
+        self.observation_governor.clone()
+    }
+
+    pub(crate) async fn current_authorization_revision(&self) -> anyhow::Result<u64> {
+        self.authorization_invalidation_hub.current_revision().await
+    }
+
+    pub(crate) async fn register_execution_lease(
+        &self,
+        turn_id: &str,
+    ) -> anyhow::Result<crate::authorization::ExecutionLeaseGuard> {
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await?;
+        let generation = self.current_authorization_revision().await?;
+        self.execution_leases
+            .register(self.crud_store.as_ref(), turn_id, &context, generation)
+            .await
+    }
+
+    pub(crate) async fn guard_execution_side_effect(
+        &self,
+        turn_id: &str,
+        action: crate::authorization::ResourceAction,
+    ) -> anyhow::Result<crate::authorization::ExecutionLeaseGuard> {
+        let generation = self.current_authorization_revision().await?;
+        self.execution_leases
+            .guard(self.crud_store.as_ref(), turn_id, action, generation)
+            .await
+    }
+
+    pub(crate) async fn guard_execution_commit(
+        &self,
+        turn_id: &str,
+    ) -> anyhow::Result<crate::authorization::ExecutionLeaseGuard> {
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await?;
+        self.guard_execution_side_effect(turn_id, context.continuation_action())
+            .await
+    }
+
+    pub(crate) async fn validate_task_execution_admission_seed(
+        &self,
+        seed: &pioneer_tasks::TaskExecutionAdmissionSeed,
+    ) -> anyhow::Result<()> {
+        let context = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+            seed.authorization_context_json.as_str(),
+        )?;
+        if context.workspace_id() != seed.workspace_id
+            || context.root_thread_id() != seed.root_thread_id
+            || context.initiating_principal_id().as_str() != seed.initiating_principal_id
+        {
+            anyhow::bail!("Task execution admission seed does not match its context");
+        }
+        context
+            .verify_task_admission_boundary(
+                self.crud_store.as_ref(),
+                seed.workspace_id.as_str(),
+                seed.root_thread_id.as_str(),
+                seed.initiating_principal_id.as_str(),
+            )
+            .await?;
+        let revision = self.current_authorization_revision().await?;
+        self.execution_leases
+            .revalidate_context(
+                self.crud_store.as_ref(),
+                &context,
+                crate::authorization::ResourceAction::TaskCreate,
+                revision,
+            )
+            .await?;
+        context.verify_current_provider_authority(self.provider_registry.as_ref())
+    }
+
     pub(crate) fn memory_loop_config(&self) -> MemoryLoopConfig {
         self.memory_loop_config
             .read()
@@ -1470,6 +1622,10 @@ impl MessageProcessor {
     }
 
     pub async fn start_resilience_workers(self: &Arc<Self>) {
+        self.authorization_invalidation_hub
+            .current_generation()
+            .await
+            .expect("Gateway startup requires durable authorization policy generation");
         self.bind_agent_tool_bridges().await;
         let processor = Arc::downgrade(self);
         self.recovery_coordinator
@@ -1543,6 +1699,17 @@ impl MessageProcessor {
             Err(error) => warn!(
                 error = %format!("{error:#}"),
                 "failed to reconcile incomplete native turn admissions at startup"
+            ),
+        }
+        match self.crud_store.reconcile_execution_admission_leases().await {
+            Ok(reconciled) if reconciled > 0 => warn!(
+                reconciled,
+                "released stale execution admission quota leases during startup"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(
+                error = %format!("{error:#}"),
+                "failed to reconcile execution admission quota leases at startup"
             ),
         }
         if let Err(error) = self.task_runtime.start().await {
@@ -2278,31 +2445,6 @@ fn user_message_payload_from_input(
 }
 
 impl MessageProcessor {
-    async fn validate_artifact_user_inputs(
-        &self,
-        workspace_id: &str,
-        input: &[pioneer_protocol::UserInput],
-    ) -> anyhow::Result<()> {
-        for value in input {
-            if let pioneer_protocol::UserInput::Artifact {
-                artifact_id,
-                version_id,
-            } = value
-            {
-                self.artifact_service
-                    .get_artifact(workspace_id, artifact_id, version_id.as_deref())
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "artifact `{artifact_id}` is not available in workspace `{workspace_id}`"
-                        )
-                    })?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Validates user-authored Turn attachments as exact, immutable artifact
     /// versions scoped to the already-authorized target thread. The persisted
     /// reference is metadata only; content remains behind the existing Axum
@@ -2375,7 +2517,7 @@ impl MessageProcessor {
                 scope
                     .thread_id
                     .as_deref()
-                    .map_or(true, |artifact_root_thread_id| {
+                    .is_some_and(|artifact_root_thread_id| {
                         target_authorization_root.as_deref() == Some(artifact_root_thread_id)
                     })
             });
@@ -2595,7 +2737,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(crate) async fn load_agent_skill_overlay_for_member_turn(
+    pub(crate) async fn load_agent_skill_overlay_for_scoped_turn(
         &self,
         principal_id: &pioneer_protocol::PrincipalId,
         workspace_id: &str,
@@ -2604,7 +2746,7 @@ impl MessageProcessor {
         if self.self_improvement_supervisor.is_none() {
             return Ok(Vec::new());
         }
-        crate::self_improvement::overlay::load_member_agent_skill_overlay(
+        crate::self_improvement::overlay::load_scoped_agent_skill_overlay(
             self.crud_store.as_ref(),
             principal_id,
             workspace_id,
@@ -2827,12 +2969,16 @@ impl MessageProcessor {
         )));
         let mcp_snapshot_version = Arc::new(AtomicU64::new(0));
         let authorization_invalidation_hub = Arc::new(AuthorizationInvalidationHub::default());
+        let execution_leases = Arc::new(crate::authorization::ExecutionLeaseRegistry::default());
+        let observation_governor =
+            Arc::new(crate::authorization::ObservationAdmissionGovernor::default());
         let mcp_service = Arc::new(McpService::new(
             crud_store.clone(),
             session_manager.clone(),
             gateway_secrets.clone(),
             mcp_snapshot_version.clone(),
             authorization_invalidation_hub.clone(),
+            execution_leases.clone(),
         ));
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
         let task_runtime = Arc::new(TaskRuntime::new(crud_store.clone()));
@@ -2940,7 +3086,8 @@ impl MessageProcessor {
                 RecoveryPolicyRegistry::default(),
                 normalized_tool_loop_config.clone(),
             )
-            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone()),
+            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
+            .with_execution_leases(execution_leases.clone()),
         );
         let memory_loop_config =
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
@@ -2986,6 +3133,8 @@ impl MessageProcessor {
             provider_registry,
             session_manager,
             authorization_invalidation_hub,
+            execution_leases,
+            observation_governor,
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,

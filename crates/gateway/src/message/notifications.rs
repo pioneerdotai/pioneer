@@ -7,8 +7,150 @@ impl MessageProcessor {
         method: &str,
         payload: &T,
     ) {
-        self.send_personal_notification(Some(owner_principal_id), method, payload)
+        self.send_personal_notification(
+            Some(owner_principal_id),
+            crate::authorization::ResourceAction::MemoryRead,
+            method,
+            payload,
+        )
+        .await;
+    }
+
+    pub(super) async fn send_task_user_notification<T: Serialize>(
+        &self,
+        workspace_id: &str,
+        recipient_principal_id: &str,
+        method: &str,
+        payload: &T,
+    ) -> usize {
+        let candidate_connection_ids = self.session_manager.connection_ids().await;
+        let initially_authorized_connection_ids = self
+            .authorized_task_user_notification_recipients(
+                workspace_id,
+                recipient_principal_id,
+                candidate_connection_ids,
+            )
             .await;
+        if initially_authorized_connection_ids.is_empty() {
+            return 0;
+        }
+        let serialization_connection_ids = self
+            .authorized_task_user_notification_recipients(
+                workspace_id,
+                recipient_principal_id,
+                initially_authorized_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return 0;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return 0;
+        };
+        let connection_ids = self
+            .authorized_task_user_notification_recipients(
+                workspace_id,
+                recipient_principal_id,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await
+    }
+
+    async fn authorized_task_user_notification_recipients(
+        &self,
+        workspace_id: &str,
+        recipient_principal_id: &str,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        use crate::authorization::{
+            ActionGateDecision, AuthorizationDecision, AuthorizationResolver, AuthorizationService,
+            DenyReason, DisclosurePolicy, ProofResolution, ResourceAction,
+            record_authorization_unavailable, record_workspace_notification_decision,
+        };
+
+        let workspace_id = workspace_id.trim();
+        let recipient_principal_id = recipient_principal_id.trim();
+        if workspace_id.is_empty()
+            || recipient_principal_id.is_empty()
+            || candidate_connection_ids.is_empty()
+        {
+            return Vec::new();
+        }
+
+        let action = ResourceAction::NotificationReadOwn;
+        let service = AuthorizationService::new();
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let mut recipients = Vec::with_capacity(candidate_connection_ids.len());
+        for connection_id in candidate_connection_ids {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+
+            // This channel is principal-owned, including for absolute roles.
+            // Superuser visibility into workspace resources must never turn an
+            // exact-recipient task result into an administrative broadcast.
+            if principal.principal_id.as_str() != recipient_principal_id {
+                continue;
+            }
+            if let Some(auth_service) = self.auth_service.as_ref()
+                && auth_service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .is_err()
+            {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::InactivePrincipal,
+                    disclosure: DisclosurePolicy::AuthenticationTerminal,
+                };
+                record_workspace_notification_decision(action, &decision);
+                continue;
+            }
+
+            let action_gate =
+                service.authorize_action(principal.kind, principal.role_key.as_ref(), action);
+            if let ActionGateDecision::Deny { reason, disclosure } = &action_gate {
+                let decision = AuthorizationDecision::Deny {
+                    reason: *reason,
+                    disclosure: *disclosure,
+                };
+                record_workspace_notification_decision(action, &decision);
+                continue;
+            }
+
+            match resolver
+                .authorize_workspace(principal.as_ref(), &action_gate, action, workspace_id)
+                .await
+            {
+                Ok(ProofResolution::Authorized(proof)) => {
+                    record_workspace_notification_decision(action, proof.decision());
+                    recipients.push(connection_id);
+                }
+                Ok(ProofResolution::Denied(decision)) => {
+                    record_workspace_notification_decision(action, &decision);
+                }
+                Err(error) => {
+                    record_authorization_unavailable(
+                        action.safe_name(),
+                        "workspace",
+                        "task_user_notification",
+                    );
+                    warn!(
+                        connection_id,
+                        authorization_action = action.safe_name(),
+                        authorization_resource_kind = "workspace",
+                        error = %format!("{error:#}"),
+                        "task user notification authorization unavailable"
+                    );
+                }
+            }
+        }
+        recipients
     }
 
     pub(super) async fn send_superuser_personal_notification<T: Serialize>(
@@ -16,53 +158,64 @@ impl MessageProcessor {
         method: &str,
         payload: &T,
     ) {
-        self.send_personal_notification(None, method, payload).await;
+        self.send_personal_notification(
+            None,
+            crate::authorization::ResourceAction::MemoryRead,
+            method,
+            payload,
+        )
+        .await;
     }
 
     async fn send_personal_notification<T: Serialize>(
         &self,
         owner_principal_id: Option<&str>,
+        action: crate::authorization::ResourceAction,
         method: &str,
         payload: &T,
-    ) {
+    ) -> usize {
         let candidate_connection_ids = self.session_manager.connection_ids().await;
         let initially_authorized_connection_ids = self
             .authorized_personal_notification_recipients(
                 owner_principal_id,
+                action,
                 candidate_connection_ids,
             )
             .await;
         if initially_authorized_connection_ids.is_empty() {
-            return;
+            return 0;
         }
         let serialization_connection_ids = self
             .authorized_personal_notification_recipients(
                 owner_principal_id,
+                action,
                 initially_authorized_connection_ids,
             )
             .await;
         if serialization_connection_ids.is_empty() {
-            return;
+            return 0;
         }
         let Some(serialized) = self.serialize_notification(method, payload) else {
-            return;
+            return 0;
         };
         let connection_ids = self
             .authorized_personal_notification_recipients(
                 owner_principal_id,
+                action,
                 serialization_connection_ids,
             )
             .await;
         self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
-            .await;
+            .await
     }
 
     async fn authorized_personal_notification_recipients(
         &self,
         owner_principal_id: Option<&str>,
+        action: crate::authorization::ResourceAction,
         candidate_connection_ids: Vec<ConnectionId>,
     ) -> Vec<ConnectionId> {
-        use crate::authorization::{ActionGateDecision, AuthorizationService, ResourceAction};
+        use crate::authorization::{ActionGateDecision, AuthorizationService};
 
         let owner_principal_id = owner_principal_id
             .map(str::trim)
@@ -90,12 +243,8 @@ impl MessageProcessor {
                 continue;
             }
 
-            match service.authorize_action(
-                principal.kind,
-                principal.role_key.as_ref(),
-                ResourceAction::MemoryRead,
-            ) {
-                ActionGateDecision::AllowSuperuser => recipients.push(connection_id),
+            match service.authorize_action(principal.kind, principal.role_key.as_ref(), action) {
+                ActionGateDecision::AllowAbsolute => recipients.push(connection_id),
                 ActionGateDecision::RequireResource { .. }
                     if owner_principal_id
                         .is_some_and(|owner| principal.principal_id.as_str() == owner) =>
@@ -108,11 +257,9 @@ impl MessageProcessor {
         recipients
     }
 
-    pub(super) async fn send_execution_initiator_notification<T: Serialize>(
+    pub(super) async fn send_execution_collaborator_notification<T: Serialize>(
         &self,
         thread_id: &str,
-        initiating_principal_id: &str,
-        initiating_session_id: &str,
         action: crate::authorization::ResourceAction,
         method: &str,
         payload: &T,
@@ -120,8 +267,6 @@ impl MessageProcessor {
         let candidate_connection_ids = self.session_manager.connection_ids().await;
         self.send_execution_scoped_notification(
             thread_id,
-            initiating_principal_id,
-            initiating_session_id,
             action,
             method,
             payload,
@@ -130,12 +275,9 @@ impl MessageProcessor {
         .await;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn send_execution_initiator_notification_to_connections<T: Serialize>(
+    pub(super) async fn send_execution_collaborator_notification_to_connections<T: Serialize>(
         &self,
         thread_id: &str,
-        initiating_principal_id: &str,
-        initiating_session_id: &str,
         action: crate::authorization::ResourceAction,
         method: &str,
         payload: &T,
@@ -143,8 +285,6 @@ impl MessageProcessor {
     ) {
         self.send_execution_scoped_notification(
             thread_id,
-            initiating_principal_id,
-            initiating_session_id,
             action,
             method,
             payload,
@@ -153,22 +293,17 @@ impl MessageProcessor {
         .await;
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn send_execution_scoped_notification<T: Serialize>(
         &self,
         thread_id: &str,
-        initiating_principal_id: &str,
-        initiating_session_id: &str,
         action: crate::authorization::ResourceAction,
         method: &str,
         payload: &T,
         candidate_connection_ids: Vec<ConnectionId>,
     ) {
         let initially_authorized_connection_ids = self
-            .authorized_execution_owner_notification_recipients(
+            .authorized_execution_collaborator_notification_recipients(
                 thread_id,
-                initiating_principal_id,
-                initiating_session_id,
                 action,
                 candidate_connection_ids,
             )
@@ -177,10 +312,8 @@ impl MessageProcessor {
             return;
         }
         let serialization_connection_ids = self
-            .authorized_execution_owner_notification_recipients(
+            .authorized_execution_collaborator_notification_recipients(
                 thread_id,
-                initiating_principal_id,
-                initiating_session_id,
                 action,
                 initially_authorized_connection_ids,
             )
@@ -192,10 +325,8 @@ impl MessageProcessor {
             return;
         };
         let connection_ids = self
-            .authorized_execution_owner_notification_recipients(
+            .authorized_execution_collaborator_notification_recipients(
                 thread_id,
-                initiating_principal_id,
-                initiating_session_id,
                 action,
                 serialization_connection_ids,
             )
@@ -204,12 +335,9 @@ impl MessageProcessor {
             .await;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn authorized_execution_owner_notification_recipients(
+    async fn authorized_execution_collaborator_notification_recipients(
         &self,
         thread_id: &str,
-        initiating_principal_id: &str,
-        initiating_session_id: &str,
         action: crate::authorization::ResourceAction,
         candidate_connection_ids: Vec<ConnectionId>,
     ) -> Vec<ConnectionId> {
@@ -220,13 +348,7 @@ impl MessageProcessor {
         };
 
         let thread_id = thread_id.trim();
-        let initiating_principal_id = initiating_principal_id.trim();
-        let initiating_session_id = initiating_session_id.trim();
-        if thread_id.is_empty()
-            || initiating_principal_id.is_empty()
-            || initiating_session_id.is_empty()
-            || candidate_connection_ids.is_empty()
-        {
+        if thread_id.is_empty() || candidate_connection_ids.is_empty() {
             return Vec::new();
         }
 
@@ -256,12 +378,7 @@ impl MessageProcessor {
             }
             let action_gate =
                 service.authorize_action(principal.kind, principal.role_key.as_ref(), action);
-            if principal.principal_id.as_str() != initiating_principal_id
-                || principal.session_id.as_str() != initiating_session_id
-            {
-                continue;
-            }
-            if action_gate == ActionGateDecision::AllowSuperuser {
+            if action_gate == ActionGateDecision::AllowAbsolute {
                 recipients.push(connection_id);
                 continue;
             }
@@ -437,6 +554,63 @@ impl MessageProcessor {
         .await;
     }
 
+    pub(super) async fn send_scoped_invitation_authorization_changed_notification(
+        &self,
+        invitation_id: &pioneer_protocol::InvitationId,
+        change: &pioneer_protocol::AuthorizationProjectionChangedNotification,
+    ) {
+        let Some(invitation) =
+            pioneer_crud::load_invitation(&self.crud_store.database_connection(), invitation_id)
+                .await
+                .ok()
+                .flatten()
+        else {
+            tracing::warn!(
+                invitation_id = %invitation_id,
+                "committed invitation authorization notification could not reload authoritative owner"
+            );
+            return;
+        };
+        let Ok(inviter_principal_id) =
+            pioneer_protocol::PrincipalId::new(invitation.created_by_principal_id)
+        else {
+            return;
+        };
+        let candidates = self.session_manager.connection_ids().await;
+        let initially_authorized = self
+            .authorized_invitation_notification_recipients(&inviter_principal_id, candidates)
+            .await;
+        if initially_authorized.is_empty() {
+            return;
+        }
+        let serialization_authorized = self
+            .authorized_invitation_notification_recipients(
+                &inviter_principal_id,
+                initially_authorized,
+            )
+            .await;
+        if serialization_authorized.is_empty() {
+            return;
+        }
+        let Some(serialized) =
+            self.serialize_notification(events::AUTHORIZATION_PROJECTION_CHANGED, change)
+        else {
+            return;
+        };
+        let authorized = self
+            .authorized_invitation_notification_recipients(
+                &inviter_principal_id,
+                serialization_authorized,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(
+            events::AUTHORIZATION_PROJECTION_CHANGED,
+            &serialized,
+            authorized,
+        )
+        .await;
+    }
+
     pub(super) async fn authorized_invitation_notification_recipients(
         &self,
         inviter_principal_id: &pioneer_protocol::PrincipalId,
@@ -467,7 +641,7 @@ impl MessageProcessor {
                 principal.role_key.as_ref(),
                 ResourceAction::InvitationList,
             ) {
-                ActionGateDecision::AllowSuperuser => recipients.push(connection_id),
+                ActionGateDecision::AllowAbsolute => recipients.push(connection_id),
                 ActionGateDecision::RequireResource { .. }
                     if &principal.principal_id == inviter_principal_id =>
                 {
@@ -507,7 +681,7 @@ impl MessageProcessor {
                 principal.kind,
                 principal.role_key.as_ref(),
                 ResourceAction::GatewayManage,
-            ) == ActionGateDecision::AllowSuperuser
+            ) == ActionGateDecision::AllowAbsolute
             {
                 recipients.push(connection_id);
             }
@@ -1449,7 +1623,8 @@ impl MessageProcessor {
         method: &str,
         serialized: &str,
         connection_ids: Vec<ConnectionId>,
-    ) {
+    ) -> usize {
+        let mut accepted = 0usize;
         for target_connection_id in connection_ids {
             if let Err(error) = self
                 .session_manager
@@ -1466,8 +1641,11 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to send notification"
                 );
+            } else {
+                accepted = accepted.saturating_add(1);
             }
         }
+        accepted
     }
 
     pub(super) async fn send_error(

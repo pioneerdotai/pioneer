@@ -3,8 +3,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use pioneer_mcp::{
-    McpAuthConfig, McpRuntimeConnector, McpRuntimeErrorKind, McpRuntimeState, McpScopeKind,
-    McpSecretResolver, McpServerInstallation, McpSourceKind, McpTransportConfig,
+    McpAuthConfig, McpInvocationBudget, McpRuntimeConnector, McpRuntimeErrorKind, McpRuntimeState,
+    McpScopeKind, McpSecretResolver, McpServerInstallation, McpSourceKind, McpTransportConfig,
     RmcpRuntimeConnector,
 };
 use serde_json::{Value, json};
@@ -62,6 +62,7 @@ async fn stdio_server_reaches_ready_and_cleans_up() -> anyhow::Result<()> {
         .call_tool(
             "send",
             json!({"message":"hello"}),
+            McpInvocationBudget::default(),
             Duration::from_secs(5),
             CancellationToken::new(),
         )
@@ -109,6 +110,7 @@ async fn streamable_http_server_reaches_ready() -> anyhow::Result<()> {
         .call_tool(
             "send",
             json!({"message":"hello"}),
+            McpInvocationBudget::default(),
             Duration::from_secs(5),
             CancellationToken::new(),
         )
@@ -171,6 +173,7 @@ async fn streamable_http_tool_call_cancellation_reaches_upstream() -> anyhow::Re
         .call_tool(
             "send",
             json!({"message":"cancel me"}),
+            McpInvocationBudget::default(),
             Duration::from_secs(5),
             cancellation,
         )
@@ -184,6 +187,7 @@ async fn streamable_http_tool_call_cancellation_reaches_upstream() -> anyhow::Re
         session.call_tool(
             "domains",
             json!({}),
+            McpInvocationBudget::default(),
             Duration::from_secs(1),
             CancellationToken::new(),
         ),
@@ -232,6 +236,7 @@ async fn stdio_tool_call_cancellation_notification_reaches_upstream() -> anyhow:
         .call_tool(
             "send",
             json!({"message":"cancel me"}),
+            McpInvocationBudget::default(),
             Duration::from_secs(5),
             cancellation,
         )
@@ -245,6 +250,7 @@ async fn stdio_tool_call_cancellation_notification_reaches_upstream() -> anyhow:
         .call_tool(
             "domains",
             json!({}),
+            McpInvocationBudget::default(),
             Duration::from_secs(2),
             CancellationToken::new(),
         )

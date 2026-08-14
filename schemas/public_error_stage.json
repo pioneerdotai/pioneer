@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicErrorStage",
+  "type": "string",
+  "enum": [
+    "discovery",
+    "admission",
+    "preparation",
+    "execution",
+    "persistence",
+    "delivery",
+    "observation"
+  ]
+}

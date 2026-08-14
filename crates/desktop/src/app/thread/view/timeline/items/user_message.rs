@@ -385,6 +385,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item_id = item_id.to_owned();
+        let can_read_artifacts = self.active_artifact_presentation_policy().can_open;
         h_flex()
             .w_full()
             .min_w_0()
@@ -405,6 +406,9 @@ impl PioneerDesktop {
                             stable_user_message_attachment_chip_id(item_id.as_str(), chip_index);
                         let artifact = attachment.artifact.clone();
                         let preview_image_path = artifact.as_ref().and_then(|artifact| {
+                            if !can_read_artifacts {
+                                return None;
+                            }
                             if let Some(workspace_id) = workspace_id.as_deref() {
                                 self.request_thread_artifact_preview_load(
                                     workspace_id,
@@ -418,6 +422,7 @@ impl PioneerDesktop {
                         });
                         let artifact_id = artifact
                             .as_ref()
+                            .filter(|_| can_read_artifacts)
                             .map(|artifact| artifact.artifact_id.clone());
 
                         h_flex()
@@ -547,8 +552,15 @@ mod tests {
     #[test]
     fn collaboration_actions_are_not_hover_only() {
         let source = include_str!("user_message.rs");
-        assert!(source.contains(".opacity(0.0)\n                        .group_hover"));
-        assert!(!source.contains(".opacity(0.6)\n                        .group_hover"));
+        let hover_only_marker = format!(".group_{}(", "hover");
+        assert!(!source.contains(&hover_only_marker));
+        for action in ["reply", "copy", "edit", "delete"] {
+            let localization_key = format!("timeline.message.{action}_action");
+            assert!(
+                source.contains(&localization_key),
+                "missing context-menu action {action}"
+            );
+        }
     }
 
     use super::{ParsedUserAttachmentKind, parse_user_attachments};

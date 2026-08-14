@@ -12,10 +12,194 @@ use crate::{
 use pioneer_protocol::{
     AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AccessChangeKind, AccessChangedNotification,
     AuthMeResponse, AuthSessionListItem, AuthSessionStatus, AuthorizationCapabilitySnapshot,
-    AuthorizationThreadCapabilities, DeviceStatus, MemberSummary, PrincipalId, PrincipalKind,
+    AuthorizationRolePresentation, AuthorizationThreadCapabilities, DeviceStatus, PrincipalId,
 };
+use std::collections::BTreeMap;
 
-/// Shell-neutral compatibility projection of the Gateway capability snapshot.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationProjectionAcceptance {
+    Accepted,
+    Stale,
+    Conflict,
+    Incompatible,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthorizationProjectionManifest {
+    schema_version: u32,
+    principal_id: PrincipalId,
+    role_key: String,
+    role: AuthorizationRolePresentation,
+    global: pioneer_protocol::AuthorizationGlobalCapabilities,
+}
+
+/// Coherent authorization projections for one connection epoch. All shells
+/// feed every scoped response through this store before exposing any bit to UI
+/// consumers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthorizationProjectionStore {
+    accepted_revision: Option<u64>,
+    manifest: Option<AuthorizationProjectionManifest>,
+    workspaces: BTreeMap<String, pioneer_protocol::AuthorizationWorkspaceCapabilitySnapshot>,
+    threads: BTreeMap<String, pioneer_protocol::AuthorizationThreadCapabilitySnapshot>,
+}
+
+impl AuthorizationProjectionStore {
+    pub fn accepted_revision(&self) -> Option<u64> {
+        self.accepted_revision
+    }
+
+    pub fn clear_epoch(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Advances the consistency fence before a replacement snapshot arrives.
+    /// Old projections become unavailable immediately.
+    pub fn invalidate_for_revision(&mut self, revision: u64) {
+        if self
+            .accepted_revision
+            .is_none_or(|accepted| revision > accepted)
+        {
+            self.accepted_revision = Some(revision);
+            self.manifest = None;
+            self.workspaces.clear();
+            self.threads.clear();
+        }
+    }
+
+    pub fn accept(
+        &mut self,
+        snapshot: AuthorizationCapabilitySnapshot,
+    ) -> AuthorizationProjectionAcceptance {
+        if snapshot.schema_version != AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION {
+            return AuthorizationProjectionAcceptance::Incompatible;
+        }
+        if snapshot.role_key.trim().is_empty()
+            || snapshot.role.key.trim().is_empty()
+            || snapshot.role.key != snapshot.role_key
+        {
+            return AuthorizationProjectionAcceptance::Incompatible;
+        }
+        if snapshot.thread.is_some() && snapshot.workspace.is_none() {
+            return AuthorizationProjectionAcceptance::Incompatible;
+        }
+        if snapshot.workspace.as_ref().is_some_and(|workspace| {
+            workspace.workspace_id.trim().is_empty()
+                || workspace
+                    .operational_resources
+                    .fingerprint
+                    .trim()
+                    .is_empty()
+                || workspace.execution_draft_policy.fingerprint
+                    != workspace.operational_resources.fingerprint
+                || workspace.execution_draft_policy.resources != workspace.operational_resources
+        }) {
+            return AuthorizationProjectionAcceptance::Incompatible;
+        }
+        if let (Some(workspace), Some(thread)) = (&snapshot.workspace, &snapshot.thread)
+            && (workspace.workspace_id != thread.workspace_id
+                || thread.thread_id.trim().is_empty()
+                || workspace.workspace_id.trim().is_empty())
+        {
+            return AuthorizationProjectionAcceptance::Incompatible;
+        }
+        if self
+            .accepted_revision
+            .is_some_and(|accepted| snapshot.authorization_revision < accepted)
+        {
+            return AuthorizationProjectionAcceptance::Stale;
+        }
+
+        let incoming_manifest = AuthorizationProjectionManifest {
+            schema_version: snapshot.schema_version,
+            principal_id: snapshot.principal_id.clone(),
+            role_key: snapshot.role_key.clone(),
+            role: snapshot.role.clone(),
+            global: snapshot.global.clone(),
+        };
+        let generation_changed = self
+            .accepted_revision
+            .is_none_or(|accepted| snapshot.authorization_revision > accepted);
+        if !generation_changed {
+            if self
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest != &incoming_manifest)
+            {
+                return AuthorizationProjectionAcceptance::Conflict;
+            }
+            if let Some(workspace) = snapshot.workspace.as_ref()
+                && self
+                    .workspaces
+                    .get(workspace.workspace_id.as_str())
+                    .is_some_and(|current| current != workspace)
+            {
+                return AuthorizationProjectionAcceptance::Conflict;
+            }
+            if let Some(thread) = snapshot.thread.as_ref()
+                && self
+                    .threads
+                    .get(thread.thread_id.as_str())
+                    .is_some_and(|current| current != thread)
+            {
+                return AuthorizationProjectionAcceptance::Conflict;
+            }
+        }
+
+        if generation_changed {
+            self.workspaces.clear();
+            self.threads.clear();
+        }
+        self.accepted_revision = Some(snapshot.authorization_revision);
+        self.manifest = Some(incoming_manifest);
+        if let Some(workspace) = snapshot.workspace {
+            self.workspaces
+                .insert(workspace.workspace_id.clone(), workspace);
+        }
+        if let Some(thread) = snapshot.thread {
+            self.threads.insert(thread.thread_id.clone(), thread);
+        }
+        AuthorizationProjectionAcceptance::Accepted
+    }
+
+    pub fn snapshot(
+        &self,
+        workspace_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Option<AuthorizationCapabilitySnapshot> {
+        let revision = self.accepted_revision?;
+        let manifest = self.manifest.as_ref()?;
+        let workspace = match workspace_id {
+            Some(id) => Some(self.workspaces.get(id)?.clone()),
+            None => None,
+        };
+        let thread = match thread_id {
+            Some(id) => Some(self.threads.get(id)?.clone()),
+            None => None,
+        };
+        if thread.as_ref().is_some_and(|thread| {
+            workspace
+                .as_ref()
+                .is_none_or(|workspace| workspace.workspace_id != thread.workspace_id)
+        }) {
+            return None;
+        }
+        Some(AuthorizationCapabilitySnapshot {
+            schema_version: manifest.schema_version,
+            authorization_revision: revision,
+            principal_id: manifest.principal_id.clone(),
+            role_key: manifest.role_key.clone(),
+            role: manifest.role.clone(),
+            global: manifest.global.clone(),
+            workspace,
+            thread,
+        })
+    }
+}
+
+/// Shell-neutral projection of the Gateway capability snapshot.
 ///
 /// These flags are presentation hints only. The Gateway remains authoritative
 /// for every operation and callers must still handle an authoritative denial.
@@ -25,6 +209,8 @@ use pioneer_protocol::{
 pub struct PrincipalPresentationCapabilities {
     pub can_create_workspace: bool,
     pub can_manage_workspace: bool,
+    pub can_read_own_notifications: bool,
+    pub can_acknowledge_own_notifications: bool,
     pub can_manage_gateway_settings: bool,
     pub can_manage_capabilities: bool,
     pub can_use_providers: bool,
@@ -42,17 +228,6 @@ pub struct PrincipalPresentationCapabilities {
     pub can_manage_own_sessions: bool,
 }
 
-/// Stable UI vocabulary for the authenticated principal kind. `Unknown` keeps
-/// clients fail-closed when a future protocol kind reaches a newer boundary.
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CurrentPrincipalKindPresentation {
-    Superuser,
-    Member,
-    Unknown,
-}
-
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -60,7 +235,7 @@ pub struct CurrentPrincipalPresentation {
     pub principal_id: PrincipalId,
     pub display_name: String,
     pub nickname: String,
-    pub kind: CurrentPrincipalKindPresentation,
+    pub role: AuthorizationRolePresentation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_revision: Option<String>,
     pub read_only: bool,
@@ -102,36 +277,20 @@ pub fn session_list_row_presentation(item: &AuthSessionListItem) -> SessionListR
     }
 }
 
-pub fn current_principal_kind_presentation(
-    kind: Option<PrincipalKind>,
-) -> CurrentPrincipalKindPresentation {
-    match kind {
-        Some(PrincipalKind::Superuser) => CurrentPrincipalKindPresentation::Superuser,
-        Some(PrincipalKind::User) => CurrentPrincipalKindPresentation::Member,
-        None => CurrentPrincipalKindPresentation::Unknown,
-    }
-}
-
-/// Project the authenticated identity. `auth/me` is authoritative for the
-/// editable profile; an older peer that omitted the avatar revision may still
-/// use a matching, already-disclosed directory row as a compatibility fallback.
+/// Project the authenticated identity from one coherent server-owned
+/// authorization manifest. The caller must reject a missing or mismatched
+/// manifest rather than derive role metadata locally.
 pub fn current_principal_presentation(
     auth: &AuthMeResponse,
-    visible_member: Option<&MemberSummary>,
     capabilities: PrincipalPresentationCapabilities,
+    role: &AuthorizationRolePresentation,
 ) -> CurrentPrincipalPresentation {
-    let avatar_revision = auth.principal.avatar_revision.clone().or_else(|| {
-        visible_member
-            .filter(|member| member.principal_id == auth.principal.id)
-            .and_then(|member| member.avatar_revision.clone())
-    });
-
     CurrentPrincipalPresentation {
         principal_id: auth.principal.id.clone(),
         display_name: auth.principal.display_name.clone(),
         nickname: auth.principal.nickname.clone(),
-        kind: current_principal_kind_presentation(Some(auth.principal.kind)),
-        avatar_revision,
+        role: role.clone(),
+        avatar_revision: auth.principal.avatar_revision.clone(),
         read_only: false,
         capabilities,
     }
@@ -144,11 +303,18 @@ pub struct ThreadPresentationCapabilities {
     pub can_read: bool,
     pub can_write: bool,
     pub can_start_turn: bool,
+    pub can_observe_agent_execution: bool,
+    pub can_cancel_agent_execution: bool,
+    pub can_resume_agent_execution: bool,
+    pub can_steer_agent_execution: bool,
     pub can_respond_to_agent_requests: bool,
     pub can_control_cli_runtime: bool,
     pub can_create_task: bool,
+    pub can_review_tasks: bool,
+    pub can_cancel_tasks: bool,
     pub can_read_artifacts: bool,
     pub can_write_artifacts: bool,
+    pub can_bind_artifacts: bool,
     pub can_manage_thread: bool,
     pub can_manage_private_participants: bool,
     pub can_move: bool,
@@ -166,6 +332,9 @@ pub fn principal_presentation_capabilities(
     PrincipalPresentationCapabilities {
         can_create_workspace: snapshot.global.can_create_workspace,
         can_manage_workspace: workspace.is_some_and(|value| value.can_manage),
+        can_read_own_notifications: workspace.is_some_and(|value| value.can_read_own_notifications),
+        can_acknowledge_own_notifications: workspace
+            .is_some_and(|value| value.can_acknowledge_own_notifications),
         can_manage_gateway_settings: snapshot.global.can_manage_gateway_settings,
         can_manage_capabilities: snapshot.global.can_manage_capabilities,
         can_use_providers: workspace.is_some_and(|value| value.can_use_providers),
@@ -195,6 +364,8 @@ pub fn authorization_capability_snapshot_is_compatible(
 ) -> bool {
     if snapshot.schema_version != AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION
         || &snapshot.principal_id != expected_principal_id
+        || snapshot.role_key.trim().is_empty()
+        || snapshot.role.key != snapshot.role_key
     {
         return false;
     }
@@ -223,11 +394,18 @@ pub fn thread_presentation_capabilities(
             can_read: capabilities.can_read,
             can_write: capabilities.can_write,
             can_start_turn: capabilities.can_start_turn,
+            can_observe_agent_execution: capabilities.can_observe_agent_execution,
+            can_cancel_agent_execution: capabilities.can_cancel_agent_execution,
+            can_resume_agent_execution: capabilities.can_resume_agent_execution,
+            can_steer_agent_execution: capabilities.can_steer_agent_execution,
             can_respond_to_agent_requests: capabilities.can_respond_to_agent_requests,
             can_control_cli_runtime: capabilities.can_control_cli_runtime,
             can_create_task: capabilities.can_create_task,
+            can_review_tasks: capabilities.can_review_tasks,
+            can_cancel_tasks: capabilities.can_cancel_tasks,
             can_read_artifacts: capabilities.can_read_artifacts,
             can_write_artifacts: capabilities.can_write_artifacts,
+            can_bind_artifacts: capabilities.can_bind_artifacts,
             can_manage_thread: capabilities.can_manage,
             can_manage_private_participants: capabilities.can_manage_private_participants,
             can_move: capabilities.can_move,
@@ -278,7 +456,7 @@ pub fn plan_access_changed(
     }
 
     let workspace_wide = notification.change == AccessChangeKind::WorkspaceMembership;
-    let access_explicitly_retained = notification.access_lost == Some(false);
+    let access_retained = notification.outcome == pioneer_protocol::AccessChangeOutcome::Retained;
     let potentially_restrictive_without_exact_thread = matches!(
         notification.change,
         AccessChangeKind::ThreadVisibility | AccessChangeKind::ThreadParticipantRemoved
@@ -288,13 +466,11 @@ pub fn plan_access_changed(
         .as_deref()
         .map(str::trim)
         .filter(|thread_id| !thread_id.is_empty());
-    let mut invalidate_thread_ids = if access_explicitly_retained {
+    let mut invalidate_thread_ids = if access_retained {
         Vec::new()
     } else if workspace_wide
         || (exact_thread_id.is_none() && potentially_restrictive_without_exact_thread)
     {
-        // Compatibility with an older Gateway that cannot identify a
-        // restrictive thread-scoped change must remain fail closed.
         known_threads
             .iter()
             .filter(|scope| scope.workspace_id == notification.workspace_id)
@@ -306,7 +482,7 @@ pub fn plan_access_changed(
     invalidate_thread_ids.sort();
     invalidate_thread_ids.dedup();
 
-    let clear_active_workspace = !access_explicitly_retained
+    let clear_active_workspace = !access_retained
         && workspace_wide
         && active_workspace_id == Some(notification.workspace_id.as_str());
     let clear_active_thread = clear_active_workspace
@@ -368,7 +544,7 @@ pub fn apply_access_changed_to_client_state(
     state.administration.apply_access_changed(notification);
     state.gateway.authorization_revision = Some(plan.authorization_revision);
     if plan.change == AccessChangeKind::WorkspaceMembership
-        && notification.access_lost != Some(false)
+        && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked
     {
         state
             .workspaces
@@ -377,7 +553,7 @@ pub fn apply_access_changed_to_client_state(
     }
     state.workspaces.error = None;
     if plan.change == AccessChangeKind::WorkspaceMembership
-        && notification.access_lost != Some(false)
+        && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked
         && state.workspaces.preferred_workspace_id.as_deref() == Some(plan.workspace_id.as_str())
     {
         state.workspaces.preferred_workspace_id = None;
@@ -389,7 +565,8 @@ pub fn apply_access_changed_to_client_state(
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
     let workspace_wide = plan.change == AccessChangeKind::WorkspaceMembership;
-    let workspace_access_lost = workspace_wide && notification.access_lost != Some(false);
+    let workspace_access_lost =
+        workspace_wide && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
     state
         .threads
         .coordinators
@@ -510,19 +687,130 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    fn projection_snapshot(
+        revision: u64,
+        role_key: &str,
+        workspace_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> AuthorizationCapabilitySnapshot {
+        let resources = pioneer_protocol::AuthorizationOperationalResourceProjection {
+            fingerprint: format!("projection-{revision}"),
+            ..Default::default()
+        };
+        AuthorizationCapabilitySnapshot {
+            schema_version: AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION,
+            authorization_revision: revision,
+            principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
+            role_key: role_key.to_owned(),
+            role: AuthorizationRolePresentation {
+                key: role_key.to_owned(),
+                display_name: "Projected role".to_owned(),
+                description: "Projection test role".to_owned(),
+                built_in: false,
+            },
+            global: AuthorizationGlobalCapabilities::default(),
+            workspace: workspace_id.map(|workspace_id| AuthorizationWorkspaceCapabilitySnapshot {
+                workspace_id: workspace_id.to_owned(),
+                capabilities: AuthorizationWorkspaceCapabilities::default(),
+                operational_resources: resources.clone(),
+                execution_draft_policy:
+                    pioneer_protocol::AuthorizationExecutionDraftPolicyProjection {
+                        fingerprint: resources.fingerprint.clone(),
+                        resources: resources.clone(),
+                        permission_options: Vec::new(),
+                        can_attach_artifacts: false,
+                        mcp_invocation_limits: Default::default(),
+                    },
+            }),
+            thread: thread_id.map(|thread_id| {
+                pioneer_protocol::AuthorizationThreadCapabilitySnapshot {
+                    workspace_id: workspace_id.unwrap_or_default().to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    capabilities: AuthorizationThreadCapabilities::default(),
+                }
+            }),
+        }
+    }
+
     #[test]
-    fn current_principal_kind_has_safe_future_fallback() {
+    fn projection_store_accepts_only_one_coherent_manifest_per_generation() {
+        let mut store = AuthorizationProjectionStore::default();
+        let initial = projection_snapshot(7, "future_role", Some("workspace-a"), Some("thread-a"));
         assert_eq!(
-            current_principal_kind_presentation(Some(PrincipalKind::Superuser)),
-            CurrentPrincipalKindPresentation::Superuser
+            store.accept(initial.clone()),
+            AuthorizationProjectionAcceptance::Accepted
         );
         assert_eq!(
-            current_principal_kind_presentation(Some(PrincipalKind::User)),
-            CurrentPrincipalKindPresentation::Member
+            store.snapshot(Some("workspace-a"), Some("thread-a")),
+            Some(initial)
         );
+
+        let conflict = projection_snapshot(7, "different_role", Some("workspace-b"), None);
         assert_eq!(
-            current_principal_kind_presentation(None),
-            CurrentPrincipalKindPresentation::Unknown
+            store.accept(conflict),
+            AuthorizationProjectionAcceptance::Conflict
+        );
+        assert!(store.snapshot(Some("workspace-b"), None).is_none());
+
+        let newer = projection_snapshot(8, "future_role", Some("workspace-b"), None);
+        assert_eq!(
+            store.accept(newer.clone()),
+            AuthorizationProjectionAcceptance::Accepted
+        );
+        assert!(
+            store
+                .snapshot(Some("workspace-a"), Some("thread-a"))
+                .is_none()
+        );
+        assert_eq!(store.snapshot(Some("workspace-b"), None), Some(newer));
+        assert_eq!(
+            store.accept(projection_snapshot(7, "future_role", None, None)),
+            AuthorizationProjectionAcceptance::Stale
+        );
+
+        let mut inconsistent = projection_snapshot(9, "future_role", Some("workspace-b"), None);
+        inconsistent
+            .workspace
+            .as_mut()
+            .expect("workspace projection")
+            .execution_draft_policy
+            .resources
+            .providers
+            .ids
+            .push("unpublished-provider".to_owned());
+        assert_eq!(
+            store.accept(inconsistent),
+            AuthorizationProjectionAcceptance::Incompatible
+        );
+        assert_eq!(store.accepted_revision(), Some(8));
+    }
+
+    #[test]
+    fn projection_store_rejects_internally_incoherent_role_and_scope_contracts() {
+        let mut store = AuthorizationProjectionStore::default();
+        let mut role_mismatch = projection_snapshot(1, "future_role", None, None);
+        role_mismatch.role.key = "another_role".to_owned();
+        assert_eq!(
+            store.accept(role_mismatch),
+            AuthorizationProjectionAcceptance::Incompatible
+        );
+
+        let mut policy_mismatch = projection_snapshot(1, "future_role", Some("workspace-a"), None);
+        policy_mismatch
+            .workspace
+            .as_mut()
+            .unwrap()
+            .execution_draft_policy
+            .fingerprint = "different-projection".to_owned();
+        assert_eq!(
+            store.accept(policy_mismatch),
+            AuthorizationProjectionAcceptance::Incompatible
+        );
+
+        let child_without_workspace = projection_snapshot(1, "future_role", None, Some("thread-a"));
+        assert_eq!(
+            store.accept(child_without_workspace),
+            AuthorizationProjectionAcceptance::Incompatible
         );
     }
 
@@ -568,44 +856,72 @@ mod tests {
     #[test]
     fn principal_capabilities_are_projected_without_role_inference() {
         let snapshot = AuthorizationCapabilitySnapshot {
-            schema_version: 1,
+            schema_version: AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION,
             authorization_revision: 42,
             principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
             // A future code-defined role must not require a client release:
             // presentation is driven exclusively by the server-owned bits.
             role_key: "future_role".to_owned(),
+            role: AuthorizationRolePresentation {
+                key: "future_role".to_owned(),
+                display_name: "Future role".to_owned(),
+                description: "Test role".to_owned(),
+                built_in: false,
+            },
             global: AuthorizationGlobalCapabilities {
                 can_create_workspace: true,
                 can_manage_gateway_settings: false,
                 can_manage_capabilities: true,
+                can_manage_providers: true,
+                can_manage_mcp: false,
+                can_manage_skills: true,
+                can_manage_cli_runtimes: false,
                 can_manage_all_threads: false,
                 can_view_invitations: true,
                 can_create_invitation: false,
+                invitation_role_options: Vec::new(),
                 can_view_member_directory: true,
                 can_manage_member_lifecycle: false,
                 can_manage_own_sessions: true,
             },
             workspace: Some(AuthorizationWorkspaceCapabilitySnapshot {
                 workspace_id: "workspace_1".to_owned(),
+                operational_resources:
+                    pioneer_protocol::AuthorizationOperationalResourceProjection {
+                        fingerprint: "fixture-policy".to_owned(),
+                        ..Default::default()
+                    },
                 capabilities: AuthorizationWorkspaceCapabilities {
                     can_read: true,
                     can_create_thread: true,
                     can_manage: false,
+                    can_read_own_notifications: true,
+                    can_acknowledge_own_notifications: true,
                     can_use_providers: true,
                     can_use_cli_runtimes: true,
                     can_use_skills: false,
                     can_use_mcp: true,
                     can_run_tasks: true,
-                    turn_permission_modes: vec![
-                        pioneer_protocol::TurnPermissionMode::FullAccess,
-                        pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
-                        pioneer_protocol::TurnPermissionMode::Supervised,
-                    ],
+                    can_read_artifacts: true,
+                    can_write_artifacts: true,
+                    execution_limits: Default::default(),
+                    agent_permission_options: Vec::new(),
                     can_list_members: true,
                     can_add_member: true,
                     can_remove_member: false,
                     thread_visibility_options: vec![ThreadVisibility::Private],
                 },
+                execution_draft_policy:
+                    pioneer_protocol::AuthorizationExecutionDraftPolicyProjection {
+                        fingerprint: "fixture-policy".to_owned(),
+                        resources: pioneer_protocol::AuthorizationOperationalResourceProjection {
+                            fingerprint: "fixture-policy".to_owned(),
+                            ..Default::default()
+                        },
+                        permission_options: Vec::new(),
+                        can_attach_artifacts: true,
+                        mcp_invocation_limits: Default::default(),
+                    },
             }),
             thread: None,
         };
@@ -615,6 +931,8 @@ mod tests {
             PrincipalPresentationCapabilities {
                 can_create_workspace: true,
                 can_manage_workspace: false,
+                can_read_own_notifications: true,
+                can_acknowledge_own_notifications: true,
                 can_manage_gateway_settings: false,
                 can_manage_capabilities: true,
                 can_use_providers: true,
@@ -640,14 +958,22 @@ mod tests {
             can_read: true,
             can_write: true,
             can_start_turn: true,
+            can_observe_agent_execution: true,
+            can_cancel_agent_execution: true,
+            can_resume_agent_execution: true,
+            can_steer_agent_execution: true,
             can_respond_to_agent_requests: true,
             can_control_cli_runtime: true,
             can_create_task: true,
+            can_review_tasks: true,
+            can_cancel_tasks: true,
             can_read_artifacts: true,
             can_write_artifacts: true,
+            can_bind_artifacts: true,
             can_manage: true,
             can_manage_private_participants: true,
             can_move: false,
+            ..AuthorizationThreadCapabilities::default()
         };
         assert_eq!(
             thread_presentation_capabilities(Some(&capabilities)),
@@ -655,11 +981,18 @@ mod tests {
                 can_read: true,
                 can_write: true,
                 can_start_turn: true,
+                can_observe_agent_execution: true,
+                can_cancel_agent_execution: true,
+                can_resume_agent_execution: true,
+                can_steer_agent_execution: true,
                 can_respond_to_agent_requests: true,
                 can_control_cli_runtime: true,
                 can_create_task: true,
+                can_review_tasks: true,
+                can_cancel_tasks: true,
                 can_read_artifacts: true,
                 can_write_artifacts: true,
+                can_bind_artifacts: true,
                 can_manage_thread: true,
                 can_manage_private_participants: true,
                 can_move: false,
@@ -674,11 +1007,18 @@ mod tests {
                 can_read: true,
                 can_write: true,
                 can_start_turn: true,
+                can_observe_agent_execution: true,
+                can_cancel_agent_execution: true,
+                can_resume_agent_execution: true,
+                can_steer_agent_execution: true,
                 can_respond_to_agent_requests: true,
                 can_control_cli_runtime: true,
                 can_create_task: true,
+                can_review_tasks: true,
+                can_cancel_tasks: true,
                 can_read_artifacts: true,
                 can_write_artifacts: true,
+                can_bind_artifacts: true,
                 can_manage_thread: true,
                 can_manage_private_participants: false,
                 can_move: false,
@@ -694,14 +1034,36 @@ mod tests {
     fn capability_snapshot_context_validation_rejects_wrong_version_or_scope() {
         let principal_id = PrincipalId::new("P00000000000000000001").unwrap();
         let snapshot = AuthorizationCapabilitySnapshot {
-            schema_version: 1,
+            schema_version: AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION,
             authorization_revision: 1,
             principal_id: principal_id.clone(),
             role_key: "member".to_owned(),
+            role: AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Test role".to_owned(),
+                built_in: true,
+            },
             global: AuthorizationGlobalCapabilities::default(),
             workspace: Some(AuthorizationWorkspaceCapabilitySnapshot {
                 workspace_id: "workspace-a".to_owned(),
+                operational_resources:
+                    pioneer_protocol::AuthorizationOperationalResourceProjection {
+                        fingerprint: "fixture-policy".to_owned(),
+                        ..Default::default()
+                    },
                 capabilities: AuthorizationWorkspaceCapabilities::default(),
+                execution_draft_policy:
+                    pioneer_protocol::AuthorizationExecutionDraftPolicyProjection {
+                        fingerprint: "fixture-policy".to_owned(),
+                        resources: pioneer_protocol::AuthorizationOperationalResourceProjection {
+                            fingerprint: "fixture-policy".to_owned(),
+                            ..Default::default()
+                        },
+                        permission_options: Vec::new(),
+                        can_attach_artifacts: false,
+                        mcp_invocation_limits: Default::default(),
+                    },
             }),
             thread: None,
         };
@@ -718,8 +1080,40 @@ mod tests {
             Some("workspace-b"),
             None,
         ));
+        assert!(!authorization_capability_snapshot_is_compatible(
+            &snapshot,
+            &principal_id,
+            None,
+            None,
+        ));
+        let mut missing_workspace = snapshot.clone();
+        missing_workspace.workspace = None;
+        assert!(authorization_capability_snapshot_is_compatible(
+            &missing_workspace,
+            &principal_id,
+            Some("workspace-a"),
+            None,
+        ));
+        let mut missing_thread = snapshot.clone();
+        assert!(authorization_capability_snapshot_is_compatible(
+            &missing_thread,
+            &principal_id,
+            Some("workspace-a"),
+            Some("thread-a"),
+        ));
+        missing_thread.thread = Some(pioneer_protocol::AuthorizationThreadCapabilitySnapshot {
+            workspace_id: "workspace-a".to_owned(),
+            thread_id: "thread-a".to_owned(),
+            capabilities: AuthorizationThreadCapabilities::default(),
+        });
+        assert!(authorization_capability_snapshot_is_compatible(
+            &missing_thread,
+            &principal_id,
+            Some("workspace-a"),
+            Some("thread-a"),
+        ));
         let mut future = snapshot;
-        future.schema_version = 2;
+        future.schema_version = AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION + 1;
         assert_eq!(
             principal_presentation_capabilities(&future),
             PrincipalPresentationCapabilities::default()
@@ -825,7 +1219,7 @@ mod tests {
                 authorization_revision: 7,
                 workspace_id: "ws_revoked".to_owned(),
                 thread_id: None,
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: AccessChangeKind::WorkspaceMembership,
             },
         );
@@ -933,7 +1327,7 @@ mod tests {
                 authorization_revision: 8,
                 workspace_id: "ws_affected".to_owned(),
                 thread_id: Some("thread_affected".to_owned()),
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: AccessChangeKind::ThreadParticipantRemoved,
             },
         );
@@ -997,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn restrictive_legacy_thread_change_without_exact_id_fails_closed_per_workspace() {
+    fn revoked_thread_change_without_exact_id_fails_closed_per_workspace() {
         let known_threads = vec![
             ThreadAuthorizationScope {
                 thread_id: "thread_a".to_owned(),
@@ -1018,7 +1412,7 @@ mod tests {
                 authorization_revision: 9,
                 workspace_id: "ws_affected".to_owned(),
                 thread_id: None,
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: AccessChangeKind::ThreadParticipantRemoved,
             },
             None,
@@ -1033,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn additive_legacy_thread_change_without_exact_id_does_not_destroy_known_threads() {
+    fn retained_additive_thread_change_without_exact_id_preserves_known_threads() {
         let known_threads = vec![ThreadAuthorizationScope {
             thread_id: "thread_existing".to_owned(),
             workspace_id: "ws_affected".to_owned(),
@@ -1044,7 +1438,7 @@ mod tests {
                 authorization_revision: 10,
                 workspace_id: "ws_affected".to_owned(),
                 thread_id: None,
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Retained,
                 change: AccessChangeKind::ThreadParticipantAdded,
             },
             None,
@@ -1066,7 +1460,7 @@ mod tests {
                 authorization_revision: 11,
                 workspace_id: "ws_affected".to_owned(),
                 thread_id: Some("thread_current".to_owned()),
-                access_lost: Some(false),
+                outcome: pioneer_protocol::AccessChangeOutcome::Retained,
                 change: AccessChangeKind::ThreadVisibility,
             },
             Some(10),
@@ -1097,7 +1491,7 @@ mod tests {
                 authorization_revision: 8,
                 workspace_id: "ws_a".to_owned(),
                 thread_id: Some("thread_current".to_owned()),
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: AccessChangeKind::ThreadParticipantRemoved,
             },
         );
@@ -1140,7 +1534,7 @@ mod tests {
                 authorization_revision: 1,
                 workspace_id: "ws_a".to_owned(),
                 thread_id: None,
-                access_lost: None,
+                outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                 change: AccessChangeKind::WorkspaceMembership,
             },
         );

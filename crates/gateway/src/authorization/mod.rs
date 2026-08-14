@@ -1,11 +1,16 @@
 mod admission;
+#[cfg(test)]
+mod catalog;
 mod domain;
 #[cfg(test)]
 mod epic5_contract;
 mod execution;
+mod governor;
 mod invalidation;
+mod lease;
 mod registry;
 mod resolver;
+mod role_registry;
 mod service;
 mod snapshot;
 
@@ -18,17 +23,24 @@ pub(crate) use admission::{
     record_workspace_notification_decision,
 };
 pub(crate) use domain::{
-    ActionGateDecision, AllowReason, ArtifactResourceId, AuthorizationDecision,
-    AuthorizationResource, CapabilityKind, CapabilityResourceId, DenyReason, DisclosurePolicy,
-    ResourceAction, ResourceIdError, TaskResourceId, ThreadAccessClass, ThreadResourceId,
-    TurnResourceId, WorkspaceResourceId,
+    ActionGateDecision, AgentsDocumentResourceId, AllowReason, ArtifactResourceId,
+    AuthorizationDecision, AuthorizationResource, CapabilityKind, CapabilityResourceId, DenyReason,
+    DisclosurePolicy, ResourceAction, ResourceIdError, TaskResourceId, ThreadAccessClass,
+    ThreadResourceId, TurnResourceId, WorkspaceResourceId, execution_child_policy_action,
 };
 pub(crate) use execution::{
-    ExecutionAuthorizationAdmission, ExecutionAuthorizationContext,
-    RevalidatedExecutionAuthorization, RuntimeDraftCreator, RuntimeDraftMaterialization,
-    ensure_contextless_execution_is_trusted,
+    ExecutionAdmissionEntryPoint, ExecutionAdmissionRequest, ExecutionAdmissionService,
+    ExecutionAuthorizationAdmission, ExecutionAuthorizationContext, ExecutionContinuityPolicy,
+    ExecutionResourceBoundary, RevalidatedExecutionAuthorization, RuntimeDraftCreator,
+    RuntimeDraftMaterialization,
 };
-pub(crate) use invalidation::{AccessChangeKind, AccessChangeSignal, AuthorizationInvalidationHub};
+pub(crate) use governor::{
+    ExecutionAdmissionGovernor, ObservationAdmissionGovernor, ObservationAdmissionPermit,
+};
+pub(crate) use invalidation::{
+    AccessChangeKind, AccessChangeSignal, AuthorizationInvalidationHub, observed_policy_generation,
+};
+pub(crate) use lease::{ExecutionLeaseGuard, ExecutionLeaseRegistry};
 pub(crate) use registry::{
     BinaryAuthorizationEntry, BinaryIngressKind, MethodAuthorizationEntry, RegistryLookupError,
     ResourceResolverKind, binary_ingress_entry, normal_method_entry,
@@ -36,13 +48,18 @@ pub(crate) use registry::{
 #[cfg(test)]
 pub(crate) use resolver::AuthorizedMemberAvatar;
 pub(crate) use resolver::{
-    AuthorizationResolver, AuthorizedArtifact, AuthorizedCapability, AuthorizedInvitation,
-    AuthorizedInvitationCollection, AuthorizedInvitationGrants, AuthorizedMemberDirectory,
-    AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
-    AuthorizedWorkspace, AuthorizedWorkspaceCollection, ProofResolution,
-    persisted_actor_is_current,
+    AuthorizationResolver, AuthorizedAgentsDocument, AuthorizedArtifact, AuthorizedCapability,
+    AuthorizedInvitation, AuthorizedInvitationCollection, AuthorizedInvitationGrants,
+    AuthorizedMemberDirectory, AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask,
+    AuthorizedThread, AuthorizedTurn, AuthorizedWorkspace, AuthorizedWorkspaceCollection,
+    CapabilityThreadFacts, ProofResolution, persisted_actor_is_current,
+};
+pub(crate) use role_registry::{
+    ObservationResourcePolicy, RoleDefinitionRegistry, RoleDisclosurePolicy, RoleResourcePolicy,
+    RuntimePrincipalPolicy,
 };
 pub(crate) use service::{
-    AuthorizationService, ResolvedResourceAccess, ThreadAccessFacts, WorkspaceAccessFacts,
+    AuthorizationService, CliThreadForkExportFacts, CliThreadForkExportProjection,
+    ResolvedResourceAccess, ThreadAccessFacts, ThreadResourceClass, WorkspaceAccessFacts,
 };
 pub(crate) use snapshot::AuthorizationCapabilitySnapshotService;

@@ -87,6 +87,10 @@ pub use repositories::membership::{
     list_workspace_memberships_for_workspace, persisted_thread_access_class_from_db,
     persisted_thread_access_class_to_db,
 };
+pub use repositories::policy_generation::{
+    append_authorization_change, current_policy_generation, current_policy_generation_on,
+    ensure_code_policy_generation, list_authorization_changes_after,
+};
 pub use repositories::principal_avatar::{
     NewPrincipalAvatarRow, PrincipalAvatarRevisionRow, PrincipalAvatarRow, delete_principal_avatar,
     insert_principal_avatar, list_principal_avatar_revisions, load_principal_avatar,
@@ -100,6 +104,10 @@ pub use repositories::turn::{
     NewTurnMessageRevision, PersistedTurnCollaboration, collaboration_from_model,
     find_turn_collaboration, find_turn_initiator, insert_turn_message_revision,
     list_turn_message_revisions, turn_message_revision_from_model,
+};
+pub use repositories::user_notification_outbox::{
+    NewUserNotificationOutbox, acknowledge_user_notification, find_user_notification_for_recipient,
+    insert_task_notification_idempotent, list_user_notifications_for_recipient,
 };
 
 use anyhow::{Context, Result, bail};
@@ -812,6 +820,7 @@ pub use crate::repositories::artifact::{
     NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
 };
 pub use crate::repositories::cli_runtime_binding::{
+    AcceptCliRuntimePendingRequestResponse, CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX,
     CliRuntimeExecutionSegmentRecord, CliRuntimeExecutionSegmentStatus,
     CliRuntimeNativeEventListFilter, CliRuntimeNativeEventRecord, CliRuntimeNativeTurnOwner,
     CliRuntimePendingRequestListFilter, CliRuntimePendingRequestRecord,
@@ -823,7 +832,8 @@ pub use crate::repositories::cli_runtime_binding::{
     NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
     PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionBinding,
     PreparedClaudeProviderSessionMode, ResolveCliRuntimePendingRequest,
-    deserialize_cli_runtime_json, serialize_cli_runtime_json,
+    TransitionCliRuntimePendingRequestDelivery, deserialize_cli_runtime_json,
+    serialize_cli_runtime_json,
 };
 pub use crate::repositories::thread_agents_doc::{
     ResolvedThreadAgentsDocRecord, ThreadAgentsDocError, ThreadAgentsDocRecord,
@@ -861,20 +871,25 @@ pub use crate::repositories::turn_mcp_projection::{
 use crate::repositories::{
     agent_memory, agent_memory_candidate, agent_memory_capsule, agent_memory_event,
     agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_quarantine,
-    agent_memory_repair_job, artifact as artifact_repository, cli_runtime_binding, hook_run,
-    mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation, policy, recovery_job,
-    recovery_terminalization_outbox, skill_audit_event, skill_dependency_snapshot,
-    skill_installation, skill_pack_installation, skill_upload_session, skill_workspace_policy,
-    task as task_repository, task_agent_spec, task_delivery, task_dependency, task_event,
-    task_result_candidate, task_result_review_event, task_run, task_run_conversation_snapshot,
-    task_run_execution, task_run_thread_binding, task_run_turn, task_trigger, task_write_lock,
-    thread, thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage,
-    thread_tree, turn, turn_admission, turn_cli_runtime_instruction, turn_event,
-    turn_event_delivery, turn_event_projection_state, turn_execution_window, turn_finalization,
-    turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding, turn_mcp_projection,
-    turn_runtime_snapshot, turn_skill_binding,
+    agent_memory_repair_job, artifact as artifact_repository, cli_runtime_binding,
+    execution_admission_lease, hook_run, mcp_audit_event, mcp_server_catalog_snapshot,
+    mcp_server_installation, policy, recovery_job, recovery_terminalization_outbox,
+    skill_audit_event, skill_dependency_snapshot, skill_installation, skill_pack_installation,
+    skill_upload_session, skill_workspace_policy, task as task_repository, task_agent_spec,
+    task_delivery, task_dependency, task_event, task_execution_admission, task_result_candidate,
+    task_result_review_event, task_run, task_run_conversation_snapshot, task_run_execution,
+    task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread,
+    thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage, thread_tree,
+    turn, turn_admission, turn_cli_runtime_instruction, turn_event, turn_event_delivery,
+    turn_event_projection_state, turn_execution_window, turn_finalization, turn_item_attempt,
+    turn_liveness, turn_llm_context, turn_mcp_binding, turn_mcp_projection, turn_runtime_snapshot,
+    turn_skill_binding,
 };
 
+pub use crate::repositories::execution_admission_lease::{
+    ExecutionAdmissionClass, ExecutionAdmissionQuotaPolicy, ExecutionQuotaBucket,
+    ExecutionQuotaCeilings, NewExecutionAdmissionLease,
+};
 pub use crate::repositories::turn_admission::NewTurnAdmission;
 pub use crate::repositories::turn_finalization::PrepareTurnFinalizationOutcome;
 
@@ -940,6 +955,9 @@ pub use crate::repositories::hook_run::{
     HookRunAttemptRecord, HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
     NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord, RecoverableHookRunRecord,
 };
+pub use crate::repositories::task_execution_admission::{
+    NewTaskExecutionAdmission, TaskExecutionAdmissionRecord,
+};
 pub use crate::repositories::task_run_conversation_snapshot::{
     NewTaskRunConversationSnapshot, TaskRunConversationSnapshotRecord,
 };
@@ -981,6 +999,45 @@ pub struct IncompleteNativeTurnAdmissionRecord {
 pub struct InProgressNativeTurnRecord {
     pub thread_id: String,
     pub turn_id: String,
+}
+
+/// Active execution row inspected by the startup authority-integrity worker.
+/// The envelope remains opaque to CRUD and is validated by Gateway policy
+/// code; CRUD never fabricates or repairs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveExecutionAuthorityRecord {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub authority_envelope_json: Option<String>,
+}
+
+/// Non-terminal Agent Task inspected by the startup authority-integrity gate.
+/// Nullable admission columns let Gateway quarantine incomplete development
+/// data without CRUD inventing an execution grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTaskExecutionAuthorityRecord {
+    pub task_id: String,
+    pub task_workspace_id: String,
+    pub admission_workspace_id: Option<String>,
+    pub root_thread_id: Option<String>,
+    pub initiating_principal_id: Option<String>,
+    pub authority_envelope_json: Option<String>,
+    pub root_thread_workspace_id: Option<String>,
+    pub root_thread_access_class: Option<String>,
+    pub principal_id: Option<String>,
+    pub principal_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizedTurnRuntimeDraft {
+    ScopedPrincipal {
+        gateway_id: GatewayId,
+        principal_id: PrincipalId,
+        access_class: PersistedThreadAccessClass,
+    },
+    Absolute {
+        access_class: PersistedThreadAccessClass,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1918,9 +1975,7 @@ async fn principal_current_thread_access_kind(
                 .map(pioneer_protocol::RoleKey::new)
                 .transpose()
                 .context("message mutation actor has an invalid persisted role")?;
-            if !role
-                .as_ref()
-                .is_some_and(pioneer_protocol::RoleKey::is_supported)
+            if role.is_none()
                 || find_active_workspace_for_principal(transaction, principal_id, workspace_id)
                     .await?
                     .is_none()
@@ -1988,8 +2043,10 @@ async fn revalidate_turn_message_edit_targets(
                     && principal.status == pioneer_protocol::PrincipalStatus::Active
                     && (principal.kind == pioneer_protocol::PrincipalKind::Superuser
                         || (principal.kind == pioneer_protocol::PrincipalKind::User
-                            && principal.role_key.as_deref()
-                                == Some(pioneer_protocol::MEMBER_ROLE_KEY)))
+                            && principal
+                                .role_key
+                                .as_deref()
+                                .is_some_and(|role| pioneer_protocol::RoleKey::new(role).is_ok())))
             })
             .ok_or_else(|| anyhow::Error::new(TurnMessageMutationFailure::InvalidTarget))?;
         let visible = match viewer.kind {
@@ -2316,9 +2373,7 @@ async fn validated_participant_ids_from_rows(
                 pioneer_protocol::PrincipalStatus::Active
                     | pioneer_protocol::PrincipalStatus::Suspended
             )
-            || !role
-                .as_ref()
-                .is_some_and(pioneer_protocol::RoleKey::is_supported)
+            || role.is_none()
             || find_workspace_membership(transaction, &principal_id, workspace_id)
                 .await?
                 .is_none()
@@ -3288,6 +3343,97 @@ impl CrudStore {
                 Ok(InProgressNativeTurnRecord {
                     thread_id: row.try_get("", "thread_id")?,
                     turn_id: row.try_get("", "turn_id")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_active_execution_authorities(
+        &self,
+        after_turn_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ActiveExecutionAuthorityRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "SELECT thread_id, id AS turn_id, execution_authorization_context_json \
+                 FROM \"turn\" WHERE status = 'in_progress' AND id > ? \
+                 ORDER BY id ASC LIMIT ?"
+                    .to_owned(),
+                [
+                    after_turn_id.unwrap_or_default().into(),
+                    i64::try_from(limit).unwrap_or(i64::MAX).into(),
+                ],
+            ))
+            .await
+            .context("failed to list active execution authority envelopes")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ActiveExecutionAuthorityRecord {
+                    thread_id: row.try_get("", "thread_id")?,
+                    turn_id: row.try_get("", "turn_id")?,
+                    authority_envelope_json: row
+                        .try_get::<Option<String>>("", "execution_authorization_context_json")?
+                        .filter(|json| !json.trim().is_empty()),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_active_task_execution_authorities(
+        &self,
+        after_task_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ActiveTaskExecutionAuthorityRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .connection
+            .query_all_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "SELECT t.id AS task_id, t.workspace_id AS task_workspace_id, \
+                        a.workspace_id AS admission_workspace_id, \
+                        a.root_thread_id, a.initiating_principal_id, \
+                        a.authorization_context_json, \
+                        root.workspace_id AS root_thread_workspace_id, \
+                        root.access_class AS root_thread_access_class, \
+                        gp.id AS principal_id, gp.kind AS principal_kind \
+                 FROM task t \
+                 LEFT JOIN task_execution_admission a ON a.task_id = t.id \
+                 LEFT JOIN \"thread\" root ON root.id = a.root_thread_id \
+                 LEFT JOIN gateway_principal gp ON gp.id = a.initiating_principal_id \
+                 WHERE t.executor_kind = 'agent' \
+                   AND t.status NOT IN ('completed', 'failed', 'blocked', 'cancelled') \
+                   AND t.id > ? \
+                 ORDER BY t.id ASC LIMIT ?"
+                    .to_owned(),
+                [
+                    after_task_id.unwrap_or_default().into(),
+                    i64::try_from(limit).unwrap_or(i64::MAX).into(),
+                ],
+            ))
+            .await
+            .context("failed to list active Task execution authority envelopes")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ActiveTaskExecutionAuthorityRecord {
+                    task_id: row.try_get("", "task_id")?,
+                    task_workspace_id: row.try_get("", "task_workspace_id")?,
+                    admission_workspace_id: row.try_get("", "admission_workspace_id")?,
+                    root_thread_id: row.try_get("", "root_thread_id")?,
+                    initiating_principal_id: row.try_get("", "initiating_principal_id")?,
+                    authority_envelope_json: row
+                        .try_get::<Option<String>>("", "authorization_context_json")?
+                        .filter(|json| !json.trim().is_empty()),
+                    root_thread_workspace_id: row.try_get("", "root_thread_workspace_id")?,
+                    root_thread_access_class: row.try_get("", "root_thread_access_class")?,
+                    principal_id: row.try_get("", "principal_id")?,
+                    principal_kind: row.try_get("", "principal_kind")?,
                 })
             })
             .collect()
@@ -4589,6 +4735,7 @@ impl CrudStore {
         &self,
         request: NewCliRuntimePendingRequest,
         authorization: CliRuntimeRequestAuthorizationBinding,
+        max_pending_requests: usize,
     ) -> Result<CliRuntimePendingRequestRecord> {
         self.run_serialized_write(|| async {
             let transaction = self
@@ -4596,6 +4743,15 @@ impl CrudStore {
                 .begin()
                 .await
                 .context("failed to begin authorized CLI runtime request transaction")?;
+            if let Some(turn_id) = request.turn_id.as_deref() {
+                cli_runtime_binding::ensure_pending_request_capacity(
+                    &transaction,
+                    request.request_id.as_str(),
+                    turn_id,
+                    max_pending_requests,
+                )
+                .await?;
+            }
             let opened =
                 cli_runtime_binding::open_pending_request(&transaction, request.clone()).await?;
             let record = cli_runtime_binding::bind_pending_request_authorization(
@@ -4618,6 +4774,116 @@ impl CrudStore {
                 .commit()
                 .await
                 .context("failed to commit authorized CLI runtime request transaction")?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn open_native_human_interaction_request_with_authorization(
+        &self,
+        request: NewCliRuntimePendingRequest,
+        authorization: CliRuntimeRequestAuthorizationBinding,
+        max_pending_requests: usize,
+    ) -> Result<CliRuntimePendingRequestRecord> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin native human interaction transaction")?;
+            let turn_id = request
+                .turn_id
+                .as_deref()
+                .context("authorized native human interaction is missing its execution turn")?;
+            cli_runtime_binding::ensure_pending_request_capacity(
+                &transaction,
+                request.request_id.as_str(),
+                turn_id,
+                max_pending_requests,
+            )
+            .await?;
+            let opened =
+                cli_runtime_binding::open_pending_request(&transaction, request.clone()).await?;
+            let record = cli_runtime_binding::bind_pending_request_authorization(
+                &transaction,
+                opened.request_id.as_str(),
+                &authorization,
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit native human interaction")?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn resolve_native_human_interaction_request(
+        &self,
+        resolution: ResolveCliRuntimePendingRequest,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin native human interaction resolution")?;
+            let record =
+                cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
+                    .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit native human interaction resolution")?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn accept_native_human_interaction_response(
+        &self,
+        response: AcceptCliRuntimePendingRequestResponse,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin native human interaction acceptance")?;
+            let record = cli_runtime_binding::accept_pending_request_response(
+                &transaction,
+                response.clone(),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit native human interaction acceptance")?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn transition_native_human_interaction_delivery(
+        &self,
+        transition: TransitionCliRuntimePendingRequestDelivery,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin native human interaction delivery transition")?;
+            let record = cli_runtime_binding::transition_pending_request_delivery(
+                &transaction,
+                transition.clone(),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit native human interaction delivery transition")?;
             Ok(record)
         })
         .await
@@ -4666,6 +4932,76 @@ impl CrudStore {
                 .commit()
                 .await
                 .context("failed to commit CLI runtime pending request resolve transaction")?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn accept_cli_runtime_pending_request_response(
+        &self,
+        response: AcceptCliRuntimePendingRequestResponse,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin human interaction response acceptance transaction")?;
+            let record = cli_runtime_binding::accept_pending_request_response(
+                &transaction,
+                response.clone(),
+            )
+            .await?;
+            if let Some(record) = &record
+                && let Err(error) =
+                    crate::timeline_live_projection::project_cli_runtime_pending_request(
+                        &transaction,
+                        record,
+                    )
+                    .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit human interaction response acceptance")?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn transition_cli_runtime_pending_request_delivery(
+        &self,
+        transition: TransitionCliRuntimePendingRequestDelivery,
+    ) -> Result<Option<CliRuntimePendingRequestRecord>> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin human interaction delivery transaction")?;
+            let record = cli_runtime_binding::transition_pending_request_delivery(
+                &transaction,
+                transition.clone(),
+            )
+            .await?;
+            if let Some(record) = &record
+                && let Err(error) =
+                    crate::timeline_live_projection::project_cli_runtime_pending_request(
+                        &transaction,
+                        record,
+                    )
+                    .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit human interaction delivery transition")?;
             Ok(record)
         })
         .await
@@ -9140,53 +9476,50 @@ impl CrudStore {
             .await
     }
 
-    /// Persists turn/start and its caller-owned permission audit as one write-set.
-    pub async fn materialize_turn_start_with_permission_audit(
+    /// Persists an execution-free System projection Turn. This deliberately
+    /// narrow API cannot be used for agent work: executable Turns must use the
+    /// authority-envelope method below.
+    pub async fn materialize_non_executable_system_turn_start_with_permission_audit(
         &self,
         thread_model: &Thread,
         sandbox_mode: SandboxMode,
         turn_model: &Turn,
         input: &[UserInput],
-        actor: PersistedActorRef,
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     ) -> Result<()> {
-        self.materialize_turn_start_with_reasoning_effort_and_permission_audit(
-            thread_model,
+        if turn_model.mode != pioneer_protocol::ThreadMode::Chat
+            || turn_model.turn_kind != pioneer_protocol::TurnKind::Conversation
+            || !input.is_empty()
+            || turn_model.prompt_manifest.is_some()
+        {
+            bail!("non-executable System Turn violates the projection-only contract");
+        }
+        let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
+            thread: thread_model.clone(),
             sandbox_mode,
-            turn_model,
-            input,
+            turn: turn_model.clone(),
+            input: Vec::new(),
+            actor: Some(PersistedActorRef::System),
+            reasoning_effort: None,
+        });
+        self.materialize_turn_events_atomically_with_optional_admission(
+            vec![
+                started_event,
+                TurnEventPayload::TurnPermissionAudit(audit_event),
+            ],
+            thread_model.updated_at,
             None,
-            actor,
-            audit_event,
-        )
-        .await
-    }
-
-    /// Persists turn/start, explicit reasoning effort, and caller-owned permission audit atomically.
-    pub async fn materialize_turn_start_with_reasoning_effort_and_permission_audit(
-        &self,
-        thread_model: &Thread,
-        sandbox_mode: SandboxMode,
-        turn_model: &Turn,
-        input: &[UserInput],
-        reasoning_effort: Option<&str>,
-        actor: PersistedActorRef,
-        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
-    ) -> Result<()> {
-        self.materialize_turn_start_with_reasoning_effort_permission_audit_and_admission(
-            thread_model,
-            sandbox_mode,
-            turn_model,
-            input,
-            reasoning_effort,
-            actor,
-            audit_event,
+            None,
             None,
         )
         .await
     }
 
-    pub async fn materialize_native_turn_start_with_reasoning_effort_and_permission_audit(
+    /// Persists an execution-capable Turn and its mandatory authority envelope
+    /// in the same database transaction. Runtime draft creation and native
+    /// admission are optional parts of that same write-set.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
         &self,
         thread_model: &Thread,
         sandbox_mode: SandboxMode,
@@ -9195,32 +9528,36 @@ impl CrudStore {
         reasoning_effort: Option<&str>,
         actor: PersistedActorRef,
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
-        admission: NewTurnAdmission,
-    ) -> Result<()> {
-        self.materialize_turn_start_with_reasoning_effort_permission_audit_and_admission(
-            thread_model,
-            sandbox_mode,
-            turn_model,
-            input,
-            reasoning_effort,
-            actor,
-            audit_event,
-            Some(admission),
-        )
-        .await
-    }
-
-    async fn materialize_turn_start_with_reasoning_effort_permission_audit_and_admission(
-        &self,
-        thread_model: &Thread,
-        sandbox_mode: SandboxMode,
-        turn_model: &Turn,
-        input: &[UserInput],
-        reasoning_effort: Option<&str>,
-        actor: PersistedActorRef,
-        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        authority_envelope_json: &str,
+        runtime_draft: Option<AuthorizedTurnRuntimeDraft>,
         admission: Option<NewTurnAdmission>,
     ) -> Result<()> {
+        let authority_envelope_json = authority_envelope_json.trim();
+        if authority_envelope_json.is_empty() {
+            bail!("execution authority envelope must not be empty");
+        }
+        let creation = match runtime_draft {
+            Some(AuthorizedTurnRuntimeDraft::ScopedPrincipal {
+                gateway_id,
+                principal_id,
+                access_class,
+            }) => Some(NewUserThreadCreation {
+                creator: actor.clone(),
+                access_class,
+                member: Some((gateway_id, principal_id)),
+            }),
+            Some(AuthorizedTurnRuntimeDraft::Absolute { access_class }) => {
+                if access_class == PersistedThreadAccessClass::Internal {
+                    bail!("new user execution thread cannot use internal access class");
+                }
+                Some(NewUserThreadCreation {
+                    creator: actor.clone(),
+                    access_class,
+                    member: None,
+                })
+            }
+            None => None,
+        };
         let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
             thread: thread_model.clone(),
             sandbox_mode,
@@ -9229,13 +9566,15 @@ impl CrudStore {
             actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
         });
-        let audit_event = TurnEventPayload::TurnPermissionAudit(audit_event);
-
         self.materialize_turn_events_atomically_with_optional_admission(
-            vec![started_event, audit_event],
+            vec![
+                started_event,
+                TurnEventPayload::TurnPermissionAudit(audit_event),
+            ],
             thread_model.updated_at,
-            None,
+            creation,
             admission,
+            Some((turn_model.id.clone(), authority_envelope_json.to_owned())),
         )
         .await
     }
@@ -9460,6 +9799,7 @@ impl CrudStore {
             thread_model.updated_at,
             Some(creation),
             admission,
+            None,
         )
         .await
     }
@@ -10201,6 +10541,22 @@ impl CrudStore {
         .await
     }
 
+    pub async fn append_task_events_with_execution_admission(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        admission: NewTaskExecutionAdmission,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.run_serialized_write(|| {
+            self.append_task_events_with_execution_admission_once(
+                events.clone(),
+                event_timestamp_secs,
+                admission.clone(),
+            )
+        })
+        .await
+    }
+
     pub async fn append_due_trigger_task_events(
         &self,
         trigger_id: &str,
@@ -10312,6 +10668,53 @@ impl CrudStore {
         task_run_conversation_snapshot::find_by_run(&self.connection, run_id).await
     }
 
+    pub async fn get_task_execution_admission(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskExecutionAdmissionRecord>> {
+        task_execution_admission::find_by_task(&self.connection, task_id).await
+    }
+
+    /// Reconciles durable quota leases after restart. Admission and terminal
+    /// release are normally committed with their subject event, while this
+    /// pass closes legacy/crash leftovers idempotently before schedulers run.
+    pub async fn reconcile_execution_admission_leases(&self) -> Result<usize> {
+        let leases = execution_admission_lease::list_active(&self.connection).await?;
+        let released_at = chrono::Utc::now().fixed_offset();
+        let mut released = 0usize;
+        for lease in leases {
+            let terminal_or_missing = match lease.subject_kind.as_str() {
+                "turn" => pioneer_entity::turn::Entity::find_by_id(lease.subject_id.clone())
+                    .one(&self.connection)
+                    .await?
+                    .is_none_or(|turn| {
+                        turn_status_from_db(turn.status.as_str())
+                            .is_none_or(|status| status != TurnStatus::InProgress)
+                    }),
+                "task" => pioneer_entity::task::Entity::find_by_id(lease.subject_id.clone())
+                    .one(&self.connection)
+                    .await?
+                    .is_none_or(|task| {
+                        task_status_from_db(task.status.as_str())
+                            .is_none_or(|status| status.is_terminal())
+                    }),
+                _ => true,
+            };
+            if terminal_or_missing
+                && execution_admission_lease::release_by_subject(
+                    &self.connection,
+                    lease.subject_kind.as_str(),
+                    lease.subject_id.as_str(),
+                    released_at,
+                )
+                .await?
+            {
+                released = released.saturating_add(1);
+            }
+        }
+        Ok(released)
+    }
+
     pub async fn delete_task_run_conversation_snapshot(&self, run_id: &str) -> Result<u64> {
         self.run_serialized_write(|| {
             task_run_conversation_snapshot::delete_by_run(&self.connection, run_id)
@@ -10323,18 +10726,55 @@ impl CrudStore {
         self.list_tasks_scoped(params, None).await
     }
 
+    /// Lists the bounded Task set causally created by one exact Turn. Task
+    /// ownership is intentionally absent from this lookup: owner is actor
+    /// provenance/quota attribution, while the creating Turn is the durable
+    /// parent-turn lifecycle boundary.
+    pub async fn list_tasks_created_by_turn(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        limit: u64,
+    ) -> Result<Vec<Task>> {
+        task_repository::list_tasks_by_creator_turn(
+            &self.connection,
+            workspace_id,
+            thread_id,
+            turn_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(task_from_db_model)
+        .collect()
+    }
+
     pub async fn list_tasks_scoped(
         &self,
         params: TaskListParams,
         access: Option<&TaskRootAccessFilter>,
     ) -> Result<Vec<Task>> {
         let limit = params.limit.map(u64::from);
+        let offset = params.cursor;
         let rows = if let Some(parent_task_id) = params.parent_task_id.as_deref() {
-            task_repository::list_tasks_by_parent_scoped(&self.connection, parent_task_id, access)
-                .await?
+            task_repository::list_tasks_by_parent_scoped(
+                &self.connection,
+                parent_task_id,
+                access,
+                limit,
+                offset,
+            )
+            .await?
         } else if let Some(root_task_id) = params.root_task_id.as_deref() {
-            task_repository::list_tasks_by_root_scoped(&self.connection, root_task_id, access)
-                .await?
+            task_repository::list_tasks_by_root_scoped(
+                &self.connection,
+                root_task_id,
+                access,
+                limit,
+                offset,
+            )
+            .await?
         } else if let Some(owner_kind) = params.owner_kind {
             let owner_kind = task_owner_kind_to_db(owner_kind);
             task_repository::list_tasks_by_owner_scoped(
@@ -10343,6 +10783,7 @@ impl CrudStore {
                 owner_kind,
                 params.owner_id.as_deref(),
                 limit,
+                offset,
                 access,
             )
             .await?
@@ -10353,6 +10794,7 @@ impl CrudStore {
                 params.workspace_id.as_str(),
                 status,
                 limit,
+                offset,
                 access,
             )
             .await?
@@ -10362,6 +10804,14 @@ impl CrudStore {
     }
 
     pub async fn get_task_tree(&self, task_id: &str) -> Result<Option<TaskTree>> {
+        self.get_task_tree_bounded(task_id, usize::MAX).await
+    }
+
+    pub async fn get_task_tree_bounded(
+        &self,
+        task_id: &str,
+        max_nodes: usize,
+    ) -> Result<Option<TaskTree>> {
         let Some(root_model) = task_repository::find_task_by_id(&self.connection, task_id).await?
         else {
             return Ok(None);
@@ -10370,6 +10820,9 @@ impl CrudStore {
         let mut task_models = vec![root_model.clone()];
         let mut child_models =
             task_repository::list_tasks_by_root(&self.connection, task_id).await?;
+        if child_models.len().saturating_add(1) > max_nodes {
+            anyhow::bail!("task tree exceeds server node budget of {max_nodes}");
+        }
         task_models.append(&mut child_models);
 
         let task_ids = task_models
@@ -10455,7 +10908,37 @@ impl CrudStore {
         after_sequence: Option<i64>,
     ) -> Result<TaskEventsResponse> {
         let rows =
-            task_event::list_events_for_task(&self.connection, task_id, after_sequence).await?;
+            task_event::list_events_for_task(&self.connection, task_id, after_sequence, None)
+                .await?;
+        let mut events = Vec::with_capacity(rows.len());
+        let mut last_sequence = after_sequence.unwrap_or(0);
+        for row in rows {
+            last_sequence = row.sequence;
+            events.push(task_event::task_event_from_model(row)?);
+        }
+        Ok(TaskEventsResponse {
+            task_id: task_id.to_owned(),
+            events,
+            last_sequence,
+            has_more: false,
+        })
+    }
+
+    pub async fn get_task_events_page(
+        &self,
+        task_id: &str,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> Result<TaskEventsResponse> {
+        let mut rows = task_event::list_events_for_task(
+            &self.connection,
+            task_id,
+            after_sequence,
+            Some(limit.saturating_add(1) as u64),
+        )
+        .await?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
         let mut events = Vec::with_capacity(rows.len());
         let mut last_sequence = after_sequence.unwrap_or(0);
 
@@ -10468,6 +10951,7 @@ impl CrudStore {
             task_id: task_id.to_owned(),
             events,
             last_sequence,
+            has_more,
         })
     }
 
@@ -10477,7 +10961,7 @@ impl CrudStore {
         after_sequence: i64,
     ) -> Result<Vec<AppendedTaskEvent>> {
         let rows =
-            task_event::list_events_for_task(&self.connection, task_id, Some(after_sequence))
+            task_event::list_events_for_task(&self.connection, task_id, Some(after_sequence), None)
                 .await?;
         let mut events = Vec::with_capacity(rows.len());
 
@@ -11629,7 +12113,12 @@ impl CrudStore {
                     parent_task_id: None,
                     root_task_id: None,
                     status: None,
-                    limit: None,
+                    // Agenda is an external observation page. Bound the
+                    // candidate materialization before the per-task trigger,
+                    // run and delivery lookups rather than truncating only
+                    // after the N-query enrichment loop.
+                    limit: Some(limit),
+                    cursor: None,
                 },
                 access,
             )
@@ -12725,6 +13214,17 @@ impl CrudStore {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<Option<TurnItemsResponse>> {
+        self.get_turn_item_events_page(thread_id, turn_id, None, 200)
+            .await
+    }
+
+    pub async fn get_turn_item_events_page(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> Result<Option<TurnItemsResponse>> {
         let Some(thread_model) = thread::find_thread_by_id(&self.connection, thread_id).await?
         else {
             return Ok(None);
@@ -12732,11 +13232,19 @@ impl CrudStore {
 
         let workspace_id = thread_model.workspace_id;
 
-        let events_rows =
-            turn_event::list_events_for_turn(&self.connection, thread_id, turn_id).await?;
+        let mut events_rows = turn_event::list_events_for_turn(
+            &self.connection,
+            thread_id,
+            turn_id,
+            after_sequence,
+            Some(limit.saturating_add(1) as u64),
+        )
+        .await?;
+        let has_more = events_rows.len() > limit;
+        events_rows.truncate(limit);
 
         let mut events = Vec::new();
-        let mut last_sequence = 0i64;
+        let mut last_sequence = after_sequence.unwrap_or(0);
         let mut latest_agent_diff_payload_by_item_id = HashMap::<String, String>::new();
 
         for row in events_rows {
@@ -12959,16 +13467,22 @@ impl CrudStore {
             });
         }
 
-        append_agent_diff_snapshot_turn_item_events(
-            &self.connection,
-            &mut events,
-            &latest_agent_diff_payload_by_item_id,
-            workspace_id.as_str(),
-            thread_id,
-            turn_id,
-            last_sequence,
-        )
-        .await?;
+        // Snapshot-only diff rows are appended exactly once, after the durable
+        // event cursor reaches the final page. Appending them to every page
+        // would duplicate the latest diff during incremental replay and could
+        // make a sequence cursor cycle forever.
+        if !has_more {
+            append_agent_diff_snapshot_turn_item_events(
+                &self.connection,
+                &mut events,
+                &latest_agent_diff_payload_by_item_id,
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                last_sequence,
+            )
+            .await?;
+        }
 
         Ok(Some(TurnItemsResponse {
             thread_id: thread_id.to_owned(),
@@ -12976,6 +13490,8 @@ impl CrudStore {
             turn_id: turn_id.to_owned(),
             events,
             last_sequence,
+            has_more,
+            next_cursor: has_more.then_some(last_sequence),
         }))
     }
 
@@ -19217,6 +19733,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             event_timestamp_secs,
             None,
             None,
+            None,
         )
         .await
     }
@@ -19227,6 +19744,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         event_timestamp_secs: i64,
         creation: Option<NewUserThreadCreation>,
         admission: Option<NewTurnAdmission>,
+        authority_envelope: Option<(String, String)>,
     ) -> Result<()> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let claim_expires_at =
@@ -19239,6 +19757,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 claim_expires_at,
                 creation.clone(),
                 admission.clone(),
+                authority_envelope.clone(),
             )
         })
         .await
@@ -19255,6 +19774,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             event_timestamp_secs,
             Some(creation),
             None,
+            None,
         )
         .await
     }
@@ -19266,6 +19786,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         claim_expires_at: DateTimeWithTimeZone,
         creation: Option<NewUserThreadCreation>,
         admission: Option<NewTurnAdmission>,
+        authority_envelope: Option<(String, String)>,
     ) -> Result<()> {
         let transaction = self
             .connection
@@ -19302,6 +19823,18 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         {
             let _ = transaction.rollback().await;
             return Err(error);
+        }
+
+        if let Some((turn_id, authority_envelope_json)) = authority_envelope
+            && !turn::set_turn_execution_authorization_context(
+                &transaction,
+                turn_id.as_str(),
+                authority_envelope_json.as_str(),
+            )
+            .await?
+        {
+            let _ = transaction.rollback().await;
+            bail!("execution Turn disappeared while persisting its authority envelope");
         }
 
         transaction
@@ -19381,6 +19914,20 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .project(transaction, &appended_event)
             .await
             .context("failed to project turn event to read models")?;
+        if matches!(
+            &event,
+            TurnEventPayload::TurnCompleted(_)
+                | TurnEventPayload::TurnFailed(_)
+                | TurnEventPayload::TurnBlocked(_)
+        ) {
+            execution_admission_lease::release_by_subject(
+                transaction,
+                "turn",
+                appended_event.turn_id.as_str(),
+                created_at,
+            )
+            .await?;
+        }
         crate::timeline_live_projection::project_semantic_timeline_live_turn_event(
             transaction,
             &appended_event,
@@ -19537,6 +20084,22 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .project(&transaction, &appended_event)
             .await
             .context("failed to project turn event to read models")
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+        if matches!(
+            &appended_event.payload,
+            TurnEventPayload::TurnCompleted(_)
+                | TurnEventPayload::TurnFailed(_)
+                | TurnEventPayload::TurnBlocked(_)
+        ) && let Err(error) = execution_admission_lease::release_by_subject(
+            &transaction,
+            "turn",
+            appended_event.turn_id.as_str(),
+            projected_at,
+        )
+        .await
         {
             let _ = transaction.rollback().await;
             return Err(error);
@@ -19974,6 +20537,41 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         Ok(appended_events)
     }
 
+    async fn append_task_events_with_execution_admission_once(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        admission: NewTaskExecutionAdmission,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin Task creation admission transaction")?;
+        let result = async {
+            let appended_events = self
+                .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
+                .await?;
+            task_execution_admission::insert_immutable(&transaction, admission).await?;
+            Ok(appended_events)
+        }
+        .await;
+
+        match result {
+            Ok(appended_events) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit Task creation admission transaction")?;
+                Ok(appended_events)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     async fn append_due_trigger_task_events_once(
         &self,
         trigger_id: String,
@@ -20053,6 +20651,21 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     .project(db, &appended_event)
                     .await
                     .context("failed to project task event to read models")?;
+                if matches!(
+                    &event,
+                    TaskEventPayload::TaskCompleted { .. }
+                        | TaskEventPayload::TaskFailed { .. }
+                        | TaskEventPayload::TaskBlocked { .. }
+                        | TaskEventPayload::TaskCancelled { .. }
+                ) {
+                    execution_admission_lease::release_by_subject(
+                        db,
+                        "task",
+                        appended_event.task_id.as_str(),
+                        created_at,
+                    )
+                    .await?;
+                }
                 task_event::initialize_fanout_cursor(
                     db,
                     appended_event.task_id.as_str(),
@@ -20167,7 +20780,7 @@ async fn latest_agent_diff_raw_payload_for_item<C: ConnectionTrait>(
     turn_id: &str,
     item_id: &str,
 ) -> Result<Option<String>> {
-    let rows = turn_event::list_events_for_turn(db, thread_id, turn_id).await?;
+    let rows = turn_event::list_events_for_turn(db, thread_id, turn_id, None, None).await?;
     let mut latest_payload = None;
 
     for row in rows {
@@ -21416,27 +22029,27 @@ mod tests {
         PersistedActorRef, PrincipalId, PromptManifest, PromptManifestDiagnostic,
         PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
         PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-        PromptManifestProfile, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
-        SkillId, SkillPackId, SystemEventLevel, Task, TaskAgentPrompt, TaskAgentResultContract,
-        TaskAgentResultFormat, TaskAgentSpec, TaskExecutorKind, TaskMetadata, TaskOwnerKind,
-        TaskResult, TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
-        TaskResultReviewEvent, TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun,
-        TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-        TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger,
-        TaskTriggerSpec, TaskTriggerStatus, TaskValue, Thread, ThreadEpisodicSourceContext,
-        ThreadHistoryEventPayload, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
-        ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolLoopBudgetAction,
-        ToolLoopBudgetLimitKind, ToolMetadata, ToolOutputPolicySnapshot,
-        ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot,
-        ToolRecoveryRetryClass, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
-        ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,
-        TurnBlockedResumeMetadata, TurnCompletedNotification, TurnExecutionSecuritySnapshot,
-        TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-        TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-        TurnFilesystemAccess, TurnFilesystemSandboxEntry, TurnItem, TurnItemEventPayload,
-        TurnItemTimeoutReason, TurnItemType, TurnKind, TurnMention, TurnOrigin,
-        TurnPermissionAuditEventKind, TurnPermissionMode, TurnPermissionProfileSnapshot,
-        TurnPermissionProfileSource, TurnSandboxMode, TurnStatus,
+        PromptManifestProfile, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, RoleKey,
+        SandboxMode, SkillId, SkillPackId, SystemEventLevel, Task, TaskAgentPrompt,
+        TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec, TaskExecutorKind,
+        TaskMetadata, TaskOwnerKind, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+        TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
+        TaskResultReviewerKind, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
+        TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+        TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec, TaskTriggerStatus,
+        TaskValue, Thread, ThreadEpisodicSourceContext, ThreadHistoryEventPayload, ThreadMode,
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
+        ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
+        ToolOutputPolicySnapshot, ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode,
+        ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind,
+        ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind, ToolRetryResolution,
+        ToolStoragePayload, Turn, TurnBlockedResumeMetadata, TurnCompletedNotification,
+        TurnExecutionSecuritySnapshot, TurnExecutionWindowCheckpointedNotification,
+        TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+        TurnExecutionWindowStartedNotification, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
+        TurnItem, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnKind, TurnMention,
+        TurnOrigin, TurnPermissionAuditEventKind, TurnPermissionMode,
+        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSandboxMode, TurnStatus,
         TurnToolLoopBudgetExceededNotification, UserInput, generate_id,
     };
     use sea_orm::{
@@ -21445,14 +22058,35 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    const NATIVE_DELIVERY_MIGRATION: &str = "m20260805_000001_native_durable_delivery";
+    const ATOMIC_TERMINALIZATION_MIGRATION: &str = "m20260806_000001_atomic_turn_terminalization";
+
+    fn migrations_before(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
+        let migrations = Migrator::migrations();
+        assert!(
+            migrations.iter().any(|migration| migration.name() == name),
+            "target migration {name} must remain registered"
+        );
+        migrations
+            .into_iter()
+            .take_while(|migration| migration.name() != name)
+            .collect()
+    }
+
+    fn rollback_steps_through(name: &str) -> u32 {
+        let offset_from_latest = Migrator::migrations()
+            .iter()
+            .rev()
+            .position(|migration| migration.name() == name)
+            .unwrap_or_else(|| panic!("target migration {name} must remain registered"));
+        u32::try_from(offset_from_latest + 1).expect("migration rollback step count must fit u32")
+    }
+
     struct PreNativeDeliveryMigrator;
 
     impl MigratorTrait for PreNativeDeliveryMigrator {
         fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-            let mut migrations = Migrator::migrations();
-            migrations.pop();
-            migrations.pop();
-            migrations
+            migrations_before(NATIVE_DELIVERY_MIGRATION)
         }
     }
 
@@ -21460,9 +22094,7 @@ mod tests {
 
     impl MigratorTrait for PreAtomicTerminalizationMigrator {
         fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-            let mut migrations = Migrator::migrations();
-            migrations.pop();
-            migrations
+            migrations_before(ATOMIC_TERMINALIZATION_MIGRATION)
         }
     }
 
@@ -21678,9 +22310,12 @@ mod tests {
                 .is_some()
         );
 
-        Migrator::down(&connection, Some(2))
-            .await
-            .expect("native delivery rollback must succeed");
+        Migrator::down(
+            &connection,
+            Some(rollback_steps_through(NATIVE_DELIVERY_MIGRATION)),
+        )
+        .await
+        .expect("native delivery rollback must succeed");
         assert!(
             connection
                 .query_one_raw(Statement::from_string(
@@ -21726,9 +22361,12 @@ mod tests {
             );
         }
 
-        Migrator::down(&connection, Some(1))
-            .await
-            .expect("atomic terminalization rollback must succeed");
+        Migrator::down(
+            &connection,
+            Some(rollback_steps_through(ATOMIC_TERMINALIZATION_MIGRATION)),
+        )
+        .await
+        .expect("atomic terminalization rollback must succeed");
         for table_name in [
             "turn_admission",
             "turn_finalization",
@@ -24383,7 +25021,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeline_approval_scope_filters_before_pagination_and_anchor_lookup() {
+    async fn authorized_pending_request_capacity_is_atomic_under_concurrency() {
+        let store = test_store_with_workspace("ws_cli_pending_capacity").await;
+        let created_at = unix_to_datetime(1_700_020_400);
+        let request = |request_id: &str| NewCliRuntimePendingRequest {
+            request_id: request_id.to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            workspace_id: "ws_cli_pending_capacity".to_owned(),
+            thread_id: "thread_cli_pending_capacity".to_owned(),
+            turn_id: Some("turn_cli_pending_capacity".to_owned()),
+            native_thread_id: Some("codex-thread-capacity".to_owned()),
+            native_turn_id: Some("codex-turn-capacity".to_owned()),
+            native_item_id: Some(request_id.to_owned()),
+            request_kind: "command_approval".to_owned(),
+            payload_json: "{}".to_owned(),
+            created_at,
+            updated_at: created_at,
+        };
+        let authorization = CliRuntimeRequestAuthorizationBinding {
+            initiating_principal_id: "P00000000000000000001".to_owned(),
+            initiating_session_id: "S00000000000000000001".to_owned(),
+            initiating_session_generation: 0,
+            authorization_context_fingerprint: "f".repeat(64),
+        };
+
+        let first = store.open_cli_runtime_pending_request_with_authorization(
+            request("capacity-request-a"),
+            authorization.clone(),
+            1,
+        );
+        let second = store.open_cli_runtime_pending_request_with_authorization(
+            request("capacity-request-b"),
+            authorization,
+            1,
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "exactly one concurrent request may reserve the final interaction slot"
+        );
+        let open = store
+            .list_cli_runtime_pending_requests(CliRuntimePendingRequestListFilter {
+                turn_id: Some("turn_cli_pending_capacity".to_owned()),
+                open_only: true,
+                limit: Some(8),
+                ..Default::default()
+            })
+            .await
+            .expect("bounded pending request list should succeed");
+        assert_eq!(open.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn timeline_approval_action_filters_before_pagination_and_anchor_lookup() {
         let workspace_id = "ws_timeline_approval";
         let thread_id = "T".repeat(21);
         let owner_principal_id = "P".repeat(21);
@@ -24428,6 +25120,7 @@ mod tests {
                         initiating_session_generation: 0,
                         authorization_context_fingerprint: "a".repeat(64),
                     },
+                    8,
                 )
                 .await
                 .expect("authorized pending request should persist");
@@ -24475,50 +25168,73 @@ mod tests {
             .expect("timeline block should persist");
         }
 
-        let approval_scope = ThreadTimelineApprovalScope {
-            initiating_principal_id: owner_principal_id,
-            initiating_session_id: owner_session_id,
+        let observer_scope = ThreadTimelineApprovalScope {
+            can_observe_agent_requests: true,
         };
-        let page = store
+        let observer_page = store
             .list_thread_timeline_projection_page(
                 thread_id.as_str(),
-                Some(&approval_scope),
+                Some(&observer_scope),
                 ProjectionPageAnchor::Start,
                 2,
             )
             .await
-            .expect("scoped timeline page should load");
+            .expect("observer timeline page should load");
         assert_eq!(
-            page.into_iter().map(|row| row.block_id).collect::<Vec<_>>(),
+            observer_page
+                .into_iter()
+                .map(|row| row.block_id)
+                .collect::<Vec<_>>(),
             vec![
+                "approval-block-other".to_owned(),
                 "ordinary-shared-block".to_owned(),
-                "approval-block-owner".to_owned(),
             ],
-            "a foreign approval must be removed in SQL before LIMIT is applied"
+            "a collaborator with AgentRequestObserve sees approvals from every initiator"
         );
         assert!(
             store
                 .find_thread_timeline_projection_block_by_sort_key(
                     thread_id.as_str(),
-                    Some(&approval_scope),
+                    Some(&observer_scope),
                     "000-other",
                 )
                 .await
-                .expect("foreign anchor lookup should succeed")
-                .is_none(),
-            "a foreign approval must not be usable as a Member cursor anchor"
+                .expect("collaborative approval anchor lookup should succeed")
+                .is_some(),
+            "an approval from another initiator remains part of the shared capsule"
+        );
+
+        let reader_scope = ThreadTimelineApprovalScope {
+            can_observe_agent_requests: false,
+        };
+        let reader_page = store
+            .list_thread_timeline_projection_page(
+                thread_id.as_str(),
+                Some(&reader_scope),
+                ProjectionPageAnchor::Start,
+                2,
+            )
+            .await
+            .expect("narrow reader timeline page should load");
+        assert_eq!(
+            reader_page
+                .into_iter()
+                .map(|row| row.block_id)
+                .collect::<Vec<_>>(),
+            vec!["ordinary-shared-block".to_owned()],
+            "approval rows must be removed in SQL before LIMIT is applied"
         );
         assert!(
             store
                 .find_thread_timeline_projection_block_by_sort_key(
                     thread_id.as_str(),
-                    Some(&approval_scope),
+                    Some(&reader_scope),
                     "002-owner",
                 )
                 .await
-                .expect("owner anchor lookup should succeed")
-                .is_some(),
-            "the initiating session must retain its own approval anchor"
+                .expect("narrow reader anchor lookup should succeed")
+                .is_none(),
+            "a role without AgentRequestObserve cannot use an approval as a cursor anchor"
         );
     }
 
@@ -32902,7 +33618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_turn_start_with_permission_audit_projects_both_events_atomically() {
+    async fn materialize_non_executable_system_turn_projects_both_events_atomically() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -32971,13 +33687,35 @@ mod tests {
             cached: false,
         };
 
+        let mut executable_turn = turn.clone();
+        executable_turn.id = "turn_contextless_execution_rejected".to_owned();
+        executable_turn.mode = ThreadMode::Agent;
+        let mut executable_audit = audit.clone();
+        executable_audit.turn_id = executable_turn.id.clone();
         store
-            .materialize_turn_start_with_permission_audit(
+            .materialize_non_executable_system_turn_start_with_permission_audit(
+                &thread,
+                SandboxMode::FullAccess,
+                &executable_turn,
+                &[],
+                executable_audit,
+            )
+            .await
+            .expect_err("an execution-capable Turn must require an authority envelope");
+        assert!(
+            pioneer_entity::turn::Entity::find_by_id(executable_turn.id)
+                .one(&connection)
+                .await
+                .expect("rejected Turn lookup should succeed")
+                .is_none()
+        );
+
+        store
+            .materialize_non_executable_system_turn_start_with_permission_audit(
                 &thread,
                 SandboxMode::FullAccess,
                 &turn,
                 &[],
-                pioneer_protocol::PersistedActorRef::System,
                 audit,
             )
             .await
@@ -33024,20 +33762,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_turn_admission_failure_rolls_back_started_event_and_projection() {
+    async fn stale_policy_generation_rolls_back_started_event_and_projection() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
         Migrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
-        connection
-            .execute_unprepared(
-                "CREATE TRIGGER reject_native_turn_admission BEFORE INSERT ON turn_admission \
-                 BEGIN SELECT RAISE(FAIL, 'injected admission failure'); END",
-            )
-            .await
-            .expect("fault trigger should install");
+        let changed = crate::append_authorization_change(
+            &connection,
+            pioneer_protocol::AuthorizationChangeKind::RolePolicy,
+            pioneer_protocol::AuthorizationChangeScope::Role {
+                role_key: pioneer_protocol::RoleKey::member(),
+            },
+        )
+        .await
+        .expect("policy revoke must advance generation");
+        assert_eq!(changed.policy_generation.get(), 2);
         let store = CrudStore::new(connection.clone());
         let timestamp = 1_700_000_000;
         let thread = Thread {
@@ -33096,7 +33837,7 @@ mod tests {
         };
 
         store
-            .materialize_native_turn_start_with_reasoning_effort_and_permission_audit(
+            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
                 &thread,
                 SandboxMode::FullAccess,
                 &turn,
@@ -33104,15 +33845,21 @@ mod tests {
                 None,
                 pioneer_protocol::PersistedActorRef::System,
                 audit,
-                crate::NewTurnAdmission {
+                r#"{"kind":"test_explicit_authority"}"#,
+                None,
+                Some(crate::NewTurnAdmission {
                     turn_id: turn.id.clone(),
                     thread_id: thread.id.clone(),
                     workspace_id: thread.workspace_id.clone(),
                     request_digest: "a".repeat(64),
-                },
+                    policy_generation: Some(1),
+                    role_key: Some("member".to_owned()),
+                    policy_fingerprint: Some("a".repeat(64)),
+                    execution_lease: None,
+                }),
             )
             .await
-            .expect_err("injected admission failure must abort the whole batch");
+            .expect_err("stale policy admission must abort the whole batch");
 
         assert!(
             pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
@@ -33791,6 +34538,7 @@ mod tests {
             NewMemberPrincipalRow {
                 id: member_id.clone(),
                 gateway_id: gateway_id.clone(),
+                role_key: RoleKey::member(),
                 display_name: "Member".to_owned(),
                 nickname: "member".to_owned(),
                 nickname_key: "member".to_owned(),

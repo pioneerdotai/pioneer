@@ -9,8 +9,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::blocking::{Client as BlockingClient, Response as BlockingResponse};
 use reqwest::redirect::Policy as RedirectPolicy;
-use std::fs;
+use std::fs::File;
 use std::io::Read;
+use std::net::SocketAddr;
 use std::time::Duration;
 use url::Url;
 
@@ -27,6 +28,7 @@ pub fn resolve_attachment_source(
     attachment: &MessageAttachment,
     _kind: InputContentType,
     config: &AttachmentPipelineConfig,
+    source_limit: usize,
 ) -> Result<ResolvedAttachmentSource> {
     let resolved = match &attachment.source {
         AttachmentDataSource::Bytes { base64_data } => {
@@ -41,10 +43,10 @@ pub fn resolve_attachment_source(
             }
 
             let estimated_size = estimate_decoded_base64_size(normalized_base64.as_str());
-            if estimated_size > config.max_bytes_per_attachment {
+            if estimated_size > source_limit {
                 return Err(AttachmentPipelineError::attachment_too_large(
                     estimated_size,
-                    config.max_bytes_per_attachment,
+                    source_limit,
                     "base64_payload",
                 )
                 .into());
@@ -62,12 +64,7 @@ pub fn resolve_attachment_source(
         }
         AttachmentDataSource::Path { path } => {
             let canonical = security::canonicalize_path(provider_name, path, &config.security)?;
-            let loaded = fs::read(canonical.as_path()).with_context(|| {
-                format!(
-                    "failed to read attachment path `{}`",
-                    canonical.as_path().display()
-                )
-            })?;
+            let loaded = read_file_limited(canonical.as_path(), source_limit)?;
             let source_name = canonical
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -88,6 +85,7 @@ pub fn resolve_attachment_source(
                 parsed.as_str(),
                 attachment.mime_type.as_str(),
                 config,
+                source_limit,
             )?;
             let source_name = parsed
                 .path_segments()
@@ -124,6 +122,35 @@ pub fn resolve_attachment_source(
     Ok(resolved)
 }
 
+fn read_file_limited(path: &std::path::Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open attachment path `{}`", path.display()))?;
+    if let Ok(metadata) = file.metadata()
+        && metadata.is_file()
+        && metadata.len() > max_bytes as u64
+    {
+        return Err(AttachmentPipelineError::attachment_too_large(
+            usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+            max_bytes,
+            path.display().to_string().as_str(),
+        )
+        .into());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read attachment path `{}`", path.display()))?;
+    if bytes.len() > max_bytes {
+        return Err(AttachmentPipelineError::attachment_too_large(
+            bytes.len(),
+            max_bytes,
+            path.display().to_string().as_str(),
+        )
+        .into());
+    }
+    Ok(bytes)
+}
+
 fn compact_base64(value: &str) -> String {
     value
         .chars()
@@ -136,24 +163,44 @@ fn fetch_url_attachment(
     raw_url: &str,
     expected_mime: &str,
     config: &AttachmentPipelineConfig,
+    source_limit: usize,
 ) -> Result<Vec<u8>> {
-    let client = build_blocking_client(config.security.url_fetch_timeout_ms)?;
     let mut current_url =
         security::parse_and_validate_url(provider_name, raw_url, &config.security)?;
     let expected_mime = normalize_mime(expected_mime)?;
 
     for redirect_index in 0..=config.security.max_url_redirects {
         security::validate_url(provider_name, &current_url, &config.security)?;
-
-        let operation_key = format!(
-            "url_fetch:{}:{}",
+        let host = current_url
+            .host_str()
+            .ok_or_else(|| AttachmentPipelineError::url_source_blocked("URL host is missing"))?;
+        let pinned_addresses = security::resolve_and_validate_host_addresses(
             provider_name,
-            current_url.host_str().unwrap_or("unknown")
+            host,
+            current_url.port_or_known_default(),
+            &config.security,
+        )?;
+        let client = build_blocking_client(
+            config.security.url_fetch_timeout_ms,
+            host,
+            pinned_addresses.as_slice(),
+        )?;
+
+        let endpoint_identity = format!(
+            "{}://{}:{}",
+            current_url.scheme(),
+            current_url.host_str().unwrap_or("unknown"),
+            current_url.port_or_known_default().unwrap_or_default(),
+        );
+        let operation_authority = runtime::AttachmentOperationAuthority::new(
+            runtime::current_authority_fingerprint()?,
+            "url_fetch",
+            endpoint_identity,
         );
         let response = match runtime::execute_with_retry_blocking(
             provider_name,
             "url_fetch",
-            operation_key.as_str(),
+            &operation_authority,
             &config.runtime,
             |_| send_url_request(&client, &current_url),
         ) {
@@ -171,6 +218,17 @@ fn fetch_url_attachment(
                 return Err(error);
             }
         };
+        let peer = response.remote_addr().ok_or_else(|| {
+            AttachmentPipelineError::url_source_blocked(
+                "attachment fetch did not expose its connected peer",
+            )
+        })?;
+        security::validate_connected_peer(
+            provider_name,
+            peer,
+            pinned_addresses.as_slice(),
+            &config.security,
+        )?;
 
         if response.status().is_redirection() {
             if redirect_index >= config.security.max_url_redirects {
@@ -196,14 +254,24 @@ fn fetch_url_attachment(
             continue;
         }
 
+        let response_limit = config.security.url_fetch_max_bytes.min(source_limit);
+        if let Some(content_length) = response.content_length()
+            && content_length > response_limit as u64
+        {
+            return Err(AttachmentPipelineError::url_fetch_budget_exceeded(response_limit).into());
+        }
+
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_default();
+            let diagnostic_limit = response_limit.min(16 * 1024);
+            let body = read_response_limited(response, diagnostic_limit)?;
+            let body = String::from_utf8_lossy(&body);
+            let body_preview = body.chars().take(4_096).collect::<String>();
             return Err(anyhow!(
                 "URL fetch failed for `{}` with status {}: {}",
                 current_url,
                 status,
-                body
+                body_preview
             ));
         }
 
@@ -216,7 +284,7 @@ fn fetch_url_attachment(
             config,
         )?;
 
-        return read_response_limited(response, config.security.url_fetch_max_bytes);
+        return read_response_limited(response, response_limit);
     }
 
     Err(AttachmentPipelineError::url_redirect_blocked(format!(
@@ -298,10 +366,16 @@ fn classify_reqwest_error(error: reqwest::Error) -> AttachmentOperationError {
     AttachmentOperationError::non_retryable(error)
 }
 
-fn build_blocking_client(timeout_ms: u64) -> Result<BlockingClient> {
+fn build_blocking_client(
+    timeout_ms: u64,
+    host: &str,
+    pinned_addresses: &[SocketAddr],
+) -> Result<BlockingClient> {
     BlockingClient::builder()
         .timeout(Duration::from_millis(timeout_ms.max(1)))
         .redirect(RedirectPolicy::none())
+        .no_proxy()
+        .resolve_to_addrs(host, pinned_addresses)
         .build()
         .context("failed to build blocking HTTP client for attachment URL fetch")
 }

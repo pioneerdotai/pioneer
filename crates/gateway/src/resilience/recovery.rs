@@ -497,6 +497,7 @@ pub struct RecoveryCoordinator {
     policy_registry: RecoveryPolicyRegistry,
     tool_loop_config: ToolLoopConfig,
     authorization_invalidation_hub: Arc<crate::authorization::AuthorizationInvalidationHub>,
+    execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
 }
 
@@ -696,14 +697,16 @@ impl RecoveryCoordinator {
         policy_registry: RecoveryPolicyRegistry,
         tool_loop_config: ToolLoopConfig,
     ) -> Self {
+        let authorization_invalidation_hub = Arc::new(
+            crate::authorization::AuthorizationInvalidationHub::durable(crud_store.clone()),
+        );
         Self {
             crud_store,
             agent_manager,
             policy_registry,
             tool_loop_config,
-            authorization_invalidation_hub: Arc::new(
-                crate::authorization::AuthorizationInvalidationHub::default(),
-            ),
+            authorization_invalidation_hub,
+            execution_leases: Arc::new(crate::authorization::ExecutionLeaseRegistry::default()),
             listener_starter: Arc::new(RwLock::new(None)),
         }
     }
@@ -728,6 +731,14 @@ impl RecoveryCoordinator {
         hub: Arc<crate::authorization::AuthorizationInvalidationHub>,
     ) -> Self {
         self.authorization_invalidation_hub = hub;
+        self
+    }
+
+    pub(crate) fn with_execution_leases(
+        mut self,
+        execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
+    ) -> Self {
+        self.execution_leases = execution_leases;
         self
     }
 
@@ -2813,31 +2824,25 @@ impl RecoveryCoordinator {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<()> {
-        let Some(encoded) = self
-            .crud_store
-            .get_turn_execution_authorization_context(turn_id)
-            .await?
-        else {
-            crate::authorization::ensure_contextless_execution_is_trusted(
-                self.crud_store.as_ref(),
-                turn_id,
-            )
-            .await
-            .context("contextless recovery turn is not a trusted legacy execution")?;
-            return Ok(());
-        };
-        let context = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
-            encoded.as_str(),
+        let context = crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+            self.crud_store.as_ref(),
+            turn_id,
         )
-        .context("failed to decode persisted execution authorization")?;
-        let revalidated = context
-            .revalidate_for_turn_scope(
+        .await
+        .context("failed to load persisted execution authorization")?;
+        let revalidated = self
+            .execution_leases
+            .revalidate_for_turn(
                 self.crud_store.as_ref(),
+                &context,
                 workspace_id,
                 thread_id,
                 turn_id,
-                crate::authorization::ResourceAction::ThreadWrite,
-                self.authorization_invalidation_hub.current_revision(),
+                crate::authorization::ResourceAction::AgentTurnStart,
+                self.authorization_invalidation_hub
+                    .current_revision()
+                    .await
+                    .context("recovery policy generation is unavailable")?,
             )
             .await
             .context("current execution authorization no longer permits recovery")?;
@@ -2864,7 +2869,9 @@ impl RecoveryCoordinator {
                 .context("persisted recovery skill projection is stale or unbound")?;
         }
 
-        if revalidated.principal().kind == pioneer_protocol::PrincipalKind::User {
+        if revalidated.resource_boundary()
+            == crate::authorization::ExecutionResourceBoundary::RootThreadCapsule
+        {
             let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
                 revalidated.principal().kind,
                 revalidated.principal().role_key.as_ref(),
@@ -4299,7 +4306,7 @@ mod tests {
         ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig,
         ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, EntityTrait, Set};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -4733,6 +4740,7 @@ mod tests {
             .await
             .expect("migrations must succeed");
         let crud_store = Arc::new(CrudStore::new(connection));
+        ensure_recovery_test_execution_authority(crud_store.as_ref()).await;
         let provider_registry = Arc::new(ProviderRegistry::with_provider(
             "echo",
             Arc::new(EchoProvider::new()),
@@ -4771,6 +4779,59 @@ mod tests {
             }))
             .await;
         (crud_store, agent_manager, coordinator)
+    }
+
+    async fn ensure_recovery_test_execution_authority(crud_store: &CrudStore) {
+        crud_store
+            .database_connection()
+            .execute_unprepared(
+                "INSERT OR IGNORE INTO gateway_identity(\
+                    id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
+                    created_at,updated_at\
+                 ) VALUES(\
+                    'G00000000000000000001',1,1,2,CURRENT_TIMESTAMP,\
+                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+                 );\
+                 INSERT OR IGNORE INTO gateway_principal(\
+                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                    created_at,updated_at,removed_at\
+                 ) VALUES(\
+                    'P00000000000000000001','G00000000000000000001','superuser',NULL,'active',\
+                    'Superuser','superuser','superuser',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                 );\
+                 INSERT OR IGNORE INTO device(\
+                    id,gateway_id,principal_id,installation_id,display_name,client_kind,\
+                    platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at\
+                 ) VALUES(\
+                    'D00000000000000000001','G00000000000000000001',\
+                    'P00000000000000000001','recovery-test-superuser','Recovery Test Superuser',\
+                    'desktop','test','1','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
+                    CURRENT_TIMESTAMP,NULL\
+                 );\
+                 INSERT OR IGNORE INTO auth_session(\
+                    id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,\
+                    activation_token_hash,activation_locator_hash,activation_failed_attempts,\
+                    activation_expires_at,activated_at,status,refresh_generation,created_at,\
+                    updated_at,last_seen_at,last_refreshed_at,refresh_expires_at,revoked_at,\
+                    revoke_reason\
+                 ) VALUES(\
+                    'S00000000000000000001','G00000000000000000001',\
+                    'P00000000000000000001','D00000000000000000001',\
+                    'F00000000000000000001',NULL,randomblob(32),randomblob(32),0,\
+                    datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
+                    datetime('now','+90 days'),NULL,NULL\
+                 );\
+                 INSERT OR IGNORE INTO auth_refresh_credential(\
+                    id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
+                 ) VALUES(\
+                    'R00000000000000000001','S00000000000000000001',\
+                    'F00000000000000000001',0,randomblob(32),CURRENT_TIMESTAMP,\
+                    datetime('now','+90 days')\
+                 );",
+            )
+            .await
+            .expect("recovery test execution authority should materialize");
     }
 
     async fn setup_coordinator_with_agent()
@@ -4896,6 +4957,11 @@ mod tests {
         permission_profile: TurnPermissionProfileSnapshot,
         recovery_policy: Option<ToolRecoveryPolicySnapshot>,
     ) {
+        crate::session::test_support::ensure_test_superuser_execution_authority(crud_store).await;
+        crate::workspace::WorkspaceManager::new(crud_store.database_connection())
+            .create_workspace(workspace_id, Some("Recovery test workspace"))
+            .await
+            .expect("recovery test workspace should materialize");
         let timestamp = 1_700_000_000;
         let thread = Thread {
             workspace_id: workspace_id.to_owned(),
@@ -4932,6 +4998,7 @@ mod tests {
             permission_profile,
         };
 
+        let principal = crate::session::test_support::authenticated_test_superuser();
         crud_store
             .materialize_turn_start(
                 &thread,
@@ -4941,7 +5008,7 @@ mod tests {
                     text: "run tool".to_owned(),
                     text_elements: Vec::new(),
                 }],
-                pioneer_protocol::PersistedActorRef::System,
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
             )
             .await
             .expect("turn start should persist");
@@ -4952,10 +5019,29 @@ mod tests {
             .expect("recovery turn should exist");
         assert_eq!(
             persisted.initiated_by_actor_kind.as_deref(),
-            Some("system"),
-            "resilience recovery fixtures must not impersonate a principal"
+            Some("principal"),
+            "resilience recovery fixtures must retain initiating authority"
         );
-        assert_eq!(persisted.initiated_by_actor_id, None);
+        assert_eq!(
+            persisted.initiated_by_actor_id.as_deref(),
+            Some(principal.principal_id.as_str())
+        );
+        let context = crate::authorization::ExecutionAuthorizationContext::for_test(
+            principal.as_ref(),
+            workspace_id,
+            thread_id,
+            &turn.permission_profile,
+            None,
+        );
+        let encoded = context
+            .to_persisted_json()
+            .expect("recovery test execution authorization should serialize");
+        assert!(
+            crud_store
+                .set_turn_execution_authorization_context(turn_id, encoded.as_str())
+                .await
+                .expect("recovery test execution authorization should persist")
+        );
         crud_store
             .materialize_item_started(
                 ItemStartedNotification {

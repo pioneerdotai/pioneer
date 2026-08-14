@@ -225,7 +225,10 @@ pub(crate) fn validate_identity_invariants(
                 .role_key
                 .as_deref()
                 .and_then(|value| RoleKey::new(value).ok());
-            if !role.as_ref().is_some_and(RoleKey::is_supported) {
+            if crate::authorization::AuthorizationService::new()
+                .resolved_role_key(PrincipalKind::User, role.as_ref())
+                .is_none()
+            {
                 push_violation(&mut violations, IdentityInvariantKind::InvalidUserRole);
             }
             if principal_id.is_none()

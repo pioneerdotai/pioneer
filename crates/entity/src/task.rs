@@ -44,6 +44,8 @@ pub struct Model {
     pub completed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(has_one)]
     pub task_event_fanout_cursor: HasOne<super::task_event_fanout_cursor::Entity>,
+    #[sea_orm(has_one)]
+    pub task_execution_admission: HasOne<super::task_execution_admission::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

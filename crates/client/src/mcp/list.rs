@@ -178,7 +178,6 @@ mod tests {
     use super::*;
     use pioneer_protocol::{
         McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind, McpServerStatus,
-        McpSourceKind, McpTransportSummary,
     };
 
     pub(crate) fn server(id: &str, name: &str) -> McpListItem {
@@ -187,28 +186,21 @@ mod tests {
             name: name.to_owned(),
             display_name: None,
             scope: McpScopeKind::Workspace,
-            source_kind: McpSourceKind::Config,
-            transport: McpTransportSummary::Stdio {
-                command: "node".to_owned(),
-            },
             policy: McpPolicyState {
                 enabled: true,
                 allow_implicit_invocation: false,
             },
             required: false,
-            fingerprint: format!("{id}:{name}:fingerprint"),
             runtime: McpRuntimeStatus {
                 state: McpRuntimeState::Ready,
                 live: true,
                 last_seen_at: None,
-                last_error: None,
             },
             tools_count: 1,
             resources_count: 0,
             resource_templates_count: 0,
             prompts_count: 0,
             status: McpServerStatus::Ready,
-            status_reason: None,
         }
     }
 

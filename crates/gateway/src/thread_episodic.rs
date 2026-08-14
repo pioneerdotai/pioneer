@@ -40,8 +40,7 @@ use pioneer_protocol::{
     ThreadEpisodicRecallInput, ThreadEpisodicRecallOutput, ThreadEpisodicRecallPolicyContext,
     ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext, ThreadEpisodicSourceProvenance,
     ThreadEpisodicThreadId, ThreadEpisodicTurnId, ThreadEpisodicWorkspaceId,
-    ThreadHistoryEventPayload, TurnItem, TurnItemEventPayload, TurnItemType,
-    task_delivery_id_from_result_item_id,
+    ThreadHistoryEventPayload, TurnItem, TurnItemType, task_delivery_id_from_result_item_id,
 };
 use pioneer_provider::ProviderRegistry;
 use serde::{Deserialize, Serialize};
@@ -1061,30 +1060,11 @@ impl StoreThreadEpisodicIndexPayloadProvider {
         &self,
         index_item: &ThreadEpisodicItemRecord,
     ) -> std::result::Result<String, ThreadEpisodicIndexResolutionError> {
-        let events = self
+        let item = self
             .crud_store
-            .get_turn_item_events(index_item.thread_id.as_str(), index_item.turn_id.as_str())
+            .get_turn_item(index_item.turn_id.as_str(), index_item.item_id.as_str())
             .await
             .map_err(|error| thread_item_events_resolution_error(error))?
-            .ok_or_else(|| {
-                ThreadEpisodicIndexResolutionError::retryable(
-                    "turn item events are not available for thread episodic indexing",
-                )
-            })?;
-        let item = events
-            .events
-            .iter()
-            .rev()
-            .filter_map(|event| match &event.payload {
-                TurnItemEventPayload::ItemCompleted { item, .. }
-                | TurnItemEventPayload::ItemUpdated { item, .. }
-                    if item.item_id() == index_item.item_id.as_str() =>
-                {
-                    Some(item.clone())
-                }
-                _ => None,
-            })
-            .next()
             .ok_or_else(|| {
                 ThreadEpisodicIndexResolutionError::retryable(
                     "canonical thread item is missing for thread episodic indexing",

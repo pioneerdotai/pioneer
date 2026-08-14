@@ -76,5 +76,6 @@ toml.workspace = true
 
 [dev-dependencies]
 pioneer-client.workspace = true
+pioneer-client-ffi.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

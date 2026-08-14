@@ -5,6 +5,7 @@ use pioneer_protocol::{
     TaskExecutorKind, TaskGetResponse, TaskRescheduleReason, TaskResultCandidateStatus,
     TaskRunThreadBindingKind, TaskThreadLineage, TaskTriggerKind, TurnKind,
 };
+use serde_json::json;
 
 struct TaskTimelineChangedTarget {
     workspace_id: String,
@@ -85,7 +86,10 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_CREATED,
-                    &pioneer_protocol::TaskCreatedNotification { context, task },
+                    &json!({
+                        "context": context,
+                        "task": crate::task_projection::project_task(&task),
+                    }),
                 )
                 .await;
             }
@@ -95,7 +99,10 @@ impl MessageProcessor {
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_SCHEDULED,
-                        &pioneer_protocol::TaskScheduledNotification { context, trigger },
+                        &json!({
+                            "context": context,
+                            "trigger": crate::task_projection::project_trigger(&trigger),
+                        }),
                     )
                     .await;
                 }
@@ -110,7 +117,10 @@ impl MessageProcessor {
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_SCHEDULED,
-                        &pioneer_protocol::TaskScheduledNotification { context, trigger },
+                        &json!({
+                            "context": context,
+                            "trigger": crate::task_projection::project_trigger(&trigger),
+                        }),
                     )
                     .await;
                 }
@@ -127,7 +137,10 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_QUEUED,
-                    &pioneer_protocol::TaskQueuedNotification { context, run },
+                    &json!({
+                        "context": context,
+                        "run": run.as_ref().map(crate::task_projection::project_run),
+                    }),
                 )
                 .await;
             }
@@ -136,7 +149,10 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_RUN_CREATED,
-                    &pioneer_protocol::TaskRunCreatedNotification { context, run },
+                    &json!({
+                        "context": context,
+                        "run": crate::task_projection::project_run(&run),
+                    }),
                 )
                 .await;
             }
@@ -146,23 +162,31 @@ impl MessageProcessor {
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_STARTED,
-                        &pioneer_protocol::TaskRunStartedNotification { context, run },
+                        &json!({
+                            "context": context,
+                            "run": crate::task_projection::project_run(&run),
+                        }),
                     )
                     .await;
                 }
             }
             TaskEventPayload::Progress {
-                message, details, ..
+                message: _,
+                details,
+                ..
             } => {
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_PROGRESS,
-                    &pioneer_protocol::TaskProgressNotification {
-                        context,
-                        message,
-                        details,
-                    },
+                    &json!({
+                        "context": context,
+                        "message": "Task progress updated.",
+                        "details": details.map(|details| json!({
+                            "stage": details.stage,
+                            "percent": details.percent,
+                        })),
+                    }),
                 )
                 .await;
             }
@@ -176,7 +200,10 @@ impl MessageProcessor {
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_COMPLETED,
-                        &pioneer_protocol::TaskRunCompletedNotification { context, run },
+                        &json!({
+                            "context": context,
+                            "run": crate::task_projection::project_run(&run),
+                        }),
                     )
                     .await;
                 }
@@ -189,7 +216,10 @@ impl MessageProcessor {
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_FAILED,
-                        &pioneer_protocol::TaskRunFailedNotification { context, run },
+                        &json!({
+                            "context": context,
+                            "run": crate::task_projection::project_run(&run),
+                        }),
                     )
                     .await;
                 }
@@ -202,7 +232,10 @@ impl MessageProcessor {
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_BLOCKED,
-                        &pioneer_protocol::TaskRunFailedNotification { context, run },
+                        &json!({
+                            "context": context,
+                            "run": crate::task_projection::project_run(&run),
+                        }),
                     )
                     .await;
                 }
@@ -215,7 +248,10 @@ impl MessageProcessor {
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_RUN_CANCELLED,
-                        &pioneer_protocol::TaskRunFailedNotification { context, run },
+                        &json!({
+                            "context": context,
+                            "run": crate::task_projection::project_run(&run),
+                        }),
                     )
                     .await;
                 }
@@ -225,10 +261,10 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_COMPLETED,
-                    &pioneer_protocol::TaskCompletedNotification {
-                        context,
-                        task: task_response.task,
-                    },
+                    &json!({
+                        "context": context,
+                        "task": crate::task_projection::project_task(&task_response.task),
+                    }),
                 )
                 .await;
             }
@@ -237,10 +273,10 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_FAILED,
-                    &pioneer_protocol::TaskFailedNotification {
-                        context,
-                        task: task_response.task,
-                    },
+                    &json!({
+                        "context": context,
+                        "task": crate::task_projection::project_task(&task_response.task),
+                    }),
                 )
                 .await;
             }
@@ -249,10 +285,10 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_BLOCKED,
-                    &pioneer_protocol::TaskFailedNotification {
-                        context,
-                        task: task_response.task,
-                    },
+                    &json!({
+                        "context": context,
+                        "task": crate::task_projection::project_task(&task_response.task),
+                    }),
                 )
                 .await;
             }
@@ -261,10 +297,10 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_CANCELLED,
-                    &pioneer_protocol::TaskCancelledNotification {
-                        context,
-                        task: task_response.task,
-                    },
+                    &json!({
+                        "context": context,
+                        "task": crate::task_projection::project_task(&task_response.task),
+                    }),
                 )
                 .await;
             }
@@ -273,17 +309,17 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DETACHED,
-                    &pioneer_protocol::TaskDetachedNotification {
-                        context,
-                        task: task_response.task,
-                    },
+                    &json!({
+                        "context": context,
+                        "task": crate::task_projection::project_task(&task_response.task),
+                    }),
                 )
                 .await;
             }
             TaskEventPayload::TaskUpdated {
                 task,
                 trigger,
-                agent_spec,
+                agent_spec: _,
                 changed_fields,
                 ..
             } => {
@@ -291,13 +327,12 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_UPDATED,
-                    &pioneer_protocol::TaskUpdatedNotification {
-                        context: context.clone(),
-                        task,
-                        trigger,
-                        agent_spec,
-                        changed_fields,
-                    },
+                    &json!({
+                        "context": context.clone(),
+                        "task": crate::task_projection::project_task(&task),
+                        "trigger": trigger.as_ref().map(crate::task_projection::project_trigger),
+                        "changedFields": changed_fields,
+                    }),
                 )
                 .await;
                 self.send_notification_to_task_workspace_connections(
@@ -315,11 +350,11 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_RESCHEDULED,
-                    &pioneer_protocol::TaskRescheduledNotification {
-                        context,
-                        trigger,
-                        reason,
-                    },
+                    &json!({
+                        "context": context,
+                        "trigger": crate::task_projection::project_trigger(&trigger),
+                        "reason": reason,
+                    }),
                 )
                 .await;
             }
@@ -333,12 +368,12 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_PAUSED,
-                    &pioneer_protocol::TaskPausedNotification {
-                        context: context.clone(),
-                        task,
-                        triggers,
-                        reason,
-                    },
+                    &json!({
+                        "context": context.clone(),
+                        "task": crate::task_projection::project_task(&task),
+                        "triggers": triggers.iter().map(crate::task_projection::project_trigger).collect::<Vec<_>>(),
+                        "reason": reason,
+                    }),
                 )
                 .await;
                 self.send_notification_to_task_workspace_connections(
@@ -364,12 +399,12 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_RESUMED,
-                    &pioneer_protocol::TaskResumedNotification {
-                        context: context.clone(),
-                        task,
-                        triggers: triggers.clone(),
-                        reason,
-                    },
+                    &json!({
+                        "context": context.clone(),
+                        "task": crate::task_projection::project_task(&task),
+                        "triggers": triggers.iter().map(crate::task_projection::project_trigger).collect::<Vec<_>>(),
+                        "reason": reason,
+                    }),
                 )
                 .await;
                 if let Some(trigger) = scheduled_trigger {
@@ -377,10 +412,10 @@ impl MessageProcessor {
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
                         events::TASK_SCHEDULED,
-                        &pioneer_protocol::TaskScheduledNotification {
-                            context: context.clone(),
-                            trigger,
-                        },
+                        &json!({
+                            "context": context.clone(),
+                            "trigger": crate::task_projection::project_trigger(&trigger),
+                        }),
                     )
                     .await;
                 }
@@ -435,20 +470,13 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_QUEUED,
-                    &pioneer_protocol::TaskDeliveryQueuedNotification {
-                        context,
-                        summary: delivery
-                            .result_snapshot
-                            .as_ref()
-                            .and_then(|result| result.summary.clone()),
-                        error_preview: delivery
-                            .error_snapshot
-                            .as_ref()
-                            .map(|error| error.message.clone()),
-                        child_thread_id,
-                        child_turn_id,
-                        delivery,
-                    },
+                    &json!({
+                        "context": context,
+                        "summary": delivery.result_snapshot.as_ref().and_then(|result| result.summary.clone()),
+                        "childThreadId": child_thread_id,
+                        "childTurnId": child_turn_id,
+                        "delivery": crate::task_projection::project_delivery(&delivery),
+                    }),
                 )
                 .await;
             }
@@ -457,11 +485,11 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_STARTED,
-                    &pioneer_protocol::TaskDeliveryStartedNotification {
-                        context,
-                        delivery,
-                        attempt,
-                    },
+                    &json!({
+                        "context": context,
+                        "delivery": crate::task_projection::project_delivery(&delivery),
+                        "attempt": crate::task_projection::project_delivery_attempt(&attempt),
+                    }),
                 )
                 .await;
             }
@@ -475,11 +503,11 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_DELIVERED,
-                    &pioneer_protocol::TaskDeliveryDeliveredNotification {
-                        context,
-                        delivery,
-                        attempt,
-                    },
+                    &json!({
+                        "context": context,
+                        "delivery": crate::task_projection::project_delivery(&delivery),
+                        "attempt": crate::task_projection::project_delivery_attempt(&attempt),
+                    }),
                 )
                 .await;
             }
@@ -495,11 +523,11 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_FAILED,
-                    &pioneer_protocol::TaskDeliveryFailedNotification {
-                        context,
-                        delivery,
-                        attempt,
-                    },
+                    &json!({
+                        "context": context,
+                        "delivery": crate::task_projection::project_delivery(&delivery),
+                        "attempt": crate::task_projection::project_delivery_attempt(&attempt),
+                    }),
                 )
                 .await;
             }
@@ -513,11 +541,11 @@ impl MessageProcessor {
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_DELIVERY_CANCELLED,
-                    &pioneer_protocol::TaskDeliveryCancelledNotification {
-                        context,
-                        delivery,
-                        reason,
-                    },
+                    &json!({
+                        "context": context,
+                        "delivery": crate::task_projection::project_delivery(&delivery),
+                        "reason": reason,
+                    }),
                 )
                 .await;
             }

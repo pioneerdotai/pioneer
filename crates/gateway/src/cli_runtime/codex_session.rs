@@ -1235,7 +1235,12 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         }
 
         let mut probe_config = codex_account_probe_config_from_instance(&instance);
-        probe_config.cwd = options.cwd.clone().or_else(|| std::env::current_dir().ok());
+        probe_config.cwd = Some(
+            options
+                .cwd
+                .clone()
+                .context("Codex session requires an authorized workspace working directory")?,
+        );
         validate_codex_custom_args(&instance.app_server_args)
             .context("Codex instance custom launch arguments are invalid")?;
         validate_codex_custom_args(&options.app_server_args)
@@ -1414,12 +1419,13 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
         };
         let rpc_setup = (|| -> Result<_> {
             let (stdout, stdin) = process.take_stdio()?;
-            let rpc = CodexJsonlRpcClient::new_with_channel_capacity(
+            let rpc = CodexJsonlRpcClient::new_with_channel_capacity_and_budget(
                 BufReader::new(stdout),
                 stdin,
                 instance.event_channel_capacity,
                 instance.event_channel_capacity,
                 instance.event_channel_capacity,
+                launch_spec.native_event_budget,
             );
             let notifications = rpc
                 .take_notification_receiver()
@@ -1468,6 +1474,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             shutdown_grace: Duration::from_secs(2),
             event_receivers: StdMutex::new(Some(CLIAgentRuntimeCodexEventReceivers {
                 process_instance: process_instance.clone(),
+                native_event_budget: launch_spec.native_event_budget,
                 notifications,
                 server_requests,
                 diagnostics,

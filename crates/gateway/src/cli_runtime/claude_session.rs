@@ -39,6 +39,7 @@ use crate::turn_mcp::result::CanonicalMcpToolResult;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine as _;
+use pioneer_cli_agent_runtime::BoundedNativeEventCodec;
 use pioneer_cli_agent_runtime::claude::{
     ClaudeAccountProbeStatus, ClaudeManagedMcpConfigDescriptor, ClaudeManagedMcpConfigIdentity,
     ClaudeProbe, ClaudeProviderSessionLaunch, cleanup_claude_managed_mcp_config,
@@ -68,7 +69,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(test)]
+use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -915,6 +918,7 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
                         .clone()
                         .map(|bridge| bridge as Arc<dyn ClaudeMcpPermissionAuthorizer>),
                 }),
+            launch_spec.native_event_budget,
         ));
         client.spawn_reader(stdout);
         if let Err(error) = client
@@ -953,6 +957,7 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             process_closed: std::sync::atomic::AtomicBool::new(false),
             event_receivers: std::sync::Mutex::new(Some(CLIAgentRuntimeEventReceivers {
                 process_instance: process_instance.clone(),
+                native_event_budget: launch_spec.native_event_budget,
                 runtime_kind: "claude".to_owned(),
                 events: event_rx,
             })),
@@ -1116,7 +1121,12 @@ fn claude_process_config_from_instance_with_managed_mcp(
     Ok(CLIAgentProcessSpawnConfig {
         executable: instance.binary_path.clone(),
         args,
-        cwd: options.cwd.clone().or_else(|| std::env::current_dir().ok()),
+        cwd: Some(
+            options
+                .cwd
+                .clone()
+                .context("Claude session requires an authorized workspace working directory")?,
+        ),
         home_path: None,
         home_dir: None,
         env,
@@ -1539,9 +1549,13 @@ fn claude_process_config_from_instance(
         )?,
         ClaudeManagedMcpLaunchMode::Empty,
     )?;
+    let mut options = options.clone();
+    if options.cwd.is_none() {
+        options.cwd = Some(expand_home_path(instance.home_path.as_str(), None)?);
+    }
     claude_process_config_from_instance_with_managed_mcp(
         instance,
-        options,
+        &options,
         &descriptor,
         &[],
         &CliProviderContinuation::ClaudeNew {
@@ -1868,6 +1882,7 @@ struct ClaudeStreamClient {
     expected_provider_session_id: uuid::Uuid,
     provider_session_verifier: Option<ClaudeProviderSessionVerifier>,
     mcp: Option<ClaudeMcpEventContext>,
+    native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
 }
 
 #[derive(Default)]
@@ -1936,6 +1951,7 @@ impl ClaudeStreamClient {
         event_tx: mpsc::Sender<RuntimeEvent>,
         provider_session_verifier: ClaudeProviderSessionVerifier,
         mcp: Option<ClaudeMcpEventContext>,
+        native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
     ) -> Self {
         let expected_provider_session_id = provider_session_verifier.expected_provider_session_id;
         Self {
@@ -1948,6 +1964,7 @@ impl ClaudeStreamClient {
             expected_provider_session_id,
             provider_session_verifier: Some(provider_session_verifier),
             mcp,
+            native_event_budget,
         }
     }
 
@@ -1966,6 +1983,7 @@ impl ClaudeStreamClient {
             expected_provider_session_id,
             provider_session_verifier: None,
             mcp: None,
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         }
     }
 
@@ -1986,6 +2004,7 @@ impl ClaudeStreamClient {
             expected_provider_session_id,
             provider_session_verifier: None,
             mcp,
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         }
     }
 
@@ -2190,11 +2209,12 @@ impl ClaudeStreamClient {
     }
 
     async fn read_loop(&self, stdout: ChildStdout) {
-        let mut lines = BufReader::new(stdout).lines();
+        let mut reader = BufReader::new(stdout);
+        let codec = BoundedNativeEventCodec::new(self.native_event_budget);
         let mut buffer = String::new();
         loop {
-            let line = match lines.next_line().await {
-                Ok(Some(line)) => line,
+            let frame = match codec.read_frame(&mut reader).await {
+                Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(error) => {
                     let (native_thread_id, native_turn_id) = {
@@ -2213,12 +2233,39 @@ impl ClaudeStreamClient {
                     break;
                 }
             };
+            let line = match String::from_utf8(frame) {
+                Ok(line) => line,
+                Err(_) => {
+                    self.emit(RuntimeEvent::Error(RuntimeErrorEvent {
+                        native_thread_id: None,
+                        native_turn_id: None,
+                        message: "Claude stdout frame is not UTF-8".to_owned(),
+                        code: Some("claude_stdout_ingress_limit".to_owned()),
+                        retryable: false,
+                        native: None,
+                    }))
+                    .await;
+                    break;
+                }
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             if buffer.is_empty() && !trimmed.starts_with('{') {
                 continue;
+            }
+            if buffer.len().saturating_add(trimmed.len()) > codec.budget().max_frame_bytes {
+                self.emit(RuntimeEvent::Error(RuntimeErrorEvent {
+                    native_thread_id: None,
+                    native_turn_id: None,
+                    message: "Claude stdout JSON exceeds the native frame budget".to_owned(),
+                    code: Some("claude_stdout_ingress_limit".to_owned()),
+                    retryable: false,
+                    native: None,
+                }))
+                .await;
+                break;
             }
             buffer.push_str(trimmed);
             let value = match serde_json::from_str::<JsonValue>(&buffer) {
@@ -2228,6 +2275,18 @@ impl ClaudeStreamClient {
                 }
                 Err(_) => continue,
             };
+            if let Err(error) = codec.validate_value(&value) {
+                self.emit(RuntimeEvent::Error(RuntimeErrorEvent {
+                    native_thread_id: None,
+                    native_turn_id: None,
+                    message: format!("Claude stdout JSON rejected: {error}"),
+                    code: Some("claude_stdout_ingress_limit".to_owned()),
+                    retryable: false,
+                    native: None,
+                }))
+                .await;
+                break;
+            }
             self.handle_incoming(value).await;
         }
         self.fail_pending_requests("Claude CLI process ended".to_owned())
@@ -4677,6 +4736,7 @@ done
                 let process = claude_process_config_from_instance_with_managed_mcp(
                     &instance,
                     &CLIAgentRuntimeSessionStartOptions {
+                        cwd: Some(temp.path().to_path_buf()),
                         approval_policy: Some("default".to_owned()),
                         enable_user_skills,
                         ..Default::default()

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{gateway_identity, gateway_principal, thread, turn};
-use pioneer_protocol::{GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus};
+use pioneer_protocol::{
+    GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter,
@@ -39,6 +41,7 @@ pub struct GatewayPrincipalRecord {
 pub struct NewMemberPrincipalRow {
     pub id: PrincipalId,
     pub gateway_id: GatewayId,
+    pub role_key: RoleKey,
     pub display_name: String,
     pub nickname: String,
     pub nickname_key: String,
@@ -290,7 +293,6 @@ pub async fn transition_member_principal_status<C: ConnectionTrait>(
         .filter(gateway_principal::Column::Id.eq(principal_id.to_string()))
         .filter(gateway_principal::Column::GatewayId.eq(gateway_id.to_string()))
         .filter(gateway_principal::Column::Kind.eq(principal_kind_to_db(PrincipalKind::User)))
-        .filter(gateway_principal::Column::RoleKey.eq(pioneer_protocol::MEMBER_ROLE_KEY))
         .filter(gateway_principal::Column::Status.eq(principal_status_to_db(from)))
         .exec(db)
         .await
@@ -368,7 +370,7 @@ pub async fn create_member_principal<C: ConnectionTrait>(
         id: Set(row.id.to_string()),
         gateway_id: Set(row.gateway_id.to_string()),
         kind: Set(principal_kind_to_db(PrincipalKind::User).to_owned()),
-        role_key: Set(Some(pioneer_protocol::MEMBER_ROLE_KEY.to_owned())),
+        role_key: Set(Some(row.role_key.to_string())),
         status: Set(principal_status_to_db(PrincipalStatus::Active).to_owned()),
         display_name: Set(row.display_name),
         nickname: Set(row.nickname),

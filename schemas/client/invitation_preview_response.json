@@ -20,6 +20,9 @@
     "inviter": {
       "$ref": "#/$defs/InvitationInviterSummary"
     },
+    "role_key": {
+      "$ref": "#/$defs/RoleKey"
+    },
     "transport": {
       "$ref": "#/$defs/InvitationTransportSecurity"
     },
@@ -33,6 +36,7 @@
   "required": [
     "gateway_id",
     "inviter",
+    "role_key",
     "workspaces",
     "expires_at_unix",
     "transport"
@@ -101,6 +105,12 @@
         "superuser",
         "user"
       ]
+    },
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
     },
     "WorkspaceId": {
       "type": "string",

@@ -1,8 +1,8 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
 use crate::authorization::{
-    AuthorizationExternalError, AuthorizedTurn, ExecutionAuthorizationAdmission,
-    RuntimeDraftCreator, RuntimeDraftMaterialization,
+    AuthorizationExternalError, AuthorizationService, AuthorizedTurn,
+    ExecutionAuthorizationAdmission, RuntimeDraftCreator, RuntimeDraftMaterialization,
 };
 use crate::cli_runtime::config::{
     claude_account_probe_config_from_instance, codex_account_probe_config_from_instance,
@@ -13,6 +13,7 @@ use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, UserInput, VoiceError, VoiceErrorKind,
     VoiceSessionOutcome, VoiceSessionResultNotification,
 };
+use serde_json::json;
 
 pub(super) struct PreparedApiProviderTurnStart {
     outcome: crate::thread::TurnStartOutcome,
@@ -34,6 +35,221 @@ pub(super) enum ApiProviderTurnAdmission {
     Replay(pioneer_protocol::TurnStartResponse),
 }
 
+#[derive(Debug)]
+pub(super) struct TurnStartFailure {
+    public_code: pioneer_protocol::PublicErrorCode,
+    diagnostic: String,
+}
+
+impl TurnStartFailure {
+    fn new(public_code: pioneer_protocol::PublicErrorCode, diagnostic: impl Into<String>) -> Self {
+        Self {
+            public_code,
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    fn invalid_input(diagnostic: impl Into<String>) -> Self {
+        Self::new(pioneer_protocol::PublicErrorCode::InvalidInput, diagnostic)
+    }
+
+    fn policy_denied(diagnostic: impl Into<String>) -> Self {
+        Self::new(pioneer_protocol::PublicErrorCode::PolicyDenied, diagnostic)
+    }
+
+    fn unavailable(diagnostic: impl Into<String>) -> Self {
+        Self::new(pioneer_protocol::PublicErrorCode::Unavailable, diagnostic)
+    }
+
+    fn conflict(diagnostic: impl Into<String>) -> Self {
+        Self::new(pioneer_protocol::PublicErrorCode::Conflict, diagnostic)
+    }
+
+    fn internal(diagnostic: impl Into<String>) -> Self {
+        Self::new(pioneer_protocol::PublicErrorCode::Internal, diagnostic)
+    }
+
+    #[cfg(test)]
+    pub(super) const fn public_code(&self) -> pioneer_protocol::PublicErrorCode {
+        self.public_code
+    }
+
+    #[cfg(test)]
+    pub(super) fn diagnostic(&self) -> &str {
+        self.diagnostic.as_str()
+    }
+}
+
+impl From<String> for TurnStartFailure {
+    fn from(diagnostic: String) -> Self {
+        Self::internal(diagnostic)
+    }
+}
+
+impl From<&'static str> for TurnStartFailure {
+    fn from(diagnostic: &'static str) -> Self {
+        Self::internal(diagnostic)
+    }
+}
+
+impl std::fmt::Display for TurnStartFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.diagnostic.as_str())
+    }
+}
+
+/// Positive authority proof for every execution-capable Turn start.
+///
+/// Interactive and voice starts carry a fresh admission which is finalized at
+/// the durable materialization boundary. Task continuations carry the already
+/// persisted and revalidated parent context. Keeping these states in one
+/// exhaustive enum makes the forbidden `None/None` and ambiguous `Some/Some`
+/// combinations unrepresentable.
+#[derive(Clone)]
+pub(super) enum TurnExecutionAuthority {
+    Fresh(ExecutionAuthorizationAdmission),
+    Durable(crate::authorization::ExecutionAuthorizationContext),
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionEnvelopeSource<'a> {
+    Fresh(&'a ExecutionAuthorizationAdmission),
+    Durable(&'a crate::authorization::ExecutionAuthorizationContext),
+}
+
+impl TurnExecutionAuthority {
+    fn source(&self) -> ExecutionEnvelopeSource<'_> {
+        match self {
+            Self::Fresh(admission) => ExecutionEnvelopeSource::Fresh(admission),
+            Self::Durable(context) => ExecutionEnvelopeSource::Durable(context),
+        }
+    }
+}
+
+impl<'a> ExecutionEnvelopeSource<'a> {
+    fn policy_revision(self) -> u64 {
+        match self {
+            Self::Fresh(admission) => admission.policy_provenance().1,
+            Self::Durable(context) => context.policy_revision(),
+        }
+    }
+
+    fn runtime_draft(self) -> Option<&'a RuntimeDraftMaterialization> {
+        match self {
+            Self::Fresh(admission) => admission.runtime_draft(),
+            Self::Durable(_) => None,
+        }
+    }
+
+    fn effective_native_event_resource_budget(
+        self,
+    ) -> anyhow::Result<pioneer_cli_agent_runtime::NativeEventBudget> {
+        match self {
+            Self::Fresh(admission) => Ok(admission.native_event_resource_budget()),
+            Self::Durable(context) => context.effective_native_event_resource_budget(),
+        }
+    }
+}
+
+fn public_turn_start_error(
+    request_id: RequestId,
+    failure: impl Into<TurnStartFailure>,
+) -> JsonRpcErrorResponse {
+    let failure = failure.into();
+    crate::public_error::agent_rpc_error(
+        Some(request_id),
+        INVALID_REQUEST_CODE,
+        failure.public_code,
+        pioneer_protocol::PublicErrorStage::Admission,
+        failure.diagnostic,
+    )
+}
+
+/// Returns the largest sequence-preserving prefix that fits the role-owned
+/// observation budget. The cursor is moved only through events present in the
+/// returned prefix, so a byte clamp can never silently skip an event.
+fn fit_turn_items_page_to_budget(
+    page: pioneer_protocol::TurnItemsResponse,
+    requested_after_sequence: Option<i64>,
+    max_items: usize,
+    max_encoded_bytes: usize,
+) -> Result<pioneer_protocol::TurnItemsResponse, String> {
+    fn encoded_len(page: &pioneer_protocol::TurnItemsResponse) -> Result<usize, String> {
+        serde_json::to_vec(page)
+            .map(|encoded| encoded.len())
+            .map_err(|_| "turn/items page could not be encoded".to_owned())
+    }
+
+    fn prefix(
+        page: &pioneer_protocol::TurnItemsResponse,
+        count: usize,
+        requested_cursor: i64,
+    ) -> Result<pioneer_protocol::TurnItemsResponse, String> {
+        let mut candidate = page.clone();
+        candidate.events.truncate(count);
+        if count < page.events.len() {
+            let cursor = candidate
+                .events
+                .last()
+                .map(|event| event.sequence)
+                .unwrap_or(requested_cursor);
+            if cursor <= requested_cursor {
+                return Err("one turn/items event exceeds the server observation budget".to_owned());
+            }
+            candidate.last_sequence = cursor;
+            candidate.has_more = true;
+            candidate.next_cursor = Some(cursor);
+        }
+        Ok(candidate)
+    }
+
+    let max_items = max_items.max(1);
+    let max_encoded_bytes = max_encoded_bytes.max(1);
+    if page.events.len() <= max_items && encoded_len(&page)? <= max_encoded_bytes {
+        return Ok(page);
+    }
+
+    let requested_cursor = requested_after_sequence.unwrap_or(0);
+    let upper = page.events.len().min(max_items);
+    if upper == 0 {
+        return Err("turn/items page metadata exceeds the server observation budget".to_owned());
+    }
+
+    let smallest = prefix(&page, 1, requested_cursor)?;
+    if encoded_len(&smallest)? > max_encoded_bytes {
+        return Err("one turn/items event exceeds the server observation budget".to_owned());
+    }
+
+    let mut best = smallest;
+    let mut low = 2usize;
+    let mut high = upper;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let candidate = prefix(&page, middle, requested_cursor)?;
+        if encoded_len(&candidate)? <= max_encoded_bytes {
+            best = candidate;
+            low = middle.saturating_add(1);
+        } else {
+            high = middle.saturating_sub(1);
+        }
+    }
+    Ok(best)
+}
+
+fn public_turn_error(
+    request_id: Option<RequestId>,
+    jsonrpc_code: i64,
+    stage: pioneer_protocol::PublicErrorStage,
+    diagnostic: impl std::fmt::Display,
+) -> JsonRpcErrorResponse {
+    let public_code = if jsonrpc_code == INVALID_PARAMS_CODE {
+        pioneer_protocol::PublicErrorCode::InvalidInput
+    } else {
+        pioneer_protocol::PublicErrorCode::Internal
+    };
+    crate::public_error::agent_rpc_error(request_id, jsonrpc_code, public_code, stage, diagnostic)
+}
+
 fn native_turn_admission_digest(
     actor: &pioneer_protocol::PersistedActorRef,
     params: &TurnStartParams,
@@ -47,123 +263,110 @@ fn native_turn_admission_digest(
 
 async fn persist_admitted_turn_start(
     crud_store: &pioneer_crud::CrudStore,
+    provider_registry: &pioneer_provider::ProviderRegistry,
+    params: &TurnStartParams,
     materialization: &crate::thread::TurnStartMaterialization,
     reasoning_effort: Option<&str>,
     actor: pioneer_protocol::PersistedActorRef,
     audit_event: pioneer_protocol::TurnPermissionAuditEvent,
-    runtime_draft: Option<&RuntimeDraftMaterialization>,
+    execution_authority: ExecutionEnvelopeSource<'_>,
     request_digest: Option<String>,
 ) -> anyhow::Result<()> {
-    let admission = request_digest.map(|request_digest| pioneer_crud::NewTurnAdmission {
-        turn_id: materialization.turn.id.clone(),
-        thread_id: materialization.thread.id.clone(),
-        workspace_id: materialization.thread.workspace_id.clone(),
-        request_digest,
-    });
-    match (
-        runtime_draft.map(RuntimeDraftMaterialization::creator),
-        admission,
-    ) {
-        (
-            Some(RuntimeDraftCreator::Member {
-                gateway_id,
-                principal_id,
-                access_class,
-            }),
-            Some(admission),
-        ) => crud_store
-            .materialize_new_member_native_turn_start_with_reasoning_effort_and_permission_audit(
-                &materialization.thread,
-                materialization.sandbox_mode,
-                &materialization.turn,
-                &materialization.input,
-                reasoning_effort,
-                actor,
-                audit_event,
-                gateway_id,
-                principal_id,
-                *access_class,
-                admission,
-            )
-            .await,
-        (Some(RuntimeDraftCreator::Superuser { access_class }), Some(admission)) => crud_store
-            .materialize_new_superuser_native_turn_start_with_reasoning_effort_and_permission_audit(
-                &materialization.thread,
-                materialization.sandbox_mode,
-                &materialization.turn,
-                &materialization.input,
-                reasoning_effort,
-                actor,
-                audit_event,
-                *access_class,
-                admission,
-            )
-            .await,
-        (None, Some(admission)) => {
-            crud_store
-                .materialize_native_turn_start_with_reasoning_effort_and_permission_audit(
-                    &materialization.thread,
-                    materialization.sandbox_mode,
-                    &materialization.turn,
-                    &materialization.input,
-                    reasoning_effort,
-                    actor,
-                    audit_event,
-                    admission,
-                )
-                .await
+    let admission = match execution_authority {
+        ExecutionEnvelopeSource::Fresh(admission) => {
+            admission
+                .validate_durable_start(crud_store, provider_registry)
+                .await?;
+            let (role_key, policy_generation, policy_fingerprint) = admission.policy_provenance();
+            let request_digest = request_digest
+                .map(Ok)
+                .unwrap_or_else(|| native_turn_admission_digest(&actor, params))
+                .map_err(anyhow::Error::msg)?;
+            pioneer_crud::NewTurnAdmission {
+                turn_id: materialization.turn.id.clone(),
+                thread_id: materialization.thread.id.clone(),
+                workspace_id: materialization.thread.workspace_id.clone(),
+                request_digest,
+                policy_generation: Some(policy_generation),
+                role_key: Some(role_key.to_owned()),
+                policy_fingerprint: Some(policy_fingerprint.to_owned()),
+                execution_lease: Some(
+                    admission.execution_quota_lease("turn", materialization.turn.id.as_str())?,
+                ),
+            }
         }
-        (
-            Some(RuntimeDraftCreator::Member {
-                gateway_id,
-                principal_id,
-                access_class,
-            }),
-            None,
-        ) => {
-            crud_store
-                .materialize_new_member_turn_start_with_reasoning_effort_and_permission_audit(
-                    &materialization.thread,
-                    materialization.sandbox_mode,
-                    &materialization.turn,
-                    &materialization.input,
-                    reasoning_effort,
-                    actor,
-                    audit_event,
-                    gateway_id,
-                    principal_id,
-                    *access_class,
-                )
-                .await
+        ExecutionEnvelopeSource::Durable(context) => {
+            context.verify_current_provider_authority(provider_registry)?;
+            context.durable_turn_admission(
+                materialization.thread.id.as_str(),
+                materialization.turn.id.as_str(),
+                params.execution_backend.as_ref(),
+            )?
         }
-        (Some(RuntimeDraftCreator::Superuser { access_class }), None) => {
-            crud_store
-                .materialize_new_superuser_turn_start_with_reasoning_effort_and_permission_audit(
-                    &materialization.thread,
-                    materialization.sandbox_mode,
-                    &materialization.turn,
-                    &materialization.input,
-                    reasoning_effort,
-                    actor,
-                    audit_event,
-                    *access_class,
-                )
-                .await
-        }
-        (None, None) => {
-            crud_store
-                .materialize_turn_start_with_reasoning_effort_and_permission_audit(
-                    &materialization.thread,
-                    materialization.sandbox_mode,
-                    &materialization.turn,
-                    &materialization.input,
-                    reasoning_effort,
-                    actor,
-                    audit_event,
-                )
-                .await
+    };
+    let authorization_context = match execution_authority {
+        ExecutionEnvelopeSource::Durable(context) => context.clone(),
+        ExecutionEnvelopeSource::Fresh(admission) => admission.finalize(
+            materialization.thread.workspace_id.as_str(),
+            materialization.thread.id.as_str(),
+            materialization.thread.model_provider.as_str(),
+            materialization.thread.model.as_str(),
+            params.execution_backend.as_ref(),
+            materialization.capabilities.as_slice(),
+            &materialization.turn.permission_profile,
+        )?,
+    };
+    if authorization_context.workspace_id() != materialization.thread.workspace_id {
+        anyhow::bail!("execution authority envelope differs from materialized Turn workspace");
+    }
+    if authorization_context.root_thread_id() != materialization.thread.id {
+        let lineage = crud_store
+            .get_task_thread_lineage(materialization.thread.id.as_str())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("non-root execution Turn has no durable internal thread lineage")
+            })?;
+        if lineage.child_thread_id != materialization.thread.id
+            || lineage.root_thread_id != authorization_context.root_thread_id()
+            || lineage.root_thread_id == lineage.child_thread_id
+        {
+            anyhow::bail!("execution authority envelope differs from materialized Turn scope");
         }
     }
+    let authority_envelope_json = authorization_context.to_persisted_json()?;
+    let runtime_draft = execution_authority
+        .runtime_draft()
+        .map(RuntimeDraftMaterialization::creator)
+        .map(|creator| match creator {
+            RuntimeDraftCreator::ScopedPrincipal {
+                gateway_id,
+                principal_id,
+                access_class,
+            } => pioneer_crud::AuthorizedTurnRuntimeDraft::ScopedPrincipal {
+                gateway_id: gateway_id.clone(),
+                principal_id: principal_id.clone(),
+                access_class: *access_class,
+            },
+            RuntimeDraftCreator::Absolute { access_class } => {
+                pioneer_crud::AuthorizedTurnRuntimeDraft::Absolute {
+                    access_class: *access_class,
+                }
+            }
+        });
+    crud_store
+        .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+            &materialization.thread,
+            materialization.sandbox_mode,
+            &materialization.turn,
+            &materialization.input,
+            reasoning_effort,
+            actor,
+            audit_event,
+            authority_envelope_json.as_str(),
+            runtime_draft,
+            Some(admission),
+        )
+        .await
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,6 +427,7 @@ struct CliRuntimeStartedPhase {
 struct CliRuntimeMaterializedPhase {
     security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
     installed_skills: Vec<crate::cli_runtime::skills::CliRuntimeSkillInstallResult>,
+    native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
 }
 
 struct ComposerDetachedStartedPhase {
@@ -254,8 +458,6 @@ pub(super) enum TurnStartSuccessResponse {
     Task {
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
         execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
-        execution_authorization_context:
-            Option<crate::authorization::ExecutionAuthorizationContext>,
         continuation_thread_id: String,
         context_thread_id: String,
         task_run_id: String,
@@ -312,18 +514,6 @@ impl TurnStartSuccessResponse {
                 execution_security_snapshot,
                 ..
             } => Some(execution_security_snapshot.clone()),
-            Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
-        }
-    }
-
-    fn task_execution_authorization_context(
-        &self,
-    ) -> Option<&crate::authorization::ExecutionAuthorizationContext> {
-        match self {
-            Self::Task {
-                execution_authorization_context,
-                ..
-            } => execution_authorization_context.as_ref(),
             Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
         }
     }
@@ -391,31 +581,97 @@ fn execution_backend_allows_agent_skill_overlay(
 }
 
 impl MessageProcessor {
-    pub(super) async fn enforce_member_skill_capability_projection(
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_composite_execution_request(
+        &self,
+        admission: &mut ExecutionAuthorizationAdmission,
+        entry_point: crate::authorization::ExecutionAdmissionEntryPoint,
+        additional_required_actions: Vec<crate::authorization::ResourceAction>,
+        workspace_id: &str,
+        target_thread_id: &str,
+        provider: &str,
+        model: &str,
+        params: &TurnStartParams,
+        capabilities: &[pioneer_protocol::TurnCapability],
+    ) -> Result<(), TurnStartFailure> {
+        if admission.workspace_id() != workspace_id
+            || admission.target_thread_id() != target_thread_id
+            || params.thread_id.trim() != target_thread_id
+        {
+            return Err(TurnStartFailure::policy_denied(
+                "execution target differs from the authorized thread".to_owned(),
+            ));
+        }
+        let provider_authority_fingerprint = match params.execution_backend.as_ref() {
+            Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+            | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => None,
+            _ => Some(
+                self.provider_registry
+                    .authority_fingerprint_for_workspace(workspace_id, provider)
+                    .as_str()
+                    .to_owned(),
+            ),
+        };
+        let request = crate::authorization::ExecutionAdmissionRequest::for_turn(
+            entry_point,
+            crate::authorization::ResourceAction::AgentTurnStart,
+            additional_required_actions,
+            workspace_id,
+            admission.root_thread_id(),
+            provider,
+            model,
+            params,
+            capabilities,
+            provider_authority_fingerprint,
+        )
+        .map_err(|error| {
+            TurnStartFailure::invalid_input(format!("invalid composite execution intent: {error}"))
+        })?;
+        admission
+            .authorize_composite(self.crud_store.as_ref(), &request)
+            .await
+            .map_err(|error| {
+                TurnStartFailure::policy_denied(format!("execution authorization denied: {error}"))
+            })
+    }
+
+    pub(super) async fn enforce_scoped_skill_capability_projection(
         &self,
         workspace_id: &str,
         capabilities: &[pioneer_protocol::TurnCapability],
-    ) -> Result<(), String> {
-        let context = self
-            .skills_runtime_context(workspace_id)
-            .map_err(|_| "Member skill projection is unavailable".to_owned())?;
+    ) -> Result<(), TurnStartFailure> {
+        let context = self.skills_runtime_context(workspace_id).map_err(|error| {
+            TurnStartFailure::unavailable(format!(
+                "Member skill projection is unavailable: {error:#}"
+            ))
+        })?;
         let catalog = self
             .load_skills_catalog(workspace_id, &context)
             .await
-            .map_err(|_| "Member skill projection is unavailable".to_owned())?;
-        let policies = self
+            .map_err(|error| {
+                TurnStartFailure::unavailable(format!(
+                    "Member skill projection is unavailable: {error:#}"
+                ))
+            })?;
+        let workspace_policies = self
             .crud_store
             .list_workspace_skill_policies(workspace_id)
             .await
-            .map_err(|_| "Member skill projection is unavailable".to_owned())?
-            .into_iter()
-            .map(|policy| (policy.skill_id.clone(), policy))
-            .collect::<HashMap<_, _>>();
+            .map_err(|error| {
+                TurnStartFailure::unavailable(format!(
+                    "Member skill projection is unavailable: {error:#}"
+                ))
+            })?;
+        let policy_set = self.build_policy_set(&catalog.skills, &workspace_policies, &context);
         let installations = self
             .crud_store
             .list_skill_installations()
             .await
-            .map_err(|_| "Member skill projection is unavailable".to_owned())?
+            .map_err(|error| {
+                TurnStartFailure::unavailable(format!(
+                    "Member skill projection is unavailable: {error:#}"
+                ))
+            })?
             .into_iter()
             .map(|installation| (installation.skill_id.clone(), installation))
             .collect::<HashMap<_, _>>();
@@ -429,26 +685,27 @@ impl MessageProcessor {
                 continue;
             };
             if capability.id != pioneer_protocol::skill_capability_key(skill_id) {
-                return Err(format!(
+                return Err(TurnStartFailure::invalid_input(format!(
                     "skill capability `{}` does not match its server identity",
                     capability.id
-                ));
-            }
-            if !policies
-                .get(skill_id)
-                .is_some_and(|policy| policy.enabled == Some(true))
-            {
-                return Err(format!(
-                    "skill `{skill_id}` is not enabled for workspace `{workspace_id}`"
-                ));
+                )));
             }
             let skill = catalog
                 .skills
                 .iter()
                 .find(|skill| &skill.identity.skill_id == skill_id)
-                .ok_or_else(|| format!("skill `{skill_id}` is not installed"))?;
+                .ok_or_else(|| {
+                    TurnStartFailure::invalid_input(format!("skill `{skill_id}` is not installed"))
+                })?;
             if !skill.is_available() {
-                return Err(format!("skill `{skill_id}` is unavailable"));
+                return Err(TurnStartFailure::unavailable(format!(
+                    "skill `{skill_id}` is unavailable"
+                )));
+            }
+            if !pioneer_skills::effective_policy_for_skill(skill, &policy_set).enabled {
+                return Err(TurnStartFailure::policy_denied(format!(
+                    "skill `{skill_id}` is not enabled for workspace `{workspace_id}`"
+                )));
             }
 
             match skill.identity.source_kind {
@@ -457,24 +714,26 @@ impl MessageProcessor {
                         && (installation.source_kind != "system"
                             || installation.fingerprint != skill.identity.fingerprint)
                     {
-                        return Err(format!(
+                        return Err(TurnStartFailure::invalid_input(format!(
                             "system skill `{skill_id}` does not match its installed identity"
-                        ));
+                        )));
                     }
                 }
                 pioneer_skills::SkillSourceKind::User
                 | pioneer_skills::SkillSourceKind::Registry => {
-                    let installation = installations
-                        .get(skill_id)
-                        .ok_or_else(|| format!("skill `{skill_id}` is not installed"))?;
+                    let installation = installations.get(skill_id).ok_or_else(|| {
+                        TurnStartFailure::invalid_input(format!(
+                            "skill `{skill_id}` is not installed"
+                        ))
+                    })?;
                     if installation.scope_key != workspace_id
                         || installation.source_kind != skill.identity.source_kind.as_db_value()
                         || installation.fingerprint != skill.identity.fingerprint
                         || installation.version != skill.identity.version_hint
                     {
-                        return Err(format!(
+                        return Err(TurnStartFailure::invalid_input(format!(
                             "skill `{skill_id}` does not match its active workspace installation"
-                        ));
+                        )));
                     }
                 }
             }
@@ -486,7 +745,7 @@ impl MessageProcessor {
         &self,
         workspace_id: &str,
         capabilities: &[pioneer_protocol::TurnCapability],
-    ) -> Result<pioneer_skills::SkillCatalogSnapshot, String> {
+    ) -> Result<pioneer_skills::SkillCatalogSnapshot, TurnStartFailure> {
         let selected = capabilities
             .iter()
             .filter_map(|capability| match &capability.kind {
@@ -510,35 +769,43 @@ impl MessageProcessor {
                 } | pioneer_protocol::TurnCapabilityKind::SkillPack { .. }
             )
         }) {
-            return Err(
-                "skill pack metadata reached the ordinary skill validation boundary".to_owned(),
-            );
+            return Err(TurnStartFailure::invalid_input(
+                "skill pack metadata reached the ordinary skill validation boundary",
+            ));
         }
-        let context = self
-            .skills_runtime_context(workspace_id)
-            .map_err(|error| format!("failed to resolve skills runtime context: {error:#}"))?;
+        let context = self.skills_runtime_context(workspace_id).map_err(|error| {
+            TurnStartFailure::unavailable(format!(
+                "failed to resolve skills runtime context: {error:#}"
+            ))
+        })?;
         let catalog = self
             .load_skills_catalog(workspace_id, &context)
             .await
-            .map_err(|error| format!("failed to load skills catalog: {error:#}"))?;
+            .map_err(|error| {
+                TurnStartFailure::unavailable(format!("failed to load skills catalog: {error:#}"))
+            })?;
 
         for (capability, skill_id) in selected {
             let expected_capability_id = format!("skill:{skill_id}");
             if capability.id != expected_capability_id {
-                return Err(format!(
+                return Err(TurnStartFailure::invalid_input(format!(
                     "skill capability `{}` must use exact ID `{expected_capability_id}`",
                     capability.id
-                ));
+                )));
             }
             let Some(skill) = catalog
                 .skills
                 .iter()
                 .find(|skill| &skill.identity.skill_id == skill_id)
             else {
-                return Err(format!("skill `{skill_id}` was not found"));
+                return Err(TurnStartFailure::invalid_input(format!(
+                    "skill `{skill_id}` was not found"
+                )));
             };
             if !skill.is_available() {
-                return Err(format!("skill `{skill_id}` is unavailable"));
+                return Err(TurnStartFailure::unavailable(format!(
+                    "skill `{skill_id}` is unavailable"
+                )));
             }
         }
         Ok(catalog)
@@ -548,7 +815,7 @@ impl MessageProcessor {
         &self,
         workspace_id: &str,
         capabilities: &[pioneer_protocol::TurnCapability],
-    ) -> Result<NormalizedTurnCapabilities, String> {
+    ) -> Result<NormalizedTurnCapabilities, TurnStartFailure> {
         use pioneer_protocol::{TurnCapability, TurnCapabilityKind};
 
         let _skills_guard = self.acquire_skills_write_lock().await;
@@ -565,13 +832,15 @@ impl MessageProcessor {
                         .find_skill_installation(skill_id)
                         .await
                         .map_err(|error| {
-                            format!("failed to load skill `{skill_id}` installation: {error:#}")
+                            TurnStartFailure::unavailable(format!(
+                                "failed to load skill `{skill_id}` installation: {error:#}"
+                            ))
                         })?;
                     let Some(installation) = installation else {
                         if let Some(requested_pack_id) = pack_id {
-                            return Err(format!(
+                            return Err(TurnStartFailure::invalid_input(format!(
                                 "skill `{skill_id}` is not a member of pack `{requested_pack_id}`"
-                            ));
+                            )));
                         }
                         presentation.push(TurnCapability {
                             id: capability.id.clone(),
@@ -586,38 +855,38 @@ impl MessageProcessor {
                     if installation.source_kind != "system"
                         && installation.scope_key != workspace_id
                     {
-                        return Err(format!(
+                        return Err(TurnStartFailure::invalid_input(format!(
                             "skill `{skill_id}` is not installed in workspace `{workspace_id}`"
-                        ));
+                        )));
                     }
 
                     let authoritative_pack_id = installation.pack_id.clone();
                     if let Some(requested_pack_id) = pack_id {
                         if authoritative_pack_id.as_ref() != Some(requested_pack_id) {
-                            return Err(format!(
+                            return Err(TurnStartFailure::invalid_input(format!(
                                 "skill `{skill_id}` is not a member of pack `{requested_pack_id}`"
-                            ));
+                            )));
                         }
                     }
                     if let Some(authoritative_pack_id) = authoritative_pack_id.as_ref() {
                         if installation.scope_key != workspace_id {
-                            return Err(format!(
+                            return Err(TurnStartFailure::invalid_input(format!(
                                 "skill `{skill_id}` pack membership is outside workspace `{workspace_id}`"
-                            ));
+                            )));
                         }
                         let parent = self
                             .crud_store
                             .find_skill_pack_installation(workspace_id, authoritative_pack_id)
                             .await
                             .map_err(|error| {
-                                format!(
+                                TurnStartFailure::unavailable(format!(
                                     "failed to load skill pack `{authoritative_pack_id}`: {error:#}"
-                                )
+                                ))
                             })?
                             .ok_or_else(|| {
-                                format!(
+                                TurnStartFailure::invalid_input(format!(
                                     "skill `{skill_id}` references missing pack `{authoritative_pack_id}`"
-                                )
+                                ))
                             })?;
                         pack_names.insert(authoritative_pack_id.clone(), parent.name);
                     }
@@ -633,19 +902,23 @@ impl MessageProcessor {
                 }
                 TurnCapabilityKind::SkillPack { pack_id } => {
                     if !full_pack_ids.insert(pack_id.clone()) {
-                        return Err(format!("skill pack `{pack_id}` is selected more than once"));
+                        return Err(TurnStartFailure::invalid_input(format!(
+                            "skill pack `{pack_id}` is selected more than once"
+                        )));
                     }
                     let parent = self
                         .crud_store
                         .find_skill_pack_installation(workspace_id, pack_id)
                         .await
                         .map_err(|error| {
-                            format!("failed to load skill pack `{pack_id}`: {error:#}")
+                            TurnStartFailure::unavailable(format!(
+                                "failed to load skill pack `{pack_id}`: {error:#}"
+                            ))
                         })?
                         .ok_or_else(|| {
-                            format!(
+                            TurnStartFailure::invalid_input(format!(
                                 "skill pack `{pack_id}` was not found in workspace `{workspace_id}`"
-                            )
+                            ))
                         })?;
                     pack_names.insert(pack_id.clone(), parent.name);
                     let children = self
@@ -653,19 +926,23 @@ impl MessageProcessor {
                         .list_skill_installations_for_pack(workspace_id, pack_id)
                         .await
                         .map_err(|error| {
-                            format!("failed to load children for skill pack `{pack_id}`: {error:#}")
+                            TurnStartFailure::unavailable(format!(
+                                "failed to load children for skill pack `{pack_id}`: {error:#}"
+                            ))
                         })?;
                     if children.is_empty() {
-                        return Err(format!("skill pack `{pack_id}` is empty"));
+                        return Err(TurnStartFailure::invalid_input(format!(
+                            "skill pack `{pack_id}` is empty"
+                        )));
                     }
                     if children.iter().any(|child| {
                         child.scope_key != workspace_id
                             || child.pack_id.as_ref() != Some(pack_id)
                             || child.pack_member_key.as_deref().is_none_or(str::is_empty)
                     }) {
-                        return Err(format!(
+                        return Err(TurnStartFailure::invalid_input(format!(
                             "skill pack `{pack_id}` has invalid authoritative membership"
-                        ));
+                        )));
                     }
                     pack_children.insert(pack_id.clone(), children);
                     presentation.push(capability.clone());
@@ -685,12 +962,14 @@ impl MessageProcessor {
                         .as_ref()
                         .is_some_and(|pack_id| full_pack_ids.contains(pack_id))
                     {
-                        return Err(format!(
+                        return Err(TurnStartFailure::invalid_input(format!(
                             "skill pack and child `{skill_id}` cannot be selected together"
-                        ));
+                        )));
                     }
                     if !seen_skill_ids.insert(skill_id.clone()) {
-                        return Err(format!("skill `{skill_id}` is selected more than once"));
+                        return Err(TurnStartFailure::invalid_input(format!(
+                            "skill `{skill_id}` is selected more than once"
+                        )));
                     }
                     execution.push(TurnCapability {
                         id: pioneer_protocol::skill_capability_key(skill_id),
@@ -711,10 +990,10 @@ impl MessageProcessor {
                         .expect("validated skill pack children");
                     for child in children {
                         if !seen_skill_ids.insert(child.skill_id.clone()) {
-                            return Err(format!(
+                            return Err(TurnStartFailure::invalid_input(format!(
                                 "skill `{}` is duplicated after pack expansion",
                                 child.skill_id
-                            ));
+                            )));
                         }
                         execution.push(TurnCapability {
                             id: pioneer_protocol::skill_capability_key(&child.skill_id),
@@ -744,15 +1023,15 @@ impl MessageProcessor {
         request_context: &'a RequestContext,
         execution_admission: ExecutionAuthorizationAdmission,
         request_id: RequestId,
-        mut params: TurnStartParams,
+        params: TurnStartParams,
     ) -> MessageFuture<'a, ()> {
         let connection_id = request_context.connection_id();
         let request_actor = request_context.persisted_actor();
-        let member_principal_id = (request_context.principal().kind
-            == pioneer_protocol::PrincipalKind::User)
+        let scoped_principal_id = execution_admission
+            .uses_scoped_collaboration_policy()
             .then(|| request_context.principal().principal_id.clone());
         message_future(async move {
-            if execution_admission.root_thread_id() != params.thread_id.trim() {
+            if execution_admission.target_thread_id() != params.thread_id.trim() {
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::NotFound.response(request_id),
@@ -763,9 +1042,10 @@ impl MessageProcessor {
             if params.thread_id.trim().is_empty() {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
+                        pioneer_protocol::PublicErrorStage::Admission,
                         format!(
                             "invalid params for `{}`: `thread_id` is required",
                             methods::TURN_START
@@ -779,9 +1059,10 @@ impl MessageProcessor {
             if params.turn_id.trim().is_empty() {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
+                        pioneer_protocol::PublicErrorStage::Admission,
                         format!(
                             "invalid params for `{}`: `turn_id` is required",
                             methods::TURN_START
@@ -800,9 +1081,10 @@ impl MessageProcessor {
                 None => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        public_turn_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorStage::Admission,
                             format!("thread `{}` is not loaded", params.thread_id.trim()),
                         ),
                     )
@@ -819,24 +1101,13 @@ impl MessageProcessor {
             ) {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        error.to_string(),
+                    public_turn_start_error(
+                        request_id,
+                        TurnStartFailure::policy_denied(error.to_string()),
                     ),
                 )
                 .await;
                 return;
-            }
-            if execution_admission.is_member() {
-                let requested = pioneer_protocol::resolve_turn_permission_profile(
-                    params.permission_profile.as_ref(),
-                );
-                let effective = execution_admission.cap_permission_profile(&requested);
-                params.permission_profile =
-                    Some(pioneer_protocol::TurnPermissionProfileSelection {
-                        mode: effective.mode,
-                    });
             }
             if thread.origin_kind.composer_execution_mode()
                 == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
@@ -847,7 +1118,7 @@ impl MessageProcessor {
                     request_actor.clone(),
                     params,
                     thread,
-                    Some(execution_admission),
+                    execution_admission,
                     TurnStartSuccessResponse::TurnStart,
                 )
                 .await;
@@ -875,7 +1146,7 @@ impl MessageProcessor {
                             params,
                             runtime_id,
                             runtime_kind,
-                            Some(execution_admission),
+                            TurnExecutionAuthority::Fresh(execution_admission),
                             TurnStartSuccessResponse::TurnStart,
                         )
                         .await;
@@ -884,9 +1155,10 @@ impl MessageProcessor {
                     AgentExecutionBackend::ACPAgentRuntime { runtime_id } => {
                         self.send_error(
                             connection_id,
-                            JsonRpcErrorResponse::new(
+                            public_turn_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
+                                pioneer_protocol::PublicErrorStage::Admission,
                                 format!("ACP agent runtime `{runtime_id}` is not supported"),
                             ),
                         )
@@ -901,20 +1173,18 @@ impl MessageProcessor {
                 .prepare_api_provider_turn_start(
                     connection_id,
                     request_actor,
-                    member_principal_id,
+                    scoped_principal_id,
                     params,
                     requested_reasoning_effort.as_deref(),
-                    Some(execution_admission),
+                    crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+                    execution_admission,
                 )
                 .await
             {
                 Ok(prepared) => prepared,
                 Err(message) => {
-                    self.send_error(
-                        connection_id,
-                        JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
-                    )
-                    .await;
+                    self.send_error(connection_id, public_turn_start_error(request_id, message))
+                        .await;
                     return;
                 }
             };
@@ -937,9 +1207,10 @@ impl MessageProcessor {
                         Err(error) => {
                             self.send_error(
                                 connection_id,
-                                JsonRpcErrorResponse::new(
+                                public_turn_error(
                                     None,
                                     INVALID_REQUEST_CODE,
+                                    pioneer_protocol::PublicErrorStage::Delivery,
                                     format!(
                                         "failed to encode idempotent turn/start response: {error}"
                                     ),
@@ -974,11 +1245,9 @@ impl MessageProcessor {
 
     async fn complete_runtime_draft_materialization(
         &self,
-        execution_admission: Option<&ExecutionAuthorizationAdmission>,
+        execution_authority: ExecutionEnvelopeSource<'_>,
     ) {
-        let Some(runtime_draft) =
-            execution_admission.and_then(ExecutionAuthorizationAdmission::runtime_draft)
-        else {
+        let Some(runtime_draft) = execution_authority.runtime_draft() else {
             return;
         };
         self.complete_runtime_draft_materialization_record(runtime_draft)
@@ -997,7 +1266,7 @@ impl MessageProcessor {
                 "first turn committed but runtime draft lifecycle could not be promoted"
             );
         }
-        if let RuntimeDraftCreator::Member { principal_id, .. } = runtime_draft.creator() {
+        if let RuntimeDraftCreator::ScopedPrincipal { principal_id, .. } = runtime_draft.creator() {
             self.publish_committed_authorization_invalidation(
                 AccessChangeKind::ThreadCreated,
                 Some(principal_id.clone()),
@@ -1018,10 +1287,12 @@ impl MessageProcessor {
         request_actor: pioneer_protocol::PersistedActorRef,
         mut params: TurnStartParams,
         thread: pioneer_protocol::Thread,
-        execution_admission: Option<ExecutionAuthorizationAdmission>,
+        mut execution_admission: ExecutionAuthorizationAdmission,
         success_response: TurnStartSuccessResponse,
     ) -> MessageFuture<'a, ()> {
         message_future(async move {
+            let admission_entry_point =
+                crate::authorization::ExecutionAdmissionEntryPoint::DetachedTask;
             let turn_id = params.turn_id.clone();
             // Keep Composer admission, durable materialization, detached Task
             // creation, and finalization in separate heap-backed futures. Polling
@@ -1050,11 +1321,9 @@ impl MessageProcessor {
                         return None;
                     }
                 };
-                if execution_admission
-                    .as_ref()
-                    .is_some_and(ExecutionAuthorizationAdmission::is_member)
+                if execution_admission.uses_scoped_collaboration_policy()
                     && let Err(message) = self
-                        .enforce_member_skill_capability_projection(
+                        .enforce_scoped_skill_capability_projection(
                             thread.workspace_id.as_str(),
                             normalized_capabilities.execution.as_slice(),
                         )
@@ -1084,6 +1353,20 @@ impl MessageProcessor {
                     )
                     .await;
                     return None;
+                }
+                let resolved_permission_profile = execution_admission
+                    .uses_scoped_collaboration_policy()
+                    .then(|| {
+                        let requested = pioneer_protocol::resolve_turn_permission_profile(
+                            params.permission_profile.as_ref(),
+                        );
+                        execution_admission.cap_permission_profile(&requested)
+                    });
+                if let Some(profile) = resolved_permission_profile.as_ref() {
+                    params.permission_profile =
+                        Some(pioneer_protocol::TurnPermissionProfileSelection {
+                            mode: profile.mode,
+                        });
                 }
                 // The detached Task must replay the exact presentation selected in the
                 // Composer. Skill packs are expanded only at the execution boundary;
@@ -1199,11 +1482,25 @@ impl MessageProcessor {
                         return None;
                     }
                 };
-                let outcome = match self
-                    .thread_manager
-                    .turn_start_with_user_metadata(connection_id, params, author, mentions)
-                    .await
-                {
+                let outcome_result = match resolved_permission_profile {
+                    Some(profile) => {
+                        self.thread_manager
+                            .turn_start_with_user_metadata_and_permission_profile(
+                                connection_id,
+                                params,
+                                profile,
+                                author,
+                                mentions,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.thread_manager
+                            .turn_start_with_user_metadata(connection_id, params, author, mentions)
+                            .await
+                    }
+                };
+                let outcome = match outcome_result {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         self.send_turn_start_failure(
@@ -1254,15 +1551,43 @@ impl MessageProcessor {
                 return;
             };
             let materialized_phase = message_future(async {
+                if let Err(message) = self
+                    .admit_composite_execution_request(
+                        &mut execution_admission,
+                        admission_entry_point,
+                        vec![crate::authorization::ResourceAction::TaskCreate],
+                        outcome.started_notification.workspace_id.as_str(),
+                        outcome.started_notification.thread_id.as_str(),
+                        outcome.materialization.thread.model_provider.as_str(),
+                        outcome.materialization.thread.model.as_str(),
+                        &launch,
+                        outcome.materialization.capabilities.as_slice(),
+                    )
+                    .await
+                {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        thread.id.as_str(),
+                        turn_id.as_str(),
+                        message,
+                    )
+                    .await;
+                    return None;
+                }
                 if let Err(error) = persist_admitted_turn_start(
                     self.crud_store.as_ref(),
+                    self.provider_registry.as_ref(),
+                    &launch,
                     &outcome.materialization,
                     requested_reasoning_effort(&launch).as_deref(),
                     request_actor,
                     profile_audit,
-                    execution_admission
-                        .as_ref()
-                        .and_then(ExecutionAuthorizationAdmission::runtime_draft),
+                    ExecutionEnvelopeSource::Fresh(&execution_admission),
                     None,
                 )
                 .await
@@ -1281,20 +1606,22 @@ impl MessageProcessor {
                     .await;
                     return None;
                 }
-                self.complete_runtime_draft_materialization(execution_admission.as_ref())
-                    .await;
+                self.complete_runtime_draft_materialization(ExecutionEnvelopeSource::Fresh(
+                    &execution_admission,
+                ))
+                .await;
                 let security_snapshot = match self
                     .persist_turn_execution_security_snapshot(
                         &launch,
                         &outcome,
                         None,
-                        None,
-                        execution_admission.as_ref(),
+                        ExecutionEnvelopeSource::Fresh(&execution_admission),
                     )
                     .await
                 {
                     Ok(snapshot) => snapshot,
-                    Err(message) => {
+                    Err(failure) => {
+                        let message = failure.to_string();
                         self.mark_turn_blocked(
                             thread.id.clone(),
                             launch.turn_id.clone(),
@@ -1307,7 +1634,7 @@ impl MessageProcessor {
                             &success_response,
                             thread.id.as_str(),
                             turn_id.as_str(),
-                            message,
+                            failure,
                         )
                         .await;
                         return None;
@@ -1437,14 +1764,79 @@ impl MessageProcessor {
                         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch.clone())),
                     }),
                 };
+                let task_execution_context = match self
+                    .load_turn_execution_authorization_context(launch.turn_id.as_str())
+                    .await
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            thread.id.clone(),
+                            launch.turn_id.clone(),
+                            format!("failed to load Composer execution admission: {error:#}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                let authorization_context_json = match task_execution_context.to_persisted_json() {
+                    Ok(json) => json,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            thread.id.clone(),
+                            launch.turn_id.clone(),
+                            format!("failed to persist Composer execution admission: {error:#}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                let (execution_resources, task_resources) =
+                    match task_execution_context.admitted_resource_budgets() {
+                        Ok(resources) => resources,
+                        Err(error) => {
+                            self.mark_turn_blocked(
+                                thread.id.clone(),
+                                launch.turn_id.clone(),
+                                format!(
+                                    "Composer execution admission has no registered resource budgets: {error:#}"
+                                ),
+                            )
+                            .await;
+                            return None;
+                        }
+                    };
                 let create_context = pioneer_tasks::TaskCreateContext {
                     conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
                         conversation_thread_id: thread.id.clone(),
                         source_turn_id: Some(launch.turn_id.clone()),
                         history_json: frozen_history_json,
                     }),
+                    execution_admission: Some(pioneer_tasks::TaskExecutionAdmissionSeed {
+                        workspace_id: task_execution_context.workspace_id().to_owned(),
+                        root_thread_id: task_execution_context.root_thread_id().to_owned(),
+                        initiating_principal_id: task_execution_context
+                            .initiating_principal_id()
+                            .to_string(),
+                        authorization_context_json,
+                        role_key: task_execution_context.role_key().to_owned(),
+                        policy_fingerprint: task_execution_context.policy_fingerprint().to_owned(),
+                        execution_resources,
+                        task_resources,
+                    }),
                     ..Default::default()
                 };
+                if let Some(seed) = create_context.execution_admission.as_ref()
+                    && let Err(error) = self.validate_task_execution_admission_seed(seed).await
+                {
+                    self.mark_turn_blocked(
+                        thread.id.clone(),
+                        launch.turn_id.clone(),
+                        format!("Composer execution admission became stale: {error:#}"),
+                    )
+                    .await;
+                    return None;
+                }
                 if let Err(error) = self
                     .task_runtime
                     .service()
@@ -1533,81 +1925,94 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_actor: pioneer_protocol::PersistedActorRef,
-        member_principal_id: Option<pioneer_protocol::PrincipalId>,
+        scoped_principal_id: Option<pioneer_protocol::PrincipalId>,
         mut params: TurnStartParams,
         requested_reasoning_effort: Option<&str>,
-        execution_admission: Option<ExecutionAuthorizationAdmission>,
-    ) -> Result<ApiProviderTurnAdmission, String> {
+        entry_point: crate::authorization::ExecutionAdmissionEntryPoint,
+        mut execution_admission: ExecutionAuthorizationAdmission,
+    ) -> Result<ApiProviderTurnAdmission, TurnStartFailure> {
         let allow_agent_skill_overlay =
             execution_backend_allows_agent_skill_overlay(params.execution_backend.as_ref());
         let thread = self
             .thread_manager
             .thread_get(params.thread_id.trim())
             .await
-            .ok_or_else(|| format!("thread `{}` is not loaded", params.thread_id.trim()))?;
+            .ok_or_else(|| {
+                TurnStartFailure::unavailable(format!(
+                    "thread `{}` is not loaded",
+                    params.thread_id.trim()
+                ))
+            })?;
         let normalized_capabilities = self
             .normalize_turn_skill_capabilities(
                 thread.workspace_id.as_str(),
                 params.capabilities.as_slice(),
             )
             .await?;
-        if execution_admission
-            .as_ref()
-            .is_some_and(ExecutionAuthorizationAdmission::is_member)
-        {
-            self.enforce_member_skill_capability_projection(
+        if execution_admission.uses_scoped_collaboration_policy() {
+            self.enforce_scoped_skill_capability_projection(
                 thread.workspace_id.as_str(),
                 normalized_capabilities.execution.as_slice(),
             )
             .await?;
         }
         params.capabilities = normalized_capabilities.execution.clone();
-        super::message_turn::normalize_turn_collaboration_params(&mut params)
-            .map_err(|error| format!("invalid Turn collaboration metadata: {error}"))?;
-        let request_digest = native_turn_admission_digest(&request_actor, &params)?;
+        super::message_turn::normalize_turn_collaboration_params(&mut params).map_err(|error| {
+            TurnStartFailure::invalid_input(format!("invalid Turn collaboration metadata: {error}"))
+        })?;
+        let request_digest = native_turn_admission_digest(&request_actor, &params)
+            .map_err(TurnStartFailure::invalid_input)?;
         let existing_admission = self
             .crud_store
             .get_turn_admission(params.turn_id.trim())
             .await
-            .map_err(|error| format!("failed to verify Turn admission request: {error:#}"))?;
+            .map_err(|error| {
+                TurnStartFailure::internal(format!(
+                    "failed to verify Turn admission request: {error:#}"
+                ))
+            })?;
         let existing_turn = self
             .crud_store
             .get_turn(params.thread_id.trim(), params.turn_id.trim())
             .await
-            .map_err(|error| format!("failed to verify Turn admission identity: {error:#}"))?;
+            .map_err(|error| {
+                TurnStartFailure::internal(format!(
+                    "failed to verify Turn admission identity: {error:#}"
+                ))
+            })?;
         if let Some(admission) = existing_admission {
             if admission.workspace_id != thread.workspace_id
                 || admission.thread_id != params.thread_id.trim()
                 || admission.request_digest != request_digest
             {
-                return Err(format!(
+                return Err(TurnStartFailure::conflict(format!(
                     "turn `{}` already has a conflicting durable admission request",
                     params.turn_id.trim()
-                ));
+                )));
             }
             let Some((workspace_id, existing)) = existing_turn else {
-                return Err(format!(
+                return Err(TurnStartFailure::internal(format!(
                     "turn `{}` has durable admission state but no authoritative Turn",
                     params.turn_id.trim()
-                ));
+                )));
             };
             if workspace_id != thread.workspace_id {
-                return Err(format!(
+                return Err(TurnStartFailure::internal(format!(
                     "turn `{}` admission workspace differs from its authoritative Turn",
                     params.turn_id.trim()
-                ));
+                )));
             }
             return Ok(ApiProviderTurnAdmission::Replay(
                 pioneer_protocol::TurnStartResponse { turn: existing },
             ));
         }
         if let Some((_workspace_id, existing)) = existing_turn {
-            return Err(format!(
+            return Err(TurnStartFailure::conflict(format!(
                 "turn `{}` already exists in thread `{}` with status `{:?}` but has no durable native admission identity",
                 params.turn_id.trim(),
                 params.thread_id.trim(),
                 existing.status
-            ));
+            )));
         }
         self.validate_turn_artifact_user_inputs(
             thread.workspace_id.as_str(),
@@ -1615,26 +2020,60 @@ impl MessageProcessor {
             params.input.as_slice(),
         )
         .await
-        .map_err(|error| format!("failed to validate artifact input: {error}"))?;
+        .map_err(|error| {
+            TurnStartFailure::unavailable(format!("failed to validate artifact input: {error}"))
+        })?;
+        let resolved_permission_profile = execution_admission
+            .uses_scoped_collaboration_policy()
+            .then(|| {
+                let requested = pioneer_protocol::resolve_turn_permission_profile(
+                    params.permission_profile.as_ref(),
+                );
+                execution_admission.cap_permission_profile(&requested)
+            });
+        if let Some(profile) = resolved_permission_profile.as_ref() {
+            params.permission_profile =
+                Some(pioneer_protocol::TurnPermissionProfileSelection { mode: profile.mode });
+        }
         let security_params = params.clone();
         let author = super::message_turn::resolve_turn_author_snapshot(
             self.crud_store.as_ref(),
             &request_actor,
         )
         .await
-        .map_err(|error| format!("failed to resolve Turn author: {error:#}"))?;
+        .map_err(|error| {
+            TurnStartFailure::internal(format!("failed to resolve Turn author: {error:#}"))
+        })?;
         let mentions = super::message_turn::resolve_turn_collaboration_metadata(
             self.crud_store.as_ref(),
             &request_actor,
             &params,
         )
         .await
-        .map_err(|error| format!("invalid Turn collaboration metadata: {error}"))?;
-        let outcome = self
-            .thread_manager
-            .turn_start_with_user_metadata(connection_id, params, author, mentions)
-            .await
-            .map_err(|error| format!("failed to start turn: {error:#}"))?;
+        .map_err(|error| {
+            TurnStartFailure::invalid_input(format!("invalid Turn collaboration metadata: {error}"))
+        })?;
+        let outcome_result = match resolved_permission_profile {
+            Some(profile) => {
+                self.thread_manager
+                    .turn_start_with_user_metadata_and_permission_profile(
+                        connection_id,
+                        params,
+                        profile,
+                        author,
+                        mentions,
+                    )
+                    .await
+            }
+            None => {
+                self.thread_manager
+                    .turn_start_with_user_metadata(connection_id, params, author, mentions)
+                    .await
+            }
+        };
+        let outcome = outcome_result.map_err(|error| {
+            TurnStartFailure::internal(format!("failed to start turn: {error:#}"))
+        })?;
         let effective_reasoning_effort = match self
             .resolve_turn_reasoning_effort(
                 outcome.started_notification.workspace_id.as_str(),
@@ -1651,7 +2090,7 @@ impl MessageProcessor {
                 self.thread_manager
                     .rollback_turn_start(outcome.rollback_context.clone())
                     .await;
-                return Err(message);
+                return Err(TurnStartFailure::invalid_input(message));
             }
         };
         let skill_catalog = match self
@@ -1669,6 +2108,25 @@ impl MessageProcessor {
                 return Err(message);
             }
         };
+        if let Err(message) = self
+            .admit_composite_execution_request(
+                &mut execution_admission,
+                entry_point,
+                Vec::new(),
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.materialization.thread.model_provider.as_str(),
+                outcome.materialization.thread.model.as_str(),
+                &security_params,
+                outcome.materialization.capabilities.as_slice(),
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            return Err(message);
+        }
         let user_message_capability_attachments =
             match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
                 normalized_capabilities.presentation.as_slice(),
@@ -1680,9 +2138,9 @@ impl MessageProcessor {
                     self.thread_manager
                         .rollback_turn_start(outcome.rollback_context.clone())
                         .await;
-                    return Err(format!(
+                    return Err(TurnStartFailure::internal(format!(
                         "failed to snapshot selected skill presentation: {error:#}"
-                    ));
+                    )));
                 }
             };
         let mut agent_skill_overlay = if allow_agent_skill_overlay
@@ -1690,10 +2148,10 @@ impl MessageProcessor {
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.thread.model_provider.as_str(),
             ) {
-            if let Some(member_principal_id) = member_principal_id.as_ref() {
+            if let Some(scoped_principal_id) = scoped_principal_id.as_ref() {
                 match self
-                    .load_agent_skill_overlay_for_member_turn(
-                        member_principal_id,
+                    .load_agent_skill_overlay_for_scoped_turn(
+                        scoped_principal_id,
                         outcome.started_notification.workspace_id.as_str(),
                         outcome.started_notification.turn.id.as_str(),
                     )
@@ -1710,7 +2168,9 @@ impl MessageProcessor {
                         self.thread_manager
                             .rollback_turn_start(outcome.rollback_context.clone())
                             .await;
-                        return Err("Member Agent skill projection is unavailable".to_owned());
+                        return Err(TurnStartFailure::unavailable(
+                            "Member Agent skill projection is unavailable",
+                        ));
                     }
                 }
             } else {
@@ -1730,20 +2190,20 @@ impl MessageProcessor {
                 self.thread_manager
                     .rollback_turn_start(outcome.rollback_context.clone())
                     .await;
-                return Err(format!(
+                return Err(TurnStartFailure::internal(format!(
                     "failed to resolve turn permission profile: {error:#}"
-                ));
+                )));
             }
         };
         if let Err(error) = message_future(persist_admitted_turn_start(
             self.crud_store.as_ref(),
+            self.provider_registry.as_ref(),
+            &security_params,
             &outcome.materialization,
             effective_reasoning_effort.as_deref(),
             request_actor,
             profile_selected_audit,
-            execution_admission
-                .as_ref()
-                .and_then(ExecutionAuthorizationAdmission::runtime_draft),
+            ExecutionEnvelopeSource::Fresh(&execution_admission),
             Some(request_digest),
         ))
         .await
@@ -1752,31 +2212,33 @@ impl MessageProcessor {
                 .rollback_turn_start(outcome.rollback_context.clone())
                 .await;
 
-            return Err(format!(
+            return Err(TurnStartFailure::internal(format!(
                 "failed to persist turn/start state and permission audit: {error:#}"
-            ));
+            )));
         }
-        self.complete_runtime_draft_materialization(execution_admission.as_ref())
-            .await;
+        self.complete_runtime_draft_materialization(ExecutionEnvelopeSource::Fresh(
+            &execution_admission,
+        ))
+        .await;
         let execution_security_snapshot = match self
             .persist_turn_execution_security_snapshot(
                 &security_params,
                 &outcome,
                 None,
-                None,
-                execution_admission.as_ref(),
+                ExecutionEnvelopeSource::Fresh(&execution_admission),
             )
             .await
         {
             Ok(snapshot) => snapshot,
-            Err(message) => {
+            Err(failure) => {
+                let message = failure.to_string();
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     message.clone(),
                 )
                 .await;
-                return Err(message);
+                return Err(failure);
             }
         };
 
@@ -1795,7 +2257,9 @@ impl MessageProcessor {
                 format!("failed to prepare agent thread runtime: {error}"),
             )
             .await;
-            return Err(format!("failed to prepare agent thread runtime: {error}"));
+            return Err(TurnStartFailure::unavailable(format!(
+                "failed to prepare agent thread runtime: {error}"
+            )));
         }
 
         if let Err(error) = self
@@ -1809,7 +2273,7 @@ impl MessageProcessor {
                 message.clone(),
             )
             .await;
-            return Err(message);
+            return Err(TurnStartFailure::unavailable(message));
         }
         let history = self
             .load_conversation_history_for_workspace(
@@ -1841,7 +2305,7 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to load authoritative workspace skill policies"
                 );
-                let message = if member_principal_id.is_some() {
+                let message = if scoped_principal_id.is_some() {
                     "Member skill projection is unavailable".to_owned()
                 } else {
                     format!("failed to load workspace skill policies: {error:#}")
@@ -1852,7 +2316,7 @@ impl MessageProcessor {
                     message.clone(),
                 )
                 .await;
-                return Err(message);
+                return Err(TurnStartFailure::unavailable(message));
             }
         };
         let resolved_artifacts = match self
@@ -1870,9 +2334,9 @@ impl MessageProcessor {
                     format!("failed to resolve artifact input for provider: {error:#}"),
                 )
                 .await;
-                return Err(format!(
+                return Err(TurnStartFailure::unavailable(format!(
                     "failed to resolve artifact input for provider: {error:#}"
-                ));
+                )));
             }
         };
         let runtime_environment = match self
@@ -1891,12 +2355,12 @@ impl MessageProcessor {
                     format!("failed to prepare artifact output directory: {error:#}"),
                 )
                 .await;
-                return Err(format!(
+                return Err(TurnStartFailure::unavailable(format!(
                     "failed to prepare artifact output directory: {error:#}"
-                ));
+                )));
             }
         };
-        let hook_runtime_context = member_principal_id.map_or_else(
+        let hook_runtime_context = scoped_principal_id.map_or_else(
             pioneer_agent::AgentTurnHookRuntimeContext::default,
             |principal_id| pioneer_agent::AgentTurnHookRuntimeContext {
                 actor_kind: pioneer_hooks::HookActorKind::User,
@@ -1930,9 +2394,9 @@ impl MessageProcessor {
                 format!("failed to persist turn runtime snapshot: {error:#}"),
             )
             .await;
-            return Err(format!(
+            return Err(TurnStartFailure::internal(format!(
                 "failed to persist turn runtime snapshot: {error:#}"
-            ));
+            )));
         }
         let permission_profile =
             match self.materialized_turn_permission_profile(&outcome.materialization.turn) {
@@ -1944,9 +2408,9 @@ impl MessageProcessor {
                         format!("failed to resolve turn permission profile: {error:#}"),
                     )
                     .await;
-                    return Err(format!(
+                    return Err(TurnStartFailure::internal(format!(
                         "failed to resolve turn permission profile: {error:#}"
-                    ));
+                    )));
                 }
             };
 
@@ -2052,20 +2516,35 @@ impl MessageProcessor {
         success_response: &TurnStartSuccessResponse,
         thread_id: &str,
         turn_id: &str,
-        message: String,
+        failure: impl Into<TurnStartFailure>,
     ) {
+        let failure = failure.into();
+        let public_error = crate::public_error::map_agent_failure(
+            failure.public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+            failure.diagnostic,
+        );
         match success_response {
             TurnStartSuccessResponse::TurnStart => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                    JsonRpcErrorResponse {
+                        jsonrpc: pioneer_protocol::JSONRPC_VERSION.to_owned(),
+                        id: Some(request_id),
+                        error: pioneer_protocol::JsonRpcError {
+                            code: INVALID_REQUEST_CODE,
+                            message: public_error.message.clone(),
+                            data: Some(json!({ "public_error": public_error })),
+                        },
+                    },
                 )
                 .await;
             }
             TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { session_id } => {
                 let error = VoiceError {
                     kind: VoiceErrorKind::Unknown,
-                    message,
+                    message: public_error.message.clone(),
+                    public_error: Some(public_error),
                 };
                 warn!(
                     connection_id,
@@ -2087,7 +2566,9 @@ impl MessageProcessor {
                 .await;
             }
             TurnStartSuccessResponse::Task { .. } => {
-                success_response.complete_task(Err(anyhow::anyhow!(message)));
+                let encoded = serde_json::to_string(&public_error)
+                    .unwrap_or_else(|_| public_error.correlation_id.clone());
+                success_response.complete_task(Err(anyhow::anyhow!(encoded)));
             }
         }
     }
@@ -2099,9 +2580,7 @@ impl MessageProcessor {
         runtime_kind: CLIAgentRuntimeKind,
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
         execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
-        execution_authorization_context: Option<
-            crate::authorization::ExecutionAuthorizationContext,
-        >,
+        execution_authorization_context: crate::authorization::ExecutionAuthorizationContext,
         continuation_thread_id: String,
         context_thread_id: String,
         task_run_id: String,
@@ -2112,7 +2591,6 @@ impl MessageProcessor {
         let response = TurnStartSuccessResponse::Task {
             permission_profile,
             execution_security_snapshot,
-            execution_authorization_context,
             continuation_thread_id,
             context_thread_id,
             task_run_id,
@@ -2128,7 +2606,7 @@ impl MessageProcessor {
             params,
             runtime_id,
             runtime_kind,
-            None,
+            TurnExecutionAuthority::Durable(execution_authorization_context),
             response,
         )
         .await;
@@ -2202,7 +2680,7 @@ impl MessageProcessor {
         capability_partition: crate::cli_runtime::skills::CliRuntimeCapabilityPartition,
         requested_mcp: bool,
         provider_claim_matches: bool,
-    ) -> MessageFuture<'a, Result<PreparedCliRuntimeCombinedPreflight, String>> {
+    ) -> MessageFuture<'a, Result<PreparedCliRuntimeCombinedPreflight, TurnStartFailure>> {
         message_future(async move {
             let mcp_projection = match self
                 .mcp_service
@@ -2246,9 +2724,9 @@ impl MessageProcessor {
                         error.rejected_capabilities.as_slice(),
                     )
                     .await;
-                    return Err(format!(
+                    return Err(TurnStartFailure::internal(format!(
                         "{code}: combined MCP and skill preflight failed: {error}"
-                    ));
+                    )));
                 }
             };
             let combined_preflight_input =
@@ -2287,7 +2765,7 @@ impl MessageProcessor {
                                 "CLI runtime skill preflight failed"
                             );
                         }
-                        return Err(failure_reason);
+                        return Err(TurnStartFailure::policy_denied(failure_reason));
                     }
                 };
                 if let Err(error) =
@@ -2304,7 +2782,7 @@ impl MessageProcessor {
                         elapsed_ms = preflight_started.elapsed().as_millis(),
                         "CLI runtime skill preflight rejected Pioneer-only required system skill"
                     );
-                    return Err(error.to_string());
+                    return Err(TurnStartFailure::invalid_input(error.to_string()));
                 }
                 if let Err(error) =
                     crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
@@ -2329,7 +2807,7 @@ impl MessageProcessor {
                             "CLI runtime skill preflight rejected unsupported native invocation"
                         );
                     }
-                    return Err(error.to_string());
+                    return Err(TurnStartFailure::internal(error.to_string()));
                 }
                 let resolved_skill_bindings =
                     crate::cli_runtime::skills::cli_runtime_turn_skill_bindings(&resolved);
@@ -2362,7 +2840,7 @@ impl MessageProcessor {
                                 "CLI runtime skill preflight planning failed"
                             );
                         }
-                        return Err(failure_reason);
+                        return Err(TurnStartFailure::internal(failure_reason));
                     }
                 };
                 (plans, resolved_skill_bindings)
@@ -2433,7 +2911,7 @@ impl MessageProcessor {
                             rejection_reason = ?rejection.reason,
                             "combined MCP and skill preflight rejected the client MCP claim"
                         );
-                        return Err(format!("{code}: {message}"));
+                        return Err(TurnStartFailure::internal(format!("{code}: {message}")));
                     }
                     let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
                     #[cfg(test)]
@@ -2461,7 +2939,7 @@ impl MessageProcessor {
                                 .diagnostics
                                 .iter()
                                 .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            return Err(format!(
+                            return Err(TurnStartFailure::unavailable(format!(
                                 "{}: {}",
                                 diagnostic
                                     .map(|diagnostic| diagnostic.code.as_str())
@@ -2469,7 +2947,7 @@ impl MessageProcessor {
                                 diagnostic
                                     .map(|diagnostic| diagnostic.message.as_str())
                                     .unwrap_or("MCP tool readiness is not available")
-                            ));
+                            )));
                         }
                         codex_mcp_launch_projection = Some(
                             crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
@@ -2477,7 +2955,9 @@ impl MessageProcessor {
                                 readiness.contract_fingerprint,
                             )
                             .map_err(|error| {
-                                format!("failed to prepare Codex MCP schema projection: {error}")
+                                TurnStartFailure::internal(format!(
+                                    "failed to prepare Codex MCP schema projection: {error}"
+                                ))
                             })?,
                         );
                     } else if runtime_kind == CLIAgentRuntimeKind::Claude {
@@ -2499,7 +2979,7 @@ impl MessageProcessor {
                                 .diagnostics
                                 .iter()
                                 .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            return Err(format!(
+                            return Err(TurnStartFailure::unavailable(format!(
                                 "{}: {}",
                                 diagnostic
                                     .map(|diagnostic| diagnostic.code.as_str())
@@ -2507,7 +2987,7 @@ impl MessageProcessor {
                                 diagnostic
                                     .map(|diagnostic| diagnostic.message.as_str())
                                     .unwrap_or("MCP tool readiness is not available")
-                            ));
+                            )));
                         }
                         claude_mcp_launch_projection = Some(
                             crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection(
@@ -2515,7 +2995,9 @@ impl MessageProcessor {
                                 readiness.contract_fingerprint,
                             )
                             .map_err(|error| {
-                                format!("failed to prepare Claude MCP schema projection: {error}")
+                                TurnStartFailure::internal(format!(
+                                    "failed to prepare Claude MCP schema projection: {error}"
+                                ))
                             })?,
                         );
                     }
@@ -2537,10 +3019,21 @@ impl MessageProcessor {
         mut params: TurnStartParams,
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
-        execution_admission: Option<ExecutionAuthorizationAdmission>,
+        mut execution_authority: TurnExecutionAuthority,
         success_response: TurnStartSuccessResponse,
     ) -> MessageFuture<'a, ()> {
         message_future(async move {
+            let admission_entry_point = match &success_response {
+                TurnStartSuccessResponse::TurnStart => {
+                    crate::authorization::ExecutionAdmissionEntryPoint::CliRuntime
+                }
+                TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { .. } => {
+                    crate::authorization::ExecutionAdmissionEntryPoint::VoiceTurn
+                }
+                TurnStartSuccessResponse::Task { .. } => {
+                    crate::authorization::ExecutionAdmissionEntryPoint::Task
+                }
+            };
             let response_turn_id = params.turn_id.clone();
             let response_thread_id = params.thread_id.clone();
             let submitted_model_provider = params.model_provider.clone();
@@ -2556,6 +3049,24 @@ impl MessageProcessor {
                     )
                     .await;
                 }};
+            }
+
+            let authority_matches_response = matches!(
+                (&success_response, &execution_authority),
+                (
+                    TurnStartSuccessResponse::Task { .. },
+                    TurnExecutionAuthority::Durable(_)
+                ) | (
+                    TurnStartSuccessResponse::TurnStart
+                        | TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { .. },
+                    TurnExecutionAuthority::Fresh(_)
+                )
+            );
+            if !authority_matches_response {
+                send_turn_start_failure!(TurnStartFailure::internal(
+                    "CLI runtime response and execution authority variants differ",
+                ));
+                return;
             }
 
             let Some(runtime_config) = self
@@ -2604,11 +3115,13 @@ impl MessageProcessor {
                     return None;
                 }
             };
-            if execution_admission
-                .as_ref()
-                .is_some_and(ExecutionAuthorizationAdmission::is_member)
+            if matches!(
+                &execution_authority,
+                TurnExecutionAuthority::Fresh(admission)
+                    if admission.uses_scoped_collaboration_policy()
+            )
                 && let Err(message) = self
-                    .enforce_member_skill_capability_projection(
+                    .enforce_scoped_skill_capability_projection(
                         thread.workspace_id.as_str(),
                         normalized_capabilities.execution.as_slice(),
                     )
@@ -2620,6 +3133,20 @@ impl MessageProcessor {
             let normalized_presentation_capabilities = normalized_capabilities.presentation;
             let normalized_pack_names = normalized_capabilities.pack_names;
             params.capabilities = normalized_capabilities.execution;
+
+            // Validate the semantic catalog projection before any provider-specific
+            // preflight. This keeps malformed/missing capabilities in the typed
+            // InvalidInput lane while storage/catalog failures remain Unavailable.
+            if let Err(failure) = self
+                .validate_turn_skill_capabilities(
+                    thread.workspace_id.as_str(),
+                    params.capabilities.as_slice(),
+                )
+                .await
+            {
+                send_turn_start_failure!(failure);
+                return None;
+            }
 
             let capability_partition =
                 match crate::cli_runtime::skills::partition_cli_runtime_capabilities(
@@ -2991,6 +3518,21 @@ impl MessageProcessor {
                 send_turn_start_failure!(format!("invalid Turn collaboration metadata: {error}"));
                 return None;
             }
+            let resolved_permission_profile = match &execution_authority {
+                TurnExecutionAuthority::Fresh(admission)
+                    if admission.uses_scoped_collaboration_policy() =>
+                {
+                    let requested = pioneer_protocol::resolve_turn_permission_profile(
+                        params.permission_profile.as_ref(),
+                    );
+                    Some(admission.cap_permission_profile(&requested))
+                }
+                TurnExecutionAuthority::Fresh(_) | TurnExecutionAuthority::Durable(_) => None,
+            };
+            if let Some(profile) = resolved_permission_profile.as_ref() {
+                params.permission_profile =
+                    Some(pioneer_protocol::TurnPermissionProfileSelection { mode: profile.mode });
+            }
             let security_params = params.clone();
             #[cfg(test)]
             self.cli_runtime_skill_preflight_test_events
@@ -3024,17 +3566,28 @@ impl MessageProcessor {
                     return None;
                 }
             };
-            let outcome = match if let Some(permission_profile) =
+            let outcome_result = if let Some(permission_profile) =
                 success_response.task_permission_profile()
             {
                 self.thread_manager
                     .system_turn_start_with_permission_profile(params, permission_profile)
                     .await
+            } else if let Some(permission_profile) = resolved_permission_profile {
+                self.thread_manager
+                    .turn_start_with_user_metadata_and_permission_profile(
+                        connection_id,
+                        params,
+                        permission_profile,
+                        author,
+                        mentions,
+                    )
+                    .await
             } else {
                 self.thread_manager
                     .turn_start_with_user_metadata(connection_id, params, author, mentions)
                     .await
-            } {
+            };
+            let outcome = match outcome_result {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     send_turn_start_failure!(format!(
@@ -3128,6 +3681,27 @@ impl MessageProcessor {
             let materialized_phase = message_future(async {
             let mut installed_skills =
                 Vec::with_capacity(combined_preflight.skill_install_plans.len());
+            if let TurnExecutionAuthority::Fresh(admission) = &mut execution_authority
+                && let Err(message) = self
+                    .admit_composite_execution_request(
+                        admission,
+                        admission_entry_point,
+                        Vec::new(),
+                        outcome.started_notification.workspace_id.as_str(),
+                        outcome.started_notification.thread_id.as_str(),
+                        outcome.materialization.thread.model_provider.as_str(),
+                        outcome.materialization.thread.model.as_str(),
+                        &security_params,
+                        outcome.materialization.capabilities.as_slice(),
+                    )
+                    .await
+            {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                send_turn_start_failure!(message);
+                return None;
+            }
             let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
                 Ok(event) => event,
                 Err(error) => {
@@ -3140,22 +3714,23 @@ impl MessageProcessor {
                     return None;
                 }
             };
-            let runtime_draft = execution_admission
-                .as_ref()
-                .and_then(ExecutionAuthorizationAdmission::runtime_draft)
-                .cloned();
+            let materialization_authority = execution_authority.clone();
+            let materialization_params = security_params.clone();
             let materialization_result = {
                 let crud_store = self.crud_store.clone();
+                let provider_registry = self.provider_registry.clone();
                 let materialization = outcome.materialization.clone();
                 let effective_reasoning_effort = effective_cli_runtime_effort.clone();
                 let workflow = message_future(async move {
                     persist_admitted_turn_start(
                         crud_store.as_ref(),
+                        provider_registry.as_ref(),
+                        &materialization_params,
                         &materialization,
                         effective_reasoning_effort.as_deref(),
                         request_actor,
                         profile_selected_audit,
-                        runtime_draft.as_ref(),
+                        materialization_authority.source(),
                         None,
                     )
                     .await
@@ -3178,20 +3753,39 @@ impl MessageProcessor {
                 ));
                 return None;
             }
-            self.complete_runtime_draft_materialization(execution_admission.as_ref())
+            self.complete_runtime_draft_materialization(execution_authority.source())
                 .await;
             let security_snapshot = match self
                 .persist_turn_execution_security_snapshot(
                     &security_params,
                     &outcome,
                     success_response.task_execution_security_snapshot(),
-                    success_response.task_execution_authorization_context(),
-                    execution_admission.as_ref(),
+                    execution_authority.source(),
                 )
                 .await
             {
                 Ok(snapshot) => snapshot,
-                Err(message) => {
+                Err(failure) => {
+                    let message = failure.to_string();
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        message.clone(),
+                    )
+                    .await;
+                    send_turn_start_failure!(failure);
+                    return None;
+                }
+            };
+            let native_event_budget = match execution_authority
+                .source()
+                .effective_native_event_resource_budget()
+            {
+                Ok(budget) => budget,
+                Err(error) => {
+                    let message = format!(
+                        "failed to resolve CLI native event resource policy: {error:#}"
+                    );
                     self.mark_turn_blocked(
                         outcome.started_notification.thread_id.clone(),
                         outcome.started_notification.turn.id.clone(),
@@ -3429,12 +4023,14 @@ impl MessageProcessor {
             Some(CliRuntimeMaterializedPhase {
                 security_snapshot,
                 installed_skills,
+                native_event_budget,
             })
             })
             .await;
             let Some(CliRuntimeMaterializedPhase {
                 security_snapshot,
                 installed_skills,
+                native_event_budget,
             }) = materialized_phase
             else {
                 return;
@@ -3620,7 +4216,8 @@ impl MessageProcessor {
                                     crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
                                 ),
                             native_thread_id,
-                        ),
+                        )
+                        .with_native_event_budget(native_event_budget),
                     )
                     .await
             } else {
@@ -3664,7 +4261,8 @@ impl MessageProcessor {
                                 crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
                             ),
                         provider_session_id,
-                    ),
+                    )
+                    .with_native_event_budget(native_event_budget),
                     crate::cli_runtime::continuation::CliProviderContinuation::ClaudeResume {
                         provider_session_id,
                     } => crate::cli_runtime::continuation::CliSessionLaunchSpec::claude_resume(
@@ -3676,7 +4274,8 @@ impl MessageProcessor {
                                 crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
                             ),
                         provider_session_id,
-                    ),
+                    )
+                    .with_native_event_budget(native_event_budget),
                     crate::cli_runtime::continuation::CliProviderContinuation::CodexRpcThread {
                         ..
                     } => unreachable!("Claude preparation returned a Codex continuation"),
@@ -4434,42 +5033,39 @@ impl MessageProcessor {
                 format!("{:?}", turn.status).to_ascii_lowercase()
             );
         }
-        if let Some(authorization_context) = self
+        let authorization_context = self
             .load_turn_execution_authorization_context(binding.turn_id.as_str())
             .await
-            .context("failed to load CLI recovery execution authorization")?
-        {
-            authorization_context
-                .revalidate_for_turn_scope(
-                    self.crud_store.as_ref(),
-                    binding.workspace_id.as_str(),
-                    binding.thread_id.as_str(),
-                    binding.turn_id.as_str(),
-                    crate::authorization::ResourceAction::CliRuntimeUse,
-                    self.authorization_invalidation_hub.current_revision(),
-                )
-                .await
-                .context("CLI recovery initiating authority is no longer active")?;
-            let runtime_kind = match binding.runtime_kind.as_str() {
-                "codex" => CLIAgentRuntimeKind::Codex,
-                "claude" => CLIAgentRuntimeKind::Claude,
-                other => anyhow::bail!("unsupported CLI runtime kind `{other}`"),
-            };
-            authorization_context
-                .verify_cli_runtime_projection(
-                    binding.workspace_id.as_str(),
-                    binding.runtime_id.as_str(),
-                    runtime_kind,
-                )
-                .context("CLI recovery runtime differs from its immutable projection")?;
-        } else {
-            crate::authorization::ensure_contextless_execution_is_trusted(
+            .context("failed to load CLI recovery execution authorization")?;
+        self.execution_leases
+            .revalidate_for_turn(
                 self.crud_store.as_ref(),
+                &authorization_context,
+                binding.workspace_id.as_str(),
+                binding.thread_id.as_str(),
                 binding.turn_id.as_str(),
+                crate::authorization::ResourceAction::CliRuntimeUse,
+                self.current_authorization_revision()
+                    .await
+                    .context("CLI recovery policy generation is unavailable")?,
             )
             .await
-            .context("contextless CLI recovery is not a trusted legacy execution")?;
-        }
+            .context("CLI recovery collaboration authority is no longer active")?;
+        let runtime_kind = match binding.runtime_kind.as_str() {
+            "codex" => CLIAgentRuntimeKind::Codex,
+            "claude" => CLIAgentRuntimeKind::Claude,
+            other => anyhow::bail!("unsupported CLI runtime kind `{other}`"),
+        };
+        authorization_context
+            .verify_cli_runtime_projection(
+                binding.workspace_id.as_str(),
+                binding.runtime_id.as_str(),
+                runtime_kind,
+            )
+            .context("CLI recovery runtime differs from its immutable projection")?;
+        let native_event_budget = authorization_context
+            .effective_native_event_resource_budget()
+            .context("CLI recovery native event resource policy is unavailable")?;
         if let Some(existing) = self
             .crud_store
             .get_cli_runtime_turn_attempt_by_recovery_attempt(request.recovery_attempt_id.as_str())
@@ -4551,12 +5147,7 @@ impl MessageProcessor {
         let native_cwd = binding
             .cwd
             .clone()
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|path| path.display().to_string())
-            })
-            .context("CLI runtime recovery has no working directory")?;
+            .context("CLI runtime recovery has no persisted workspace working directory")?;
         let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
             cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
             approval_policy: binding.approval_policy.clone(),
@@ -4587,6 +5178,7 @@ impl MessageProcessor {
                     mcp,
                     Some(binding.native_thread_id.clone()),
                 )
+                .with_native_event_budget(native_event_budget)
             }
             CLIAgentRuntimeKind::Claude => {
                 let provider_session_id = uuid::Uuid::parse_str(binding.native_thread_id.as_str())
@@ -4599,6 +5191,7 @@ impl MessageProcessor {
                     mcp,
                     provider_session_id,
                 )
+                .with_native_event_budget(native_event_budget)
             }
         };
         let session_handle = manager
@@ -5034,29 +5627,27 @@ impl MessageProcessor {
         params: &TurnStartParams,
         outcome: &crate::thread::TurnStartOutcome,
         resolved_override: Option<pioneer_protocol::TurnExecutionSecuritySnapshot>,
-        resolved_authorization_context: Option<
-            &crate::authorization::ExecutionAuthorizationContext,
-        >,
-        execution_admission: Option<&ExecutionAuthorizationAdmission>,
-    ) -> Result<pioneer_protocol::TurnExecutionSecuritySnapshot, String> {
+        execution_authority: ExecutionEnvelopeSource<'_>,
+    ) -> Result<pioneer_protocol::TurnExecutionSecuritySnapshot, TurnStartFailure> {
         let permission_profile = self
             .materialized_turn_permission_profile(&outcome.materialization.turn)
             .map_err(|error| {
-                format!(
+                TurnStartFailure::internal(format!(
                     "failed to resolve turn permission profile for security snapshot: {error:#}"
-                )
+                ))
             })?;
-        let snapshot = if let Some(snapshot) = resolved_override {
+        let mut snapshot = if let Some(snapshot) = resolved_override {
             snapshot
         } else {
             let workspace_id = outcome.started_notification.workspace_id.clone();
-            let cwd = std::env::current_dir()
-                .map_err(|error| format!("failed to resolve turn cwd: {error}"))?;
+            let cwd = self
+                .turn_security_workspace_root(workspace_id.as_str())
+                .await?;
             let input_context = crate::turn_security::TurnSecurityResolverInputContext {
                 workspace_id: workspace_id.clone(),
                 cwd: Some(cwd),
                 project_roots: Vec::new(),
-                app_read_roots: self.turn_security_app_read_roots(),
+                app_read_roots: Vec::new(),
                 effective_model_provider: outcome.materialization.thread.model_provider.clone(),
                 resolved_permission_profile: permission_profile,
                 parent_cap: None,
@@ -5069,12 +5660,19 @@ impl MessageProcessor {
                     input_context,
                 )
                 .map_err(|error| {
-                    format!("failed to build turn execution security resolver input: {error:#}")
+                    TurnStartFailure::internal(format!(
+                        "failed to build turn execution security resolver input: {error:#}"
+                    ))
                 })?;
             crate::turn_security::resolve_turn_execution_security(&resolver_input).map_err(
-                |error| format!("failed to resolve turn execution security snapshot: {error:#}"),
+                |error| {
+                    TurnStartFailure::internal(format!(
+                        "failed to resolve turn execution security snapshot: {error:#}"
+                    ))
+                },
             )?
         };
+        snapshot.authority_cap.resource_binding_revision = execution_authority.policy_revision();
         let security_audit_events = self.turn_security_audit_events_for_turn(
             outcome.started_notification.workspace_id.as_str(),
             outcome.started_notification.thread_id.as_str(),
@@ -5092,95 +5690,89 @@ impl MessageProcessor {
         {
             self.materialize_turn_security_audit_events(security_audit_events)
                 .await?;
-            return Err(format!("turn execution security unavailable: {reason}"));
+            return Err(TurnStartFailure::unavailable(format!(
+                "turn execution security unavailable: {reason}"
+            )));
         }
-        let authorization_context_json = if let Some(context) = resolved_authorization_context {
-            if execution_admission.is_some() {
-                return Err(
-                    "failed to persist execution authorization context: resolved context and admission cannot both be present"
-                        .to_owned(),
-                );
+        let authorization_context = match execution_authority {
+            ExecutionEnvelopeSource::Durable(context) => {
+                if outcome.started_notification.workspace_id != context.workspace_id() {
+                    return Err(TurnStartFailure::internal(
+                        "failed to persist execution authorization context: durable context belongs to a different workspace",
+                    ));
+                }
+                context.clone()
             }
-            if outcome.started_notification.workspace_id != context.workspace_id() {
-                return Err(
-                    "failed to persist execution authorization context: resolved context belongs to a different workspace"
-                        .to_owned(),
-                );
+            ExecutionEnvelopeSource::Fresh(admission) => {
+                if outcome.started_notification.thread_id != admission.target_thread_id()
+                    || outcome.started_notification.workspace_id != admission.workspace_id()
+                {
+                    return Err(TurnStartFailure::internal(
+                        "failed to persist execution authorization context: materialized turn differs from authorized target",
+                    ));
+                }
+                admission
+                    .finalize(
+                        outcome.started_notification.workspace_id.as_str(),
+                        outcome.started_notification.thread_id.as_str(),
+                        outcome.materialization.thread.model_provider.as_str(),
+                        outcome.materialization.thread.model.as_str(),
+                        params.execution_backend.as_ref(),
+                        outcome.materialization.capabilities.as_slice(),
+                        &snapshot.permission_profile,
+                    )
+                    .map_err(|error| {
+                        TurnStartFailure::internal(format!(
+                            "failed to finalize execution authorization context: {error:#}"
+                        ))
+                    })?
             }
-            let context_json = context.to_persisted_json().map_err(|error| {
-                format!("failed to encode execution authorization context: {error:#}")
-            })?;
-            Some(context_json)
-        } else if let Some(admission) = execution_admission {
-            if outcome.started_notification.thread_id != admission.root_thread_id()
-                || outcome.started_notification.workspace_id != admission.workspace_id()
-            {
-                return Err(
-                    "failed to persist execution authorization context: materialized turn differs from authorized root"
-                        .to_owned(),
-                );
-            }
-            let context = admission
-                .finalize(
-                    outcome.started_notification.workspace_id.as_str(),
-                    outcome.started_notification.thread_id.as_str(),
-                    outcome.materialization.thread.model_provider.as_str(),
-                    outcome.materialization.thread.model.as_str(),
-                    params.execution_backend.as_ref(),
-                    outcome.materialization.capabilities.as_slice(),
-                    &snapshot.permission_profile,
-                )
-                .map_err(|error| {
-                    format!("failed to finalize execution authorization context: {error:#}")
-                })?;
-            let context_json = context.to_persisted_json().map_err(|error| {
-                format!("failed to encode execution authorization context: {error:#}")
-            })?;
-            Some(context_json)
-        } else {
-            None
         };
-        let updated = if let Some(context_json) = authorization_context_json.as_deref() {
-            self.crud_store
-                .set_turn_execution_envelope(
-                    outcome.started_notification.turn.id.as_str(),
-                    &snapshot,
-                    context_json,
-                )
-                .await
-        } else {
-            self.crud_store
-                .set_turn_execution_security_snapshot(
-                    outcome.started_notification.turn.id.as_str(),
-                    &snapshot,
-                )
-                .await
-        }
-        .map_err(|error| format!("failed to persist turn execution envelope: {error:#}"))?;
+        let authorization_context_json =
+            authorization_context.to_persisted_json().map_err(|error| {
+                TurnStartFailure::internal(format!(
+                    "failed to encode execution authorization context: {error:#}"
+                ))
+            })?;
+        let updated = self
+            .crud_store
+            .set_turn_execution_envelope(
+                outcome.started_notification.turn.id.as_str(),
+                &snapshot,
+                authorization_context_json.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                TurnStartFailure::internal(format!(
+                    "failed to persist turn execution envelope: {error:#}"
+                ))
+            })?;
         if !updated {
-            return Err(format!(
+            return Err(TurnStartFailure::internal(format!(
                 "failed to persist turn execution envelope: turn `{}` was not found",
                 outcome.started_notification.turn.id
-            ));
+            )));
         }
+        self.register_execution_lease(outcome.started_notification.turn.id.as_str())
+            .await
+            .map_err(|error| {
+                TurnStartFailure::internal(format!("failed to register execution lease: {error:#}"))
+            })?;
         self.materialize_turn_security_audit_events(security_audit_events)
-            .await?;
+            .await
+            .map_err(TurnStartFailure::internal)?;
         Ok(snapshot)
     }
 
     pub(crate) async fn load_turn_execution_authorization_context(
         &self,
         turn_id: &str,
-    ) -> anyhow::Result<Option<crate::authorization::ExecutionAuthorizationContext>> {
-        self.crud_store
-            .get_turn_execution_authorization_context(turn_id)
-            .await?
-            .map(|json| {
-                crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
-                    json.as_str(),
-                )
-            })
-            .transpose()
+    ) -> anyhow::Result<crate::authorization::ExecutionAuthorizationContext> {
+        crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+            self.crud_store.as_ref(),
+            turn_id,
+        )
+        .await
     }
 
     fn log_turn_security_snapshot(
@@ -5325,8 +5917,45 @@ impl MessageProcessor {
         }
     }
 
-    fn turn_security_app_read_roots(&self) -> Vec<std::path::PathBuf> {
-        vec![self.artifact_runtime_home.join("skills")]
+    pub(crate) async fn turn_security_workspace_root(
+        &self,
+        workspace_id: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let workspace_id = workspace_id.trim();
+        if workspace_id.is_empty() || workspace_id.contains(['/', '\\']) {
+            return Err(
+                "failed to resolve workspace filesystem binding: invalid workspace id".to_owned(),
+            );
+        }
+        let bindings_root = self.artifact_runtime_home.join("workspace_filesystems");
+        tokio::fs::create_dir_all(&bindings_root)
+            .await
+            .map_err(|error| {
+                format!("failed to create workspace filesystem bindings root: {error}")
+            })?;
+        let canonical_bindings_root =
+            tokio::fs::canonicalize(&bindings_root)
+                .await
+                .map_err(|error| {
+                    format!("failed to canonicalize workspace filesystem bindings root: {error}")
+                })?;
+        let workspace_root = bindings_root.join(workspace_id).join("agent");
+        tokio::fs::create_dir_all(&workspace_root)
+            .await
+            .map_err(|error| format!("failed to create workspace filesystem root: {error}"))?;
+        let canonical_workspace_root =
+            tokio::fs::canonicalize(&workspace_root)
+                .await
+                .map_err(|error| {
+                    format!("failed to canonicalize workspace filesystem root: {error}")
+                })?;
+        if !canonical_workspace_root.starts_with(&canonical_bindings_root) {
+            return Err(
+                "failed to resolve workspace filesystem binding: root escaped managed storage"
+                    .to_owned(),
+            );
+        }
+        Ok(canonical_workspace_root)
     }
 
     pub(super) fn turn_profile_selected_audit_event(
@@ -5502,9 +6131,10 @@ impl MessageProcessor {
         {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Persistence,
                     "failed to commit native turn start lifecycle".to_owned(),
                 ),
             )
@@ -5516,9 +6146,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         None,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Delivery,
                         format!("failed to encode response: {error}"),
                     ),
                 )
@@ -5565,6 +6196,7 @@ impl MessageProcessor {
                     error: Some(VoiceError {
                         kind: VoiceErrorKind::Unknown,
                         message: "failed to publish CLI runtime turn start".to_owned(),
+                        public_error: None,
                     }),
                 },
             )
@@ -5656,9 +6288,10 @@ impl MessageProcessor {
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
+                    pioneer_protocol::PublicErrorStage::Execution,
                     format!(
                         "invalid params for `{}`: `thread_id` and `turn_id` are required",
                         methods::TURN_CANCEL
@@ -5686,9 +6319,10 @@ impl MessageProcessor {
         else {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Execution,
                     format!("turn `{turn_id}` not found in thread `{thread_id}`"),
                 ),
             )
@@ -5699,26 +6333,6 @@ impl MessageProcessor {
             self.send_error(
                 connection_id,
                 AuthorizationExternalError::NotFound.response(request_id),
-            )
-            .await;
-            return;
-        }
-
-        let subscribed = self
-            .thread_manager
-            .subscribed_connection_ids(thread_id.as_str())
-            .await
-            .contains(&connection_id);
-        if !subscribed {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "connection `{connection_id}` is not subscribed to thread `{thread_id}`"
-                    ),
-                ),
             )
             .await;
             return;
@@ -5736,9 +6350,10 @@ impl MessageProcessor {
             {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!(
                             "failed to reconcile interrupted turn `{turn_id}` in thread `{thread_id}`"
                         ),
@@ -5772,9 +6387,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to load CLI runtime turn binding: {error:#}"),
                     ),
                 )
@@ -5791,9 +6407,10 @@ impl MessageProcessor {
             {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to interrupt turn `{turn_id}` in thread `{thread_id}`"),
                     ),
                 )
@@ -5813,9 +6430,10 @@ impl MessageProcessor {
             else {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("turn `{turn_id}` disappeared after cancellation"),
                     ),
                 )
@@ -5862,9 +6480,10 @@ impl MessageProcessor {
                     .remove(&cancel_intent_key);
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Execution,
                         format!("failed to cancel turn: {error}"),
                     ),
                 )
@@ -5883,9 +6502,10 @@ impl MessageProcessor {
         if !interrupted {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Persistence,
                     format!("failed to interrupt turn `{turn_id}` in thread `{thread_id}`"),
                 ),
             )
@@ -5900,9 +6520,10 @@ impl MessageProcessor {
         else {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Observation,
                     format!("turn `{turn_id}` disappeared after cancellation"),
                 ),
             )
@@ -5964,9 +6585,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         None,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Delivery,
                         format!("failed to encode response: {error}"),
                     ),
                 )
@@ -6005,9 +6627,10 @@ impl MessageProcessor {
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
+                    pioneer_protocol::PublicErrorStage::Execution,
                     format!(
                         "invalid params for `{}`: `thread_id` and `turn_id` are required",
                         methods::TURN_RESUME
@@ -6027,26 +6650,6 @@ impl MessageProcessor {
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
 
-        let subscribed = self
-            .thread_manager
-            .subscribed_connection_ids(thread_id.as_str())
-            .await
-            .contains(&connection_id);
-        if !subscribed {
-            self.send_error(
-                connection_id,
-                JsonRpcErrorResponse::new(
-                    Some(request_id),
-                    INVALID_REQUEST_CODE,
-                    format!(
-                        "connection `{connection_id}` is not subscribed to thread `{thread_id}`"
-                    ),
-                ),
-            )
-            .await;
-            return;
-        }
-
         let Some((workspace_id, turn)) = (match self
             .crud_store
             .get_turn(thread_id.as_str(), turn_id.as_str())
@@ -6056,9 +6659,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to fetch turn before resume: {error:#}"),
                     ),
                 )
@@ -6068,9 +6672,10 @@ impl MessageProcessor {
         }) else {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Observation,
                     format!("turn `{turn_id}` not found in thread `{thread_id}`"),
                 ),
             )
@@ -6089,9 +6694,10 @@ impl MessageProcessor {
         if turn.status != TurnStatus::Blocked {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Execution,
                     format!("turn `{turn_id}` is not blocked and cannot be resumed"),
                 ),
             )
@@ -6114,9 +6720,10 @@ impl MessageProcessor {
             Ok(None) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Execution,
                         format!("turn `{turn_id}` has no blocked recovery job to resume"),
                     ),
                 )
@@ -6126,9 +6733,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Execution,
                         format!("failed to resume turn `{turn_id}`: {error:#}"),
                     ),
                 )
@@ -6146,9 +6754,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Execution,
                         format!(
                             "turn `{turn_id}` was resumed but recovery start failed: {error:#}"
                         ),
@@ -6168,9 +6777,10 @@ impl MessageProcessor {
             Ok(None) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("turn `{turn_id}` disappeared after resume"),
                     ),
                 )
@@ -6180,9 +6790,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to fetch turn after resume: {error:#}"),
                     ),
                 )
@@ -6204,9 +6815,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         None,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Delivery,
                         format!("failed to encode response: {error}"),
                     ),
                 )
@@ -6245,9 +6857,10 @@ impl MessageProcessor {
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
+                    pioneer_protocol::PublicErrorStage::Observation,
                     format!(
                         "invalid params for `{}`: `thread_id` and `turn_id` are required",
                         methods::TURN_GET
@@ -6283,9 +6896,10 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        public_turn_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorStage::Observation,
                             format!("failed to fetch turn: {error:#}"),
                         ),
                     )
@@ -6298,9 +6912,10 @@ impl MessageProcessor {
         let Some(result) = result else {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Observation,
                     format!(
                         "turn `{}` in thread `{}` was not found",
                         params.turn_id, params.thread_id
@@ -6328,9 +6943,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         None,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Delivery,
                         format!("failed to encode response: {error}"),
                     ),
                 )
@@ -6348,7 +6964,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn turn_items(
+    pub(super) async fn turn_items_page(
         &self,
         request_context: &RequestContext,
         authorization: &AuthorizedTurn,
@@ -6369,12 +6985,13 @@ impl MessageProcessor {
         if params.thread_id.trim().is_empty() || params.turn_id.trim().is_empty() {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                public_turn_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
+                    pioneer_protocol::PublicErrorStage::Observation,
                     format!(
                         "invalid params for `{}`: `thread_id` and `turn_id` are required",
-                        methods::TURN_ITEMS
+                        methods::TURN_ITEMS_PAGE
                     ),
                 ),
             )
@@ -6382,18 +6999,101 @@ impl MessageProcessor {
             return;
         }
 
-        let mut result = match self
+        if params.after_sequence.is_some_and(|cursor| cursor < 0) {
+            self.send_error(
+                connection_id,
+                public_turn_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    pioneer_protocol::PublicErrorStage::Observation,
+                    "turn/items/page cursor must be non-negative".to_owned(),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        const HARD_MAX_TURN_ITEM_PAGE_ITEMS: usize = 200;
+        const HARD_MAX_TURN_ITEM_PAGE_BYTES: usize = 1024 * 1024;
+        let principal = request_context.principal();
+        let policy_service = AuthorizationService::new();
+        let Some(role_key) =
+            policy_service.resolved_role_key(principal.kind, principal.role_key.as_ref())
+        else {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::Unavailable.response(request_id),
+            )
+            .await;
+            return;
+        };
+        let Some(observation_policy) =
+            policy_service.observation_resource_policy(principal.kind, principal.role_key.as_ref())
+        else {
+            self.send_error(
+                connection_id,
+                AuthorizationExternalError::Unavailable.response(request_id),
+            )
+            .await;
+            return;
+        };
+        let _observation_permit = match self
+            .observation_governor
+            .acquire_page(
+                principal.principal_id.as_str(),
+                role_key,
+                authorization.workspace_id(),
+                observation_policy,
+            )
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                warn!(
+                    principal_id = %principal.principal_id,
+                    workspace_id = authorization.workspace_id(),
+                    error = %format!("{error:#}"),
+                    "turn observation page rejected by resource governor"
+                );
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        let max_page_items = (observation_policy.max_turn_page_items as usize)
+            .min(HARD_MAX_TURN_ITEM_PAGE_ITEMS)
+            .max(1);
+        let max_page_bytes = observation_policy
+            .max_turn_page_bytes
+            .min(HARD_MAX_TURN_ITEM_PAGE_BYTES)
+            .max(1);
+        let limit = params
+            .limit
+            .map(|limit| limit as usize)
+            .unwrap_or(max_page_items)
+            .min(max_page_items)
+            .max(1);
+        let result = match self
             .crud_store
-            .get_turn_item_events(params.thread_id.as_str(), params.turn_id.as_str())
+            .get_turn_item_events_page(
+                params.thread_id.as_str(),
+                params.turn_id.as_str(),
+                params.after_sequence,
+                limit,
+            )
             .await
         {
             Ok(Some(value)) => value,
             Ok(None) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!(
                             "turn `{}` in thread `{}` was not found",
                             params.turn_id, params.thread_id
@@ -6406,9 +7106,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to fetch turn items: {error:#}"),
                     ),
                 )
@@ -6425,7 +7126,29 @@ impl MessageProcessor {
             return;
         }
 
+        let mut result = result;
         Self::enrich_turn_item_events_markdown(result.events.as_mut_slice());
+        let result = match fit_turn_items_page_to_budget(
+            result,
+            params.after_sequence,
+            max_page_items,
+            max_page_bytes,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    public_turn_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
+                        error,
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
 
         self.session_manager
             .set_connection_workspace(connection_id, Some(result.workspace_id.clone()))
@@ -6436,9 +7159,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_turn_error(
                         None,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Delivery,
                         format!("failed to encode response: {error}"),
                     ),
                 )
@@ -7233,6 +7957,73 @@ fn cli_runtime_binding_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observation_event(sequence: i64, message_bytes: usize) -> pioneer_protocol::TurnItemEvent {
+        pioneer_protocol::TurnItemEvent {
+            sequence,
+            created_at: sequence,
+            payload: pioneer_protocol::TurnItemEventPayload::ItemCompleted {
+                workspace_id: "workspace-a".to_owned(),
+                thread_id: "thread-a".to_owned(),
+                turn_id: "turn-a".to_owned(),
+                item: pioneer_protocol::TurnItem::SystemEvent {
+                    id: format!("item-{sequence}"),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "x".repeat(message_bytes),
+                    code: None,
+                    details: None,
+                },
+            },
+        }
+    }
+
+    fn observation_page(
+        event_count: i64,
+        message_bytes: usize,
+    ) -> pioneer_protocol::TurnItemsResponse {
+        pioneer_protocol::TurnItemsResponse {
+            thread_id: "thread-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            turn_id: "turn-a".to_owned(),
+            events: (1..=event_count)
+                .map(|sequence| observation_event(sequence, message_bytes))
+                .collect(),
+            last_sequence: event_count,
+            has_more: false,
+            next_cursor: None,
+        }
+    }
+
+    #[test]
+    fn turn_items_page_budget_returns_largest_lossless_prefix() {
+        let page = observation_page(3, 128);
+        let mut two_event_prefix = page.clone();
+        two_event_prefix.events.truncate(2);
+        two_event_prefix.last_sequence = 2;
+        two_event_prefix.has_more = true;
+        two_event_prefix.next_cursor = Some(2);
+        let budget = serde_json::to_vec(&two_event_prefix).unwrap().len();
+
+        let fitted = fit_turn_items_page_to_budget(page, None, 200, budget)
+            .expect("two-event prefix should fit exactly");
+        assert_eq!(fitted.events.len(), 2);
+        assert_eq!(fitted.last_sequence, 2);
+        assert!(fitted.has_more);
+        assert_eq!(fitted.next_cursor, Some(2));
+        assert!(serde_json::to_vec(&fitted).unwrap().len() <= budget);
+    }
+
+    #[test]
+    fn turn_items_page_budget_clamps_item_count_and_rejects_oversized_single_event() {
+        let fitted = fit_turn_items_page_to_budget(observation_page(3, 16), None, 2, usize::MAX)
+            .expect("item clamp should return a continuation");
+        assert_eq!(fitted.events.len(), 2);
+        assert_eq!(fitted.next_cursor, Some(2));
+
+        let error = fit_turn_items_page_to_budget(observation_page(1, 4096), None, 200, 256)
+            .expect_err("one oversized event cannot be skipped by advancing the cursor");
+        assert!(error.contains("one turn/items event"));
+    }
 
     #[test]
     fn agent_skill_overlay_is_native_api_only() {

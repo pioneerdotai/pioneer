@@ -24,6 +24,31 @@
     "members"
   ],
   "$defs": {
+    "AuthorizationRolePresentation": {
+      "description": "Server-owned presentation metadata for the authenticated role. The key is\ndeliberately open-ended: clients display this object but never derive\nauthorization decisions from it.",
+      "type": "object",
+      "properties": {
+        "built_in": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "display_name",
+        "description",
+        "built_in"
+      ]
+    },
     "MemberSummary": {
       "type": "object",
       "properties": {
@@ -39,11 +64,19 @@
         "kind": {
           "$ref": "#/$defs/PrincipalKind"
         },
+        "lifecycle_managed": {
+          "description": "Server-owned target trait. Clients may combine it with caller\ncapabilities for presentation, but never infer it from identity kind\nor a well-known role key.",
+          "type": "boolean"
+        },
         "nickname": {
           "type": "string"
         },
         "principal_id": {
           "$ref": "#/$defs/PrincipalId"
+        },
+        "role": {
+          "description": "Server-owned role label. Clients display it verbatim and never infer\nrole semantics from `kind` or a well-known key.",
+          "$ref": "#/$defs/AuthorizationRolePresentation"
         },
         "role_key": {
           "anyOf": [
@@ -64,6 +97,8 @@
         "kind",
         "display_name",
         "nickname",
+        "role",
+        "lifecycle_managed",
         "status"
       ]
     },

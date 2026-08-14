@@ -55,12 +55,17 @@ const UNSUPPORTED_SESSION_SCOPE_APPROVAL: CLIRuntimeCapabilitySupport =
         reason: "provider adapter does not expose a durable session-scoped approval mapping",
     };
 
+const UNSUPPORTED_TURN_SCOPE_APPROVAL: CLIRuntimeCapabilitySupport =
+    CLIRuntimeCapabilitySupport::Unsupported {
+        reason: "provider adapter exposes only one-shot and session-scoped approval responses",
+    };
+
 const CODEX_CAPABILITIES: CLIRuntimeProviderCapabilities = CLIRuntimeProviderCapabilities {
     provider: CLIAgentRuntimeProviderKind::Codex,
     approval: CLIRuntimeApprovalCapabilities {
         permission_mode_mapping: CLIRuntimeCapabilitySupport::Supported,
         request_permissions: CLIRuntimeCapabilitySupport::Supported,
-        turn_scope_approval: CLIRuntimeCapabilitySupport::Supported,
+        turn_scope_approval: UNSUPPORTED_TURN_SCOPE_APPROVAL,
         session_scope_approval: UNSUPPORTED_SESSION_SCOPE_APPROVAL,
     },
     sandbox: CLIRuntimeSandboxCapabilities {
@@ -81,7 +86,7 @@ const CLAUDE_CAPABILITIES: CLIRuntimeProviderCapabilities = CLIRuntimeProviderCa
     approval: CLIRuntimeApprovalCapabilities {
         permission_mode_mapping: CLIRuntimeCapabilitySupport::Supported,
         request_permissions: CLIRuntimeCapabilitySupport::Supported,
-        turn_scope_approval: CLIRuntimeCapabilitySupport::Supported,
+        turn_scope_approval: UNSUPPORTED_TURN_SCOPE_APPROVAL,
         session_scope_approval: UNSUPPORTED_SESSION_SCOPE_APPROVAL,
     },
     sandbox: CLIRuntimeSandboxCapabilities {
@@ -97,13 +102,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capabilities_codex_supports_approval_and_provider_sandbox_knobs() {
+    fn capabilities_codex_reports_exact_approval_and_provider_sandbox_knobs() {
         let descriptor = cli_runtime_provider_capabilities(CLIAgentRuntimeProviderKind::Codex);
 
         assert_eq!(descriptor.provider, CLIAgentRuntimeProviderKind::Codex);
         assert!(descriptor.approval.permission_mode_mapping.is_supported());
         assert!(descriptor.approval.request_permissions.is_supported());
-        assert!(descriptor.approval.turn_scope_approval.is_supported());
+        assert!(!descriptor.approval.turn_scope_approval.is_supported());
         assert!(!descriptor.approval.session_scope_approval.is_supported());
         assert!(descriptor.sandbox.provider_sandbox_policy.is_supported());
         assert!(
@@ -123,7 +128,7 @@ mod tests {
         assert_eq!(descriptor.provider, CLIAgentRuntimeProviderKind::Claude);
         assert!(descriptor.approval.permission_mode_mapping.is_supported());
         assert!(descriptor.approval.request_permissions.is_supported());
-        assert!(descriptor.approval.turn_scope_approval.is_supported());
+        assert!(!descriptor.approval.turn_scope_approval.is_supported());
         assert!(!descriptor.sandbox.provider_sandbox_policy.is_supported());
         assert!(
             !descriptor

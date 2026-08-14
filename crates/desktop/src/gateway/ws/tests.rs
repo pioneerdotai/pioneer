@@ -1380,7 +1380,7 @@ impl TestWsServer {
                                                             .send(Message::Text(response.to_string().into()))
                                                             .await;
                                                     }
-                                                    "turn/items" => {
+                                                    "turn/items/page" => {
                                                         let Some(thread_id) = request
                                                             .get("params")
                                                             .and_then(|value| value.get("thread_id"))
@@ -1405,7 +1405,8 @@ impl TestWsServer {
                                                                 "workspace_id": "ws_000000000000000001",
                                                                 "turn_id": turn_id,
                                                                 "events": [],
-                                                                "last_sequence": 0
+                                                                "last_sequence": 0,
+                                                                "has_more": false
                                                             }
                                                         });
                                                         let _ = writer

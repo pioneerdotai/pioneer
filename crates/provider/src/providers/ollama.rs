@@ -1,6 +1,6 @@
 use crate::attachments::{
     PreparedProviderMessages, attachment_bytes, ensure_no_unrendered_attachments,
-    prepare_messages_for_provider,
+    prepare_messages_for_provider_async,
 };
 use crate::tools::stream::IncrementalLineDecoder;
 use crate::types::{
@@ -334,11 +334,12 @@ impl crate::traits::Provider for OllamaProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let options = Self::build_options(&request);
         let api_request = OllamaChatRequest {
@@ -409,11 +410,12 @@ impl crate::traits::Provider for OllamaProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let options = Self::build_options(&request);
         let api_request = OllamaChatRequest {

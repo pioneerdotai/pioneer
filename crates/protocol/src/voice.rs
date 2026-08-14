@@ -82,6 +82,8 @@ impl VoiceErrorKind {
 pub struct VoiceError {
     pub kind: VoiceErrorKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_error: Option<crate::PublicError>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -730,6 +732,7 @@ mod tests {
             error: Some(VoiceError {
                 kind: VoiceErrorKind::ModelDownloading,
                 message: "loading".to_owned(),
+                public_error: None,
             }),
         };
         let status_round_trip: VoiceStatusResponse =

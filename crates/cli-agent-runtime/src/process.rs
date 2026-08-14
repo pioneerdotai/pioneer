@@ -505,9 +505,35 @@ pub fn spawn_prepared_cli_agent_process(
 }
 
 pub fn scrub_inherited_cli_environment(command: &mut Command) {
-    for key in inherited_sensitive_environment_names() {
-        command.env_remove(key);
+    let allowlisted = inherited_cli_environment_allowlist();
+    command.env_clear();
+    for (key, value) in allowlisted {
+        command.env(key, value);
     }
+}
+
+fn inherited_cli_environment_allowlist() -> Vec<(String, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            let allowed = matches!(
+                key.as_str(),
+                "PATH"
+                    | "LANG"
+                    | "LC_ALL"
+                    | "LC_CTYPE"
+                    | "TERM"
+                    | "TMPDIR"
+                    | "TMP"
+                    | "TEMP"
+                    | "TZ"
+                    | "NO_COLOR"
+                    | "SSL_CERT_FILE"
+                    | "SSL_CERT_DIR"
+            ) || key.starts_with("LC_");
+            allowed.then_some((key, value))
+        })
+        .collect()
 }
 
 pub fn expand_home_path(raw: &str, home_dir: Option<&Path>) -> Result<PathBuf> {

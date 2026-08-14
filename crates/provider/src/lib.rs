@@ -22,12 +22,13 @@ pub use attachments::{
     AttachmentRetryPolicy, AttachmentRuntimePolicy, AttachmentSecurityPolicy,
     AttachmentTransportKind, AttachmentTransportPlan, PreparedAttachment, PreparedAttachmentSource,
     PreparedProviderMessages, default_attachment_pipeline_config, infer_mime_from_reference,
-    lookup_uploaded_reference_with_artifact, set_artifact_external_ref_cache_backend,
-    set_default_attachment_pipeline_config,
+    lookup_uploaded_reference_with_artifact_for_authority, set_artifact_external_ref_cache_backend,
+    set_default_attachment_pipeline_config, store_uploaded_reference_for_authority,
+    upload_registry_key_for_authority,
 };
 pub use factory::create_provider;
 pub use http::validate_proxy_url;
-pub use registry::ProviderRegistry;
+pub use registry::{ProviderAuthorityFingerprint, ProviderRegistry};
 pub use traits::Provider;
 pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,

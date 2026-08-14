@@ -1,6 +1,7 @@
 mod agent_diff_event_compaction;
 mod authorization_legacy_backfill;
 mod cli_runtime_native_event_compaction;
+mod execution_authority_integrity;
 mod stable_skill_id_backfill;
 mod task_anchor_backfill;
 mod task_event_fanout_cursor_backfill;
@@ -35,6 +36,15 @@ struct ActiveWorkspaceRefill {
 pub(crate) struct ThreadEpisodicWorkspaceRefillLease {
     cancellation: CancellationToken,
     completed: Option<watch::Sender<bool>>,
+}
+
+/// Completes the mandatory execution-authority integrity gate before any
+/// listener, recovery worker, or task runtime can observe active executions.
+/// Invalid rows are quarantined; storage/scan failures abort Gateway startup.
+pub(crate) async fn enforce_execution_authority_integrity(
+    crud_store: &CrudStore,
+) -> anyhow::Result<()> {
+    execution_authority_integrity::run(crud_store).await
 }
 
 impl ThreadEpisodicWorkspaceRefillSupervisor {
@@ -284,8 +294,6 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
     .await;
 }
 
-#[cfg(test)]
-pub(crate) use task_anchor_backfill::backfill_once as backfill_task_anchors_once;
 #[cfg(test)]
 pub(crate) use task_event_fanout_cursor_backfill::backfill_once as backfill_task_event_fanout_cursors_once;
 #[cfg(test)]

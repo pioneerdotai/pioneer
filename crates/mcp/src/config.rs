@@ -298,8 +298,12 @@ fn parse_http_transport(
         return None;
     };
 
-    match Url::parse(url.trim()) {
-        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {}
+    let parsed = match Url::parse(url.trim()) {
+        Ok(parsed)
+            if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some() =>
+        {
+            parsed
+        }
         _ => {
             diagnostics.push(McpValidationDiagnostic::error(
                 "invalid_url",
@@ -308,6 +312,18 @@ fn parse_http_transport(
             ));
             return None;
         }
+    };
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        diagnostics.push(McpValidationDiagnostic::error(
+            "credential_bearing_url",
+            "MCP URLs cannot contain userinfo, query parameters, or fragments; pass credentials through secret-backed headers",
+            Some(format!("$.mcpServers.{name}.url")),
+        ));
+        return None;
     }
 
     let headers = secret_string_map_field(
@@ -322,7 +338,7 @@ fn parse_http_transport(
     .unwrap_or_default();
 
     Some(McpTransportConfig::StreamableHttp {
-        url: url.trim().to_owned(),
+        url: parsed.to_string(),
         headers,
         startup_timeout_ms,
         tool_timeout_ms,
@@ -681,6 +697,26 @@ mod tests {
         let input = r#"{"mcpServers":{"resend":{"url":"ftp://example.com/mcp"}}}"#;
         let plan = parse_install_config(input, context()).unwrap();
         assert_eq!(plan.items[0].diagnostics[0].code, "invalid_url");
+    }
+
+    #[test]
+    fn rejects_every_credential_bearing_url_component() {
+        for url in [
+            "https://user:password@example.com/mcp",
+            "https://example.com/mcp?token=secret",
+            "https://example.com/mcp#credential",
+        ] {
+            let input = serde_json::json!({
+                "mcpServers": {"resend": {"url": url}}
+            })
+            .to_string();
+            let plan = parse_install_config(input.as_str(), context()).unwrap();
+            assert_eq!(
+                plan.items[0].diagnostics[0].code, "credential_bearing_url",
+                "URL must require secret-backed headers: {url}"
+            );
+            assert!(plan.items[0].installation.is_none());
+        }
     }
 
     #[test]

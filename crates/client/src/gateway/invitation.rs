@@ -518,11 +518,7 @@ impl InvitationSessionCommit {
             || grant.principal.kind != PrincipalKind::User
             || accepted.member.principal_id != grant.principal.id
             || accepted.member.kind != PrincipalKind::User
-            || accepted
-                .member
-                .role_key
-                .as_ref()
-                .is_none_or(|role| role.as_str() != pioneer_protocol::MEMBER_ROLE_KEY)
+            || accepted.member.role_key.as_ref().is_none()
             || accepted.member.status != PrincipalStatus::Active
             || accepted.member.display_name != grant.principal.display_name
             || accepted.member.nickname != grant.principal.nickname
@@ -755,6 +751,13 @@ mod tests {
                 display_name: "Member".to_owned(),
                 nickname: "member".to_owned(),
                 role_key: Some(RoleKey::member()),
+                role: pioneer_protocol::AuthorizationRolePresentation {
+                    key: "member".to_owned(),
+                    display_name: "Member".to_owned(),
+                    description: "Workspace collaborator".to_owned(),
+                    built_in: true,
+                },
+                lifecycle_managed: true,
                 status: PrincipalStatus::Active,
                 avatar_revision: None,
             },

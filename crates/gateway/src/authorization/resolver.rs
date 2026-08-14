@@ -17,12 +17,21 @@ use crate::auth::AuthenticatedSessionPrincipal;
 use crate::thread::RuntimeDraftAccess;
 
 use super::{
-    ActionGateDecision, ArtifactResourceId, AuthorizationDecision, AuthorizationResource,
-    AuthorizationService, CapabilityKind, CapabilityResourceId, DenyReason, DisclosurePolicy,
-    ResourceAction, TaskResourceId, ThreadAccessClass, ThreadAccessFacts, ThreadResourceId,
-    TurnResourceId, WorkspaceAccessFacts, WorkspaceResourceId,
+    ActionGateDecision, AgentsDocumentResourceId, ArtifactResourceId, AuthorizationDecision,
+    AuthorizationResource, AuthorizationService, CapabilityKind, CapabilityResourceId, DenyReason,
+    DisclosurePolicy, ResourceAction, TaskResourceId, ThreadAccessClass, ThreadAccessFacts,
+    ThreadResourceClass, ThreadResourceId, TurnResourceId, WorkspaceAccessFacts,
+    WorkspaceResourceId,
 };
 use super::{ResolvedResourceAccess, ResourceIdError};
+
+#[derive(Clone, Debug)]
+pub(crate) struct CapabilityThreadFacts {
+    pub(crate) workspace_id: String,
+    pub(crate) access: ThreadAccessFacts,
+    pub(crate) internal_child: bool,
+    pub(crate) parent_execution_actions: Option<Vec<String>>,
+}
 
 #[derive(Clone)]
 pub(crate) struct AuthorizationResolver {
@@ -64,7 +73,7 @@ impl AuthorizationResolver {
         principal: &AuthenticatedSessionPrincipal,
         thread_id: &str,
         expected_workspace_id: Option<&str>,
-    ) -> Result<Option<(String, ThreadAccessFacts)>> {
+    ) -> Result<Option<CapabilityThreadFacts>> {
         let Some(scope) = resolve_thread_authorization_scope(
             &self.store.database_connection(),
             thread_id,
@@ -75,7 +84,10 @@ impl AuthorizationResolver {
             return Ok(None);
         };
         let workspace_id = scope.workspace_id.clone();
-        if principal.kind == PrincipalKind::User
+        if self
+            .service
+            .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+            == Some(super::RuntimePrincipalPolicy::ScopedCollaboration)
             && scope.access_class == PersistedThreadAccessClass::Internal
         {
             let Some(lineage) = self
@@ -100,14 +112,78 @@ impl AuthorizationResolver {
             else {
                 return Ok(None);
             };
+            let Some(parent_turn_id) = lineage.created_by_turn_id.as_deref() else {
+                return Ok(None);
+            };
+            if self
+                .store
+                .get_turn_execution_authorization_context(parent_turn_id)
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let parent_execution_actions = Some(
+                super::ExecutionAuthorizationContext::load_for_turn(&self.store, parent_turn_id)
+                    .await?
+                    .granted_action_names()
+                    .to_vec(),
+            );
             return self
                 .thread_facts(principal, &root_scope)
                 .await
-                .map(|facts| Some((workspace_id, facts)));
+                .map(|access| {
+                    Some(CapabilityThreadFacts {
+                        workspace_id,
+                        access,
+                        internal_child: true,
+                        parent_execution_actions,
+                    })
+                });
         }
-        self.thread_facts(principal, &scope)
-            .await
-            .map(|facts| Some((workspace_id, facts)))
+        self.thread_facts(principal, &scope).await.map(|access| {
+            Some(CapabilityThreadFacts {
+                workspace_id,
+                access,
+                internal_child: false,
+                parent_execution_actions: None,
+            })
+        })
+    }
+
+    pub(crate) async fn authorize_agents_document_for_thread(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        action: ResourceAction,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Result<ProofResolution<AuthorizedAgentsDocument>> {
+        let Some(thread) = resolve_thread_authorization_scope(
+            &self.store.database_connection(),
+            thread_id,
+            Some(workspace_id),
+        )
+        .await?
+        else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        if thread.access_class == PersistedThreadAccessClass::Internal {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
+        let folder_id = self
+            .store
+            .resolve_thread_agents_doc_folder_for_thread(workspace_id, thread_id)
+            .await?;
+        self.authorize_agents_document(
+            principal,
+            action_gate,
+            action,
+            workspace_id,
+            folder_id.as_deref(),
+            None,
+        )
+        .await
     }
 
     pub(crate) fn authorize_workspace_collection(
@@ -146,7 +222,7 @@ impl AuthorizationResolver {
         let mut resources = Vec::with_capacity(canonical_workspace_ids.len());
         for workspace_id in &canonical_workspace_ids {
             let authorized = match action_gate {
-                ActionGateDecision::AllowSuperuser => {
+                ActionGateDecision::AllowAbsolute => {
                     pioneer_crud::resolve_workspace_authorization_scope(db, workspace_id.as_str())
                         .await?
                         .is_some_and(|scope| scope.is_active)
@@ -239,7 +315,7 @@ impl AuthorizationResolver {
             return Ok(ProofResolution::Denied(missing_resource()));
         }
         let visible = match action_gate {
-            ActionGateDecision::AllowSuperuser => true,
+            ActionGateDecision::AllowAbsolute => true,
             ActionGateDecision::RequireResource { .. } => {
                 target.id == principal.principal_id
                     || (target.kind == PrincipalKind::Superuser
@@ -345,7 +421,7 @@ impl AuthorizationResolver {
         }
         let database = self.store.database_connection();
         let scope = match action_gate {
-            ActionGateDecision::AllowSuperuser => {
+            ActionGateDecision::AllowAbsolute => {
                 resolve_workspace_authorization_scope(&database, workspace_id).await?
             }
             ActionGateDecision::RequireResource { .. } => find_active_workspace_for_principal(
@@ -406,6 +482,29 @@ impl AuthorizationResolver {
         else {
             return Ok(ProofResolution::Denied(missing_resource()));
         };
+        let collaboration_root_thread_id = if scope.access_class
+            == PersistedThreadAccessClass::Internal
+        {
+            let Some(lineage) = self
+                .store
+                .get_task_thread_lineage(scope.thread_id.as_str())
+                .await
+                .context("failed to resolve internal thread authorization lineage")?
+            else {
+                return Ok(ProofResolution::Denied(missing_resource()));
+            };
+            if lineage.child_thread_id != scope.thread_id
+                || lineage.root_thread_id == scope.thread_id
+            {
+                return Ok(ProofResolution::Denied(missing_resource()));
+            }
+            let Some(root_id) = resource_id(ThreadResourceId::new(lineage.root_thread_id)) else {
+                return Ok(ProofResolution::Denied(missing_resource()));
+            };
+            Some(root_id)
+        } else {
+            None
+        };
         let access = self.thread_facts(principal, &scope).await?;
         Ok(self
             .finish(
@@ -415,7 +514,10 @@ impl AuthorizationResolver {
                 resource,
                 ResolvedResourceAccess::Thread(access),
             )
-            .map(AuthorizedThread))
+            .map(|mut proof| {
+                proof.collaboration_root_thread_id = collaboration_root_thread_id;
+                AuthorizedThread(proof)
+            }))
     }
 
     /// Authorizes an exact connection-owned draft without pretending that it
@@ -479,7 +581,11 @@ impl AuthorizationResolver {
                 ResolvedResourceAccess::Thread(ThreadAccessFacts {
                     workspace,
                     access_class,
-                    thread_member: principal.kind == PrincipalKind::User,
+                    resource_class: ThreadResourceClass::Root,
+                    thread_member: self
+                        .service
+                        .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+                        == Some(super::RuntimePrincipalPolicy::ScopedCollaboration),
                     thread_creator: true,
                 }),
             )
@@ -536,6 +642,37 @@ impl AuthorizationResolver {
         let ProofResolution::Authorized(root) = root else {
             return Ok(ProofResolution::Denied(missing_resource()));
         };
+        let Some(child_action) = super::execution_child_policy_action(action) else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let child_gate = self.service.authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            child_action,
+        );
+        if !child_gate.permits_resource_resolution() && !child_gate.is_final_allow() {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
+        let Some(parent_turn_id) = lineage.created_by_turn_id.as_deref() else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        if self
+            .store
+            .get_turn_execution_authorization_context(parent_turn_id)
+            .await?
+            .is_none()
+        {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
+        let context =
+            super::ExecutionAuthorizationContext::load_for_turn(&self.store, parent_turn_id)
+                .await?;
+        if context.workspace_id() != workspace_id
+            || context.root_thread_id() != lineage.root_thread_id
+            || !context.grants_action(action)
+        {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
         let Some(resource) = thread_resource(workspace_id.as_str(), child_scope.thread_id.as_str())
         else {
             return Ok(ProofResolution::Denied(missing_resource()));
@@ -546,7 +683,13 @@ impl AuthorizationResolver {
                 action,
                 resource,
                 decision: root.decision().clone(),
-                thread_access: root.0.thread_access,
+                collaboration_root_thread_id: resource_id(ThreadResourceId::new(
+                    lineage.root_thread_id.clone(),
+                )),
+                thread_access: root.0.thread_access.map(|mut facts| {
+                    facts.resource_class = ThreadResourceClass::InternalChild;
+                    facts
+                }),
             },
         )))
     }
@@ -611,6 +754,7 @@ impl AuthorizationResolver {
                     turn_id,
                 },
                 decision: child.decision().clone(),
+                collaboration_root_thread_id: None,
                 thread_access: child.0.thread_access,
             },
         )))
@@ -706,7 +850,10 @@ impl AuthorizationResolver {
         // child thread. Members never receive direct ACL membership for those
         // implementation threads, so inherit the exact artifact operation
         // from the persisted root lineage just as thread/turn reads do.
-        if principal.kind == PrincipalKind::User
+        if self
+            .service
+            .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+            == Some(super::RuntimePrincipalPolicy::ScopedCollaboration)
             && scope
                 .thread
                 .as_ref()
@@ -737,6 +884,7 @@ impl AuthorizationResolver {
                         artifact_id,
                     },
                     decision: child.decision().clone(),
+                    collaboration_root_thread_id: None,
                     thread_access: child.0.thread_access,
                 },
             )));
@@ -837,6 +985,84 @@ impl AuthorizationResolver {
             .map(AuthorizedTask))
     }
 
+    pub(crate) async fn authorize_agents_document(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        action_gate: &ActionGateDecision,
+        action: ResourceAction,
+        workspace_id: &str,
+        folder_id: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> Result<ProofResolution<AuthorizedAgentsDocument>> {
+        if let Some(denied) = self.preflight(action_gate, action) {
+            return Ok(ProofResolution::Denied(denied));
+        }
+        let Some(workspace_scope) =
+            resolve_workspace_authorization_scope(&self.store.database_connection(), workspace_id)
+                .await?
+        else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let Some(workspace_resource_id) = resource_id(WorkspaceResourceId::new(
+            workspace_scope.workspace_id.clone(),
+        )) else {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        };
+        let folder_resource_id = match folder_id {
+            Some(folder_id) => {
+                let folder_id = folder_id.trim();
+                if folder_id.is_empty()
+                    || !self
+                        .store
+                        .list_thread_folders(workspace_scope.workspace_id.as_str())
+                        .await?
+                        .iter()
+                        .any(|folder| folder.id == folder_id)
+                {
+                    return Ok(ProofResolution::Denied(missing_resource()));
+                }
+                let Some(folder_id) =
+                    resource_id(AgentsDocumentResourceId::new(folder_id.to_owned()))
+                else {
+                    return Ok(ProofResolution::Denied(missing_resource()));
+                };
+                Some(folder_id)
+            }
+            None => None,
+        };
+        let current_revision = self
+            .store
+            .get_thread_agents_doc_explicit(workspace_scope.workspace_id.as_str(), folder_id)
+            .await?
+            .map(|doc| doc.version);
+        if expected_revision.is_some() && expected_revision != current_revision {
+            return Ok(ProofResolution::Denied(missing_resource()));
+        }
+        let workspace = self
+            .workspace_facts(
+                principal,
+                workspace_scope.workspace_id.as_str(),
+                workspace_scope.is_active,
+            )
+            .await?;
+        Ok(self
+            .finish(
+                principal,
+                action_gate,
+                action,
+                AuthorizationResource::AgentsDocument {
+                    workspace_id: workspace_resource_id,
+                    folder_id: folder_resource_id,
+                    revision: current_revision,
+                },
+                ResolvedResourceAccess::AgentsDocument {
+                    workspace,
+                    scope_exists: true,
+                },
+            )
+            .map(AuthorizedAgentsDocument))
+    }
+
     pub(crate) async fn authorize_session(
         &self,
         principal: &AuthenticatedSessionPrincipal,
@@ -905,6 +1131,18 @@ impl AuthorizationResolver {
         else {
             return Ok(ProofResolution::Denied(missing_resource()));
         };
+        let projected = match kind {
+            CapabilityKind::Skill => self.service.skill_allowed(
+                principal.kind,
+                principal.role_key.as_ref(),
+                scope.capability_id.as_str(),
+            ),
+            CapabilityKind::McpServer => self.service.mcp_server_allowed(
+                principal.kind,
+                principal.role_key.as_ref(),
+                scope.capability_id.as_str(),
+            ),
+        };
         self.authorize_capability_scope(
             principal,
             action_gate,
@@ -913,7 +1151,7 @@ impl AuthorizationResolver {
             kind,
             scope.capability_id.as_str(),
             scope.workspace_is_active,
-            scope.enabled,
+            scope.enabled && projected,
         )
         .await
     }
@@ -975,9 +1213,12 @@ impl AuthorizationResolver {
         workspace_id: &str,
         workspace_active: bool,
     ) -> Result<WorkspaceAccessFacts> {
-        let workspace_member = match principal.kind {
-            PrincipalKind::Superuser => false,
-            PrincipalKind::User => find_workspace_membership(
+        let workspace_member = match self
+            .service
+            .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+        {
+            Some(super::RuntimePrincipalPolicy::Absolute) | None => false,
+            Some(super::RuntimePrincipalPolicy::ScopedCollaboration) => find_workspace_membership(
                 &self.store.database_connection(),
                 &principal.principal_id,
                 workspace_id,
@@ -1004,9 +1245,12 @@ impl AuthorizationResolver {
                 scope.workspace_is_active,
             )
             .await?;
-        let thread_member = match principal.kind {
-            PrincipalKind::Superuser => false,
-            PrincipalKind::User => find_thread_membership(
+        let thread_member = match self
+            .service
+            .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+        {
+            Some(super::RuntimePrincipalPolicy::Absolute) | None => false,
+            Some(super::RuntimePrincipalPolicy::ScopedCollaboration) => find_thread_membership(
                 &self.store.database_connection(),
                 scope.thread_id.as_str(),
                 &principal.principal_id,
@@ -1022,6 +1266,7 @@ impl AuthorizationResolver {
                 PersistedThreadAccessClass::Workspace => ThreadAccessClass::Workspace,
                 PersistedThreadAccessClass::Internal => ThreadAccessClass::Internal,
             },
+            resource_class: ThreadResourceClass::Root,
             thread_member,
             thread_creator: scope.creator_principal_id.as_ref() == Some(&principal.principal_id),
         })
@@ -1048,6 +1293,7 @@ impl AuthorizationResolver {
                 action,
                 resource,
                 decision,
+                collaboration_root_thread_id: None,
                 thread_access,
             })
         } else {
@@ -1094,6 +1340,7 @@ struct AuthorizationProofCore {
     action: ResourceAction,
     resource: AuthorizationResource,
     decision: AuthorizationDecision,
+    collaboration_root_thread_id: Option<ThreadResourceId>,
     thread_access: Option<ThreadAccessFacts>,
 }
 
@@ -1171,6 +1418,7 @@ authorized_proof!(AuthorizedArtifact, action, resource, decision);
 authorized_proof!(AuthorizedTask, action, resource, decision);
 authorized_proof!(AuthorizedSession, principal_id, action, resource, decision,);
 authorized_proof!(AuthorizedCapability, decision);
+authorized_proof!(AuthorizedAgentsDocument, action, resource, decision,);
 authorized_proof!(
     AuthorizedInvitationGrants,
     principal_id,
@@ -1258,6 +1506,34 @@ impl AuthorizedThread {
     pub(crate) fn thread_access_class(&self) -> Option<ThreadAccessClass> {
         self.0.thread_access.map(|facts| facts.access_class)
     }
+
+    /// Exact collaboration root carried by a thread proof. Root-thread proofs
+    /// return their own id; internal-child proofs retain the root id resolved
+    /// from durable lineage in `ThreadAccessFacts`.
+    pub(crate) fn collaboration_root_thread_id(&self) -> &str {
+        self.0
+            .collaboration_root_thread_id
+            .as_ref()
+            .map_or_else(|| self.thread_id(), |thread_id| thread_id.as_str())
+    }
+}
+
+impl AuthorizedAgentsDocument {
+    pub(crate) fn workspace_id(&self) -> &str {
+        match self.resource() {
+            AuthorizationResource::AgentsDocument { workspace_id, .. } => workspace_id.as_str(),
+            _ => unreachable!("AuthorizedAgentsDocument always contains an instruction resource"),
+        }
+    }
+
+    pub(crate) fn folder_id(&self) -> Option<&str> {
+        match self.resource() {
+            AuthorizationResource::AgentsDocument { folder_id, .. } => {
+                folder_id.as_ref().map(|folder_id| folder_id.as_str())
+            }
+            _ => unreachable!("AuthorizedAgentsDocument always contains an instruction resource"),
+        }
+    }
 }
 
 impl AuthorizedTurn {
@@ -1309,6 +1585,13 @@ impl AuthorizedArtifact {
 }
 
 impl AuthorizedTask {
+    pub(crate) fn workspace_id(&self) -> &str {
+        match self.resource() {
+            AuthorizationResource::Task { workspace_id, .. } => workspace_id.as_str(),
+            _ => unreachable!("AuthorizedTask always contains a task resource"),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn root_thread_id(&self) -> Option<&str> {
         match self.resource() {
@@ -1340,6 +1623,7 @@ pub(super) fn authorized_thread_for_test(
         action,
         resource,
         decision,
+        collaboration_root_thread_id: None,
         thread_access: None,
     })
 }
@@ -1477,7 +1761,7 @@ mod tests {
                  ) VALUES(\
                     'T0000000000000000000I','T0000000000000000000A',\
                     'T0000000000000000000A',1,CURRENT_TIMESTAMP,'task_run',\
-                    'T0000000000000000000A',NULL\
+                    'T0000000000000000000A','U0000000000000000000A'\
                  );\
                  INSERT INTO turn(\
                     id,thread_id,status,prompt_manifest_json,created_at,updated_at,\
@@ -1534,7 +1818,25 @@ mod tests {
             )
             .await
             .expect("materialize resolver fixture");
-        let resolver = AuthorizationResolver::new(CrudStore::new(harness.database.clone()));
+        let store = CrudStore::new(harness.database.clone());
+        let context = super::super::ExecutionAuthorizationContext::for_test(
+            &principal(MEMBER_A_ID, PrincipalKind::User),
+            WORKSPACE_ID,
+            PRIVATE_THREAD_ID,
+            &pioneer_protocol::default_turn_permission_profile_snapshot(),
+            None,
+        );
+        store
+            .set_turn_execution_authorization_context(
+                TURN_ID,
+                context
+                    .to_persisted_json()
+                    .expect("parent authority should encode")
+                    .as_str(),
+            )
+            .await
+            .expect("parent authority should persist");
+        let resolver = AuthorizationResolver::new(store);
         (harness, resolver)
     }
 
@@ -2126,7 +2428,7 @@ mod tests {
 
     #[tokio::test]
     async fn internal_thread_is_denied_directly_and_requires_authorized_root_lineage() {
-        let (_harness, resolver) = resolver_fixture().await;
+        let (harness, resolver) = resolver_fixture().await;
         let service = AuthorizationService::new();
         let member = principal(MEMBER_A_ID, PrincipalKind::User);
         let gate = service.authorize_action(
@@ -2187,6 +2489,30 @@ mod tests {
                 .into_authorized()
                 .is_none(),
             "guessed child id must not bypass inaccessible root ACL"
+        );
+
+        harness
+            .database
+            .execute_unprepared(
+                "UPDATE \"turn\" SET execution_authorization_context_json=NULL \
+                 WHERE id='U0000000000000000000A'",
+            )
+            .await
+            .expect("parent authority should be removable for fail-closed test");
+        assert!(
+            resolver
+                .authorize_internal_thread_via_root(
+                    &member,
+                    &gate,
+                    ResourceAction::ThreadRead,
+                    INTERNAL_THREAD_ID,
+                    Some(WORKSPACE_ID),
+                )
+                .await
+                .expect("missing parent authority should resolve as deny")
+                .into_authorized()
+                .is_none(),
+            "missing parent authority must never become unrestricted child access"
         );
     }
 
@@ -2564,7 +2890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_management_requires_root_initiating_principal() {
+    async fn task_management_is_shared_by_authorized_root_collaborators() {
         let (_harness, resolver) = resolver_fixture().await;
         let service = AuthorizationService::new();
         let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
@@ -2572,12 +2898,12 @@ mod tests {
         let manage_a = service.authorize_action(
             member_a.kind,
             member_a.role_key.as_ref(),
-            ResourceAction::TaskManage,
+            ResourceAction::TaskReview,
         );
         let manage_b = service.authorize_action(
             member_b.kind,
             member_b.role_key.as_ref(),
-            ResourceAction::TaskManage,
+            ResourceAction::TaskReview,
         );
 
         assert!(
@@ -2585,7 +2911,7 @@ mod tests {
                 .authorize_task(
                     &member_a,
                     &manage_a,
-                    ResourceAction::TaskManage,
+                    ResourceAction::TaskReview,
                     WORKSPACE_ROOT_TASK_ID,
                     Some(WORKSPACE_ID),
                     Some(WORKSPACE_THREAD_ID),
@@ -2600,7 +2926,7 @@ mod tests {
                 .authorize_task(
                     &member_b,
                     &manage_b,
-                    ResourceAction::TaskManage,
+                    ResourceAction::TaskReview,
                     WORKSPACE_ROOT_TASK_ID,
                     Some(WORKSPACE_ID),
                     Some(WORKSPACE_THREAD_ID),
@@ -2608,8 +2934,8 @@ mod tests {
                 .await
                 .expect("resolve peer management")
                 .into_authorized()
-                .is_none(),
-            "workspace visibility must not transfer task management authority"
+                .is_some(),
+            "root-thread collaboration authority must allow peer task management"
         );
     }
 
@@ -2640,6 +2966,7 @@ mod tests {
                     parent_task_id: None,
                     root_task_id: None,
                     status: None,
+                    cursor: None,
                     limit: Some(1),
                 },
                 Some(&pioneer_crud::TaskRootAccessFilter {

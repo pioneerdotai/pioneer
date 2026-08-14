@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnMessageErrorReason",
+  "type": "string",
+  "enum": [
+    "invalid_input",
+    "invalid_target",
+    "immutable_message",
+    "deleted_message",
+    "revision_conflict"
+  ]
+}

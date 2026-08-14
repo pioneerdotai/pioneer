@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvitationListRow",
+  "type": "object",
+  "properties": {
+    "can_revoke": {
+      "type": "boolean"
+    },
+    "created_at_unix": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "expires_at_unix": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "invitation_id": {
+      "$ref": "#/$defs/InvitationId"
+    },
+    "inviter_display_name": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/InvitationPresentationStatus"
+    },
+    "terminal_at_unix": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "workspace_names": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "invitation_id",
+    "status",
+    "inviter_display_name",
+    "workspace_names",
+    "created_at_unix",
+    "expires_at_unix",
+    "can_revoke"
+  ],
+  "$defs": {
+    "InvitationId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "InvitationPresentationStatus": {
+      "description": "Shell-neutral invitation state. `Unknown` keeps newer server values\nfail-closed in an older presentation layer.",
+      "type": "string",
+      "enum": [
+        "pending",
+        "accepted",
+        "revoked",
+        "expired",
+        "unknown"
+      ]
+    }
+  }
+}

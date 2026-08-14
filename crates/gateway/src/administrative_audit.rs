@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use pioneer_protocol::{
     ADMINISTRATION_DOMAIN_ID_LEN, AuditAction, AuditEventId, AuditTargetKind, AuthSessionId,
-    BoundedServerGeneratedMetadata, DeviceId, GatewayId, InvitationId, PrincipalId, WorkspaceId,
-    generate_id,
+    BoundedServerGeneratedMetadata, DeviceId, GatewayId, InvitationId, PrincipalId, RoleKey,
+    WorkspaceId, generate_id,
 };
 use sea_orm::{DatabaseTransaction, entity::prelude::DateTimeWithTimeZone};
 
@@ -388,6 +388,24 @@ impl AdministrativeAuditWriter {
         let started = std::time::Instant::now();
         let id = AuditEventId::new(generate_id(ADMINISTRATION_DOMAIN_ID_LEN))
             .context("generated invalid administrative audit event id")?;
+        let policy_generation = pioneer_crud::current_policy_generation_on(transaction).await?;
+        let registry = crate::authorization::RoleDefinitionRegistry::new();
+        let policy_role_key = if let Some((actor_principal_id, _)) = actor {
+            let principal = pioneer_crud::load_principal_by_id(transaction, actor_principal_id)
+                .await?
+                .context("administrative audit actor principal is missing")?;
+            let persisted_role = principal
+                .role_key
+                .map(RoleKey::new)
+                .transpose()
+                .context("administrative audit actor has invalid persisted role")?;
+            let definition = registry
+                .resolve(principal.kind, persisted_role.as_ref())
+                .context("administrative audit actor role is unsupported")?;
+            Some(RoleKey::new(definition.key).expect("registered role key must be valid"))
+        } else {
+            None
+        };
         let result = pioneer_crud::insert_administrative_audit_event(
             transaction,
             pioneer_crud::NewAdministrativeAuditEvent {
@@ -400,6 +418,9 @@ impl AdministrativeAuditWriter {
                 target_id: record.target_id,
                 workspace_id: record.workspace_id,
                 metadata: record.metadata,
+                policy_generation,
+                policy_role_key,
+                policy_fingerprint: registry.policy_fingerprint(),
                 created_at: now,
             },
         )

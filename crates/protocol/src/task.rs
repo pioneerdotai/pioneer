@@ -3,6 +3,50 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskResourceBudget {
+    pub profile_version: u32,
+    pub max_encoded_bytes: usize,
+    pub max_title_bytes: usize,
+    pub max_string_bytes: usize,
+    pub max_collection_items: usize,
+    pub max_value_depth: usize,
+    pub max_value_nodes: usize,
+    pub min_interval_seconds: i64,
+    pub max_page_items: usize,
+    pub max_response_bytes: usize,
+    pub max_tree_nodes: usize,
+    pub max_tree_depth: usize,
+    pub max_event_page_items: usize,
+    pub max_wait_targets: usize,
+    pub max_wait_duration_ms: u64,
+    pub max_concurrent_waits: usize,
+}
+
+impl Default for TaskResourceBudget {
+    fn default() -> Self {
+        Self {
+            profile_version: 1,
+            max_encoded_bytes: 512 * 1024,
+            max_title_bytes: 512,
+            max_string_bytes: 64 * 1024,
+            max_collection_items: 128,
+            max_value_depth: 32,
+            max_value_nodes: 4_096,
+            min_interval_seconds: 10,
+            max_page_items: 100,
+            max_response_bytes: 1024 * 1024,
+            max_tree_nodes: 128,
+            max_tree_depth: 8,
+            max_event_page_items: 200,
+            max_wait_targets: 64,
+            max_wait_duration_ms: 120_000,
+            max_concurrent_waits: 4,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum TaskValue {
@@ -887,6 +931,8 @@ pub struct TaskAgentInputAttachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
 }
 
@@ -905,6 +951,8 @@ pub enum TaskAgentInputReferenceKind {
 pub struct TaskAgentInputReference {
     pub kind: TaskAgentInputReferenceKind,
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
@@ -2201,6 +2249,8 @@ pub struct TaskListParams {
     pub status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -2208,6 +2258,8 @@ pub struct TaskListParams {
 pub struct TaskListResponse {
     #[serde(default)]
     pub tasks: Vec<Task>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
@@ -2228,6 +2280,8 @@ pub struct TaskEventsParams {
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_sequence: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -2237,6 +2291,7 @@ pub struct TaskEventsResponse {
     #[serde(default)]
     pub events: Vec<TaskEvent>,
     pub last_sequence: i64,
+    pub has_more: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
@@ -2587,6 +2642,352 @@ pub struct TaskDeliveriesResponse {
     pub attempts: Vec<TaskDeliveryAttempt>,
 }
 
+// Public Task observation contracts. These intentionally do not reuse the
+// persistence/domain structs above: collaborator reads must not acquire
+// execution configuration, delivery secrets, host paths, or raw diagnostics.
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskArtifact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<PublicTaskArtifact>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskFailure {
+    pub class: TaskErrorClass,
+    pub error: crate::PublicError,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTask {
+    pub id: String,
+    pub workspace_id: String,
+    pub owner_kind: TaskOwnerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    pub executor_kind: TaskExecutorKind,
+    pub status: TaskStatus,
+    pub title: String,
+    pub goal: String,
+    pub priority: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<PublicTaskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<PublicTaskFailure>,
+    pub revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskRun {
+    pub id: String,
+    pub task_id: String,
+    pub attempt_number: u32,
+    pub run_number: i64,
+    pub status: TaskRunStatus,
+    pub executor_kind: TaskExecutorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<PublicTaskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<PublicTaskFailure>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskTrigger {
+    pub id: String,
+    pub task_id: String,
+    pub status: TaskTriggerStatus,
+    pub kind: TaskTriggerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fire_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskDependency {
+    pub id: String,
+    pub task_id: String,
+    pub depends_on_task_id: String,
+    pub kind: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOperatorDetails {
+    pub task: Task,
+    #[serde(default)]
+    pub agent_specs: Vec<TaskAgentSpec>,
+    #[serde(default)]
+    pub write_locks: Vec<TaskWriteLock>,
+    #[serde(default)]
+    pub thread_lineage: Vec<TaskThreadLineage>,
+    #[serde(default)]
+    pub task_run_thread_bindings: Vec<TaskRunThreadBinding>,
+    #[serde(default)]
+    pub task_run_turns: Vec<TaskRunTurn>,
+    #[serde(default)]
+    pub result_candidates: Vec<TaskResultCandidate>,
+    #[serde(default)]
+    pub result_review_events: Vec<TaskResultReviewEvent>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskGetResponse {
+    pub task: PublicTask,
+    #[serde(default)]
+    pub triggers: Vec<PublicTaskTrigger>,
+    #[serde(default)]
+    pub runs: Vec<PublicTaskRun>,
+    #[serde(default)]
+    pub dependencies: Vec<PublicTaskDependency>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<TaskOperatorDetails>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskListResponse {
+    #[serde(default)]
+    pub tasks: Vec<PublicTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskTree {
+    pub task: PublicTask,
+    #[serde(default)]
+    pub triggers: Vec<PublicTaskTrigger>,
+    #[serde(default)]
+    pub runs: Vec<PublicTaskRun>,
+    #[serde(default)]
+    pub dependencies: Vec<PublicTaskDependency>,
+    #[serde(default)]
+    pub children: Vec<PublicTaskTree>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskTreeResponse {
+    pub tree: PublicTaskTree,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<TaskTree>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskEvent {
+    pub id: String,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub sequence: i64,
+    pub event_type: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskEventsResponse {
+    pub task_id: String,
+    #[serde(default)]
+    pub events: Vec<PublicTaskEvent>,
+    pub last_sequence: i64,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_events: Option<Vec<TaskEvent>>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskDelivery {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub mode: TaskDeliveryMode,
+    pub status: TaskDeliveryStatus,
+    pub attempt_count: u32,
+    pub max_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<PublicTaskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<PublicTaskFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskDeliveryAttempt {
+    pub id: String,
+    pub delivery_id: String,
+    pub attempt_number: u32,
+    pub status: TaskDeliveryAttemptStatus,
+    pub started_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOperatorDeliveries {
+    #[serde(default)]
+    pub deliveries: Vec<TaskDelivery>,
+    #[serde(default)]
+    pub attempts: Vec<TaskDeliveryAttempt>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskDeliveriesResponse {
+    #[serde(default)]
+    pub deliveries: Vec<PublicTaskDelivery>,
+    #[serde(default)]
+    pub attempts: Vec<PublicTaskDeliveryAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<TaskOperatorDeliveries>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskResultCandidate {
+    pub id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub round: u32,
+    pub status: TaskResultCandidateStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<PublicTaskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskWaitItem {
+    pub task: PublicTask,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<PublicTaskRun>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskWaitReviewItem {
+    pub item: PublicTaskWaitItem,
+    pub candidate: PublicTaskResultCandidate,
+    #[serde(default)]
+    pub remaining_revision_rounds: u32,
+    #[serde(default)]
+    pub allowed_actions: Vec<TaskWaitReviewAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_blocked_reason: Option<TaskWaitRevisionBlockedReason>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskWaitNonWaitableItem {
+    pub item: PublicTaskWaitItem,
+    pub reason: TaskWaitNonWaitableReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskWaitResponse {
+    #[serde(default)]
+    pub completed: Vec<PublicTaskWaitItem>,
+    #[serde(default)]
+    pub failed: Vec<PublicTaskWaitItem>,
+    #[serde(default)]
+    pub blocked: Vec<PublicTaskWaitItem>,
+    #[serde(default)]
+    pub cancelled: Vec<PublicTaskWaitItem>,
+    #[serde(default)]
+    pub review_required: Vec<PublicTaskWaitReviewItem>,
+    #[serde(default)]
+    pub pending: Vec<PublicTaskWaitItem>,
+    #[serde(default)]
+    pub non_waitable: Vec<PublicTaskWaitNonWaitableItem>,
+    pub timed_out: bool,
+    pub total_count: u32,
+    pub terminal_count: u32,
+    pub pending_count: u32,
+    pub review_required_count: u32,
+    pub blocked_count: u32,
+    pub non_waitable_count: u32,
+    pub mode: TaskWaitMode,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskAgendaItem {
+    pub task: PublicTask,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<PublicTaskTrigger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run: Option<PublicTaskRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_delivery: Option<PublicTaskDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskAgendaResponse {
+    #[serde(default)]
+    pub items: Vec<PublicTaskAgendaItem>,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskNotificationContext {
@@ -2793,6 +3194,76 @@ pub struct TaskDeliveryCancelledNotification {
     pub delivery: TaskDelivery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUserNotificationDeliveredNotification {
+    pub notification_id: String,
+    pub workspace_id: String,
+    pub recipient_principal_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub delivery_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<PublicTaskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<PublicTaskFailure>,
+    pub created_at: i64,
+}
+
+/// Durable exact-recipient Task notification returned by the user inbox.
+///
+/// The websocket notification is only a live invalidation hint. This record is
+/// the reconnect-safe source of truth and deliberately contains only the
+/// collaborator-safe Task projection.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUserNotification {
+    pub notification_id: String,
+    pub workspace_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub delivery_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<PublicTaskResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<PublicTaskFailure>,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUserNotificationListParams {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUserNotificationListResponse {
+    #[serde(default)]
+    pub notifications: Vec<TaskUserNotification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUserNotificationAcknowledgeParams {
+    pub workspace_id: String,
+    pub notification_id: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskUserNotificationAcknowledgeResponse {
+    pub notification: TaskUserNotification,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]

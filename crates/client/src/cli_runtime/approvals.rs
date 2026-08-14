@@ -241,12 +241,9 @@ pub fn pending_request_available_actions(
             Kind::Allow,
         ][..],
         (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::CommandApproval)
-        | (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::FileChangeApproval) => &[
-            Kind::CancelTurn,
-            Kind::Deny,
-            Kind::AllowForTurn,
-            Kind::Allow,
-        ][..],
+        | (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::FileChangeApproval) => {
+            &[Kind::CancelTurn, Kind::Deny, Kind::Allow][..]
+        }
         (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::UserInput) => {
             &[Kind::CancelTurn, Kind::Answer][..]
         }
@@ -280,7 +277,7 @@ pub fn pending_request_action_resolution(
             (
                 PendingRequestOrigin::CLIRuntime { .. },
                 PendingRequestKind::CommandApproval | PendingRequestKind::FileChangeApproval,
-            ) => Some(PendingRequestResolution::AllowForSession),
+            ) => None,
             (PendingRequestOrigin::CLIRuntime { .. }, _) => None,
         },
         PendingRequestActionKind::Answer => None,
@@ -385,12 +382,8 @@ fn cli_runtime_resolution_from_pending_resolution(
                 }
                 PendingRequestResolution::Cancel => Ok(CLIRuntimeRequestResolution::Cancelled),
                 PendingRequestResolution::Expired => Ok(CLIRuntimeRequestResolution::Expired),
-                PendingRequestResolution::AllowForSession => {
-                    Ok(CLIRuntimeRequestResolution::Answered {
-                        response: Some(serde_json::json!({ "decision": "allow_for_session" })),
-                    })
-                }
                 PendingRequestResolution::AllowForTurn
+                | PendingRequestResolution::AllowForSession
                 | PendingRequestResolution::Answered { .. } => {
                     Err(PendingRequestResponsePlanError::UnsupportedResolutionForOrigin)
                 }
@@ -1307,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn response_planner_routes_cli_runtime_session_request_to_cli_rpc_params() {
+    fn response_planner_rejects_cli_runtime_session_scope() {
         let pending = PendingRequest::from_cli_runtime_opened_notification(request_opened(
             "req",
             "ws",
@@ -1317,25 +1310,12 @@ mod tests {
             "pwd",
         ));
 
-        let action =
+        let error =
             plan_pending_request_response(&pending, PendingRequestResolution::AllowForSession)
-                .expect("plan CLI session response");
-
-        let PendingRequestResponseAction::CLIRuntime { method, params } = action else {
-            panic!("expected CLI runtime action");
-        };
+                .expect_err("CLI session scope exceeds the canonical approval contract");
         assert_eq!(
-            method,
-            pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND
-        );
-        assert_eq!(params.workspace_id, "ws");
-        assert_eq!(params.runtime_id, "codex");
-        assert_eq!(params.request_id, "req");
-        assert_eq!(
-            params.resolution,
-            CLIRuntimeRequestResolution::Answered {
-                response: Some(serde_json::json!({ "decision": "allow_for_session" }))
-            }
+            error,
+            PendingRequestResponsePlanError::UnsupportedResolutionForOrigin
         );
     }
 
@@ -1477,7 +1457,6 @@ mod tests {
             vec![
                 PendingRequestActionKind::CancelTurn,
                 PendingRequestActionKind::Deny,
-                PendingRequestActionKind::AllowForTurn,
                 PendingRequestActionKind::Allow,
             ]
         );
@@ -1506,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_for_turn_action_maps_to_origin_specific_resolution() {
+    fn allow_for_turn_action_is_exposed_only_for_native_permission_gate() {
         let cli_command = PendingRequest::from_cli_runtime_opened_notification(request_opened(
             "req",
             "ws",
@@ -1520,17 +1499,13 @@ mod tests {
 
         let cli_allow_for_turn = pending_request_available_actions(&cli_command)
             .into_iter()
-            .find(|action| action.kind == PendingRequestActionKind::AllowForTurn)
-            .expect("CLI command approvals expose a scoped allow action");
+            .find(|action| action.kind == PendingRequestActionKind::AllowForTurn);
         let native_allow_for_turn = pending_request_available_actions(&native)
             .into_iter()
             .find(|action| action.kind == PendingRequestActionKind::AllowForTurn)
             .expect("native approvals expose a scoped allow action");
 
-        assert_eq!(
-            cli_allow_for_turn.resolution,
-            Some(PendingRequestResolution::AllowForSession)
-        );
+        assert!(cli_allow_for_turn.is_none());
         assert_eq!(
             native_allow_for_turn.resolution,
             Some(PendingRequestResolution::AllowForTurn)

@@ -23,7 +23,8 @@ use pioneer_protocol::{
     SkillsUpdateParams, TaskAcceptParams, TaskAgendaParams, TaskCancelParams, TaskCreateParams,
     TaskDeliveriesParams, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
     TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
-    TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
+    TaskTreeParams as TaskTreeTaskParams, TaskUserNotificationAcknowledgeParams,
+    TaskUserNotificationListParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
     ThreadReadParams, ThreadTimelinePageParams, TurnCancelParams, TurnMessageDeleteParams,
     TurnMessageEditParams, TurnMessageRevisionsPageParams, TurnPermissionRequestRespondParams,
@@ -35,12 +36,12 @@ use tracing::Instrument as _;
 
 use crate::authorization::{
     AuthorizationDecision, AuthorizationExternalError, AuthorizationResolver, AuthorizationService,
-    AuthorizedArtifact, AuthorizedCapability, AuthorizedInvitation, AuthorizedInvitationCollection,
-    AuthorizedInvitationGrants, AuthorizedMemberDirectory, AuthorizedMemberPrincipal,
-    AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn, AuthorizedWorkspace,
-    AuthorizedWorkspaceCollection, CapabilityKind, DenyReason, DisclosurePolicy,
-    MethodAuthorizationEntry, ProofResolution, RegistryLookupError, ResourceAction,
-    ResourceResolverKind, external_error_for_decision, normal_method_entry,
+    AuthorizedAgentsDocument, AuthorizedArtifact, AuthorizedCapability, AuthorizedInvitation,
+    AuthorizedInvitationCollection, AuthorizedInvitationGrants, AuthorizedMemberDirectory,
+    AuthorizedMemberPrincipal, AuthorizedSession, AuthorizedTask, AuthorizedThread, AuthorizedTurn,
+    AuthorizedWorkspace, AuthorizedWorkspaceCollection, CapabilityKind, DenyReason,
+    DisclosurePolicy, MethodAuthorizationEntry, ProofResolution, RegistryLookupError,
+    ResourceAction, ResourceResolverKind, external_error_for_decision, normal_method_entry,
     record_authorization_unavailable, record_method_decision, record_method_decision_for_action,
 };
 
@@ -63,6 +64,7 @@ pub(super) enum RequestAdmission {
     Turn(AuthorizedTurn),
     Artifact(AuthorizedArtifact),
     Capability(AuthorizedCapability),
+    AgentsDocument(AuthorizedAgentsDocument),
     Task(AuthorizedTask),
     TaskBatch(Vec<AuthorizedTask>),
 }
@@ -148,6 +150,13 @@ impl RequestAdmission {
     fn capability(&self) -> Option<&AuthorizedCapability> {
         match self {
             Self::Capability(proof) => Some(proof),
+            _ => None,
+        }
+    }
+
+    fn agents_document(&self) -> Option<&AuthorizedAgentsDocument> {
+        match self {
+            Self::AgentsDocument(proof) => Some(proof),
             _ => None,
         }
     }
@@ -536,6 +545,17 @@ impl MessageProcessor {
             if params.task_ids.is_empty() && params.run_ids.is_empty() {
                 return Err(invalid_params());
             }
+            let task_budget = AuthorizationService::new()
+                .task_resource_budget(
+                    context.principal().kind,
+                    context.principal().role_key.as_ref(),
+                )
+                .ok_or_else(invalid_params)?;
+            if params.task_ids.len().saturating_add(params.run_ids.len())
+                > task_budget.max_wait_targets
+            {
+                return Err(invalid_params());
+            }
             let mut task_ids = params.task_ids;
             for run_id in params.run_ids {
                 let Some(run) =
@@ -736,7 +756,7 @@ impl MessageProcessor {
                 AuthorizationExternalError::Unavailable.response(request.id.clone())
             })?;
         if let Some((access, decision)) = authorization {
-            record_method_decision(entry, &decision);
+            record_method_decision_for_action(entry, action, &decision);
             Ok(Some(access))
         } else {
             Ok(None)
@@ -767,6 +787,44 @@ impl MessageProcessor {
             return self
                 .authorize_thread_start_request(context, request, entry, &service)
                 .await;
+        }
+        if request.method == methods::TURN_START {
+            return self
+                .authorize_turn_start_request(context, request, entry, &service)
+                .await;
+        }
+        if matches!(
+            request.method.as_str(),
+            methods::THREAD_AGENTS_DOC_GET
+                | methods::THREAD_AGENTS_DOC_SAVE
+                | methods::THREAD_AGENTS_DOC_ARCHIVE
+                | methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD
+        ) {
+            return self
+                .authorize_agents_document_request(context, request, entry, &service)
+                .await;
+        }
+        if request.method.starts_with("cli_runtime/")
+            && let Some(runtime_id) = request
+                .params
+                .as_ref()
+                .and_then(JsonValue::as_object)
+                .and_then(|params| params.get("runtime_id").or_else(|| params.get("runtimeId")))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|runtime_id| !runtime_id.is_empty())
+            && !service.cli_runtime_allowed(
+                context.principal().kind,
+                context.role_key(),
+                runtime_id,
+            )
+        {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::CapabilityDisabled,
+                disclosure: DisclosurePolicy::NotFound,
+            };
+            record_method_decision(entry, &decision);
+            return Err(AuthorizationExternalError::NotFound.response(request.id.clone()));
         }
         let action_gate =
             service.authorize_action(context.principal().kind, context.role_key(), entry.action);
@@ -1105,7 +1163,10 @@ impl MessageProcessor {
             };
         }
         if entry.resolver == ResourceResolverKind::Capability
-            && entry.action == ResourceAction::ProviderUse
+            && matches!(
+                entry.action,
+                ResourceAction::ProviderDiscover | ResourceAction::ProviderUse
+            )
         {
             let params = request.params.as_ref().and_then(JsonValue::as_object);
             let workspace_id = match request.method.as_str() {
@@ -1197,7 +1258,7 @@ impl MessageProcessor {
             };
         }
         if entry.resolver == ResourceResolverKind::Capability
-            && entry.action == ResourceAction::McpUse
+            && entry.action == ResourceAction::McpDiscover
             && request.method == methods::MCP_SERVER_DETAILS
         {
             let params = serde_json::from_value::<McpServerDetailsParams>(
@@ -1356,6 +1417,8 @@ impl MessageProcessor {
                         | methods::CLI_RUNTIME_REFRESH
                         | methods::CLI_RUNTIME_LIST_MODELS
                         | methods::MCP_LIST
+                        | methods::TASK_USER_NOTIFICATION_LIST
+                        | methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE
                 ) =>
             {
                 let invalid_params = || {
@@ -1410,6 +1473,16 @@ impl MessageProcessor {
                     }
                     methods::MCP_LIST => {
                         serde_json::from_value::<McpListParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::TASK_USER_NOTIFICATION_LIST => {
+                        serde_json::from_value::<TaskUserNotificationListParams>(params)
+                            .map_err(|_| invalid_params())?
+                            .workspace_id
+                    }
+                    methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE => {
+                        serde_json::from_value::<TaskUserNotificationAcknowledgeParams>(params)
                             .map_err(|_| invalid_params())?
                             .workspace_id
                     }
@@ -1681,7 +1754,7 @@ impl MessageProcessor {
                                 | methods::THREAD_AGENTS_DOC_ARCHIVE
                         )
                     {
-                        let decision = AuthorizationDecision::AllowSuperuser;
+                        let decision = AuthorizationDecision::AllowAbsolute;
                         record_method_decision(entry, &decision);
                         return Ok(RequestAdmission::Superuser);
                     }
@@ -2074,7 +2147,7 @@ impl MessageProcessor {
             }
             ResourceResolverKind::OwnSession => {}
             _ if action_gate.is_final_allow() => {
-                let decision = AuthorizationDecision::AllowSuperuser;
+                let decision = AuthorizationDecision::AllowAbsolute;
                 record_method_decision(entry, &decision);
                 return Ok(RequestAdmission::Superuser);
             }
@@ -2181,7 +2254,7 @@ impl MessageProcessor {
                 else {
                     return Err(validation());
                 };
-                let turn_action = ResourceAction::ThreadWrite;
+                let turn_action = ResourceAction::ArtifactCreateThread;
                 let turn_gate = AuthorizationService::new().authorize_action(
                     context.principal().kind,
                     context.role_key(),
@@ -2292,7 +2365,7 @@ impl MessageProcessor {
             .as_deref()
             .filter(|_| session.planned_turn_id.is_some())
         {
-            let turn_action = ResourceAction::ThreadWrite;
+            let turn_action = ResourceAction::ArtifactCreateThread;
             let turn_gate = AuthorizationService::new().authorize_action(
                 context.principal().kind,
                 context.role_key(),
@@ -2455,6 +2528,151 @@ impl MessageProcessor {
         }
     }
 
+    async fn authorize_agents_document_request(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
+        entry: &'static crate::authorization::MethodAuthorizationEntry,
+        service: &AuthorizationService,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        let invalid = || {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::Validation,
+            };
+            record_method_decision(entry, &decision);
+            AuthorizationExternalError::Validation.response(request.id.clone())
+        };
+        let params = request.params.clone().unwrap_or_else(empty_object_value);
+        let (workspace_id, thread_id, requested_folder_id, revision) = match request.method.as_str()
+        {
+            methods::THREAD_AGENTS_DOC_GET => {
+                let params = serde_json::from_value::<ThreadAgentsDocGetParams>(params)
+                    .map_err(|_| invalid())?;
+                (
+                    params.workspace_id,
+                    params.thread_id,
+                    params.folder_id,
+                    None,
+                )
+            }
+            methods::THREAD_AGENTS_DOC_SAVE => {
+                let params = serde_json::from_value::<ThreadAgentsDocSaveParams>(params)
+                    .map_err(|_| invalid())?;
+                (
+                    params.workspace_id,
+                    params.thread_id,
+                    params.folder_id,
+                    params.expected_version,
+                )
+            }
+            methods::THREAD_AGENTS_DOC_ARCHIVE => {
+                let params = serde_json::from_value::<ThreadAgentsDocArchiveParams>(params)
+                    .map_err(|_| invalid())?;
+                (
+                    params.workspace_id,
+                    params.thread_id,
+                    params.folder_id,
+                    params.expected_version,
+                )
+            }
+            methods::THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD => {
+                let params =
+                    serde_json::from_value::<ThreadAgentsDocResolveForThreadParams>(params)
+                        .map_err(|_| invalid())?;
+                (params.workspace_id, Some(params.thread_id), None, None)
+            }
+            _ => unreachable!("caller restricts instruction methods"),
+        };
+        let workspace_id = workspace_id.trim();
+        if workspace_id.is_empty() {
+            return Err(invalid());
+        }
+        let folder_id = if let Some(thread_id) = thread_id.as_deref() {
+            let thread_id = thread_id.trim();
+            if thread_id.is_empty()
+                || pioneer_crud::resolve_thread_authorization_scope(
+                    &self.crud_store.database_connection(),
+                    thread_id,
+                    Some(workspace_id),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        "agents_document",
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?
+                .is_none()
+            {
+                let decision = AuthorizationDecision::Deny {
+                    reason: DenyReason::MissingAuthoritativeResource,
+                    disclosure: entry.disclosure,
+                };
+                record_method_decision(entry, &decision);
+                return Err(AuthorizationExternalError::NotFound.response(request.id.clone()));
+            }
+            let canonical = self
+                .crud_store
+                .resolve_thread_agents_doc_folder_for_thread(workspace_id, thread_id)
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        entry.action.safe_name(),
+                        "agents_document",
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+            if requested_folder_id
+                .as_deref()
+                .is_some_and(|requested| Some(requested.trim()) != canonical.as_deref())
+            {
+                return Err(invalid());
+            }
+            canonical
+        } else {
+            requested_folder_id
+                .map(|folder_id| folder_id.trim().to_owned())
+                .filter(|folder_id| !folder_id.is_empty())
+        };
+
+        let action_gate =
+            service.authorize_action(context.principal().kind, context.role_key(), entry.action);
+        let resolution = AuthorizationResolver::new((*self.crud_store).clone())
+            .authorize_agents_document(
+                context.principal(),
+                &action_gate,
+                entry.action,
+                workspace_id,
+                folder_id.as_deref(),
+                revision,
+            )
+            .await
+            .map_err(|_| {
+                record_authorization_unavailable(
+                    entry.action.safe_name(),
+                    entry.resolver.safe_name(),
+                    entry.audit.safe_name(),
+                );
+                AuthorizationExternalError::Unavailable.response(request.id.clone())
+            })?;
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision(entry, proof.decision());
+                Ok(RequestAdmission::AgentsDocument(proof))
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision(entry, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::NotFound)
+                    .response(request.id.clone()))
+            }
+        }
+    }
+
     async fn authorize_thread_start_request(
         &self,
         context: &crate::request_context::RequestContext,
@@ -2470,7 +2688,7 @@ impl MessageProcessor {
                 reason: DenyReason::ResourceScopeMismatch,
                 disclosure: DisclosurePolicy::Validation,
             };
-            record_method_decision_for_action(entry, ResourceAction::ThreadCreate, &decision);
+            record_method_decision_for_action(entry, entry.action, &decision);
             JsonRpcErrorResponse::new(
                 Some(request.id.clone()),
                 INVALID_PARAMS_CODE,
@@ -2482,7 +2700,7 @@ impl MessageProcessor {
                 reason: DenyReason::ResourceScopeMismatch,
                 disclosure: DisclosurePolicy::Validation,
             };
-            record_method_decision_for_action(entry, ResourceAction::ThreadCreate, &decision);
+            record_method_decision_for_action(entry, entry.action, &decision);
             return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
         }
 
@@ -2494,7 +2712,7 @@ impl MessageProcessor {
         .await
         .map_err(|_| {
             record_authorization_unavailable(
-                ResourceAction::ThreadCreate.safe_name(),
+                entry.action.safe_name(),
                 entry.resolver.safe_name(),
                 entry.audit.safe_name(),
             );
@@ -2504,7 +2722,17 @@ impl MessageProcessor {
 
         match scope {
             pioneer_crud::ThreadStartAuthorizationScope::Missing => {
-                let action = ResourceAction::ThreadCreate;
+                let action = match params
+                    .visibility
+                    .unwrap_or(pioneer_protocol::ThreadVisibility::Private)
+                {
+                    pioneer_protocol::ThreadVisibility::Private => {
+                        ResourceAction::ThreadCreatePrivate
+                    }
+                    pioneer_protocol::ThreadVisibility::Workspace => {
+                        ResourceAction::ThreadCreateWorkspace
+                    }
+                };
                 let gate =
                     service.authorize_action(context.principal().kind, context.role_key(), action);
                 let resolution = resolver
@@ -2606,6 +2834,143 @@ impl MessageProcessor {
         }
     }
 
+    async fn authorize_turn_start_request(
+        &self,
+        context: &crate::request_context::RequestContext,
+        request: &JsonRpcRequest,
+        entry: &'static crate::authorization::MethodAuthorizationEntry,
+        service: &AuthorizationService,
+    ) -> Result<RequestAdmission, JsonRpcErrorResponse> {
+        let params = serde_json::from_value::<TurnStartParams>(
+            request.params.clone().unwrap_or_else(empty_object_value),
+        )
+        .map_err(|error| {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::Validation,
+            };
+            record_method_decision_for_action(entry, entry.action, &decision);
+            JsonRpcErrorResponse::new(
+                Some(request.id.clone()),
+                INVALID_PARAMS_CODE,
+                format!("invalid params for `{}`: {error}", methods::TURN_START),
+            )
+        })?;
+        let thread_id = params.thread_id.trim();
+        if thread_id.is_empty() {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::ResourceScopeMismatch,
+                disclosure: DisclosurePolicy::Validation,
+            };
+            record_method_decision_for_action(entry, entry.action, &decision);
+            return Err(AuthorizationExternalError::Validation.response(request.id.clone()));
+        }
+
+        // Turn mode is server-owned when the caller omits it. Resolve the
+        // loaded thread before selecting the canonical atomic action so a
+        // Message turn can never inherit AgentTurnStart (or vice versa).
+        let Some(thread) = self.thread_manager.thread_get(thread_id).await else {
+            let decision = AuthorizationDecision::Deny {
+                reason: DenyReason::MissingAuthoritativeResource,
+                disclosure: entry.disclosure,
+            };
+            record_method_decision_for_action(entry, entry.action, &decision);
+            return Err(AuthorizationExternalError::NotFound.response(request.id.clone()));
+        };
+        let action = if super::message_turn::effective_turn_mode(params.mode, thread.mode)
+            == pioneer_protocol::ThreadMode::Message
+        {
+            ResourceAction::MessageCreate
+        } else {
+            ResourceAction::AgentTurnStart
+        };
+        debug_assert!(entry.supports_action(action));
+        let gate = service.authorize_action(context.principal().kind, context.role_key(), action);
+        let resolver = AuthorizationResolver::new((*self.crud_store).clone());
+        let mut resolution = resolver
+            .authorize_thread(
+                context.principal(),
+                &gate,
+                action,
+                thread_id,
+                Some(thread.workspace_id.as_str()),
+            )
+            .await
+            .map_err(|_| {
+                record_authorization_unavailable(
+                    action.safe_name(),
+                    entry.resolver.safe_name(),
+                    entry.audit.safe_name(),
+                );
+                AuthorizationExternalError::Unavailable.response(request.id.clone())
+            })?;
+        if matches!(
+            resolution.denial(),
+            Some(AuthorizationDecision::Deny {
+                reason: DenyReason::MissingAuthoritativeResource,
+                ..
+            })
+        ) {
+            resolution = resolver
+                .authorize_internal_thread_via_root(
+                    context.principal(),
+                    &gate,
+                    action,
+                    thread_id,
+                    Some(thread.workspace_id.as_str()),
+                )
+                .await
+                .map_err(|_| {
+                    record_authorization_unavailable(
+                        action.safe_name(),
+                        "thread_lineage",
+                        entry.audit.safe_name(),
+                    );
+                    AuthorizationExternalError::Unavailable.response(request.id.clone())
+                })?;
+        }
+        match resolution {
+            ProofResolution::Authorized(proof) => {
+                record_method_decision_for_action(entry, action, proof.decision());
+                Ok(RequestAdmission::Thread(proof))
+            }
+            ProofResolution::Denied(decision)
+                if matches!(
+                    decision,
+                    AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        ..
+                    }
+                ) =>
+            {
+                if let Some(access) = self
+                    .authorize_runtime_draft_request(
+                        context,
+                        request,
+                        entry,
+                        action,
+                        thread_id,
+                        Some(thread.workspace_id.as_str()),
+                    )
+                    .await?
+                {
+                    Ok(RequestAdmission::RuntimeDraft(access))
+                } else {
+                    record_method_decision_for_action(entry, action, &decision);
+                    Err(external_error_for_decision(&decision)
+                        .unwrap_or(AuthorizationExternalError::NotFound)
+                        .response(request.id.clone()))
+                }
+            }
+            ProofResolution::Denied(decision) => {
+                record_method_decision_for_action(entry, action, &decision);
+                Err(external_error_for_decision(&decision)
+                    .unwrap_or(AuthorizationExternalError::Forbidden)
+                    .response(request.id.clone()))
+            }
+        }
+    }
+
     fn dispatch_turn_start<'a>(
         &'a self,
         context: crate::request_context::RequestContext,
@@ -2686,19 +3051,40 @@ impl MessageProcessor {
                     return;
                 }
 
+                let authorization_revision = match self.current_authorization_revision().await {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        crate::authorization::record_authorization_unavailable(
+                            crate::authorization::ResourceAction::AgentTurnStart.safe_name(),
+                            "thread",
+                            "turn_admission",
+                        );
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "Turn admission policy generation is unavailable"
+                        );
+                        self.send_error(
+                            connection_id,
+                            crate::authorization::AuthorizationExternalError::Unavailable
+                                .response(request.id),
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 let execution_admission = if let Some(proof) = admission.thread() {
                     debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
                     crate::authorization::ExecutionAuthorizationAdmission::from_authorized_thread(
                         &context,
                         proof,
-                        self.authorization_invalidation_hub.current_revision(),
+                        authorization_revision,
                     )
                 } else if let Some(access) = admission.runtime_draft() {
                     debug_assert_eq!(access.thread_id(), params.thread_id.trim());
                     crate::authorization::ExecutionAuthorizationAdmission::from_authorized_runtime_draft(
                         &context,
                         access.clone(),
-                        self.authorization_invalidation_hub.current_revision(),
+                        authorization_revision,
                     )
                 } else {
                     unreachable!("central admission supplies a persisted thread or runtime draft")
@@ -3958,7 +4344,7 @@ impl MessageProcessor {
                                 &context,
                                 request.id,
                                 params,
-                                admission.thread(),
+                                admission.agents_document(),
                             )
                                 .await;
                         }
@@ -3986,7 +4372,7 @@ impl MessageProcessor {
                                 &context,
                                 request.id,
                                 params,
-                                admission.thread(),
+                                admission.agents_document(),
                             )
                                 .await;
                         }
@@ -4014,7 +4400,7 @@ impl MessageProcessor {
                                 &context,
                                 request.id,
                                 params,
-                                admission.thread(),
+                                admission.agents_document(),
                             )
                                 .await;
                         }
@@ -4043,7 +4429,7 @@ impl MessageProcessor {
                             self.thread_agents_doc_resolve_for_thread(&context,
                                 request.id,
                                 params,
-                                admission.thread(),
+                                admission.agents_document(),
                             )
                             .await;
                         }
@@ -4375,7 +4761,7 @@ impl MessageProcessor {
                         }
                     }
                 }
-                methods::TURN_ITEMS => {
+                methods::TURN_ITEMS_PAGE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     let params = if params_value.is_null() {
                         Ok(TurnItemsParams::default())
@@ -4390,7 +4776,8 @@ impl MessageProcessor {
                                 .expect("central admission supplies turn proof");
                             debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
                             debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
-                            self.turn_items(&context, proof, request.id, params).await;
+                            self.turn_items_page(&context, proof, request.id, params)
+                                .await;
                         }
                         Err(error) => {
                             self.send_error(
@@ -4400,7 +4787,7 @@ impl MessageProcessor {
                                     INVALID_PARAMS_CODE,
                                     format!(
                                         "invalid params for `{}`: {error}",
-                                        methods::TURN_ITEMS
+                                        methods::TURN_ITEMS_PAGE
                                     ),
                                 ),
                             )
@@ -4844,9 +5231,12 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<CLIRuntimeRequestRespondParams>(params_value) {
                         Ok(params) => {
+                            let authorization = admission
+                                .turn()
+                                .expect("central admission supplies pending-turn proof");
                             self.cli_runtime_request_respond(
                                 &context,
-                                admission.turn(),
+                                authorization,
                                 request.id,
                                 params,
                             )
@@ -6236,6 +6626,68 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::TASK_DELIVERIES
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TASK_USER_NOTIFICATION_LIST => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TaskUserNotificationListParams>(params_value) {
+                        Ok(params) => {
+                            self.task_user_notification_list(
+                                &context,
+                                admission
+                                    .workspace()
+                                    .expect("central admission supplies notification workspace"),
+                                request.id,
+                                params,
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TASK_USER_NOTIFICATION_LIST
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TaskUserNotificationAcknowledgeParams>(
+                        params_value,
+                    ) {
+                        Ok(params) => {
+                            self.task_user_notification_acknowledge(
+                                &context,
+                                admission
+                                    .workspace()
+                                    .expect("central admission supplies notification workspace"),
+                                request.id,
+                                params,
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE
                                     ),
                                 ),
                             )

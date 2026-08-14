@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SessionListRowPresentation",
+  "type": "object",
+  "properties": {
+    "actionable": {
+      "type": "boolean"
+    },
+    "status": {
+      "$ref": "#/$defs/SessionStatusPresentation"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "actionable"
+  ],
+  "$defs": {
+    "SessionStatusPresentation": {
+      "type": "string",
+      "enum": [
+        "active",
+        "pending",
+        "expired",
+        "revoked"
+      ]
+    }
+  }
+}

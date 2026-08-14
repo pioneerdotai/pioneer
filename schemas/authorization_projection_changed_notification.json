@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorizationProjectionChangedNotification",
+  "type": "object",
+  "properties": {
+    "affected": {
+      "$ref": "#/$defs/AuthorizationChangeScope"
+    },
+    "change": {
+      "$ref": "#/$defs/AuthorizationChangeKind"
+    },
+    "policy_generation": {
+      "$ref": "#/$defs/PolicyGeneration"
+    }
+  },
+  "required": [
+    "policy_generation",
+    "change",
+    "affected"
+  ],
+  "$defs": {
+    "AuthorizationChangeKind": {
+      "description": "Payload-safe type of committed authorization input change.",
+      "type": "string",
+      "enum": [
+        "code_policy",
+        "role_policy",
+        "role_assignment",
+        "workspace_acl",
+        "thread_acl",
+        "resource_selector"
+      ]
+    },
+    "AuthorizationChangeScope": {
+      "description": "Exact invalidation scope without policy contents or protected metadata.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "global"
+            }
+          },
+          "required": [
+            "scope"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "role_key": {
+              "$ref": "#/$defs/RoleKey"
+            },
+            "scope": {
+              "type": "string",
+              "const": "role"
+            }
+          },
+          "required": [
+            "scope",
+            "role_key"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "principal_id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "scope": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "scope",
+            "principal_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "principal_id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "scope": {
+              "type": "string",
+              "const": "principal_workspace"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "scope",
+            "principal_id",
+            "workspace_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "principal_id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "scope": {
+              "type": "string",
+              "const": "principal_thread"
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "scope",
+            "principal_id",
+            "workspace_id",
+            "thread_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "invitation_id": {
+              "$ref": "#/$defs/InvitationId"
+            },
+            "scope": {
+              "type": "string",
+              "const": "invitation"
+            }
+          },
+          "required": [
+            "scope",
+            "invitation_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "workspace"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "scope",
+            "workspace_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "thread"
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "scope",
+            "workspace_id",
+            "thread_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "resource_selector"
+            },
+            "selector": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "scope",
+            "workspace_id",
+            "selector"
+          ]
+        }
+      ]
+    },
+    "InvitationId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PolicyGeneration": {
+      "description": "Durable, monotonically increasing authorization policy/ACL generation.\nZero is reserved for an uninitialized process and is never persisted.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    }
+  }
+}

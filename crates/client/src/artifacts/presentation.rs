@@ -9,6 +9,54 @@ use std::hash::{Hash, Hasher};
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPresentationBlockReason {
+    CapabilityDenied,
+    Disconnected,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactPresentationPolicy {
+    pub can_attach: bool,
+    pub can_list: bool,
+    pub can_open: bool,
+    pub can_download: bool,
+    pub can_share: bool,
+    pub read_block_reason: Option<ArtifactPresentationBlockReason>,
+    pub write_block_reason: Option<ArtifactPresentationBlockReason>,
+}
+
+pub fn artifact_presentation_policy(
+    can_read_artifacts: bool,
+    can_attach_artifacts: bool,
+    connected: bool,
+) -> ArtifactPresentationPolicy {
+    let can_read = connected && can_read_artifacts;
+    let can_attach = connected && can_attach_artifacts;
+    let reason = |allowed: bool| {
+        if !allowed {
+            Some(ArtifactPresentationBlockReason::CapabilityDenied)
+        } else if !connected {
+            Some(ArtifactPresentationBlockReason::Disconnected)
+        } else {
+            None
+        }
+    };
+    ArtifactPresentationPolicy {
+        can_attach,
+        can_list: can_read,
+        can_open: can_read,
+        can_download: can_read,
+        can_share: can_read,
+        read_block_reason: reason(can_read_artifacts),
+        write_block_reason: reason(can_attach_artifacts),
+    }
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ArtifactBindingTargetKind {
     Thread,
     Turn,
@@ -150,6 +198,38 @@ mod tests {
         assert_eq!(
             thread_artifact_filter_id(ThreadArtifactFilter::Documents),
             5
+        );
+    }
+
+    #[test]
+    fn artifact_actions_follow_exact_server_capabilities_and_connection_state() {
+        let allowed = artifact_presentation_policy(true, true, true);
+        assert!(allowed.can_list);
+        assert!(allowed.can_open);
+        assert!(allowed.can_download);
+        assert!(allowed.can_share);
+        assert!(allowed.can_attach);
+        assert_eq!(allowed.read_block_reason, None);
+        assert_eq!(allowed.write_block_reason, None);
+
+        let read_only = artifact_presentation_policy(true, false, true);
+        assert!(read_only.can_open);
+        assert!(!read_only.can_attach);
+        assert_eq!(
+            read_only.write_block_reason,
+            Some(ArtifactPresentationBlockReason::CapabilityDenied)
+        );
+
+        let disconnected = artifact_presentation_policy(true, true, false);
+        assert!(!disconnected.can_open);
+        assert!(!disconnected.can_attach);
+        assert_eq!(
+            disconnected.read_block_reason,
+            Some(ArtifactPresentationBlockReason::Disconnected)
+        );
+        assert_eq!(
+            disconnected.write_block_reason,
+            Some(ArtifactPresentationBlockReason::Disconnected)
         );
     }
 

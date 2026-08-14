@@ -24,9 +24,6 @@
             "null"
           ]
         },
-        "fingerprint": {
-          "type": "string"
-        },
         "id": {
           "type": "string"
         },
@@ -60,36 +57,21 @@
         "scope": {
           "$ref": "#/$defs/McpScopeKind"
         },
-        "source_kind": {
-          "$ref": "#/$defs/McpSourceKind"
-        },
         "status": {
           "$ref": "#/$defs/McpServerStatus"
-        },
-        "status_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "tools_count": {
           "type": "integer",
           "format": "uint",
           "minimum": 0
-        },
-        "transport": {
-          "$ref": "#/$defs/McpTransportSummary"
         }
       },
       "required": [
         "id",
         "name",
         "scope",
-        "source_kind",
-        "transport",
         "policy",
         "required",
-        "fingerprint",
         "runtime",
         "tools_count",
         "resources_count",
@@ -131,12 +113,6 @@
     "McpRuntimeStatus": {
       "type": "object",
       "properties": {
-        "last_error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "last_seen_at": {
           "type": [
             "integer",
@@ -176,48 +152,6 @@
         "stopping",
         "stopped",
         "restarting"
-      ]
-    },
-    "McpSourceKind": {
-      "type": "string",
-      "enum": [
-        "config"
-      ]
-    },
-    "McpTransportSummary": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "command": {
-              "type": "string"
-            },
-            "kind": {
-              "type": "string",
-              "const": "stdio"
-            }
-          },
-          "required": [
-            "kind",
-            "command"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "streamable_http"
-            },
-            "url": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "url"
-          ]
-        }
       ]
     }
   }

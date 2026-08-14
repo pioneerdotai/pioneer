@@ -4,7 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuthDeviceCreateResponse, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey, WorkspaceId,
+    AuthDeviceCreateResponse, AuthorizationRolePresentation, PrincipalId, PrincipalKind,
+    PrincipalStatus, RoleKey, WorkspaceId,
 };
 
 pub const MEMBER_DISPLAY_NAME_MAX_SCALARS: usize = 128;
@@ -160,6 +161,13 @@ pub struct MemberSummary {
     pub nickname: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_key: Option<RoleKey>,
+    /// Server-owned role label. Clients display it verbatim and never infer
+    /// role semantics from `kind` or a well-known key.
+    pub role: AuthorizationRolePresentation,
+    /// Server-owned target trait. Clients may combine it with caller
+    /// capabilities for presentation, but never infer it from identity kind
+    /// or a well-known role key.
+    pub lifecycle_managed: bool,
     pub status: PrincipalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_revision: Option<String>,

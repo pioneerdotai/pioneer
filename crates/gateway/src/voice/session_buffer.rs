@@ -52,17 +52,38 @@ pub(crate) struct VoiceChunkIngestError {
 
 impl VoiceChunkIngestError {
     pub(crate) fn into_voice_error(self) -> VoiceError {
-        let kind = match self.kind {
-            VoiceChunkIngestErrorKind::UnknownSession => VoiceErrorKind::InvalidSession,
-            VoiceChunkIngestErrorKind::DuplicateSession => VoiceErrorKind::InvalidSession,
-            VoiceChunkIngestErrorKind::StaleChunk => VoiceErrorKind::StaleChunk,
-            VoiceChunkIngestErrorKind::SequenceGap => VoiceErrorKind::SequenceGap,
-            VoiceChunkIngestErrorKind::AudioFormatMismatch => VoiceErrorKind::DeviceUnavailable,
-            VoiceChunkIngestErrorKind::BufferLimitExceeded => VoiceErrorKind::GatewayBusy,
+        let (kind, public_code) = match self.kind {
+            VoiceChunkIngestErrorKind::UnknownSession
+            | VoiceChunkIngestErrorKind::DuplicateSession => (
+                VoiceErrorKind::InvalidSession,
+                pioneer_protocol::PublicErrorCode::InvalidInput,
+            ),
+            VoiceChunkIngestErrorKind::StaleChunk => (
+                VoiceErrorKind::StaleChunk,
+                pioneer_protocol::PublicErrorCode::InvalidInput,
+            ),
+            VoiceChunkIngestErrorKind::SequenceGap => (
+                VoiceErrorKind::SequenceGap,
+                pioneer_protocol::PublicErrorCode::InvalidInput,
+            ),
+            VoiceChunkIngestErrorKind::AudioFormatMismatch => (
+                VoiceErrorKind::DeviceUnavailable,
+                pioneer_protocol::PublicErrorCode::InvalidInput,
+            ),
+            VoiceChunkIngestErrorKind::BufferLimitExceeded => (
+                VoiceErrorKind::GatewayBusy,
+                pioneer_protocol::PublicErrorCode::ResourceExhausted,
+            ),
         };
+        let public_error = crate::public_error::map_agent_failure(
+            public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+            self.message,
+        );
         VoiceError {
             kind,
-            message: self.message,
+            message: public_error.message.clone(),
+            public_error: Some(public_error),
         }
     }
 }

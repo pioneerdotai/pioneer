@@ -334,6 +334,8 @@ impl MessageProcessor {
         }
 
         if !changed.is_empty() {
+            self.publish_resource_selector_change(workspace_id.as_str())
+                .await;
             let snapshot_version = self.next_mcp_snapshot_version();
             let notification = McpChangedNotification {
                 workspace_id: workspace_id.clone(),

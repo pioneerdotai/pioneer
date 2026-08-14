@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorizationChangeKind",
+  "description": "Payload-safe type of committed authorization input change.",
+  "type": "string",
+  "enum": [
+    "code_policy",
+    "role_policy",
+    "role_assignment",
+    "workspace_acl",
+    "thread_acl",
+    "resource_selector"
+  ]
+}

@@ -134,7 +134,9 @@ use pioneer_protocol::{
     CLIRuntimeThreadCompactResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     TaskAcceptParams, TaskAcceptResponse, TaskCancelParams, TaskCancelResponse, TaskReviseParams,
-    TaskReviseResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
+    TaskReviseResponse, TaskUserNotificationAcknowledgeParams,
+    TaskUserNotificationAcknowledgeResponse, TaskUserNotificationListParams,
+    TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
     ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams,
     ThreadAgentsDocSaveResponse, ThreadReadParams, ThreadReadResponse, ThreadTimelinePageParams,
     ThreadTimelinePageResponse, TimelinePageAnchor, TurnMessageDeleteParams,
@@ -147,12 +149,16 @@ use pioneer_protocol::{
     VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
 };
 use presentation::{
-    ClientCurrentPrincipalPresentationRequest, ClientInvitationListRowRequest,
+    ClientArtifactPresentationPolicyRequest, ClientAuthorizationProjectionAcceptRequest,
+    ClientAuthorizationProjectionAcceptResult, ClientCurrentPrincipalPresentationRequest,
+    ClientExecutionDraftReconcileRequest, ClientInvitationListRowRequest,
     ClientMemberPresentationRequest, ClientThreadCreateVisibilityRequest,
-    ClientThreadScopeMutationPlanRequest, ClientThreadScopePresentationRequest, current_principal,
-    invitation_list_row, member_presentation, principal_capabilities, session_list_row,
+    ClientThreadScopeMutationPlanRequest, ClientThreadScopePresentationRequest,
+    accept_authorization_projection, artifact_presentation_policy, current_principal,
+    invitation_list_row, member_presentation, reconcile_execution_draft, session_list_row,
     thread_create_visibility, thread_scope, thread_scope_mutation_plan,
 };
+pub use presentation::{principal_capabilities, thread_capabilities};
 use serde::{Deserialize, Serialize};
 use skills::{
     ClientComposerSkillChipsRequest, ClientComposerSkillPackPickerRequest,
@@ -194,6 +200,7 @@ struct ClientFfiRuntime {
     config: Mutex<Option<ClientFfiConfig>>,
     client_runtime: ClientRuntime,
     active_thread: ClientFfiActiveThreadState,
+    authorization_projection_state: Mutex<AuthorizationProjectionRuntimeState>,
     active_connection_id: Mutex<Option<u64>>,
     diagnostics: ClientFfiDiagnostics,
     gateway_session_lifecycles:
@@ -203,6 +210,18 @@ struct ClientFfiRuntime {
     invitation_commit_sequence: AtomicU64,
     invitation_commits:
         Mutex<HashMap<String, pioneer_client::gateway::invitation::InvitationSessionCommit>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthorizationProjectionEpoch {
+    gateway_id: String,
+    connection_id: u64,
+}
+
+#[derive(Debug, Default)]
+struct AuthorizationProjectionRuntimeState {
+    epoch: Option<AuthorizationProjectionEpoch>,
+    store: pioneer_client::authorization::AuthorizationProjectionStore,
 }
 
 fn contains_gateway_connection_epoch_boundary(events: &[ClientEvent]) -> bool {
@@ -228,11 +247,27 @@ fn contains_avatar_authorization_boundary(events: &[ClientEvent]) -> bool {
             event,
             ClientEvent::GatewayNotification(
                 pioneer_protocol::GatewayNotification::AccessChanged(_)
+                    | pioneer_protocol::GatewayNotification::AuthorizationProjectionChanged(_)
                     | pioneer_protocol::GatewayNotification::MemberChanged(_)
                     | pioneer_protocol::GatewayNotification::WorkspaceMembersChanged(_)
             )
         )
     })
+}
+
+fn newest_authorization_revision(events: &[ClientEvent]) -> Option<u64> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::GatewayNotification(
+                pioneer_protocol::GatewayNotification::AccessChanged(notification),
+            ) => Some(notification.authorization_revision),
+            ClientEvent::GatewayNotification(
+                pioneer_protocol::GatewayNotification::AuthorizationProjectionChanged(notification),
+            ) => Some(notification.policy_generation.get()),
+            _ => None,
+        })
+        .max()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1120,6 +1155,7 @@ impl ClientFfiRuntime {
                     auth::INVALID_AUTH_REQUEST_CODE,
                 )
             })?;
+        let gateway_id = request.endpoint.id.clone();
         let spec = request
             .into_session_spec()
             .map_err(|message| ClientFfiError::new(message, auth::INVALID_AUTH_REQUEST_CODE))?;
@@ -1131,6 +1167,19 @@ impl ClientFfiRuntime {
         if let Ok(runtime_home) = self.native_cache_runtime_home() {
             self.avatar_cache.invalidate_all(runtime_home.as_path());
         }
+        let mut authorization_projection_state =
+            self.authorization_projection_state.lock().map_err(|_| {
+                ClientFfiError::new(
+                    "authorization projection state is unavailable",
+                    ClientFfiError::GENERIC_CODE,
+                )
+            })?;
+        authorization_projection_state.store.clear_epoch();
+        authorization_projection_state.epoch = Some(AuthorizationProjectionEpoch {
+            gateway_id,
+            connection_id,
+        });
+        drop(authorization_projection_state);
         self.active_thread
             .begin_authorization_epoch()
             .map_err(|error| {
@@ -1171,6 +1220,13 @@ impl ClientFfiRuntime {
             let events = reduce_gateway_ws_events_to_client_events(events, Default::default());
 
             if !events.is_empty() {
+                if let Some(revision) = newest_authorization_revision(events.as_slice()) {
+                    self.authorization_projection_state
+                        .lock()
+                        .map_err(|_| "authorization projection state is unavailable".to_owned())?
+                        .store
+                        .invalidate_for_revision(revision);
+                }
                 if contains_session_termination(events.as_slice())
                     || contains_avatar_authorization_boundary(events.as_slice())
                 {
@@ -1185,6 +1241,11 @@ impl ClientFfiRuntime {
                         .clear();
                 }
                 if contains_gateway_connection_epoch_boundary(events.as_slice()) {
+                    self.authorization_projection_state
+                        .lock()
+                        .map_err(|_| "authorization projection state is unavailable".to_owned())?
+                        .store
+                        .clear_epoch();
                     self.active_thread
                         .begin_authorization_epoch()
                         .map_err(|error| format!("{error:#}"))?;
@@ -1206,6 +1267,13 @@ impl ClientFfiRuntime {
         self.active_thread
             .begin_authorization_epoch()
             .map_err(|error| format!("{error:#}"))?;
+        let mut authorization_projection_state = self
+            .authorization_projection_state
+            .lock()
+            .map_err(|_| "authorization projection state is unavailable".to_owned())?;
+        authorization_projection_state.store.clear_epoch();
+        authorization_projection_state.epoch = None;
+        drop(authorization_projection_state);
         *self
             .active_connection_id
             .lock()
@@ -1588,6 +1656,34 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
+    fn task_user_notification_list(
+        &self,
+        input_json: &str,
+    ) -> Result<TaskUserNotificationListResponse, String> {
+        let params = serde_json::from_str::<TaskUserNotificationListParams>(input_json)
+            .map_err(|error| format!("invalid task user notification list params: {error}"))?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .task_user_notification_list(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn task_user_notification_acknowledge(
+        &self,
+        input_json: &str,
+    ) -> Result<TaskUserNotificationAcknowledgeResponse, String> {
+        let params = serde_json::from_str::<TaskUserNotificationAcknowledgeParams>(input_json)
+            .map_err(|error| {
+                format!("invalid task user notification acknowledge params: {error}")
+            })?;
+
+        self.client_runtime
+            .ws_command_sender()
+            .task_user_notification_acknowledge(params)
+            .map_err(|error| format!("{error:#}"))
+    }
+
     fn voice_status(&self, input_json: &str) -> Result<VoiceStatusResponse, String> {
         let params = serde_json::from_str::<VoiceStatusParams>(input_json)
             .map_err(|error| format!("invalid voice status params: {error}"))?;
@@ -1800,17 +1896,6 @@ impl ClientFfiRuntime {
         Ok(reasoning_effort_rows_from_request(request))
     }
 
-    fn composer_permission_mode_options(
-        &self,
-    ) -> Result<Vec<pioneer_client::composer::permissions::ComposerPermissionModeOption>, String>
-    {
-        Ok(
-            pioneer_client::composer::permissions::composer_permission_mode_options()
-                .into_iter()
-                .collect(),
-        )
-    }
-
     fn composer_turn_mode_options(&self) -> Result<Vec<pioneer_protocol::ThreadMode>, String> {
         Ok(
             pioneer_client::composer::model_selection::composer_turn_mode_options()
@@ -1829,13 +1914,52 @@ impl ClientFfiRuntime {
         Ok(principal_capabilities(snapshot))
     }
 
+    fn authorization_projection_accept(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientAuthorizationProjectionAcceptResult, String> {
+        let request =
+            serde_json::from_str::<ClientAuthorizationProjectionAcceptRequest>(input_json)
+                .map_err(|error| format!("invalid authorization projection request: {error}"))?;
+        let mut state = self
+            .authorization_projection_state
+            .lock()
+            .map_err(|_| "authorization projection state is unavailable".to_owned())?;
+        let active_epoch = state.epoch.clone();
+        Ok(accept_authorization_projection(
+            &mut state.store,
+            active_epoch.as_ref().map(|epoch| epoch.gateway_id.as_str()),
+            active_epoch.as_ref().map(|epoch| epoch.connection_id),
+            request,
+        ))
+    }
+
+    fn artifact_presentation_policy(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::artifacts::presentation::ArtifactPresentationPolicy, String> {
+        let request = serde_json::from_str::<ClientArtifactPresentationPolicyRequest>(input_json)
+            .map_err(|error| format!("invalid artifact presentation request: {error}"))?;
+        Ok(artifact_presentation_policy(request))
+    }
+
+    fn reconcile_execution_draft(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::reconciliation::ExecutionDraftReconciliation, String>
+    {
+        let request = serde_json::from_str::<ClientExecutionDraftReconcileRequest>(input_json)
+            .map_err(|error| format!("invalid execution draft reconciliation request: {error}"))?;
+        Ok(reconcile_execution_draft(request))
+    }
+
     fn current_principal_presentation(
         &self,
         input_json: &str,
     ) -> Result<pioneer_client::authorization::CurrentPrincipalPresentation, String> {
         let request = serde_json::from_str::<ClientCurrentPrincipalPresentationRequest>(input_json)
             .map_err(|_| "invalid current principal presentation request".to_owned())?;
-        Ok(current_principal(request))
+        current_principal(request)
     }
 
     fn session_list_row_presentation(
@@ -2909,6 +3033,14 @@ ffi_client_json_method!(
 ffi_client_json_method!(pioneer_client_ffi_task_accept, task_accept);
 ffi_client_json_method!(pioneer_client_ffi_task_revise, task_revise);
 ffi_client_json_method!(pioneer_client_ffi_task_cancel, task_cancel);
+ffi_client_json_method!(
+    pioneer_client_ffi_task_user_notification_list,
+    task_user_notification_list
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_task_user_notification_acknowledge,
+    task_user_notification_acknowledge
+);
 ffi_client_json_method!(pioneer_client_ffi_voice_status, voice_status);
 ffi_client_json_method!(pioneer_client_ffi_voice_session_start, voice_session_start);
 #[unsafe(no_mangle)]
@@ -2981,14 +3113,6 @@ ffi_client_json_method!(
     reasoning_effort_rows
 );
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pioneer_client_ffi_composer_permission_mode_options(
-    ptr: *mut PioneerClientFfi,
-) -> *mut c_char {
-    ffi_client_response(ptr, "composer_permission_mode_options", |runtime| {
-        runtime.composer_permission_mode_options()
-    })
-}
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_composer_turn_mode_options(
     ptr: *mut PioneerClientFfi,
 ) -> *mut c_char {
@@ -2999,6 +3123,18 @@ pub unsafe extern "C" fn pioneer_client_ffi_composer_turn_mode_options(
 ffi_client_json_method!(
     pioneer_client_ffi_principal_presentation_capabilities,
     principal_presentation_capabilities
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_authorization_projection_accept,
+    authorization_projection_accept
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_artifact_presentation_policy,
+    artifact_presentation_policy
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_reconcile_execution_draft,
+    reconcile_execution_draft
 );
 ffi_client_json_method!(
     pioneer_client_ffi_current_principal_presentation,
@@ -3609,28 +3745,6 @@ mod tests {
                 },
             }),
             WorkPageMergeMode::Reset
-        );
-    }
-
-    #[test]
-    fn composer_permission_mode_options_use_shared_client_contract() {
-        let runtime = ClientFfiRuntime::default();
-        let options = runtime
-            .composer_permission_mode_options()
-            .expect("composer permission options");
-
-        assert_eq!(options.len(), 3);
-        assert_eq!(
-            options[0].mode,
-            pioneer_protocol::TurnPermissionMode::FullAccess
-        );
-        assert_eq!(
-            options[1].mode,
-            pioneer_protocol::TurnPermissionMode::AutoAcceptEdits
-        );
-        assert_eq!(
-            options[2].mode,
-            pioneer_protocol::TurnPermissionMode::Supervised
         );
     }
 
@@ -4276,7 +4390,7 @@ mod tests {
                     authorization_revision: 7,
                     workspace_id: "workspace-one".to_owned(),
                     thread_id: None,
-                    access_lost: None,
+                    outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
                     change: pioneer_protocol::AccessChangeKind::WorkspaceMembership,
                 },
             ));

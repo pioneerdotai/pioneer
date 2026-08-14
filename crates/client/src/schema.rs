@@ -90,6 +90,26 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::artifacts::presentation::ArtifactBindingTargetPart
         ),
         schema_doc!(
+            "artifact_presentation_policy.json",
+            crate::artifacts::presentation::ArtifactPresentationPolicy
+        ),
+        schema_doc!(
+            "artifact_presentation_block_reason.json",
+            crate::artifacts::presentation::ArtifactPresentationBlockReason
+        ),
+        schema_doc!(
+            "execution_draft_selection.json",
+            crate::composer::reconciliation::ExecutionDraftSelection
+        ),
+        schema_doc!(
+            "execution_draft_reconciliation.json",
+            crate::composer::reconciliation::ExecutionDraftReconciliation
+        ),
+        schema_doc!(
+            "execution_draft_reconciliation_reason.json",
+            crate::composer::reconciliation::ExecutionDraftReconciliationReason
+        ),
+        schema_doc!(
             "artifact_upload_file_request.json",
             crate::artifacts::upload::ArtifactUploadFileRequest
         ),
@@ -1103,6 +1123,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::tasks::review::TaskReviewActionState
         ),
         schema_doc!(
+            "task_review_presentation_capabilities.json",
+            crate::tasks::review::TaskReviewPresentationCapabilities
+        ),
+        schema_doc!(
             "task_review_plan_error.json",
             crate::tasks::review::TaskReviewPlanError
         ),
@@ -1129,6 +1153,26 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "task_cancel_response.json",
             pioneer_protocol::TaskCancelResponse
+        ),
+        schema_doc!(
+            "task_user_notification.json",
+            pioneer_protocol::TaskUserNotification
+        ),
+        schema_doc!(
+            "task_user_notification_list_params.json",
+            pioneer_protocol::TaskUserNotificationListParams
+        ),
+        schema_doc!(
+            "task_user_notification_list_response.json",
+            pioneer_protocol::TaskUserNotificationListResponse
+        ),
+        schema_doc!(
+            "task_user_notification_acknowledge_params.json",
+            pioneer_protocol::TaskUserNotificationAcknowledgeParams
+        ),
+        schema_doc!(
+            "task_user_notification_acknowledge_response.json",
+            pioneer_protocol::TaskUserNotificationAcknowledgeResponse
         ),
         schema_doc!(
             "task_wait_review_display.json",
@@ -1344,10 +1388,6 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "principal_presentation_capabilities.json",
             crate::authorization::PrincipalPresentationCapabilities
-        ),
-        schema_doc!(
-            "current_principal_kind_presentation.json",
-            crate::authorization::CurrentPrincipalKindPresentation
         ),
         schema_doc!(
             "current_principal_presentation.json",

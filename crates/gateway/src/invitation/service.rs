@@ -329,8 +329,11 @@ impl InvitationService {
         admission: &AuthorizedInvitationGrants,
         params: InvitationCreateParams,
     ) -> Result<InvitationCreateResponse, InvitationServiceError> {
-        let params = InvitationCreateParams::new(params.workspace_ids)
+        let params = InvitationCreateParams::new_for_role(params.role_key, params.workspace_ids)
             .map_err(|_| InvitationServiceError::InvalidParams)?;
+        if !AuthorizationService::new().role_is_invitation_assignable(&params.role_key) {
+            return Err(InvitationServiceError::InvalidParams);
+        }
         if admission.principal_id() != &principal.principal_id
             || admission.action() != ResourceAction::InvitationCreate
             || admission.workspace_ids()
@@ -429,6 +432,7 @@ impl InvitationService {
                     gateway_id: principal.gateway_id.clone(),
                     created_by_principal_id: principal.principal_id.clone(),
                     created_by_session_id: principal.session_id.clone(),
+                    target_role_key: params.role_key.clone(),
                     token_hash: *issued.token_hash(),
                     expires_at,
                     now,
@@ -514,8 +518,8 @@ impl InvitationService {
         let limit = params
             .validate()
             .map_err(|_| InvitationServiceError::InvalidParams)?;
-        let is_superuser = principal.kind == PrincipalKind::Superuser;
-        if !is_superuser
+        let administrative_disclosure = principal_has_administrative_disclosure(principal);
+        if !administrative_disclosure
             && (params
                 .status
                 .is_some_and(|status| status != InvitationStatus::Pending)
@@ -555,7 +559,7 @@ impl InvitationService {
             if !persisted_actor_is_current(&transaction, principal).await? {
                 return Err(ListTransactionError::Authorization(inactive_principal()));
             }
-            let page = if is_superuser {
+            let page = if administrative_disclosure {
                 pioneer_crud::list_invitations_for_superuser(
                     &transaction,
                     &principal.gateway_id,
@@ -769,7 +773,7 @@ impl InvitationService {
             record_outcome(Epic5Operation::InvitationExpire, Epic5Outcome::Success);
             record_latency(Epic5Operation::InvitationExpire, started.elapsed());
         }
-        if principal.kind != PrincipalKind::Superuser && !changed {
+        if !principal_has_administrative_disclosure(principal) && !changed {
             if notification_changed {
                 return Err(InvitationServiceError::CommittedTerminalHidden(
                     params.invitation_id,
@@ -830,6 +834,7 @@ enum InvitationAdmission {
         invitation_id: InvitationId,
         inviter_id: PrincipalId,
         workspace_ids: Vec<WorkspaceId>,
+        role_key: RoleKey,
     },
     Unavailable {
         terminal_change: Option<CommittedInvitationChange>,
@@ -927,11 +932,19 @@ async fn admit_invitation_in_transaction(
             inviter_id,
             workspace_ids,
         } => {
+            let role_key = RoleKey::new(invitation.invitation.target_role_key.clone())
+                .context("persisted invitation target role is invalid")?;
+            if !AuthorizationService::new().role_is_invitation_assignable(&role_key) {
+                return Ok(InvitationAdmission::Unavailable {
+                    terminal_change: None,
+                });
+            }
             record_outcome(Epic5Operation::GrantReauthorization, Epic5Outcome::Success);
             Ok(InvitationAdmission::Available {
                 invitation_id,
                 inviter_id,
                 workspace_ids,
+                role_key,
             })
         }
         InvitationAuthority::Invalid(reason) => {
@@ -964,12 +977,13 @@ async fn accept_in_transaction(
     let admission =
         admit_invitation_in_transaction(transaction, credentials, gateway_id, raw_credential, now)
             .await?;
-    let (invitation_id, inviter_id, workspace_ids) = match admission {
+    let (invitation_id, inviter_id, workspace_ids, role_key) = match admission {
         InvitationAdmission::Available {
             invitation_id,
             inviter_id,
             workspace_ids,
-        } => (invitation_id, inviter_id, workspace_ids),
+            role_key,
+        } => (invitation_id, inviter_id, workspace_ids, role_key),
         InvitationAdmission::Unavailable { terminal_change } => {
             return Ok(AcceptTransactionOutcome::Unavailable { terminal_change });
         }
@@ -996,11 +1010,13 @@ async fn accept_in_transaction(
         installation,
     } = validated;
     let avatar_revision = profile.avatar.as_ref().map(|avatar| avatar.revision());
+    let accepted_role_key = role_key.clone();
     pioneer_crud::create_member_principal(
         transaction,
         NewMemberPrincipalRow {
             id: principal_id.clone(),
             gateway_id: gateway_id.clone(),
+            role_key,
             display_name: profile.display_name.clone(),
             nickname: profile.nickname.clone(),
             nickname_key: profile.nickname_key,
@@ -1085,7 +1101,12 @@ async fn accept_in_transaction(
                 kind: PrincipalKind::User,
                 display_name: profile.display_name,
                 nickname: profile.nickname,
-                role_key: Some(RoleKey::member()),
+                role: AuthorizationService::new()
+                    .role_presentation(PrincipalKind::User, Some(&accepted_role_key))
+                    .context("accepted invitation role is not registered")?,
+                lifecycle_managed: AuthorizationService::new()
+                    .role_is_lifecycle_managed(PrincipalKind::User, Some(&accepted_role_key)),
+                role_key: Some(accepted_role_key),
                 status: PrincipalStatus::Active,
                 avatar_revision,
             },
@@ -1153,6 +1174,7 @@ async fn preview_in_transaction(
             gateway_id: gateway_id.clone(),
             gateway_display_name: None,
             inviter: summary.inviter,
+            role_key: summary.role_key,
             workspaces: summary.workspaces,
             expires_at_unix: summary.expires_at_unix,
             transport,
@@ -1185,13 +1207,19 @@ async fn validate_invitation_authority(
             InvitationRevokeReason::InviterUnavailable,
         ));
     };
+    let inviter_role_key = match inviter.role_key.as_deref().map(RoleKey::new).transpose() {
+        Ok(role_key) => role_key,
+        Err(_) => {
+            return Ok(InvitationAuthority::Invalid(
+                InvitationRevokeReason::InviterUnavailable,
+            ));
+        }
+    };
+    let inviter_runtime_policy = AuthorizationService::new()
+        .runtime_principal_policy(inviter.kind, inviter_role_key.as_ref());
     if inviter.gateway_id != *gateway_id
         || inviter.status != pioneer_protocol::PrincipalStatus::Active
-        || !matches!(
-            (inviter.kind, inviter.role_key.as_deref()),
-            (PrincipalKind::Superuser, None)
-                | (PrincipalKind::User, Some(pioneer_protocol::MEMBER_ROLE_KEY))
-        )
+        || inviter_runtime_policy.is_none()
     {
         return Ok(InvitationAuthority::Invalid(
             InvitationRevokeReason::InviterUnavailable,
@@ -1214,7 +1242,8 @@ async fn validate_invitation_authority(
                 InvitationRevokeReason::WorkspaceUnavailable,
             ));
         }
-        if inviter.kind == PrincipalKind::User
+        if inviter_runtime_policy
+            == Some(crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration)
             && pioneer_crud::find_active_workspace_for_principal(
                 transaction,
                 &inviter_id,
@@ -1319,8 +1348,13 @@ fn invitation_cursor_scope(
     principal: &AuthenticatedSessionPrincipal,
     params: &InvitationListParams,
 ) -> String {
-    if principal.kind != PrincipalKind::Superuser {
-        return format!("member:{}", principal.principal_id);
+    if !principal_has_administrative_disclosure(principal) {
+        let role = principal
+            .role_key
+            .as_ref()
+            .map(RoleKey::as_str)
+            .unwrap_or("unsupported_user_role");
+        return format!("{role}:{}", principal.principal_id);
     }
     let status = params
         .status
@@ -1331,7 +1365,18 @@ fn invitation_cursor_scope(
         .as_ref()
         .map(PrincipalId::as_str)
         .unwrap_or("*");
-    format!("superuser:{}:{status}:{creator}", principal.gateway_id)
+    let role = AuthorizationService::new()
+        .resolved_role_key(principal.kind, principal.role_key.as_ref())
+        .unwrap_or("unsupported_role");
+    format!(
+        "administrative:{role}:{}:{status}:{creator}",
+        principal.gateway_id
+    )
+}
+
+fn principal_has_administrative_disclosure(principal: &AuthenticatedSessionPrincipal) -> bool {
+    AuthorizationService::new().role_disclosure_policy(principal.kind, principal.role_key.as_ref())
+        == Some(crate::authorization::RoleDisclosurePolicy::Administrative)
 }
 
 fn invitation_summary(
@@ -1358,6 +1403,8 @@ fn invitation_summary(
     let status = pioneer_crud::effective_invitation_status(&rows.invitation, now)?;
     Ok(InvitationSummary {
         invitation_id,
+        role_key: RoleKey::new(rows.invitation.target_role_key)
+            .context("persisted invitation target role is invalid")?,
         status,
         revoke_reason: rows
             .invitation
@@ -1742,7 +1789,7 @@ mod tests {
             .create(
                 &principal,
                 &proof,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -1780,6 +1827,16 @@ mod tests {
             .unwrap();
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "invitation_created");
+        assert_eq!(audits[0].policy_generation, 1);
+        assert_eq!(audits[0].policy_role_key.as_deref(), Some("member"));
+        assert_eq!(audits[0].policy_fingerprint.len(), 64);
+        assert!(
+            audits[0]
+                .policy_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert_ne!(audits[0].policy_fingerprint, "0".repeat(64));
         assert!(
             !audits[0]
                 .metadata_json
@@ -1809,6 +1866,7 @@ mod tests {
                     gateway_id: principal.gateway_id.clone(),
                     created_by_principal_id: principal.principal_id.clone(),
                     created_by_session_id: principal.session_id.clone(),
+                    target_role_key: RoleKey::member(),
                     token_hash: [index as u8; 32],
                     expires_at,
                     now,
@@ -1829,7 +1887,7 @@ mod tests {
             .create(
                 &principal,
                 &proof,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await;
 
@@ -1910,7 +1968,8 @@ mod tests {
                 .create(
                     &principal,
                     &proof,
-                    InvitationCreateParams::new(vec![green.clone()]).unwrap(),
+                    InvitationCreateParams::new_for_role(RoleKey::member(), vec![green.clone()])
+                        .unwrap(),
                 )
                 .await
                 .is_ok()
@@ -1963,7 +2022,7 @@ mod tests {
                 .create(
                     &principal,
                     &proof,
-                    InvitationCreateParams::new(workspace_ids).unwrap(),
+                    InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
                 )
                 .await
                 .is_err()
@@ -1998,7 +2057,7 @@ mod tests {
             .create(
                 &member_a,
                 &authorized_grants(&store, &member_a, &red).await,
-                InvitationCreateParams::new(red).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), red).unwrap(),
             )
             .await
             .unwrap()
@@ -2007,7 +2066,7 @@ mod tests {
             .create(
                 &member_b,
                 &authorized_grants(&store, &member_b, &green).await,
-                InvitationCreateParams::new(green).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), green).unwrap(),
             )
             .await
             .unwrap();
@@ -2053,7 +2112,8 @@ mod tests {
             .create(
                 &member_a,
                 &authorized_grants(&store, &member_a, &replacement_workspace_ids).await,
-                InvitationCreateParams::new(replacement_workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), replacement_workspace_ids)
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -2105,7 +2165,7 @@ mod tests {
             .create(
                 &member,
                 &authorized_grants(&store, &member, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2169,7 +2229,7 @@ mod tests {
             .create(
                 &member,
                 &authorized_grants(&store, &member, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2242,7 +2302,7 @@ mod tests {
             .create(
                 &member,
                 &authorized_grants(&store, &member, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2305,7 +2365,7 @@ mod tests {
             .create(
                 &member,
                 &authorized_grants(&store, &member, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2369,7 +2429,7 @@ mod tests {
             .create(
                 &principal,
                 &authorized_grants(&store, &principal, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2432,7 +2492,7 @@ mod tests {
             .create(
                 &principal,
                 &authorized_grants(&store, &principal, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2501,7 +2561,7 @@ mod tests {
             .create(
                 &principal,
                 &authorized_grants(&store, &principal, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2559,7 +2619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_atomically_creates_exact_member_grants_session_and_audit() {
+    async fn accept_atomically_creates_exact_registered_role_grants_session_and_audit() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
@@ -2571,11 +2631,13 @@ mod tests {
             WorkspaceId::new(WORKSPACE_RED_ID).unwrap(),
             WorkspaceId::new(WORKSPACE_BLUE_ID).unwrap(),
         ];
+        let target_role = RoleKey::new("synthetic_executor").unwrap();
         let created = service
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids.clone()).unwrap(),
+                InvitationCreateParams::new_for_role(target_role.clone(), workspace_ids.clone())
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -2609,6 +2671,7 @@ mod tests {
 
         assert_eq!(response.workspace_ids, workspace_ids);
         assert_eq!(response.member.principal_id, response.grant.principal.id);
+        assert_eq!(response.member.role_key.as_ref(), Some(&target_role));
         assert_eq!(response.grant.refresh_generation, 0);
         assert_eq!(
             response.grant.credential_storage_order,
@@ -2620,6 +2683,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(accepted.status, "accepted");
+        assert_eq!(accepted.target_role_key, target_role.as_str());
         assert!(accepted.token_hash.is_none());
         assert_eq!(
             accepted.accepted_principal_id.as_deref(),
@@ -2632,6 +2696,16 @@ mod tests {
         assert_eq!(
             accepted.accepted_session_id.as_deref(),
             Some(response.grant.session.id.as_str())
+        );
+        let accepted_principal =
+            gateway_principal::Entity::find_by_id(response.member.principal_id.to_string())
+                .one(&harness.database)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            accepted_principal.role_key.as_deref(),
+            Some(target_role.as_str())
         );
         let memberships = workspace_membership::Entity::find()
             .filter(
@@ -2707,7 +2781,7 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2762,7 +2836,7 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2838,7 +2912,7 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2899,7 +2973,7 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -2970,7 +3044,7 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -3031,7 +3105,7 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -3139,7 +3213,7 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();
@@ -3232,7 +3306,8 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, std::slice::from_ref(&workspace_id)).await,
-                InvitationCreateParams::new(vec![workspace_id.clone()]).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), vec![workspace_id.clone()])
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -3365,7 +3440,8 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, std::slice::from_ref(&workspace_id)).await,
-                InvitationCreateParams::new(vec![workspace_id.clone()]).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), vec![workspace_id.clone()])
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -3477,7 +3553,7 @@ mod tests {
             .create(
                 &inviter,
                 &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new(workspace_ids).unwrap(),
+                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
             )
             .await
             .unwrap();

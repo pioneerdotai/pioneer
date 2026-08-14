@@ -154,6 +154,7 @@ pub trait McpRuntimeSession: Send {
         &mut self,
         raw_tool_name: &str,
         arguments: JsonValue,
+        budget: crate::McpInvocationBudget,
         timeout: Duration,
         cancellation: CancellationToken,
     ) -> Result<McpToolCallResult, McpRuntimeError>;

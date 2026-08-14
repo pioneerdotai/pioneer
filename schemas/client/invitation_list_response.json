@@ -96,6 +96,9 @@
             }
           ]
         },
+        "role_key": {
+          "$ref": "#/$defs/RoleKey"
+        },
         "status": {
           "$ref": "#/$defs/InvitationStatus"
         },
@@ -116,6 +119,7 @@
       },
       "required": [
         "invitation_id",
+        "role_key",
         "status",
         "inviter",
         "workspaces",
@@ -150,6 +154,12 @@
         "superuser",
         "user"
       ]
+    },
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
     },
     "WorkspaceId": {
       "type": "string",

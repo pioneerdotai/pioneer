@@ -1936,6 +1936,13 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "task_review_presentation_capabilities.json",
+            crate::tasks::review::TaskReviewPresentationCapabilities,
+            Domain::Tasks,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
             "task_review_plan_error.json",
             crate::tasks::review::TaskReviewPlanError,
             Domain::Tasks,
@@ -1985,6 +1992,41 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Stability::Stable
         ),
         contract_type!(
+            "task_user_notification.json",
+            pioneer_protocol::TaskUserNotification,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_user_notification_list_params.json",
+            pioneer_protocol::TaskUserNotificationListParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_user_notification_list_response.json",
+            pioneer_protocol::TaskUserNotificationListResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_user_notification_acknowledge_params.json",
+            pioneer_protocol::TaskUserNotificationAcknowledgeParams,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_user_notification_acknowledge_response.json",
+            pioneer_protocol::TaskUserNotificationAcknowledgeResponse,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
             "task_wait_review_display.json",
             crate::timeline::labels::TaskWaitReviewDisplay,
             Domain::Timeline,
@@ -2023,6 +2065,41 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             "artifact_binding_target_part.json",
             crate::artifacts::presentation::ArtifactBindingTargetPart,
             Domain::Artifacts,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "artifact_presentation_policy.json",
+            crate::artifacts::presentation::ArtifactPresentationPolicy,
+            Domain::Artifacts,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "artifact_presentation_block_reason.json",
+            crate::artifacts::presentation::ArtifactPresentationBlockReason,
+            Domain::Artifacts,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "execution_draft_selection.json",
+            crate::composer::reconciliation::ExecutionDraftSelection,
+            Domain::Composer,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "execution_draft_reconciliation.json",
+            crate::composer::reconciliation::ExecutionDraftReconciliation,
+            Domain::Composer,
+            Kind::PresentationDto,
+            Stability::Stable
+        ),
+        contract_type!(
+            "execution_draft_reconciliation_reason.json",
+            crate::composer::reconciliation::ExecutionDraftReconciliationReason,
+            Domain::Composer,
             Kind::PresentationDto,
             Stability::Stable
         ),
@@ -2421,13 +2498,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
         contract_type!(
             "principal_presentation_capabilities.json",
             crate::authorization::PrincipalPresentationCapabilities,
-            Domain::Connection,
-            Kind::Snapshot,
-            Stability::Stable
-        ),
-        contract_type!(
-            "current_principal_kind_presentation.json",
-            crate::authorization::CurrentPrincipalKindPresentation,
             Domain::Connection,
             Kind::Snapshot,
             Stability::Stable

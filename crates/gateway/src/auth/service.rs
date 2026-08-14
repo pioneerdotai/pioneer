@@ -38,6 +38,7 @@ use serde_json::{Value as JsonValue, to_value};
 use subtle::ConstantTimeEq;
 
 use crate::administrative_audit::AdministrativeAuditWriter;
+use crate::authorization::AuthorizationService;
 use crate::epic5_observability::{
     Epic5Operation, Epic5Outcome, Epic5RateLimits, record_latency, record_outcome,
 };
@@ -1455,7 +1456,12 @@ impl GatewayAuthService {
                     if target.gateway_id != self.identity.gateway.id
                         || target.kind != PrincipalKind::User
                         || target.status != PrincipalStatus::Active
-                        || target.role_key.as_deref() != Some(pioneer_protocol::MEMBER_ROLE_KEY)
+                        || !target.role_key.as_deref().is_some_and(|role| {
+                            RoleKey::new(role).is_ok_and(|role| {
+                                AuthorizationService::new()
+                                    .role_is_lifecycle_managed(PrincipalKind::User, Some(&role))
+                            })
+                        })
                     {
                         return Err(AuthError::new(AuthErrorCode::RecoveryInvalidTarget));
                     }
@@ -1694,7 +1700,12 @@ impl GatewayAuthService {
         if principal.gateway_id != self.identity.gateway.id
             || principal.kind != PrincipalKind::User
             || principal.status != PrincipalStatus::Active
-            || principal.role_key.as_deref() != Some(pioneer_protocol::MEMBER_ROLE_KEY)
+            || !principal.role_key.as_deref().is_some_and(|role| {
+                RoleKey::new(role).is_ok_and(|role| {
+                    AuthorizationService::new()
+                        .role_is_lifecycle_managed(PrincipalKind::User, Some(&role))
+                })
+            })
         {
             return Err(AuthError::new(AuthErrorCode::InvalidCredential));
         }
@@ -2330,8 +2341,13 @@ fn validate_authenticated_principal(
         PrincipalKind::User => {
             let role_key = persisted_role_key
                 .and_then(|value| RoleKey::new(value).ok())
-                .filter(RoleKey::is_supported)
                 .ok_or_else(|| AuthError::new(AuthErrorCode::SessionRevoked))?;
+            if AuthorizationService::new()
+                .resolved_role_key(PrincipalKind::User, Some(&role_key))
+                .is_none()
+            {
+                return Err(AuthError::new(AuthErrorCode::SessionRevoked));
+            }
             Ok(Some(role_key))
         }
         PrincipalKind::Superuser => Err(AuthError::new(AuthErrorCode::SessionRevoked)),
@@ -2750,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_access_principal_contract_accepts_only_supported_active_shapes() {
+    fn persisted_access_principal_contract_resolves_registry_roles_without_protocol_allowlist() {
         assert_eq!(
             validate_authenticated_principal(
                 PrincipalKind::Superuser,
@@ -2768,6 +2784,17 @@ mod tests {
             )
             .unwrap(),
             Some(RoleKey::member())
+        );
+        assert_eq!(
+            validate_authenticated_principal(
+                PrincipalKind::User,
+                PrincipalStatus::Active,
+                Some("synthetic_executor"),
+            )
+            .unwrap()
+            .as_ref()
+            .map(RoleKey::as_str),
+            Some("synthetic_executor")
         );
         for (kind, status, role) in [
             (

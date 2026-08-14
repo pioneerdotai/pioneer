@@ -487,6 +487,9 @@ impl PioneerDesktop {
     }
 
     fn artifact_action_can_download(&mut self, summary: &ArtifactSummary) -> bool {
+        if !self.active_artifact_presentation_policy().can_download {
+            return false;
+        }
         let artifact_key = client_artifact_actions::artifact_version_key(&summary.artifact);
         let action_in_progress = self.thread_artifacts.action_in_progress(&summary.artifact)
             || self

@@ -1,6 +1,7 @@
 //! Turn resume coordination.
 
 use crate::{conversation::ConversationEvent, threads::coordinator::ThreadCoordinator};
+use anyhow::{Context as _, ensure};
 use pioneer_protocol::{
     Turn, TurnGetParams, TurnGetResponse, TurnItemEventPayload, TurnItemsParams, TurnItemsResponse,
     TurnStatus,
@@ -14,6 +15,7 @@ pub const TURN_RESUME_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(800)
 pub const TURN_RESUME_RETRY_MAX_DELAY: Duration = Duration::from_millis(5_000);
 pub const TURN_RESUME_IN_PROGRESS_POLL_DELAY: Duration = Duration::from_millis(800);
 pub const TURN_RESUME_MISMATCH_RETRY_DELAY: Duration = Duration::from_secs(5);
+pub const TURN_RESUME_ITEMS_PAGE_LIMIT: u32 = 200;
 
 #[derive(Default)]
 pub struct ThreadResumeCoordinator {
@@ -64,20 +66,24 @@ pub enum TurnResumeStatusPlan {
     Reset,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TurnResumeSnapshotParams {
-    pub turn: TurnGetParams,
-    pub items: TurnItemsParams,
-}
-
 #[derive(Clone, Debug)]
 pub enum TurnResumeSnapshotReduction {
-    ThreadMismatch {
+    ScopeMismatch {
         expected_thread_id: String,
         actual_thread_id: String,
+        expected_turn_id: String,
+        actual_turn_id: String,
         retry_after: Duration,
     },
     Apply(TurnResumeSnapshotApplyReduction),
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnResumeItemsPageReduction {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub replay_events: Vec<ConversationEvent>,
+    pub next_cursor: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -252,36 +258,48 @@ pub fn turn_resume_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(delay_ms.min(TURN_RESUME_RETRY_MAX_DELAY.as_millis() as u64))
 }
 
-pub fn turn_snapshot_matches_thread(expected_thread_id: &str, actual_thread_id: &str) -> bool {
-    expected_thread_id == actual_thread_id
+pub fn turn_snapshot_matches_scope(
+    expected_thread_id: &str,
+    expected_turn_id: &str,
+    snapshot: &TurnGetResponse,
+) -> bool {
+    expected_thread_id == snapshot.thread_id && expected_turn_id == snapshot.turn.id
 }
 
-pub fn turn_resume_snapshot_params(thread_id: String, turn_id: String) -> TurnResumeSnapshotParams {
-    TurnResumeSnapshotParams {
-        turn: TurnGetParams {
-            thread_id: thread_id.clone(),
-            turn_id: turn_id.clone(),
-        },
-        items: TurnItemsParams { thread_id, turn_id },
+pub fn turn_resume_turn_params(thread_id: String, turn_id: String) -> TurnGetParams {
+    TurnGetParams { thread_id, turn_id }
+}
+
+pub fn turn_resume_items_page_params(
+    thread_id: String,
+    turn_id: String,
+    after_sequence: Option<i64>,
+) -> TurnItemsParams {
+    TurnItemsParams {
+        thread_id,
+        turn_id,
+        after_sequence,
+        limit: Some(TURN_RESUME_ITEMS_PAGE_LIMIT),
     }
 }
 
-pub fn reduce_turn_resume_snapshot_result(
+pub fn reduce_turn_resume_turn_snapshot(
     expected_thread_id: &str,
+    expected_turn_id: &str,
     turn_snapshot: TurnGetResponse,
-    item_snapshot: TurnItemsResponse,
 ) -> TurnResumeSnapshotReduction {
-    if !turn_snapshot_matches_thread(expected_thread_id, turn_snapshot.thread_id.as_str()) {
-        return TurnResumeSnapshotReduction::ThreadMismatch {
+    if !turn_snapshot_matches_scope(expected_thread_id, expected_turn_id, &turn_snapshot) {
+        return TurnResumeSnapshotReduction::ScopeMismatch {
             expected_thread_id: expected_thread_id.to_owned(),
             actual_thread_id: turn_snapshot.thread_id,
+            expected_turn_id: expected_turn_id.to_owned(),
+            actual_turn_id: turn_snapshot.turn.id,
             retry_after: TURN_RESUME_MISMATCH_RETRY_DELAY,
         };
     }
 
     let thread_id = turn_snapshot.thread_id.clone();
     let workspace_id = turn_snapshot.workspace_id.clone();
-    let replay_events = turn_items_replay_events(&turn_snapshot, item_snapshot);
 
     let status_plan = plan_turn_resume_after_status(turn_snapshot.turn.status.clone());
     let (
@@ -309,11 +327,81 @@ pub fn reduce_turn_resume_snapshot_result(
     TurnResumeSnapshotReduction::Apply(TurnResumeSnapshotApplyReduction {
         thread_id,
         workspace_id,
-        replay_events,
+        replay_events: Vec::new(),
         terminal_event,
         schedule_after,
         reset_thread_resume,
         tick_conversation_after_terminal_event,
+    })
+}
+
+/// Validates and reduces one bounded replay page. Scope and cursor checks live
+/// in the shared client so every shell fails closed on malformed Gateway data.
+pub fn reduce_turn_resume_items_page(
+    turn_snapshot: &TurnGetResponse,
+    requested_after_sequence: Option<i64>,
+    item_snapshot: TurnItemsResponse,
+) -> anyhow::Result<TurnResumeItemsPageReduction> {
+    ensure!(
+        item_snapshot.thread_id == turn_snapshot.thread_id,
+        "turn/items/page returned another thread"
+    );
+    ensure!(
+        item_snapshot.workspace_id == turn_snapshot.workspace_id,
+        "turn/items/page returned another workspace"
+    );
+    ensure!(
+        item_snapshot.turn_id == turn_snapshot.turn.id,
+        "turn/items/page returned another turn"
+    );
+    ensure!(
+        item_snapshot.events.len() <= TURN_RESUME_ITEMS_PAGE_LIMIT as usize,
+        "turn/items/page exceeded the client item budget"
+    );
+
+    let requested_cursor = requested_after_sequence.unwrap_or(0);
+    ensure!(
+        item_snapshot.last_sequence >= requested_cursor,
+        "turn/items/page cursor moved backwards"
+    );
+    match (item_snapshot.has_more, item_snapshot.next_cursor) {
+        (true, Some(next_cursor)) => {
+            ensure!(
+                next_cursor == item_snapshot.last_sequence && next_cursor > requested_cursor,
+                "turn/items/page returned a non-advancing cursor"
+            );
+        }
+        (false, None) => {}
+        _ => ensure!(
+            false,
+            "turn/items/page returned an inconsistent continuation"
+        ),
+    }
+
+    let mut previous_sequence = requested_cursor;
+    let mut replay_events = Vec::with_capacity(item_snapshot.events.len());
+    for event in item_snapshot.events {
+        ensure!(
+            event.sequence >= previous_sequence && event.sequence <= item_snapshot.last_sequence,
+            "turn/items/page event sequence is outside the page cursor"
+        );
+        previous_sequence = event.sequence;
+        replay_events.push(
+            turn_item_payload_to_conversation_event(
+                turn_snapshot.workspace_id.as_str(),
+                turn_snapshot.thread_id.as_str(),
+                turn_snapshot.turn.id.as_str(),
+                event.payload,
+            )
+            .context("turn/items/page contains an event outside the requested turn")?,
+        );
+    }
+
+    Ok(TurnResumeItemsPageReduction {
+        thread_id: item_snapshot.thread_id,
+        workspace_id: item_snapshot.workspace_id,
+        replay_events,
+        next_cursor: item_snapshot.next_cursor,
     })
 }
 
@@ -332,28 +420,23 @@ pub fn turn_item_event_matches_snapshot(
     event_thread_id == snapshot_thread_id && event_workspace_id == snapshot_workspace_id
 }
 
-pub fn turn_items_replay_events(
-    turn_snapshot: &TurnGetResponse,
-    item_snapshot: TurnItemsResponse,
-) -> Vec<ConversationEvent> {
-    item_snapshot
-        .events
-        .into_iter()
-        .filter_map(|event| {
-            turn_item_payload_to_conversation_event(
-                turn_snapshot.workspace_id.as_str(),
-                turn_snapshot.thread_id.as_str(),
-                event.payload,
-            )
-        })
-        .collect()
-}
-
 pub fn turn_item_payload_to_conversation_event(
     snapshot_workspace_id: &str,
     snapshot_thread_id: &str,
+    snapshot_turn_id: &str,
     payload: TurnItemEventPayload,
 ) -> Option<ConversationEvent> {
+    let (event_workspace_id, event_thread_id, event_turn_id) = turn_item_payload_scope(&payload);
+    if !turn_item_event_matches_snapshot(
+        event_workspace_id,
+        event_thread_id,
+        snapshot_workspace_id,
+        snapshot_thread_id,
+    ) || event_turn_id != snapshot_turn_id
+    {
+        return None;
+    }
+
     match payload {
         TurnItemEventPayload::ItemStarted {
             workspace_id,
@@ -778,6 +861,131 @@ pub fn turn_item_payload_to_conversation_event(
     }
 }
 
+fn turn_item_payload_scope(payload: &TurnItemEventPayload) -> (&str, &str, &str) {
+    match payload {
+        TurnItemEventPayload::ItemStarted {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemDelta {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemCompleted {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemUpdated {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemTimeoutDetected {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemRecoveryOpened {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemRecoveryAttached {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemRetryScheduled {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemRetryAttemptStarted {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemRecoverySucceeded {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemRecoveryExhausted {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemToolRetryScheduled {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemToolRetryResolved {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::ItemToolRetryExhausted {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        }
+        | TurnItemEventPayload::TurnToolLoopBudgetExceeded {
+            workspace_id,
+            thread_id,
+            turn_id,
+            ..
+        } => (workspace_id.as_str(), thread_id.as_str(), turn_id.as_str()),
+        TurnItemEventPayload::TurnExecutionWindowStarted(notification) => (
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+        ),
+        TurnItemEventPayload::TurnExecutionWindowExhausted(notification) => (
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+        ),
+        TurnItemEventPayload::TurnExecutionWindowCheckpointed(notification) => (
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+        ),
+        TurnItemEventPayload::TurnExecutionWindowContinued(notification) => (
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+        ),
+        TurnItemEventPayload::TurnExecutionWindowBlocked(notification) => (
+            notification.workspace_id.as_str(),
+            notification.thread_id.as_str(),
+            notification.turn_id.as_str(),
+        ),
+        TurnItemEventPayload::TurnPermissionAudit(event) => (
+            event.workspace_id.as_str(),
+            event.thread_id.as_str(),
+            event.turn_id.as_str(),
+        ),
+    }
+}
+
 pub fn plan_turn_resume_after_status(status: TurnStatus) -> TurnResumeStatusPlan {
     match status {
         TurnStatus::InProgress => {
@@ -990,14 +1198,16 @@ mod tests {
 
     #[test]
     fn snapshot_and_event_matching_are_scope_strict() {
-        let params = turn_resume_snapshot_params("thread_a".to_owned(), "turn_a".to_owned());
-        assert_eq!(params.turn.thread_id, "thread_a");
-        assert_eq!(params.turn.turn_id, "turn_a");
-        assert_eq!(params.items.thread_id, "thread_a");
-        assert_eq!(params.items.turn_id, "turn_a");
+        let turn_params = turn_resume_turn_params("thread_a".to_owned(), "turn_a".to_owned());
+        assert_eq!(turn_params.thread_id, "thread_a");
+        assert_eq!(turn_params.turn_id, "turn_a");
+        let page_params =
+            turn_resume_items_page_params("thread_a".to_owned(), "turn_a".to_owned(), Some(40));
+        assert_eq!(page_params.thread_id, "thread_a");
+        assert_eq!(page_params.turn_id, "turn_a");
+        assert_eq!(page_params.after_sequence, Some(40));
+        assert_eq!(page_params.limit, Some(TURN_RESUME_ITEMS_PAGE_LIMIT));
 
-        assert!(turn_snapshot_matches_thread("thread_a", "thread_a"));
-        assert!(!turn_snapshot_matches_thread("thread_a", "thread_b"));
         assert!(turn_item_event_matches_snapshot(
             "ws_a", "thread_a", "ws_a", "thread_a"
         ));
@@ -1119,22 +1329,18 @@ mod tests {
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             },
         };
-        let item_snapshot = TurnItemsResponse {
-            thread_id: "thread_b".to_owned(),
-            workspace_id: "ws_a".to_owned(),
-            turn_id: "turn_a".to_owned(),
-            last_sequence: 0,
-            events: Vec::new(),
-        };
-
-        match reduce_turn_resume_snapshot_result("thread_a", turn_snapshot, item_snapshot) {
-            TurnResumeSnapshotReduction::ThreadMismatch {
+        match reduce_turn_resume_turn_snapshot("thread_a", "turn_a", turn_snapshot) {
+            TurnResumeSnapshotReduction::ScopeMismatch {
                 expected_thread_id,
                 actual_thread_id,
+                expected_turn_id,
+                actual_turn_id,
                 retry_after,
             } => {
                 assert_eq!(expected_thread_id, "thread_a");
                 assert_eq!(actual_thread_id, "thread_b");
+                assert_eq!(expected_turn_id, "turn_a");
+                assert_eq!(actual_turn_id, "turn_a");
                 assert_eq!(retry_after, TURN_RESUME_MISMATCH_RETRY_DELAY);
             }
             reduction => panic!("unexpected reduction: {reduction:?}"),
@@ -1183,12 +1389,29 @@ mod tests {
                     },
                 },
             }],
+            has_more: false,
+            next_cursor: None,
         };
 
+        let page = reduce_turn_resume_items_page(&turn_snapshot, None, item_snapshot)
+            .expect("valid first page");
+        assert_eq!(page.thread_id, "thread_a");
+        assert_eq!(page.workspace_id, "ws_a");
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(page.replay_events.len(), 1);
+        assert!(matches!(
+            &page.replay_events[0],
+            ConversationEvent::ItemStarted {
+                thread_id,
+                turn_id,
+                item: TurnItem::SystemEvent { id, .. },
+            } if thread_id == "thread_a" && turn_id == "turn_a" && id == "item_a"
+        ));
+
         let TurnResumeSnapshotReduction::Apply(reduction) =
-            reduce_turn_resume_snapshot_result("thread_a", turn_snapshot, item_snapshot)
+            reduce_turn_resume_turn_snapshot("thread_a", "turn_a", turn_snapshot)
         else {
-            panic!("expected apply reduction");
+            panic!("expected status reduction");
         };
 
         assert_eq!(reduction.thread_id, "thread_a");
@@ -1200,15 +1423,7 @@ mod tests {
         assert!(!reduction.reset_thread_resume);
         assert!(!reduction.tick_conversation_after_terminal_event);
         assert!(reduction.terminal_event.is_none());
-        assert_eq!(reduction.replay_events.len(), 1);
-        assert!(matches!(
-            &reduction.replay_events[0],
-            ConversationEvent::ItemStarted {
-                thread_id,
-                turn_id,
-                item: TurnItem::SystemEvent { id, .. },
-            } if thread_id == "thread_a" && turn_id == "turn_a" && id == "item_a"
-        ));
+        assert!(reduction.replay_events.is_empty());
     }
 
     #[test]
@@ -1232,16 +1447,8 @@ mod tests {
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             },
         };
-        let item_snapshot = TurnItemsResponse {
-            thread_id: "thread_a".to_owned(),
-            workspace_id: "ws_a".to_owned(),
-            turn_id: "turn_a".to_owned(),
-            last_sequence: 0,
-            events: Vec::new(),
-        };
-
         let TurnResumeSnapshotReduction::Apply(reduction) =
-            reduce_turn_resume_snapshot_result("thread_a", turn_snapshot, item_snapshot)
+            reduce_turn_resume_turn_snapshot("thread_a", "turn_a", turn_snapshot)
         else {
             panic!("expected apply reduction");
         };
@@ -1269,7 +1476,86 @@ mod tests {
     }
 
     #[test]
-    fn turn_items_replay_events_maps_scoped_events_and_skips_foreign_events() {
+    fn incremental_turn_item_pages_preserve_a_long_event_log_without_loss() {
+        let turn_snapshot = TurnGetResponse {
+            thread_id: "thread_a".to_owned(),
+            workspace_id: "ws_a".to_owned(),
+            turn: Turn {
+                id: "turn_a".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            },
+        };
+        let make_page = |start: i64, end: i64, has_more: bool| TurnItemsResponse {
+            thread_id: "thread_a".to_owned(),
+            workspace_id: "ws_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            events: (start..=end)
+                .map(|sequence| TurnItemEvent {
+                    sequence,
+                    created_at: sequence,
+                    payload: TurnItemEventPayload::ItemCompleted {
+                        workspace_id: "ws_a".to_owned(),
+                        thread_id: "thread_a".to_owned(),
+                        turn_id: "turn_a".to_owned(),
+                        item: TurnItem::SystemEvent {
+                            id: format!("item_{sequence}"),
+                            level: SystemEventLevel::Info,
+                            message: "completed".to_owned(),
+                            code: None,
+                            details: None,
+                        },
+                    },
+                })
+                .collect(),
+            last_sequence: end,
+            has_more,
+            next_cursor: has_more.then_some(end),
+        };
+
+        let mut cursor = None;
+        let mut replayed = Vec::new();
+        for page in [
+            make_page(1, 200, true),
+            make_page(201, 400, true),
+            make_page(401, 401, false),
+        ] {
+            let reduced = reduce_turn_resume_items_page(&turn_snapshot, cursor, page)
+                .expect("each bounded page should reduce");
+            cursor = reduced.next_cursor;
+            replayed.extend(reduced.replay_events);
+        }
+
+        assert_eq!(cursor, None);
+        assert_eq!(replayed.len(), 401);
+        assert!(matches!(
+            replayed.first(),
+            Some(ConversationEvent::ItemCompleted {
+                item: TurnItem::SystemEvent { id, .. },
+                ..
+            }) if id == "item_1"
+        ));
+        assert!(matches!(
+            replayed.last(),
+            Some(ConversationEvent::ItemCompleted {
+                item: TurnItem::SystemEvent { id, .. },
+                ..
+            }) if id == "item_401"
+        ));
+    }
+
+    #[test]
+    fn turn_items_page_rejects_foreign_events_instead_of_skipping_them() {
         let turn_snapshot = TurnGetResponse {
             thread_id: "thread_a".to_owned(),
             workspace_id: "ws_a".to_owned(),
@@ -1328,19 +1614,13 @@ mod tests {
                     },
                 },
             ],
+            has_more: false,
+            next_cursor: None,
         };
 
-        let events = turn_items_replay_events(&turn_snapshot, item_snapshot);
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            ConversationEvent::ItemStarted {
-                thread_id,
-                turn_id,
-                item: TurnItem::SystemEvent { id, .. },
-            } if thread_id == "thread_a" && turn_id == "turn_a" && id == "item_a"
-        ));
+        let error = reduce_turn_resume_items_page(&turn_snapshot, None, item_snapshot)
+            .expect_err("foreign event must fail the whole page closed");
+        assert!(error.to_string().contains("outside the requested turn"));
     }
 
     #[test]

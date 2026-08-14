@@ -9,6 +9,9 @@
         "$ref": "#/$defs/ComposerAttachment"
       }
     },
+    "authorization_fingerprint": {
+      "type": "string"
+    },
     "capabilities": {
       "type": "array",
       "items": {
@@ -107,6 +110,7 @@
     }
   },
   "required": [
+    "authorization_fingerprint",
     "workspace_id",
     "thread_id",
     "turn_id",
@@ -754,10 +758,19 @@
       "pattern": "^[A-Za-z0-9]{21}$"
     },
     "ThreadMode": {
-      "type": "string",
-      "enum": [
-        "Chat",
-        "Agent"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Message",
+            "Agent"
+          ]
+        },
+        {
+          "description": "Compatibility default for pre-Epic-6 persisted and wire values. New\nuser-thread creation selects `Message` explicitly.",
+          "type": "string",
+          "const": "Chat"
+        }
       ]
     },
     "TurnCLIRuntimeOptions": {

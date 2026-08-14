@@ -279,7 +279,7 @@ pub fn default_composer_turn_mode() -> ThreadMode {
 }
 
 pub fn composer_turn_mode_options() -> [ThreadMode; 3] {
-    [ThreadMode::Message, ThreadMode::Agent, ThreadMode::Chat]
+    [ThreadMode::Message, ThreadMode::Chat, ThreadMode::Agent]
 }
 
 pub fn set_composer_turn_mode(current: &mut ThreadMode, mode: ThreadMode) -> bool {

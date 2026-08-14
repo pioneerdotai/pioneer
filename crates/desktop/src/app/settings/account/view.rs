@@ -1,9 +1,7 @@
 use crate::app::root::PioneerDesktop;
 use gpui::{prelude::*, *};
 use gpui_component::{avatar::Avatar, button::*, theme::ActiveTheme, *};
-use pioneer_client::authorization::{
-    CurrentPrincipalKindPresentation, CurrentPrincipalPresentation, current_principal_presentation,
-};
+use pioneer_client::authorization::{CurrentPrincipalPresentation, current_principal_presentation};
 
 const ACCOUNT_CONTENT_MAX_WIDTH_PX: f32 = 860.0;
 
@@ -14,17 +12,19 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let desktop = cx.entity().clone();
-        let principal = self.gateway.current_auth.as_ref().map(|auth| {
-            let visible_member = self
-                .administration
-                .members()
-                .find(|member| member.principal_id == auth.principal.id);
-            current_principal_presentation(
-                auth,
-                visible_member,
-                self.principal_presentation_capabilities(),
-            )
-        });
+        let principal = self
+            .gateway
+            .current_auth
+            .as_ref()
+            .zip(self.gateway.capability_snapshot.as_ref())
+            .filter(|(auth, snapshot)| snapshot.principal_id == auth.principal.id)
+            .map(|(auth, snapshot)| {
+                current_principal_presentation(
+                    auth,
+                    self.principal_presentation_capabilities(),
+                    &snapshot.role,
+                )
+            });
         let principal_avatar_path = self.gateway.current_auth.as_ref().and_then(|auth| {
             self.member_avatar_state
                 .presentation(&auth.principal.id)
@@ -135,17 +135,7 @@ impl PioneerDesktop {
         desktop: Entity<Self>,
         _cx: &mut Context<Self>,
     ) -> AnyElement {
-        let kind = match principal.kind {
-            CurrentPrincipalKindPresentation::Superuser => {
-                t!("settings.profile.kind.superuser").to_string()
-            }
-            CurrentPrincipalKindPresentation::Member => {
-                t!("settings.profile.kind.member").to_string()
-            }
-            CurrentPrincipalKindPresentation::Unknown => {
-                t!("settings.profile.kind.unknown").to_string()
-            }
-        };
+        let role_label = principal.role.display_name.clone();
 
         h_flex()
             .id("settings-current-principal")
@@ -180,7 +170,7 @@ impl PioneerDesktop {
                                     .opacity(0.6)
                                     .child(format!("@{}", principal.nickname)),
                             )
-                            .child(div().text_xs().opacity(0.6).child(kind)),
+                            .child(div().text_xs().opacity(0.6).child(role_label)),
                     ),
             )
             .child(Icon::new(IconName::ChevronRight).size_4().opacity(0.6))

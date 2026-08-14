@@ -401,6 +401,13 @@ mod tests {
             display_name: "Member".to_owned(),
             nickname: "member".to_owned(),
             role_key: Some(pioneer_protocol::RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
             status: PrincipalStatus::Active,
             avatar_revision: revision.map(str::to_owned),
         }
@@ -580,9 +587,12 @@ mod tests {
     #[::core::prelude::v1::test]
     fn desktop_avatar_source_has_no_legacy_rpc_or_data_url_path() {
         let source = include_str!("member_avatars.rs");
-        assert!(!source.contains(&["member", "_avatar_get"].concat()));
-        assert!(!source.contains(&["content", "_base64"].concat()));
-        assert!(!source.contains(&["data", ":image"].concat()));
-        assert!(!source.contains(&["Author", "ization"].concat()));
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+        assert!(!production_source.contains(&["member", "_avatar_get"].concat()));
+        assert!(!production_source.contains(&["content", "_base64"].concat()));
+        assert!(!production_source.contains(&["data", ":image"].concat()));
+        assert!(!production_source.contains(&["Author", "ization"].concat()));
     }
 }

@@ -1350,9 +1350,9 @@ fn normalize_capability_query(query: &str) -> String {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        McpPolicyState, McpRuntimeStatus, McpServerCatalogDetails, McpServerHealthDetails,
-        McpServerStatus, McpSourceKind, McpToolCatalogItem, McpTransportSummary,
-        SkillHealthSummary, SkillInstallState, SkillPolicyState,
+        McpManagementDetails, McpPolicyState, McpRuntimeStatus, McpServerCatalogDetails,
+        McpServerHealthDetails, McpServerStatus, McpSourceKind, McpToolCatalogItem,
+        McpTransportSummary, SkillHealthSummary, SkillInstallState, SkillPolicyState,
     };
 
     fn skill_id(seed: &str) -> SkillId {
@@ -1493,28 +1493,21 @@ mod tests {
             name: name.to_owned(),
             display_name: None,
             scope: McpScopeKind::Workspace,
-            source_kind: McpSourceKind::Config,
-            transport: McpTransportSummary::Stdio {
-                command: "server".to_owned(),
-            },
             policy: McpPolicyState {
                 enabled: true,
                 allow_implicit_invocation: false,
             },
             required: false,
-            fingerprint: "fingerprint".to_owned(),
             runtime: McpRuntimeStatus {
                 state: McpRuntimeState::Ready,
                 live: true,
                 last_seen_at: None,
-                last_error: None,
             },
             tools_count: 1,
             resources_count: 0,
             resource_templates_count: 0,
             prompts_count: 0,
             status: McpServerStatus::Ready,
-            status_reason: None,
         }
     }
 
@@ -1886,18 +1879,26 @@ mod tests {
                 resource_templates: Vec::new(),
                 prompts: Vec::new(),
             },
-            health: McpServerHealthDetails {
-                runtime: server.runtime.clone(),
-                status: server.status,
-                status_reason: server.status_reason.clone(),
-                last_error: None,
-                retry_attempt: None,
-                next_retry_at: None,
-                catalog_version: Some("catalog-v1".to_owned()),
-                stderr_tail: None,
-            },
-            audit: Vec::new(),
-            recent_bindings: Vec::new(),
+            management: Some(McpManagementDetails {
+                scope: McpScopeKind::Workspace,
+                source_kind: McpSourceKind::Config,
+                transport: McpTransportSummary::Stdio {
+                    command: "server".to_owned(),
+                },
+                fingerprint: "fingerprint".to_owned(),
+                health: McpServerHealthDetails {
+                    runtime: server.runtime.clone(),
+                    status: server.status,
+                    status_reason: None,
+                    last_error: None,
+                    retry_attempt: None,
+                    next_retry_at: None,
+                    catalog_version: Some("catalog-v1".to_owned()),
+                    stderr_tail: None,
+                },
+                audit: Vec::new(),
+                recent_bindings: Vec::new(),
+            }),
         }
     }
 

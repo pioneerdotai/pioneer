@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactPresentationPolicy",
+  "type": "object",
+  "properties": {
+    "can_attach": {
+      "type": "boolean"
+    },
+    "can_download": {
+      "type": "boolean"
+    },
+    "can_list": {
+      "type": "boolean"
+    },
+    "can_open": {
+      "type": "boolean"
+    },
+    "can_share": {
+      "type": "boolean"
+    },
+    "read_block_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactPresentationBlockReason"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "write_block_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactPresentationBlockReason"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "can_attach",
+    "can_list",
+    "can_open",
+    "can_download",
+    "can_share"
+  ],
+  "$defs": {
+    "ArtifactPresentationBlockReason": {
+      "type": "string",
+      "enum": [
+        "capability_denied",
+        "disconnected"
+      ]
+    }
+  }
+}

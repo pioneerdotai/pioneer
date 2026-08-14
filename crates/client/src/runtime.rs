@@ -60,11 +60,11 @@ use crate::{
     voice::{VoiceSessionResultReduction, reduce_voice_session_result_notification},
 };
 use pioneer_protocol::{
-    AccessChangedNotification, ArtifactSummary, GatewayNotification,
-    GatewayRemoteAccessStatusChangedNotification,
+    AccessChangedNotification, ArtifactSummary, AuthorizationProjectionChangedNotification,
+    GatewayNotification, GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification,
-    GatewayVoiceInputStatusChangedNotification, ThreadParticipantsChangedNotification, Workspace,
-    WorkspaceChangedNotification,
+    GatewayVoiceInputStatusChangedNotification, TaskUserNotificationDeliveredNotification,
+    ThreadParticipantsChangedNotification, Workspace, WorkspaceChangedNotification,
 };
 
 #[derive(Clone)]
@@ -118,6 +118,7 @@ impl Default for ClientRuntimeNotificationContext<'_> {
 #[derive(Clone, Debug)]
 pub enum ClientRuntimeNotification {
     AccessChanged(AccessChangedNotification),
+    AuthorizationProjectionChanged(AuthorizationProjectionChangedNotification),
     AdministrationChanged(AdministrationEvent),
     ThreadStarted(ThreadStartedReduction),
     TurnLifecycle(TurnLifecycleReduction),
@@ -141,6 +142,10 @@ pub enum ClientRuntimeNotification {
     PendingRequests {
         reduction: PendingRequestsReduction,
     },
+    /// Live hint for the durable, exact-recipient Task notification inbox.
+    /// Shells must reconcile the inbox through `task/user_notification/list`;
+    /// this event is not the source of truth and may be missed on reconnect.
+    TaskUserNotificationDelivered(TaskUserNotificationDeliveredNotification),
     SemanticTimeline(SemanticTimelineLiveUpdate),
     VoiceSessionResult(VoiceSessionResultReduction),
     GatewayRemoteAccessStatusChanged(GatewayRemoteAccessStatusChangedNotification),
@@ -358,6 +363,9 @@ pub fn reduce_gateway_notification(
         GatewayNotification::AccessChanged(notification) => {
             Some(ClientRuntimeNotification::AccessChanged(notification))
         }
+        GatewayNotification::AuthorizationProjectionChanged(notification) => Some(
+            ClientRuntimeNotification::AuthorizationProjectionChanged(notification),
+        ),
         GatewayNotification::InvitationChanged(notification) => {
             Some(ClientRuntimeNotification::AdministrationChanged(
                 AdministrationEvent::InvitationChanged(notification),
@@ -692,6 +700,9 @@ pub fn reduce_gateway_notification(
                 reduce_voice_session_result_notification(&notification),
             ))
         }
+        GatewayNotification::TaskUserNotificationDelivered(notification) => Some(
+            ClientRuntimeNotification::TaskUserNotificationDelivered(notification),
+        ),
         GatewayNotification::AuthSessionRevoked(_)
         | GatewayNotification::AuthAccessExpiring(_)
         | GatewayNotification::ContextCompressing(_)
@@ -1053,7 +1064,7 @@ mod tests {
             authorization_revision: 12,
             workspace_id: "ws_a".to_owned(),
             thread_id: Some("thread_a".to_owned()),
-            access_lost: None,
+            outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
             change: AccessChangeKind::ThreadVisibility,
         };
 
@@ -1388,6 +1399,31 @@ mod tests {
         let Some(ClientRuntimeNotification::GatewayVoiceInputStatusChanged(actual)) = reduced
         else {
             panic!("expected Voice Input status notification");
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn durable_task_inbox_live_hint_is_not_dropped_by_shared_runtime() {
+        let expected = TaskUserNotificationDeliveredNotification {
+            notification_id: "notification-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+            recipient_principal_id: "principal-a".to_owned(),
+            task_id: "task-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            delivery_id: "delivery-a".to_owned(),
+            result: None,
+            error: None,
+            created_at: 1_700_000_000,
+        };
+
+        let reduced = reduce_gateway_notification(
+            GatewayNotification::TaskUserNotificationDelivered(expected.clone()),
+            ClientRuntimeNotificationContext::default(),
+        );
+
+        let Some(ClientRuntimeNotification::TaskUserNotificationDelivered(actual)) = reduced else {
+            panic!("expected durable Task inbox invalidation");
         };
         assert_eq!(actual, expected);
     }

@@ -1,7 +1,7 @@
 use crate::{
     attachments::{
         PreparedAttachmentSource, PreparedProviderMessages, attachment_bytes, attachment_data_url,
-        ensure_no_unrendered_attachments, prepare_messages_for_provider,
+        ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
     tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
@@ -527,11 +527,12 @@ impl crate::traits::Provider for CopilotProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = ApiChatRequest {
             model: request.model,
@@ -617,11 +618,12 @@ impl crate::traits::Provider for CopilotProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let api_request = ApiChatRequest {
             model: request.model,

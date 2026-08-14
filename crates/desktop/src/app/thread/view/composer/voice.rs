@@ -216,6 +216,11 @@ impl PioneerDesktop {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reconcile_composer_draft_with_capabilities();
+        let Some(authorization_fingerprint) = self.composer_authorization_fingerprint.clone()
+        else {
+            return;
+        };
         if self.desktop_voice_composer.is_active()
             || self.desktop_voice_status != VoiceStatus::Ready
             || self.desktop_voice_entry_availability() != DesktopVoiceEntryAvailability::Ready
@@ -309,6 +314,7 @@ impl PioneerDesktop {
         let gateway_sender = self.gateway.ws_command_sender.clone();
 
         let prepare_request = PrepareVoiceComposerSnapshotRequest {
+            authorization_fingerprint,
             workspace_id: workspace_id.clone(),
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
@@ -489,6 +495,18 @@ impl PioneerDesktop {
             cx.notify();
             return;
         };
+        self.reconcile_composer_draft_with_capabilities();
+        if self.composer_authorization_fingerprint.as_deref()
+            != Some(prepare_request.authorization_fingerprint.as_str())
+        {
+            let _ = flow.release_cancel();
+            self.desktop_voice_composer = DesktopVoiceComposerState::Error {
+                kind: DesktopVoiceCaptureErrorKind::GatewaySession,
+                message: "Voice draft policy changed; review the updated selections".to_owned(),
+            };
+            cx.notify();
+            return;
+        }
 
         self.desktop_voice_composer = DesktopVoiceComposerState::Finalizing {
             thread_id: prepare_request.thread_id.clone(),

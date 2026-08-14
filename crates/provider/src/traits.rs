@@ -13,6 +13,13 @@ pub trait Provider: Send + Sync {
     /// Human-readable provider name (e.g. "openrouter", "anthropic").
     fn name(&self) -> &str;
 
+    /// Non-secret identity of the credential/account/endpoint authority that
+    /// created this instance. Registry-managed providers always expose one;
+    /// directly constructed test providers may remain unbound.
+    fn authority_fingerprint(&self) -> Option<&str> {
+        None
+    }
+
     /// Declares what features this provider supports.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()

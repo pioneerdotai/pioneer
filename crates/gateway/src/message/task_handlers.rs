@@ -1,6 +1,11 @@
 use super::*;
 use crate::authorization::ResourceAction;
 
+struct TaskObservationAdmission {
+    budget: pioneer_protocol::TaskResourceBudget,
+    _permit: crate::authorization::ObservationAdmissionPermit,
+}
+
 fn task_authorization_unavailable(
     request_id: RequestId,
     action: ResourceAction,
@@ -15,15 +20,108 @@ fn task_authorization_unavailable(
     crate::authorization::AuthorizationExternalError::Unavailable.response(request_id)
 }
 
+fn task_public_error(
+    request_id: Option<RequestId>,
+    stage: pioneer_protocol::PublicErrorStage,
+    diagnostic: impl std::fmt::Display,
+) -> JsonRpcErrorResponse {
+    crate::public_error::agent_rpc_error(
+        request_id,
+        INVALID_REQUEST_CODE,
+        pioneer_protocol::PublicErrorCode::Internal,
+        stage,
+        diagnostic,
+    )
+}
+
 impl MessageProcessor {
-    async fn require_member_task_delivery_policy(
+    async fn acquire_task_observation_page(
+        &self,
+        request_context: &RequestContext,
+        request_id: &RequestId,
+        workspace_id: &str,
+    ) -> Option<TaskObservationAdmission> {
+        let principal = request_context.principal();
+        let policy = crate::authorization::AuthorizationService::new();
+        let Some(role_key) = policy.resolved_role_key(principal.kind, principal.role_key.as_ref())
+        else {
+            self.send_error(
+                request_context.connection_id(),
+                crate::authorization::AuthorizationExternalError::Unavailable
+                    .response(request_id.clone()),
+            )
+            .await;
+            return None;
+        };
+        let Some(observation_policy) =
+            policy.observation_resource_policy(principal.kind, principal.role_key.as_ref())
+        else {
+            self.send_error(
+                request_context.connection_id(),
+                crate::authorization::AuthorizationExternalError::Unavailable
+                    .response(request_id.clone()),
+            )
+            .await;
+            return None;
+        };
+        let Some(budget) = policy.task_resource_budget(principal.kind, principal.role_key.as_ref())
+        else {
+            self.send_error(
+                request_context.connection_id(),
+                crate::authorization::AuthorizationExternalError::Unavailable
+                    .response(request_id.clone()),
+            )
+            .await;
+            return None;
+        };
+        let permit = match self
+            .observation_governor
+            .acquire_page(
+                principal.principal_id.as_str(),
+                role_key,
+                workspace_id,
+                observation_policy,
+            )
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                warn!(
+                    principal_id = %principal.principal_id,
+                    workspace_id,
+                    error = %format!("{error:#}"),
+                    "task observation page rejected by resource governor"
+                );
+                self.send_error(
+                    request_context.connection_id(),
+                    crate::authorization::AuthorizationExternalError::Unavailable
+                        .response(request_id.clone()),
+                )
+                .await;
+                return None;
+            }
+        };
+        Some(TaskObservationAdmission {
+            budget,
+            _permit: permit,
+        })
+    }
+
+    fn uses_scoped_task_policy(request_context: &RequestContext) -> bool {
+        crate::authorization::AuthorizationService::new().runtime_principal_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration)
+    }
+
+    async fn require_scoped_task_delivery_policy(
         &self,
         request_context: &RequestContext,
         request_id: &RequestId,
         workspace_id: &str,
         policy: Option<&pioneer_protocol::TaskDeliveryPolicy>,
     ) -> bool {
-        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User {
+        if !Self::uses_scoped_task_policy(request_context) {
             return true;
         }
         let Some(policy) = policy else {
@@ -51,16 +149,18 @@ impl MessageProcessor {
                 else {
                     self.send_error(
                         request_context.connection_id(),
-                        JsonRpcErrorResponse::new(
+                        crate::public_error::agent_rpc_error(
                             Some(request_id.clone()),
                             INVALID_PARAMS_CODE,
+                            pioneer_protocol::PublicErrorCode::InvalidInput,
+                            pioneer_protocol::PublicErrorStage::Admission,
                             "thread delivery requires delivery_policy.thread_id",
                         ),
                     )
                     .await;
                     return false;
                 };
-                let action = ResourceAction::ThreadWrite;
+                let action = ResourceAction::MessageCreate;
                 let gate = crate::authorization::AuthorizationService::new().authorize_action(
                     request_context.principal().kind,
                     request_context.principal().role_key.as_ref(),
@@ -124,7 +224,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn require_member_task_proof(
+    async fn require_scoped_task_proof(
         &self,
         request_context: &RequestContext,
         request_id: &RequestId,
@@ -132,7 +232,7 @@ impl MessageProcessor {
         expected_task_id: &str,
         expected_action: ResourceAction,
     ) -> bool {
-        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User {
+        if !Self::uses_scoped_task_policy(request_context) {
             return true;
         }
         if proof.is_some_and(|proof| {
@@ -148,7 +248,7 @@ impl MessageProcessor {
         false
     }
 
-    async fn require_member_task_batch_proof(
+    async fn require_scoped_task_batch_proof(
         &self,
         request_context: &RequestContext,
         request_id: &RequestId,
@@ -156,7 +256,7 @@ impl MessageProcessor {
         params: &TaskWaitParams,
         expected_action: ResourceAction,
     ) -> bool {
-        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User {
+        if !Self::uses_scoped_task_policy(request_context) {
             return true;
         }
         let Some(proofs) = proofs else {
@@ -185,12 +285,54 @@ impl MessageProcessor {
         false
     }
 
+    /// Resolves operator disclosure against the exact Task. An action-level
+    /// grant is final only for an absolute role; a future scoped operator role
+    /// must pass the same authoritative Task facts as every mutation/read.
+    async fn task_operator_projection_allowed(
+        &self,
+        request_context: &RequestContext,
+        task_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> bool {
+        let service = crate::authorization::AuthorizationService::new();
+        let action = ResourceAction::TaskReadOperator;
+        let gate = service.authorize_action(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            action,
+        );
+        match gate {
+            crate::authorization::ActionGateDecision::AllowAbsolute => true,
+            crate::authorization::ActionGateDecision::Deny { .. } => false,
+            crate::authorization::ActionGateDecision::RequireResource { .. } => {
+                let Some(task_id) = task_id else {
+                    return false;
+                };
+                matches!(
+                    crate::authorization::AuthorizationResolver::new(
+                        self.crud_store.as_ref().clone(),
+                    )
+                    .authorize_task(
+                        request_context.principal(),
+                        &gate,
+                        action,
+                        task_id,
+                        workspace_id,
+                        None,
+                    )
+                    .await,
+                    Ok(crate::authorization::ProofResolution::Authorized(_))
+                )
+            }
+        }
+    }
+
     async fn task_root_access_filter(
         &self,
         request_context: &RequestContext,
         workspace_id: &str,
     ) -> anyhow::Result<Option<pioneer_crud::TaskRootAccessFilter>> {
-        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User {
+        if !Self::uses_scoped_task_policy(request_context) {
             return Ok(None);
         }
         let threads = pioneer_crud::list_accessible_threads_for_principal(
@@ -208,9 +350,15 @@ impl MessageProcessor {
     fn task_mutation_context(
         request_context: &RequestContext,
     ) -> pioneer_tasks::TaskMutationContext {
-        pioneer_tasks::TaskMutationContext::user(
+        let mut context = pioneer_tasks::TaskMutationContext::user(
             request_context.principal().principal_id.to_string(),
-        )
+        );
+        context.task_resource_budget = crate::authorization::AuthorizationService::new()
+            .task_resource_budget(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
+            );
+        context
     }
 
     pub(crate) async fn task_create_context_for_params(
@@ -318,13 +466,31 @@ impl MessageProcessor {
         mut params: TaskCreateParams,
     ) {
         let connection_id = request_context.connection_id();
-        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+        if crate::authorization::AuthorizationService::new().runtime_principal_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration)
+        {
+            // `System` tasks execute with Gateway-owned authority and therefore
+            // are not a user-selectable escape hatch around execution admission.
+            // Collaborative principals create Agent tasks; trusted internal
+            // services may still create System tasks through the typed service
+            // boundary.
+            if params.executor_kind != pioneer_protocol::TaskExecutorKind::Agent {
+                self.send_error(
+                    connection_id,
+                    crate::authorization::AuthorizationExternalError::Forbidden
+                        .response(request_id),
+                )
+                .await;
+                return;
+            }
             let Some(authorized_thread) = authorized_thread else {
                 self.send_error(
                     connection_id,
                     task_authorization_unavailable(
                         request_id,
-                        ResourceAction::TaskRun,
+                        ResourceAction::TaskCreate,
                         "thread",
                         "execution",
                     ),
@@ -332,7 +498,7 @@ impl MessageProcessor {
                 .await;
                 return;
             };
-            if authorized_thread.action() != ResourceAction::TaskRun {
+            if authorized_thread.action() != ResourceAction::TaskCreate {
                 self.send_error(
                     connection_id,
                     crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
@@ -355,9 +521,11 @@ impl MessageProcessor {
                     Ok(_) => {
                         self.send_error(
                             connection_id,
-                            JsonRpcErrorResponse::new(
+                            crate::public_error::agent_rpc_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
+                                pioneer_protocol::PublicErrorCode::NotFound,
+                                pioneer_protocol::PublicErrorStage::Admission,
                                 "task creator turn does not belong to the authorized initiating thread",
                             ),
                         )
@@ -369,7 +537,7 @@ impl MessageProcessor {
                             connection_id,
                             task_authorization_unavailable(
                                 request_id,
-                                ResourceAction::TaskRun,
+                                ResourceAction::TaskCreate,
                                 "turn",
                                 "execution",
                             ),
@@ -380,7 +548,7 @@ impl MessageProcessor {
                 }
             }
             if !self
-                .require_member_task_delivery_policy(
+                .require_scoped_task_delivery_policy(
                     request_context,
                     &request_id,
                     authorized_thread.workspace_id(),
@@ -391,14 +559,177 @@ impl MessageProcessor {
                 return;
             }
         }
+        let mut task_execution_admission = None;
+        if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent {
+            let Some(root_thread_id) = authorized_thread
+                .map(|proof| proof.thread_id())
+                .or(params.created_by_thread_id.as_deref())
+            else {
+                self.send_error(
+                    connection_id,
+                    crate::public_error::agent_rpc_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorCode::InvalidInput,
+                        pioneer_protocol::PublicErrorStage::Admission,
+                        "agent task requires an exact initiating thread",
+                    ),
+                )
+                .await;
+                return;
+            };
+            let root_thread = match self.crud_store.get_thread_by_id(root_thread_id).await {
+                Ok(Some(thread)) if thread.workspace_id == params.workspace_id => thread,
+                Ok(_) => {
+                    self.send_error(
+                        connection_id,
+                        crate::authorization::AuthorizationExternalError::NotFound
+                            .response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        task_authorization_unavailable(
+                            request_id,
+                            ResourceAction::TaskCreate,
+                            "thread",
+                            "execution",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let mut execution_request =
+                match crate::authorization::ExecutionAdmissionRequest::for_task(
+                    &params,
+                    root_thread_id,
+                    root_thread.model_provider.as_str(),
+                    root_thread.model.as_str(),
+                    None,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            crate::public_error::agent_rpc_error(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                pioneer_protocol::PublicErrorCode::InvalidInput,
+                                pioneer_protocol::PublicErrorStage::Admission,
+                                format!("invalid task execution intent: {error}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            if !matches!(
+                execution_request.execution_backend,
+                Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
+                    | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. })
+            ) {
+                execution_request.provider_authority_fingerprint = Some(
+                    self.provider_registry
+                        .authority_fingerprint_for_workspace(
+                            params.workspace_id.as_str(),
+                            execution_request.provider.as_str(),
+                        )
+                        .as_str()
+                        .to_owned(),
+                );
+            }
+            let policy_revision = match self.authorization_invalidation_hub.current_revision().await
+            {
+                Ok(revision) => revision,
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        task_authorization_unavailable(
+                            request_id,
+                            ResourceAction::TaskCreate,
+                            "execution_intent",
+                            "execution",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let requested_permission_cap = params
+                .agent_spec
+                .as_ref()
+                .and_then(|spec| spec.permission_cap.as_ref());
+            let admitted_context = match crate::authorization::ExecutionAdmissionService::new(
+                self.crud_store.as_ref().clone(),
+            )
+            .admit_context(
+                request_context.principal(),
+                policy_revision,
+                &execution_request,
+                requested_permission_cap,
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        crate::authorization::AuthorizationExternalError::Forbidden
+                            .response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let authorization_context_json = match admitted_context.to_persisted_json() {
+                Ok(json) => json,
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        task_authorization_unavailable(
+                            request_id,
+                            ResourceAction::TaskCreate,
+                            "execution_intent",
+                            "persistence",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            task_execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
+                workspace_id: admitted_context.workspace_id().to_owned(),
+                root_thread_id: admitted_context.root_thread_id().to_owned(),
+                initiating_principal_id: admitted_context.initiating_principal_id().to_string(),
+                authorization_context_json,
+                role_key: admitted_context.role_key().to_owned(),
+                policy_fingerprint: admitted_context.policy_fingerprint().to_owned(),
+                execution_resources: crate::authorization::AuthorizationService::new()
+                    .execution_resource_policy(
+                        request_context.principal().kind,
+                        request_context.principal().role_key.as_ref(),
+                    )
+                    .expect("admitted Task role must have execution resources"),
+                task_resources: crate::authorization::AuthorizationService::new()
+                    .task_resource_budget(
+                        request_context.principal().kind,
+                        request_context.principal().role_key.as_ref(),
+                    )
+                    .expect("admitted Task role must have a Task resource budget"),
+            });
+        }
         let mut context = match self.task_create_context_for_params(&params).await {
             Ok(context) => context,
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Preparation,
                         format!("failed to freeze task context: {error:#}"),
                     ),
                 )
@@ -407,6 +738,30 @@ impl MessageProcessor {
             }
         };
         context.actor_id = Some(request_context.principal().principal_id.to_string());
+        context.execution_admission = task_execution_admission;
+        context.task_resource_budget = crate::authorization::AuthorizationService::new()
+            .task_resource_budget(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
+            );
+        if let Some(seed) = context.execution_admission.as_ref()
+            && self
+                .validate_task_execution_admission_seed(seed)
+                .await
+                .is_err()
+        {
+            self.send_error(
+                connection_id,
+                task_authorization_unavailable(
+                    request_id,
+                    ResourceAction::TaskCreate,
+                    "execution_intent",
+                    "durable_start",
+                ),
+            )
+            .await;
+            return;
+        }
         match message_future(self.task_runtime.service().create_task(context, params)).await {
             Ok(response_payload) => {
                 self.send_task_response(connection_id, request_id, &response_payload)
@@ -415,9 +770,9 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to create task: {error:#}"),
                     ),
                 )
@@ -434,7 +789,7 @@ impl MessageProcessor {
         params: TaskGetParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
@@ -445,18 +800,47 @@ impl MessageProcessor {
         {
             return;
         }
+        let Some(workspace_id) = authorized_task.map(|proof| proof.workspace_id()) else {
+            self.send_error(
+                request_context.connection_id(),
+                task_authorization_unavailable(
+                    request_id,
+                    ResourceAction::TaskRead,
+                    "task",
+                    "observation",
+                ),
+            )
+            .await;
+            return;
+        };
+        let Some(observation) = self
+            .acquire_task_observation_page(request_context, &request_id, workspace_id)
+            .await
+        else {
+            return;
+        };
         let connection_id = request_context.connection_id();
-        match self.task_runtime.service().get_task(params).await {
+        let operator_allowed = self
+            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .await;
+        match self
+            .task_runtime
+            .service()
+            .get_task_with_budget(params, observation.budget)
+            .await
+        {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
+                let projected =
+                    crate::task_projection::project_task_get(&response_payload, operator_allowed);
+                self.send_task_response(connection_id, request_id, &projected)
                     .await
             }
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to get task: {error:#}"),
                     ),
                 )
@@ -472,6 +856,16 @@ impl MessageProcessor {
         params: TaskListParams,
     ) {
         let connection_id = request_context.connection_id();
+        let Some(observation) = self
+            .acquire_task_observation_page(
+                request_context,
+                &request_id,
+                params.workspace_id.as_str(),
+            )
+            .await
+        else {
+            return;
+        };
         let access = match self
             .task_root_access_filter(request_context, params.workspace_id.as_str())
             .await
@@ -495,22 +889,28 @@ impl MessageProcessor {
             Some(access) => {
                 self.task_runtime
                     .service()
-                    .list_tasks_scoped(params, access)
+                    .list_tasks_scoped_with_budget(params, access, observation.budget)
                     .await
             }
-            None => self.task_runtime.service().list_tasks(params).await,
+            None => {
+                self.task_runtime
+                    .service()
+                    .list_tasks_with_budget(params, observation.budget)
+                    .await
+            }
         };
         match response {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
+                let projected = crate::task_projection::project_task_list(&response_payload);
+                self.send_task_response(connection_id, request_id, &projected)
                     .await
             }
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to list tasks: {error:#}"),
                     ),
                 )
@@ -527,7 +927,7 @@ impl MessageProcessor {
         params: TaskTreeTaskParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
@@ -538,18 +938,47 @@ impl MessageProcessor {
         {
             return;
         }
+        let Some(workspace_id) = authorized_task.map(|proof| proof.workspace_id()) else {
+            self.send_error(
+                request_context.connection_id(),
+                task_authorization_unavailable(
+                    request_id,
+                    ResourceAction::TaskRead,
+                    "task",
+                    "observation",
+                ),
+            )
+            .await;
+            return;
+        };
+        let Some(observation) = self
+            .acquire_task_observation_page(request_context, &request_id, workspace_id)
+            .await
+        else {
+            return;
+        };
         let connection_id = request_context.connection_id();
-        match self.task_runtime.service().get_task_tree(params).await {
+        let operator_allowed = self
+            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .await;
+        match self
+            .task_runtime
+            .service()
+            .get_task_tree_with_budget(params, observation.budget)
+            .await
+        {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
+                let projected =
+                    crate::task_projection::project_task_tree(&response_payload, operator_allowed);
+                self.send_task_response(connection_id, request_id, &projected)
                     .await
             }
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to get task tree: {error:#}"),
                     ),
                 )
@@ -566,7 +995,7 @@ impl MessageProcessor {
         params: TaskEventsParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
@@ -577,18 +1006,49 @@ impl MessageProcessor {
         {
             return;
         }
+        let Some(workspace_id) = authorized_task.map(|proof| proof.workspace_id()) else {
+            self.send_error(
+                request_context.connection_id(),
+                task_authorization_unavailable(
+                    request_id,
+                    ResourceAction::TaskRead,
+                    "task",
+                    "observation",
+                ),
+            )
+            .await;
+            return;
+        };
+        let Some(observation) = self
+            .acquire_task_observation_page(request_context, &request_id, workspace_id)
+            .await
+        else {
+            return;
+        };
         let connection_id = request_context.connection_id();
-        match self.task_runtime.service().get_task_events(params).await {
+        let operator_allowed = self
+            .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
+            .await;
+        match self
+            .task_runtime
+            .service()
+            .get_task_events_with_budget(params, observation.budget)
+            .await
+        {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
+                let projected = crate::task_projection::project_task_events(
+                    &response_payload,
+                    operator_allowed,
+                );
+                self.send_task_response(connection_id, request_id, &projected)
                     .await
             }
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to get task events: {error:#}"),
                     ),
                 )
@@ -605,7 +1065,7 @@ impl MessageProcessor {
         params: TaskWaitParams,
     ) {
         if !self
-            .require_member_task_batch_proof(
+            .require_scoped_task_batch_proof(
                 request_context,
                 &request_id,
                 authorized_tasks,
@@ -617,22 +1077,31 @@ impl MessageProcessor {
             return;
         }
         let connection_id = request_context.connection_id();
+        let wait_context = pioneer_tasks::TaskWaitContext {
+            actor_id: Some(request_context.principal().principal_id.to_string()),
+            task_resource_budget: crate::authorization::AuthorizationService::new()
+                .task_resource_budget(
+                    request_context.principal().kind,
+                    request_context.principal().role_key.as_ref(),
+                ),
+        };
         match self
             .task_runtime
             .service()
-            .wait_tasks(pioneer_tasks::TaskWaitContext::default(), params)
+            .wait_tasks(wait_context, params)
             .await
         {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
+                let projected = crate::task_projection::project_task_wait(&response_payload);
+                self.send_task_response(connection_id, request_id, &projected)
                     .await
             }
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to wait for task: {error:#}"),
                     ),
                 )
@@ -649,12 +1118,12 @@ impl MessageProcessor {
         params: TaskAcceptParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
                 params.task_id.as_str(),
-                ResourceAction::TaskManage,
+                ResourceAction::TaskReview,
             )
             .await
         {
@@ -676,9 +1145,9 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to accept task result: {error:#}"),
                     ),
                 )
@@ -695,12 +1164,12 @@ impl MessageProcessor {
         params: TaskReviseParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
                 params.task_id.as_str(),
-                ResourceAction::TaskManage,
+                ResourceAction::TaskReview,
             )
             .await
         {
@@ -734,9 +1203,9 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to revise task result: {error:#}"),
                     ),
                 )
@@ -753,12 +1222,12 @@ impl MessageProcessor {
         params: TaskCancelParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
                 params.task_id.as_str(),
-                ResourceAction::TaskManage,
+                ResourceAction::TaskCancel,
             )
             .await
         {
@@ -779,9 +1248,9 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to cancel task: {error:#}"),
                     ),
                 )
@@ -798,12 +1267,12 @@ impl MessageProcessor {
         params: TaskDetachParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
                 params.task_id.as_str(),
-                ResourceAction::TaskManage,
+                ResourceAction::TaskDetach,
             )
             .await
         {
@@ -824,9 +1293,9 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to detach task: {error:#}"),
                     ),
                 )
@@ -843,12 +1312,12 @@ impl MessageProcessor {
         params: TaskRescheduleParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
                 params.task_id.as_str(),
-                ResourceAction::TaskManage,
+                ResourceAction::TaskScheduleManage,
             )
             .await
         {
@@ -869,9 +1338,9 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to reschedule task: {error:#}"),
                     ),
                 )
@@ -888,12 +1357,12 @@ impl MessageProcessor {
         params: TaskPauseParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
                 params.task_id.as_str(),
-                ResourceAction::TaskManage,
+                ResourceAction::TaskScheduleManage,
             )
             .await
         {
@@ -914,9 +1383,9 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to pause task: {error:#}"),
                     ),
                 )
@@ -933,12 +1402,12 @@ impl MessageProcessor {
         params: TaskResumeParams,
     ) {
         if !self
-            .require_member_task_proof(
+            .require_scoped_task_proof(
                 request_context,
                 &request_id,
                 authorized_task,
                 params.task_id.as_str(),
-                ResourceAction::TaskManage,
+                ResourceAction::TaskScheduleManage,
             )
             .await
         {
@@ -959,9 +1428,9 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
                         format!("failed to resume task: {error:#}"),
                     ),
                 )
@@ -977,6 +1446,16 @@ impl MessageProcessor {
         params: TaskAgendaParams,
     ) {
         let connection_id = request_context.connection_id();
+        let Some(observation) = self
+            .acquire_task_observation_page(
+                request_context,
+                &request_id,
+                params.workspace_id.as_str(),
+            )
+            .await
+        else {
+            return;
+        };
         let access = match self
             .task_root_access_filter(request_context, params.workspace_id.as_str())
             .await
@@ -998,26 +1477,34 @@ impl MessageProcessor {
         };
         let response = match access.as_ref() {
             Some(access) => {
+                message_future(self.task_runtime.service().list_agenda_scoped_with_budget(
+                    params,
+                    access,
+                    observation.budget,
+                ))
+                .await
+            }
+            None => {
                 message_future(
                     self.task_runtime
                         .service()
-                        .list_agenda_scoped(params, access),
+                        .list_agenda_with_budget(params, observation.budget),
                 )
                 .await
             }
-            None => message_future(self.task_runtime.service().list_agenda(params)).await,
         };
         match response {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
+                let projected = crate::task_projection::project_task_agenda(&response_payload);
+                self.send_task_response(connection_id, request_id, &projected)
                     .await
             }
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to list task agenda: {error:#}"),
                     ),
                 )
@@ -1033,6 +1520,25 @@ impl MessageProcessor {
         params: TaskDeliveriesParams,
     ) {
         let connection_id = request_context.connection_id();
+        let Some(observation) = self
+            .acquire_task_observation_page(
+                request_context,
+                &request_id,
+                params.workspace_id.as_str(),
+            )
+            .await
+        else {
+            return;
+        };
+        let operator_task_id = params.task_id.clone();
+        let operator_workspace_id = params.workspace_id.clone();
+        let operator_allowed = self
+            .task_operator_projection_allowed(
+                request_context,
+                operator_task_id.as_deref(),
+                Some(operator_workspace_id.as_str()),
+            )
+            .await;
         let access = match self
             .task_root_access_filter(request_context, params.workspace_id.as_str())
             .await
@@ -1056,22 +1562,31 @@ impl MessageProcessor {
             Some(access) => {
                 self.task_runtime
                     .service()
-                    .list_deliveries_scoped(params, access)
+                    .list_deliveries_scoped_with_budget(params, access, observation.budget)
                     .await
             }
-            None => self.task_runtime.service().list_deliveries(params).await,
+            None => {
+                self.task_runtime
+                    .service()
+                    .list_deliveries_with_budget(params, observation.budget)
+                    .await
+            }
         };
         match response {
             Ok(response_payload) => {
-                self.send_task_response(connection_id, request_id, &response_payload)
+                let projected = crate::task_projection::project_task_deliveries(
+                    &response_payload,
+                    operator_allowed,
+                );
+                self.send_task_response(connection_id, request_id, &projected)
                     .await
             }
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    task_public_error(
                         Some(request_id),
-                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Observation,
                         format!("failed to list task deliveries: {error:#}"),
                     ),
                 )
@@ -1092,10 +1607,10 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        task_public_error(
                             None,
-                            INVALID_REQUEST_CODE,
-                            format!("failed to encode response: {error}"),
+                            pioneer_protocol::PublicErrorStage::Delivery,
+                            format!("failed to encode task response: {error}"),
                         ),
                     )
                     .await;

@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorizationOperationalResourceProjection",
+  "type": "object",
+  "properties": {
+    "cli_models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AuthorizationCliModelGrant"
+      }
+    },
+    "cli_models_all": {
+      "description": "Same contract as `provider_models_all`, scoped to allowed CLI runtimes.",
+      "type": "boolean"
+    },
+    "cli_runtimes": {
+      "$ref": "#/$defs/AuthorizationResourceSelector"
+    },
+    "fingerprint": {
+      "description": "Opaque receipt over role policy, workspace and authorization revision.",
+      "type": "string"
+    },
+    "mcp_servers": {
+      "$ref": "#/$defs/AuthorizationResourceSelector"
+    },
+    "provider_models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AuthorizationProviderModelGrant"
+      }
+    },
+    "provider_models_all": {
+      "description": "`true` means every model of an allowed provider; `false` means the\nexact grants below. The flag preserves the distinction between an\nunrestricted model set and an intentionally empty one.",
+      "type": "boolean"
+    },
+    "providers": {
+      "$ref": "#/$defs/AuthorizationResourceSelector"
+    },
+    "skills": {
+      "$ref": "#/$defs/AuthorizationResourceSelector"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "fingerprint",
+    "providers",
+    "provider_models_all",
+    "cli_runtimes",
+    "cli_models_all",
+    "skills",
+    "mcp_servers"
+  ],
+  "$defs": {
+    "AuthorizationCliModelGrant": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "runtime_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "runtime_id",
+        "model"
+      ]
+    },
+    "AuthorizationProviderModelGrant": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
+    "AuthorizationResourceSelector": {
+      "description": "Role-scoped constraints used by discovery and exact admission. `all=true`\nmeans every operationally enabled resource of that kind; otherwise only\nthe listed stable identifiers are visible and usable.",
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "boolean"
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "all"
+      ]
+    }
+  }
+}

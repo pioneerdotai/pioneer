@@ -19,6 +19,7 @@ mod member;
 mod memory;
 mod notification;
 mod provider;
+mod public_error;
 mod schema;
 mod settings;
 mod skills;
@@ -34,7 +35,10 @@ mod voice;
 pub mod voice_contract;
 mod workspace;
 
-pub use access::{AccessChangeKind, AccessChangedNotification};
+pub use access::{
+    AccessChangeKind, AccessChangeOutcome, AccessChangedNotification, AuthorizationChangeKind,
+    AuthorizationChangeScope, AuthorizationProjectionChangedNotification, PolicyGeneration,
+};
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ProgressCoalescingKey,
     ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
@@ -84,10 +88,15 @@ pub use auth::{
     normalize_device_activation_code, normalize_device_activation_code_input,
 };
 pub use authorization::{
-    AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AuthorizationCapabilitiesParams,
-    AuthorizationCapabilitySnapshot, AuthorizationGlobalCapabilities,
+    AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AuthorizationAgentPermissionOption,
+    AuthorizationCapabilitiesParams, AuthorizationCapabilitySnapshot, AuthorizationCliModelGrant,
+    AuthorizationExecutionDraftPolicyProjection, AuthorizationExecutionResourceLimits,
+    AuthorizationGlobalCapabilities, AuthorizationInvitationRoleOption,
+    AuthorizationOperationalResourceProjection, AuthorizationPermissionLock,
+    AuthorizationProviderModelGrant, AuthorizationResourceSelector, AuthorizationRolePresentation,
     AuthorizationThreadCapabilities, AuthorizationThreadCapabilitySnapshot,
     AuthorizationWorkspaceCapabilities, AuthorizationWorkspaceCapabilitySnapshot,
+    McpInvocationResourceLimits,
 };
 pub use cli_runtime::{
     CLIRuntimeAccountUpdatedNotification, CLIRuntimeAppsChangedNotification, CLIRuntimeGetParams,
@@ -103,13 +112,13 @@ pub use cli_runtime::{
     CLIRuntimeReviewStartResponse, CLIRuntimeReviewTarget, CLIRuntimeStatusChangedNotification,
     CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBinding,
     CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
-    CLIRuntimeThreadCompactParams, CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams,
-    CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
-    CliMcpAdapterReadiness, CliMcpInjectionKind, CliMcpProjectionUpdateKind,
-    RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS, RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot,
-    RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
-    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, sanitize_runtime_diagnostic_line,
-    sanitize_runtime_diagnostic_lines,
+    CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams,
+    CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
+    CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, CliMcpAdapterReadiness,
+    CliMcpInjectionKind, CliMcpProjectionUpdateKind, RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS,
+    RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot, RuntimeAppInfo, RuntimeCapabilities,
+    RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
+    sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };
 pub use gateway_endpoint::{
     DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError, GatewayTransportSecurity,
@@ -124,8 +133,8 @@ pub use id::{
     TokenFamilyId, WorkspaceId, generate_id,
 };
 pub use identity::{
-    BUILT_IN_USER_ROLE_KEYS, MEMBER_ROLE_KEY, PersistedActorRef, PrincipalKind, PrincipalStatus,
-    ROLE_KEY_MAX_LEN, RoleKey, RoleKeyError, SUPERUSER_CAPABILITY_ROLE_KEY,
+    MEMBER_ROLE_KEY, PersistedActorRef, PrincipalKind, PrincipalStatus, ROLE_KEY_MAX_LEN, RoleKey,
+    RoleKeyError, SUPERUSER_CAPABILITY_ROLE_KEY,
 };
 pub use invitation::{
     INVITATION_CREDENTIAL_BODY_LEN, INVITATION_CREDENTIAL_ENTROPY_BYTES,
@@ -154,12 +163,12 @@ pub use mcp::{
     McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
     McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
     McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
-    McpListResponse, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
-    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
-    McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification, McpServerCatalogDetails,
-    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
-    McpServerRestartParams, McpServerRestartResponse, McpServerStatus,
-    McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
+    McpListResponse, McpManagementDetails, McpPolicySetParams, McpPolicySetResponse,
+    McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem,
+    McpRuntimeState, McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification,
+    McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
+    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
+    McpServerStatus, McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic,
 };
@@ -209,6 +218,7 @@ pub use provider::{
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
     ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata, ReasoningCapabilitySource,
 };
+pub use public_error::{PUBLIC_ERROR_VERSION, PublicError, PublicErrorCode, PublicErrorStage};
 pub use settings::{
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
@@ -246,6 +256,12 @@ pub use skills::{
 };
 pub use system_assets::PIONEER_AGENT_AVATAR_REVISION;
 pub use task::{
+    PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse, PublicTaskArtifact,
+    PublicTaskDeliveriesResponse, PublicTaskDelivery, PublicTaskDeliveryAttempt,
+    PublicTaskDependency, PublicTaskEvent, PublicTaskEventsResponse, PublicTaskFailure,
+    PublicTaskGetResponse, PublicTaskListResponse, PublicTaskResult, PublicTaskResultCandidate,
+    PublicTaskRun, PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger, PublicTaskWaitItem,
+    PublicTaskWaitNonWaitableItem, PublicTaskWaitResponse, PublicTaskWaitReviewItem,
     TASK_COMPOSER_WORK_VERSION, Task, TaskAcceptParams, TaskAcceptResponse, TaskAgendaItem,
     TaskAgendaParams, TaskAgendaResponse, TaskAgentContext, TaskAgentContextMode,
     TaskAgentContextPolicy, TaskAgentInput, TaskAgentInputAttachment, TaskAgentInputAttachmentKind,
@@ -265,26 +281,29 @@ pub use task::{
     TaskError, TaskErrorClass, TaskEvent, TaskEventPayload, TaskEventsParams, TaskEventsResponse,
     TaskExecutorKind, TaskExternalTriggerFilter, TaskFailedNotification, TaskGetParams,
     TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskListResponse, TaskManualActor,
-    TaskMetadata, TaskNotificationContext, TaskOwnerKind, TaskParentTerminalAction,
-    TaskPauseParams, TaskPauseResponse, TaskPausedNotification, TaskProgressDetails,
-    TaskProgressNotification, TaskQueuedNotification, TaskRecoveredNotification,
-    TaskRescheduleParams, TaskRescheduleReason, TaskRescheduleResponse,
-    TaskRescheduledNotification, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
-    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResultReviewerSpec,
-    TaskResumeParams, TaskResumeResponse, TaskResumedNotification, TaskRetryBackoffKind,
-    TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunCompletedNotification,
-    TaskRunCreatedNotification, TaskRunExecution, TaskRunExecutionStatus,
-    TaskRunFailedNotification, TaskRunStartedNotification, TaskRunStatus, TaskRunThreadBinding,
-    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus,
-    TaskScheduledNotification, TaskSchema, TaskStatus, TaskThreadLineage, TaskTimeoutPolicy,
-    TaskTree, TaskTreeChangedNotification, TaskTreeParams, TaskTreeResponse, TaskTrigger,
-    TaskTriggerCatchUpMode, TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind,
-    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse,
-    TaskUpdatedNotification, TaskValue, TaskWaitItem, TaskWaitMode, TaskWaitNonWaitableItem,
-    TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse, TaskWaitReviewAction,
-    TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock, TaskWriteLockConflict,
-    TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadLineage,
+    TaskMetadata, TaskNotificationContext, TaskOperatorDeliveries, TaskOperatorDetails,
+    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse,
+    TaskPausedNotification, TaskProgressDetails, TaskProgressNotification, TaskQueuedNotification,
+    TaskRecoveredNotification, TaskRescheduleParams, TaskRescheduleReason, TaskRescheduleResponse,
+    TaskRescheduledNotification, TaskResourceBudget, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+    TaskResultReviewEventKind, TaskResultReviewResolutionStrategy, TaskResultReviewerKind,
+    TaskResultReviewerSpec, TaskResumeParams, TaskResumeResponse, TaskResumedNotification,
+    TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
+    TaskRunCompletedNotification, TaskRunCreatedNotification, TaskRunExecution,
+    TaskRunExecutionStatus, TaskRunFailedNotification, TaskRunStartedNotification, TaskRunStatus,
+    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskScheduledNotification, TaskSchema, TaskStatus, TaskThreadLineage,
+    TaskTimeoutPolicy, TaskTree, TaskTreeChangedNotification, TaskTreeParams, TaskTreeResponse,
+    TaskTrigger, TaskTriggerCatchUpMode, TaskTriggerCatchUpPolicy, TaskTriggerInput,
+    TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskUpdateParams,
+    TaskUpdateResponse, TaskUpdatedNotification, TaskUserNotification,
+    TaskUserNotificationAcknowledgeParams, TaskUserNotificationAcknowledgeResponse,
+    TaskUserNotificationDeliveredNotification, TaskUserNotificationListParams,
+    TaskUserNotificationListResponse, TaskValue, TaskWaitItem, TaskWaitMode,
+    TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse,
+    TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock,
+    TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadLineage,
     task_delivery_id_from_result_item_id, task_delivery_result_item_id,
 };
 pub use thread::{
@@ -351,8 +370,12 @@ pub use turn::{
     ProviderTransportKind, ReasoningEffort, RecoveryAction, RecoveryJobStatus,
     RecoveryOutputPolicy, RecoveryTrigger, SandboxBackendKind, SandboxBackendRequirement,
     StaticStrictObligationCollector, StorageOutputPolicy, StrictObligationCollector,
-    SystemEventLevel, TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
-    TURN_MESSAGE_INPUT_MAX_BYTES, TURN_MESSAGE_INPUT_MAX_ITEMS, TURN_MESSAGE_MENTION_MAX_COUNT,
+    SystemEventLevel, TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT,
+    TURN_EXECUTION_CAPABILITY_MAX_COUNT, TURN_EXECUTION_INPUT_MAX_BYTES,
+    TURN_EXECUTION_INPUT_MAX_ITEMS, TURN_EXECUTION_MENTION_MAX_COUNT,
+    TURN_EXECUTION_REQUEST_MAX_BYTES, TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
+    TURN_EXECUTION_TEXT_ELEMENT_MAX_COUNT, TURN_MESSAGE_INPUT_MAX_BYTES,
+    TURN_MESSAGE_INPUT_MAX_ITEMS, TURN_MESSAGE_MENTION_MAX_COUNT,
     TURN_MESSAGE_REVISION_CURSOR_MAX_BYTES, TURN_MESSAGE_REVISION_PAGE_DEFAULT_LIMIT,
     TURN_MESSAGE_REVISION_PAGE_MAX_LIMIT, TextElement, ThreadReadCursor,
     ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadResponse, TimelineLane,
@@ -398,7 +421,7 @@ pub use turn::{
     collect_execution_checkpoint_strict_obligations, mcp_server_capability_key,
     mcp_tool_capability_key, normalize_metadata_reasoning_effort, reasoning_effort_comparison_key,
     resolve_turn_permission_profile, skill_capability_key, skill_pack_capability_key,
-    validate_turn_message_content,
+    validate_turn_execution_envelope, validate_turn_message_content,
 };
 pub use turn_permissions::{
     compile_turn_permission_profile, composer_turn_permission_profile_snapshot,

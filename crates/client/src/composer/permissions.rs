@@ -1,6 +1,8 @@
 //! Shared composer permission-mode state.
 
-use pioneer_protocol::{TurnPermissionMode, TurnPermissionProfileSelection};
+use pioneer_protocol::{
+    AuthorizationAgentPermissionOption, TurnPermissionMode, TurnPermissionProfileSelection,
+};
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -16,39 +18,40 @@ pub fn default_composer_permission_mode() -> TurnPermissionMode {
     TurnPermissionMode::FullAccess
 }
 
-pub fn composer_permission_mode_options() -> [ComposerPermissionModeOption; 3] {
-    [
-        ComposerPermissionModeOption {
-            mode: TurnPermissionMode::FullAccess,
-            label: "Full access".to_owned(),
-            description: "Allow commands and edits without prompts.".to_owned(),
-        },
-        ComposerPermissionModeOption {
-            mode: TurnPermissionMode::AutoAcceptEdits,
-            label: "Auto-accept edits".to_owned(),
-            description: "Auto-approve edits, ask before other actions.".to_owned(),
-        },
-        ComposerPermissionModeOption {
-            mode: TurnPermissionMode::Supervised,
-            label: "Supervised".to_owned(),
-            description: "Ask before commands and file changes.".to_owned(),
-        },
-    ]
-}
-
-pub fn composer_permission_mode_option(mode: TurnPermissionMode) -> ComposerPermissionModeOption {
-    composer_permission_mode_options()
-        .into_iter()
-        .find(|option| option.mode == mode)
-        .unwrap_or(ComposerPermissionModeOption {
-            mode,
-            label: "Full access".to_owned(),
-            description: "Allow commands and edits without prompts.".to_owned(),
+/// Project the Gateway-owned permission presets without deriving policy from
+/// a role name. The Gateway still revalidates the selected mode and immutable
+/// execution ceiling when a turn starts.
+pub fn authorized_composer_permission_mode_options(
+    options: &[AuthorizationAgentPermissionOption],
+) -> Vec<ComposerPermissionModeOption> {
+    options
+        .iter()
+        .map(|option| ComposerPermissionModeOption {
+            mode: option.mode,
+            label: option.label.clone(),
+            description: option.description.clone(),
         })
+        .collect()
 }
 
 pub fn turn_permission_mode_display(mode: TurnPermissionMode) -> TurnPermissionModeDisplay {
-    composer_permission_mode_option(mode)
+    match mode {
+        TurnPermissionMode::FullAccess => ComposerPermissionModeOption {
+            mode,
+            label: "Full access".to_owned(),
+            description: "Allow commands and edits without prompts.".to_owned(),
+        },
+        TurnPermissionMode::AutoAcceptEdits => ComposerPermissionModeOption {
+            mode,
+            label: "Auto-accept edits".to_owned(),
+            description: "Auto-approve edits, ask before other actions.".to_owned(),
+        },
+        TurnPermissionMode::Supervised => ComposerPermissionModeOption {
+            mode,
+            label: "Supervised".to_owned(),
+            description: "Ask before commands and file changes.".to_owned(),
+        },
+    }
 }
 
 pub fn set_composer_permission_mode(
@@ -79,16 +82,6 @@ mod tests {
             default_composer_permission_mode(),
             TurnPermissionMode::FullAccess
         );
-    }
-
-    #[test]
-    fn permission_mode_options_match_product_modes() {
-        let options = composer_permission_mode_options();
-
-        assert_eq!(options.len(), 3);
-        assert_eq!(options[0].mode, TurnPermissionMode::FullAccess);
-        assert_eq!(options[1].mode, TurnPermissionMode::AutoAcceptEdits);
-        assert_eq!(options[2].mode, TurnPermissionMode::Supervised);
     }
 
     #[test]

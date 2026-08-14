@@ -6,7 +6,7 @@ use crate::{
     composer::model_selection::{
         self as composer_model_selection, ComposerModelSelection, ComposerModelSelectionCandidate,
     },
-    composer::permissions::{self as composer_permissions, ComposerPermissionModeOption},
+    composer::permissions as composer_permissions,
     conversation::{Conversation, state_machine::TurnFlowState},
     state::{
         client_state::{ClientState, ThreadAgentsDocSummaryKey, WorkspaceThreadState},
@@ -87,14 +87,6 @@ pub fn current_composer_permission_mode(
     selected_mode: Option<TurnPermissionMode>,
 ) -> TurnPermissionMode {
     selected_mode.unwrap_or_else(composer_permissions::default_composer_permission_mode)
-}
-
-pub fn composer_permission_mode_options() -> [ComposerPermissionModeOption; 3] {
-    composer_permissions::composer_permission_mode_options()
-}
-
-pub fn composer_permission_mode_option(mode: TurnPermissionMode) -> ComposerPermissionModeOption {
-    composer_permissions::composer_permission_mode_option(mode)
 }
 
 pub fn remembered_thread_for_workspace<'a>(
@@ -640,20 +632,6 @@ mod tests {
         assert_eq!(
             current_composer_permission_mode(Some(TurnPermissionMode::Supervised)),
             TurnPermissionMode::Supervised
-        );
-    }
-
-    #[test]
-    fn composer_permission_selector_exposes_display_metadata() {
-        let options = composer_permission_mode_options();
-
-        assert_eq!(options.len(), 3);
-        assert_eq!(options[0].mode, TurnPermissionMode::FullAccess);
-        assert_eq!(options[1].mode, TurnPermissionMode::AutoAcceptEdits);
-        assert_eq!(options[2].mode, TurnPermissionMode::Supervised);
-        assert_eq!(
-            composer_permission_mode_option(TurnPermissionMode::AutoAcceptEdits).label,
-            "Auto-accept edits"
         );
     }
 

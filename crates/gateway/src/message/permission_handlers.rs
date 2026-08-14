@@ -1,6 +1,24 @@
 use super::*;
 use crate::authorization::{AuthorizationExternalError, AuthorizedTurn};
 
+const NATIVE_HUMAN_INTERACTION_RUNTIME_ID: &str = "__native_permission__";
+const NATIVE_HUMAN_INTERACTION_RUNTIME_KIND: &str = "native";
+const NATIVE_HUMAN_INTERACTION_REQUEST_KIND: &str = "native_permission";
+
+fn public_permission_error(
+    request_id: Option<RequestId>,
+    jsonrpc_code: i64,
+    stage: pioneer_protocol::PublicErrorStage,
+    diagnostic: impl std::fmt::Display,
+) -> JsonRpcErrorResponse {
+    let public_code = if jsonrpc_code == INVALID_PARAMS_CODE {
+        pioneer_protocol::PublicErrorCode::InvalidInput
+    } else {
+        pioneer_protocol::PublicErrorCode::Internal
+    };
+    crate::public_error::agent_rpc_error(request_id, jsonrpc_code, public_code, stage, diagnostic)
+}
+
 impl MessageProcessor {
     pub(super) async fn open_native_permission_request(
         &self,
@@ -35,7 +53,7 @@ impl MessageProcessor {
                 workspace_id.as_str(),
                 thread_id.as_str(),
                 turn_id.as_str(),
-                crate::authorization::ResourceAction::ThreadWrite,
+                crate::authorization::ResourceAction::AgentRequestObserve,
             )
             .await
         {
@@ -46,7 +64,7 @@ impl MessageProcessor {
                     thread_id,
                     turn_id,
                     error = %format!("{error:#}"),
-                    "denied permission request without current initiating authority"
+                    "denied permission request without current collaboration observation authority"
                 );
                 let _ =
                     request
@@ -57,38 +75,6 @@ impl MessageProcessor {
                 return;
             }
         };
-        let session =
-            match pioneer_crud::load_session(
-                &self.crud_store.database_connection(),
-                authorization_context.initiating_session_id(),
-            )
-            .await
-            {
-                Ok(Some(session)) if session.refresh_generation >= 0 => session,
-                Ok(_) => {
-                    let _ = request.respond_to.send(
-                        pioneer_tools::PermissionApprovalResolution::Deny {
-                            message: "turn authorization is no longer active".to_owned(),
-                        },
-                    );
-                    return;
-                }
-                Err(error) => {
-                    warn!(
-                        workspace_id,
-                        thread_id,
-                        turn_id,
-                        error = %format!("{error:#}"),
-                        "failed to bind permission request to initiating session generation"
-                    );
-                    let _ = request.respond_to.send(
-                        pioneer_tools::PermissionApprovalResolution::Deny {
-                            message: "turn authorization is unavailable".to_owned(),
-                        },
-                    );
-                    return;
-                }
-            };
         let authorization_context_fingerprint =
             match authorization_context.authorization_fingerprint() {
                 Ok(fingerprint) => fingerprint,
@@ -125,16 +111,104 @@ impl MessageProcessor {
             summary: request.summary,
             details: request.details,
         };
-
+        let interaction_service = crate::human_interaction::HumanInteractionService::from_budget(
+            authorization_context.human_interaction_budget(),
+        );
+        if let Err(error) = interaction_service.validate_native_request(&protocol_request) {
+            warn!(
+                workspace_id,
+                thread_id,
+                turn_id,
+                request_id = protocol_request.request_id.as_str(),
+                error = %format!("{error:#}"),
+                "denied native permission request outside the human interaction budget"
+            );
+            let _ = request
+                .respond_to
+                .send(pioneer_tools::PermissionApprovalResolution::Deny {
+                    message: "permission request exceeds the interaction budget".to_owned(),
+                });
+            return;
+        }
         let initiating_principal_id = authorization_context.initiating_principal_id().clone();
         let initiating_session_id = authorization_context.initiating_session_id().clone();
+        let durable_request = CLIRuntimePendingRequest {
+            kind: CLIRuntimeRequestKind::Other,
+            title: Some("Tool permission requested".to_owned()),
+            message: protocol_request.summary.clone(),
+            native_request_id: Some(protocol_request.request_id.clone()),
+            payload: serde_json::to_value(&protocol_request).ok(),
+        };
+        let payload_json = match pioneer_crud::serialize_cli_runtime_json(&durable_request) {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to encode native permission request durably"
+                );
+                let _ =
+                    request
+                        .respond_to
+                        .send(pioneer_tools::PermissionApprovalResolution::Deny {
+                            message: "permission request could not be persisted".to_owned(),
+                        });
+                return;
+            }
+        };
+        let now = chrono::Utc::now().fixed_offset();
+        if let Err(error) = self
+            .crud_store
+            .open_native_human_interaction_request_with_authorization(
+                NewCliRuntimePendingRequest {
+                    request_id: protocol_request.request_id.clone(),
+                    runtime_id: NATIVE_HUMAN_INTERACTION_RUNTIME_ID.to_owned(),
+                    runtime_kind: NATIVE_HUMAN_INTERACTION_RUNTIME_KIND.to_owned(),
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn_id: Some(turn_id.clone()),
+                    native_thread_id: None,
+                    native_turn_id: None,
+                    native_item_id: None,
+                    request_kind: NATIVE_HUMAN_INTERACTION_REQUEST_KIND.to_owned(),
+                    payload_json,
+                    created_at: now,
+                    updated_at: now,
+                },
+                pioneer_crud::CliRuntimeRequestAuthorizationBinding {
+                    initiating_principal_id: initiating_principal_id.to_string(),
+                    initiating_session_id: initiating_session_id.to_string(),
+                    initiating_session_generation: 0,
+                    authorization_context_fingerprint: authorization_context_fingerprint.clone(),
+                },
+                interaction_service
+                    .budget()
+                    .max_pending_requests_per_execution,
+            )
+            .await
+        {
+            warn!(
+                workspace_id,
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                "failed to persist native permission request"
+            );
+            let _ = request
+                .respond_to
+                .send(pioneer_tools::PermissionApprovalResolution::Deny {
+                    message: "permission request could not be persisted".to_owned(),
+                });
+            return;
+        }
         let pending = PendingNativePermissionApprovalRequest {
             workspace_id: workspace_id.clone(),
             thread_id,
             turn_id,
             initiating_principal_id: initiating_principal_id.clone(),
             initiating_session_id: initiating_session_id.clone(),
-            initiating_session_generation: session.refresh_generation,
             authorization_context_fingerprint,
             request: protocol_request.clone(),
             respond_to: request.respond_to,
@@ -153,11 +227,9 @@ impl MessageProcessor {
 
         let notification_thread_id =
             native_permission_notification_thread_id(&protocol_request).to_owned();
-        self.send_execution_initiator_notification(
+        self.send_execution_collaborator_notification(
             notification_thread_id.as_str(),
-            initiating_principal_id.as_str(),
-            initiating_session_id.as_str(),
-            crate::authorization::ResourceAction::ThreadWrite,
+            crate::authorization::ResourceAction::AgentRequestObserve,
             events::TURN_PERMISSION_REQUEST_OPENED,
             &TurnPermissionRequestOpenedNotification {
                 request: protocol_request,
@@ -172,6 +244,67 @@ impl MessageProcessor {
         workspace_id: &str,
         thread_id: &str,
     ) {
+        let live_request_ids = self
+            .native_permission_pending_requests
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut after = None;
+        loop {
+            let orphaned = match self
+                .crud_store
+                .list_cli_runtime_pending_requests(
+                    pioneer_crud::CliRuntimePendingRequestListFilter {
+                        workspace_id: Some(workspace_id.to_owned()),
+                        runtime_id: Some(NATIVE_HUMAN_INTERACTION_RUNTIME_ID.to_owned()),
+                        open_only: true,
+                        after,
+                        limit: Some(pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(orphaned) => orphaned,
+                Err(error) => {
+                    warn!(
+                        workspace_id,
+                        error = %format!("{error:#}"),
+                        "failed to reconcile durable native human interactions during replay"
+                    );
+                    break;
+                }
+            };
+            let next = orphaned
+                .last()
+                .map(|record| (record.created_at, record.request_id.clone()));
+            for record in orphaned {
+                if live_request_ids.contains(record.request_id.as_str())
+                    || record.status != StoredCliRuntimePendingRequestStatus::Pending
+                {
+                    continue;
+                }
+                let resolution = TurnPermissionApprovalResolution::Expired;
+                let response_json = pioneer_crud::serialize_cli_runtime_json(&resolution).ok();
+                let now = chrono::Utc::now().fixed_offset();
+                let _ = self
+                    .crud_store
+                    .resolve_native_human_interaction_request(ResolveCliRuntimePendingRequest {
+                        request_id: record.request_id,
+                        status: StoredCliRuntimePendingRequestStatus::Expired,
+                        response_json,
+                        updated_at: now,
+                        resolved_at: now,
+                    })
+                    .await;
+            }
+            let Some(next) = next else {
+                break;
+            };
+            after = Some(next);
+        }
         let mut requests = self
             .native_permission_pending_requests
             .lock()
@@ -186,22 +319,14 @@ impl MessageProcessor {
                             .iter()
                             .any(|visible_thread_id| visible_thread_id == thread_id))
             })
-            .map(|pending| {
-                (
-                    pending.request.clone(),
-                    pending.initiating_principal_id.clone(),
-                    pending.initiating_session_id.clone(),
-                )
-            })
+            .map(|pending| pending.request.clone())
             .collect::<Vec<_>>();
-        requests.sort_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
+        requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
 
-        for (request, initiating_principal_id, initiating_session_id) in requests {
-            self.send_execution_initiator_notification_to_connections(
+        for request in requests {
+            self.send_execution_collaborator_notification_to_connections(
                 thread_id,
-                initiating_principal_id.as_str(),
-                initiating_session_id.as_str(),
-                crate::authorization::ResourceAction::ThreadWrite,
+                crate::authorization::ResourceAction::AgentRequestObserve,
                 events::TURN_PERMISSION_REQUEST_OPENED,
                 &TurnPermissionRequestOpenedNotification {
                     request: request.clone(),
@@ -217,11 +342,9 @@ impl MessageProcessor {
                 .get(request.request_id.as_str())
                 .is_some_and(|pending| pending.request == request);
             if !still_pending {
-                self.send_execution_initiator_notification_to_connections(
+                self.send_execution_collaborator_notification_to_connections(
                     thread_id,
-                    initiating_principal_id.as_str(),
-                    initiating_session_id.as_str(),
-                    crate::authorization::ResourceAction::ThreadWrite,
+                    crate::authorization::ResourceAction::AgentRequestObserve,
                     events::TURN_PERMISSION_REQUEST_RESOLVED,
                     &TurnPermissionRequestResolvedNotification {
                         request_id: request.request_id,
@@ -254,7 +377,6 @@ impl MessageProcessor {
                     pending.turn_id.clone(),
                     pending.initiating_principal_id.clone(),
                     pending.initiating_session_id.clone(),
-                    pending.initiating_session_generation,
                     pending.authorization_context_fingerprint.clone(),
                 )
             })
@@ -266,7 +388,6 @@ impl MessageProcessor {
             pending_turn_id,
             initiating_principal_id,
             initiating_session_id,
-            initiating_session_generation,
             authorization_context_fingerprint,
         )) = pending_identity
         else {
@@ -281,8 +402,6 @@ impl MessageProcessor {
         if authorization.workspace_id() != pending_workspace_id
             || authorization.thread_id() != pending_thread_id
             || authorization.turn_id() != pending_turn_id
-            || request_context.principal().principal_id != initiating_principal_id
-            || request_context.principal().session_id != initiating_session_id
         {
             self.send_error(
                 connection_id,
@@ -297,7 +416,7 @@ impl MessageProcessor {
                 pending_workspace_id.as_str(),
                 pending_thread_id.as_str(),
                 pending_turn_id.as_str(),
-                crate::authorization::ResourceAction::ThreadWrite,
+                crate::authorization::ResourceAction::AgentRequestRespond,
             )
             .await
         {
@@ -318,7 +437,6 @@ impl MessageProcessor {
                     &pending_turn_id,
                     &initiating_principal_id,
                     &initiating_session_id,
-                    initiating_session_generation,
                     authorization_context_fingerprint.as_str(),
                 )
                 .await;
@@ -330,34 +448,44 @@ impl MessageProcessor {
                 return;
             }
         };
-        let current_session = pioneer_crud::load_session(
-            &self.crud_store.database_connection(),
-            current_context.initiating_session_id(),
-        )
-        .await;
-        if !matches!(
-            current_session,
-            Ok(Some(session)) if session.refresh_generation == initiating_session_generation
-        ) {
-            self.expire_native_permission_request_after_authority_loss(
-                params.request_id.as_str(),
-                &pending_workspace_id,
-                &pending_thread_id,
-                &pending_turn_id,
-                &initiating_principal_id,
-                &initiating_session_id,
-                initiating_session_generation,
-                authorization_context_fingerprint.as_str(),
+        let approval_cap = current_context.approval_scope_cap();
+        let Some(responder_approval_cap) = crate::authorization::AuthorizationService::new()
+            .approval_scope_cap(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
             )
-            .await;
+        else {
             self.send_error(
                 connection_id,
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
             return;
+        };
+        let resolution_is_allowed = match &params.resolution {
+            TurnPermissionApprovalResolution::AllowOnce => {
+                approval_cap.allow_once && responder_approval_cap.allow_once
+            }
+            TurnPermissionApprovalResolution::AllowForTurn => {
+                approval_cap.allow_for_turn && responder_approval_cap.allow_for_turn
+            }
+            TurnPermissionApprovalResolution::Deny
+            | TurnPermissionApprovalResolution::Cancelled => true,
+            TurnPermissionApprovalResolution::Expired => false,
+        };
+        if !resolution_is_allowed {
+            self.send_error(
+                connection_id,
+                public_permission_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    pioneer_protocol::PublicErrorStage::Admission,
+                    "permission response scope exceeds the execution approval cap",
+                ),
+            )
+            .await;
+            return;
         }
-
         if let Some(connection_workspace_id) = self
             .session_manager
             .connection_workspace_id(connection_id)
@@ -372,6 +500,117 @@ impl MessageProcessor {
             return;
         }
 
+        let response_json = match pioneer_crud::serialize_cli_runtime_json(&params.resolution) {
+            Ok(response) => Some(response),
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    public_permission_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to encode native permission response: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let response_revision = match self.current_authorization_revision().await {
+            Ok(revision) => match i64::try_from(revision) {
+                Ok(revision) => revision,
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        public_permission_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorStage::Persistence,
+                            "authorization revision exceeds the durable interaction range",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    public_permission_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to load interaction policy generation: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let now = chrono::Utc::now().fixed_offset();
+        let accepted = match self
+            .crud_store
+            .accept_native_human_interaction_response(
+                pioneer_crud::AcceptCliRuntimePendingRequestResponse {
+                    request_id: params.request_id.clone(),
+                    response_json,
+                    responding_principal_id: request_context.principal().principal_id.to_string(),
+                    responding_session_id: request_context.principal().session_id.to_string(),
+                    response_authorization_revision: response_revision,
+                    response_contains_secret: false,
+                    updated_at: now,
+                },
+            )
+            .await
+        {
+            Ok(Some(accepted)) => accepted,
+            Ok(None) => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    public_permission_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to accept native permission response: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let delivering = match self
+            .crud_store
+            .transition_native_human_interaction_delivery(
+                pioneer_crud::TransitionCliRuntimePendingRequestDelivery {
+                    request_id: accepted.request_id.clone(),
+                    expected_status: StoredCliRuntimePendingRequestStatus::ResponseAccepted,
+                    status: StoredCliRuntimePendingRequestStatus::Delivering,
+                    delivery_error: None,
+                    updated_at: now,
+                    resolved_at: None,
+                },
+            )
+            .await
+        {
+            Ok(Some(delivering)) => delivering,
+            Ok(None) | Err(_) => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+
         let pending = {
             let mut requests = self.native_permission_pending_requests.lock().await;
             let unchanged = requests
@@ -382,7 +621,6 @@ impl MessageProcessor {
                         && pending.turn_id == pending_turn_id
                         && pending.initiating_principal_id == initiating_principal_id
                         && pending.initiating_session_id == initiating_session_id
-                        && pending.initiating_session_generation == initiating_session_generation
                         && pending.authorization_context_fingerprint
                             == authorization_context_fingerprint
                 });
@@ -391,6 +629,20 @@ impl MessageProcessor {
                 .flatten()
         };
         let Some(pending) = pending else {
+            let now = chrono::Utc::now().fixed_offset();
+            let _ = self
+                .crud_store
+                .transition_native_human_interaction_delivery(
+                    pioneer_crud::TransitionCliRuntimePendingRequestDelivery {
+                        request_id: delivering.request_id,
+                        expected_status: StoredCliRuntimePendingRequestStatus::Delivering,
+                        status: StoredCliRuntimePendingRequestStatus::Expired,
+                        delivery_error: Some("native response lane disappeared".to_owned()),
+                        updated_at: now,
+                        resolved_at: Some(now),
+                    },
+                )
+                .await;
             self.send_error(
                 connection_id,
                 AuthorizationExternalError::NotFound.response(request_id),
@@ -401,16 +653,71 @@ impl MessageProcessor {
 
         let notification_thread_id =
             native_permission_notification_thread_id(&pending.request).to_owned();
-        let notification_principal_id = pending.initiating_principal_id.clone();
-        let notification_session_id = pending.initiating_session_id.clone();
         let resolution = params.resolution;
-        let _ = pending
+        if pending
             .respond_to
-            .send(permission_approval_resolution_from_protocol(resolution));
+            .send(permission_approval_resolution_from_protocol(
+                resolution.clone(),
+            ))
+            .is_err()
+        {
+            let now = chrono::Utc::now().fixed_offset();
+            let _ = self
+                .crud_store
+                .transition_native_human_interaction_delivery(
+                    pioneer_crud::TransitionCliRuntimePendingRequestDelivery {
+                        request_id: delivering.request_id,
+                        expected_status: StoredCliRuntimePendingRequestStatus::Delivering,
+                        status: StoredCliRuntimePendingRequestStatus::Expired,
+                        delivery_error: Some("native response lane did not acknowledge".to_owned()),
+                        updated_at: now,
+                        resolved_at: Some(now),
+                    },
+                )
+                .await;
+            self.send_error(
+                connection_id,
+                public_permission_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Delivery,
+                    "native permission response lane is closed",
+                ),
+            )
+            .await;
+            return;
+        }
+        let now = chrono::Utc::now().fixed_offset();
+        let delivered = self
+            .crud_store
+            .transition_native_human_interaction_delivery(
+                pioneer_crud::TransitionCliRuntimePendingRequestDelivery {
+                    request_id: delivering.request_id,
+                    expected_status: StoredCliRuntimePendingRequestStatus::Delivering,
+                    status: StoredCliRuntimePendingRequestStatus::Resolved,
+                    delivery_error: None,
+                    updated_at: now,
+                    resolved_at: Some(now),
+                },
+            )
+            .await;
+        if !matches!(delivered, Ok(Some(_))) {
+            self.send_error(
+                connection_id,
+                public_permission_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Persistence,
+                    "native permission response was delivered but durable acknowledgement failed",
+                ),
+            )
+            .await;
+            return;
+        }
 
         let response = TurnPermissionRequestRespondResponse {
             request_id: params.request_id.clone(),
-            resolution,
+            resolution: resolution.clone(),
         };
         self.send_turn_permission_response(connection_id, request_id, &response)
             .await;
@@ -423,11 +730,9 @@ impl MessageProcessor {
             turn_id: pending.turn_id,
             resolution,
         };
-        self.send_execution_initiator_notification(
+        self.send_execution_collaborator_notification(
             notification_thread_id.as_str(),
-            notification_principal_id.as_str(),
-            notification_session_id.as_str(),
-            crate::authorization::ResourceAction::ThreadWrite,
+            crate::authorization::ResourceAction::AgentRequestObserve,
             events::TURN_PERMISSION_REQUEST_RESOLVED,
             &notification,
         )
@@ -447,11 +752,15 @@ impl MessageProcessor {
 
         let notification_thread_id =
             native_permission_notification_thread_id(&pending.request).to_owned();
-        let notification_principal_id = pending.initiating_principal_id.clone();
-        let notification_session_id = pending.initiating_session_id.clone();
         let _ = pending
             .respond_to
             .send(pioneer_tools::PermissionApprovalResolution::Cancelled);
+        self.persist_native_interaction_terminal(
+            request_id,
+            StoredCliRuntimePendingRequestStatus::Cancelled,
+            TurnPermissionApprovalResolution::Cancelled,
+        )
+        .await;
 
         let workspace_id = pending.workspace_id.clone();
         let notification = TurnPermissionRequestResolvedNotification {
@@ -461,13 +770,46 @@ impl MessageProcessor {
             turn_id: pending.turn_id,
             resolution: TurnPermissionApprovalResolution::Cancelled,
         };
-        self.send_execution_initiator_notification(
+        self.send_execution_collaborator_notification(
             notification_thread_id.as_str(),
-            notification_principal_id.as_str(),
-            notification_session_id.as_str(),
-            crate::authorization::ResourceAction::ThreadWrite,
+            crate::authorization::ResourceAction::AgentRequestObserve,
             events::TURN_PERMISSION_REQUEST_RESOLVED,
             &notification,
+        )
+        .await;
+    }
+
+    pub(super) async fn expire_native_permission_request(&self, request_id: &str) {
+        let pending = self
+            .native_permission_pending_requests
+            .lock()
+            .await
+            .remove(request_id);
+        let Some(pending) = pending else {
+            return;
+        };
+        let notification_thread_id =
+            native_permission_notification_thread_id(&pending.request).to_owned();
+        let _ = pending
+            .respond_to
+            .send(pioneer_tools::PermissionApprovalResolution::Expired);
+        self.persist_native_interaction_terminal(
+            request_id,
+            StoredCliRuntimePendingRequestStatus::Expired,
+            TurnPermissionApprovalResolution::Expired,
+        )
+        .await;
+        self.send_execution_collaborator_notification(
+            notification_thread_id.as_str(),
+            crate::authorization::ResourceAction::AgentRequestObserve,
+            events::TURN_PERMISSION_REQUEST_RESOLVED,
+            &TurnPermissionRequestResolvedNotification {
+                request_id: request_id.to_owned(),
+                workspace_id: pending.workspace_id,
+                thread_id: pending.thread_id,
+                turn_id: pending.turn_id,
+                resolution: TurnPermissionApprovalResolution::Expired,
+            },
         )
         .await;
     }
@@ -475,18 +817,14 @@ impl MessageProcessor {
     pub(super) async fn expire_native_permission_requests_without_current_authority(
         &self,
         workspace_id: &str,
-        affected_principal_id: Option<&pioneer_protocol::PrincipalId>,
+        _affected_principal_id: Option<&pioneer_protocol::PrincipalId>,
     ) {
         let candidates = self
             .native_permission_pending_requests
             .lock()
             .await
             .values()
-            .filter(|pending| {
-                pending.workspace_id == workspace_id
-                    && affected_principal_id
-                        .is_none_or(|principal_id| &pending.initiating_principal_id == principal_id)
-            })
+            .filter(|pending| pending.workspace_id == workspace_id)
             .map(|pending| {
                 (
                     pending.request.request_id.clone(),
@@ -495,7 +833,6 @@ impl MessageProcessor {
                     pending.turn_id.clone(),
                     pending.initiating_principal_id.clone(),
                     pending.initiating_session_id.clone(),
-                    pending.initiating_session_generation,
                     pending.authorization_context_fingerprint.clone(),
                 )
             })
@@ -508,7 +845,6 @@ impl MessageProcessor {
             pending_turn_id,
             initiating_principal_id,
             initiating_session_id,
-            initiating_session_generation,
             authorization_context_fingerprint,
         ) in candidates
         {
@@ -517,7 +853,7 @@ impl MessageProcessor {
                     pending_workspace_id.as_str(),
                     pending_thread_id.as_str(),
                     pending_turn_id.as_str(),
-                    crate::authorization::ResourceAction::ThreadWrite,
+                    crate::authorization::ResourceAction::AgentRequestRespond,
                 )
                 .await
             {
@@ -528,15 +864,7 @@ impl MessageProcessor {
                             .authorization_fingerprint()
                             .is_ok_and(|current| current == authorization_context_fingerprint) =>
                 {
-                    matches!(
-                        pioneer_crud::load_session(
-                            &self.crud_store.database_connection(),
-                            context.initiating_session_id(),
-                        )
-                        .await,
-                        Ok(Some(session))
-                            if session.refresh_generation == initiating_session_generation
-                    )
+                    true
                 }
                 Ok(_) | Err(_) => false,
             };
@@ -550,14 +878,12 @@ impl MessageProcessor {
                 pending_turn_id.as_str(),
                 &initiating_principal_id,
                 &initiating_session_id,
-                initiating_session_generation,
                 authorization_context_fingerprint.as_str(),
             )
             .await;
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn expire_native_permission_request_after_authority_loss(
         &self,
         request_id: &str,
@@ -566,7 +892,6 @@ impl MessageProcessor {
         turn_id: &str,
         initiating_principal_id: &pioneer_protocol::PrincipalId,
         initiating_session_id: &pioneer_protocol::AuthSessionId,
-        initiating_session_generation: i64,
         authorization_context_fingerprint: &str,
     ) {
         let pending = {
@@ -577,7 +902,6 @@ impl MessageProcessor {
                     && pending.turn_id == turn_id
                     && &pending.initiating_principal_id == initiating_principal_id
                     && &pending.initiating_session_id == initiating_session_id
-                    && pending.initiating_session_generation == initiating_session_generation
                     && pending.authorization_context_fingerprint
                         == authorization_context_fingerprint
             });
@@ -589,16 +913,18 @@ impl MessageProcessor {
 
         let notification_thread_id =
             native_permission_notification_thread_id(&pending.request).to_owned();
-        let notification_principal_id = pending.initiating_principal_id.clone();
-        let notification_session_id = pending.initiating_session_id.clone();
         let _ = pending
             .respond_to
             .send(pioneer_tools::PermissionApprovalResolution::Expired);
-        self.send_execution_initiator_notification(
+        self.persist_native_interaction_terminal(
+            request_id,
+            StoredCliRuntimePendingRequestStatus::Expired,
+            TurnPermissionApprovalResolution::Expired,
+        )
+        .await;
+        self.send_execution_collaborator_notification(
             notification_thread_id.as_str(),
-            notification_principal_id.as_str(),
-            notification_session_id.as_str(),
-            crate::authorization::ResourceAction::ThreadWrite,
+            crate::authorization::ResourceAction::AgentRequestObserve,
             events::TURN_PERMISSION_REQUEST_RESOLVED,
             &TurnPermissionRequestResolvedNotification {
                 request_id: request_id.to_owned(),
@@ -609,6 +935,34 @@ impl MessageProcessor {
             },
         )
         .await;
+    }
+
+    async fn persist_native_interaction_terminal(
+        &self,
+        request_id: &str,
+        status: StoredCliRuntimePendingRequestStatus,
+        resolution: TurnPermissionApprovalResolution,
+    ) {
+        let response_json = pioneer_crud::serialize_cli_runtime_json(&resolution).ok();
+        let now = chrono::Utc::now().fixed_offset();
+        if let Err(error) = self
+            .crud_store
+            .resolve_native_human_interaction_request(ResolveCliRuntimePendingRequest {
+                request_id: request_id.to_owned(),
+                status,
+                response_json,
+                updated_at: now,
+                resolved_at: now,
+            })
+            .await
+        {
+            warn!(
+                request_id,
+                status = status.as_str(),
+                error = %format!("{error:#}"),
+                "failed to persist native human interaction terminal state"
+            );
+        }
     }
 
     async fn send_turn_permission_response<T: Serialize>(
@@ -622,9 +976,10 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    public_permission_error(
                         None,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Delivery,
                         format!("failed to encode response: {error}"),
                     ),
                 )

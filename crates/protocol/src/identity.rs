@@ -12,11 +12,6 @@ pub const ROLE_KEY_MAX_LEN: usize = 32;
 /// metadata, not a user-role value.
 pub const SUPERUSER_CAPABILITY_ROLE_KEY: &str = "superuser";
 pub const MEMBER_ROLE_KEY: &str = "member";
-/// User-role keys understood by this protocol/Gateway release.
-///
-/// This is deliberately a code-defined registry for now. Persisted custom
-/// role definitions will replace it when editable roles are introduced.
-pub const BUILT_IN_USER_ROLE_KEYS: &[&str] = &[MEMBER_ROLE_KEY];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
@@ -37,10 +32,6 @@ impl RoleKey {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
-    }
-
-    pub fn is_supported(&self) -> bool {
-        BUILT_IN_USER_ROLE_KEYS.contains(&self.as_str())
     }
 }
 
@@ -249,7 +240,6 @@ mod tests {
     fn role_key_is_canonical_bounded_and_round_trips() {
         let member = RoleKey::member();
         assert_eq!(member.as_str(), MEMBER_ROLE_KEY);
-        assert!(member.is_supported());
         assert_eq!(
             serde_json::from_value::<RoleKey>(serde_json::json!("member")).unwrap(),
             member
@@ -260,7 +250,6 @@ mod tests {
         );
 
         let future = RoleKey::new("future_role-2").expect("valid future role key");
-        assert!(!future.is_supported());
         assert_eq!(future.to_string(), "future_role-2");
         assert!(RoleKey::new("a".repeat(ROLE_KEY_MAX_LEN)).is_ok());
     }

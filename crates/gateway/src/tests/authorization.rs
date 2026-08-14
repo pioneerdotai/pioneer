@@ -923,18 +923,18 @@ mod tests {
             .database
             .execute_unprepared(
                 "INSERT INTO invitation(\
-                    id,gateway_id,created_by_principal_id,created_by_session_id,status,token_hash,\
+                    id,gateway_id,created_by_principal_id,created_by_session_id,target_role_key,status,token_hash,\
                     token_format_version,expires_at,accepted_at,revoked_at,expired_at,\
                     accepted_principal_id,accepted_device_id,accepted_session_id,revoke_reason,\
                     created_at,updated_at\
                  ) VALUES\
                     ('I0000000000000000000A','G00000000000000000001',\
-                     'P0000000000000000000B','S0000000000000000000B','accepted',NULL,1,\
+                     'P0000000000000000000B','S0000000000000000000B','member','accepted',NULL,1,\
                      datetime(CURRENT_TIMESTAMP,'+7 days'),CURRENT_TIMESTAMP,NULL,NULL,\
                      'P0000000000000000000A','D0000000000000000000A',\
                      'S0000000000000000000A',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
                     ('I0000000000000000000B','G00000000000000000001',\
-                     'P0000000000000000000A','S0000000000000000000A','accepted',NULL,1,\
+                     'P0000000000000000000A','S0000000000000000000A','member','accepted',NULL,1,\
                      datetime(CURRENT_TIMESTAMP,'+7 days'),CURRENT_TIMESTAMP,NULL,NULL,\
                      'P0000000000000000000B','D0000000000000000000B',\
                      'S0000000000000000000B',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);\

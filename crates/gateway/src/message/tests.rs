@@ -1,6 +1,6 @@
 use super::{
     AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor, message_future,
-    record_resilience_worker_poll_error,
+    now_timestamp_secs, record_resilience_worker_poll_error,
 };
 use crate::bootstrap::bootstrap;
 use crate::cli_runtime::continuation::{
@@ -21,7 +21,11 @@ use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::secrets::GatewaySecrets;
 use crate::session::{
     ConnectionId, SessionManager,
-    test_support::{authenticated_test_superuser, register_authenticated_test_connection},
+    test_support::{
+        authenticated_test_superuser, authenticated_test_superuser_secondary_session,
+        ensure_test_superuser_execution_authority,
+        ensure_test_superuser_secondary_session_authority, register_authenticated_test_connection,
+    },
 };
 use crate::thread::ThreadManager;
 use crate::thread_episodic::{
@@ -29,6 +33,7 @@ use crate::thread_episodic::{
     ThreadEpisodicIngestor,
 };
 use crate::workspace::WorkspaceManager;
+use anyhow::Context as _;
 use async_trait::async_trait;
 use axum::extract::ws::Message;
 use futures_util::StreamExt;
@@ -91,41 +96,41 @@ use pioneer_protocol::{
     JsonRpcNotification, JsonRpcResponse, METHOD_NOT_FOUND_CODE, McpChangedAction,
     McpChangedNotification, McpInstallResponse, McpInstallResultStatus, McpInstallStatus,
     McpListResponse, McpPolicySetResponse, McpRuntimeState, McpScopeKind, McpServerDetailsResponse,
-    McpServerStatus, McpSourceKind, McpTransportSummary, McpTurnBindingSummary,
-    McpUninstallResponse, MemoryActor, MemoryActorKind, MemoryCandidateDecision,
-    MemoryCandidateStatus, MemoryCandidatesDecideParams, MemoryCandidatesDecideResponse,
-    MemoryCandidatesListParams, MemoryCandidatesListResponse, MemoryCategory, MemoryChangeKind,
-    MemoryChangedNotification, MemoryForgetParams, MemoryForgetResponse, MemoryForgetTarget,
-    MemoryForgottenNotification, MemoryGetParams, MemoryGetResponse, MemoryListParams,
-    MemoryListResponse, MemoryRememberParams, MemoryRememberResponse, MemoryScope, MemoryScopeKind,
-    MemorySearchParams, MemorySearchResponse, MemorySensitivity, PersistedActorRef, PrincipalId,
-    PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode,
-    PromptManifestHookContributionKind, PromptManifestHookPhase, PromptManifestHookSource,
-    PromptManifestHookSourceEntry, PromptManifestHookTruncation, PromptManifestProfile,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
+    McpServerStatus, McpSourceKind, McpTurnBindingSummary, McpUninstallResponse, MemoryActor,
+    MemoryActorKind, MemoryCandidateDecision, MemoryCandidateStatus, MemoryCandidatesDecideParams,
+    MemoryCandidatesDecideResponse, MemoryCandidatesListParams, MemoryCandidatesListResponse,
+    MemoryCategory, MemoryChangeKind, MemoryChangedNotification, MemoryForgetParams,
+    MemoryForgetResponse, MemoryForgetTarget, MemoryForgottenNotification, MemoryGetParams,
+    MemoryGetResponse, MemoryListParams, MemoryListResponse, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeKind, MemorySearchParams, MemorySearchResponse,
+    MemorySensitivity, PersistedActorRef, PrincipalId, PromptManifest, PromptManifestDiagnostic,
+    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
+    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
+    PromptManifestProfile, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
+    ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, ProviderTransportKind, RecoveryAction, RecoveryJobStatus,
-    RecoveryTrigger, RoleKey, SandboxMode, SkillArchiveFormat,
+    ProviderSetApiKeyResponse, ProviderTransportKind, PublicError, PublicErrorCode,
+    PublicErrorStage, PublicTaskAgendaResponse, PublicTaskDeliveriesResponse, RecoveryAction,
+    RecoveryJobStatus, RecoveryTrigger, RoleKey, SandboxMode, SkillArchiveFormat,
     SkillAuditEvent as ProtocolSkillAuditEvent, SkillListResponse, SkillsChangedNotification,
     SkillsHealthResponse, SkillsInstallResponse, SkillsPackInstallResponse,
     SkillsPackUninstallResponse, SkillsPackUpdateResponse, SkillsPolicySetResponse,
     SkillsUninstallResponse, SkillsUpdateResponse, SkillsUploadAbortResponse,
     SkillsUploadChunkHeader, SkillsUploadFinishResponse, SkillsUploadStartResponse,
-    TaskAcceptResponse, TaskAgendaResponse, TaskAgentPrompt, TaskAgentResultContract,
-    TaskAgentResultFormat, TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSpecInput,
-    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior,
-    TaskCreateParams, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDeliveryFormat,
-    TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind,
-    TaskLifecyclePolicy, TaskListParams, TaskOwnerKind, TaskParentTerminalAction,
-    TaskPauseResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
-    TaskResultReviewerKind, TaskResumeResponse, TaskRetryBackoffKind, TaskRetryPolicy,
-    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTriggerInput, TaskTriggerKind,
-    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskValue, TaskWaitParams,
-    TaskWriteLockStatus, Thread, ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
+    TaskAcceptResponse, TaskAgentPrompt, TaskAgentResultContract, TaskAgentResultFormat,
+    TaskAgentReviewMode, TaskAgentReviewPolicy, TaskAgentSpecInput, TaskAgentToolPolicy,
+    TaskAgentWriteMode, TaskAttachmentMode, TaskCompletionBehavior, TaskCreateParams,
+    TaskDeliveriesParams, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
+    TaskDeliveryStatus, TaskEventPayload, TaskExecutorKind, TaskLifecyclePolicy, TaskListParams,
+    TaskOwnerKind, TaskParentTerminalAction, TaskPauseResponse, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
+    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResumeResponse,
+    TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
+    TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem,
+    TaskUpdateParams, TaskValue, TaskWaitParams, TaskWriteLockStatus, Thread,
+    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetResponse,
     ThreadAgentsDocResolveForThreadResponse, ThreadAgentsDocSaveResponse, ThreadAgentsDocStatus,
     ThreadClosedNotification, ThreadFolderCreateResponse, ThreadFolderDeleteResponse,
     ThreadFolderMoveResponse, ThreadGetResponse, ThreadHistoryEventPayload, ThreadMode,
@@ -193,6 +198,53 @@ async fn registered_request_context(
     )
 }
 
+async fn test_execution_authorization_admission(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    workspace_id: &str,
+    thread_id: &str,
+) -> crate::authorization::ExecutionAuthorizationAdmission {
+    ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+    let request = registered_request_context(
+        processor,
+        connection_id,
+        pioneer_protocol::constants::methods::TURN_START,
+    )
+    .await;
+    let action = crate::authorization::ResourceAction::AgentTurnStart;
+    let action_gate = crate::authorization::AuthorizationService::new().authorize_action(
+        request.principal().kind,
+        request.principal().role_key.as_ref(),
+        action,
+    );
+    let proof =
+        match crate::authorization::AuthorizationResolver::new((*processor.crud_store).clone())
+            .authorize_thread(
+                request.principal(),
+                &action_gate,
+                action,
+                thread_id,
+                Some(workspace_id),
+            )
+            .await
+            .expect("test thread authorization should resolve")
+        {
+            crate::authorization::ProofResolution::Authorized(proof) => proof,
+            crate::authorization::ProofResolution::Denied(decision) => {
+                panic!("test thread authorization should be allowed: {decision:?}")
+            }
+        };
+    let revision =
+        pioneer_crud::current_policy_generation(&processor.crud_store.database_connection())
+            .await
+            .expect("test policy generation should load")
+            .get();
+    crate::authorization::ExecutionAuthorizationAdmission::from_authorized_thread(
+        &request, &proof, revision,
+    )
+    .expect("test execution admission should bind the authorized thread")
+}
+
 async fn persist_test_execution_authorization_context(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
@@ -200,18 +252,62 @@ async fn persist_test_execution_authorization_context(
     root_thread_id: &str,
     turn_id: &str,
 ) {
-    ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
     let connection = processor
         .session_manager
         .connection_context(connection_id)
         .await
         .expect("test connection context");
-    let context = crate::authorization::ExecutionAuthorizationContext::for_test(
+    persist_test_execution_authorization_context_for_principal(
+        processor,
         connection.principal(),
         workspace_id,
         root_thread_id,
+        turn_id,
+    )
+    .await;
+}
+
+async fn persist_test_execution_authorization_context_for_principal(
+    processor: &MessageProcessor,
+    principal: &crate::auth::AuthenticatedSessionPrincipal,
+    workspace_id: &str,
+    root_thread_id: &str,
+    turn_id: &str,
+) {
+    persist_test_execution_authorization_context_for_principal_with_profile(
+        processor,
+        principal,
+        workspace_id,
+        root_thread_id,
+        turn_id,
         &default_test_permission_profile(),
+    )
+    .await;
+}
+
+async fn persist_test_execution_authorization_context_for_principal_with_profile(
+    processor: &MessageProcessor,
+    principal: &crate::auth::AuthenticatedSessionPrincipal,
+    workspace_id: &str,
+    root_thread_id: &str,
+    turn_id: &str,
+    permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
+) {
+    ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+    let mut context = crate::authorization::ExecutionAuthorizationContext::for_test(
+        principal,
+        workspace_id,
+        root_thread_id,
+        permission_profile,
         None,
+    );
+    context.bind_test_provider_authority(
+        "openai",
+        "test-model",
+        processor
+            .provider_registry
+            .authority_fingerprint_for_workspace(workspace_id, "openai")
+            .as_str(),
     );
     let encoded = context
         .to_persisted_json()
@@ -225,57 +321,84 @@ async fn persist_test_execution_authorization_context(
     );
 }
 
-async fn ensure_test_superuser_execution_authority(crud_store: &CrudStore) {
-    crud_store
-        .database_connection()
-        .execute_unprepared(
-            "INSERT OR IGNORE INTO gateway_identity(\
-                id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
-                created_at,updated_at\
-             ) VALUES(\
-                'G00000000000000000001',1,1,2,CURRENT_TIMESTAMP,\
-                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
-             INSERT OR IGNORE INTO gateway_principal(\
-                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
-                created_at,updated_at,removed_at\
-             ) VALUES(\
-                'P00000000000000000001','G00000000000000000001','superuser',NULL,'active',\
-                'Superuser','superuser','superuser',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-             );\
-             INSERT OR IGNORE INTO device(\
-                id,gateway_id,principal_id,installation_id,display_name,client_kind,\
-                platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at\
-             ) VALUES(\
-                'D00000000000000000001','G00000000000000000001',\
-                'P00000000000000000001','message-test-superuser','Message Test Superuser',\
-                'desktop','test','1','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                CURRENT_TIMESTAMP,NULL\
-             );\
-             INSERT OR IGNORE INTO auth_session(\
-                id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,\
-                activation_token_hash,activation_locator_hash,activation_failed_attempts,\
-                activation_expires_at,activated_at,status,refresh_generation,created_at,\
-                updated_at,last_seen_at,last_refreshed_at,refresh_expires_at,revoked_at,\
-                revoke_reason\
-             ) VALUES(\
-                'S00000000000000000001','G00000000000000000001',\
-                'P00000000000000000001','D00000000000000000001',\
-                'F00000000000000000001',NULL,randomblob(32),randomblob(32),0,\
-                datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
-                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                datetime('now','+90 days'),NULL,NULL\
-             );\
-             INSERT OR IGNORE INTO auth_refresh_credential(\
-                id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
-             ) VALUES(\
-                'R00000000000000000001','S00000000000000000001',\
-                'F00000000000000000001',0,randomblob(32),CURRENT_TIMESTAMP,\
-                datetime('now','+90 days')\
-             );",
-        )
+async fn ensure_test_superuser_execution_turn(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
+    if processor
+        .crud_store
+        .get_turn(thread_id, turn_id)
         .await
-        .expect("test Superuser execution authority should materialize");
+        .expect("test execution turn lookup should succeed")
+        .is_none()
+    {
+        let timestamp = now_timestamp_secs();
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "test-model".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: default_test_permission_profile(),
+        };
+        processor
+            .crud_store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .expect("test execution turn should materialize");
+    }
+    if processor
+        .crud_store
+        .get_turn_execution_authorization_context(turn_id)
+        .await
+        .expect("test execution authorization lookup should succeed")
+        .is_none()
+    {
+        persist_test_execution_authorization_context_for_principal(
+            processor,
+            authenticated_test_superuser().as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+        )
+        .await;
+    }
 }
 
 async fn persist_test_cli_execution_authorization_context(
@@ -804,20 +927,22 @@ async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
     let runtime_home = unique_temp_dir("cli_runtime_security");
     std::fs::create_dir_all(&runtime_home).expect("CLI runtime test home must exist");
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager.clone(),
-        provider_registry.clone(),
-        session_manager,
-        workspace_manager.clone(),
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone())
-    .with_runtime_home_for_tests(runtime_home)
-    .with_self_improvement_supervisor(self_improvement_supervisor.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager.clone(),
+            provider_registry.clone(),
+            session_manager,
+            workspace_manager.clone(),
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone())
+        .with_runtime_home_for_tests(runtime_home)
+        .with_self_improvement_supervisor(self_improvement_supervisor.clone()),
+    );
 
     CliRuntimeSecurityHarness {
         rx,
@@ -1442,6 +1567,7 @@ where
 {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
@@ -1877,11 +2003,10 @@ async fn cli_runtime_system_skill_rejected_before_write_or_materialization_impl(
         .process_request_for_connection(harness.connection_id, &request)
         .await;
     let error = recv_error_by_id(&mut harness.rx, &request_id).await;
-    assert!(
-        error
-            .error
-            .message
-            .contains(crate::cli_runtime::skills::CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE)
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Admission,
     );
     assert!(!harness.native_home.join("skills").exists());
     assert!(
@@ -2115,11 +2240,10 @@ async fn claude_skill_not_model_invocable_rejects_before_write_and_native_impl()
         .process_request_for_connection(harness.connection_id, &request)
         .await;
     let error = recv_error_by_id(&mut harness.rx, &request_id).await;
-    assert!(
-        error
-            .error
-            .message
-            .contains(crate::cli_runtime::skills::CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE)
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Admission,
     );
     assert!(!harness.native_home.join("skills").exists());
     assert!(
@@ -2182,11 +2306,10 @@ async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_tur
         .process_request_for_connection(collision.connection_id, &request)
         .await;
     let error = recv_error_by_id(&mut collision.rx, &collision_request_id).await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("cli_runtime.skill_destination_collision")
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Admission,
     );
     assert!(!collision.native_home.join("skills").exists());
     assert!(collision.cli_session.thread_starts.lock().await.is_empty());
@@ -2229,11 +2352,10 @@ async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_tur
         .process_request_for_connection(copy_failure.connection_id, &request)
         .await;
     let error = recv_error_by_id(&mut copy_failure.rx, &copy_request_id).await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("failed to prepare CLI runtime skill")
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Admission,
     );
     assert!(
         copy_failure
@@ -2274,7 +2396,7 @@ fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects(
 }
 
 async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects_impl() {
-    for (suffix, capabilities, expected) in [
+    for (suffix, capabilities, expected_code) in [
         (
             "mcp",
             vec![
@@ -2288,12 +2410,12 @@ async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_ef
                 })
                 .unwrap(),
             ],
-            "cli_runtime.mcp.explicit_capability_unresolved",
+            PublicErrorCode::Internal,
         ),
         (
             "missing",
             vec![cli_runtime_skill_capability("tests/missing", "user")],
-            "cli_runtime.skill_resolve_failed",
+            PublicErrorCode::InvalidInput,
         ),
     ] {
         let mut harness =
@@ -2315,11 +2437,7 @@ async fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_ef
             .process_request_for_connection(harness.connection_id, &request)
             .await;
         let error = recv_error_by_id(&mut harness.rx, &request_id).await;
-        assert!(
-            error.error.message.contains(expected),
-            "unexpected {suffix} preflight error: {}",
-            error.error.message
-        );
+        assert_public_error(&error, expected_code, PublicErrorStage::Admission);
         assert!(harness.cli_session.thread_starts.lock().await.is_empty());
         assert!(harness.cli_session.turn_starts.lock().await.is_empty());
         assert!(harness.event_log.lock().await.is_empty());
@@ -4876,16 +4994,16 @@ fn canonical_provider_messages_for_artifact_parity(
                 pioneer_provider::MessageContentPart::Video { video } => video,
                 pioneer_provider::MessageContentPart::Text { .. } => continue,
             };
-            let Some(artifact) = attachment.artifact.as_ref() else {
+            let Some(_artifact) = attachment.artifact.as_ref() else {
                 continue;
             };
             let pioneer_provider::AttachmentDataSource::Path { path } = &attachment.source else {
                 continue;
             };
 
-            // Artifact resolution deliberately creates a fresh per-turn staging path. The
-            // provider adapter consumes the bytes, not that path string, so parity is defined by
-            // the durable artifact identity and verified content digest.
+            // Artifact resolution deliberately creates a fresh per-turn staging path. Exact
+            // root isolation also requires distinct handles when equivalent bytes are attached
+            // from independent roots, so provider parity is defined by verified content here.
             let bytes =
                 std::fs::read(path).expect("materialized parity artifact should be readable");
             let sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
@@ -4896,13 +5014,9 @@ fn canonical_provider_messages_for_artifact_parity(
                 );
             }
             attachment.source = pioneer_provider::AttachmentDataSource::Reference {
-                reference: format!(
-                    "artifact:{}/{}/{}#sha256={sha256}",
-                    artifact.workspace_id,
-                    artifact.artifact_id,
-                    artifact.artifact_version_id.as_deref().unwrap_or_default()
-                ),
+                reference: format!("artifact-content:sha256={sha256}"),
             };
+            attachment.artifact = None;
         }
     }
     messages
@@ -5000,7 +5114,7 @@ async fn wait_for_prompt_parity_request_count(
     kind: PromptParityRequestKind,
     expected: usize,
 ) -> bool {
-    for _ in 0..200 {
+    for _ in 0..2_000 {
         if provider.request_count(kind) >= expected {
             return true;
         }
@@ -5262,7 +5376,6 @@ async fn setup_provider_api_key_processor(
         test_context_budget(),
         test_tool_loop_config(),
     );
-
     (
         processor,
         secret_store,
@@ -5984,7 +6097,72 @@ async fn create_task_for_test(
     params: TaskCreateParams,
 ) -> anyhow::Result<pioneer_protocol::TaskCreateResponse> {
     ensure_task_create_parent_turn_for_test(processor, &params).await?;
-    let context = processor.task_create_context_for_params(&params).await?;
+    let mut context = processor.task_create_context_for_params(&params).await?;
+    let principal = authenticated_test_superuser();
+    context.actor_id = Some(principal.principal_id.to_string());
+    context.task_resource_budget = crate::authorization::AuthorizationService::new()
+        .task_resource_budget(principal.kind, principal.role_key.as_ref());
+    if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent {
+        let root_thread_id = params
+            .created_by_thread_id
+            .as_deref()
+            .context("test Agent Task requires an exact root thread")?;
+        let root_thread = processor
+            .crud_store
+            .get_thread_by_id(root_thread_id)
+            .await?
+            .context("test Agent Task root thread is missing")?;
+        let mut request = crate::authorization::ExecutionAdmissionRequest::for_task(
+            &params,
+            root_thread_id,
+            root_thread.model_provider.as_str(),
+            root_thread.model.as_str(),
+            None,
+        )?;
+        if !matches!(
+            request.execution_backend,
+            Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
+                | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. })
+        ) {
+            request.provider_authority_fingerprint = Some(
+                processor
+                    .provider_registry()
+                    .authority_fingerprint_for_workspace(
+                        params.workspace_id.as_str(),
+                        request.provider.as_str(),
+                    )
+                    .as_str()
+                    .to_owned(),
+            );
+        }
+        let admitted = crate::authorization::ExecutionAdmissionService::new(
+            processor.crud_store.as_ref().clone(),
+        )
+        .admit_context(
+            principal.as_ref(),
+            processor.current_authorization_revision().await?,
+            &request,
+            params
+                .agent_spec
+                .as_ref()
+                .and_then(|spec| spec.permission_cap.as_ref()),
+        )
+        .await?;
+        context.execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
+            workspace_id: admitted.workspace_id().to_owned(),
+            root_thread_id: admitted.root_thread_id().to_owned(),
+            initiating_principal_id: admitted.initiating_principal_id().to_string(),
+            authorization_context_json: admitted.to_persisted_json()?,
+            role_key: admitted.role_key().to_owned(),
+            policy_fingerprint: admitted.policy_fingerprint().to_owned(),
+            execution_resources: crate::authorization::AuthorizationService::new()
+                .execution_resource_policy(principal.kind, principal.role_key.as_ref())
+                .context("test Agent Task role has no execution resource policy")?,
+            task_resources: crate::authorization::AuthorizationService::new()
+                .task_resource_budget(principal.kind, principal.role_key.as_ref())
+                .context("test Agent Task role has no Task resource budget")?,
+        });
+    }
     message_future(
         processor
             .task_runtime
@@ -6005,6 +6183,8 @@ async fn ensure_task_create_parent_turn_for_test(
     let Some(parent_turn_id) = params.created_by_turn_id.as_deref() else {
         return Ok(());
     };
+    ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
 
     if processor
         .crud_store
@@ -6053,7 +6233,7 @@ async fn ensure_task_create_parent_turn_for_test(
                 SandboxMode::FullAccess,
                 &turn,
                 &[],
-                pioneer_protocol::PersistedActorRef::System,
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
             )
             .await?;
     }
@@ -6082,6 +6262,14 @@ async fn ensure_task_create_parent_turn_for_test(
         }
     }
 
+    ensure_test_superuser_execution_turn(
+        processor.as_ref(),
+        params.workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+    )
+    .await;
+
     Ok(())
 }
 
@@ -6092,6 +6280,8 @@ async fn seed_completed_task_parent_with_history(
     parent_turn_id: &str,
     history: &str,
 ) {
+    ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
     let created_at = super::now_timestamp_secs();
     processor
         .crud_store
@@ -6138,7 +6328,7 @@ async fn seed_completed_task_parent_with_history(
                 text: history.to_owned(),
                 text_elements: Vec::new(),
             }],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
         .await
         .expect("native Task parent start should persist");
@@ -6748,6 +6938,8 @@ async fn setup_progress_delta_harness(
         test_context_budget(),
         test_tool_loop_config(),
     );
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
 
     let thread_id = generate_test_request_id("thr", case_id);
     let turn_id = generate_test_request_id("turn", case_id);
@@ -6825,10 +7017,17 @@ async fn setup_progress_delta_harness(
             SandboxMode::FullAccess,
             &turn,
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
         .await
         .expect("turn/start should materialize");
+    ensure_test_superuser_execution_turn(
+        &processor,
+        workspace_id.as_str(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+    )
+    .await;
     crud_store
         .materialize_item_started(
             ItemStartedNotification {
@@ -8562,11 +8761,20 @@ async fn ingest_user_test_artifact(
     workspace_id: &str,
     display_name: &str,
 ) -> pioneer_protocol::ArtifactRef {
+    ingest_user_test_artifact_for_thread(processor, workspace_id, None, display_name).await
+}
+
+async fn ingest_user_test_artifact_for_thread(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    primary_thread_id: Option<&str>,
+    display_name: &str,
+) -> pioneer_protocol::ArtifactRef {
     processor
         .artifact_service
         .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
             workspace_id: workspace_id.to_owned(),
-            primary_thread_id: None,
+            primary_thread_id: primary_thread_id.map(str::to_owned),
             bytes: b"hello artifact".to_vec(),
             display_name: display_name.to_owned(),
             kind: pioneer_protocol::ArtifactKind::File,
@@ -8595,6 +8803,8 @@ async fn setup_write_file_artifact_registration_gateway(
         workspace_manager,
         crud_store.clone(),
     );
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
     let thread_id = generate_test_request_id("wfat", case_id);
     let turn_id = generate_test_request_id("wfaturn", case_id);
     let thread_start = thread_manager
@@ -8639,10 +8849,17 @@ async fn setup_write_file_artifact_registration_gateway(
                 permission_profile: default_test_permission_profile(),
             },
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
         .await
         .expect("write_file artifact registration turn should persist");
+    ensure_test_superuser_execution_turn(
+        &processor,
+        workspace_id.as_str(),
+        thread_id.as_str(),
+        turn_id.as_str(),
+    )
+    .await;
     agent_manager
         .ensure_thread(thread_id.as_str(), workspace_id.as_str())
         .await
@@ -8789,6 +9006,7 @@ async fn materialize_artifact_api_thread(
     thread_id: &str,
     turn_id: &str,
 ) {
+    ensure_test_superuser_execution_authority(crud_store).await;
     let thread = pioneer_protocol::Thread {
         workspace_id: workspace_id.to_owned(),
         id: thread_id.to_owned(),
@@ -8829,7 +9047,9 @@ async fn materialize_artifact_api_thread(
             SandboxMode::FullAccess,
             &turn,
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
         )
         .await
         .expect("artifact API test thread should materialize");
@@ -8983,13 +9203,19 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
         test_context_budget(),
         test_tool_loop_config(),
     );
-    let artifact = ingest_user_test_artifact(&processor, workspace_id.as_str(), "report.txt").await;
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
         &mut rx,
         workspace_id.as_str(),
         "thr_artifact_user_msg",
+    )
+    .await;
+    let artifact = ingest_user_test_artifact_for_thread(
+        &processor,
+        workspace_id.as_str(),
+        Some(thread.thread.id.as_str()),
+        "report.txt",
     )
     .await;
 
@@ -9107,13 +9333,19 @@ async fn followup_turn_history_includes_inline_artifact_ref_without_reattaching_
         test_context_budget(),
         test_tool_loop_config(),
     );
-    let artifact = ingest_user_test_artifact(&processor, workspace_id.as_str(), "car.jpg").await;
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
         &mut rx,
         workspace_id.as_str(),
         "thr_artifact_followup_history",
+    )
+    .await;
+    let artifact = ingest_user_test_artifact_for_thread(
+        &processor,
+        workspace_id.as_str(),
+        Some(thread.thread.id.as_str()),
+        "car.jpg",
     )
     .await;
 
@@ -10129,7 +10361,12 @@ async fn first_voice_turn_materializes_runtime_draft() {
         turn_id,
     )
     .await;
-    assert_eq!(result.outcome, VoiceSessionOutcome::TurnStarted);
+    assert_eq!(
+        result.outcome,
+        VoiceSessionOutcome::TurnStarted,
+        "voice execution failed: {:?}",
+        result.error
+    );
     assert_eq!(result.turn_id.as_deref(), Some(turn_id));
     assert!(
         crud_store
@@ -10186,8 +10423,8 @@ async fn voice_turn_start_replay_does_not_dispatch_provider_again() {
                 model_provider: Some("openai".to_owned()),
                 sandbox: None,
                 mode: Some(ThreadMode::Agent),
-                origin_kind: Some(ThreadOriginKind::TaskRun),
-                sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
+                origin_kind: Some(ThreadOriginKind::User),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
                 visibility: None,
                 agent_nickname: None,
                 agent_role: None,
@@ -10381,6 +10618,15 @@ async fn task_run_voice_composer_stays_foreground() {
         test_tool_loop_config(),
     )
     .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child"));
+    let root_thread_id = "thr_voice_task_root";
+    let root_turn_id = "turn_voice_task_root";
+    ensure_test_superuser_execution_turn(
+        &processor,
+        workspace_id.as_str(),
+        root_thread_id,
+        root_turn_id,
+    )
+    .await;
     let child_thread_id = "thr_voice_task_run";
     let started = thread_manager
         .thread_start_seeded(
@@ -10412,6 +10658,26 @@ async fn task_run_voice_composer_stays_foreground() {
         )
         .await
         .expect("persist task-run voice authorization target");
+    crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_voice_task_run".to_owned(),
+                run_id: "run_voice_task_run".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: child_thread_id.to_owned(),
+                    parent_thread_id: root_thread_id.to_owned(),
+                    root_thread_id: root_thread_id.to_owned(),
+                    depth: 1,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(root_thread_id.to_owned()),
+                    created_by_turn_id: Some(root_turn_id.to_owned()),
+                    created_at: now_timestamp_secs(),
+                },
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .expect("persist task-run voice lineage");
 
     let turn_id = "turn_voice_task_run";
     let result = submit_test_voice_turn(
@@ -10423,7 +10689,12 @@ async fn task_run_voice_composer_stays_foreground() {
         turn_id,
     )
     .await;
-    assert_eq!(result.outcome, VoiceSessionOutcome::TurnStarted);
+    assert_eq!(
+        result.outcome,
+        VoiceSessionOutcome::TurnStarted,
+        "voice execution failed: {:?}",
+        result.error
+    );
     assert_eq!(result.turn_id.as_deref(), Some(turn_id));
 
     let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
@@ -10494,14 +10765,19 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
     .with_voice_input_supervisor(ready_gateway_voice_supervisor(
         "voice transcript with context",
     ));
-    let artifact =
-        ingest_user_test_artifact(&processor, workspace_id.as_str(), "voice-artifact.txt").await;
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
         &mut rx,
         workspace_id.as_str(),
         "thr_voice_turn_context",
+    )
+    .await;
+    let artifact = ingest_user_test_artifact_for_thread(
+        &processor,
+        workspace_id.as_str(),
+        Some(thread.thread.id.as_str()),
+        "voice-artifact.txt",
     )
     .await;
 
@@ -10862,14 +11138,20 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         result_payload.error.as_ref().map(|error| error.kind),
         Some(VoiceErrorKind::NoSpeech)
     );
-    let error_message = result_payload
+    let error = result_payload
         .error
         .as_ref()
-        .map(|error| error.message.as_str())
-        .expect("no-speech result should include error message");
-    assert!(error_message.contains("rms=0.000000"));
-    assert!(error_message.contains("peak=0.000000"));
-    assert!(error_message.contains("non_zero_samples=0"));
+        .expect("no-speech result should include a public error");
+    let public_error = error
+        .public_error
+        .as_ref()
+        .expect("no-speech result should include typed public error metadata");
+    assert_eq!(public_error.code, PublicErrorCode::InvalidInput);
+    assert_eq!(public_error.stage, PublicErrorStage::Execution);
+    assert_eq!(error.message, public_error.message);
+    assert!(!error.message.contains("rms="));
+    assert!(!error.message.contains("peak="));
+    assert!(!error.message.contains("non_zero_samples="));
 
     let missing_turn = crud_store
         .get_turn("thr_voice_no_speech", "turn_voice_no_speech_0001")
@@ -12618,6 +12900,31 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         "invitation changes are visible only to Superuser and the owning inviter"
     );
 
+    let live_task_notification_recipients = processor
+        .send_task_user_notification(
+            workspace_id.as_str(),
+            MEMBER_ALLOWED_ID,
+            "test/task-user-notification",
+            &json!({ "notification_id": "N0000000000000000000A" }),
+        )
+        .await;
+    assert_eq!(
+        live_task_notification_recipients, 1,
+        "an exact-recipient task notification must reach every authorized session of only that principal"
+    );
+    assert_eq!(
+        recv_notification_by_method(&mut allowed_rx, "test/task-user-notification")
+            .await
+            .method,
+        "test/task-user-notification"
+    );
+    assert!(
+        superuser_rx.try_recv().is_err(),
+        "absolute workspace authority must not widen an exact-recipient task notification"
+    );
+    assert!(denied_rx.try_recv().is_err());
+    assert!(unselected_rx.try_recv().is_err());
+
     let queued_before_revoke = processor
         .authorized_workspace_notification_recipients(
             workspace_id.as_str(),
@@ -12675,6 +12982,27 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         "a recipient captured before the committed revoke must be rejected before queueing"
     );
 
+    let revoked_task_user_notification_serializations = Arc::new(AtomicUsize::new(0));
+    assert_eq!(
+        processor
+            .send_task_user_notification(
+                workspace_id.as_str(),
+                MEMBER_ALLOWED_ID,
+                "test/task-user-notification-after-revoke",
+                &CountedPayload {
+                    serializations: revoked_task_user_notification_serializations.clone(),
+                },
+            )
+            .await,
+        0,
+        "a revoked exact recipient must not receive the live task notification"
+    );
+    assert_eq!(
+        revoked_task_user_notification_serializations.load(Ordering::SeqCst),
+        0,
+        "revocation must be checked before serializing exact-recipient task data"
+    );
+
     let queued_task_serializations = Arc::new(AtomicUsize::new(0));
     processor
         .send_notification_to_reauthorized_task_connections(
@@ -12718,6 +13046,226 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         "membership removal must affect the next workspace notification"
     );
     assert!(denied_rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowledgeable() {
+    const RECIPIENT_ID: &str = "P0000000000000000000A";
+    const FOREIGN_ID: &str = "P0000000000000000000B";
+    const DELIVERY_ID: &str = "D0000000000000000000N";
+    const NOTIFICATION_ID: &str = "N0000000000000000000N";
+
+    fn member_principal(
+        principal_id: &str,
+        device_id: &str,
+        session_id: &str,
+    ) -> Arc<crate::auth::AuthenticatedSessionPrincipal> {
+        let mut principal = (*authenticated_test_superuser()).clone();
+        principal.principal_id =
+            pioneer_protocol::PrincipalId::new(principal_id).expect("Member principal id");
+        principal.kind = pioneer_protocol::PrincipalKind::User;
+        principal.role_key = Some(RoleKey::member());
+        principal.device_id = pioneer_protocol::DeviceId::new(device_id).expect("Member device id");
+        principal.session_id =
+            pioneer_protocol::AuthSessionId::new(session_id).expect("Member session id");
+        Arc::new(principal)
+    }
+
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT OR IGNORE INTO gateway_identity(\
+                id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
+                created_at,updated_at\
+             ) VALUES(\
+                'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES\
+                ('P0000000000000000000A','G00000000000000000001','user','member','active',\
+                 'Inbox Recipient','inbox-recipient','inbox-recipient',\
+                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL),\
+                ('P0000000000000000000B','G00000000000000000001','user','member','active',\
+                 'Foreign Member','foreign-member','foreign-member',\
+                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL);\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES\
+                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
+                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
+        )
+        .await
+        .expect("materialize exact-recipient inbox collaborators");
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO task_delivery(\
+                id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,\
+                attempt_count,max_attempts,created_at,updated_at\
+             ) VALUES(\
+                'D0000000000000000000N',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'K0000000000000000000N','R0000000000000000000N','inbox-rpc-delivery',\
+                'user_notification','P0000000000000000000A','delivered',1,1,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
+        )
+        .await
+        .expect("materialize inbox delivery envelope");
+
+    let payload = pioneer_protocol::TaskUserNotificationDeliveredNotification {
+        notification_id: NOTIFICATION_ID.to_owned(),
+        workspace_id: workspace_id.clone(),
+        recipient_principal_id: RECIPIENT_ID.to_owned(),
+        task_id: "K0000000000000000000N".to_owned(),
+        run_id: "R0000000000000000000N".to_owned(),
+        delivery_id: DELIVERY_ID.to_owned(),
+        result: None,
+        error: None,
+        created_at: 1_725_000_000,
+    };
+    pioneer_crud::insert_task_notification_idempotent(
+        &crud_store.database_connection(),
+        pioneer_crud::NewUserNotificationOutbox {
+            id: NOTIFICATION_ID.to_owned(),
+            task_delivery_id: DELIVERY_ID.to_owned(),
+            workspace_id: workspace_id.clone(),
+            recipient_principal_id: RECIPIENT_ID.to_owned(),
+            task_id: payload.task_id.clone(),
+            run_id: payload.run_id.clone(),
+            payload_json: serde_json::to_string(&payload).expect("notification payload"),
+            created_at_unix: payload.created_at,
+        },
+    )
+    .await
+    .expect("persist durable exact-recipient notification");
+
+    let session_manager = Arc::new(SessionManager::new());
+    let (recipient_tx, mut recipient_rx) = mpsc::channel(8);
+    let recipient_connection = session_manager
+        .register_connection(
+            recipient_tx,
+            member_principal(
+                RECIPIENT_ID,
+                "D0000000000000000000A",
+                "S0000000000000000000A",
+            ),
+        )
+        .await
+        .expect("register notification recipient");
+    let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
+    let foreign_connection = session_manager
+        .register_connection(
+            foreign_tx,
+            member_principal(FOREIGN_ID, "D0000000000000000000B", "S0000000000000000000B"),
+        )
+        .await
+        .expect("register foreign collaborator");
+    for connection_id in [recipient_connection, foreign_connection] {
+        session_manager
+            .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+            .await;
+    }
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+
+    let recipient_list_id = generate_test_request_id("taskinbox", "recipient");
+    processor
+        .process_request_for_connection(
+            recipient_connection,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": recipient_list_id,
+                "method": pioneer_protocol::constants::methods::TASK_USER_NOTIFICATION_LIST,
+                "params": { "workspaceId": workspace_id, "limit": 10 }
+            })
+            .to_string(),
+        )
+        .await;
+    let recipient_list = recv_response_by_id(&mut recipient_rx, recipient_list_id.as_str()).await;
+    let recipient_list: pioneer_protocol::TaskUserNotificationListResponse =
+        serde_json::from_value(recipient_list.result).expect("decode recipient inbox");
+    assert_eq!(recipient_list.notifications.len(), 1);
+    assert_eq!(
+        recipient_list.notifications[0].notification_id,
+        NOTIFICATION_ID
+    );
+    assert_eq!(recipient_list.notifications[0].acknowledged_at, None);
+
+    let foreign_list_id = generate_test_request_id("taskinbox", "foreign");
+    processor
+        .process_request_for_connection(
+            foreign_connection,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": foreign_list_id,
+                "method": pioneer_protocol::constants::methods::TASK_USER_NOTIFICATION_LIST,
+                "params": { "workspaceId": workspace_id, "limit": 10 }
+            })
+            .to_string(),
+        )
+        .await;
+    let foreign_list = recv_response_by_id(&mut foreign_rx, foreign_list_id.as_str()).await;
+    let foreign_list: pioneer_protocol::TaskUserNotificationListResponse =
+        serde_json::from_value(foreign_list.result).expect("decode foreign inbox");
+    assert!(
+        foreign_list.notifications.is_empty(),
+        "thread collaboration must not widen a principal-addressed notification inbox"
+    );
+
+    let foreign_ack_id = generate_test_request_id("taskinbox", "foreign-ack");
+    processor
+        .process_request_for_connection(
+            foreign_connection,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": foreign_ack_id,
+                "method": pioneer_protocol::constants::methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE,
+                "params": {
+                    "workspaceId": workspace_id,
+                    "notificationId": NOTIFICATION_ID
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let foreign_ack = recv_error_by_id(&mut foreign_rx, foreign_ack_id.as_str()).await;
+    assert_eq!(foreign_ack.error.message, "not_found");
+
+    let recipient_ack_id = generate_test_request_id("taskinbox", "recipient-ack");
+    processor
+        .process_request_for_connection(
+            recipient_connection,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": recipient_ack_id,
+                "method": pioneer_protocol::constants::methods::TASK_USER_NOTIFICATION_ACKNOWLEDGE,
+                "params": {
+                    "workspaceId": workspace_id,
+                    "notificationId": NOTIFICATION_ID
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let recipient_ack = recv_response_by_id(&mut recipient_rx, recipient_ack_id.as_str()).await;
+    let recipient_ack: pioneer_protocol::TaskUserNotificationAcknowledgeResponse =
+        serde_json::from_value(recipient_ack.result).expect("decode notification acknowledgement");
+    assert_eq!(recipient_ack.notification.notification_id, NOTIFICATION_ID);
+    assert!(recipient_ack.notification.acknowledged_at.is_some());
 }
 
 #[tokio::test]
@@ -12966,28 +13514,35 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         .expect("register another session for the allowed Member");
 
     processor
-        .send_execution_initiator_notification(
+        .send_execution_collaborator_notification(
             THREAD_ID,
-            MEMBER_ALLOWED_ID,
-            "S0000000000000000000A",
-            crate::authorization::ResourceAction::ThreadWrite,
-            "test/native-permission-initiator-only",
+            crate::authorization::ResourceAction::AgentRequestRespond,
+            "test/native-permission-collaborators",
             &json!({"command": "approval"}),
         )
         .await;
     assert_eq!(
-        recv_notification_by_method(&mut allowed_rx, "test/native-permission-initiator-only")
+        recv_notification_by_method(&mut allowed_rx, "test/native-permission-collaborators")
             .await
             .method,
-        "test/native-permission-initiator-only"
+        "test/native-permission-collaborators"
     );
-    assert!(
-        superuser_rx.try_recv().is_err(),
-        "native permission prompts must not be shown to a superuser who cannot answer them"
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/native-permission-collaborators")
+            .await
+            .method,
+        "test/native-permission-collaborators",
+        "an authorized Superuser collaborator must receive the same execution prompt"
     );
-    assert!(
-        other_session_rx.try_recv().is_err(),
-        "native permission prompts must remain bound to the initiating session"
+    assert_eq!(
+        recv_notification_by_method(
+            &mut other_session_rx,
+            "test/native-permission-collaborators"
+        )
+        .await
+        .method,
+        "test/native-permission-collaborators",
+        "execution prompts belong to the thread capsule, not the initiating session"
     );
     assert!(
         denied_rx.try_recv().is_err(),
@@ -13631,9 +14186,9 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
         access_changed
             .params
             .as_ref()
-            .and_then(|params| params.get("access_lost"))
-            .and_then(JsonValue::as_bool),
-        Some(true)
+            .and_then(|params| params.get("outcome"))
+            .and_then(JsonValue::as_str),
+        Some("revoked")
     );
     assert!(!access_changed_json.contains(AFFECTED_THREAD_ID));
     assert!(!access_changed_json.contains("affected.txt"));
@@ -14126,13 +14681,10 @@ async fn turn_start_rejects_artifact_from_another_workspace() {
         .await;
 
     let error = recv_error_by_id(&mut rx, request_id.as_str()).await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("failed to validate artifact input"),
-        "unexpected error: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Unavailable,
+        PublicErrorStage::Admission,
     );
 }
 
@@ -15690,6 +16242,13 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
     assert_eq!(observations_b[0].run_id, run_b.id);
     assert_eq!(observations_b[0].candidate_id, candidate_b.id);
 
+    ensure_test_superuser_execution_turn(
+        processor.as_ref(),
+        workspace_id.as_str(),
+        "thr_review_scope_a",
+        "turn_review_scope_other",
+    )
+    .await;
     let wrong_turn_observations = task_provider
         .review_required_attached_task_observations(TaskTurnContext {
             workspace_id,
@@ -18558,8 +19117,13 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         )
         .await
         .expect("parent history turn should complete");
-    let artifact =
-        ingest_user_test_artifact(&processor, workspace_id.as_str(), "launch-context.txt").await;
+    let artifact = ingest_user_test_artifact_for_thread(
+        &processor,
+        workspace_id.as_str(),
+        Some(parent_thread_id),
+        "launch-context.txt",
+    )
+    .await;
     let exact_input = vec![
         UserInput::Text {
             text: "Use the exact composer request".to_owned(),
@@ -18901,14 +19465,11 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
         let turn_id = format!("turn_dynamic_native_{runtime_id}");
         let request_id = generate_test_request_id("dynamic", runtime_id);
         let input_marker = format!("dynamic Composer request for {runtime_id}");
-        let artifact = ingest_bound_test_artifact(
+        let artifact = ingest_user_test_artifact_for_thread(
             processor.as_ref(),
             workspace_id.as_str(),
-            parent_thread_id.as_str(),
-            turn_id.as_str(),
-            format!("user_{turn_id}").as_str(),
+            Some(parent_thread_id.as_str()),
             format!("{runtime_id}-attachment.txt").as_str(),
-            format!("{runtime_id} attachment body").into_bytes(),
         )
         .await;
         let launch = pioneer_protocol::TurnStartParams {
@@ -19222,8 +19783,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
         let authorization_context = processor
             .load_turn_execution_authorization_context(lineage.child_turn_id.as_str())
             .await
-            .expect("native Task child execution authorization should load")
-            .expect("native Task child execution authorization should exist");
+            .expect("native Task child execution authorization should load");
         let projection_version = u32::try_from(projection.projection_version)
             .expect("native Task child MCP projection version should fit u32");
         assert_eq!(
@@ -19326,7 +19886,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers()
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
         let cli_session = Arc::new(RecordingCliRuntimeSession::default());
         let cli_manager = test_cli_runtime_manager(cli_session.clone());
-        let processor = Arc::new(
+        let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
             MessageProcessor::new(
                 thread_manager,
                 test_provider(),
@@ -19339,7 +19899,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers()
                 test_tool_loop_config(),
             )
             .with_cli_runtime_manager_for_tests(cli_manager.clone()),
-        );
+        ));
         processor.bind_task_bridge().await;
         processor.start_task_event_listener().await;
 
@@ -19532,7 +20092,7 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = Arc::new(
+    let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             thread_manager,
             test_provider(),
@@ -19545,7 +20105,7 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
-    );
+    ));
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
 
@@ -19689,7 +20249,7 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = Arc::new(
+    let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             thread_manager,
             test_provider(),
@@ -19702,7 +20262,7 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
-    );
+    ));
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
 
@@ -19854,7 +20414,7 @@ async fn assert_detached_native_child_turn_cancellation() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = Arc::new(
+    let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             thread_manager.clone(),
             test_provider(),
@@ -19867,7 +20427,7 @@ async fn assert_detached_native_child_turn_cancellation() {
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager),
-    );
+    ));
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
 
@@ -20365,9 +20925,17 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
     );
     let _ = provider.take_requests();
 
-    let artifact = ingest_user_test_artifact(
+    let direct_artifact = ingest_user_test_artifact_for_thread(
         harness.processor.as_ref(),
         harness.workspace_id.as_str(),
+        Some(direct_parent_thread_id),
+        "full-parity-context.txt",
+    )
+    .await;
+    let task_artifact = ingest_user_test_artifact_for_thread(
+        harness.processor.as_ref(),
+        harness.workspace_id.as_str(),
+        Some(task_parent_thread_id),
         "full-parity-context.txt",
     )
     .await;
@@ -20377,8 +20945,8 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
             text_elements: Vec::new(),
         },
         UserInput::Artifact {
-            artifact_id: artifact.artifact_id.clone(),
-            version_id: artifact.version_id.clone(),
+            artifact_id: direct_artifact.artifact_id.clone(),
+            version_id: direct_artifact.version_id.clone(),
         },
     ];
     let exact_capabilities = vec![
@@ -20445,11 +21013,21 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
     let direct_requests = provider.take_requests();
 
     let planned_child_turn_id = "turn_full_prompt_parity_planned";
-    let task_launch = pioneer_protocol::TurnStartParams {
+    let mut task_launch = pioneer_protocol::TurnStartParams {
         thread_id: task_parent_thread_id.to_owned(),
         turn_id: planned_child_turn_id.to_owned(),
         ..direct_launch.clone()
     };
+    task_launch.input = vec![
+        UserInput::Text {
+            text: "Verify the complete parent and detached child LLM request.".to_owned(),
+            text_elements: Vec::new(),
+        },
+        UserInput::Artifact {
+            artifact_id: task_artifact.artifact_id.clone(),
+            version_id: task_artifact.version_id.clone(),
+        },
+    ];
     let mut params = test_task_create_params(
         harness.workspace_id.as_str(),
         task_parent_thread_id,
@@ -20619,8 +21197,8 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
         [pioneer_provider::MessageContentPart::File { file }]
             if file.name.as_deref() == Some("full-parity-context.txt")
                 && file.artifact.as_ref().is_some_and(|reference| {
-                    reference.artifact_id == artifact.artifact_id
-                        && reference.artifact_version_id == artifact.version_id
+                    reference.artifact_id == direct_artifact.artifact_id
+                        && reference.artifact_version_id == direct_artifact.version_id
                 })
     ));
     let compiled_prompt = direct_main
@@ -21071,15 +21649,20 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
     let root = create_task_for_test(&processor, root_params)
         .await
         .expect("root task should start");
-    assert_eq!(
-        wait_for_task_status(
-            crud_store.clone(),
-            root.task.id.as_str(),
-            pioneer_protocol::TaskStatus::Completed,
-        )
-        .await,
+    let root_status = wait_for_task_status(
+        crud_store.clone(),
+        root.task.id.as_str(),
         pioneer_protocol::TaskStatus::Completed,
-        "root task should complete after its nested attached task"
+    )
+    .await;
+    let root_after_execution = crud_store
+        .get_task(root.task.id.as_str())
+        .await
+        .expect("root task diagnostic should load");
+    assert_eq!(
+        root_status,
+        pioneer_protocol::TaskStatus::Completed,
+        "root task should complete after its nested attached task: {root_after_execution:#?}"
     );
 
     let tasks = processor
@@ -21096,6 +21679,7 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         .tasks
         .iter()
         .filter(|task| task.parent_task_id.as_deref() == Some(root.task.id.as_str()))
+        .cloned()
         .collect::<Vec<_>>();
     assert_eq!(
         nested.len(),
@@ -21133,6 +21717,21 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
     assert_eq!(root_lineage.parent_thread_id, root_thread_id);
     assert_eq!(root_lineage.root_thread_id, root_thread_id);
     for nested_task in nested {
+        let nested_status = wait_for_task_status(
+            crud_store.clone(),
+            nested_task.id.as_str(),
+            pioneer_protocol::TaskStatus::Completed,
+        )
+        .await;
+        let nested_after_execution = crud_store
+            .get_task(nested_task.id.as_str())
+            .await
+            .expect("nested task diagnostic should load");
+        assert_eq!(
+            nested_status,
+            pioneer_protocol::TaskStatus::Completed,
+            "nested task should complete before lineage is inspected: {nested_after_execution:#?}"
+        );
         assert_eq!(
             nested_task.root_task_id.as_deref(),
             Some(root.task.id.as_str())
@@ -21467,16 +22066,6 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
 }
 
 #[test]
-fn task_create_tool_persists_anchor_and_rejects_legacy_timeline() {
-    run_gateway_message_test(
-        "task_create_tool_persists_anchor_and_rejects_legacy_timeline",
-        || async {
-            task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl().await;
-        },
-    );
-}
-
-#[test]
 fn task_create_tool_idempotency_key_deduplicates_parallel_mutations() {
     run_gateway_message_test(
         "task_create_tool_idempotency_key_deduplicates_parallel_mutations",
@@ -21497,6 +22086,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "title": child_title,
         "goal": "Return a short delegated result",
         "instructions": ["Return a concise final answer."],
+        "background": true,
         "idempotencyKey": "same-task-create-key"
     })
     .to_string();
@@ -21568,265 +22158,6 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         task_anchor_count, 1,
         "same idempotency key in one provider round must create one durable task anchor"
     );
-}
-
-async fn task_create_tool_persists_anchor_and_rejects_legacy_timeline_impl() {
-    let (tx, mut rx) = mpsc::channel(128);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("test-model", "parent"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let child_title = "Summarize from task tool";
-    let provider = Arc::new(SequencedToolProvider::new(
-        vec![ProviderToolCall {
-            id: "call_task_create_1".to_owned(),
-            name: "task_create".to_owned(),
-            arguments: json!({
-                "title": child_title,
-                "goal": "Return a short delegated result",
-                "instructions": ["Return a concise final answer."]
-            })
-            .to_string(),
-        }],
-        "parent observed child result",
-    ));
-    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent",
-        provider.clone(),
-    ));
-    provider_registry.insert("echo", Arc::new(EchoProvider::new()));
-    let processor = Arc::new(MessageProcessor::new(
-        thread_manager,
-        provider_registry,
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    ));
-    processor.start_resilience_workers().await;
-
-    start_thread_and_turn_with_permission_profile(
-        &processor,
-        connection_id,
-        &mut rx,
-        workspace_id.as_str(),
-        "thr_task_tool_anchor",
-        "turn_task_tool_anchor",
-        "Agent",
-        "parent",
-        Some(json!({ "mode": "full_access" })),
-    )
-    .await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
-    let requests = provider.snapshot_requests();
-    assert!(
-        requests.iter().any(|request| {
-            request.messages.iter().any(|message| {
-                message
-                    .content
-                    .contains("Attached task results are available")
-            })
-        }),
-        "completed attached task result should be delivered to the next parent model round"
-    );
-
-    let turn_items = crud_store
-        .get_turn_item_events("thr_task_tool_anchor", "turn_task_tool_anchor")
-        .await
-        .expect("turn items should load")
-        .expect("turn should exist");
-    let anchor_task_id = turn_items
-        .events
-        .iter()
-        .find_map(|event| match &event.payload {
-            TurnItemEventPayload::ItemCompleted {
-                item: TurnItem::Task { item },
-                ..
-            } => Some(item.task_id.clone()),
-            _ => None,
-        });
-    let anchor_task_id = anchor_task_id.expect("task_create tool should persist task anchor");
-    wait_for_task_status(
-        crud_store.clone(),
-        anchor_task_id.as_str(),
-        pioneer_protocol::TaskStatus::Completed,
-    )
-    .await;
-    let anchor_status = wait_for_task_anchor_status(
-        crud_store.clone(),
-        "turn_task_tool_anchor",
-        anchor_task_id.as_str(),
-        pioneer_protocol::TaskStatus::Completed,
-    )
-    .await;
-    assert_eq!(
-        anchor_status,
-        pioneer_protocol::TaskStatus::Completed,
-        "task anchor read model should be refreshed from task lifecycle events"
-    );
-    let task_response = crud_store
-        .get_task(anchor_task_id.as_str())
-        .await
-        .expect("task_get should succeed")
-        .expect("task should exist");
-    let permission_cap = task_response
-        .agent_specs
-        .first()
-        .and_then(|spec| spec.permission_cap.as_ref())
-        .expect("task_create tool should persist the creating turn permission cap");
-    assert_eq!(
-        permission_cap.mode,
-        pioneer_protocol::TurnPermissionMode::FullAccess
-    );
-    assert_eq!(
-        permission_cap.effective_policy,
-        pioneer_protocol::ToolPermissionPolicySnapshot::all(
-            pioneer_protocol::PermissionBehavior::Allow
-        )
-    );
-    let lineage = task_response.thread_lineage;
-    assert!(
-        !lineage.is_empty(),
-        "agent task should create hidden child lineage"
-    );
-    let child_thread = crud_store
-        .get_thread_model(lineage[0].child_thread_id.as_str())
-        .await
-        .expect("child thread lookup should succeed")
-        .expect("child thread should exist");
-    assert_eq!(
-        child_thread.sidebar_visibility,
-        ThreadSidebarVisibility::Hidden
-    );
-    assert_eq!(child_thread.name.as_deref(), Some(child_title));
-    let run = task_response
-        .runs
-        .last()
-        .expect("attached task should have an immediate run");
-    let child_anchor = crud_store
-        .get_task_run_child_anchor(run.id.as_str())
-        .await
-        .expect("child anchor lookup should succeed");
-    let anchor_item_id = crate::task_tools::task_anchor_id(anchor_task_id.as_str());
-    let refreshed_anchor = load_task_anchor_item(
-        crud_store.clone(),
-        "turn_task_tool_anchor",
-        anchor_item_id.as_str(),
-    )
-    .await;
-    assert_eq!(
-        refreshed_anchor.child_thread_id.as_deref(),
-        child_anchor.child_thread_id.as_deref(),
-        "parent task anchor should point at the hidden child thread"
-    );
-    assert_eq!(
-        refreshed_anchor.child_turn_id.as_deref(),
-        child_anchor.child_turn_id.as_deref(),
-        "parent task anchor should point at the hidden child turn"
-    );
-    assert!(
-        refreshed_anchor.result_preview.is_some(),
-        "terminal child result should refresh the parent task anchor preview"
-    );
-
-    // Isolate the startup backfill assertion below: the live task event fanout
-    // can refresh this same parent anchor before the explicit backfill runs.
-    if let Some(handle) = processor.task_event_listener_worker.lock().await.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = processor.resilience_worker.lock().await.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = processor.hook_recovery_worker.lock().await.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-
-    let mut stale_anchor = refreshed_anchor.clone();
-    stale_anchor.status = TaskStatus::Running;
-    stale_anchor.child_thread_id = None;
-    stale_anchor.child_turn_id = None;
-    stale_anchor.progress_preview = Some("stale progress".to_owned());
-    stale_anchor.result_preview = None;
-    crud_store
-        .materialize_item_updated(
-            ItemUpdatedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: "thr_task_tool_anchor".to_owned(),
-                turn_id: "turn_task_tool_anchor".to_owned(),
-                item: TurnItem::Task { item: stale_anchor },
-            },
-            super::now_timestamp_secs(),
-        )
-        .await
-        .expect("stale task anchor should persist");
-
-    // A recurring task returns to Scheduled after a successful occurrence.
-    // Model that global state explicitly: rebuilding this historical run card
-    // must still use the terminal TaskRun status, never the task container.
-    pioneer_entity::task::Entity::update_many()
-        .col_expr(
-            pioneer_entity::task::Column::Status,
-            Expr::value("scheduled"),
-        )
-        .filter(pioneer_entity::task::Column::Id.eq(anchor_task_id.clone()))
-        .exec(&crud_store.database_connection())
-        .await
-        .expect("test task should return to recurring scheduled state");
-
-    let backfill = crate::database::startup::backfill_task_anchors_once(crud_store.as_ref())
-        .await
-        .expect("task anchor backfill should complete");
-    assert!(
-        backfill.anchors_updated >= 1,
-        "task anchor backfill should refresh stale task payloads"
-    );
-    let backfilled_anchor = load_task_anchor_item(
-        crud_store.clone(),
-        "turn_task_tool_anchor",
-        anchor_item_id.as_str(),
-    )
-    .await;
-    assert_eq!(
-        backfilled_anchor.child_thread_id.as_deref(),
-        child_anchor.child_thread_id.as_deref()
-    );
-    assert_eq!(
-        backfilled_anchor.child_turn_id.as_deref(),
-        child_anchor.child_turn_id.as_deref()
-    );
-    assert!(
-        backfilled_anchor.progress_preview.is_none(),
-        "backfill should not keep stale live progress on terminal task anchors"
-    );
-    assert_eq!(
-        backfilled_anchor.status,
-        TaskStatus::Completed,
-        "a completed occurrence must not inherit the recurring task's Scheduled status"
-    );
-    assert!(backfilled_anchor.result_preview.is_some());
-
-    let timeline_request = json!({
-        "jsonrpc": "2.0",
-        "id": "turntimelinephase4001",
-        "method": "turn/timeline",
-        "params": {
-            "threadId": "thr_task_tool_anchor",
-            "turnId": "turn_task_tool_anchor",
-            "composeTasks": true,
-            "includeCollapsedTaskEvents": true
-        }
-    });
-    processor
-        .process_request_for_connection(connection_id, &timeline_request.to_string())
-        .await;
-    let timeline_error = recv_error_by_id(&mut rx, "turntimelinephase4001").await;
-    assert_eq!(timeline_error.error.code, METHOD_NOT_FOUND_CODE);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22073,7 +22404,12 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         .deliveries
         .first()
         .expect("delivery should exist");
-    assert_eq!(delivery.status, TaskDeliveryStatus::Delivered);
+    assert_eq!(
+        delivery.status,
+        TaskDeliveryStatus::Delivered,
+        "delivery failed: {:?}",
+        delivery.last_error
+    );
     let delivered_turn_id = delivery
         .delivered_turn_id
         .as_deref()
@@ -22160,7 +22496,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         .process_request_for_connection(connection_id, &deliveries_request.to_string())
         .await;
     let deliveries_response = recv_response_by_id(&mut rx, "taskdeliveriesrpc0001").await;
-    let deliveries_payload: TaskDeliveriesResponse =
+    let deliveries_payload: PublicTaskDeliveriesResponse =
         serde_json::from_value(deliveries_response.result)
             .expect("task/deliveries response should decode");
     assert_eq!(deliveries_payload.deliveries.len(), 1);
@@ -22185,7 +22521,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         .process_request_for_connection(connection_id, &agenda_request.to_string())
         .await;
     let agenda_response = recv_response_by_id(&mut rx, "taskagendarpc00000001").await;
-    let agenda_payload: TaskAgendaResponse =
+    let agenda_payload: PublicTaskAgendaResponse =
         serde_json::from_value(agenda_response.result).expect("task/agenda response should decode");
     let agenda_item = agenda_payload
         .items
@@ -22426,15 +22762,19 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
             .process_request_for_connection(connection_id, &agenda_request.to_string())
             .await;
         let agenda_response = recv_response_by_id(&mut rx, "taskagendarpc00000002").await;
-        let agenda: TaskAgendaResponse = serde_json::from_value(agenda_response.result)
+        let agenda: PublicTaskAgendaResponse = serde_json::from_value(agenda_response.result)
             .expect("task/agenda response should decode");
         let agenda_item = agenda
             .items
             .iter()
             .find(|item| item.task.id == task_id)
             .expect("agenda should include active scheduled task");
-        assert_eq!(agenda_item.next_fire_at, Some(4_000_000_000));
-        assert_eq!(agenda_item.trigger_status, Some(TaskTriggerStatus::Active));
+        let agenda_trigger = agenda_item
+            .trigger
+            .as_ref()
+            .expect("scheduled agenda item should expose its trigger");
+        assert_eq!(agenda_trigger.next_fire_at, Some(4_000_000_000));
+        assert_eq!(agenda_trigger.status, TaskTriggerStatus::Active);
     }
 
     {
@@ -22482,7 +22822,7 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
             .await;
         let agenda_without_paused_response =
             recv_response_by_id(&mut rx, "taskagendarpc00000003").await;
-        let agenda_without_paused: TaskAgendaResponse =
+        let agenda_without_paused: PublicTaskAgendaResponse =
             serde_json::from_value(agenda_without_paused_response.result)
                 .expect("task/agenda response should decode");
         assert!(
@@ -22512,11 +22852,13 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
             .await;
         let agenda_with_paused_response =
             recv_response_by_id(&mut rx, "taskagendarpc00000004").await;
-        let agenda_with_paused: TaskAgendaResponse =
+        let agenda_with_paused: PublicTaskAgendaResponse =
             serde_json::from_value(agenda_with_paused_response.result)
                 .expect("task/agenda response should decode");
         assert!(agenda_with_paused.items.iter().any(|item| {
-            item.task.id == task_id && item.trigger_status == Some(TaskTriggerStatus::Paused)
+            item.task.id == task_id
+                && item.trigger.as_ref().map(|trigger| trigger.status)
+                    == Some(TaskTriggerStatus::Paused)
         }));
     }
 
@@ -23336,7 +23678,7 @@ async fn internal_llm_context_event_persists_without_websocket_notification() {
     let _connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
-    let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let processor = MessageProcessor::with_agent_manager(
         thread_manager,
         agent_manager,
@@ -23344,6 +23686,13 @@ async fn internal_llm_context_event_persists_without_websocket_notification() {
         workspace_manager,
         crud_store.clone(),
     );
+    ensure_test_superuser_execution_turn(
+        &processor,
+        workspace_id.as_str(),
+        "thread_llm_ctx",
+        "turn_llm_ctx",
+    )
+    .await;
 
     let assistant_round = ChatMessage::assistant_tool_calls_with_reasoning(
         None::<String>,
@@ -23451,6 +23800,8 @@ async fn turn_mcp_persistence_durable_capability_event_is_read_only() {
 
     let thread_id = "thr_capabilities_durable_1";
     let turn_id = "turn_capabilities_durable_1";
+    ensure_test_superuser_execution_turn(&processor, workspace_id.as_str(), thread_id, turn_id)
+        .await;
     agent_manager
         .ensure_thread(thread_id, workspace_id.as_str())
         .await
@@ -23632,10 +23983,14 @@ async fn direct_durable_item_completed_persists_before_committed_notification() 
                 permission_profile: default_test_permission_profile(),
             },
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
         )
         .await
         .expect("turn start should persist");
+    ensure_test_superuser_execution_turn(&processor, workspace_id.as_str(), thread_id, turn_id)
+        .await;
     agent_manager
         .ensure_thread(thread_id, workspace_id.as_str())
         .await
@@ -24071,10 +24426,14 @@ async fn direct_durable_item_completed_ingestion_failure_does_not_block_commit()
                 permission_profile: default_test_permission_profile(),
             },
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
         )
         .await
         .expect("turn start should persist");
+    ensure_test_superuser_execution_turn(&processor, workspace_id.as_str(), thread_id, turn_id)
+        .await;
     agent_manager
         .ensure_thread(thread_id, workspace_id.as_str())
         .await
@@ -24414,10 +24773,15 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 permission_profile: default_test_permission_profile(),
             },
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
         )
         .await
         .expect("turn start should persist");
+
+    ensure_test_superuser_execution_turn(&processor, workspace_id.as_str(), thread_id, turn_id)
+        .await;
 
     processor
         .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
@@ -24915,6 +25279,8 @@ async fn setup_execution_window_terminal_turn(
         workspace_manager,
         crud_store.clone(),
     );
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
 
     let thread_start = thread_manager
         .system_thread_start_seeded(
@@ -24982,7 +25348,7 @@ async fn setup_execution_window_terminal_turn(
                 permission_profile: default_test_permission_profile(),
             },
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
         )
         .await
         .expect("turn start should persist");
@@ -26474,7 +26840,11 @@ async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispat
         .process_request_for_connection(connection_id, &conflict.to_string())
         .await;
     let conflict_error = recv_error_by_id(&mut rx, "bbbbbbbbbbbbbbbbbbbbd").await;
-    assert!(conflict_error.error.message.contains("different request"));
+    assert_public_error(
+        &conflict_error,
+        PublicErrorCode::Conflict,
+        PublicErrorStage::Admission,
+    );
     assert!(capture_provider.snapshot_requests().is_empty());
 
     let second_thread_request = json!({
@@ -26509,9 +26879,10 @@ async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispat
         .process_request_for_connection(connection_id, &cross_thread_conflict.to_string())
         .await;
     let cross_thread_error = recv_error_by_id(&mut rx, "bbbbbbbbbbbbbbbbxid01").await;
-    assert_eq!(
-        cross_thread_error.error.message,
-        "turn_id is already used by a different request"
+    assert_public_error(
+        &cross_thread_error,
+        PublicErrorCode::Conflict,
+        PublicErrorStage::Admission,
     );
     let cross_thread_error_json =
         serde_json::to_string(&cross_thread_error).expect("conflict should serialize");
@@ -26732,7 +27103,11 @@ async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped(
             )
             .await;
         let error = recv_error_by_id(&mut rx, request_id).await;
-        assert!(error.error.message.contains("unavailable"));
+        assert_public_error(
+            &error,
+            PublicErrorCode::InvalidInput,
+            PublicErrorStage::Admission,
+        );
         assert!(!error.error.message.contains(TARGET_TURN_ID));
         assert!(!error.error.message.contains(HIDDEN_MEMBER_ID));
         assert!(!error.error.message.contains("hidden-member"));
@@ -27007,27 +27382,27 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
             .contains("epic6-secret-file-bytes")
     );
 
-    for (suffix, thread_id, requested_version, expected_code, expected_message) in [
+    for (suffix, thread_id, requested_version, expected_code, expected_public_code) in [
         (
             "cross",
             SECOND_THREAD_ID,
             Some(version_id.as_str()),
             INVALID_REQUEST_CODE,
-            "unavailable",
+            Some(PublicErrorCode::Unavailable),
         ),
         (
             "missing",
             FIRST_THREAD_ID,
             None,
             INVALID_PARAMS_CODE,
-            "artifact reference is invalid",
+            Some(PublicErrorCode::InvalidInput),
         ),
         (
             "wrong",
             FIRST_THREAD_ID,
             Some("not-an-artifact-version"),
             INVALID_REQUEST_CODE,
-            "unavailable",
+            Some(PublicErrorCode::Unavailable),
         ),
     ] {
         let request_id = generate_test_request_id("epic6artifact", suffix);
@@ -27055,7 +27430,16 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
             .await;
         let error = recv_error_by_id(&mut rx, request_id.as_str()).await;
         assert_eq!(error.error.code, expected_code);
-        assert!(error.error.message.contains(expected_message));
+        if let Some(expected_public_code) = expected_public_code {
+            assert_public_error(&error, expected_public_code, PublicErrorStage::Admission);
+        } else {
+            assert!(
+                error
+                    .error
+                    .message
+                    .contains("artifact reference is invalid")
+            );
+        }
         assert!(!error.error.message.contains(artifact.artifact_id.as_str()));
         assert!(
             crud_store
@@ -27441,7 +27825,11 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
         )
         .await;
     let actor_conflict = recv_error_by_id(&mut peer_rx, "e6peerturnidconflict1").await;
-    assert!(actor_conflict.error.message.contains("different request"));
+    assert_public_error(
+        &actor_conflict,
+        PublicErrorCode::Conflict,
+        PublicErrorStage::Admission,
+    );
     let actor_conflict_json = serde_json::to_string(&actor_conflict).unwrap();
     assert!(!actor_conflict_json.contains("message-author"));
     assert!(!actor_conflict_json.contains(AUTHOR_ID));
@@ -28263,7 +28651,7 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch() {
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -28280,29 +28668,21 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         test_tool_loop_config(),
     );
 
-    thread_manager
-        .thread_start_seeded(
-            connection_id,
-            workspace_id.clone(),
-            ThreadStartParams {
-                thread_id: "thread_security_native".to_owned(),
-                workspace_id,
-                name: Some("Security snapshot native".to_owned()),
-                model: Some("o4-mini".to_owned()),
-                model_provider: Some("openai".to_owned()),
-                sandbox: Some(SandboxMode::FullAccess),
-                mode: Some(ThreadMode::Agent),
-                origin_kind: None,
-                sidebar_visibility: None,
-                visibility: None,
-                agent_nickname: None,
-                agent_role: None,
-            },
-            None,
-            None,
-        )
-        .await
-        .expect("thread/start should seed native security snapshot thread");
+    start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thread_security_native",
+    )
+    .await;
+    let execution_admission = test_execution_authorization_admission(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        "thread_security_native",
+    )
+    .await;
     processor
         .prepare_api_provider_turn_start(
             connection_id,
@@ -28333,7 +28713,8 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
                 cli_runtime_options: None,
             },
             None,
-            None,
+            crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            execution_admission,
         )
         .await
         .expect("native turn/start preparation should succeed");
@@ -28371,8 +28752,10 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         persisted.snapshot.enforcement,
         pioneer_protocol::TurnSecurityEnforcementStatus::Active
     );
-    let expected_cwd = std::env::current_dir()
-        .expect("gateway test cwd should resolve")
+    let expected_cwd = processor
+        .turn_security_workspace_root(workspace_id.as_str())
+        .await
+        .expect("managed workspace security root should resolve")
         .to_string_lossy()
         .into_owned();
     assert_eq!(persisted.snapshot.sandbox.cwd, expected_cwd);
@@ -28385,7 +28768,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         .expect("restricted snapshot should include cwd root");
     assert_eq!(
         cwd_entry.path,
-        pioneer_protocol::TurnFilesystemSandboxPath::CurrentWorkingDirectory
+        pioneer_protocol::TurnFilesystemSandboxPath::WorkspaceRoot
     );
     assert_eq!(
         cwd_entry.resolved_path.as_deref(),
@@ -28395,7 +28778,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch() {
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -28413,30 +28796,24 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
     );
     let thread_id = "thread_native_admission_replay";
     let turn_id = "turn_native_admission_replay";
-    thread_manager
-        .thread_start_seeded(
-            connection_id,
-            workspace_id.clone(),
-            ThreadStartParams {
-                thread_id: thread_id.to_owned(),
-                workspace_id,
-                name: Some("Native admission replay".to_owned()),
-                model: Some("o4-mini".to_owned()),
-                model_provider: Some("openai".to_owned()),
-                sandbox: Some(SandboxMode::FullAccess),
-                mode: Some(ThreadMode::Agent),
-                origin_kind: None,
-                sidebar_visibility: None,
-                visibility: None,
-                agent_nickname: None,
-                agent_role: None,
-            },
-            None,
-            None,
-        )
-        .await
-        .expect("thread should seed");
-    let actor = pioneer_protocol::PersistedActorRef::System;
+    start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+    )
+    .await;
+    let execution_admission = test_execution_authorization_admission(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        thread_id,
+    )
+    .await;
+    let actor = pioneer_protocol::PersistedActorRef::Principal(
+        authenticated_test_superuser().principal_id.clone(),
+    );
     let params = pioneer_protocol::TurnStartParams {
         thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
@@ -28464,7 +28841,8 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
             None,
             params.clone(),
             None,
-            None,
+            crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            execution_admission.clone(),
         )
         .await
         .expect("first request should prepare");
@@ -28480,7 +28858,8 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
             None,
             params.clone(),
             None,
-            None,
+            crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            execution_admission.clone(),
         )
         .await
         .expect("same request should replay");
@@ -28496,13 +28875,26 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
         text_elements: Vec::new(),
     }];
     let error = match processor
-        .prepare_api_provider_turn_start(connection_id, actor, None, conflicting, None, None)
+        .prepare_api_provider_turn_start(
+            connection_id,
+            actor,
+            None,
+            conflicting,
+            None,
+            crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            execution_admission,
+        )
         .await
     {
         Err(error) => error,
         Ok(_) => panic!("same Turn identity with another payload must conflict"),
     };
-    assert!(error.contains("conflicting durable admission request"));
+    assert_eq!(error.public_code(), PublicErrorCode::Conflict);
+    assert!(
+        error
+            .diagnostic()
+            .contains("conflicting durable admission request")
+    );
     assert_eq!(
         pioneer_entity::turn_admission::Entity::find()
             .all(&crud_store.database_connection())
@@ -28515,7 +28907,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_security_audit_events_include_snapshot_reference() {
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -28534,33 +28926,27 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
     let thread_id = "thread_security_audit_native";
     let turn_id = "turn_security_audit_native";
 
-    thread_manager
-        .thread_start_seeded(
-            connection_id,
-            workspace_id.clone(),
-            ThreadStartParams {
-                thread_id: thread_id.to_owned(),
-                workspace_id,
-                name: Some("Security audit native".to_owned()),
-                model: Some("o4-mini".to_owned()),
-                model_provider: Some("openai".to_owned()),
-                sandbox: Some(SandboxMode::FullAccess),
-                mode: Some(ThreadMode::Agent),
-                origin_kind: None,
-                sidebar_visibility: None,
-                visibility: None,
-                agent_nickname: None,
-                agent_role: None,
-            },
-            None,
-            None,
-        )
-        .await
-        .expect("thread/start should seed native security audit thread");
+    start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+    )
+    .await;
+    let execution_admission = test_execution_authorization_admission(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        thread_id,
+    )
+    .await;
     processor
         .prepare_api_provider_turn_start(
             connection_id,
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
             None,
             pioneer_protocol::TurnStartParams {
                 thread_id: thread_id.to_owned(),
@@ -28584,7 +28970,8 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
                 cli_runtime_options: None,
             },
             None,
-            None,
+            crate::authorization::ExecutionAdmissionEntryPoint::InteractiveTurn,
+            execution_admission,
         )
         .await
         .expect("native turn/start preparation should succeed");
@@ -28711,13 +29098,10 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
         .await;
 
     let error = recv_error_by_id(&mut rx, "turnstartclidsturn001").await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("CLI agent runtime execution is disabled"),
-        "error should mention disabled CLI runtime feature flag: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Admission,
     );
     sleep(Duration::from_millis(100)).await;
     assert_eq!(capture_provider.call_count(), 0);
@@ -29814,13 +30198,10 @@ async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runt
     process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
 
     let error = recv_error_by_id(&mut harness.rx, turn_request_id.as_str()).await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("turn execution security unavailable"),
-        "error should mention unavailable security: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Unavailable,
+        PublicErrorStage::Admission,
     );
     assert!(harness.cli_session.thread_starts.lock().await.is_empty());
     assert!(harness.cli_session.turn_starts.lock().await.is_empty());
@@ -29947,13 +30328,10 @@ async fn turn_start_security_audit_events_include_unavailable_sandbox_decision_i
     process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
 
     let error = recv_error_by_id(&mut harness.rx, turn_request_id.as_str()).await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("turn execution security unavailable"),
-        "error should mention unavailable security: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Unavailable,
+        PublicErrorStage::Admission,
     );
     assert!(harness.cli_session.thread_starts.lock().await.is_empty());
     assert!(harness.cli_session.turn_starts.lock().await.is_empty());
@@ -30084,13 +30462,10 @@ async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call
 
     let error = recv_error_by_id(&mut rx, "codexreviewstart00001").await;
     assert_eq!(error.error.code, INVALID_REQUEST_CODE);
-    assert!(
-        error
-            .error
-            .message
-            .contains("review start is not supported"),
-        "error should mention unsupported review start: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
     assert!(cli_session.turn_starts.lock().await.is_empty());
     assert!(
@@ -30193,13 +30568,10 @@ async fn codex_review_start_custom_instructions_is_rejected_without_runtime_call
 
     let error = recv_error_by_id(&mut rx, "codexreviewstart00002").await;
     assert_eq!(error.error.code, INVALID_REQUEST_CODE);
-    assert!(
-        error
-            .error
-            .message
-            .contains("review start is not supported"),
-        "error should mention unsupported review start: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
     assert!(cli_session.turn_starts.lock().await.is_empty());
 }
@@ -30271,13 +30643,10 @@ async fn codex_review_start_rejects_before_target_validation() {
 
     let error = recv_error_by_id(&mut rx, "codexreviewbadtarget1").await;
     assert_eq!(error.error.code, INVALID_REQUEST_CODE);
-    assert!(
-        error
-            .error
-            .message
-            .contains("review start is not supported"),
-        "error should mention unsupported review start: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
 }
 
@@ -30370,13 +30739,10 @@ async fn codex_compaction_start_is_rejected_without_runtime_call() {
 
     let error = recv_error_by_id(&mut rx, "codexcompactstart0001").await;
     assert_eq!(error.error.code, INVALID_REQUEST_CODE);
-    assert!(
-        error
-            .error
-            .message
-            .contains("thread compaction is not supported"),
-        "error should mention unsupported compaction: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
     assert!(cli_session.thread_compactions.lock().await.is_empty());
 }
@@ -30465,11 +30831,10 @@ async fn codex_compaction_start_rejects_wrong_backend() {
         .await;
 
     let error = recv_error_by_id(&mut rx, "codexcompactstart0002").await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("thread compaction is not supported")
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
     assert!(cli_session.thread_compactions.lock().await.is_empty());
 }
@@ -30724,7 +31089,6 @@ async fn codex_thread_ops_fork_creates_pioneer_thread_and_native_binding() {
         serde_json::from_value(response.result).expect("fork result should decode");
     assert_eq!(result.thread.id, "thread_codex_ops_fork");
     assert_eq!(result.thread.name.as_deref(), Some("Forked source"));
-    assert_eq!(result.native_thread_id, "codex-native-forked");
     let _fork_started = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
 
     let forks = cli_session.thread_forks.lock().await;
@@ -31149,32 +31513,6 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
         "codex-thread-db-only-terminal",
     )
     .await;
-    crud_store
-        .materialize_turn_completed(
-            TurnCompletedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: thread_id.to_owned(),
-                turn: Turn {
-                    id: turn_id.to_owned(),
-                    status: TurnStatus::Completed,
-                    turn_kind: TurnKind::default(),
-                    origin: TurnOrigin::User,
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-            },
-            chrono::Utc::now().timestamp(),
-        )
-        .await
-        .expect("turn should complete in durable store");
-
     let pending_payload = CLIRuntimePendingRequest {
         kind: CLIRuntimeRequestKind::CommandApproval,
         title: Some("Run terminal command".to_owned()),
@@ -31204,6 +31542,31 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
         })
         .await
         .expect("pending request should open");
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn: Turn {
+                    id: turn_id.to_owned(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::default(),
+                    origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .expect("turn should complete in durable store after opening the request");
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
@@ -31638,10 +32001,21 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
                 text: "run in background".to_owned(),
                 text_elements: Vec::new(),
             }],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
         )
         .await
         .expect("unloaded turn should materialize");
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "codex",
+        "codex",
+    )
+    .await;
     assert!(
         processor
             .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
@@ -33071,18 +33445,20 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     let launch_specs = Arc::new(TokioMutex::new(Vec::new()));
     let cli_manager =
         test_cli_runtime_manager_with_launch_specs(cli_session.clone(), Some(launch_specs.clone()));
-    let processor = MessageProcessor::new(
-        thread_manager.clone(),
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager.clone(),
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
     let thread_id = "thread_cli_interrupted_recovery";
     let continuation_thread_id = if detached_child_owner {
         "thread_cli_interrupted_recovery_parent"
@@ -33151,10 +33527,65 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
             turn_outcome.materialization.sandbox_mode,
             &turn_outcome.materialization.turn,
             &turn_outcome.materialization.input,
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
         )
         .await
         .expect("CLI recovery turn should materialize");
+    if detached_child_owner {
+        let now = super::now_timestamp_secs();
+        crud_store
+            .upsert_thread_model(
+                &Thread {
+                    workspace_id: workspace_id.clone(),
+                    id: continuation_thread_id.to_owned(),
+                    name: Some("CLI recovery parent".to_owned()),
+                    preview: String::new(),
+                    mode: ThreadMode::Agent,
+                    model: "o4-mini".to_owned(),
+                    model_provider: "openai".to_owned(),
+                    reasoning_effort: None,
+                    created_at: now,
+                    updated_at: now,
+                    status: ThreadStatus::Active,
+                    origin_kind: ThreadOriginKind::User,
+                    sidebar_visibility: ThreadSidebarVisibility::Visible,
+                    agent_nickname: None,
+                    agent_role: None,
+                    visibility: None,
+                    turns: Vec::new(),
+                },
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("detached recovery parent should materialize");
+        crud_store
+            .database_connection()
+            .execute_unprepared(&format!(
+                "UPDATE thread SET access_class='private' WHERE id='{continuation_thread_id}';\
+                 UPDATE thread SET access_class='internal', origin_kind='task_run', \
+                    sidebar_visibility='hidden' WHERE id='{thread_id}';\
+                 INSERT INTO thread_lineage(\
+                    child_thread_id,parent_thread_id,root_thread_id,depth,created_at,\
+                    origin_kind,created_by_thread_id,created_by_turn_id\
+                 ) VALUES(\
+                    '{thread_id}','{continuation_thread_id}','{continuation_thread_id}',1,\
+                    CURRENT_TIMESTAMP,'task_run','{continuation_thread_id}',NULL\
+                 );"
+            ))
+            .await
+            .expect("detached recovery lineage should materialize");
+    }
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        continuation_thread_id,
+        turn_id,
+        "codex",
+        "codex",
+    )
+    .await;
 
     let recovery_instruction_text =
         "## Pioneer CLI Runtime Instructions\n\nContinue the interrupted Pioneer turn.";
@@ -33886,32 +34317,6 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
         "codex-thread-stale-db-terminal",
     )
     .await;
-    crud_store
-        .materialize_turn_completed(
-            TurnCompletedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: thread_id.to_owned(),
-                turn: Turn {
-                    id: turn_id.to_owned(),
-                    status: TurnStatus::Completed,
-                    turn_kind: TurnKind::default(),
-                    origin: TurnOrigin::User,
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: default_test_permission_profile(),
-                },
-            },
-            chrono::Utc::now().timestamp(),
-        )
-        .await
-        .expect("turn should complete in durable store");
-
     let pending_payload = CLIRuntimePendingRequest {
         kind: CLIRuntimeRequestKind::CommandApproval,
         title: Some("Run stale terminal command".to_owned()),
@@ -33941,6 +34346,31 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
         })
         .await
         .expect("pending request should open");
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn: Turn {
+                    id: turn_id.to_owned(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::default(),
+                    origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .expect("turn should complete in durable store after opening the request");
 
     processor
         .fail_stale_cli_runtime_turns(chrono::Utc::now().fixed_offset().timestamp_millis())
@@ -34011,8 +34441,8 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             workspace_id.as_str(),
             "thread_codex_steer",
             "turn_codex_steer",
-            "claude",
-            "claude",
+            "codex",
+            "codex",
         )
         .await;
 
@@ -34049,39 +34479,6 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             .await
             .expect("CLI runtime session should be active for steering");
 
-        let denied_steer_payload = json!({
-            "jsonrpc": "2.0",
-            "id": "codexsteer00000000000",
-            "method": pioneer_protocol::constants::methods::CLI_RUNTIME_TURN_STEER,
-            "params": {
-                "workspace_id": workspace_id,
-                "runtime_id": "codex",
-                "thread_id": "thread_codex_steer",
-                "turn_id": "turn_codex_steer",
-                "message": "Use a runtime outside the frozen projection"
-            }
-        })
-        .to_string();
-        message_future(
-            processor.process_request_for_connection(connection_id, &denied_steer_payload),
-        )
-        .await;
-
-        let denied = recv_error_by_id(&mut rx, "codexsteer00000000000").await;
-        assert_eq!(denied.error.code, pioneer_protocol::NOT_FOUND_CODE);
-        assert_eq!(denied.error.message, "not_found");
-        assert!(cli_session.turn_steers.lock().await.is_empty());
-
-        persist_test_cli_execution_authorization_context(
-            crud_store.as_ref(),
-            workspace_id.as_str(),
-            "thread_codex_steer",
-            "turn_codex_steer",
-            "codex",
-            "codex",
-        )
-        .await;
-
         let steer_payload = json!({
             "jsonrpc": "2.0",
             "id": "codexsteer00000000001",
@@ -34104,8 +34501,6 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
         assert_eq!(result.runtime_id, "codex");
         assert_eq!(result.thread_id, "thread_codex_steer");
         assert_eq!(result.turn_id, "turn_codex_steer");
-        assert_eq!(result.native_thread_id, "codex-thread-steer");
-        assert_eq!(result.native_turn_id, "codex-turn-steer");
 
         let steers = cli_session.turn_steers.lock().await;
         assert_eq!(steers.len(), 1);
@@ -34198,13 +34593,10 @@ async fn codex_steer_rejects_missing_active_runtime_session() {
     message_future(processor.process_request_for_connection(connection_id, &steer_payload)).await;
 
     let error = recv_error_by_id(&mut rx, "codexsteer00000000004").await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("CLI runtime session is not active"),
-        "error should mention missing active session: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
     assert!(cli_session.turn_steers.lock().await.is_empty());
 }
@@ -34256,10 +34648,10 @@ async fn codex_steer_rejects_missing_active_turn_binding() {
     message_future(processor.process_request_for_connection(connection_id, &steer_payload)).await;
 
     let error = recv_error_by_id(&mut rx, "codexsteer00000000002").await;
-    assert!(
-        error.error.message.contains("not bound to a CLI runtime"),
-        "error should mention missing active CLI runtime turn binding: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
     assert!(cli_session.turn_steers.lock().await.is_empty());
 }
@@ -34335,19 +34727,16 @@ async fn codex_steer_rejects_wrong_backend() {
     message_future(processor.process_request_for_connection(connection_id, &steer_payload)).await;
 
     let error = recv_error_by_id(&mut rx, "codexsteer00000000003").await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("is not supported for `claude` turns"),
-        "error should mention backend mismatch: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
     assert!(cli_session.turn_steers.lock().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_request_respond_is_scoped_to_the_initiating_session() {
+async fn cli_runtime_request_respond_allows_another_current_collaborator_session() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -34389,12 +34778,10 @@ async fn cli_runtime_request_respond_is_scoped_to_the_initiating_session() {
         .await
         .expect("CLI runtime session should be active for native request response");
 
+    ensure_test_superuser_secondary_session_authority(crud_store.as_ref()).await;
     let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
-    let mut foreign_principal = authenticated_test_superuser().as_ref().clone();
-    foreign_principal.session_id = pioneer_protocol::AuthSessionId::new("S00000000000000000002")
-        .expect("foreign CLI response session id");
     let foreign_connection_id = session_manager
-        .register_connection(foreign_tx, Arc::new(foreign_principal))
+        .register_connection(foreign_tx, authenticated_test_superuser_secondary_session())
         .await
         .expect("foreign CLI response session should register");
     session_manager
@@ -34441,10 +34828,15 @@ async fn cli_runtime_request_respond_is_scoped_to_the_initiating_session() {
         opened_payload.request.native_request_id.as_deref(),
         Some("codex-native-request-1")
     );
-    assert!(
-        foreign_rx.try_recv().is_err(),
-        "CLI approval prompts must not be shown to a different session that cannot answer them"
-    );
+    let foreign_opened =
+        recv_notification_by_method(&mut foreign_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let foreign_opened_payload: CLIRuntimeRequestOpenedNotification = serde_json::from_value(
+        foreign_opened
+            .params
+            .expect("collaborator request_opened params"),
+    )
+    .expect("collaborator request_opened payload should decode");
+    assert_eq!(foreign_opened_payload.request_id, pending_request_id);
     processor
         .process_request_for_connection(
             foreign_connection_id,
@@ -34462,40 +34854,9 @@ async fn cli_runtime_request_respond_is_scoped_to_the_initiating_session() {
             .to_string(),
         )
         .await;
-    let foreign_error = recv_error_by_id(&mut foreign_rx, "cliruntime_foreign001").await;
-    assert_eq!(foreign_error.error.message, "not_found");
-    assert_eq!(
-        crud_store
-            .get_cli_runtime_pending_request(pending_request_id.as_str())
-            .await
-            .expect("foreign response pending request lookup should succeed")
-            .expect("foreign response must not consume the pending request")
-            .status,
-        pioneer_crud::CliRuntimePendingRequestStatus::Pending
-    );
-    assert!(cli_session.responses.lock().await.is_empty());
-
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "cliruntime_reqresp001",
-                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
-                "params": {
-                    "workspace_id": workspace_id,
-                    "runtime_id": "codex",
-                    "request_id": pending_request_id.clone(),
-                    "resolution": { "status": "approved" }
-                }
-            })
-            .to_string(),
-        )
-        .await;
-
     let (response, resolved) = recv_response_and_notification_by_id_method(
-        &mut rx,
-        "cliruntime_reqresp001",
+        &mut foreign_rx,
+        "cliruntime_foreign001",
         events::CLI_RUNTIME_REQUEST_RESOLVED,
     )
     .await;
@@ -34534,6 +34895,16 @@ async fn cli_runtime_request_respond_is_scoped_to_the_initiating_session() {
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].0, json!("codex-native-request-1"));
     assert_eq!(responses[0].1, json!({"decision": "accept"}));
+
+    let initiator_resolved =
+        recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_RESOLVED).await;
+    let initiator_resolved_payload: CLIRuntimeRequestResolvedNotification = serde_json::from_value(
+        initiator_resolved
+            .params
+            .expect("initiator resolved params"),
+    )
+    .expect("initiator resolved payload should decode");
+    assert_eq!(initiator_resolved_payload.request_id, pending_request_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -34648,7 +35019,7 @@ async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_permission_request_respond_is_scoped_to_the_initiating_session() {
+async fn turn_permission_request_respond_allows_another_current_collaborator_session() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -34675,12 +35046,20 @@ async fn turn_permission_request_respond_is_scoped_to_the_initiating_session() {
         "turn_native_permission",
     )
     .await;
-    persist_test_execution_authorization_context(
+    let connection = processor
+        .session_manager
+        .connection_context(connection_id)
+        .await
+        .expect("test connection context");
+    persist_test_execution_authorization_context_for_principal_with_profile(
         &processor,
-        connection_id,
+        connection.principal(),
         workspace_id.as_str(),
         "thread_native_permission",
         "turn_native_permission",
+        &pioneer_protocol::system_turn_permission_profile_snapshot(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+        ),
     )
     .await;
     subscribe_test_connection_to_materialized_thread(
@@ -34690,12 +35069,10 @@ async fn turn_permission_request_respond_is_scoped_to_the_initiating_session() {
         "thread_native_permission",
     )
     .await;
+    ensure_test_superuser_secondary_session_authority(processor.crud_store.as_ref()).await;
     let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
-    let mut foreign_principal = authenticated_test_superuser().as_ref().clone();
-    foreign_principal.session_id =
-        pioneer_protocol::AuthSessionId::new("S00000000000000000002").expect("foreign session id");
     let foreign_connection_id = session_manager
-        .register_connection(foreign_tx, Arc::new(foreign_principal))
+        .register_connection(foreign_tx, authenticated_test_superuser_secondary_session())
         .await
         .expect("foreign test session should register");
     session_manager
@@ -34742,9 +35119,15 @@ async fn turn_permission_request_respond_is_scoped_to_the_initiating_session() {
         opened_params["request"]["action"],
         serde_json::json!("shell_command")
     );
-    assert!(
-        foreign_rx.try_recv().is_err(),
-        "another subscribed session must not see an approval it cannot answer"
+    let foreign_opened =
+        recv_notification_by_method(&mut foreign_rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    let foreign_opened_params = foreign_opened
+        .params
+        .as_ref()
+        .expect("collaborator opened params");
+    assert_eq!(
+        foreign_opened_params["request"]["request_id"],
+        serde_json::json!("perm-approval-request-1")
     );
     let foreign_response_id = "permissionforeign0001";
     processor
@@ -34756,44 +35139,21 @@ async fn turn_permission_request_respond_is_scoped_to_the_initiating_session() {
                 "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
                 "params": {
                     "request_id": "perm-approval-request-1",
-                    "resolution": "allow_for_turn"
+                    "resolution": "allow_once"
                 }
             })
             .to_string(),
         )
         .await;
-    let foreign_response = recv_error_by_id(&mut foreign_rx, foreign_response_id).await;
-    assert_eq!(foreign_response.error.message, "not_found");
-    assert!(
-        processor
-            .native_permission_pending_requests
-            .lock()
-            .await
-            .contains_key("perm-approval-request-1"),
-        "foreign session must not consume the legitimate pending request"
-    );
-
-    let respond_payload = json!({
-        "jsonrpc": "2.0",
-        "id": "permissionrespond0001",
-        "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
-        "params": {
-            "request_id": "perm-approval-request-1",
-            "resolution": "allow_for_turn"
-        }
-    })
-    .to_string();
-    message_future(processor.process_request_for_connection(connection_id, &respond_payload)).await;
-
     let (response, resolved) = recv_response_and_notification_by_id_method(
-        &mut rx,
-        "permissionrespond0001",
+        &mut foreign_rx,
+        foreign_response_id,
         events::TURN_PERMISSION_REQUEST_RESOLVED,
     )
     .await;
     assert_eq!(
         response.result["resolution"],
-        serde_json::json!("allow_for_turn")
+        serde_json::json!("allow_once")
     );
     let resolved_params = resolved.params.as_ref().expect("resolved params");
     assert_eq!(
@@ -34802,7 +35162,7 @@ async fn turn_permission_request_respond_is_scoped_to_the_initiating_session() {
     );
     assert_eq!(
         resolved_params["resolution"],
-        serde_json::json!("allow_for_turn")
+        serde_json::json!("allow_once")
     );
 
     let resolution = respond_rx
@@ -34810,11 +35170,24 @@ async fn turn_permission_request_respond_is_scoped_to_the_initiating_session() {
         .expect("native permission broker should receive response");
     assert_eq!(
         resolution,
-        pioneer_tools::PermissionApprovalResolution::AllowForTurn
+        pioneer_tools::PermissionApprovalResolution::AllowOnce
     );
     assert!(
-        foreign_rx.try_recv().is_err(),
-        "resolution must remain scoped to the initiating session"
+        !processor
+            .native_permission_pending_requests
+            .lock()
+            .await
+            .contains_key("perm-approval-request-1"),
+        "the collaborator response must consume the pending request exactly once"
+    );
+    let initiator_resolved =
+        recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_RESOLVED).await;
+    assert_eq!(
+        initiator_resolved
+            .params
+            .as_ref()
+            .expect("initiator resolved params")["request_id"],
+        serde_json::json!("perm-approval-request-1")
     );
 }
 
@@ -34917,6 +35290,15 @@ async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_sc
         )
         .await
         .expect("grandchild task lineage should persist");
+    processor
+        .crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "UPDATE thread SET access_class='internal', origin_kind='task_run', \
+             sidebar_visibility='hidden' WHERE id IN ('{child_thread_id}','{grandchild_thread_id}')"
+        ))
+        .await
+        .expect("permission child threads should use the production internal access class");
     persist_test_execution_authorization_context(
         &processor,
         connection_id,
@@ -35263,8 +35645,8 @@ async fn cli_runtime_request_respond_rejects_pending_without_turn_binding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_command_approval_accept_for_session_sends_codex_decision() {
-    let (processor, connection_id, mut rx, workspace_id, _crud_store, cli_session) =
+async fn cli_runtime_command_approval_rejects_legacy_session_scope() {
+    let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
     let opened =
         open_test_codex_command_approval(&processor, &mut rx, workspace_id.as_str(), json!(777))
@@ -35312,21 +35694,26 @@ async fn cli_runtime_command_approval_accept_for_session_sends_codex_decision() 
         )
         .await;
 
-    let (response, _resolved) = recv_response_and_notification_by_id_method(
-        &mut rx,
-        "cmdapproval_session01",
-        events::CLI_RUNTIME_REQUEST_RESOLVED,
-    )
-    .await;
-    let result: CLIRuntimeRequestRespondResponse =
-        serde_json::from_value(response.result).expect("respond result should decode");
-    assert_eq!(result.status, CLIRuntimePendingRequestStatus::Answered);
+    let error = recv_error_by_id(&mut rx, "cmdapproval_session01").await;
+    assert_eq!(error.error.code, INVALID_PARAMS_CODE);
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Execution,
+    );
 
     let responses = cli_session.responses.lock().await;
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].0, json!(777));
-    assert_eq!(responses[0].1, json!({"decision": "acceptForSession"}));
+    assert!(responses.is_empty());
     assert!(cli_session.interrupts.lock().await.is_empty());
+    let pending = crud_store
+        .get_cli_runtime_pending_request(opened.request_id.as_str())
+        .await
+        .expect("pending request should load")
+        .expect("pending request should remain");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -35470,6 +35857,14 @@ async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reache
         )
         .await
         .expect("grandchild task lineage should persist");
+    crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "UPDATE thread SET access_class='internal', origin_kind='task_run', \
+             sidebar_visibility='hidden' WHERE id IN ('{child_thread_id}','{grandchild_thread_id}')"
+        ))
+        .await
+        .expect("approval child threads should use the production internal access class");
     persist_test_cli_execution_authorization_context(
         crud_store.as_ref(),
         workspace_id.as_str(),
@@ -36018,8 +36413,8 @@ async fn cli_runtime_file_change_approval_allow_preserves_paths_and_truncates_la
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_file_change_approval_accept_for_session_sends_codex_decision() {
-    let (processor, connection_id, mut rx, workspace_id, _crud_store, cli_session) =
+async fn cli_runtime_file_change_approval_rejects_legacy_session_scope() {
+    let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
     let opened = open_test_codex_file_change_approval(
         &processor,
@@ -36052,20 +36447,25 @@ async fn cli_runtime_file_change_approval_accept_for_session_sends_codex_decisio
         )
         .await;
 
-    let (response, _resolved) = recv_response_and_notification_by_id_method(
-        &mut rx,
-        response_id,
-        events::CLI_RUNTIME_REQUEST_RESOLVED,
-    )
-    .await;
-    let result: CLIRuntimeRequestRespondResponse =
-        serde_json::from_value(response.result).expect("respond result should decode");
-    assert_eq!(result.status, CLIRuntimePendingRequestStatus::Answered);
+    let error = recv_error_by_id(&mut rx, response_id).await;
+    assert_eq!(error.error.code, INVALID_PARAMS_CODE);
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Execution,
+    );
 
     let responses = cli_session.responses.lock().await;
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].0, json!("file-approval-session"));
-    assert_eq!(responses[0].1, json!({"decision": "acceptForSession"}));
+    assert!(responses.is_empty());
+    let pending = crud_store
+        .get_cli_runtime_pending_request(opened.request_id.as_str())
+        .await
+        .expect("pending request should load")
+        .expect("pending request should remain");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -36329,10 +36729,10 @@ async fn cli_runtime_user_input_request_invalid_answers_are_rejected_before_nati
         .await;
 
     let error = recv_error_by_id(&mut rx, "userinput_invalid0001").await;
-    assert!(
-        error.error.message.contains("answer for question `mode`"),
-        "invalid answer error should identify question: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Execution,
     );
     assert!(cli_session.responses.lock().await.is_empty());
 
@@ -36803,13 +37203,10 @@ async fn cli_runtime_request_response_after_human_sla_expires_request_and_blocks
         .await;
 
     let error = recv_error_by_id(&mut rx, "cmdapproval_expired01").await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("expired after waiting for user response"),
-        "expired response error should be explicit: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Execution,
     );
 
     let pending = crud_store
@@ -37006,6 +37403,8 @@ async fn materialize_cli_runtime_approval_turn(
     thread_id: &str,
     turn_id: &str,
 ) {
+    ensure_test_superuser_execution_authority(crud_store).await;
+    let execution_principal = authenticated_test_superuser();
     let now_secs = chrono::Utc::now().timestamp();
     let thread = Thread {
         workspace_id: workspace_id.to_owned(),
@@ -37050,7 +37449,9 @@ async fn materialize_cli_runtime_approval_turn(
                 text: "approval".to_owned(),
                 text_elements: Vec::new(),
             }],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                execution_principal.principal_id.clone(),
+            ),
         )
         .await
         .expect("CLI approval test turn should materialize");
@@ -37739,7 +38140,25 @@ async fn persist_agent_skill_snapshot_for_resolution_test(
     turn_id: &str,
     entry: &AgentSkillRuntimeEntry,
 ) {
-    let mut overlay = vec![entry.clone()];
+    persist_agent_skill_snapshot_for_resolution_tests(
+        processor,
+        workspace_id,
+        thread_id,
+        turn_id,
+        std::slice::from_ref(entry),
+    )
+    .await;
+}
+
+async fn persist_agent_skill_snapshot_for_resolution_tests(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    entries: &[AgentSkillRuntimeEntry],
+) {
+    ensure_test_superuser_execution_turn(processor, workspace_id, thread_id, turn_id).await;
+    let mut overlay = entries.to_vec();
     let workspace_skill_policies =
         HashMap::<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>::new();
     let runtime_environment = HashMap::<String, String>::new();
@@ -37767,8 +38186,7 @@ async fn persist_agent_skill_snapshot_for_resolution_test(
         )
         .await
         .expect("Agent skill snapshot fixture must persist");
-    assert_eq!(overlay.len(), 1);
-    assert_eq!(overlay[0].skill_id, entry.skill_id);
+    assert_eq!(overlay, entries);
 }
 
 fn agent_skill_resolution_fixture() -> AgentSkillRuntimeEntry {
@@ -37895,9 +38313,39 @@ async fn agent_skill_resolution_event_rejects_exposure_that_does_not_match_pins(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
+    let base_dir = unique_temp_dir("agent_skill_projection_persistence");
+    let system_root = base_dir.join("system");
+    let user_root = base_dir.join("user");
+    let workspace_root = base_dir.join("workspace");
+    let registry_root = base_dir.join("registry");
+    std::fs::create_dir_all(&system_root).expect("create system skill root");
+    std::fs::create_dir_all(&workspace_root).expect("create workspace skill root");
+    std::fs::create_dir_all(&registry_root).expect("create registry skill root");
+    let first_path = write_test_skill(&user_root, "projection-first", "", "first body");
+    let second_path = write_test_skill(&user_root, "projection-second", "", "second body");
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let session_manager = Arc::new(SessionManager::new());
+    let first_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'S',
+        workspace_id.as_str(),
+        "user",
+        first_path.as_path(),
+        Some("pioneer"),
+        "projection-first",
+    )
+    .await;
+    let second_id = seed_test_skill_installation(
+        crud_store.as_ref(),
+        'T',
+        workspace_id.as_str(),
+        "user",
+        second_path.as_path(),
+        Some("pioneer"),
+        "projection-second",
+    )
+    .await;
 
     let processor = MessageProcessor::new(
         thread_manager,
@@ -37908,38 +38356,66 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
-        test_tool_loop_config(),
+        test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
+    let thread_id = "thr_000000000000000020";
     let turn_id = "turn_000000000000000020";
-    processor
+    ensure_test_superuser_execution_turn(&processor, workspace_id.as_str(), thread_id, turn_id)
+        .await;
+    let runtime_context = processor
+        .skills_runtime_context(workspace_id.as_str())
+        .expect("skill runtime context must resolve");
+    let catalog = processor
+        .load_skills_catalog(workspace_id.as_str(), &runtime_context)
+        .await
+        .expect("installed skill catalog must load");
+    let binding_for = |skill_id: &pioneer_protocol::SkillId| {
+        let identity = &catalog
+            .skills
+            .iter()
+            .find(|skill| skill.identity.skill_id == *skill_id)
+            .expect("seeded skill must be present in the catalog")
+            .identity;
+        TurnSkillBinding {
+            skill_id: identity.skill_id.clone(),
+            skill_owner: identity.owner.clone(),
+            skill_slug: identity.slug.clone(),
+            skill_version: identity.version_hint.clone(),
+            fingerprint: identity.fingerprint.clone(),
+            source_kind: identity.source_kind.as_db_value().to_owned(),
+            resolved_reason: "explicit_composer_capability".to_owned(),
+        }
+    };
+    let first = binding_for(&first_id);
+    let second = binding_for(&second_id);
+    let committed = processor
         .handle_durable_agent_event(AgentDurableEvent::TurnSkillsResolved {
-            thread_id: "thr_000000000000000020".to_owned(),
+            thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             bindings: vec![
                 TurnSkillBinding {
-                    skill_id: pioneer_protocol::SkillId::new("SSSSSSSSSSSSSSSSSSSSS")
-                        .expect("valid binding SkillId"),
-                    skill_owner: Some("pioneer".to_owned()),
-                    skill_slug: "pioneer/my-skill".to_owned(),
-                    skill_version: Some("1.2.3".to_owned()),
-                    fingerprint: "fp-my-skill".to_owned(),
-                    source_kind: "user".to_owned(),
+                    skill_id: first.skill_id.clone(),
+                    skill_owner: first.skill_owner.clone(),
+                    skill_slug: first.skill_slug.clone(),
+                    skill_version: first.skill_version.clone(),
+                    fingerprint: first.fingerprint.clone(),
+                    source_kind: first.source_kind.clone(),
                     resolved_reason: "explicit_composer_capability".to_owned(),
                 },
                 TurnSkillBinding {
-                    skill_id: pioneer_protocol::SkillId::new("TTTTTTTTTTTTTTTTTTTTT")
-                        .expect("valid duplicate-label binding SkillId"),
-                    skill_owner: Some("pioneer".to_owned()),
-                    skill_slug: "pioneer/my-skill".to_owned(),
-                    skill_version: Some("2.0.0".to_owned()),
-                    fingerprint: "fp-neighbor".to_owned(),
-                    source_kind: "user".to_owned(),
+                    skill_id: second.skill_id.clone(),
+                    skill_owner: second.skill_owner.clone(),
+                    skill_slug: second.skill_slug.clone(),
+                    skill_version: second.skill_version.clone(),
+                    fingerprint: second.fingerprint.clone(),
+                    source_kind: second.source_kind.clone(),
                     resolved_reason: "explicit_composer_capability".to_owned(),
                 },
             ],
         })
         .await;
+    assert!(committed, "exactly pinned skill exposure must commit");
 
     let bindings = crud_store
         .find_turn_skill_bindings(turn_id)
@@ -37948,10 +38424,11 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
     assert_eq!(bindings.len(), 2);
     assert_eq!(bindings[0].skill_id.as_str(), "SSSSSSSSSSSSSSSSSSSSS");
     assert_eq!(bindings[0].skill_owner.as_deref(), Some("pioneer"));
-    assert_eq!(bindings[0].skill_slug, "pioneer/my-skill");
+    assert_eq!(bindings[0].skill_slug, "projection-first");
     assert_eq!(bindings[0].resolved_reason, "explicit_composer_capability");
     assert_eq!(bindings[1].skill_id.as_str(), "TTTTTTTTTTTTTTTTTTTTT");
-    assert_eq!(bindings[1].skill_slug, "pioneer/my-skill");
+    assert_eq!(bindings[1].skill_slug, "projection-second");
+    let _ = std::fs::remove_dir_all(base_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -38025,7 +38502,7 @@ async fn agent_skill_binding_failure_fails_closed_before_execution() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_skill_audit_event_persists_audit_rows() {
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, _workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let session_manager = Arc::new(SessionManager::new());
 
     let processor = MessageProcessor::new(
@@ -38041,6 +38518,13 @@ async fn agent_skill_audit_event_persists_audit_rows() {
     );
 
     let turn_id = "turn_000000000000000021";
+    ensure_test_superuser_execution_turn(
+        &processor,
+        workspace_id.as_str(),
+        "thr_000000000000000021",
+        turn_id,
+    )
+    .await;
     let audit_skill_id =
         pioneer_protocol::SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("valid audit SkillId");
     processor
@@ -38110,9 +38594,16 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            Arc::new(DelayedProvider {
+                delay: Duration::from_secs(5),
+                text: "delayed manifest response".to_owned(),
+            }),
+        ));
         let processor = MessageProcessor::new(
             thread_manager.clone(),
-            test_provider(),
+            provider_registry,
             session_manager,
             workspace_manager,
             crud_store.clone(),
@@ -38147,6 +38638,9 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             "params": {
                 "thread_id": thread_id,
                 "turn_id": turn_id,
+                "mode": "Agent",
+                "model": "o4-mini",
+                "model_provider": "openai",
                 "input": [{"type": "text", "text": "manifest me"}]
             }
         });
@@ -38159,6 +38653,26 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             events::TURN_STARTED,
         )
         .await;
+        let _execution_lease = processor
+            .register_execution_lease(turn_id)
+            .await
+            .expect("prompt-manifest fixture execution lease should register");
+        assert!(
+            processor
+                .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowStarted {
+                    notification: pioneer_protocol::TurnExecutionWindowStartedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_id: "prompt_manifest_fixture_window".to_owned(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        started_at_unix_ms: 1_000,
+                    },
+                })
+                .await,
+            "prompt-manifest fixture execution window should persist"
+        );
 
         let manifest = PromptManifest {
             compiler_version: "0.1.0-test".to_owned(),
@@ -38885,7 +39399,7 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_cancel_rejects_non_subscribed_connection() {
+async fn turn_cancel_allows_authorized_non_subscribed_connection() {
     let (tx_owner, mut rx_owner) = mpsc::channel(16);
     let (tx_foreign, mut rx_foreign) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
@@ -38965,9 +39479,10 @@ async fn turn_cancel_rejects_non_subscribed_connection() {
         .process_request_for_connection(foreign_connection_id, &cancel_request.to_string())
         .await;
 
-    let error = recv_error_by_id(&mut rx_foreign, cancel_request_id.as_str()).await;
-    assert_eq!(error.error.code, INVALID_REQUEST_CODE);
-    assert!(error.error.message.contains("is not subscribed"));
+    let response = recv_response_by_id(&mut rx_foreign, cancel_request_id.as_str()).await;
+    let response: TurnCancelResponse =
+        serde_json::from_value(response.result).expect("authorized cancel response should decode");
+    assert_eq!(response.turn.status, TurnStatus::Interrupted);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -40064,14 +40579,8 @@ fn thread_agents_doc_rpc_rejects_large_content_and_version_conflicts() {
             .process_request_for_connection(connection_id, &conflict_save.to_string())
             .await;
         let conflict_error = recv_error_by_id(&mut rx, "agentsdocconflict0001").await;
-        assert_eq!(
-            conflict_error.error.code,
-            pioneer_protocol::INVALID_REQUEST_CODE
-        );
-        assert!(
-            conflict_error.error.message.contains("version conflict"),
-            "version conflict should be explicit in error message"
-        );
+        assert_eq!(conflict_error.error.code, pioneer_protocol::NOT_FOUND_CODE);
+        assert_eq!(conflict_error.error.message, "not_found");
     });
 }
 
@@ -40181,7 +40690,7 @@ async fn turn_items_returns_stream_events_for_resume() {
     let turn_items_request = json!({
         "jsonrpc": "2.0",
         "id": "ccccccccccccccccccccc",
-        "method": "turn/items",
+        "method": "turn/items/page",
         "params": {
             "thread_id": "thr_000000000000000022",
             "turn_id": "turn_000000000000000022"
@@ -41569,6 +42078,16 @@ async fn live_semantic_timeline_grandchild_pending_request_projects_to_every_anc
         )
         .await
         .expect("grandchild task lineage should persist");
+    harness
+        .processor
+        .crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "UPDATE thread SET access_class='internal', origin_kind='task_run', \
+             sidebar_visibility='hidden' WHERE id IN ('{child_thread_id}','{grandchild_thread_id}')"
+        ))
+        .await
+        .expect("semantic child threads should use the production internal access class");
     persist_test_cli_execution_authorization_context(
         harness.processor.crud_store.as_ref(),
         harness.workspace_id.as_str(),
@@ -41953,7 +42472,9 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
                 text: format!("semantic live {case_id} input"),
                 text_elements: Vec::new(),
             }],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
         )
         .await
         .expect("live semantic turn start should persist");
@@ -43615,10 +44136,10 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
         .await;
 
     let error = recv_error_by_id(&mut rx, "cliruntime_reqblock01").await;
-    assert!(
-        error.error.message.contains("binding status is `blocked`"),
-        "error should mention blocked binding: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Execution,
     );
 
     let pending = crud_store
@@ -43763,10 +44284,10 @@ async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requ
     );
 
     let error = recv_error_by_id(&mut rx, "cliruntime_reqdone001").await;
-    assert!(
-        error.error.message.contains("completed"),
-        "error should mention completed turn: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Execution,
     );
 
     for request_id in ["cli-approval-completed-one", "cli-approval-completed-two"] {
@@ -43886,13 +44407,10 @@ async fn cli_runtime_request_respond_rejects_pending_without_active_runtime_sess
         .await;
 
     let error = recv_error_by_id(&mut rx, "cliruntimenoactive001").await;
-    assert!(
-        error
-            .error
-            .message
-            .contains("originating Codex process is not active"),
-        "error should mention missing active session: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::Internal,
+        PublicErrorStage::Execution,
     );
     let pending = crud_store
         .get_cli_runtime_pending_request("cli-approval-no-active-session")
@@ -44020,10 +44538,10 @@ async fn cli_runtime_request_respond_rejects_pending_with_mismatched_native_thre
     );
     let error: JsonRpcErrorResponse =
         serde_json::from_value(response).expect("error response should decode");
-    assert!(
-        error.error.message.contains("request native thread"),
-        "error should mention mismatched native thread: {}",
-        error.error.message
+    assert_public_error(
+        &error,
+        PublicErrorCode::InvalidInput,
+        PublicErrorStage::Execution,
     );
 
     let pending = crud_store
@@ -46888,7 +47406,7 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         label: None,
     };
     processor
-        .enforce_member_skill_capability_projection(
+        .enforce_scoped_skill_capability_projection(
             workspace_id.as_str(),
             std::slice::from_ref(&allowed_member_capability),
         )
@@ -46902,21 +47420,18 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         },
         label: None,
     };
-    assert!(
-        processor
-            .enforce_member_skill_capability_projection(
-                workspace_id.as_str(),
-                std::slice::from_ref(&denied_member_capability),
-            )
-            .await
-            .is_err(),
-        "global catalog availability must not replace explicit workspace policy"
-    );
+    processor
+        .enforce_scoped_skill_capability_projection(
+            workspace_id.as_str(),
+            std::slice::from_ref(&denied_member_capability),
+        )
+        .await
+        .expect("an absent workspace override must inherit the enabled global policy");
     let mut spoofed_member_capability = allowed_member_capability;
     spoofed_member_capability.id = "skill:/private/skill/archive".to_owned();
     assert!(
         processor
-            .enforce_member_skill_capability_projection(
+            .enforce_scoped_skill_capability_projection(
                 workspace_id.as_str(),
                 std::slice::from_ref(&spoofed_member_capability),
             )
@@ -46937,7 +47452,11 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         .validate_turn_skill_capabilities(workspace_id.as_str(), std::slice::from_ref(&unavailable))
         .await
         .expect_err("unavailable exact ID must fail");
-    assert!(unavailable_error.contains("is unavailable"));
+    assert_eq!(
+        unavailable_error.public_code(),
+        PublicErrorCode::Unavailable
+    );
+    assert!(unavailable_error.diagnostic().contains("is unavailable"));
 
     let missing_id =
         pioneer_protocol::SkillId::new("NNNNNNNNNNNNNNNNNNNNN").expect("valid missing SkillId");
@@ -46953,7 +47472,8 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         .validate_turn_skill_capabilities(workspace_id.as_str(), std::slice::from_ref(&missing))
         .await
         .expect_err("missing exact ID must fail");
-    assert!(missing_error.contains("was not found"));
+    assert_eq!(missing_error.public_code(), PublicErrorCode::InvalidInput);
+    assert!(missing_error.diagnostic().contains("was not found"));
 
     let mismatched_key = TurnCapability {
         id: format!("skill:{second_id}"),
@@ -46970,7 +47490,8 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         )
         .await
         .expect_err("capability key must match the exact SkillId");
-    assert!(key_error.contains("must use exact ID"));
+    assert_eq!(key_error.public_code(), PublicErrorCode::InvalidInput);
+    assert!(key_error.diagnostic().contains("must use exact ID"));
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -50705,6 +51226,7 @@ impl pioneer_mcp::McpRuntimeSession for FakeMcpRuntimeSession {
         &mut self,
         raw_tool_name: &str,
         arguments: serde_json::Value,
+        _budget: pioneer_mcp::McpInvocationBudget,
         _timeout: std::time::Duration,
         _cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<pioneer_mcp::McpToolCallResult, pioneer_mcp::McpRuntimeError> {
@@ -50806,10 +51328,6 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
     assert_eq!(installed.name, "resend");
     assert_eq!(installed.status, McpInstallResultStatus::Installed);
     let installed_server = installed.server.as_ref().expect("installed server item");
-    match &installed_server.transport {
-        McpTransportSummary::Stdio { command } => assert_eq!(command, "npx"),
-        other => panic!("expected stdio transport, got {other:?}"),
-    }
     assert_eq!(installed_server.runtime.state, McpRuntimeState::NotStarted);
     assert!(!installed_server.runtime.live);
     assert!(installed_server.policy.enabled);
@@ -50861,6 +51379,8 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
         .await
         .expect("MCP installation find should succeed")
         .expect("resend MCP installation should exist");
+    assert_eq!(row.transport_kind, "stdio");
+    assert!(row.transport_json.contains("npx"));
     let db_json = format!(
         "{}{}{}",
         row.transport_json, row.source_ref, row.secret_refs_json
@@ -51059,12 +51579,6 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
         .server
         .as_ref()
         .expect("installed HTTP server");
-    match &server.transport {
-        McpTransportSummary::StreamableHttp { url } => {
-            assert_eq!(url, "http://127.0.0.1:3000/mcp")
-        }
-        other => panic!("expected streamable_http transport, got {other:?}"),
-    }
     assert_eq!(server.runtime.state, McpRuntimeState::Disabled);
     assert_eq!(server.status, McpServerStatus::Disabled);
     assert!(!server.policy.enabled);
@@ -51077,6 +51591,8 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
         .await
         .expect("MCP installation find should succeed")
         .expect("resend MCP installation should exist");
+    assert_eq!(row.transport_kind, "streamable_http");
+    assert!(row.transport_json.contains("http://127.0.0.1:3000/mcp"));
     assert!(!row.transport_json.contains(secret));
     assert!(!row.source_ref.contains(secret));
     assert!(!row.secret_refs_json.contains(secret));
@@ -51355,6 +51871,11 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
         sleep(Duration::from_millis(50)).await;
     }
 
+    let installation = crud_store_for_assert
+        .find_mcp_server_installation("workspace", workspace_id.as_str(), "resend")
+        .await
+        .expect("MCP installation find should succeed")
+        .expect("resend MCP installation should exist");
     crud_store_for_assert
         .replace_turn_mcp_bindings(
             "turn_mcp_details",
@@ -51366,7 +51887,7 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
                 canonical_callable_name: "mcp_resend_send".to_owned(),
                 provider_callable_name: "mcp_resend_send".to_owned(),
                 catalog_version: "catalog-v1".to_owned(),
-                fingerprint: installed_server.fingerprint.clone(),
+                fingerprint: installation.fingerprint.clone(),
                 canonical_schema_fingerprint: "schema-canonical-v1".to_owned(),
                 provider_schema_fingerprint: "schema-provider-v1".to_owned(),
                 annotations_json: "{}".to_owned(),
@@ -51399,24 +51920,28 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
         serde_json::from_value(details_response.result).expect("mcp/details payload decode");
     assert_eq!(details_payload.server.name, "resend");
     assert_eq!(details_payload.server.status, McpServerStatus::Ready);
-    assert!(details_payload.health.runtime.live);
+    let management = details_payload
+        .management
+        .as_ref()
+        .expect("superuser details should include management data");
+    assert!(management.health.runtime.live);
     assert_eq!(details_payload.catalog.tools.len(), 2);
     assert_eq!(details_payload.catalog.resources.len(), 1);
     assert_eq!(details_payload.catalog.resource_templates.len(), 1);
     assert_eq!(details_payload.catalog.prompts.len(), 1);
     assert!(
-        details_payload
+        management
             .audit
             .iter()
             .any(|event| event.action == "install")
     );
     assert!(
-        details_payload
+        management
             .audit
             .iter()
             .all(|event| !event.details.to_string().contains(secret))
     );
-    let recent_binding = details_payload
+    let recent_binding = management
         .recent_bindings
         .iter()
         .find(|binding| binding.server_name == "resend" && binding.raw_tool_name == "send")
@@ -51520,7 +52045,7 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
         .and_then(|data| data.get("code"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    assert_eq!(code, "mcp.not_found");
+    assert_eq!(code, "not_found");
 
     let _ = std::fs::remove_dir_all(base_dir);
 }
@@ -52993,6 +53518,84 @@ async fn materialize_memory_tools_for_context(
     harness: &MemoryGatewayHarness,
     context: MemoryTurnContext,
 ) -> pioneer_memory::hooks::MemoryToolMaterialization {
+    ensure_test_superuser_execution_authority(harness.crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
+    if harness
+        .crud_store
+        .get_turn(context.thread_id.as_str(), context.turn_id.as_str())
+        .await
+        .expect("memory test turn should load")
+        .is_none()
+    {
+        let now = now_timestamp_secs();
+        let thread = Thread {
+            workspace_id: context.workspace_id.clone(),
+            id: context.thread_id.clone(),
+            name: Some("Memory tool authority fixture".to_owned()),
+            preview: String::new(),
+            mode: context.mode.clone(),
+            model: "test-model".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: now,
+            updated_at: now,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        harness
+            .crud_store
+            .upsert_thread_model(
+                &thread,
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .expect("memory test thread should persist");
+        harness
+            .crud_store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &Turn {
+                    id: context.turn_id.clone(),
+                    status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
+                },
+                &[],
+                pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            )
+            .await
+            .expect("memory test turn should persist");
+    }
+    subscribe_test_connection_to_materialized_thread(
+        harness.processor.as_ref(),
+        harness.connection_id,
+        context.workspace_id.as_str(),
+        context.effective_conversation_thread_id(),
+    )
+    .await;
+    persist_test_execution_authorization_context(
+        harness.processor.as_ref(),
+        harness.connection_id,
+        context.workspace_id.as_str(),
+        context.thread_id.as_str(),
+        context.turn_id.as_str(),
+    )
+    .await;
     let provider =
         crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
     provider
@@ -53657,6 +54260,7 @@ async fn memory_remember_tool_accepts_recurring_instruction_category() {
         json!({
             "content": "The user wants concise direct answers by default.",
             "category": "recurring_instruction",
+            "scope": "thread",
             "key": "recurring_instruction.concise_direct_answers",
             "source_context": "direct_user_conversation",
             "confidence": 0.95,
@@ -53674,8 +54278,8 @@ async fn memory_remember_tool_accepts_recurring_instruction_category() {
         result
             .pointer("/scope/kind")
             .and_then(serde_json::Value::as_str),
-        Some("user"),
-        "recurring instructions should route to user scope by default"
+        Some("thread"),
+        "an execution may persist a recurring instruction only inside its thread capsule"
     );
     assert_eq!(
         result.get("key").and_then(serde_json::Value::as_str),
@@ -53695,9 +54299,10 @@ async fn memory_list_tool_returns_inventory_without_semantic_query() {
         "memory_remember",
         "call_memory_list_seed_name",
         json!({
-            "content": "Имя пользователя — Александр.",
-            "category": "identity",
-            "key": "user_name"
+            "content": "Проект называется Pioneer.",
+            "category": "project_fact",
+            "scope": "thread",
+            "key": "project_name"
         }),
     )
     .await;
@@ -53706,9 +54311,10 @@ async fn memory_list_tool_returns_inventory_without_semantic_query() {
         "memory_remember",
         "call_memory_list_seed_lang",
         json!({
-            "content": "Пользователь предпочитает русский язык для общения.",
-            "category": "preference",
-            "key": "preferred_language"
+            "content": "В проекте используется русский язык для обсуждений.",
+            "category": "project_policy",
+            "scope": "thread",
+            "key": "project_language"
         }),
     )
     .await;
@@ -53718,7 +54324,7 @@ async fn memory_list_tool_returns_inventory_without_semantic_query() {
         "memory_list",
         "call_memory_list_inventory",
         json!({
-            "scopes": ["user"],
+            "scopes": ["thread"],
             "limit": 20
         }),
     )
@@ -53767,32 +54373,6 @@ async fn memory_provider_disabled_runtime_materializes_no_tools() {
 #[tokio::test]
 async fn memory_provider_recall_calls_memory_service() {
     let mut harness = setup_memory_gateway_harness("provider_recall", true).await;
-    let request_context = harness.request_context().await;
-    let remember_id = memory_request_id("providerrecall");
-    harness
-        .processor
-        .memory_remember(
-            &request_context,
-            remember_id.clone(),
-            memory_remember_params(
-                user_memory_scope(),
-                MemoryCategory::Preference,
-                Some("phase09_provider_recall"),
-                "phase09 provider recall should find the green papaya preference",
-            ),
-        )
-        .await;
-    let (remember_response, _) = recv_response_and_notification_by_id_method(
-        &mut harness.rx,
-        remember_id.as_str(),
-        events::MEMORY_CHANGED,
-    )
-    .await;
-    let remember_payload: MemoryRememberResponse =
-        serde_json::from_value(remember_response.result).expect("memory remember response");
-
-    let provider =
-        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
     let recall_context = memory_tool_context(&harness, "provider_recall");
     let thread_start_id = memory_request_id("providerthread");
     let thread_start_request = json!({
@@ -53822,6 +54402,8 @@ async fn memory_provider_recall_calls_memory_service() {
     .await;
     let thread_payload: ThreadStartResponse =
         serde_json::from_value(thread_response.result).expect("thread start response");
+    let provider =
+        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
     harness
         .crud_store
         .materialize_turn_start(
@@ -53843,10 +54425,49 @@ async fn memory_provider_recall_calls_memory_service() {
                 permission_profile: default_test_permission_profile(),
             },
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
         )
         .await
         .expect("turn start should persist for recall scope");
+    persist_test_execution_authorization_context(
+        harness.processor.as_ref(),
+        harness.connection_id,
+        recall_context.workspace_id.as_str(),
+        recall_context.thread_id.as_str(),
+        recall_context.turn_id.as_str(),
+    )
+    .await;
+    let remember_payload = harness
+        .processor
+        .memory_runtime()
+        .service()
+        .remember(
+            harness
+                .processor
+                .memory_runtime()
+                .operation_context_for_authorized_turn(&recall_context, None, true),
+            MemoryRememberParams {
+                provenance: Some(pioneer_protocol::MemoryProvenance {
+                    source_thread_id: Some(recall_context.thread_id.clone()),
+                    source_turn_id: Some(recall_context.turn_id.clone()),
+                    source_item_id: None,
+                    created_by: None,
+                }),
+                ..memory_remember_params(
+                    MemoryScope {
+                        kind: MemoryScopeKind::Thread,
+                        key: recall_context.effective_conversation_thread_id().to_owned(),
+                    },
+                    MemoryCategory::ProjectFact,
+                    Some("phase09_provider_recall"),
+                    "phase09 provider recall should find the green papaya preference",
+                )
+            },
+        )
+        .await
+        .expect("authorized thread-capsule memory seed should persist");
     let snapshot = provider
         .recall_memory(
             recall_context,
@@ -53987,10 +54608,10 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
         "memory_remember",
         "call_memory_remember",
         json!({
-            "content": "phase09 remember tool stores a durable user preference",
-            "category": "preference",
-            "scope": "user",
-            "key": "phase09_remember_preference",
+            "content": "phase09 remember tool stores a durable project fact",
+            "category": "project_fact",
+            "scope": "thread",
+            "key": "phase09_remember_project_fact",
             "source_context": "direct_user_conversation"
         }),
     )
@@ -54006,11 +54627,11 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
             .get("scope")
             .and_then(|scope| scope.get("kind"))
             .and_then(serde_json::Value::as_str),
-        Some("user")
+        Some("thread")
     );
     assert_eq!(
         output.get("category").and_then(serde_json::Value::as_str),
-        Some("preference")
+        Some("project_fact")
     );
     assert!(output.get("provenance").is_some());
     assert_eq!(
@@ -54188,9 +54809,9 @@ async fn memory_task_runtime_context_materializes_all_memory_tools() {
         "memory_remember",
         "call_task_runtime_memory_remember",
         json!({
-            "content": "task runtime can write a durable user memory",
-            "category": "preference",
-            "scope": "user",
+            "content": "task runtime can write durable thread-capsule memory",
+            "category": "project_fact",
+            "scope": "thread",
             "key": "task_runtime_memory_write"
         }),
     )
@@ -54233,10 +54854,10 @@ async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
         "memory_remember",
         "call_memory_search_seed",
         json!({
-            "content": "phase09 search tool finds the silver apricot preference",
-            "category": "preference",
-            "scope": "user",
-            "key": "phase09_search_preference"
+            "content": "phase09 search tool finds the silver apricot project fact",
+            "category": "project_fact",
+            "scope": "thread",
+            "key": "phase09_search_project_fact"
         }),
     )
     .await;
@@ -54252,8 +54873,8 @@ async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
         "call_memory_search",
         json!({
             "query": "silver apricot",
-            "scopes": ["user"],
-            "categories": ["preference"],
+            "scopes": ["thread"],
+            "categories": ["project_fact"],
             "limit": 5,
             "includeProvenance": true
         }),
@@ -54271,11 +54892,11 @@ async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
         hit.get("scope")
             .and_then(|scope| scope.get("kind"))
             .and_then(serde_json::Value::as_str),
-        Some("user")
+        Some("thread")
     );
     assert_eq!(
         hit.get("category").and_then(serde_json::Value::as_str),
-        Some("preference")
+        Some("project_fact")
     );
     assert!(hit.get("provenance").is_some());
 
@@ -54293,7 +54914,7 @@ async fn memory_tool_get_returns_exact_record_with_provenance() {
         json!({
             "content": "phase09 get tool exact detail target",
             "category": "project_fact",
-            "scope": "workspace",
+            "scope": "thread",
             "key": "phase09_get_fact"
         }),
     )
@@ -54330,7 +54951,7 @@ async fn memory_tool_get_returns_exact_record_with_provenance() {
         "call_memory_get_key",
         json!({
             "key": "phase09_get_fact",
-            "scope": "workspace"
+            "scope": "thread"
         }),
     )
     .await;
@@ -54354,9 +54975,9 @@ async fn memory_tool_forget_tombstones_memory_and_suppresses_future_search() {
         "memory_remember",
         "call_memory_forget_seed",
         json!({
-            "content": "phase09 forget tool removes the amber pear target",
-            "category": "preference",
-            "scope": "user",
+            "content": "phase09 forget tool removes the amber pear project fact",
+            "category": "project_fact",
+            "scope": "thread",
             "key": "phase09_forget_target"
         }),
     )
@@ -54403,7 +55024,7 @@ async fn memory_tool_forget_tombstones_memory_and_suppresses_future_search() {
         "call_memory_forget_search",
         json!({
             "query": "amber pear",
-            "scopes": ["user"],
+            "scopes": ["thread"],
             "limit": 5
         }),
     )
@@ -54482,8 +55103,8 @@ async fn memory_tool_duplicate_remember_retry_is_idempotent() {
     let tools = built_memory_tools(&harness, "retry").await;
     let args = json!({
         "content": "phase09 duplicate remember retry stores one logical memory",
-        "category": "preference",
-        "scope": "user"
+        "category": "project_fact",
+        "scope": "thread"
     });
 
     let first =
@@ -54898,41 +55519,16 @@ async fn wait_for_cli_runtime_turn_starts(
     session.turn_starts.lock().await.clone()
 }
 
-async fn wait_for_task_anchor_status(
-    crud_store: Arc<CrudStore>,
-    turn_id: &str,
-    task_id: &str,
-    expected_status: pioneer_protocol::TaskStatus,
-) -> pioneer_protocol::TaskStatus {
-    let item_id = format!("task_{task_id}");
-    for _ in 0..100 {
-        if let Some(TurnItem::Task { item }) = crud_store
-            .get_turn_item(turn_id, item_id.as_str())
-            .await
-            .expect("turn item query should succeed")
-        {
-            if item.status == expected_status {
-                return item.status;
-            }
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-    let Some(TurnItem::Task { item }) = crud_store
-        .get_turn_item(turn_id, item_id.as_str())
-        .await
-        .expect("turn item query should succeed")
-    else {
-        panic!("task anchor read model was not found");
-    };
-    item.status
-}
-
 async fn wait_for_task_status(
     crud_store: Arc<CrudStore>,
     task_id: &str,
     expected_status: pioneer_protocol::TaskStatus,
 ) -> pioneer_protocol::TaskStatus {
-    for _ in 0..100 {
+    // The full Gateway suite runs many SQLite/provider scenarios in parallel.
+    // Nested collaborative Task dispatch can be delayed by that contention;
+    // keep the oracle bounded, but do not turn a healthy lineage transition
+    // into a 2.5-second scheduling flake.
+    for _ in 0..1_200 {
         let response = crud_store
             .get_task(task_id)
             .await
@@ -55215,6 +55811,28 @@ async fn recv_error_by_id(
     }
 
     panic!("timed out waiting for error response id `{request_id}`");
+}
+
+fn assert_public_error(
+    response: &JsonRpcErrorResponse,
+    expected_code: PublicErrorCode,
+    expected_stage: PublicErrorStage,
+) -> PublicError {
+    let public_error: PublicError = serde_json::from_value(
+        response
+            .error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("public_error"))
+            .cloned()
+            .expect("agent-domain errors must include a typed public_error"),
+    )
+    .expect("public_error must match the stable protocol shape");
+    assert_eq!(public_error.code, expected_code);
+    assert_eq!(public_error.stage, expected_stage);
+    assert_eq!(response.error.message, public_error.message);
+    assert!(!public_error.correlation_id.trim().is_empty());
+    public_error
 }
 
 async fn recv_notification_by_method(

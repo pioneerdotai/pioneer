@@ -2,33 +2,110 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
+use async_trait::async_trait;
+use futures_util::stream::BoxStream;
+use sha2::{Digest, Sha256};
 
-use crate::factory::create_provider_with_timeout_policy_and_proxy;
+use crate::factory::create_provider_with_timeout_policy_and_proxy_and_authority;
 use crate::traits::Provider;
-use crate::types::ProviderTimeoutPolicy;
+use crate::types::{
+    ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
+    ProviderFailureClassification, ProviderTimeoutPolicy, StreamChunk,
+};
+use pioneer_protocol::ProviderModelInfo;
+
+const PROVIDER_AUTHORITY_FINGERPRINT_VERSION: &str = "pioneer-provider-authority-v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderAuthorityFingerprint(String);
+
+impl ProviderAuthorityFingerprint {
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProviderCacheKey {
     workspace_id: Option<String>,
     provider_name: String,
-    proxy_url: Option<String>,
+    authority_fingerprint: ProviderAuthorityFingerprint,
 }
 
 impl ProviderCacheKey {
-    fn global(provider_name: &str) -> Self {
+    fn new(
+        workspace_id: Option<&str>,
+        provider_name: &str,
+        authority_fingerprint: ProviderAuthorityFingerprint,
+    ) -> Self {
         Self {
-            workspace_id: None,
+            workspace_id: workspace_id.map(str::to_owned),
             provider_name: provider_name.to_owned(),
-            proxy_url: None,
+            authority_fingerprint,
         }
     }
+}
 
-    fn workspace(workspace_id: &str, provider_name: &str, proxy_url: Option<String>) -> Self {
-        Self {
-            workspace_id: Some(workspace_id.to_owned()),
-            provider_name: provider_name.to_owned(),
-            proxy_url,
-        }
+struct AuthorityBoundProvider {
+    inner: Arc<dyn Provider>,
+    authority_fingerprint: ProviderAuthorityFingerprint,
+}
+
+#[async_trait]
+impl Provider for AuthorityBoundProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn authority_fingerprint(&self) -> Option<&str> {
+        Some(self.authority_fingerprint.as_str())
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        self.inner.classify_failure(error)
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        crate::attachments::runtime::with_async_authority_scope(
+            self.authority_fingerprint.as_str().to_owned(),
+            self.inner.chat(request),
+        )
+        .await
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        crate::attachments::runtime::with_async_authority_scope(
+            self.authority_fingerprint.as_str().to_owned(),
+            self.inner.stream_chat(request),
+        )
+        .await
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.inner.list_models().await
+    }
+
+    async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.inner.list_embedding_models().await
+    }
+
+    async fn list_transcription_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.inner.list_transcription_models().await
+    }
+
+    async fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        self.inner.embed(request).await
+    }
+
+    async fn warmup(&self) -> Result<()> {
+        self.inner.warmup().await
     }
 }
 
@@ -40,6 +117,11 @@ impl ProviderCacheKey {
 /// of the provider crate.
 pub struct ProviderRegistry {
     cache: RwLock<HashMap<ProviderCacheKey, Arc<dyn Provider>>>,
+    /// Explicitly injected providers are a test/integration seam. Unlike the
+    /// production factory, an injected provider name is intentionally valid
+    /// in every workspace; each lookup still receives a scope-specific
+    /// authority wrapper and cache key.
+    injected: RwLock<HashMap<String, Arc<dyn Provider>>>,
     key_resolver: Box<dyn Fn(Option<&str>, &str) -> String + Send + Sync>,
     proxy_resolver: Box<dyn Fn(Option<&str>, &str) -> Option<String> + Send + Sync>,
     timeout_policy: ProviderTimeoutPolicy,
@@ -49,7 +131,8 @@ impl ProviderRegistry {
     /// Create a new registry with the given key resolver.
     ///
     /// `key_resolver` maps a provider name (e.g. `"openai"`) to the API key
-    /// string. It is called at most once per provider name.
+    /// string. It is resolved before every lookup so credential rotation
+    /// changes the authority fingerprint and cannot reuse a stale instance.
     pub fn new(key_resolver: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
         Self::new_with_timeout_policy(key_resolver, ProviderTimeoutPolicy::default())
     }
@@ -60,6 +143,7 @@ impl ProviderRegistry {
     ) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
+            injected: RwLock::new(HashMap::new()),
             key_resolver: Box::new(move |_, provider_name| key_resolver(provider_name)),
             proxy_resolver: Box::new(|_, _| None),
             timeout_policy,
@@ -86,6 +170,7 @@ impl ProviderRegistry {
     ) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
+            injected: RwLock::new(HashMap::new()),
             key_resolver: Box::new(key_resolver),
             proxy_resolver: Box::new(proxy_resolver),
             timeout_policy,
@@ -93,7 +178,7 @@ impl ProviderRegistry {
     }
 
     pub fn get_or_create(&self, provider_name: &str) -> Result<Arc<dyn Provider>> {
-        self.get_or_create_with_key(ProviderCacheKey::global(provider_name))
+        self.get_or_create_for_scope(None, provider_name)
     }
 
     pub fn get_or_create_for_workspace(
@@ -101,15 +186,28 @@ impl ProviderRegistry {
         workspace_id: &str,
         provider_name: &str,
     ) -> Result<Arc<dyn Provider>> {
-        let proxy_url = (self.proxy_resolver)(Some(workspace_id), provider_name);
-        self.get_or_create_with_key(ProviderCacheKey::workspace(
-            workspace_id,
-            provider_name,
-            proxy_url,
-        ))
+        self.get_or_create_for_scope(Some(workspace_id), provider_name)
     }
 
-    fn get_or_create_with_key(&self, key: ProviderCacheKey) -> Result<Arc<dyn Provider>> {
+    pub fn authority_fingerprint_for_workspace(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+    ) -> ProviderAuthorityFingerprint {
+        self.resolve_authority(Some(workspace_id), provider_name).2
+    }
+
+    fn get_or_create_for_scope(
+        &self,
+        workspace_id: Option<&str>,
+        provider_name: &str,
+    ) -> Result<Arc<dyn Provider>> {
+        // Resolve the complete effective authority before consulting the
+        // cache. A workspace lookup can therefore never fall back to an
+        // instance created for a different credential/account scope.
+        let (api_key, proxy_url, authority_fingerprint) =
+            self.resolve_authority(workspace_id, provider_name);
+        let key = ProviderCacheKey::new(workspace_id, provider_name, authority_fingerprint.clone());
         {
             // A poisoned cache must not panic the native agent actor. The
             // registry only stores independently owned provider Arcs, so the
@@ -122,12 +220,6 @@ impl ProviderRegistry {
             if let Some(provider) = cache.get(&key) {
                 return Ok(provider.clone());
             }
-            if key.workspace_id.is_some()
-                && key.proxy_url.is_none()
-                && let Some(provider) = cache.get(&ProviderCacheKey::global(&key.provider_name))
-            {
-                return Ok(provider.clone());
-            }
         }
 
         let mut cache = self
@@ -137,34 +229,82 @@ impl ProviderRegistry {
         if let Some(provider) = cache.get(&key) {
             return Ok(provider.clone());
         }
-        if key.workspace_id.is_some()
-            && key.proxy_url.is_none()
-            && let Some(provider) = cache.get(&ProviderCacheKey::global(&key.provider_name))
-        {
-            return Ok(provider.clone());
-        }
 
-        let api_key = (self.key_resolver)(key.workspace_id.as_deref(), key.provider_name.as_str());
-        let provider: Arc<dyn Provider> = Arc::from(create_provider_with_timeout_policy_and_proxy(
-            &key.provider_name,
-            &api_key,
-            self.timeout_policy,
-            key.proxy_url.as_deref(),
-        )?);
+        let provider: Arc<dyn Provider> = if let Some(provider) = self
+            .injected
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key.provider_name)
+            .cloned()
+        {
+            provider
+        } else {
+            Arc::from(create_provider_with_timeout_policy_and_proxy_and_authority(
+                &key.provider_name,
+                &api_key,
+                self.timeout_policy,
+                proxy_url.as_deref(),
+                authority_fingerprint.as_str(),
+            )?)
+        };
+        let provider: Arc<dyn Provider> = Arc::new(AuthorityBoundProvider {
+            inner: provider,
+            authority_fingerprint,
+        });
         cache.insert(key, provider.clone());
         Ok(provider)
     }
 
+    fn resolve_authority(
+        &self,
+        workspace_id: Option<&str>,
+        provider_name: &str,
+    ) -> (String, Option<String>, ProviderAuthorityFingerprint) {
+        let api_key = (self.key_resolver)(workspace_id, provider_name);
+        let proxy_url = (self.proxy_resolver)(workspace_id, provider_name);
+        let mut digest = Sha256::new();
+        digest.update(PROVIDER_AUTHORITY_FINGERPRINT_VERSION.as_bytes());
+        digest.update([0]);
+        digest.update(workspace_id.unwrap_or("<global>").as_bytes());
+        digest.update([0]);
+        digest.update(provider_name.trim().to_ascii_lowercase().as_bytes());
+        digest.update([0]);
+        digest.update(api_key.as_bytes());
+        digest.update([0]);
+        digest.update(proxy_url.as_deref().unwrap_or("<direct>").as_bytes());
+        (
+            api_key,
+            proxy_url,
+            ProviderAuthorityFingerprint(hex::encode(digest.finalize())),
+        )
+    }
+
     pub fn insert(&self, name: impl Into<String>, provider: Arc<dyn Provider>) {
+        let name = name.into();
+        let (_, _, authority_fingerprint) = self.resolve_authority(None, name.as_str());
+        self.injected
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.clone(), provider.clone());
         let mut cache = self
             .cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let name = name.into();
-        cache.insert(ProviderCacheKey::global(name.as_str()), provider);
+        let provider: Arc<dyn Provider> = Arc::new(AuthorityBoundProvider {
+            inner: provider,
+            authority_fingerprint: authority_fingerprint.clone(),
+        });
+        cache.insert(
+            ProviderCacheKey::new(None, name.as_str(), authority_fingerprint),
+            provider,
+        );
     }
 
     pub fn invalidate(&self, provider_name: &str) {
+        self.injected
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(provider_name);
         let mut cache = self
             .cache
             .write()
@@ -176,14 +316,15 @@ impl ProviderRegistry {
 /// Create a registry with a single pre-seeded provider. For tests.
 impl ProviderRegistry {
     pub fn with_provider(name: &str, provider: Arc<dyn Provider>) -> Self {
-        let mut cache = HashMap::new();
-        cache.insert(ProviderCacheKey::global(name), provider);
-        Self {
-            cache: RwLock::new(cache),
+        let registry = Self {
+            cache: RwLock::new(HashMap::new()),
+            injected: RwLock::new(HashMap::new()),
             key_resolver: Box::new(|_, _| String::new()),
             proxy_resolver: Box::new(|_, _| None),
             timeout_policy: ProviderTimeoutPolicy::default(),
-        }
+        };
+        registry.insert(name, provider);
+        registry
     }
 }
 
@@ -236,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn key_resolver_is_called_on_miss() {
+    fn key_resolver_is_called_before_every_authority_lookup() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -250,9 +391,10 @@ mod tests {
         // Pre-seed so creation succeeds
         registry.insert("echo", Arc::new(EchoProvider::new()));
 
-        // Cached hit — resolver not called
+        // Insert and lookup both resolve authority so credential rotation can
+        // never be hidden by an older cache hit.
         let _ = registry.get_or_create("echo").unwrap();
-        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -285,6 +427,7 @@ mod tests {
         assert_eq!(
             calls.lock().expect("calls lock poisoned").as_slice(),
             &[
+                (Some("workspace-1".to_owned()), "ollama".to_owned()),
                 (Some("workspace-1".to_owned()), "ollama".to_owned()),
                 (Some("workspace-2".to_owned()), "ollama".to_owned()),
             ]

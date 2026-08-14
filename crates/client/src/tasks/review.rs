@@ -55,6 +55,17 @@ pub struct TaskReviewActionRequest<TParams> {
     pub params: TParams,
 }
 
+/// Exact Task action vocabulary projected by the Gateway for the active
+/// thread. Candidate state is intersected separately from authorization so a
+/// role cannot acquire review authority from ownership or another capability.
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskReviewPresentationCapabilities {
+    pub can_review: bool,
+    pub can_cancel: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TaskReviewTarget {
     task_id: String,
@@ -113,19 +124,41 @@ pub fn task_review_action_enabled(
     validate_task_review_target(item, action).is_ok() && !state.any_in_flight(&item.candidate_id)
 }
 
-/// Presentation gate for user-review controls. The task owner comes from the
-/// Gateway's sanitized task_wait projection; the RPC remains authoritative and
-/// revalidates the same ownership before mutating task state.
+pub fn task_review_action_authorized_and_enabled(
+    item: &TaskWaitReviewDisplayItem,
+    action: TaskReviewAction,
+    capabilities: TaskReviewPresentationCapabilities,
+    state: &TaskReviewActionState,
+) -> bool {
+    let authorized = match action {
+        TaskReviewAction::Accept | TaskReviewAction::Revise => capabilities.can_review,
+        TaskReviewAction::Cancel => capabilities.can_cancel,
+    };
+    authorized && task_review_action_enabled(item, action, state)
+}
+
+/// Presentation gate for collaborative review controls. Candidate state comes
+/// from the Gateway's sanitized `task_wait` projection, while authorization is
+/// the exact TaskReview/TaskCancel projection for the current root-thread
+/// participant. Creator identity is provenance only; the RPC revalidates the
+/// caller's current collaboration grant before mutating task state.
 pub fn task_review_item_is_manageable_by(
     item: &TaskWaitReviewDisplayItem,
-    principal_id: Option<&str>,
-    can_manage_all_threads: bool,
-    can_respond_to_agent_requests: bool,
+    capabilities: TaskReviewPresentationCapabilities,
 ) -> bool {
-    can_manage_all_threads
-        || (can_respond_to_agent_requests
-            && principal_id.is_some()
-            && item.owner_principal_id.as_deref() == principal_id)
+    [
+        TaskReviewAction::Accept,
+        TaskReviewAction::Revise,
+        TaskReviewAction::Cancel,
+    ]
+    .into_iter()
+    .any(|action| {
+        let authorized = match action {
+            TaskReviewAction::Accept | TaskReviewAction::Revise => capabilities.can_review,
+            TaskReviewAction::Cancel => capabilities.can_cancel,
+        };
+        authorized && item.allows_action(action.protocol_action())
+    })
 }
 
 pub fn plan_task_review_accept(
@@ -295,31 +328,32 @@ mod tests {
     }
 
     #[test]
-    fn task_review_ownership_survives_agent_and_subtask_turns() {
+    fn task_review_controls_follow_atomic_collaboration_capabilities_not_owner_identity() {
         let item = review_item();
         assert!(task_review_item_is_manageable_by(
             &item,
-            Some("principal_1"),
-            false,
-            true,
-        ));
-        assert!(!task_review_item_is_manageable_by(
-            &item,
-            Some("principal_2"),
-            false,
-            true,
-        ));
-        assert!(!task_review_item_is_manageable_by(
-            &item,
-            Some("principal_1"),
-            false,
-            false,
+            TaskReviewPresentationCapabilities {
+                can_review: true,
+                can_cancel: false,
+            },
         ));
         assert!(task_review_item_is_manageable_by(
             &item,
-            Some("principal_2"),
-            true,
-            false,
+            TaskReviewPresentationCapabilities {
+                can_review: false,
+                can_cancel: true,
+            },
+        ));
+        assert!(!task_review_item_is_manageable_by(
+            &item,
+            TaskReviewPresentationCapabilities::default(),
+        ));
+        assert!(task_review_item_is_manageable_by(
+            &item,
+            TaskReviewPresentationCapabilities {
+                can_review: true,
+                can_cancel: true,
+            },
         ));
     }
 

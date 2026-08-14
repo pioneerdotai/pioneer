@@ -632,8 +632,22 @@ impl GatewayWsCommandSender {
         client_ws_commands::turn_get(self, params)
     }
 
-    pub fn turn_items(&self, params: TurnItemsParams) -> Result<TurnItemsResponse> {
-        client_ws_commands::turn_items(self, params)
+    pub fn turn_items_page(&self, params: TurnItemsParams) -> Result<TurnItemsResponse> {
+        client_ws_commands::turn_items_page(self, params)
+    }
+
+    pub fn task_user_notification_list(
+        &self,
+        params: TaskUserNotificationListParams,
+    ) -> Result<TaskUserNotificationListResponse> {
+        client_ws_commands::task_user_notification_list(self, params)
+    }
+
+    pub fn task_user_notification_acknowledge(
+        &self,
+        params: TaskUserNotificationAcknowledgeParams,
+    ) -> Result<TaskUserNotificationAcknowledgeResponse> {
+        client_ws_commands::task_user_notification_acknowledge(self, params)
     }
 
     pub fn turn_work_page(&self, params: TurnWorkPageParams) -> Result<TurnWorkPageResponse> {

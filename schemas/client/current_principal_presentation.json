@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CurrentPrincipalPresentation",
+  "type": "object",
+  "properties": {
+    "avatar_revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capabilities": {
+      "$ref": "#/$defs/PrincipalPresentationCapabilities"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "nickname": {
+      "type": "string"
+    },
+    "principal_id": {
+      "$ref": "#/$defs/PrincipalId"
+    },
+    "read_only": {
+      "type": "boolean"
+    },
+    "role": {
+      "$ref": "#/$defs/AuthorizationRolePresentation"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "principal_id",
+    "display_name",
+    "nickname",
+    "role",
+    "read_only",
+    "capabilities"
+  ],
+  "$defs": {
+    "AuthorizationRolePresentation": {
+      "description": "Server-owned presentation metadata for the authenticated role. The key is\ndeliberately open-ended: clients display this object but never derive\nauthorization decisions from it.",
+      "type": "object",
+      "properties": {
+        "built_in": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "display_name",
+        "description",
+        "built_in"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalPresentationCapabilities": {
+      "description": "Shell-neutral projection of the Gateway capability snapshot.\n\nThese flags are presentation hints only. The Gateway remains authoritative\nfor every operation and callers must still handle an authoritative denial.",
+      "type": "object",
+      "properties": {
+        "can_acknowledge_own_notifications": {
+          "type": "boolean"
+        },
+        "can_add_workspace_member": {
+          "type": "boolean"
+        },
+        "can_create_invitation": {
+          "type": "boolean"
+        },
+        "can_create_workspace": {
+          "type": "boolean"
+        },
+        "can_manage_all_threads": {
+          "type": "boolean"
+        },
+        "can_manage_capabilities": {
+          "type": "boolean"
+        },
+        "can_manage_gateway_settings": {
+          "type": "boolean"
+        },
+        "can_manage_member_lifecycle": {
+          "type": "boolean"
+        },
+        "can_manage_own_sessions": {
+          "type": "boolean"
+        },
+        "can_manage_workspace": {
+          "type": "boolean"
+        },
+        "can_read_own_notifications": {
+          "type": "boolean"
+        },
+        "can_remove_workspace_member": {
+          "type": "boolean"
+        },
+        "can_run_tasks": {
+          "type": "boolean"
+        },
+        "can_use_cli_runtimes": {
+          "type": "boolean"
+        },
+        "can_use_mcp": {
+          "type": "boolean"
+        },
+        "can_use_providers": {
+          "type": "boolean"
+        },
+        "can_use_skills": {
+          "type": "boolean"
+        },
+        "can_view_invitations": {
+          "type": "boolean"
+        },
+        "can_view_member_directory": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "can_create_workspace",
+        "can_manage_workspace",
+        "can_read_own_notifications",
+        "can_acknowledge_own_notifications",
+        "can_manage_gateway_settings",
+        "can_manage_capabilities",
+        "can_use_providers",
+        "can_use_cli_runtimes",
+        "can_use_skills",
+        "can_use_mcp",
+        "can_run_tasks",
+        "can_manage_all_threads",
+        "can_view_invitations",
+        "can_create_invitation",
+        "can_view_member_directory",
+        "can_add_workspace_member",
+        "can_manage_member_lifecycle",
+        "can_remove_workspace_member",
+        "can_manage_own_sessions"
+      ]
+    }
+  }
+}

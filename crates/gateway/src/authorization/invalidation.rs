@@ -1,13 +1,27 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pioneer_protocol::PrincipalId;
+use anyhow::{Context, Result};
+use pioneer_crud::CrudStore;
+use pioneer_protocol::{
+    AuthorizationChangeKind, AuthorizationChangeScope, AuthorizationProjectionChangedNotification,
+    PolicyGeneration, PrincipalId,
+};
+
+use super::RoleDefinitionRegistry;
+
+static OBSERVED_POLICY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn observed_policy_generation() -> u64 {
+    OBSERVED_POLICY_GENERATION.load(Ordering::Acquire)
+}
 
 pub(crate) use pioneer_protocol::AccessChangeKind;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccessChangeSignal {
-    /// Monotonic process-local authorization epoch.
     pub(crate) authorization_revision: u64,
+    pub(crate) change: AuthorizationProjectionChangedNotification,
     pub(crate) kind: AccessChangeKind,
     /// `None` means every principal whose access can be derived from the
     /// workspace/thread must be re-evaluated.
@@ -16,56 +30,143 @@ pub(crate) struct AccessChangeSignal {
     pub(crate) thread_id: Option<String>,
 }
 
-/// Post-commit seam between durable ACL mutation and runtime eviction.
+/// Durable post-commit authorization generation and payload-safe change feed.
 ///
-/// Phase 4 publishes only identifiers and a monotonic revision. Phase 6 owns
-/// connection/subscription eviction and Phase 8 owns the safe client
-/// notification DTO. Keeping this hub payload-free prevents an invalidation
-/// from becoming an accidental protected-resource delivery path.
+/// Production instances use `durable`; `Default` is deliberately restricted
+/// to isolated tests that do not own a database.
 pub(crate) struct AuthorizationInvalidationHub {
-    revision: AtomicU64,
+    generation: AtomicU64,
+    store: Option<Arc<CrudStore>>,
 }
 
 impl Default for AuthorizationInvalidationHub {
     fn default() -> Self {
         Self {
-            revision: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            store: None,
         }
     }
 }
 
 impl AuthorizationInvalidationHub {
-    /// Advances the shared snapshot revision for a committed non-ACL
-    /// administrative projection change. No access signal is emitted because
-    /// invitation/member recipients refetch through their scoped APIs.
-    pub(crate) fn advance_snapshot_revision(&self) -> u64 {
-        self.revision
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
-                revision.checked_add(1)
-            })
-            .expect("authorization invalidation revision exhausted")
-            + 1
+    pub(crate) fn durable(store: Arc<CrudStore>) -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            store: Some(store),
+        }
     }
 
-    pub(crate) fn publish(
+    pub(crate) async fn current_generation(&self) -> Result<PolicyGeneration> {
+        if let Some(store) = &self.store {
+            let fingerprint = RoleDefinitionRegistry::new().policy_fingerprint();
+            let initialized = pioneer_crud::ensure_code_policy_generation(
+                &store.database_connection(),
+                fingerprint.as_str(),
+            )
+            .await
+            .context("failed to initialize durable code-policy generation")?;
+            self.observe(initialized.policy_generation);
+            let durable =
+                pioneer_crud::current_policy_generation(&store.database_connection()).await?;
+            self.observe(durable);
+            return Ok(durable);
+        }
+        let current = self.generation.load(Ordering::Acquire);
+        if let Some(current) = PolicyGeneration::new(current) {
+            return Ok(current);
+        }
+        self.generation
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .ok();
+        Ok(PolicyGeneration::INITIAL)
+    }
+
+    pub(crate) async fn current_revision(&self) -> Result<u64> {
+        Ok(self.current_generation().await?.get())
+    }
+
+    pub(crate) async fn publish_change(
+        &self,
+        change: AuthorizationChangeKind,
+        affected: AuthorizationChangeScope,
+    ) -> Result<AuthorizationProjectionChangedNotification> {
+        let notification = if let Some(store) = &self.store {
+            // Ensures a deployment policy change owns an earlier generation
+            // than the mutation being published.
+            self.current_generation().await?;
+            pioneer_crud::append_authorization_change(
+                &store.database_connection(),
+                change,
+                affected,
+            )
+            .await
+            .context("failed to append durable authorization change")?
+        } else {
+            let current = self.current_generation().await?;
+            let next = current
+                .get()
+                .checked_add(1)
+                .and_then(PolicyGeneration::new)
+                .expect("authorization policy generation exhausted");
+            self.generation.store(next.get(), Ordering::Release);
+            AuthorizationProjectionChangedNotification {
+                policy_generation: next,
+                change,
+                affected,
+            }
+        };
+        self.observe(notification.policy_generation);
+        Ok(notification)
+    }
+
+    pub(crate) async fn publish(
         &self,
         kind: AccessChangeKind,
         affected_principal_id: Option<PrincipalId>,
         workspace_id: impl Into<String>,
         thread_id: Option<String>,
-    ) -> AccessChangeSignal {
-        let revision = self.advance_snapshot_revision();
-        AccessChangeSignal {
-            authorization_revision: revision,
+    ) -> Result<AccessChangeSignal> {
+        let workspace_id = workspace_id.into();
+        let affected = match (&affected_principal_id, &thread_id) {
+            (Some(principal_id), Some(thread_id)) => AuthorizationChangeScope::PrincipalThread {
+                principal_id: principal_id.clone(),
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.clone(),
+            },
+            (Some(principal_id), None) => AuthorizationChangeScope::PrincipalWorkspace {
+                principal_id: principal_id.clone(),
+                workspace_id: workspace_id.clone(),
+            },
+            (None, Some(thread_id)) => AuthorizationChangeScope::Thread {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.clone(),
+            },
+            (None, None) => AuthorizationChangeScope::Workspace {
+                workspace_id: workspace_id.clone(),
+            },
+        };
+        let change_kind = match kind {
+            AccessChangeKind::WorkspaceMembership => AuthorizationChangeKind::WorkspaceAcl,
+            AccessChangeKind::ThreadCreated
+            | AccessChangeKind::ThreadVisibility
+            | AccessChangeKind::ThreadParticipantAdded
+            | AccessChangeKind::ThreadParticipantRemoved => AuthorizationChangeKind::ThreadAcl,
+        };
+        let change = self.publish_change(change_kind, affected).await?;
+        Ok(AccessChangeSignal {
+            authorization_revision: change.policy_generation.get(),
+            change,
             kind,
             affected_principal_id,
-            workspace_id: workspace_id.into(),
+            workspace_id,
             thread_id,
-        }
+        })
     }
 
-    pub(crate) fn current_revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
+    fn observe(&self, generation: PolicyGeneration) {
+        self.generation
+            .fetch_max(generation.get(), Ordering::AcqRel);
+        OBSERVED_POLICY_GENERATION.fetch_max(generation.get(), Ordering::AcqRel);
     }
 }
 
@@ -73,65 +174,42 @@ impl AuthorizationInvalidationHub {
 mod tests {
     use super::*;
 
-    #[test]
-    fn invalidation_is_monotonic_scoped_and_payload_free() {
+    #[tokio::test]
+    async fn invalidation_is_monotonic_scoped_and_payload_free() {
         let hub = AuthorizationInvalidationHub::default();
-        assert_eq!(hub.current_revision(), 0);
+        assert_eq!(hub.current_revision().await.unwrap(), 1);
 
         let principal_id =
             PrincipalId::new("P0000000000000000000A").expect("valid fixture principal");
-        let first = hub.publish(
-            AccessChangeKind::ThreadParticipantAdded,
-            Some(principal_id.clone()),
-            "workspace-red",
-            Some("thread-private".to_owned()),
-        );
-        let second = hub.publish(
-            AccessChangeKind::ThreadVisibility,
-            None,
-            "workspace-red",
-            Some("thread-private".to_owned()),
-        );
-        let third = hub.publish(
-            AccessChangeKind::WorkspaceMembership,
-            Some(principal_id.clone()),
-            "workspace-blue",
-            None,
-        );
-
-        assert_eq!(first.authorization_revision, 1);
-        assert_eq!(second.authorization_revision, 2);
-        assert_eq!(third.authorization_revision, 3);
-        assert_eq!(hub.current_revision(), 3);
-        assert_eq!(first.affected_principal_id, Some(principal_id));
-        assert_eq!(first.workspace_id, "workspace-red");
-        assert_eq!(first.thread_id.as_deref(), Some("thread-private"));
-        assert_eq!(third.workspace_id, "workspace-blue");
-        assert_eq!(third.thread_id, None);
-    }
-
-    #[test]
-    fn no_mutation_means_no_revision() {
-        let hub = AuthorizationInvalidationHub::default();
-
-        assert_eq!(hub.current_revision(), 0);
-    }
-
-    #[test]
-    fn committed_snapshot_change_shares_the_monotonic_revision_space() {
-        let hub = AuthorizationInvalidationHub::default();
-
-        assert_eq!(hub.advance_snapshot_revision(), 1);
-        assert_eq!(hub.current_revision(), 1);
-        assert_eq!(
-            hub.publish(
-                AccessChangeKind::WorkspaceMembership,
+        let first = hub
+            .publish(
+                AccessChangeKind::ThreadParticipantAdded,
+                Some(principal_id.clone()),
+                "workspace-red",
+                Some("thread-private".to_owned()),
+            )
+            .await
+            .unwrap();
+        let second = hub
+            .publish(
+                AccessChangeKind::ThreadVisibility,
                 None,
                 "workspace-red",
-                None,
+                Some("thread-private".to_owned()),
             )
-            .authorization_revision,
-            2
-        );
+            .await
+            .unwrap();
+
+        assert_eq!(first.authorization_revision, 2);
+        assert_eq!(second.authorization_revision, 3);
+        assert_eq!(hub.current_revision().await.unwrap(), 3);
+        assert!(matches!(
+            first.change.affected,
+            AuthorizationChangeScope::PrincipalThread { .. }
+        ));
+        assert!(matches!(
+            second.change.affected,
+            AuthorizationChangeScope::Thread { .. }
+        ));
     }
 }

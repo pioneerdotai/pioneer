@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use pioneer_entity::{gateway_principal, invitation, invitation_workspace_grant, workspace};
 use pioneer_protocol::{
     AuthSessionId, DeviceId, GatewayId, InvitationId, InvitationRevokeReason, InvitationStatus,
-    PrincipalId, WorkspaceId,
+    PrincipalId, RoleKey, WorkspaceId,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
@@ -17,6 +17,7 @@ pub struct NewInvitationRow {
     pub gateway_id: GatewayId,
     pub created_by_principal_id: PrincipalId,
     pub created_by_session_id: AuthSessionId,
+    pub target_role_key: RoleKey,
     pub token_hash: [u8; 32],
     pub expires_at: DateTimeWithTimeZone,
     pub now: DateTimeWithTimeZone,
@@ -30,6 +31,7 @@ impl std::fmt::Debug for NewInvitationRow {
             .field("gateway_id", &self.gateway_id)
             .field("created_by_principal_id", &self.created_by_principal_id)
             .field("created_by_session_id", &self.created_by_session_id)
+            .field("target_role_key", &self.target_role_key)
             .field("token_hash", &"[redacted]")
             .field("expires_at", &self.expires_at)
             .field("now", &self.now)
@@ -131,6 +133,7 @@ pub async fn insert_invitation(
         gateway_id: Set(row.gateway_id.to_string()),
         created_by_principal_id: Set(row.created_by_principal_id.to_string()),
         created_by_session_id: Set(row.created_by_session_id.to_string()),
+        target_role_key: Set(row.target_role_key.to_string()),
         status: Set(invitation_status_to_db(InvitationStatus::Pending).to_owned()),
         token_hash: Set(Some(row.token_hash.to_vec())),
         token_format_version: Set(1),
@@ -800,6 +803,7 @@ mod tests {
                 gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
                 created_by_principal_id: principal_id(creator),
                 created_by_session_id: session_id(creator),
+                target_role_key: RoleKey::member(),
                 token_hash: [hash_byte; 32],
                 expires_at: timestamp(expires_offset),
                 now: timestamp(created_offset),
@@ -845,6 +849,7 @@ mod tests {
                 gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
                 created_by_principal_id: principal_id(1),
                 created_by_session_id: session_id(1),
+                target_role_key: RoleKey::member(),
                 token_hash: [222; 32],
                 expires_at: timestamp(100),
                 now: timestamp(1),

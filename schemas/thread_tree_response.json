@@ -31,6 +31,13 @@
         "$ref": "#/$defs/Thread"
       }
     },
+    "unread": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ThreadUnreadSummary"
+      }
+    },
     "workspace_id": {
       "type": "string"
     }
@@ -46,6 +53,44 @@
         "ask",
         "deny"
       ]
+    },
+    "PersistedActorRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "PromptManifest": {
       "type": "object",
@@ -439,10 +484,19 @@
       ]
     },
     "ThreadMode": {
-      "type": "string",
-      "enum": [
-        "Chat",
-        "Agent"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Message",
+            "Agent"
+          ]
+        },
+        {
+          "description": "Compatibility default for pre-Epic-6 persisted and wire values. New\nuser-thread creation selects `Message` explicitly.",
+          "type": "string",
+          "const": "Chat"
+        }
       ]
     },
     "ThreadOriginKind": {
@@ -505,6 +559,23 @@
         "Active",
         "Idle",
         "Closed"
+      ]
+    },
+    "ThreadUnreadSummary": {
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "unread_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "thread_id",
+        "unread_count"
       ]
     },
     "ThreadVisibility": {
@@ -583,6 +654,17 @@
     "Turn": {
       "type": "object",
       "properties": {
+        "author": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnAuthorSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "error": {
           "type": [
             "string",
@@ -591,6 +673,27 @@
         },
         "id": {
           "type": "string"
+        },
+        "mentions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TurnMention"
+          }
+        },
+        "message_deleted": {
+          "type": "boolean",
+          "default": false
+        },
+        "message_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/ThreadMode",
+          "default": "Chat"
         },
         "origin": {
           "$ref": "#/$defs/TurnOrigin",
@@ -609,6 +712,13 @@
             }
           ]
         },
+        "reply_to_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "status": {
           "$ref": "#/$defs/TurnStatus"
         },
@@ -623,11 +733,59 @@
         "permission_profile"
       ]
     },
+    "TurnAuthorSnapshot": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/PersistedActorRef"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        }
+      },
+      "required": [
+        "actor",
+        "display_name",
+        "nickname"
+      ]
+    },
     "TurnKind": {
       "type": "string",
       "enum": [
         "conversation",
         "task_run"
+      ]
+    },
+    "TurnMention": {
+      "type": "object",
+      "properties": {
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "nickname"
       ]
     },
     "TurnOrigin": {

@@ -57,16 +57,31 @@ pub(crate) struct GatewayVoiceSessionError {
 
 impl GatewayVoiceSessionError {
     pub(crate) fn into_voice_error(self) -> VoiceError {
-        let kind = match self.kind {
+        let (kind, public_code) = match self.kind {
             GatewayVoiceSessionErrorKind::UnknownSession
-            | GatewayVoiceSessionErrorKind::OwnershipMismatch => VoiceErrorKind::InvalidSession,
+            | GatewayVoiceSessionErrorKind::OwnershipMismatch => (
+                VoiceErrorKind::InvalidSession,
+                pioneer_protocol::PublicErrorCode::NotFound,
+            ),
             GatewayVoiceSessionErrorKind::DuplicateSession
-            | GatewayVoiceSessionErrorKind::InvalidTransition => VoiceErrorKind::InvalidSession,
-            GatewayVoiceSessionErrorKind::StoreUnavailable => VoiceErrorKind::GatewayBusy,
+            | GatewayVoiceSessionErrorKind::InvalidTransition => (
+                VoiceErrorKind::InvalidSession,
+                pioneer_protocol::PublicErrorCode::Conflict,
+            ),
+            GatewayVoiceSessionErrorKind::StoreUnavailable => (
+                VoiceErrorKind::GatewayBusy,
+                pioneer_protocol::PublicErrorCode::Unavailable,
+            ),
         };
+        let public_error = crate::public_error::map_agent_failure(
+            public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+            self.message,
+        );
         VoiceError {
             kind,
-            message: self.message,
+            message: public_error.message.clone(),
+            public_error: Some(public_error),
         }
     }
 }

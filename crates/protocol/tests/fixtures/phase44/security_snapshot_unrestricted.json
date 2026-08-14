@@ -74,5 +74,39 @@
   "enforcement": {
     "status": "active"
   },
+  "authority_cap": {
+    "version": 1,
+    "resource_binding_id": "phase44-unrestricted",
+    "resource_binding_revision": 1,
+    "filesystem": {
+      "kind": "unrestricted"
+    },
+    "network": {
+      "mode": "enabled",
+      "allow_localhost": true,
+      "allow_unix_sockets": true
+    },
+    "process": {
+      "shell": {
+        "enabled": true,
+        "allow_stdin": true,
+        "allow_session_inheritance": true
+      },
+      "environment": {
+        "inherit": true
+      },
+      "timeout": {
+        "max_duration_ms": 1800000
+      },
+      "command_risk": {}
+    },
+    "approval": {
+      "allow_once": false,
+      "allow_for_turn": false,
+      "allow_for_session": false,
+      "allow_always": false,
+      "request_permissions": false
+    }
+  },
   "created_at_unix_ms": 1700000000000
 }

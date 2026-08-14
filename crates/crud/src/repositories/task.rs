@@ -120,6 +120,7 @@ pub async fn list_tasks_by_workspace_status_scoped<C: ConnectionTrait>(
     workspace_id: &str,
     status: Option<&str>,
     limit: Option<u64>,
+    offset: Option<u64>,
     access: Option<&TaskRootAccessFilter>,
 ) -> Result<Vec<task::Model>> {
     let mut query = apply_root_access_filter(
@@ -135,6 +136,9 @@ pub async fn list_tasks_by_workspace_status_scoped<C: ConnectionTrait>(
     if let Some(limit) = limit {
         query = query.limit(limit);
     }
+    if let Some(offset) = offset {
+        query = query.offset(offset);
+    }
 
     query
         .all(db)
@@ -148,6 +152,7 @@ pub async fn list_tasks_by_owner_scoped<C: ConnectionTrait>(
     owner_kind: &str,
     owner_id: Option<&str>,
     limit: Option<u64>,
+    offset: Option<u64>,
     access: Option<&TaskRootAccessFilter>,
 ) -> Result<Vec<task::Model>> {
     let mut query = apply_root_access_filter(
@@ -165,6 +170,9 @@ pub async fn list_tasks_by_owner_scoped<C: ConnectionTrait>(
     if let Some(limit) = limit {
         query = query.limit(limit);
     }
+    if let Some(offset) = offset {
+        query = query.offset(offset);
+    }
 
     query
         .all(db)
@@ -176,16 +184,25 @@ pub async fn list_tasks_by_parent_scoped<C: ConnectionTrait>(
     db: &C,
     parent_task_id: &str,
     access: Option<&TaskRootAccessFilter>,
+    limit: Option<u64>,
+    offset: Option<u64>,
 ) -> Result<Vec<task::Model>> {
-    apply_root_access_filter(
+    let mut query = apply_root_access_filter(
         task::Entity::find()
             .filter(task::Column::ParentTaskId.eq(parent_task_id.to_owned()))
             .order_by_asc(task::Column::CreatedAt),
         access,
-    )
-    .all(db)
-    .await
-    .context("failed to list root-authorized child tasks")
+    );
+    if let Some(limit) = limit {
+        query = query.limit(limit);
+    }
+    if let Some(offset) = offset {
+        query = query.offset(offset);
+    }
+    query
+        .all(db)
+        .await
+        .context("failed to list root-authorized child tasks")
 }
 
 pub async fn list_tasks_by_root<C: ConnectionTrait>(
@@ -204,16 +221,25 @@ pub async fn list_tasks_by_root_scoped<C: ConnectionTrait>(
     db: &C,
     root_task_id: &str,
     access: Option<&TaskRootAccessFilter>,
+    limit: Option<u64>,
+    offset: Option<u64>,
 ) -> Result<Vec<task::Model>> {
-    apply_root_access_filter(
+    let mut query = apply_root_access_filter(
         task::Entity::find()
             .filter(task::Column::RootTaskId.eq(root_task_id.to_owned()))
             .order_by_asc(task::Column::CreatedAt),
         access,
-    )
-    .all(db)
-    .await
-    .context("failed to list root-authorized task tree")
+    );
+    if let Some(limit) = limit {
+        query = query.limit(limit);
+    }
+    if let Some(offset) = offset {
+        query = query.offset(offset);
+    }
+    query
+        .all(db)
+        .await
+        .context("failed to list root-authorized task tree")
 }
 pub async fn list_tasks_by_creator_turns<C: ConnectionTrait>(
     db: &C,
@@ -230,6 +256,24 @@ pub async fn list_tasks_by_creator_turns<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list tasks by creator turns")
+}
+
+pub async fn list_tasks_by_creator_turn<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    limit: u64,
+) -> Result<Vec<task::Model>> {
+    task::Entity::find()
+        .filter(task::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(task::Column::CreatedByThreadId.eq(thread_id.to_owned()))
+        .filter(task::Column::CreatedByTurnId.eq(turn_id.to_owned()))
+        .order_by_asc(task::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to list tasks by exact creator turn")
 }
 
 pub async fn update_task_status<C: ConnectionTrait>(

@@ -115,6 +115,7 @@ mod tests {
             error: Some(VoiceError {
                 kind: VoiceErrorKind::NoSpeech,
                 message: "no speech".to_owned(),
+                public_error: None,
             }),
         });
 

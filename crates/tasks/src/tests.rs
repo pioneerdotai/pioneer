@@ -20,16 +20,16 @@ use pioneer_protocol::{
     TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskDetachParams, TaskError,
     TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy,
     TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams,
-    TaskRescheduleReason, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewResolutionStrategy,
-    TaskResultReviewerKind, TaskResultReviewerSpec, TaskResumeParams, TaskRetryBackoffKind,
-    TaskRetryPolicy, TaskReviseParams, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTriggerCatchUpPolicy, TaskTriggerInput,
-    TaskTriggerSpec, TaskTriggerStatus, TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams,
-    TaskWaitReviewAction, TaskWaitRevisionBlockedReason, ThreadLineage, TurnFilesystemAccess,
-    TurnFilesystemSandboxEntry, TurnNetworkPolicySnapshot, TurnPermissionMode,
-    TurnProcessPolicySnapshot, TurnSandboxMode,
+    TaskRescheduleReason, TaskResourceBudget, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
+    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResultReviewerSpec,
+    TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskRun,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
+    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
+    TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams, TaskWaitReviewAction,
+    TaskWaitRevisionBlockedReason, ThreadLineage, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
+    TurnNetworkPolicySnapshot, TurnPermissionMode, TurnProcessPolicySnapshot, TurnSandboxMode,
 };
 use sea_orm::Database;
 use std::collections::BTreeMap;
@@ -463,6 +463,48 @@ fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
     }
 }
 
+/// Produces the explicit positive authority seed required by Agent Tasks in
+/// service-level tests. The Tasks crate deliberately treats the serialized
+/// authorization context as opaque; Gateway integration tests exercise the
+/// real context parser and revalidator. Keeping this helper keyed by the
+/// requested executor prevents tests from normalizing a missing Agent
+/// authority while leaving System Tasks free of an execution envelope.
+fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
+    if params.executor_kind != TaskExecutorKind::Agent {
+        return TaskCreateContext::default();
+    }
+
+    let generous = pioneer_crud::ExecutionQuotaCeilings {
+        per_principal: 1_024,
+        per_role: 1_024,
+        per_workspace: 1_024,
+        gateway: 1_024,
+    };
+    TaskCreateContext {
+        actor_id: Some("P00000000000000000001".to_owned()),
+        conversation_snapshot: None,
+        execution_admission: Some(crate::TaskExecutionAdmissionSeed {
+            workspace_id: params.workspace_id.clone(),
+            root_thread_id: params
+                .created_by_thread_id
+                .clone()
+                .or_else(|| params.owner_id.clone())
+                .unwrap_or_else(|| "thr_tasks_test_root".to_owned()),
+            initiating_principal_id: "P00000000000000000001".to_owned(),
+            authorization_context_json: r#"{"test_authority":"tasks_unit"}"#.to_owned(),
+            role_key: "tasks_test_role".to_owned(),
+            policy_fingerprint: "0".repeat(64),
+            execution_resources: pioneer_crud::ExecutionAdmissionQuotaPolicy {
+                active: generous,
+                queued: generous,
+                scheduled: generous,
+            },
+            task_resources: TaskResourceBudget::default(),
+        }),
+        task_resource_budget: Some(TaskResourceBudget::default()),
+    }
+}
+
 async fn record_active_task_execution_turn(
     runtime: &TaskRuntime,
     task_id: &str,
@@ -574,7 +616,7 @@ async fn create_waiting_review_agent_task_with_policy(
 
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("review task should create");
     let run = response.run.expect("review task should have run");
@@ -799,7 +841,7 @@ async fn composer_work_rejects_unsupported_payload_version_before_commit() {
 
     let error = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect_err("unsupported composer payload must fail safely");
     assert!(
@@ -854,16 +896,14 @@ async fn composer_work_accepts_scheduled_interval_and_cron_detached_tasks() {
 
     for (name, trigger) in cases {
         let parent_thread_id = format!("thr_composer_{name}");
+        let params = composer_work_create_params(
+            trigger,
+            parent_thread_id.as_str(),
+            pioneer_protocol::TASK_COMPOSER_WORK_VERSION,
+        );
         let response = runtime
             .service()
-            .create_task(
-                TaskCreateContext::default(),
-                composer_work_create_params(
-                    trigger,
-                    parent_thread_id.as_str(),
-                    pioneer_protocol::TASK_COMPOSER_WORK_VERSION,
-                ),
-            )
+            .create_task(task_create_context_for(&params), params)
             .await
             .unwrap_or_else(|error| panic!("{name} composer work should create: {error:#}"));
 
@@ -1807,6 +1847,7 @@ async fn revise_task_result_candidate_records_rejection_and_revision_turn_idempo
         .get_task_events(TaskEventsParams {
             task_id: task_id.clone(),
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("events should list");
@@ -2483,7 +2524,7 @@ async fn agent_run_is_atomically_claimed_before_spawn() {
     params.agent_spec = Some(spec);
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("scheduled agent task should create");
 
@@ -2563,7 +2604,7 @@ async fn running_agent_recovery_reuses_one_execution_and_one_child_lineage() {
     params.agent_spec = Some(agent_spec(2));
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("agent task should create");
     let run = response.run.expect("immediate run");
@@ -2674,7 +2715,7 @@ async fn starting_agent_recovery_reuses_reserved_execution_identity() {
     params.agent_spec = Some(agent_spec(2));
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("agent task should create");
     let run = response.run.expect("immediate run");
@@ -2761,6 +2802,7 @@ async fn mark_started_is_idempotent_and_emits_one_started_event() {
         .get_task_events(TaskEventsParams {
             task_id: run.task_id.clone(),
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("events should read");
@@ -2780,7 +2822,7 @@ async fn concurrent_execution_reservations_reuse_one_child_identity() {
     params.agent_spec = Some(agent_spec(2));
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("agent task should create");
     let run = response.run.expect("immediate run");
@@ -2898,7 +2940,7 @@ async fn one_task_run_can_link_only_one_child_thread() {
     params.agent_spec = Some(agent_spec(2));
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("task should create");
     let run = response.run.expect("immediate run");
@@ -3176,7 +3218,7 @@ async fn recurring_due_trigger_with_active_serial_run_skips_fire_and_moves_next_
     });
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("interval task should create");
 
@@ -3283,6 +3325,7 @@ async fn daily_cron_catches_up_latest_missed_once_and_advances_to_next_day() {
         .get_task_events(TaskEventsParams {
             task_id: response.task.id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("events should read");
@@ -3346,6 +3389,7 @@ async fn skip_missed_cron_advances_trigger_without_creating_run() {
         .get_task_events(TaskEventsParams {
             task_id: response.task.id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("events should read");
@@ -3414,7 +3458,7 @@ async fn run_all_missed_interval_respects_batch_limit_and_active_run_slots() {
     });
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("interval task should create");
 
@@ -3487,7 +3531,7 @@ async fn failed_run_schedules_retry_and_defers_terminal_delivery_until_exhausted
 
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("retry task should create");
 
@@ -3551,6 +3595,7 @@ async fn failed_run_schedules_retry_and_defers_terminal_delivery_until_exhausted
         .get_task_events(TaskEventsParams {
             task_id: response.task.id.clone(),
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("task events should read");
@@ -3597,7 +3642,7 @@ async fn write_locks_block_conflicting_agent_runs_and_recover_release_terminal_l
     });
     let first = runtime
         .service()
-        .create_task(TaskCreateContext::default(), first)
+        .create_task(task_create_context_for(&first), first)
         .await
         .expect("first agent task should create");
     let first_run_id = first.run.expect("first run should exist").id;
@@ -3620,7 +3665,7 @@ async fn write_locks_block_conflicting_agent_runs_and_recover_release_terminal_l
     });
     let second = runtime
         .service()
-        .create_task(TaskCreateContext::default(), second)
+        .create_task(task_create_context_for(&second), second)
         .await
         .expect("second agent task should create");
     let second_run_id = second.run.expect("second run should exist").id;
@@ -3644,6 +3689,7 @@ async fn write_locks_block_conflicting_agent_runs_and_recover_release_terminal_l
         .get_task_events(TaskEventsParams {
             task_id: second.task.id.clone(),
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("second task events should read");
@@ -3704,7 +3750,7 @@ async fn waiting_review_recovery_preserves_stale_write_lock() {
     });
     let first = runtime
         .service()
-        .create_task(TaskCreateContext::default(), first)
+        .create_task(task_create_context_for(&first), first)
         .await
         .expect("first agent task should create");
     let first_run_id = first.run.expect("first run should exist").id;
@@ -3727,7 +3773,7 @@ async fn waiting_review_recovery_preserves_stale_write_lock() {
     });
     let second = runtime
         .service()
-        .create_task(TaskCreateContext::default(), second)
+        .create_task(task_create_context_for(&second), second)
         .await
         .expect("second agent task should create");
     let second_run_id = second.run.expect("second run should exist").id;
@@ -3791,6 +3837,7 @@ async fn waiting_review_recovery_preserves_stale_write_lock() {
         .get_task_events(TaskEventsParams {
             task_id: first.task.id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("first task events should read");
@@ -3927,7 +3974,7 @@ async fn terminal_run_enqueues_owner_thread_delivery_from_normalized_result() {
 
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("scheduled task should create");
     runtime
@@ -3980,7 +4027,7 @@ async fn immediate_detached_thread_task_defaults_to_owner_thread_delivery() {
 
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("immediate detached task should create and run");
 
@@ -4047,7 +4094,7 @@ async fn immediate_attached_thread_task_keeps_no_delivery_default() {
 
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("immediate attached task should create and run");
 
@@ -4105,7 +4152,7 @@ async fn cancel_task_cancels_pending_deliveries() {
     });
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("interval task should create");
     runtime
@@ -4176,7 +4223,7 @@ async fn invalid_interval_is_rejected() {
         )
         .await
         .expect_err("invalid interval should fail");
-    assert!(format!("{error:#}").contains("interval_seconds must be positive"));
+    assert!(format!("{error:#}").contains("below resource minimum"));
 }
 
 #[tokio::test]
@@ -4220,11 +4267,30 @@ async fn agent_task_create_requires_permission_cap() {
 
     let error = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect_err("agent task should reject missing permission cap");
 
     assert!(format!("{error:#}").contains("agent_spec.permission_cap"));
+}
+
+#[tokio::test]
+async fn agent_task_create_requires_explicit_execution_admission() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Immediate);
+    params.executor_kind = TaskExecutorKind::Agent;
+    params.agent_spec = Some(agent_spec(3));
+
+    let error = runtime
+        .service()
+        .create_task(TaskCreateContext::default(), params)
+        .await
+        .expect_err("agent task without execution authority must fail closed");
+
+    assert!(
+        format!("{error:#}").contains("explicit execution authorization admission"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[tokio::test]
@@ -4239,7 +4305,7 @@ async fn task_security_cap_persists_on_agent_spec() {
 
     let created = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("agent task should create");
     assert_eq!(
@@ -4277,7 +4343,7 @@ async fn security_intersection_missing_security_cap_is_rejected_for_agent_task()
 
     let error = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect_err("agent task should reject missing security cap");
     assert!(
@@ -4297,7 +4363,7 @@ async fn recovery_security_missing_security_cap_is_not_defaulted() {
 
     let error = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect_err("agent task should reject missing security cap");
     let message = format!("{error:#}");
@@ -4319,7 +4385,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
     missing_prompt.agent_spec = Some(agent_spec(3));
     let error = runtime
         .service()
-        .create_task(TaskCreateContext::default(), missing_prompt)
+        .create_task(task_create_context_for(&missing_prompt), missing_prompt)
         .await
         .expect_err("scheduled agent task should reject empty prompt");
     assert!(format!("{error:#}").contains("self-contained executor instructions"));
@@ -4339,7 +4405,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
     missing_output.agent_spec = Some(spec);
     let error = runtime
         .service()
-        .create_task(TaskCreateContext::default(), missing_output)
+        .create_task(task_create_context_for(&missing_output), missing_output)
         .await
         .expect_err("scheduled agent task should reject missing output contract");
     assert!(format!("{error:#}").contains("output instructions"));
@@ -4361,7 +4427,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
     valid.agent_spec = Some(spec);
     runtime
         .service()
-        .create_task(TaskCreateContext::default(), valid)
+        .create_task(task_create_context_for(&valid), valid)
         .await
         .expect("scheduled agent task should accept a durable prompt contract");
 }
@@ -4385,7 +4451,7 @@ async fn update_task_patches_task_trigger_and_base_agent_spec_atomically() {
     params.agent_spec = Some(spec);
     let created = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("scheduled agent task should create");
 
@@ -4497,7 +4563,7 @@ async fn update_task_rejects_scheduled_agent_without_prompt_contract() {
     params.agent_spec = Some(agent_spec(3));
     let created = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("immediate agent task should create");
 
@@ -4533,7 +4599,7 @@ async fn lifecycle_defaults_attach_only_immediate_parent_turn_tasks() {
     immediate.created_by_turn_id = Some("turn_a".to_owned());
     let immediate = runtime
         .service()
-        .create_task(TaskCreateContext::default(), immediate)
+        .create_task(task_create_context_for(&immediate), immediate)
         .await
         .expect("immediate task should create");
     assert_eq!(
@@ -4565,11 +4631,12 @@ async fn max_depth_is_enforced_before_child_events_are_appended() {
     let mut root = create_params(TaskTriggerSpec::Manual {
         allowed_actor: None,
     });
+    root.created_by_thread_id = Some("thread_depth_root".to_owned());
     root.executor_kind = TaskExecutorKind::Agent;
     root.agent_spec = Some(agent_spec(1));
     let root = runtime
         .service()
-        .create_task(TaskCreateContext::default(), root)
+        .create_task(task_create_context_for(&root), root)
         .await
         .expect("root task should create");
 
@@ -4577,11 +4644,12 @@ async fn max_depth_is_enforced_before_child_events_are_appended() {
         allowed_actor: None,
     });
     child.executor_kind = TaskExecutorKind::Agent;
+    child.created_by_thread_id = Some("thread_depth_root".to_owned());
     child.parent_task_id = Some(root.task.id.clone());
     child.agent_spec = Some(agent_spec(1));
     let error = runtime
         .service()
-        .create_task(TaskCreateContext::default(), child)
+        .create_task(task_create_context_for(&child), child)
         .await
         .expect_err("child beyond max depth should fail");
     assert!(format!("{error:#}").contains("exceeds max depth"));
@@ -4591,6 +4659,7 @@ async fn max_depth_is_enforced_before_child_events_are_appended() {
         .get_task_events(TaskEventsParams {
             task_id: root.task.id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("events should read");
@@ -4610,6 +4679,7 @@ async fn scheduled_parent_task_can_create_child_when_depth_allows() {
         timezone: "UTC".to_owned(),
         catch_up_policy: None,
     });
+    root.created_by_thread_id = Some("thread_scheduled_parent".to_owned());
     root.executor_kind = TaskExecutorKind::Agent;
     let mut root_spec = agent_spec(3);
     root_spec.prompt.instructions = vec!["Run the scheduled parent task.".to_owned()];
@@ -4617,17 +4687,18 @@ async fn scheduled_parent_task_can_create_child_when_depth_allows() {
     root.agent_spec = Some(root_spec);
     let root = runtime
         .service()
-        .create_task(TaskCreateContext::default(), root)
+        .create_task(task_create_context_for(&root), root)
         .await
         .expect("scheduled root task should create");
 
     let mut child = create_params(TaskTriggerSpec::Immediate);
     child.executor_kind = TaskExecutorKind::Agent;
+    child.created_by_thread_id = Some("thread_scheduled_parent".to_owned());
     child.parent_task_id = Some(root.task.id.clone());
     child.agent_spec = Some(agent_spec(3));
     let child = runtime
         .service()
-        .create_task(TaskCreateContext::default(), child)
+        .create_task(task_create_context_for(&child), child)
         .await
         .expect("child task should be allowed while depth remains within max_depth");
     let child_spec = child.agent_spec.expect("child agent spec");
@@ -4790,23 +4861,23 @@ async fn executing_task_cannot_cancel_itself() {
 #[tokio::test]
 async fn executing_task_cannot_cancel_an_ancestor() {
     let runtime = runtime().await;
+    let mut root_params = create_params(TaskTriggerSpec::ScheduledAt {
+        scheduled_at: 4_000_000_000,
+        timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
+    });
+    root_params.created_by_thread_id = Some("thread_ancestor_root".to_owned());
     let root = runtime
         .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: 4_000_000_000,
-                timezone: Some("UTC".to_owned()),
-                catch_up_policy: None,
-            }),
-        )
+        .create_task(task_create_context_for(&root_params), root_params)
         .await
         .expect("root task should create");
     let mut child_params = create_params(TaskTriggerSpec::Immediate);
+    child_params.created_by_thread_id = Some("thread_ancestor_root".to_owned());
     child_params.parent_task_id = Some(root.task.id.clone());
     let child = runtime
         .service()
-        .create_task(TaskCreateContext::default(), child_params)
+        .create_task(task_create_context_for(&child_params), child_params)
         .await
         .expect("child task should create");
     let child_run = child.run.expect("immediate child should have a run");
@@ -4922,16 +4993,15 @@ async fn executing_task_can_cancel_an_unrelated_task() {
 #[tokio::test]
 async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
     let runtime = runtime().await;
+    let mut root_params = create_params(TaskTriggerSpec::ScheduledAt {
+        scheduled_at: 4_000_000_000,
+        timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
+    });
+    root_params.created_by_thread_id = Some("thread_cancel_root".to_owned());
     let root = runtime
         .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::ScheduledAt {
-                scheduled_at: 4_000_000_000,
-                timezone: Some("UTC".to_owned()),
-                catch_up_policy: None,
-            }),
-        )
+        .create_task(task_create_context_for(&root_params), root_params)
         .await
         .expect("root task should create");
 
@@ -4940,6 +5010,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
         timezone: Some("UTC".to_owned()),
         catch_up_policy: None,
     });
+    attached_cancel.created_by_thread_id = Some("thread_cancel_root".to_owned());
     attached_cancel.parent_task_id = Some(root.task.id.clone());
     attached_cancel.lifecycle_policy = Some(TaskLifecyclePolicy {
         attachment: TaskAttachmentMode::Attached,
@@ -4949,7 +5020,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
     });
     let attached_cancel = runtime
         .service()
-        .create_task(TaskCreateContext::default(), attached_cancel)
+        .create_task(task_create_context_for(&attached_cancel), attached_cancel)
         .await
         .expect("attached cancel child should create");
 
@@ -4958,6 +5029,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
         timezone: Some("UTC".to_owned()),
         catch_up_policy: None,
     });
+    attached_detach.created_by_thread_id = Some("thread_cancel_root".to_owned());
     attached_detach.parent_task_id = Some(root.task.id.clone());
     attached_detach.lifecycle_policy = Some(TaskLifecyclePolicy {
         attachment: TaskAttachmentMode::Attached,
@@ -4967,7 +5039,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
     });
     let attached_detach = runtime
         .service()
-        .create_task(TaskCreateContext::default(), attached_detach)
+        .create_task(task_create_context_for(&attached_detach), attached_detach)
         .await
         .expect("attached detach child should create");
 
@@ -4976,6 +5048,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
         timezone: Some("UTC".to_owned()),
         catch_up_policy: None,
     });
+    detached_keep.created_by_thread_id = Some("thread_cancel_root".to_owned());
     detached_keep.parent_task_id = Some(root.task.id.clone());
     detached_keep.lifecycle_policy = Some(TaskLifecyclePolicy {
         attachment: TaskAttachmentMode::Detached,
@@ -4985,7 +5058,7 @@ async fn cancel_attached_subtree_cancels_detaches_and_keeps_by_policy() {
     });
     let detached_keep = runtime
         .service()
-        .create_task(TaskCreateContext::default(), detached_keep)
+        .create_task(task_create_context_for(&detached_keep), detached_keep)
         .await
         .expect("detached child should create");
 
@@ -5077,7 +5150,7 @@ async fn detach_task_updates_attachment_without_cancelling() {
     });
     let response = runtime
         .service()
-        .create_task(TaskCreateContext::default(), params)
+        .create_task(task_create_context_for(&params), params)
         .await
         .expect("task should create");
     let detached = runtime
@@ -5620,6 +5693,7 @@ async fn cancellation_class_failure_projects_as_cancelled_without_task_failed() 
         .get_task_events(TaskEventsParams {
             task_id: response.task.id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("events should read");
@@ -5821,6 +5895,7 @@ async fn duplicate_keyed_run_started_append_is_noop_without_new_sequence() {
         .get_task_events(TaskEventsParams {
             task_id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("task events should read");
@@ -5885,6 +5960,7 @@ async fn duplicate_child_thread_link_append_is_noop_without_new_sequence() {
         .get_task_events(TaskEventsParams {
             task_id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("task events should read");
@@ -6091,6 +6167,7 @@ async fn startup_reconciliation_emits_recovered_event_for_dormant_active_trigger
         .get_task_events(TaskEventsParams {
             task_id: response.task.id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("events should read");
@@ -6158,6 +6235,7 @@ async fn startup_reconciliation_is_idempotent() {
         .get_task_events(TaskEventsParams {
             task_id: response.task.id,
             after_sequence: None,
+            limit: None,
         })
         .await
         .expect("events should read");
@@ -6173,4 +6251,108 @@ async fn startup_reconciliation_is_idempotent() {
         })
         .count();
     assert_eq!(recovered_count, 1);
+}
+
+#[tokio::test]
+async fn role_owned_task_observation_budget_clamps_list_and_event_pages() {
+    let runtime = runtime().await;
+    let first = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
+            }),
+        )
+        .await
+        .expect("first task should create");
+    runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
+            }),
+        )
+        .await
+        .expect("second task should create");
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskPaused {
+                task: first.task.clone(),
+                triggers: vec![first.trigger.clone()],
+                reason: Some("budget fixture".to_owned()),
+                paused_at: 20,
+            },
+            20,
+        )
+        .await
+        .expect("second task event should append");
+
+    let budget = TaskResourceBudget {
+        max_page_items: 1,
+        max_event_page_items: 1,
+        ..TaskResourceBudget::default()
+    };
+    let page = runtime
+        .service()
+        .list_tasks_with_budget(
+            pioneer_protocol::TaskListParams {
+                workspace_id: "ws_tasks".to_owned(),
+                limit: None,
+                ..Default::default()
+            },
+            budget,
+        )
+        .await
+        .expect("bounded task list should succeed");
+    assert_eq!(page.tasks.len(), 1);
+    assert!(page.next_cursor.is_some());
+
+    let events = runtime
+        .service()
+        .get_task_events_with_budget(
+            TaskEventsParams {
+                task_id: first.task.id,
+                after_sequence: None,
+                limit: None,
+            },
+            budget,
+        )
+        .await
+        .expect("bounded task events should succeed");
+    assert_eq!(events.events.len(), 1);
+    assert!(events.has_more);
+}
+
+#[tokio::test]
+async fn role_owned_task_observation_budget_rejects_oversized_response() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
+            }),
+        )
+        .await
+        .expect("task should create");
+    let budget = TaskResourceBudget {
+        max_response_bytes: 1,
+        ..TaskResourceBudget::default()
+    };
+
+    let error = runtime
+        .service()
+        .get_task_with_budget(
+            pioneer_protocol::TaskGetParams {
+                task_id: response.task.id,
+            },
+            budget,
+        )
+        .await
+        .expect_err("oversized observation response must fail closed");
+    assert!(format!("{error:#}").contains("task get response exceeds"));
 }

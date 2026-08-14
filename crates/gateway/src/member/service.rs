@@ -20,7 +20,7 @@ use crate::auth::AuthenticatedSessionPrincipal;
 use crate::authorization::{
     AuthorizationDecision, AuthorizationResolver, AuthorizationService, AuthorizedMemberDirectory,
     AuthorizedMemberPrincipal, AuthorizedWorkspace, DenyReason, DisclosurePolicy, ProofResolution,
-    ResourceAction, persisted_actor_is_current,
+    ResourceAction, RuntimePrincipalPolicy, persisted_actor_is_current,
 };
 use crate::epic5_observability::Epic5RateLimits;
 use crate::secrets::GatewaySecrets;
@@ -139,8 +139,7 @@ impl MemberService {
         authorization: &AuthorizedMemberPrincipal,
         params: MemberSuspendParams,
     ) -> Result<MemberLifecycleCommitted, MemberServiceError> {
-        if principal.kind != PrincipalKind::Superuser
-            || authorization.principal_id() != &principal.principal_id
+        if authorization.principal_id() != &principal.principal_id
             || authorization.action() != ResourceAction::MemberSuspend
             || authorization.target_principal_id() != &params.principal_id
         {
@@ -263,8 +262,7 @@ impl MemberService {
         authorization: &AuthorizedMemberPrincipal,
         params: MemberRestoreParams,
     ) -> Result<MemberLifecycleCommitted, MemberServiceError> {
-        if principal.kind != PrincipalKind::Superuser
-            || authorization.principal_id() != &principal.principal_id
+        if authorization.principal_id() != &principal.principal_id
             || authorization.action() != ResourceAction::MemberRestore
             || authorization.target_principal_id() != &params.principal_id
         {
@@ -379,8 +377,7 @@ impl MemberService {
         authorization: &AuthorizedMemberPrincipal,
         params: MemberRemoveParams,
     ) -> Result<MemberRemovalCommitted, MemberServiceError> {
-        if principal.kind != PrincipalKind::Superuser
-            || authorization.principal_id() != &principal.principal_id
+        if authorization.principal_id() != &principal.principal_id
             || authorization.action() != ResourceAction::MemberRemove
             || authorization.target_principal_id() != &params.principal_id
         {
@@ -535,11 +532,10 @@ impl MemberService {
             .load_or_create_auth_credential_hmac_key(MEMBER_CURSOR_KEY_MIN_BYTES)
             .map_err(MemberServiceError::Unavailable)?;
         let codec = MemberCursorCodec::new(&key).map_err(MemberServiceError::Unavailable)?;
-        let principal_kind = match principal.kind {
-            PrincipalKind::Superuser => "superuser",
-            PrincipalKind::User => "member",
-        };
-        let scope = format!("{principal_kind}:{}", principal.principal_id);
+        let policy_role = AuthorizationService::new()
+            .resolved_role_key(principal.kind, principal.role_key.as_ref())
+            .ok_or_else(|| MemberServiceError::Authorization(unsupported_role()))?;
+        let scope = format!("{policy_role}:{}", principal.principal_id);
         let cursor = params
             .cursor
             .as_deref()
@@ -721,21 +717,9 @@ impl MemberService {
             .map_err(MemberServiceError::Unavailable)?;
         let result = async {
             ensure_current_actor(&transaction, principal).await?;
-            let workspace_active = match principal.kind {
-                PrincipalKind::Superuser => pioneer_crud::resolve_workspace_authorization_scope(
-                    &transaction,
-                    params.workspace_id.as_str(),
-                )
-                .await?
-                .is_some_and(|workspace| workspace.is_active),
-                PrincipalKind::User => pioneer_crud::find_active_workspace_for_principal(
-                    &transaction,
-                    &principal.principal_id,
-                    params.workspace_id.as_str(),
-                )
-                .await?
-                .is_some(),
-            };
+            let workspace_active =
+                principal_has_active_workspace(&transaction, principal, &params.workspace_id)
+                    .await?;
             if !workspace_active {
                 return Err(MemberServiceError::Authorization(missing_resource()));
             }
@@ -814,21 +798,9 @@ impl MemberService {
             .map_err(MemberServiceError::Unavailable)?;
         let result = async {
             ensure_current_actor(&transaction, principal).await?;
-            let workspace_active = match principal.kind {
-                PrincipalKind::Superuser => pioneer_crud::resolve_workspace_authorization_scope(
-                    &transaction,
-                    params.workspace_id.as_str(),
-                )
-                .await?
-                .is_some_and(|workspace| workspace.is_active),
-                PrincipalKind::User => pioneer_crud::find_active_workspace_for_principal(
-                    &transaction,
-                    &principal.principal_id,
-                    params.workspace_id.as_str(),
-                )
-                .await?
-                .is_some(),
-            };
+            let workspace_active =
+                principal_has_active_workspace(&transaction, principal, &params.workspace_id)
+                    .await?;
             if !workspace_active {
                 return Err(MemberServiceError::Authorization(missing_resource()));
             }
@@ -842,7 +814,7 @@ impl MemberService {
             }
             if target.kind != PrincipalKind::User
                 || target.status != PrincipalStatus::Active
-                || target.role_key.as_deref() != Some(pioneer_protocol::MEMBER_ROLE_KEY)
+                || !is_lifecycle_managed_user_role(target.role_key.as_deref())
             {
                 return Err(MemberServiceError::InvalidTarget);
             }
@@ -911,8 +883,7 @@ impl MemberService {
         authorization: &AuthorizedWorkspace,
         params: WorkspaceMemberRemoveParams,
     ) -> Result<WorkspaceMemberRemovalCommitted, MemberServiceError> {
-        if principal.kind != PrincipalKind::Superuser
-            || authorization.principal_id() != &principal.principal_id
+        if authorization.principal_id() != &principal.principal_id
             || authorization.action() != ResourceAction::WorkspaceMemberRemove
             || authorization.workspace_id() != params.workspace_id.as_str()
         {
@@ -949,7 +920,7 @@ impl MemberService {
                     target.status,
                     PrincipalStatus::Active | PrincipalStatus::Suspended
                 )
-                || target.role_key.as_deref() != Some(pioneer_protocol::MEMBER_ROLE_KEY)
+                || !is_lifecycle_managed_user_role(target.role_key.as_deref())
             {
                 return Err(MemberServiceError::InvalidTarget);
             }
@@ -1058,27 +1029,70 @@ async fn load_lifecycle_target(
         return Err(MemberServiceError::Authorization(missing_resource()));
     }
     if target.kind != PrincipalKind::User
-        || target.role_key.as_deref() != Some(pioneer_protocol::MEMBER_ROLE_KEY)
+        || !is_lifecycle_managed_user_role(target.role_key.as_deref())
     {
         return Err(MemberServiceError::InvalidTarget);
     }
     Ok(target)
 }
 
+async fn principal_has_active_workspace(
+    transaction: &DatabaseTransaction,
+    principal: &AuthenticatedSessionPrincipal,
+    workspace_id: &WorkspaceId,
+) -> Result<bool, Error> {
+    match AuthorizationService::new()
+        .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
+    {
+        Some(RuntimePrincipalPolicy::Absolute) => Ok(
+            pioneer_crud::resolve_workspace_authorization_scope(transaction, workspace_id.as_str())
+                .await?
+                .is_some_and(|workspace| workspace.is_active),
+        ),
+        Some(RuntimePrincipalPolicy::ScopedCollaboration) => {
+            Ok(pioneer_crud::find_active_workspace_for_principal(
+                transaction,
+                &principal.principal_id,
+                workspace_id.as_str(),
+            )
+            .await?
+            .is_some())
+        }
+        None => Ok(false),
+    }
+}
+
+fn is_lifecycle_managed_user_role(role_key: Option<&str>) -> bool {
+    role_key.is_some_and(|role_key| {
+        RoleKey::new(role_key).is_ok_and(|role_key| {
+            AuthorizationService::new()
+                .role_is_lifecycle_managed(PrincipalKind::User, Some(&role_key))
+        })
+    })
+}
+
 fn member_summary(
     row: pioneer_crud::GatewayPrincipalRecord,
     avatar_revision: Option<String>,
 ) -> Result<MemberSummary, Error> {
+    let role_key = row
+        .role_key
+        .map(RoleKey::new)
+        .transpose()
+        .context("persisted Member role is invalid")?;
+    let authorization = AuthorizationService::new();
+    let role = authorization
+        .role_presentation(row.kind, role_key.as_ref())
+        .context("persisted Member role is not registered")?;
+    let lifecycle_managed = authorization.role_is_lifecycle_managed(row.kind, role_key.as_ref());
     Ok(MemberSummary {
         principal_id: row.id,
         kind: row.kind,
         display_name: row.display_name,
         nickname: row.nickname,
-        role_key: row
-            .role_key
-            .map(RoleKey::new)
-            .transpose()
-            .context("persisted Member role is invalid")?,
+        role_key,
+        role,
+        lifecycle_managed,
         status: row.status,
         avatar_revision,
     })
@@ -1095,6 +1109,13 @@ fn missing_resource() -> AuthorizationDecision {
     AuthorizationDecision::Deny {
         reason: DenyReason::MissingAuthoritativeResource,
         disclosure: DisclosurePolicy::NotFound,
+    }
+}
+
+fn unsupported_role() -> AuthorizationDecision {
+    AuthorizationDecision::Deny {
+        reason: DenyReason::UnsupportedRole,
+        disclosure: DisclosurePolicy::AuthenticationTerminal,
     }
 }
 
@@ -1673,6 +1694,7 @@ mod tests {
             pioneer_crud::NewMemberPrincipalRow {
                 id: target.clone(),
                 gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
+                role_key: RoleKey::member(),
                 display_name: "Hidden Existing Member".to_owned(),
                 nickname: "hidden-existing".to_owned(),
                 nickname_key: "hidden-existing".to_owned(),
@@ -1794,6 +1816,7 @@ mod tests {
             pioneer_crud::NewMemberPrincipalRow {
                 id: target.clone(),
                 gateway_id: actor.gateway_id.clone(),
+                role_key: RoleKey::member(),
                 display_name: "Hidden Existing Member".to_owned(),
                 nickname: "hidden-existing".to_owned(),
                 nickname_key: "hidden-existing".to_owned(),
@@ -2003,6 +2026,7 @@ mod tests {
             pioneer_crud::NewMemberPrincipalRow {
                 id: target.clone(),
                 gateway_id: actor.gateway_id.clone(),
+                role_key: RoleKey::member(),
                 display_name: "Concurrent Existing Member".to_owned(),
                 nickname: "concurrent-existing".to_owned(),
                 nickname_key: "concurrent-existing".to_owned(),
@@ -2587,6 +2611,7 @@ mod tests {
                     gateway_id: actor.gateway_id.clone(),
                     created_by_principal_id: target.clone(),
                     created_by_session_id: target_session_id.clone(),
+                    target_role_key: RoleKey::member(),
                     token_hash,
                     expires_at: now + chrono::Duration::days(7),
                     now,

@@ -21,6 +21,7 @@ mod epic5_observability;
 mod helpers;
 mod hook_run_store;
 mod hook_runtime;
+mod human_interaction;
 mod identity;
 mod invitation;
 mod keep_awake;
@@ -35,6 +36,7 @@ mod operations;
 mod permissions;
 mod profile_avatar;
 mod prompt_hooks;
+mod public_error;
 mod request_context;
 mod resilience;
 mod secrets;
@@ -42,6 +44,7 @@ mod self_improvement;
 mod session;
 mod settings;
 mod system_skills;
+mod task_projection;
 mod task_tools;
 #[cfg(test)]
 mod tests;
@@ -277,6 +280,9 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     auth_service.set_disconnect_hook(session_manager.clone());
     let workspace_manager = Arc::new(WorkspaceManager::new(database.clone()));
     let crud_store = Arc::new(CrudStore::new(database.clone()));
+    database::startup::enforce_execution_authority_integrity(crud_store.as_ref())
+        .await
+        .context("Gateway execution authority integrity gate failed")?;
     let thread_manager = Arc::new(ThreadManager::from_app_config(&config));
 
     migrate_legacy_provider_api_keys_to_current_workspace(

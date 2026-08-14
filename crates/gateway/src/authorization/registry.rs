@@ -14,6 +14,7 @@ pub(crate) enum ResourceResolverKind {
     Artifact,
     Task,
     Capability,
+    AgentsDocument,
     OwnSession,
     InvitationGrantSet,
     InvitationCollection,
@@ -33,6 +34,7 @@ impl ResourceResolverKind {
             Self::Artifact => "artifact",
             Self::Task => "task",
             Self::Capability => "capability",
+            Self::AgentsDocument => "agents_document",
             Self::OwnSession => "own_session",
             Self::InvitationGrantSet => "invitation_grant_set",
             Self::InvitationCollection => "invitation_collection",
@@ -68,6 +70,11 @@ impl AuthorizationAuditClass {
 pub(crate) struct MethodAuthorizationEntry {
     pub(crate) method: &'static str,
     pub(crate) action: ResourceAction,
+    /// Additional canonical actions selected from server-owned request facts.
+    /// The primary action remains the fail-closed default used by static
+    /// dispatch; dynamic admission must explicitly select and audit one of
+    /// these actions before resolving the resource.
+    pub(crate) alternate_actions: &'static [ResourceAction],
     pub(crate) resolver: ResourceResolverKind,
     pub(crate) disclosure: DisclosurePolicy,
     pub(crate) audit: AuthorizationAuditClass,
@@ -83,27 +90,58 @@ const fn method_entry(
     MethodAuthorizationEntry {
         method,
         action,
+        alternate_actions: &[],
         resolver,
         disclosure,
         audit,
     }
 }
 
+const fn dynamic_method_entry(
+    method: &'static str,
+    action: ResourceAction,
+    alternate_actions: &'static [ResourceAction],
+    resolver: ResourceResolverKind,
+    disclosure: DisclosurePolicy,
+    audit: AuthorizationAuditClass,
+) -> MethodAuthorizationEntry {
+    MethodAuthorizationEntry {
+        method,
+        action,
+        alternate_actions,
+        resolver,
+        disclosure,
+        audit,
+    }
+}
+
+impl MethodAuthorizationEntry {
+    pub(crate) fn supports_action(&self, action: ResourceAction) -> bool {
+        self.action == action || self.alternate_actions.contains(&action)
+    }
+}
+
 use AuthorizationAuditClass::{Authentication, Execution, Management, Mutation, Read};
 use DisclosurePolicy::{Forbidden, NotFound};
 use ResourceAction::{
-    ArtifactDelete, ArtifactRead, ArtifactWrite, CliRuntimeManage, CliRuntimeUse, GatewayManage,
-    InvitationCreate, InvitationList, InvitationRevoke, McpManage, McpUse, MemberDeviceCreate,
-    MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend, MemoryRead, MemoryWrite,
-    ProfileUpdateOwn, ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn, SkillManage,
-    SkillUse, TaskManage, TaskRead, TaskRun, ThreadCreate, ThreadManage, ThreadMove,
-    ThreadParticipantsManage, ThreadRead, ThreadWrite, WorkspaceCreate, WorkspaceList,
-    WorkspaceManage, WorkspaceMemberAdd, WorkspaceMemberList, WorkspaceMemberRemove, WorkspaceRead,
+    AgentExecutionCancel, AgentExecutionObserve, AgentExecutionResume, AgentExecutionSteer,
+    AgentRequestRespond, AgentTurnStart, AgentsDocumentManage, AgentsDocumentRead,
+    ArtifactBindThread, ArtifactCreateThread, ArtifactDeleteThread, ArtifactRead,
+    CliRuntimeDiscover, CliRuntimeManage, CliThreadFork, GatewayManage, InvitationCreate,
+    InvitationList, InvitationRevoke, McpDiscover, McpManage, MemberDeviceCreate,
+    MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend, MemoryCreateThread,
+    MemoryForgetThread, MemoryModerateWorkspace, MemoryRead, MessageCreate, MessageDeleteOwn,
+    MessageEditOwn, NotificationAcknowledgeOwn, NotificationReadOwn, ProfileUpdateOwn,
+    ProviderDiscover, ProviderManage, ProviderUse, SessionReadOwn, SessionRevokeOwn, SkillDiscover,
+    SkillManage, TaskCancel, TaskCreate, TaskDetach, TaskRead, TaskReview, TaskScheduleManage,
+    ThreadCreatePrivate, ThreadCreateWorkspace, ThreadManage, ThreadMove, ThreadParticipantsManage,
+    ThreadRead, WorkspaceCreate, WorkspaceList, WorkspaceManage, WorkspaceMemberAdd,
+    WorkspaceMemberList, WorkspaceMemberRemove, WorkspaceRead,
 };
 use ResourceResolverKind::{
-    Artifact, Capability, Gateway, Invitation, InvitationCollection, InvitationGrantSet,
-    MemberDirectory, MemberPrincipal, OwnSession, Task, Thread, Turn, Workspace,
-    WorkspaceCollection,
+    AgentsDocument, Artifact, Capability, Gateway, Invitation, InvitationCollection,
+    InvitationGrantSet, MemberDirectory, MemberPrincipal, OwnSession, Task, Thread, Turn,
+    Workspace, WorkspaceCollection,
 };
 
 pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
@@ -268,7 +306,14 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         NotFound,
         Management,
     ),
-    method_entry(THREAD_START, ThreadCreate, Workspace, NotFound, Mutation),
+    dynamic_method_entry(
+        THREAD_START,
+        ThreadCreatePrivate,
+        &[ThreadCreateWorkspace, ThreadRead],
+        Workspace,
+        NotFound,
+        Mutation,
+    ),
     method_entry(THREAD_TREE, WorkspaceRead, Workspace, NotFound, Read),
     method_entry(THREAD_UPDATE, ThreadManage, Thread, NotFound, Mutation),
     method_entry(THREAD_MOVE, ThreadMove, Thread, NotFound, Management),
@@ -308,25 +353,31 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Forbidden,
         Management,
     ),
-    method_entry(THREAD_AGENTS_DOC_GET, ThreadRead, Thread, NotFound, Read),
+    method_entry(
+        THREAD_AGENTS_DOC_GET,
+        AgentsDocumentRead,
+        AgentsDocument,
+        NotFound,
+        Read,
+    ),
     method_entry(
         THREAD_AGENTS_DOC_SAVE,
-        ThreadWrite,
-        Thread,
+        AgentsDocumentManage,
+        AgentsDocument,
         NotFound,
         Mutation,
     ),
     method_entry(
         THREAD_AGENTS_DOC_ARCHIVE,
-        ThreadManage,
-        Thread,
+        AgentsDocumentManage,
+        AgentsDocument,
         NotFound,
         Mutation,
     ),
     method_entry(
         THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD,
-        ThreadRead,
-        Thread,
+        AgentsDocumentRead,
+        AgentsDocument,
         NotFound,
         Read,
     ),
@@ -334,9 +385,22 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     method_entry(THREAD_TIMELINE_PAGE, ThreadRead, Thread, NotFound, Read),
     method_entry(THREAD_READ, ThreadRead, Thread, NotFound, Mutation),
     method_entry(THREAD_UNSUBSCRIBE, ThreadRead, Thread, NotFound, Mutation),
-    method_entry(TURN_START, ThreadWrite, Thread, NotFound, Execution),
-    method_entry(TURN_MESSAGE_EDIT, ThreadWrite, Turn, NotFound, Mutation),
-    method_entry(TURN_MESSAGE_DELETE, ThreadWrite, Turn, NotFound, Mutation),
+    dynamic_method_entry(
+        TURN_START,
+        AgentTurnStart,
+        &[MessageCreate],
+        Thread,
+        NotFound,
+        Execution,
+    ),
+    method_entry(TURN_MESSAGE_EDIT, MessageEditOwn, Turn, NotFound, Mutation),
+    method_entry(
+        TURN_MESSAGE_DELETE,
+        MessageDeleteOwn,
+        Turn,
+        NotFound,
+        Mutation,
+    ),
     method_entry(
         TURN_MESSAGE_REVISIONS_PAGE,
         ThreadRead,
@@ -344,20 +408,26 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         NotFound,
         Read,
     ),
-    method_entry(TURN_CANCEL, ThreadWrite, Turn, NotFound, Mutation),
-    method_entry(TURN_RESUME, ThreadWrite, Turn, NotFound, Execution),
-    method_entry(TURN_GET, ThreadRead, Turn, NotFound, Read),
-    method_entry(TURN_ITEMS, ThreadRead, Turn, NotFound, Read),
-    method_entry(TURN_WORK_PAGE, ThreadRead, Turn, NotFound, Read),
-    method_entry(TURN_WORK_ITEMS_GET, ThreadRead, Turn, NotFound, Read),
+    method_entry(TURN_CANCEL, AgentExecutionCancel, Turn, NotFound, Mutation),
+    method_entry(TURN_RESUME, AgentExecutionResume, Turn, NotFound, Execution),
+    method_entry(TURN_GET, AgentExecutionObserve, Turn, NotFound, Read),
+    method_entry(TURN_ITEMS_PAGE, AgentExecutionObserve, Turn, NotFound, Read),
+    method_entry(TURN_WORK_PAGE, AgentExecutionObserve, Turn, NotFound, Read),
+    method_entry(
+        TURN_WORK_ITEMS_GET,
+        AgentExecutionObserve,
+        Turn,
+        NotFound,
+        Read,
+    ),
     method_entry(
         TURN_PERMISSION_REQUEST_RESPOND,
-        ThreadWrite,
+        AgentRequestRespond,
         Turn,
         NotFound,
         Execution,
     ),
-    method_entry(VOICE_STATUS, ProviderUse, Capability, NotFound, Read),
+    method_entry(VOICE_STATUS, ProviderDiscover, Capability, NotFound, Read),
     method_entry(
         VOICE_SESSION_START,
         ProviderUse,
@@ -379,24 +449,24 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         NotFound,
         Mutation,
     ),
-    method_entry(PROVIDER_LIST, ProviderUse, Capability, NotFound, Read),
+    method_entry(PROVIDER_LIST, ProviderDiscover, Capability, NotFound, Read),
     method_entry(
         PROVIDER_MODELS_LIST,
-        ProviderUse,
+        ProviderDiscover,
         Capability,
         NotFound,
         Read,
     ),
     method_entry(
         PROVIDER_EMBEDDING_MODELS_LIST,
-        ProviderUse,
+        ProviderDiscover,
         Capability,
         NotFound,
         Read,
     ),
     method_entry(
         PROVIDER_TRANSCRIPTION_MODELS_LIST,
-        ProviderUse,
+        ProviderDiscover,
         Capability,
         NotFound,
         Read,
@@ -422,54 +492,72 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Forbidden,
         Management,
     ),
-    method_entry(CLI_RUNTIME_LIST, CliRuntimeUse, Workspace, NotFound, Read),
-    method_entry(CLI_RUNTIME_GET, CliRuntimeUse, Workspace, NotFound, Read),
-    method_entry(CLI_RUNTIME_STATUS, CliRuntimeUse, Workspace, NotFound, Read),
+    method_entry(
+        CLI_RUNTIME_LIST,
+        CliRuntimeDiscover,
+        Workspace,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        CLI_RUNTIME_GET,
+        CliRuntimeDiscover,
+        Workspace,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        CLI_RUNTIME_STATUS,
+        CliRuntimeDiscover,
+        Workspace,
+        NotFound,
+        Read,
+    ),
     method_entry(
         CLI_RUNTIME_REFRESH,
-        CliRuntimeUse,
+        CliRuntimeDiscover,
         Workspace,
         NotFound,
         Execution,
     ),
     method_entry(
         CLI_RUNTIME_LIST_MODELS,
-        CliRuntimeUse,
+        CliRuntimeDiscover,
         Workspace,
         NotFound,
         Read,
     ),
     method_entry(
         CLI_RUNTIME_THREAD_BINDING_GET,
-        CliRuntimeUse,
+        CliRuntimeDiscover,
         Thread,
         NotFound,
         Read,
     ),
     method_entry(
         CLI_RUNTIME_THREAD_FORK,
-        CliRuntimeUse,
+        CliThreadFork,
         Thread,
         NotFound,
         Execution,
     ),
     method_entry(
         CLI_RUNTIME_THREAD_COMPACT,
-        CliRuntimeUse,
+        AgentExecutionSteer,
         Thread,
         NotFound,
         Execution,
     ),
     method_entry(
         CLI_RUNTIME_TURN_STEER,
-        CliRuntimeUse,
+        AgentExecutionSteer,
         Turn,
         NotFound,
         Execution,
     ),
     method_entry(
         CLI_RUNTIME_REVIEW_START,
-        CliRuntimeUse,
+        AgentRequestRespond,
         Thread,
         NotFound,
         Execution,
@@ -504,7 +592,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     ),
     method_entry(
         CLI_RUNTIME_REQUEST_RESPOND,
-        CliRuntimeUse,
+        AgentRequestRespond,
         Turn,
         NotFound,
         Execution,
@@ -517,7 +605,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Forbidden,
         Management,
     ),
-    method_entry(SKILLS_LIST, SkillUse, Workspace, NotFound, Read),
+    method_entry(SKILLS_LIST, SkillDiscover, Workspace, NotFound, Read),
     method_entry(
         SKILLS_INSTALL,
         SkillManage,
@@ -602,7 +690,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Forbidden,
         Management,
     ),
-    method_entry(MCP_LIST, McpUse, Workspace, NotFound, Read),
+    method_entry(MCP_LIST, McpDiscover, Workspace, NotFound, Read),
     method_entry(MCP_INSTALL, McpManage, Capability, Forbidden, Management),
     method_entry(MCP_POLICY_SET, McpManage, Capability, Forbidden, Management),
     method_entry(
@@ -613,27 +701,59 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Management,
     ),
     method_entry(MCP_UNINSTALL, McpManage, Capability, Forbidden, Management),
-    method_entry(MCP_SERVER_DETAILS, McpUse, Capability, NotFound, Read),
-    method_entry(TASK_CREATE, TaskRun, Thread, NotFound, Execution),
+    method_entry(MCP_SERVER_DETAILS, McpDiscover, Capability, NotFound, Read),
+    method_entry(TASK_CREATE, TaskCreate, Thread, NotFound, Execution),
     method_entry(TASK_GET, TaskRead, Task, NotFound, Read),
     method_entry(TASK_LIST, TaskRead, Task, NotFound, Read),
     method_entry(TASK_TREE, TaskRead, Task, NotFound, Read),
     method_entry(TASK_EVENTS, TaskRead, Task, NotFound, Read),
     method_entry(TASK_WAIT, TaskRead, Task, NotFound, Read),
-    method_entry(TASK_ACCEPT, TaskManage, Task, NotFound, Mutation),
-    method_entry(TASK_REVISE, TaskManage, Task, NotFound, Mutation),
-    method_entry(TASK_CANCEL, TaskManage, Task, NotFound, Mutation),
-    method_entry(TASK_RESCHEDULE, TaskManage, Task, NotFound, Mutation),
-    method_entry(TASK_DETACH, TaskManage, Task, NotFound, Mutation),
-    method_entry(TASK_PAUSE, TaskManage, Task, NotFound, Mutation),
-    method_entry(TASK_RESUME, TaskManage, Task, NotFound, Execution),
+    method_entry(TASK_ACCEPT, TaskReview, Task, NotFound, Mutation),
+    method_entry(TASK_REVISE, TaskReview, Task, NotFound, Mutation),
+    method_entry(TASK_CANCEL, TaskCancel, Task, NotFound, Mutation),
+    method_entry(
+        TASK_RESCHEDULE,
+        TaskScheduleManage,
+        Task,
+        NotFound,
+        Mutation,
+    ),
+    method_entry(TASK_DETACH, TaskDetach, Task, NotFound, Mutation),
+    method_entry(TASK_PAUSE, TaskScheduleManage, Task, NotFound, Mutation),
+    method_entry(TASK_RESUME, TaskScheduleManage, Task, NotFound, Execution),
     method_entry(TASK_AGENDA, TaskRead, Task, NotFound, Read),
     method_entry(TASK_DELIVERIES, TaskRead, Task, NotFound, Read),
+    method_entry(
+        TASK_USER_NOTIFICATION_LIST,
+        NotificationReadOwn,
+        Workspace,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        TASK_USER_NOTIFICATION_ACKNOWLEDGE,
+        NotificationAcknowledgeOwn,
+        Workspace,
+        NotFound,
+        Mutation,
+    ),
     method_entry(MEMORY_SEARCH, MemoryRead, Workspace, NotFound, Read),
     method_entry(MEMORY_GET, MemoryRead, Workspace, NotFound, Read),
     method_entry(MEMORY_LIST, MemoryRead, Workspace, NotFound, Read),
-    method_entry(MEMORY_REMEMBER, MemoryWrite, Workspace, NotFound, Mutation),
-    method_entry(MEMORY_FORGET, MemoryWrite, Workspace, NotFound, Mutation),
+    method_entry(
+        MEMORY_REMEMBER,
+        MemoryCreateThread,
+        Workspace,
+        NotFound,
+        Mutation,
+    ),
+    method_entry(
+        MEMORY_FORGET,
+        MemoryForgetThread,
+        Workspace,
+        NotFound,
+        Mutation,
+    ),
     method_entry(
         MEMORY_CANDIDATES_LIST,
         MemoryRead,
@@ -644,42 +764,42 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     method_entry(MEMORY_CANDIDATES_GET, MemoryRead, Workspace, NotFound, Read),
     method_entry(
         MEMORY_CANDIDATES_DECIDE,
-        MemoryWrite,
+        MemoryModerateWorkspace,
         Workspace,
         NotFound,
         Mutation,
     ),
     method_entry(
         MEMORY_CANDIDATES_APPROVE,
-        MemoryWrite,
+        MemoryModerateWorkspace,
         Workspace,
         NotFound,
         Mutation,
     ),
     method_entry(
         MEMORY_CANDIDATES_REJECT,
-        MemoryWrite,
+        MemoryModerateWorkspace,
         Workspace,
         NotFound,
         Mutation,
     ),
     method_entry(
         MEMORY_CANDIDATES_EDIT_AND_APPROVE,
-        MemoryWrite,
+        MemoryModerateWorkspace,
         Workspace,
         NotFound,
         Mutation,
     ),
     method_entry(
         MEMORY_CANDIDATES_MERGE,
-        MemoryWrite,
+        MemoryModerateWorkspace,
         Workspace,
         NotFound,
         Mutation,
     ),
     method_entry(
         MEMORY_CANDIDATES_SUPPRESS_SIMILAR,
-        MemoryWrite,
+        MemoryModerateWorkspace,
         Workspace,
         NotFound,
         Mutation,
@@ -717,36 +837,42 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     ),
     method_entry(
         ARTIFACT_DELETE,
-        ArtifactDelete,
+        ArtifactDeleteThread,
         Artifact,
         NotFound,
         Management,
     ),
     method_entry(
         ARTIFACT_RESTORE,
-        ArtifactDelete,
+        ArtifactDeleteThread,
         Artifact,
         NotFound,
         Management,
     ),
-    method_entry(ARTIFACT_BIND, ArtifactWrite, Artifact, NotFound, Mutation),
+    method_entry(
+        ARTIFACT_BIND,
+        ArtifactBindThread,
+        Artifact,
+        NotFound,
+        Mutation,
+    ),
     method_entry(
         ARTIFACT_UPLOAD_START,
-        ArtifactWrite,
+        ArtifactCreateThread,
         Artifact,
         NotFound,
         Mutation,
     ),
     method_entry(
         ARTIFACT_UPLOAD_FINISH,
-        ArtifactWrite,
+        ArtifactCreateThread,
         Artifact,
         NotFound,
         Mutation,
     ),
     method_entry(
         ARTIFACT_UPLOAD_ABORT,
-        ArtifactWrite,
+        ArtifactCreateThread,
         Artifact,
         NotFound,
         Mutation,
@@ -790,7 +916,7 @@ pub(crate) struct BinaryAuthorizationEntry {
 pub(crate) static BINARY_INGRESS_REGISTRY: &[BinaryAuthorizationEntry] = &[
     BinaryAuthorizationEntry {
         kind: BinaryIngressKind::ArtifactUploadChunk,
-        action: ResourceAction::ArtifactWrite,
+        action: ResourceAction::ArtifactCreateThread,
         resolver: ResourceResolverKind::Artifact,
         disclosure: DisclosurePolicy::NotFound,
         audit: AuthorizationAuditClass::Mutation,
@@ -857,6 +983,12 @@ fn validate_method_registry(entries: &[MethodAuthorizationEntry]) -> Result<(), 
             || entries[..index]
                 .iter()
                 .any(|previous| previous.method == entry.method)
+            || entry.alternate_actions.contains(&entry.action)
+            || entry
+                .alternate_actions
+                .iter()
+                .enumerate()
+                .any(|(index, action)| entry.alternate_actions[..index].contains(action))
         {
             return Err(());
         }
@@ -909,7 +1041,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 140);
+        assert_eq!(registry.len(), 142);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());
@@ -924,12 +1056,12 @@ mod tests {
         for (method, action, audit) in [
             (
                 methods::TURN_MESSAGE_EDIT,
-                ResourceAction::ThreadWrite,
+                ResourceAction::MessageEditOwn,
                 AuthorizationAuditClass::Mutation,
             ),
             (
                 methods::TURN_MESSAGE_DELETE,
-                ResourceAction::ThreadWrite,
+                ResourceAction::MessageDeleteOwn,
                 AuthorizationAuditClass::Mutation,
             ),
             (
@@ -989,15 +1121,21 @@ mod tests {
     fn member_discovery_methods_resolve_the_requested_workspace() {
         for (method, action) in [
             (methods::ARTIFACT_CAPABILITIES, ResourceAction::ArtifactRead),
-            (methods::SKILLS_LIST, ResourceAction::SkillUse),
-            (methods::CLI_RUNTIME_LIST, ResourceAction::CliRuntimeUse),
-            (methods::CLI_RUNTIME_GET, ResourceAction::CliRuntimeUse),
-            (methods::CLI_RUNTIME_STATUS, ResourceAction::CliRuntimeUse),
+            (methods::SKILLS_LIST, ResourceAction::SkillDiscover),
+            (
+                methods::CLI_RUNTIME_LIST,
+                ResourceAction::CliRuntimeDiscover,
+            ),
+            (methods::CLI_RUNTIME_GET, ResourceAction::CliRuntimeDiscover),
+            (
+                methods::CLI_RUNTIME_STATUS,
+                ResourceAction::CliRuntimeDiscover,
+            ),
             (
                 methods::CLI_RUNTIME_LIST_MODELS,
-                ResourceAction::CliRuntimeUse,
+                ResourceAction::CliRuntimeDiscover,
             ),
-            (methods::MCP_LIST, ResourceAction::McpUse),
+            (methods::MCP_LIST, ResourceAction::McpDiscover),
         ] {
             let entry = normal_method_entry(method).expect("registered discovery method");
             assert_eq!(entry.action, action);
@@ -1008,14 +1146,14 @@ mod tests {
 
         let refresh =
             normal_method_entry(methods::CLI_RUNTIME_REFRESH).expect("registered runtime refresh");
-        assert_eq!(refresh.action, ResourceAction::CliRuntimeUse);
+        assert_eq!(refresh.action, ResourceAction::CliRuntimeDiscover);
         assert_eq!(refresh.resolver, ResourceResolverKind::Workspace);
         assert_eq!(refresh.disclosure, DisclosurePolicy::NotFound);
         assert_eq!(refresh.audit, AuthorizationAuditClass::Execution);
 
         let mcp_details = normal_method_entry(methods::MCP_SERVER_DETAILS)
             .expect("registered MCP details discovery");
-        assert_eq!(mcp_details.action, ResourceAction::McpUse);
+        assert_eq!(mcp_details.action, ResourceAction::McpDiscover);
         assert_eq!(mcp_details.resolver, ResourceResolverKind::Capability);
         assert_eq!(mcp_details.disclosure, DisclosurePolicy::NotFound);
         assert_eq!(mcp_details.audit, AuthorizationAuditClass::Read);
@@ -1026,32 +1164,32 @@ mod tests {
         for (method, action, resolver) in [
             (
                 methods::TURN_PERMISSION_REQUEST_RESPOND,
-                ResourceAction::ThreadWrite,
+                ResourceAction::AgentRequestRespond,
                 ResourceResolverKind::Turn,
             ),
             (
                 methods::CLI_RUNTIME_REQUEST_RESPOND,
-                ResourceAction::CliRuntimeUse,
+                ResourceAction::AgentRequestRespond,
                 ResourceResolverKind::Turn,
             ),
             (
                 methods::CLI_RUNTIME_TURN_STEER,
-                ResourceAction::CliRuntimeUse,
+                ResourceAction::AgentExecutionSteer,
                 ResourceResolverKind::Turn,
             ),
             (
                 methods::CLI_RUNTIME_REVIEW_START,
-                ResourceAction::CliRuntimeUse,
+                ResourceAction::AgentRequestRespond,
                 ResourceResolverKind::Thread,
             ),
             (
                 methods::TASK_CREATE,
-                ResourceAction::TaskRun,
+                ResourceAction::TaskCreate,
                 ResourceResolverKind::Thread,
             ),
             (
                 methods::TASK_ACCEPT,
-                ResourceAction::TaskManage,
+                ResourceAction::TaskReview,
                 ResourceResolverKind::Task,
             ),
         ] {

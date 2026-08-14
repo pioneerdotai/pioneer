@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionDraftSelection",
+  "type": "object",
+  "properties": {
+    "has_attachments": {
+      "type": "boolean",
+      "default": false
+    },
+    "mcp_server_ids": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "permission_mode": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnPermissionMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "policy_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "skill_ids": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    }
+  }
+}

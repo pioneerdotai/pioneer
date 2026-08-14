@@ -178,14 +178,20 @@ pub async fn list_events_for_turn<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
     turn_id: &str,
+    after_sequence: Option<i64>,
+    limit: Option<u64>,
 ) -> Result<Vec<turn_event::Model>> {
-    turn_event::Entity::find()
+    let mut query = turn_event::Entity::find()
         .filter(turn_event::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
-        .order_by_asc(turn_event::Column::Sequence)
-        .all(db)
-        .await
-        .context("failed to query turn events")
+        .order_by_asc(turn_event::Column::Sequence);
+    if let Some(after_sequence) = after_sequence {
+        query = query.filter(turn_event::Column::Sequence.gt(after_sequence));
+    }
+    if let Some(limit) = limit {
+        query = query.limit(limit);
+    }
+    query.all(db).await.context("failed to query turn events")
 }
 
 pub async fn list_events_for_thread<C: ConnectionTrait>(

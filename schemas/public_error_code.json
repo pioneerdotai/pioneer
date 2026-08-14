@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicErrorCode",
+  "type": "string",
+  "enum": [
+    "invalid_input",
+    "policy_denied",
+    "not_found",
+    "conflict",
+    "resource_exhausted",
+    "unavailable",
+    "timeout",
+    "internal"
+  ]
+}

@@ -26,14 +26,28 @@ impl MessageTurnResponse {
         processor: &MessageProcessor,
         connection_id: ConnectionId,
         code: i64,
+        public_code: pioneer_protocol::PublicErrorCode,
         message: impl Into<String>,
     ) {
+        let public_error = crate::public_error::map_agent_failure(
+            public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+            message.into(),
+        );
         match self {
             Self::JsonRpc { request_id } => {
                 processor
                     .send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(Some(request_id.clone()), code, message),
+                        JsonRpcErrorResponse {
+                            jsonrpc: pioneer_protocol::JSONRPC_VERSION.to_owned(),
+                            id: Some(request_id.clone()),
+                            error: pioneer_protocol::JsonRpcError {
+                                code,
+                                message: public_error.message.clone(),
+                                data: Some(serde_json::json!({ "public_error": public_error })),
+                            },
+                        },
                     )
                     .await;
             }
@@ -52,7 +66,8 @@ impl MessageTurnResponse {
                             turn_id: Some(turn_id.clone()),
                             error: Some(VoiceError {
                                 kind: VoiceErrorKind::Unknown,
-                                message: message.into(),
+                                message: public_error.message.clone(),
+                                public_error: Some(public_error),
                             }),
                         },
                     )
@@ -103,6 +118,7 @@ impl MessageTurnResponse {
             processor,
             connection_id,
             INVALID_REQUEST_CODE,
+            pioneer_protocol::PublicErrorCode::Conflict,
             "turn_id is already used by a different request",
         )
         .await;
@@ -311,24 +327,38 @@ pub(super) async fn resolve_turn_mentions(
     if viewer.status != pioneer_protocol::PrincipalStatus::Active {
         anyhow::bail!("mention viewer is unavailable");
     }
+    let viewer_role_key = viewer
+        .role_key
+        .as_deref()
+        .map(pioneer_protocol::RoleKey::new)
+        .transpose()
+        .context("mention viewer has an invalid role")?;
+    let viewer_disclosure = crate::authorization::AuthorizationService::new()
+        .role_disclosure_policy(viewer.kind, viewer_role_key.as_ref())
+        .context("mention viewer has an unsupported role")?;
 
     let mut mentions = Vec::with_capacity(mentioned_principal_ids.len());
     for target_principal_id in mentioned_principal_ids {
         let target = pioneer_crud::load_principal_by_id(&database, target_principal_id)
             .await
             .context("failed to resolve mentioned principal")?;
+        let target_role_key = target
+            .as_ref()
+            .and_then(|target| target.role_key.as_deref())
+            .map(pioneer_protocol::RoleKey::new)
+            .transpose()
+            .context("mentioned principal has an invalid role")?;
         let visible = match target.as_ref() {
             Some(target)
                 if target.gateway_id == viewer.gateway_id
                     && target.status == pioneer_protocol::PrincipalStatus::Active
-                    && (target.kind == pioneer_protocol::PrincipalKind::Superuser
-                        || (target.kind == pioneer_protocol::PrincipalKind::User
-                            && target.role_key.as_deref()
-                                == Some(pioneer_protocol::MEMBER_ROLE_KEY))) =>
+                    && crate::authorization::AuthorizationService::new()
+                        .resolved_role_key(target.kind, target_role_key.as_ref())
+                        .is_some() =>
             {
-                match viewer.kind {
-                    pioneer_protocol::PrincipalKind::Superuser => true,
-                    pioneer_protocol::PrincipalKind::User => {
+                match viewer_disclosure {
+                    crate::authorization::RoleDisclosurePolicy::Administrative => true,
+                    crate::authorization::RoleDisclosurePolicy::Collaborator => {
                         target.id == viewer.id
                             || target.kind == pioneer_protocol::PrincipalKind::Superuser
                             || pioneer_crud::find_shared_workspace_principal_for_principal(
@@ -373,7 +403,7 @@ async fn persist_completed_message_turn(
         audit_event: audit_event.clone(),
     };
     match runtime_draft.map(RuntimeDraftMaterialization::creator) {
-        Some(RuntimeDraftCreator::Member {
+        Some(RuntimeDraftCreator::ScopedPrincipal {
             gateway_id,
             principal_id,
             access_class,
@@ -387,7 +417,7 @@ async fn persist_completed_message_turn(
                 )
                 .await
         }
-        Some(RuntimeDraftCreator::Superuser { access_class }) => {
+        Some(RuntimeDraftCreator::Absolute { access_class }) => {
             crud_store
                 .materialize_new_superuser_completed_message_turn_with_permission_audit(
                     write(),
@@ -487,9 +517,11 @@ async fn send_message_turn_response(
             processor
                 .send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    crate::public_error::agent_rpc_error(
                         None,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorCode::Internal,
+                        pioneer_protocol::PublicErrorStage::Delivery,
                         format!("failed to encode Message response: {error}"),
                     ),
                 )
@@ -647,6 +679,9 @@ impl MessageTurnAdmission {
             if proof.thread_id() != thread_id {
                 anyhow::bail!("message authorization thread does not match request");
             }
+            if proof.action() != crate::authorization::ResourceAction::MessageCreate {
+                anyhow::bail!("message authorization action does not match request");
+            }
             return Ok(Self {
                 runtime_draft: None,
             });
@@ -701,6 +736,7 @@ impl MessageProcessor {
                         self,
                         connection_id,
                         INVALID_PARAMS_CODE,
+                        pioneer_protocol::PublicErrorCode::InvalidInput,
                         format!("invalid params for `{}`: {error}", methods::TURN_START),
                     )
                     .await;
@@ -720,6 +756,7 @@ impl MessageProcessor {
                         self,
                         connection_id,
                         INVALID_PARAMS_CODE,
+                        pioneer_protocol::PublicErrorCode::InvalidInput,
                         format!("invalid params for `{}`: {error}", methods::TURN_START),
                     )
                     .await;
@@ -743,6 +780,7 @@ impl MessageProcessor {
                         self,
                         connection_id,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorCode::Unavailable,
                         "authorized Message thread is unavailable",
                     )
                     .await;
@@ -791,6 +829,7 @@ impl MessageProcessor {
                             self,
                             connection_id,
                             INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorCode::Internal,
                             format!("failed to resolve Message idempotency: {error:#}"),
                         )
                         .await;
@@ -818,6 +857,7 @@ impl MessageProcessor {
                         self,
                         connection_id,
                         INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorCode::Unavailable,
                         format!("invalid Message attachment: {error}"),
                     )
                     .await;
@@ -844,6 +884,7 @@ impl MessageProcessor {
                             self,
                             connection_id,
                             INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorCode::Unavailable,
                             "authenticated Message author is unavailable",
                         )
                         .await;
@@ -863,6 +904,7 @@ impl MessageProcessor {
                             self,
                             connection_id,
                             INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorCode::Internal,
                             format!("failed to resolve Message author: {error:#}"),
                         )
                         .await;
@@ -891,6 +933,7 @@ impl MessageProcessor {
                             self,
                             connection_id,
                             INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorCode::InvalidInput,
                             format!("invalid Turn collaboration metadata: {error}"),
                         )
                         .await;
@@ -917,6 +960,7 @@ impl MessageProcessor {
                             self,
                             connection_id,
                             INVALID_REQUEST_CODE,
+                            pioneer_protocol::PublicErrorCode::Internal,
                             format!("failed to admit Message turn: {error:#}"),
                         )
                         .await;
@@ -979,6 +1023,7 @@ impl MessageProcessor {
                                 self,
                                 connection_id,
                                 INVALID_REQUEST_CODE,
+                                pioneer_protocol::PublicErrorCode::Internal,
                                 format!("failed to persist Message turn: {error:#}"),
                             )
                             .await;

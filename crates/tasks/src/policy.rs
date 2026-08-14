@@ -11,10 +11,24 @@ pub struct TaskRunConversationSnapshotSeed {
     pub history_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskExecutionAdmissionSeed {
+    pub workspace_id: String,
+    pub root_thread_id: String,
+    pub initiating_principal_id: String,
+    pub authorization_context_json: String,
+    pub role_key: String,
+    pub policy_fingerprint: String,
+    pub execution_resources: pioneer_crud::ExecutionAdmissionQuotaPolicy,
+    pub task_resources: pioneer_protocol::TaskResourceBudget,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskCreateContext {
     pub actor_id: Option<String>,
     pub conversation_snapshot: Option<TaskRunConversationSnapshotSeed>,
+    pub execution_admission: Option<TaskExecutionAdmissionSeed>,
+    pub task_resource_budget: Option<pioneer_protocol::TaskResourceBudget>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -22,6 +36,7 @@ pub struct TaskMutationContext {
     pub actor_id: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
+    pub task_resource_budget: Option<pioneer_protocol::TaskResourceBudget>,
 }
 
 impl TaskMutationContext {
@@ -30,6 +45,7 @@ impl TaskMutationContext {
             actor_id: None,
             thread_id: Some(thread_id.into()),
             turn_id: Some(turn_id.into()),
+            task_resource_budget: None,
         }
     }
 
@@ -38,6 +54,7 @@ impl TaskMutationContext {
             actor_id: Some(actor_id.into()),
             thread_id: None,
             turn_id: None,
+            task_resource_budget: None,
         }
     }
 }
@@ -45,6 +62,7 @@ impl TaskMutationContext {
 #[derive(Debug, Clone, Default)]
 pub struct TaskWaitContext {
     pub actor_id: Option<String>,
+    pub task_resource_budget: Option<pioneer_protocol::TaskResourceBudget>,
 }
 
 pub fn default_lifecycle_policy(

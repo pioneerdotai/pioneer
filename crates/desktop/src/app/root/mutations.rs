@@ -12,15 +12,133 @@ use pioneer_client::threads::{
 use tracing::warn;
 
 impl PioneerDesktop {
-    pub(in crate::app) fn reconcile_composer_permission_mode_with_capabilities(&mut self) {
-        let allowed = self.allowed_composer_permission_modes();
-        if allowed.is_empty() || allowed.contains(&self.composer_permission_mode) {
-            return;
-        }
-        let Some(mode) = allowed.last().copied() else {
+    pub(in crate::app) fn reconcile_composer_draft_with_capabilities(&mut self) {
+        let Some(policy) = self
+            .gateway
+            .capability_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.workspace.as_ref())
+            .map(|workspace| workspace.execution_draft_policy.clone())
+        else {
+            let had_sensitive_draft = self.composer_selected_provider.is_some()
+                || self.composer_selected_model.is_some()
+                || !self.composer_capabilities.is_empty()
+                || !self.composer_skill_selections.is_empty()
+                || !self.composer_attachments.is_empty();
+            self.composer_selected_provider = None;
+            self.composer_selected_model = None;
+            self.composer_selected_reasoning_effort = None;
+            self.composer_capabilities.clear();
+            self.composer_skill_selections.clear();
+            self.composer_attachments.clear();
+            self.composer_authorization_fingerprint = None;
+            if had_sensitive_draft {
+                self.composer_upload_error =
+                    Some("Composer selections were cleared after an authorization change".into());
+            }
             return;
         };
-        self.reduce_composer_domain(ComposerDomainAction::SetPermissionMode { mode });
+
+        let mut skill_ids = Vec::new();
+        let mut mcp_server_ids = Vec::new();
+        for capability in &self.composer_capabilities {
+            match &capability.kind {
+                ComposerCapabilityKind::Skill { skill_id, .. } => {
+                    skill_ids.push(skill_id.as_str().to_owned());
+                }
+                ComposerCapabilityKind::McpServer { name, .. } => {
+                    mcp_server_ids.push(name.clone());
+                }
+                ComposerCapabilityKind::McpTool { server_name, .. } => {
+                    mcp_server_ids.push(server_name.clone());
+                }
+            }
+        }
+        for selection in &self.composer_skill_selections {
+            match selection {
+                ComposerSkillSelection::Skill { skill_id, .. } => {
+                    skill_ids.push(skill_id.as_str().to_owned());
+                }
+                ComposerSkillSelection::SkillPack { pack_id } => {
+                    skill_ids.push(pack_id.as_str().to_owned());
+                }
+            }
+        }
+        skill_ids.sort();
+        skill_ids.dedup();
+        mcp_server_ids.sort();
+        mcp_server_ids.dedup();
+
+        let reconciliation = pioneer_client::composer::reconciliation::reconcile_execution_draft(
+            &pioneer_client::composer::reconciliation::ExecutionDraftSelection {
+                policy_fingerprint: self.composer_authorization_fingerprint.clone(),
+                provider: self.composer_selected_provider.clone(),
+                model: self.composer_selected_model.clone(),
+                permission_mode: Some(self.composer_permission_mode),
+                skill_ids,
+                mcp_server_ids,
+                has_attachments: !self.composer_attachments.is_empty(),
+            },
+            &policy,
+        );
+        let allowed_skills = reconciliation
+            .draft
+            .skill_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let allowed_mcp = reconciliation
+            .draft
+            .mcp_server_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        self.composer_capabilities
+            .retain(|capability| match &capability.kind {
+                ComposerCapabilityKind::Skill { skill_id, .. } => {
+                    allowed_skills.contains(skill_id.as_str())
+                }
+                ComposerCapabilityKind::McpServer { name, .. } => {
+                    allowed_mcp.contains(name.as_str())
+                }
+                ComposerCapabilityKind::McpTool { server_name, .. } => {
+                    allowed_mcp.contains(server_name.as_str())
+                }
+            });
+        self.composer_skill_selections
+            .retain(|selection| match selection {
+                ComposerSkillSelection::Skill { skill_id, .. } => {
+                    allowed_skills.contains(skill_id.as_str())
+                }
+                ComposerSkillSelection::SkillPack { pack_id } => {
+                    allowed_skills.contains(pack_id.as_str())
+                }
+            });
+        if !reconciliation.draft.has_attachments {
+            self.composer_attachments.clear();
+        }
+        self.composer_selected_provider = reconciliation.draft.provider;
+        self.composer_selected_model = reconciliation.draft.model;
+        if self.composer_selected_provider.is_none() || self.composer_selected_model.is_none() {
+            self.composer_selected_reasoning_effort = None;
+        }
+        self.composer_authorization_fingerprint = reconciliation.draft.policy_fingerprint;
+        if let Some(mode) = reconciliation.draft.permission_mode
+            && mode != self.composer_permission_mode
+        {
+            self.reduce_composer_domain(ComposerDomainAction::SetPermissionMode { mode });
+        }
+        if reconciliation.reasons.iter().any(|reason| {
+            reason.kind
+                != pioneer_client::composer::reconciliation::ExecutionDraftReconciliationKind::PolicyGeneration
+        }) {
+            self.composer_upload_error =
+                Some("Composer selections were updated to match the current policy".into());
+        }
+    }
+
+    pub(in crate::app) fn reconcile_composer_permission_mode_with_capabilities(&mut self) {
+        self.reconcile_composer_draft_with_capabilities();
     }
 
     pub(in crate::app) fn invalidate_active_thread_capability_projection(&mut self) {
@@ -249,6 +367,7 @@ impl PioneerDesktop {
         self.reduce_composer_domain(ComposerDomainAction::ClearPayload);
         self.composer_upload_in_progress = false;
         self.composer_upload_error = None;
+        self.composer_authorization_fingerprint = None;
     }
 
     pub(in crate::app) fn clear_composer_payload_for_thread(&mut self, thread_id: &str) {
@@ -476,6 +595,7 @@ impl PioneerDesktop {
         self.composer_capabilities.clear();
         self.composer_skill_selections.clear();
         self.composer_attachments.clear();
+        self.composer_authorization_fingerprint = None;
         self.composer_reply_target = None;
         self.composer_edit_target = None;
         self.composer_selected_mentions.clear();
@@ -500,6 +620,7 @@ impl PioneerDesktop {
     /// deliberately owned by the Gateway coordinator and remain untouched.
     pub(in crate::app) fn clear_authorization_epoch_cache(&mut self) {
         self.gateway.capability_snapshot = None;
+        self.gateway.authorization_projections.clear_epoch();
         self.workspaces.clear();
         self.workspaces_error = None;
         self.set_active_thread_id(None);

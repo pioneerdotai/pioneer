@@ -6,8 +6,6 @@
 
 use std::collections::BTreeSet;
 
-#[cfg(test)]
-use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
     AuthorizationWorkspaceCapabilities, MemberSummary, PrincipalId, PrincipalStatus, Thread,
     ThreadOriginKind, ThreadParticipantSummary, ThreadStatus, ThreadVisibility, WorkspaceId,
@@ -237,12 +235,17 @@ mod tests {
             can_read: true,
             can_create_thread: true,
             can_manage: false,
+            can_read_own_notifications: true,
+            can_acknowledge_own_notifications: true,
             can_use_providers: true,
             can_use_cli_runtimes: true,
             can_use_skills: true,
             can_use_mcp: true,
             can_run_tasks: true,
-            turn_permission_modes: vec![TurnPermissionMode::Supervised],
+            can_read_artifacts: true,
+            can_write_artifacts: true,
+            execution_limits: Default::default(),
+            agent_permission_options: Vec::new(),
             can_list_members: true,
             can_add_member: true,
             can_remove_member: false,
@@ -257,6 +260,13 @@ mod tests {
             display_name: format!("Member {id}"),
             nickname: id.to_owned(),
             role_key: Some(RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
             status,
             avatar_revision: None,
         }

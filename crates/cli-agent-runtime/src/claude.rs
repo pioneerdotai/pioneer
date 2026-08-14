@@ -2341,7 +2341,10 @@ mod tests {
         .expect("help fixture");
         fs::set_permissions(executable.as_path(), fs::Permissions::from_mode(0o700))
             .expect("help fixture permissions");
-        let evidence = probe_claude_help_contract(executable.as_path(), Duration::from_secs(1))
+        // Exercise the same bounded startup window used by Gateway readiness.
+        // A one-second test-only budget made the shell spawn itself the oracle
+        // under a parallel workspace test load, rather than the help contract.
+        let evidence = probe_claude_help_contract(executable.as_path(), Duration::from_secs(5))
             .await
             .expect("public help contract");
         assert!(

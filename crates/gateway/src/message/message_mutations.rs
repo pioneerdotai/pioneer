@@ -1,12 +1,12 @@
 use super::*;
 use crate::authorization::{AuthorizationExternalError, AuthorizedTurn};
 use base64::Engine as _;
-use pioneer_protocol::{PersistedActorRef, PrincipalKind, TurnMessageErrorReason};
+use pioneer_protocol::{PersistedActorRef, TurnMessageErrorReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MessageMutationActor {
     Author,
-    SuperuserModerator,
+    AbsoluteModerator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +173,7 @@ fn mutation_policy(
     current_revision: u64,
     original_author: Option<&pioneer_protocol::PersistedActorRef>,
     caller: &pioneer_protocol::PrincipalId,
-    caller_kind: PrincipalKind,
+    caller_has_absolute_authority: bool,
 ) -> Result<Option<MessageMutationActor>, MessageMutationError> {
     if !message_mutation_eligible {
         return Err(MessageMutationError::ImmutableMessage);
@@ -187,8 +187,8 @@ fn mutation_policy(
             caller.clone(),
         )) {
         MessageMutationActor::Author
-    } else if caller_kind == PrincipalKind::Superuser {
-        MessageMutationActor::SuperuserModerator
+    } else if caller_has_absolute_authority {
+        MessageMutationActor::AbsoluteModerator
     } else if operation != MessageMutationOperation::RevisionsRead {
         return Err(MessageMutationError::Forbidden);
     } else {
@@ -287,7 +287,7 @@ impl MessageProcessor {
             collaboration.message_revision,
             original_author,
             &context.principal().principal_id,
-            context.principal().kind,
+            authorization.decision().is_absolute(),
         )?;
         Ok(ResolvedMessageMutation {
             collaboration,
@@ -843,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_policy_allows_only_message_author_or_superuser() {
+    fn mutation_policy_allows_only_message_author_or_absolute_authority() {
         let author = principal("P00000000000000000001");
         let other = principal("P00000000000000000002");
         let author_ref = PersistedActorRef::Principal(author.clone());
@@ -858,7 +858,7 @@ mod tests {
                 0,
                 Some(&author_ref),
                 &author,
-                PrincipalKind::User,
+                false,
             )
             .expect("author may edit"),
             Some(MessageMutationActor::Author)
@@ -873,7 +873,7 @@ mod tests {
                 0,
                 Some(&author_ref),
                 &other,
-                PrincipalKind::User,
+                false,
             ),
             Err(MessageMutationError::Forbidden)
         ));
@@ -887,10 +887,10 @@ mod tests {
                 0,
                 Some(&author_ref),
                 &other,
-                PrincipalKind::Superuser,
+                true,
             )
-            .expect("Superuser may moderate"),
-            Some(MessageMutationActor::SuperuserModerator)
+            .expect("absolute authority may moderate"),
+            Some(MessageMutationActor::AbsoluteModerator)
         );
     }
 
@@ -909,7 +909,7 @@ mod tests {
                     0,
                     Some(&author),
                     &caller,
-                    PrincipalKind::Superuser,
+                    true,
                 ),
                 Err(MessageMutationError::ImmutableMessage)
             ));
@@ -931,7 +931,7 @@ mod tests {
                     0,
                     original_author,
                     &caller,
-                    PrincipalKind::Superuser,
+                    true,
                 ),
                 Err(MessageMutationError::ImmutableMessage)
             ));
@@ -952,7 +952,7 @@ mod tests {
                 2,
                 Some(&author),
                 &caller,
-                PrincipalKind::User,
+                false,
             ),
             Err(MessageMutationError::RevisionConflict)
         ));
@@ -966,7 +966,7 @@ mod tests {
                 2,
                 Some(&author),
                 &caller,
-                PrincipalKind::User,
+                false,
             )
             .expect("same delete retry is idempotent"),
             Some(MessageMutationActor::Author)
@@ -981,7 +981,7 @@ mod tests {
                 2,
                 Some(&author),
                 &caller,
-                PrincipalKind::User,
+                false,
             ),
             Err(MessageMutationError::RevisionConflict)
         ));

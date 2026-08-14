@@ -1,17 +1,20 @@
 use super::*;
-use crate::authorization::{AuthorizedThread, ResourceAction};
+use crate::authorization::{AuthorizedAgentsDocument, ResourceAction};
 
 const THREAD_AGENTS_DOC_MAX_CHARS: usize = 64 * 1024;
 
 impl MessageProcessor {
-    async fn require_member_thread_agents_doc_proof(
+    async fn require_scoped_thread_agents_doc_proof(
         &self,
         request_context: &RequestContext,
         request_id: &RequestId,
-        authorization: Option<&AuthorizedThread>,
+        authorization: Option<&AuthorizedAgentsDocument>,
         expected_action: ResourceAction,
     ) -> bool {
-        if request_context.principal().kind != pioneer_protocol::PrincipalKind::User
+        if crate::authorization::AuthorizationService::new().runtime_principal_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) != Some(crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration)
             || authorization.is_some_and(|proof| proof.action() == expected_action)
         {
             return true;
@@ -29,14 +32,14 @@ impl MessageProcessor {
         request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocGetParams,
-        authorization: Option<&AuthorizedThread>,
+        authorization: Option<&AuthorizedAgentsDocument>,
     ) {
         if !self
-            .require_member_thread_agents_doc_proof(
+            .require_scoped_thread_agents_doc_proof(
                 request_context,
                 &request_id,
                 authorization,
-                ResourceAction::ThreadRead,
+                ResourceAction::AgentsDocumentRead,
             )
             .await
         {
@@ -97,14 +100,14 @@ impl MessageProcessor {
         request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocSaveParams,
-        authorization: Option<&AuthorizedThread>,
+        authorization: Option<&AuthorizedAgentsDocument>,
     ) {
         if !self
-            .require_member_thread_agents_doc_proof(
+            .require_scoped_thread_agents_doc_proof(
                 request_context,
                 &request_id,
                 authorization,
-                ResourceAction::ThreadWrite,
+                ResourceAction::AgentsDocumentManage,
             )
             .await
         {
@@ -157,7 +160,7 @@ impl MessageProcessor {
                 folder_id.as_deref(),
                 params.content.as_str(),
                 params.expected_version,
-                None,
+                Some(request_context.principal().principal_id.as_str()),
                 save_reason,
             )
             .await
@@ -202,14 +205,14 @@ impl MessageProcessor {
         request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocArchiveParams,
-        authorization: Option<&AuthorizedThread>,
+        authorization: Option<&AuthorizedAgentsDocument>,
     ) {
         if !self
-            .require_member_thread_agents_doc_proof(
+            .require_scoped_thread_agents_doc_proof(
                 request_context,
                 &request_id,
                 authorization,
-                ResourceAction::ThreadManage,
+                ResourceAction::AgentsDocumentManage,
             )
             .await
         {
@@ -239,7 +242,7 @@ impl MessageProcessor {
                 workspace_id.as_str(),
                 folder_id.as_deref(),
                 params.expected_version,
-                None,
+                Some(request_context.principal().principal_id.as_str()),
             )
             .await
         {
@@ -302,14 +305,14 @@ impl MessageProcessor {
         request_context: &RequestContext,
         request_id: RequestId,
         params: ThreadAgentsDocResolveForThreadParams,
-        authorization: Option<&AuthorizedThread>,
+        authorization: Option<&AuthorizedAgentsDocument>,
     ) {
         if !self
-            .require_member_thread_agents_doc_proof(
+            .require_scoped_thread_agents_doc_proof(
                 request_context,
                 &request_id,
                 authorization,
-                ResourceAction::ThreadRead,
+                ResourceAction::AgentsDocumentRead,
             )
             .await
         {
@@ -332,8 +335,7 @@ impl MessageProcessor {
             return;
         }
         if let Some(authorization) = authorization
-            && (authorization.workspace_id() != params.workspace_id.trim()
-                || authorization.thread_id() != params.thread_id.trim())
+            && authorization.workspace_id() != params.workspace_id.trim()
         {
             self.send_error(
                 connection_id,
@@ -398,14 +400,12 @@ impl MessageProcessor {
         request_id: RequestId,
         method: &'static str,
         workspace_id: String,
-        thread_id: Option<String>,
+        _thread_id: Option<String>,
         folder_id: Option<String>,
-        authorization: Option<&AuthorizedThread>,
+        authorization: Option<&AuthorizedAgentsDocument>,
     ) -> Option<(String, Option<String>)> {
         if let Some(authorization) = authorization {
-            if workspace_id.trim() != authorization.workspace_id()
-                || thread_id.as_deref().map(str::trim) != Some(authorization.thread_id())
-            {
+            if workspace_id.trim() != authorization.workspace_id() {
                 self.send_error(
                     connection_id,
                     crate::authorization::AuthorizationExternalError::NotFound.response(request_id),
@@ -413,22 +413,7 @@ impl MessageProcessor {
                 .await;
                 return None;
             }
-            let canonical_folder_id = match self
-                .crud_store
-                .resolve_thread_agents_doc_folder_for_thread(
-                    authorization.workspace_id(),
-                    authorization.thread_id(),
-                )
-                .await
-            {
-                Ok(folder_id) => folder_id,
-                Err(error) => {
-                    self.send_thread_agents_doc_error(connection_id, request_id, method, error)
-                        .await;
-                    return None;
-                }
-            };
-            if folder_id.as_deref().map(str::trim) != canonical_folder_id.as_deref()
+            if folder_id.as_deref().map(str::trim) != authorization.folder_id()
                 && folder_id.is_some()
             {
                 self.send_error(
@@ -444,7 +429,10 @@ impl MessageProcessor {
                     Some(authorization.workspace_id().to_owned()),
                 )
                 .await;
-            return Some((authorization.workspace_id().to_owned(), canonical_folder_id));
+            return Some((
+                authorization.workspace_id().to_owned(),
+                authorization.folder_id().map(str::to_owned),
+            ));
         }
 
         let workspace_id = match self

@@ -6,7 +6,7 @@ use pioneer_agent::{AgentTurnHookRuntimeContext, ExecutionCheckpointContext};
 use pioneer_promt::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, ExecutionCheckpointPayload,
-    ItemCompletedNotification, ItemStartedNotification, PermissionBehavior, SandboxMode,
+    ItemCompletedNotification, ItemStartedNotification, PermissionBehavior,
     TASK_COMPOSER_WORK_VERSION, Task, TaskAgentContext, TaskAgentContextMode, TaskAgentInput,
     TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec,
     TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskError, TaskErrorClass,
@@ -108,47 +108,44 @@ impl TaskAgentExecutor {
             .ok_or_else(|| anyhow!("message processor is no longer available"))
     }
 
-    async fn initiating_member_still_has_root_access(
+    async fn root_collaboration_still_has_task_authority(
         processor: &Arc<MessageProcessor>,
         task_response: &TaskGetResponse,
     ) -> Result<bool> {
-        let root_task = match task_response.task.root_task_id.as_deref() {
-            Some(root_task_id) => processor
-                .crud_store
-                .get_task(root_task_id)
-                .await?
-                .map(|response| response.task)
-                .ok_or_else(|| anyhow!("task root `{root_task_id}` is unavailable"))?,
-            None => task_response.task.clone(),
-        };
-        if root_task.owner_kind != pioneer_protocol::TaskOwnerKind::User {
-            return Ok(true);
+        let task = &task_response.task;
+        let admission = processor
+            .crud_store
+            .get_task_execution_admission(task.id.as_str())
+            .await?
+            .with_context(|| {
+                format!(
+                    "agent Task `{}` has no durable execution admission",
+                    task.id
+                )
+            })?;
+        let context = crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+            processor.crud_store.as_ref(),
+            &admission,
+        )
+        .await?;
+        if admission.workspace_id != task.workspace_id
+            || admission.workspace_id != context.workspace_id()
+            || admission.root_thread_id != context.root_thread_id()
+            || admission.initiating_principal_id != context.initiating_principal_id().as_str()
+        {
+            return Ok(false);
         }
-        let owner_id = root_task
-            .owner_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("user-owned task root has no initiating principal"))?;
-        let root_thread_id = root_task
-            .created_by_thread_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("user-owned task root has no authoritative thread"))?;
-        let root_turn_id = root_task
-            .created_by_turn_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("user-owned task root has no initiating turn"))?;
-        let context = match processor
-            .revalidate_execution_authorization_for_turn(
-                root_task.workspace_id.as_str(),
-                root_thread_id,
-                root_turn_id,
-                crate::authorization::ResourceAction::ThreadWrite,
+        let revision = processor.current_authorization_revision().await?;
+        Ok(processor
+            .execution_leases
+            .revalidate_context(
+                processor.crud_store.as_ref(),
+                &context,
+                crate::authorization::ResourceAction::TaskCreate,
+                revision,
             )
             .await
-        {
-            Ok(context) => context,
-            Err(_) => return Ok(false),
-        };
-        Ok(context.initiating_principal_id().as_str() == owner_id)
+            .is_ok())
     }
 
     async fn start_or_recover_run(
@@ -161,7 +158,7 @@ impl TaskAgentExecutor {
         let Some(task_response) = processor.crud_store.get_task(run.task_id.as_str()).await? else {
             bail!("task `{}` not found", run.task_id);
         };
-        if !Self::initiating_member_still_has_root_access(&processor, &task_response).await? {
+        if !Self::root_collaboration_still_has_task_authority(&processor, &task_response).await? {
             return Ok(TaskExecutorStartOutcome::Rejected);
         }
         if task_response.task.status.is_terminal() || run.status.is_terminal() {
@@ -375,11 +372,23 @@ impl TaskAgentExecutor {
             launch_permission_profile.as_ref(),
         )?;
         let reasoning_effort = composer_launch_reasoning_effort(composer_launch.as_ref());
-        let sandbox_mode = composer_launch
+        let sandbox_mode = match composer_launch
             .as_ref()
             .and_then(|launch| launch.sandbox_policy.as_ref())
             .map(|policy| policy.mode)
-            .unwrap_or(SandboxMode::FullAccess);
+        {
+            Some(mode) => mode,
+            None => processor
+                .crud_store
+                .get_thread_sandbox_mode(parent.parent_thread_id.as_str())
+                .await?
+                .with_context(|| {
+                    format!(
+                        "agent Task `{}` parent thread `{}` has no persisted sandbox policy",
+                        task.id, parent.parent_thread_id
+                    )
+                })?,
+        };
         let thread_params = pioneer_protocol::ThreadStartParams {
             thread_id: child_thread_id.clone(),
             workspace_id: context.workspace_id.clone(),
@@ -653,8 +662,9 @@ impl TaskAgentExecutor {
             .context("failed to create hidden task turn")?;
 
         if let Err(error) = processor
-            .validate_artifact_user_inputs(
+            .validate_turn_artifact_user_inputs(
                 context.workspace_id.as_str(),
+                parent.root_thread_id.as_str(),
                 turn_outcome.materialization.input.as_slice(),
             )
             .await
@@ -730,10 +740,27 @@ impl TaskAgentExecutor {
             child_turn_id.as_str(),
             turn_permission_profile.clone(),
         );
+        let child_authority_json = child_authorization_context
+            .to_persisted_json()
+            .context("failed to encode hidden task authority envelope")?;
+        let child_turn_admission = match child_authorization_context.durable_turn_admission(
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            child_execution_backend.as_ref(),
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to reserve hidden task execution quota");
+            }
+        };
         if let Err(error) = message_future(
             processor
                 .crud_store
-                .materialize_turn_start_with_reasoning_effort_and_permission_audit(
+                .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
                     &turn_outcome.materialization.thread,
                     turn_outcome.materialization.sandbox_mode,
                     &turn_outcome.materialization.turn,
@@ -741,6 +768,9 @@ impl TaskAgentExecutor {
                     reasoning_effort.as_deref(),
                     pioneer_protocol::PersistedActorRef::System,
                     profile_selected_audit,
+                    child_authority_json.as_str(),
+                    None,
+                    Some(child_turn_admission),
                 ),
         )
         .await
@@ -751,20 +781,10 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to persist hidden task turn");
         }
-        close_admitted_task_turn_on_error(
-            processor,
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-            persist_resolved_task_child_execution_envelope(
-                processor,
-                child_turn_id.as_str(),
-                &child_security_snapshot,
-                child_authorization_context.as_ref(),
-            )
-            .await
-            .context("failed to persist hidden task execution security"),
-        )
-        .await?;
+        // The execution lease revalidator proves the child against durable
+        // lineage. Persist that typed derivation before any security/lease side
+        // effect, matching the CLI path and preventing a transient authority
+        // gap between Turn admission and child registration.
         close_admitted_task_turn_on_error(
             processor,
             child_thread_id.as_str(),
@@ -778,6 +798,20 @@ impl TaskAgentExecutor {
                 )
                 .await
                 .context("failed to link hidden task runtime"),
+        )
+        .await?;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            persist_resolved_task_child_execution_envelope(
+                processor,
+                child_turn_id.as_str(),
+                &child_security_snapshot,
+                &child_authorization_context,
+            )
+            .await
+            .context("failed to persist hidden task execution security"),
         )
         .await?;
 
@@ -945,7 +979,12 @@ impl TaskAgentExecutor {
                 processor,
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
-                load_task_agent_skill_overlay(processor, task, child_turn_id.as_str()).await,
+                load_task_agent_skill_overlay(
+                    processor,
+                    &child_authorization_context,
+                    child_turn_id.as_str(),
+                )
+                .await,
             )
             .await?
         } else {
@@ -1094,7 +1133,7 @@ impl TaskAgentExecutor {
         let task = &task_response.task;
         let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
         let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
-        if !Self::initiating_member_still_has_root_access(processor, task_response).await? {
+        if !Self::root_collaboration_still_has_task_authority(processor, task_response).await? {
             self.block_revision_dispatch_turn(
                 processor,
                 child_runtime,
@@ -1332,8 +1371,9 @@ impl TaskAgentExecutor {
             }
         };
         if let Err(error) = processor
-            .validate_artifact_user_inputs(
+            .validate_turn_artifact_user_inputs(
                 task.workspace_id.as_str(),
+                parent.root_thread_id.as_str(),
                 turn_outcome.materialization.input.as_slice(),
             )
             .await
@@ -1458,15 +1498,67 @@ impl TaskAgentExecutor {
             child_turn_id.as_str(),
             turn_permission_profile.clone(),
         );
+        let child_authority_json = match child_authorization_context.to_persisted_json() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                self.block_revision_dispatch_turn(
+                    processor,
+                    child_runtime,
+                    handle,
+                    task_error(
+                        "revision_authority_envelope_invalid",
+                        format!("failed to encode revision task authority: {error:#}"),
+                        TaskErrorClass::Internal,
+                        Some(run.id.clone()),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let child_turn_admission = match child_authorization_context.durable_turn_admission(
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            None,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                self.block_revision_dispatch_turn(
+                    processor,
+                    child_runtime,
+                    handle,
+                    task_error(
+                        "revision_execution_quota_unavailable",
+                        format!("failed to reserve revision task execution quota: {error:#}"),
+                        TaskErrorClass::Policy,
+                        Some(run.id.clone()),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         if let Err(error) = processor
             .crud_store
-            .materialize_turn_start_with_permission_audit(
+            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
                 &turn_outcome.materialization.thread,
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
+                None,
                 pioneer_protocol::PersistedActorRef::System,
                 profile_selected_audit,
+                child_authority_json.as_str(),
+                None,
+                Some(child_turn_admission),
             )
             .await
         {
@@ -1492,7 +1584,7 @@ impl TaskAgentExecutor {
             processor,
             child_turn_id.as_str(),
             &child_security_snapshot,
-            child_authorization_context.as_ref(),
+            &child_authorization_context,
         )
         .await
         {
@@ -1659,7 +1751,12 @@ impl TaskAgentExecutor {
                 processor,
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
-                load_task_agent_skill_overlay(processor, task, child_turn_id.as_str()).await,
+                load_task_agent_skill_overlay(
+                    processor,
+                    &child_authorization_context,
+                    child_turn_id.as_str(),
+                )
+                .await,
             )
             .await?
         } else {
@@ -2052,8 +2149,9 @@ impl TaskAgentExecutor {
         };
 
         if let Err(error) = processor
-            .validate_artifact_user_inputs(
+            .validate_turn_artifact_user_inputs(
                 task.workspace_id.as_str(),
+                parent.root_thread_id.as_str(),
                 turn_outcome.materialization.input.as_slice(),
             )
             .await
@@ -2668,16 +2766,12 @@ impl TaskAgentExecutor {
                         task_run_turn.task_id.clone(),
                         task_run_turn.run_id.clone(),
                     );
+                    let lineage =
+                        load_required_task_thread_lineage(processor, &task_run_turn).await?;
                     self.complete_reviewer_turn(
                         processor,
                         TaskRunChildRuntime {
-                            lineage: processor
-                                .crud_store
-                                .get_task_thread_lineage(task_run_turn.thread_id.as_str())
-                                .await?
-                                .unwrap_or_else(|| {
-                                    fallback_lineage_for_task_run_turn(&task_run_turn)
-                                }),
+                            lineage,
                             task_run_turn,
                         },
                         handle,
@@ -2732,15 +2826,11 @@ impl TaskAgentExecutor {
                     let error_message = turn
                         .error
                         .unwrap_or_else(|| "reviewer child turn blocked".to_owned());
+                    let lineage =
+                        load_required_task_thread_lineage(processor, &task_run_turn).await?;
                     self.block_child_turn(
                         TaskRunChildRuntime {
-                            lineage: processor
-                                .crud_store
-                                .get_task_thread_lineage(task_run_turn.thread_id.as_str())
-                                .await?
-                                .unwrap_or_else(|| {
-                                    fallback_lineage_for_task_run_turn(&task_run_turn)
-                                }),
+                            lineage,
                             task_run_turn,
                         },
                         error_message.as_str(),
@@ -2765,13 +2855,23 @@ impl TaskAgentExecutor {
             })?;
         let parent = resolve_parent_context(processor, task).await?;
         let effective_model = effective_agent_model(agent_spec)?;
+        let parent_sandbox_mode = processor
+            .crud_store
+            .get_thread_sandbox_mode(parent.parent_thread_id.as_str())
+            .await?
+            .with_context(|| {
+                format!(
+                    "reviewer Task `{}` parent thread `{}` has no persisted sandbox policy",
+                    task.id, parent.parent_thread_id
+                )
+            })?;
         let thread_params = pioneer_protocol::ThreadStartParams {
             thread_id: task_run_turn.thread_id.clone(),
             workspace_id: task.workspace_id.clone(),
             name: Some(reviewer_thread_name(task, reviewer_spec)),
             model: Some(effective_model.model.clone()),
             model_provider: Some(effective_model.model_provider.clone()),
-            sandbox: Some(SandboxMode::FullAccess),
+            sandbox: Some(parent_sandbox_mode),
             mode: Some(ThreadMode::Agent),
             origin_kind: Some(ThreadOriginKind::TaskRun),
             sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
@@ -2824,8 +2924,9 @@ impl TaskAgentExecutor {
             .context("failed to create hidden reviewer turn")?;
 
         if let Err(error) = processor
-            .validate_artifact_user_inputs(
+            .validate_turn_artifact_user_inputs(
                 task.workspace_id.as_str(),
+                parent.root_thread_id.as_str(),
                 turn_outcome.materialization.input.as_slice(),
             )
             .await
@@ -2901,15 +3002,36 @@ impl TaskAgentExecutor {
             task_run_turn.turn_id.as_str(),
             turn_permission_profile.clone(),
         );
+        let child_authority_json = child_authorization_context
+            .to_persisted_json()
+            .context("failed to encode hidden reviewer authority envelope")?;
+        let child_turn_admission = match child_authorization_context.durable_turn_admission(
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            None,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to reserve hidden reviewer execution quota");
+            }
+        };
         if let Err(error) = processor
             .crud_store
-            .materialize_turn_start_with_permission_audit(
+            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
                 &turn_outcome.materialization.thread,
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
+                None,
                 pioneer_protocol::PersistedActorRef::System,
                 profile_selected_audit,
+                child_authority_json.as_str(),
+                None,
+                Some(child_turn_admission),
             )
             .await
         {
@@ -2923,7 +3045,7 @@ impl TaskAgentExecutor {
             processor,
             task_run_turn.turn_id.as_str(),
             &child_security_snapshot,
-            child_authorization_context.as_ref(),
+            &child_authorization_context,
         )
         .await
         {
@@ -3053,8 +3175,12 @@ impl TaskAgentExecutor {
                 processor,
                 task_run_turn.thread_id.as_str(),
                 task_run_turn.turn_id.as_str(),
-                load_task_agent_skill_overlay(processor, task, task_run_turn.turn_id.as_str())
-                    .await,
+                load_task_agent_skill_overlay(
+                    processor,
+                    &child_authorization_context,
+                    task_run_turn.turn_id.as_str(),
+                )
+                .await,
             )
             .await?
         } else {
@@ -3587,27 +3713,46 @@ async fn resolve_parent_context(
     processor: &Arc<MessageProcessor>,
     task: &Task,
 ) -> Result<TaskParentRuntimeContext> {
-    let mut root_thread_id = task
-        .created_by_thread_id
-        .clone()
-        .or_else(|| {
-            (task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
-                .then(|| task.owner_id.clone())
-                .flatten()
-        })
-        .unwrap_or_else(|| task.id.clone());
-
-    if let Some(parent_task_id) = task.parent_task_id.as_deref()
-        && let Some(parent_response) = processor.crud_store.get_task(parent_task_id).await?
-        && let Some(parent_lineage) = parent_response.thread_lineage.last()
-    {
-        root_thread_id = parent_lineage.root_thread_id.clone();
+    let admission = processor
+        .crud_store
+        .get_task_execution_admission(task.id.as_str())
+        .await?
+        .with_context(|| {
+            format!(
+                "agent Task `{}` has no durable execution admission",
+                task.id
+            )
+        })?;
+    if admission.workspace_id != task.workspace_id || admission.root_thread_id.trim().is_empty() {
+        bail!(
+            "agent Task `{}` has an invalid durable execution boundary",
+            task.id
+        );
     }
-
+    let root_thread_id = admission.root_thread_id;
     let parent_thread_id = task
         .created_by_thread_id
         .clone()
         .unwrap_or_else(|| root_thread_id.clone());
+
+    if parent_thread_id != root_thread_id {
+        let lineage = processor
+            .crud_store
+            .get_task_thread_lineage(parent_thread_id.as_str())
+            .await?
+            .with_context(|| {
+                format!(
+                    "agent Task `{}` parent thread `{}` has no durable collaboration lineage",
+                    task.id, parent_thread_id
+                )
+            })?;
+        if lineage.child_thread_id != parent_thread_id || lineage.root_thread_id != root_thread_id {
+            bail!(
+                "agent Task `{}` parent thread differs from its admitted collaboration root",
+                task.id
+            );
+        }
+    }
 
     Ok(TaskParentRuntimeContext {
         parent_thread_id,
@@ -3816,7 +3961,7 @@ async fn ensure_task_run_occurrence_context(
         origin,
         permission_profile,
         &occurrence_security_snapshot,
-        occurrence_authorization_context.as_ref(),
+        &occurrence_authorization_context,
     )
     .await?;
     ensure_task_run_occurrence_anchor(
@@ -3871,7 +4016,7 @@ async fn ensure_task_run_occurrence_turn(
     origin: TurnOrigin,
     permission_profile: &TurnPermissionProfileSnapshot,
     execution_security_snapshot: &TurnExecutionSecuritySnapshot,
-    authorization_context: Option<&crate::authorization::ExecutionAuthorizationContext>,
+    authorization_context: &crate::authorization::ExecutionAuthorizationContext,
 ) -> Result<()> {
     if processor
         .crud_store
@@ -3879,31 +4024,25 @@ async fn ensure_task_run_occurrence_turn(
         .await?
         .is_some()
     {
-        if processor
+        processor
             .crud_store
             .get_turn_execution_security_snapshot(run.id.as_str())
             .await?
-            .is_none()
-            || (authorization_context.is_some()
-                && processor
-                    .load_turn_execution_authorization_context(run.id.as_str())
-                    .await?
-                    .is_none())
-        {
-            persist_resolved_task_child_execution_envelope(
-                processor,
-                run.id.as_str(),
-                execution_security_snapshot,
-                authorization_context,
-            )
-            .await
             .with_context(|| {
                 format!(
-                    "failed to persist missing task run occurrence execution security snapshot `{}`",
+                    "existing task run occurrence `{}` has no durable execution security snapshot",
                     run.id
                 )
             })?;
-        }
+        processor
+            .load_turn_execution_authorization_context(run.id.as_str())
+            .await
+            .with_context(|| {
+                format!(
+                    "existing task run occurrence `{}` has no valid durable authority envelope",
+                    run.id
+                )
+            })?;
         return Ok(());
     }
 
@@ -3942,7 +4081,7 @@ async fn ensure_task_run_occurrence_turn(
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "cannot create task run occurrence turn for task `{}` because parent thread `{}` is missing legacy sandbox policy",
+                "cannot create task run occurrence turn for task `{}` because parent thread `{}` is missing its persisted sandbox policy",
                 task.id,
                 parent_thread_id
             )
@@ -3953,15 +4092,22 @@ async fn ensure_task_run_occurrence_turn(
         run.id.as_str(),
         permission_profile.clone(),
     );
+    let occurrence_authority_json = authorization_context
+        .to_persisted_json()
+        .context("failed to encode task run occurrence authority envelope")?;
     processor
         .crud_store
-        .materialize_turn_start_with_permission_audit(
+        .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
             &parent_thread,
             sandbox_mode,
             &occurrence_turn,
             &[],
+            None,
             pioneer_protocol::PersistedActorRef::System,
             profile_selected_audit,
+            occurrence_authority_json.as_str(),
+            None,
+            None,
         )
         .await
         .with_context(|| {
@@ -4317,15 +4463,46 @@ async fn load_child_runtime_from_task_run_turn(
         );
     }
 
-    let lineage = processor
-        .crud_store
-        .get_task_thread_lineage(task_run_turn.thread_id.as_str())
-        .await?
-        .unwrap_or_else(|| fallback_lineage_for_task_run_turn(&task_run_turn));
+    let lineage = load_required_task_thread_lineage(processor, &task_run_turn).await?;
     Ok(TaskRunChildRuntime {
         lineage,
         task_run_turn,
     })
+}
+
+async fn load_required_task_thread_lineage(
+    processor: &Arc<MessageProcessor>,
+    task_run_turn: &TaskRunTurn,
+) -> Result<TaskThreadLineage> {
+    let lineage = processor
+        .crud_store
+        .get_task_thread_lineage(task_run_turn.thread_id.as_str())
+        .await?
+        .with_context(|| {
+            format!(
+                "task run turn `{}` has no durable collaboration lineage for child thread `{}`",
+                task_run_turn.id, task_run_turn.thread_id
+            )
+        })?;
+    validate_task_thread_lineage(task_run_turn, lineage)
+}
+
+fn validate_task_thread_lineage(
+    task_run_turn: &TaskRunTurn,
+    lineage: TaskThreadLineage,
+) -> Result<TaskThreadLineage> {
+    if lineage.child_thread_id != task_run_turn.thread_id
+        || lineage.child_thread_id.trim().is_empty()
+        || lineage.parent_thread_id.trim().is_empty()
+        || lineage.root_thread_id.trim().is_empty()
+        || lineage.root_thread_id == lineage.child_thread_id
+    {
+        bail!(
+            "task run turn `{}` has an invalid durable collaboration lineage",
+            task_run_turn.id
+        );
+    }
+    Ok(lineage)
 }
 
 async fn load_execution_checkpoint_context_for_turn(
@@ -4473,19 +4650,6 @@ fn lineage_from_task_run_turn(
         created_by_thread_id: Some(parent.parent_thread_id.clone()),
         created_by_turn_id: parent.parent_turn_id.clone(),
         created_at,
-    }
-}
-
-fn fallback_lineage_for_task_run_turn(task_run_turn: &TaskRunTurn) -> TaskThreadLineage {
-    TaskThreadLineage {
-        child_thread_id: task_run_turn.thread_id.clone(),
-        parent_thread_id: task_run_turn.thread_id.clone(),
-        root_thread_id: task_run_turn.thread_id.clone(),
-        depth: 0,
-        origin_kind: Some("task_run".to_owned()),
-        created_by_thread_id: None,
-        created_by_turn_id: None,
-        created_at: task_run_turn.created_at,
     }
 }
 
@@ -4989,95 +5153,77 @@ async fn persist_resolved_task_child_execution_envelope(
     processor: &Arc<MessageProcessor>,
     child_turn_id: &str,
     snapshot: &TurnExecutionSecuritySnapshot,
-    authorization_context: Option<&crate::authorization::ExecutionAuthorizationContext>,
+    authorization_context: &crate::authorization::ExecutionAuthorizationContext,
 ) -> Result<()> {
-    let updated = if let Some(authorization_context) = authorization_context {
-        let encoded = authorization_context
-            .to_persisted_json()
-            .context("failed to encode task continuation authorization context")?;
-        processor
-            .crud_store
-            .set_turn_execution_envelope(child_turn_id, snapshot, encoded.as_str())
-            .await?
-    } else {
-        processor
-            .crud_store
-            .set_turn_execution_security_snapshot(child_turn_id, snapshot)
-            .await?
-    };
+    let encoded = authorization_context
+        .to_persisted_json()
+        .context("failed to encode task continuation authority envelope")?;
+    let updated = processor
+        .crud_store
+        .set_turn_execution_envelope(child_turn_id, snapshot, encoded.as_str())
+        .await?;
     if !updated {
         bail!(
             "failed to persist task child execution envelope: turn `{}` was not found",
             child_turn_id
         );
     }
+    processor
+        .register_execution_lease(child_turn_id)
+        .await
+        .context("failed to register task child execution lease")?;
     Ok(())
-}
-
-async fn task_root_user_owner_id(
-    processor: &Arc<MessageProcessor>,
-    task: &Task,
-) -> Result<Option<String>> {
-    let root_task = match task.root_task_id.as_deref() {
-        Some(root_task_id) => processor
-            .crud_store
-            .get_task(root_task_id)
-            .await?
-            .map(|response| response.task)
-            .ok_or_else(|| anyhow!("task root `{root_task_id}` is unavailable"))?,
-        None => task.clone(),
-    };
-    if root_task.owner_kind != pioneer_protocol::TaskOwnerKind::User {
-        return Ok(None);
-    }
-    root_task
-        .owner_id
-        .filter(|owner_id| !owner_id.trim().is_empty())
-        .map(Some)
-        .ok_or_else(|| anyhow!("user-owned task root has no initiating principal"))
 }
 
 async fn resolve_task_parent_execution_authorization_context(
     processor: &Arc<MessageProcessor>,
     task: &Task,
     parent: &TaskParentRuntimeContext,
-) -> Result<Option<crate::authorization::ExecutionAuthorizationContext>> {
-    let user_owner_id = task_root_user_owner_id(processor, task).await?;
-    let Some(parent_turn_id) = parent.parent_turn_id.as_deref() else {
-        if user_owner_id.is_some() {
-            bail!("user-owned task continuation has no initiating parent turn");
-        }
-        return Ok(None);
-    };
-    let context = processor
-        .load_turn_execution_authorization_context(parent_turn_id)
+) -> Result<crate::authorization::ExecutionAuthorizationContext> {
+    let admission = processor
+        .crud_store
+        .get_task_execution_admission(task.id.as_str())
         .await
-        .context("failed to load task parent execution authorization context")?;
-    let Some(context) = context else {
-        if user_owner_id.is_some() {
-            bail!("user-owned task continuation has no durable initiating authority");
-        }
-        return Ok(None);
-    };
-    let current = processor
-        .revalidate_execution_authorization_for_turn(
-            task.workspace_id.as_str(),
-            parent.parent_thread_id.as_str(),
-            parent_turn_id,
-            crate::authorization::ResourceAction::ThreadWrite,
+        .context("failed to load durable Task execution admission")?
+        .with_context(|| {
+            format!(
+                "agent Task `{}` has no durable execution admission",
+                task.id
+            )
+        })?;
+    let context = crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+        processor.crud_store.as_ref(),
+        &admission,
+    )
+    .await
+    .context("durable Task execution admission is invalid")?;
+    if admission.workspace_id != task.workspace_id
+        || admission.workspace_id != context.workspace_id()
+        || admission.root_thread_id != parent.root_thread_id
+        || admission.root_thread_id != context.root_thread_id()
+        || admission.initiating_principal_id != context.initiating_principal_id().as_str()
+    {
+        bail!("Task execution admission differs from its immutable task boundary");
+    }
+    let revision = processor
+        .authorization_invalidation_hub
+        .current_revision()
+        .await
+        .context("failed to load current authorization generation")?;
+    processor
+        .execution_leases
+        .revalidate_context(
+            processor.crud_store.as_ref(),
+            &context,
+            crate::authorization::ResourceAction::TaskCreate,
+            revision,
         )
         .await
-        .context("task initiating authority no longer permits continuation")?;
-    if current != context
-        || current.workspace_id() != task.workspace_id
-        || current.root_thread_id() != parent.root_thread_id
-        || user_owner_id
-            .as_deref()
-            .is_some_and(|owner_id| current.initiating_principal_id().as_str() != owner_id)
-    {
-        bail!("task continuation differs from its initiating authorization boundary");
-    }
-    Ok(Some(current))
+        .context("Task execution admission is no longer authorized")?;
+    context
+        .verify_current_provider_authority(processor.provider_registry().as_ref())
+        .context("Task provider authority changed after admission")?;
+    Ok(context)
 }
 
 async fn resolve_task_child_execution_authorization_context(
@@ -5089,19 +5235,28 @@ async fn resolve_task_child_execution_authorization_context(
     execution_backend: Option<&AgentExecutionBackend>,
     capabilities: &[pioneer_protocol::TurnCapability],
     permission_profile: &TurnPermissionProfileSnapshot,
-) -> Result<Option<crate::authorization::ExecutionAuthorizationContext>> {
+) -> Result<crate::authorization::ExecutionAuthorizationContext> {
+    let provider_authority_fingerprint = match execution_backend {
+        Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+        | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => None,
+        _ => Some(
+            processor
+                .provider_registry()
+                .authority_fingerprint_for_workspace(task.workspace_id.as_str(), provider)
+                .as_str()
+                .to_owned(),
+        ),
+    };
     resolve_task_parent_execution_authorization_context(processor, task, parent)
         .await?
-        .map(|context| {
-            context.derive_continuation(
-                provider,
-                model,
-                execution_backend,
-                capabilities,
-                permission_profile,
-            )
-        })
-        .transpose()
+        .derive_continuation(
+            provider,
+            model,
+            execution_backend,
+            capabilities,
+            permission_profile,
+            provider_authority_fingerprint.as_deref(),
+        )
 }
 
 async fn revalidate_existing_task_child_execution_authorization(
@@ -5109,36 +5264,28 @@ async fn revalidate_existing_task_child_execution_authorization(
     task: &Task,
     child_thread_id: &str,
     child_turn_id: &str,
-) -> Result<Option<crate::authorization::ExecutionAuthorizationContext>> {
-    let user_owner_id = task_root_user_owner_id(processor, task).await?;
+) -> Result<crate::authorization::ExecutionAuthorizationContext> {
     let context = processor
         .load_turn_execution_authorization_context(child_turn_id)
         .await
         .context("failed to load task child execution authorization")?;
-    let Some(context) = context else {
-        if user_owner_id.is_some() {
-            bail!("user-owned task child has no durable initiating authority");
-        }
-        return Ok(None);
-    };
-    context
-        .revalidate_for_turn_scope(
+    processor
+        .execution_leases
+        .revalidate_for_turn(
             processor.crud_store.as_ref(),
+            &context,
             task.workspace_id.as_str(),
             child_thread_id,
             child_turn_id,
-            crate::authorization::ResourceAction::ThreadWrite,
-            processor.authorization_invalidation_hub.current_revision(),
+            crate::authorization::ResourceAction::TaskCreate,
+            processor
+                .current_authorization_revision()
+                .await
+                .context("task continuation policy generation is unavailable")?,
         )
         .await
-        .context("task child initiating authority no longer permits continuation")?;
-    if user_owner_id
-        .as_deref()
-        .is_some_and(|owner_id| context.initiating_principal_id().as_str() != owner_id)
-    {
-        bail!("task child authorization principal differs from the task owner");
-    }
-    Ok(Some(context))
+        .context("task child collaboration authority no longer permits continuation")?;
+    Ok(context)
 }
 
 async fn load_required_task_child_execution_security_snapshot(
@@ -5983,6 +6130,13 @@ impl TaskAgentResultExtractor {
         result: TaskResult,
         artifact_mode: TaskAgentResultArtifactMode,
     ) -> Result<TaskAgentResultExtraction> {
+        let authorization = task_artifacts::authorize_task_result_artifacts(
+            processor,
+            &task_response.task,
+            task_run_turn,
+            &result,
+        )
+        .await?;
         match artifact_mode {
             TaskAgentResultArtifactMode::FinalResult => {
                 task_artifacts::normalize_task_result_artifacts(
@@ -5990,6 +6144,7 @@ impl TaskAgentResultExtractor {
                     &task_response.task,
                     task_run_turn,
                     lineage,
+                    &authorization,
                     result,
                 )
                 .await
@@ -6001,6 +6156,7 @@ impl TaskAgentResultExtractor {
                     task_run_turn,
                     lineage,
                     candidate_id.as_str(),
+                    &authorization,
                     result,
                 )
                 .await
@@ -6534,23 +6690,23 @@ async fn load_workspace_skill_policies(
 
 async fn load_task_agent_skill_overlay(
     processor: &Arc<MessageProcessor>,
-    task: &Task,
+    authorization: &crate::authorization::ExecutionAuthorizationContext,
     turn_id: &str,
 ) -> Result<Vec<pioneer_skills::AgentSkillRuntimeEntry>> {
-    let Some(owner_id) = task_root_user_owner_id(processor, task).await? else {
-        return Ok(processor
-            .load_agent_skill_overlay_for_new_native_turn(task.workspace_id.as_str(), turn_id)
-            .await);
-    };
-    let principal_id = pioneer_protocol::PrincipalId::new(owner_id)
-        .context("Member-owned task has an invalid initiating principal")?;
-    processor
-        .load_agent_skill_overlay_for_member_turn(
-            &principal_id,
-            task.workspace_id.as_str(),
-            turn_id,
-        )
-        .await
+    match authorization.runtime_principal_policy()? {
+        crate::authorization::RuntimePrincipalPolicy::Absolute => Ok(processor
+            .load_agent_skill_overlay_for_new_native_turn(authorization.workspace_id(), turn_id)
+            .await),
+        crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration => {
+            processor
+                .load_agent_skill_overlay_for_scoped_turn(
+                    authorization.initiating_principal_id(),
+                    authorization.workspace_id(),
+                    turn_id,
+                )
+                .await
+        }
+    }
 }
 
 fn task_error(
@@ -6622,6 +6778,34 @@ mod tests {
             started_at: Some(1),
             completed_at: Some(2),
         }
+    }
+
+    #[test]
+    fn task_child_runtime_requires_exact_non_self_rooted_collaboration_lineage() {
+        let task_run_turn = test_task_run_turn();
+        let valid = TaskThreadLineage {
+            child_thread_id: task_run_turn.thread_id.clone(),
+            parent_thread_id: "parent_thread".to_owned(),
+            root_thread_id: "root_thread".to_owned(),
+            depth: 1,
+            origin_kind: Some("task_run".to_owned()),
+            created_by_thread_id: Some("parent_thread".to_owned()),
+            created_by_turn_id: Some("parent_turn".to_owned()),
+            created_at: 1,
+        };
+        assert_eq!(
+            validate_task_thread_lineage(&task_run_turn, valid.clone())
+                .expect("valid task child lineage"),
+            valid
+        );
+
+        let mut wrong_child = valid.clone();
+        wrong_child.child_thread_id = "other_child".to_owned();
+        assert!(validate_task_thread_lineage(&task_run_turn, wrong_child).is_err());
+
+        let mut self_rooted = valid;
+        self_rooted.root_thread_id = task_run_turn.thread_id.clone();
+        assert!(validate_task_thread_lineage(&task_run_turn, self_rooted).is_err());
     }
 
     fn permission_test_agent_spec(
@@ -6876,6 +7060,38 @@ mod tests {
                 .await
                 .expect("missing checkpoint should not fail");
         assert!(context.is_none());
+    }
+
+    #[tokio::test]
+    async fn child_runtime_without_persisted_lineage_fails_closed() {
+        let (processor, _task, task_run_turn, _lineage) =
+            task_artifact_harness("missing_child_lineage").await;
+
+        let error = load_child_runtime_from_task_run_turn(&processor, task_run_turn)
+            .await
+            .err()
+            .expect("missing durable child lineage must be rejected");
+
+        assert!(
+            format!("{error:#}").contains("no durable collaboration lineage"),
+            "failure must identify the missing collaboration authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_task_without_persisted_execution_admission_fails_closed() {
+        let (processor, task, _task_run_turn, _lineage) =
+            task_artifact_harness("missing_task_admission").await;
+
+        let error = resolve_parent_context(&processor, &task)
+            .await
+            .err()
+            .expect("missing durable Task admission must be rejected");
+
+        assert!(
+            format!("{error:#}").contains("no durable execution admission"),
+            "failure must identify the missing execution authority"
+        );
     }
 
     #[tokio::test]
@@ -7196,12 +7412,14 @@ mod tests {
                         path: None,
                         url: None,
                         artifact_id: Some("art_input".to_owned()),
+                        version_id: Some("version_input".to_owned()),
                         mime_type: None,
                     }],
                     references: vec![pioneer_protocol::TaskAgentInputReference {
                         kind: TaskAgentInputReferenceKind::Artifact,
                         id: "art_ref".to_owned(),
                         label: None,
+                        version_id: Some("version_ref".to_owned()),
                     }],
                 }),
                 output_instructions: None,
@@ -7282,9 +7500,13 @@ mod tests {
     #[tokio::test]
     async fn task_artifact_existing_id_gets_task_result_binding() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("existing").await;
-        let source =
-            ingest_task_test_artifact(&processor, task.workspace_id.as_str(), None, "source.txt")
-                .await;
+        let source = ingest_task_test_artifact(
+            &processor,
+            task.workspace_id.as_str(),
+            task.created_by_thread_id.clone(),
+            "source.txt",
+        )
+        .await;
         let result = TaskResult {
             summary: Some("done".to_owned()),
             data: None,
@@ -7304,6 +7526,7 @@ mod tests {
             &task,
             &task_run_turn,
             &lineage,
+            &task_artifacts::TaskResultArtifactAuthorization::structural_test_proof(),
             result,
         )
         .await
@@ -7338,7 +7561,7 @@ mod tests {
         let source = ingest_task_test_artifact(
             &processor,
             task.workspace_id.as_str(),
-            None,
+            task.created_by_thread_id.clone(),
             "candidate-source.txt",
         )
         .await;
@@ -7363,6 +7586,7 @@ mod tests {
             &task_run_turn,
             &lineage,
             candidate_id,
+            &task_artifacts::TaskResultArtifactAuthorization::structural_test_proof(),
             result,
         )
         .await
@@ -7416,7 +7640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_artifact_path_is_ingested_and_listable_by_task() {
+    async fn task_artifact_path_is_rejected_without_an_execution_owned_handle() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("path").await;
         let output_dir = std::env::current_dir()
             .expect("cwd")
@@ -7444,18 +7668,24 @@ mod tests {
             completed_by_run_id: Some(task_run_turn.run_id.clone()),
         };
 
-        let normalized = task_artifacts::normalize_task_result_artifacts(
+        let error = task_artifacts::normalize_task_result_artifacts(
             &processor,
             &task,
             &task_run_turn,
             &lineage,
+            &task_artifacts::TaskResultArtifactAuthorization::structural_test_proof(),
             result,
         )
         .await
-        .expect("normalize")
-        .expect("valid result");
+        .expect("normalization should return a task error")
+        .expect_err("raw paths must not become task artifacts");
 
-        assert!(normalized.artifacts[0].artifact_id.is_some());
+        assert_eq!(error.code, "task_artifact_invalid");
+        assert!(
+            error
+                .message
+                .contains("raw task result paths and URLs are not accepted")
+        );
         let page = processor
             .artifact_service
             .list_artifacts(
@@ -7468,8 +7698,7 @@ mod tests {
             )
             .await
             .expect("list task artifacts");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].artifact.display_name, "result.txt");
+        assert!(page.items.is_empty());
         let _ = tokio::fs::remove_dir_all(output_dir.as_path()).await;
     }
 
@@ -7503,11 +7732,47 @@ mod tests {
             &task,
             &task_run_turn,
             &lineage,
+            &task_artifacts::TaskResultArtifactAuthorization::structural_test_proof(),
             result,
         )
         .await
         .expect("normalization should return task error")
         .expect_err("foreign artifact should fail result");
+
+        assert_eq!(error.code, "task_artifact_invalid");
+    }
+
+    #[tokio::test]
+    async fn task_artifact_rejects_unbound_workspace_artifact() {
+        let (processor, task, task_run_turn, lineage) = task_artifact_harness("unbound").await;
+        let source =
+            ingest_task_test_artifact(&processor, task.workspace_id.as_str(), None, "unbound.txt")
+                .await;
+        let result = TaskResult {
+            summary: None,
+            data: None,
+            artifacts: vec![TaskArtifact {
+                artifact_id: Some(source.artifact.artifact_id),
+                version_id: source.artifact.version_id,
+                path: None,
+                url: None,
+                mime_type: None,
+                metadata: None,
+            }],
+            completed_by_run_id: Some(task_run_turn.run_id.clone()),
+        };
+
+        let error = task_artifacts::normalize_task_result_artifacts(
+            &processor,
+            &task,
+            &task_run_turn,
+            &lineage,
+            &task_artifacts::TaskResultArtifactAuthorization::structural_test_proof(),
+            result,
+        )
+        .await
+        .expect("normalization should return task error")
+        .expect_err("an unbound artifact must not be shared into a collaboration root");
 
         assert_eq!(error.code, "task_artifact_invalid");
     }

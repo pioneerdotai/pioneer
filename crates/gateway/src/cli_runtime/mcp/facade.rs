@@ -1175,88 +1175,66 @@ fn validate_arguments(
     arguments: &JsonValue,
     limits: &CliMcpFacadeLimits,
 ) -> Result<(), FacadeProtocolError> {
-    let encoded = serde_json::to_vec(arguments).map_err(|_| invalid_params())?;
-    if encoded.len() > limits.max_arguments_bytes {
-        return Err(FacadeProtocolError::new(
-            FACADE_LIMIT_EXCEEDED,
-            "MCP tool arguments exceed the configured byte limit",
-            "arguments_too_large",
-        ));
-    }
-    if json_depth(arguments, limits.max_arguments_depth).is_none() {
-        return Err(FacadeProtocolError::new(
-            FACADE_LIMIT_EXCEEDED,
-            "MCP tool arguments exceed the configured depth limit",
-            "arguments_too_deep",
-        ));
-    }
-    Ok(())
+    pioneer_mcp::validate_mcp_arguments(arguments, common_invocation_budget(limits)).map_err(
+        |error| {
+            FacadeProtocolError::new(
+                FACADE_LIMIT_EXCEEDED,
+                "MCP tool arguments exceed the shared invocation budget",
+                error.reason_code(),
+            )
+        },
+    )
 }
 
-fn json_depth(value: &JsonValue, maximum: usize) -> Option<usize> {
-    let mut stack = vec![(value, 1_usize)];
-    let mut deepest = 0_usize;
-    while let Some((value, depth)) = stack.pop() {
-        if depth > maximum {
-            return None;
-        }
-        deepest = deepest.max(depth);
-        match value {
-            JsonValue::Array(values) => {
-                stack.extend(values.iter().map(|value| (value, depth + 1)));
-            }
-            JsonValue::Object(values) => {
-                stack.extend(values.values().map(|value| (value, depth + 1)));
-            }
-            _ => {}
-        }
+fn common_invocation_budget(limits: &CliMcpFacadeLimits) -> pioneer_mcp::McpInvocationBudget {
+    pioneer_mcp::McpInvocationBudget {
+        max_arguments_bytes: limits.max_arguments_bytes,
+        max_arguments_depth: limits.max_arguments_depth,
+        max_result_wire_bytes: limits.max_result_bytes,
+        max_result_decoded_bytes: limits.max_result_bytes,
+        max_result_depth: limits.max_arguments_depth,
+        max_result_tokens: limits.max_result_tokens,
+        max_result_media: limits.max_result_images,
     }
-    Some(deepest)
 }
 
 fn validate_result(
     result: &JsonValue,
     limits: &CliMcpFacadeLimits,
 ) -> Result<(), FacadeProtocolError> {
-    let encoded = serde_json::to_vec(result).map_err(|_| {
+    let content = result.get("content").ok_or_else(|| {
         FacadeProtocolError::new(
             INTERNAL_ERROR,
-            "failed to encode MCP tool result",
+            "MCP result is missing content",
             "result_invalid",
         )
     })?;
-    if encoded.len() > limits.max_result_bytes {
-        return Err(FacadeProtocolError::new(
+    pioneer_mcp::validate_mcp_result_parts(
+        content,
+        result
+            .get("structuredContent")
+            .filter(|value| !value.is_null()),
+        result
+            .get("isError")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false),
+        result
+            .get("durationMs")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or_default(),
+        result
+            .get("_meta")
+            .or_else(|| result.get("meta"))
+            .filter(|value| !value.is_null()),
+        common_invocation_budget(limits),
+    )
+    .map_err(|error| {
+        FacadeProtocolError::new(
             FACADE_LIMIT_EXCEEDED,
-            "MCP tool result exceeds the configured byte limit",
-            "result_too_large",
-        ));
-    }
-    if encoded.len().div_ceil(4) > limits.max_result_tokens {
-        return Err(FacadeProtocolError::new(
-            FACADE_LIMIT_EXCEEDED,
-            "MCP tool result exceeds the configured token budget",
-            "result_token_limit_exceeded",
-        ));
-    }
-    let image_count = result
-        .get("content")
-        .and_then(JsonValue::as_array)
-        .map(|content| {
-            content
-                .iter()
-                .filter(|block| block.get("type").and_then(JsonValue::as_str) == Some("image"))
-                .count()
-        })
-        .unwrap_or_default();
-    if image_count > limits.max_result_images {
-        return Err(FacadeProtocolError::new(
-            FACADE_LIMIT_EXCEEDED,
-            "MCP tool result exceeds the configured image limit",
-            "result_image_limit_exceeded",
-        ));
-    }
-    Ok(())
+            "MCP tool result exceeds the shared invocation budget",
+            error.reason_code(),
+        )
+    })
 }
 
 fn json_fingerprint(value: &JsonValue) -> Result<String, FacadeProtocolError> {

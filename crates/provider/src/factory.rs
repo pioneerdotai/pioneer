@@ -6,6 +6,7 @@ use crate::providers::{
 use crate::traits::Provider;
 use crate::types::{InputTypeSupport, ProviderInputCapabilities, ProviderTimeoutPolicy};
 use anyhow::{Result, bail};
+use sha2::{Digest, Sha256};
 
 pub fn create_provider(provider_name: &str, api_key: &str) -> Result<Box<dyn Provider>> {
     create_provider_with_timeout_policy(provider_name, api_key, ProviderTimeoutPolicy::default())
@@ -25,9 +26,41 @@ pub fn create_provider_with_timeout_policy_and_proxy(
     timeout_policy: ProviderTimeoutPolicy,
     proxy_url: Option<&str>,
 ) -> Result<Box<dyn Provider>> {
+    let mut digest = Sha256::new();
+    digest.update(b"pioneer-provider-authority-v1");
+    digest.update([0]);
+    digest.update(b"<direct-factory>");
+    digest.update([0]);
+    digest.update(provider_name.trim().to_ascii_lowercase().as_bytes());
+    digest.update([0]);
+    digest.update(api_key.as_bytes());
+    digest.update([0]);
+    digest.update(proxy_url.unwrap_or("<direct>").as_bytes());
+    let authority_fingerprint = hex::encode(digest.finalize());
+    create_provider_with_timeout_policy_and_proxy_and_authority(
+        provider_name,
+        api_key,
+        timeout_policy,
+        proxy_url,
+        authority_fingerprint.as_str(),
+    )
+}
+
+pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_authority(
+    provider_name: &str,
+    api_key: &str,
+    timeout_policy: ProviderTimeoutPolicy,
+    proxy_url: Option<&str>,
+    authority_fingerprint: &str,
+) -> Result<Box<dyn Provider>> {
     let proxy_url = proxy_url.map(crate::http::validate_proxy_url).transpose()?;
     crate::http::with_provider_proxy(proxy_url.as_deref(), || {
-        create_provider_with_timeout_policy_inner(provider_name, api_key, timeout_policy)
+        create_provider_with_timeout_policy_inner(
+            provider_name,
+            api_key,
+            timeout_policy,
+            authority_fingerprint,
+        )
     })
 }
 
@@ -35,6 +68,7 @@ fn create_provider_with_timeout_policy_inner(
     provider_name: &str,
     api_key: &str,
     timeout_policy: ProviderTimeoutPolicy,
+    authority_fingerprint: &str,
 ) -> Result<Box<dyn Provider>> {
     let compat = |name: &str, base_url: &str, api_key: &str| {
         compat(name, base_url, api_key).with_timeout_policy(timeout_policy)
@@ -50,9 +84,10 @@ fn create_provider_with_timeout_policy_inner(
             api_key,
             timeout_policy,
         ))),
-        "openai" => Ok(Box::new(OpenAiProvider::with_timeout_policy(
+        "openai" => Ok(Box::new(OpenAiProvider::with_timeout_policy_and_authority(
             api_key,
             timeout_policy,
+            authority_fingerprint,
         ))),
         "local" => Ok(Box::new(LocalProvider::new())),
         "gemini" | "google" | "google-gemini" => Ok(Box::new(GeminiProvider::with_timeout_policy(

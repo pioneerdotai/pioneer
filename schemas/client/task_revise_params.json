@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskReviseParams",
+  "type": "object",
+  "properties": {
+    "additionalInstructions": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "candidateId": {
+      "type": "string"
+    },
+    "feedback": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "taskId",
+    "runId",
+    "candidateId",
+    "feedback"
+  ]
+}

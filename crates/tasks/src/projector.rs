@@ -84,4 +84,23 @@ impl TaskProjector {
         })
         .await
     }
+
+    pub async fn append_events_with_execution_admission(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        admission: pioneer_crud::NewTaskExecutionAdmission,
+    ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
+        let store = self.store.clone();
+        task_projector_fresh_task(async move {
+            Ok(store
+                .append_task_events_with_execution_admission(
+                    events,
+                    event_timestamp_secs,
+                    admission,
+                )
+                .await?)
+        })
+        .await
+    }
 }

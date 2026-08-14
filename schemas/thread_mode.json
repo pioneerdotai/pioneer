@@ -1,9 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ThreadMode",
-  "type": "string",
-  "enum": [
-    "Chat",
-    "Agent"
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "Message",
+        "Agent"
+      ]
+    },
+    {
+      "description": "Compatibility default for pre-Epic-6 persisted and wire values. New\nuser-thread creation selects `Message` explicitly.",
+      "type": "string",
+      "const": "Chat"
+    }
   ]
 }

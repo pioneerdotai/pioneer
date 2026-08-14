@@ -8,7 +8,9 @@ use pioneer_client::{
         semantic_render::render_semantic_timeline_rows,
     },
 };
-use pioneer_protocol::{CLIRuntimePendingRequestStatus, TimelineBlock, TimelineBlockKind};
+#[cfg(test)]
+use pioneer_protocol::CLIRuntimePendingRequestStatus;
+use pioneer_protocol::{TimelineBlock, TimelineBlockKind};
 use std::rc::Rc;
 
 pub(in crate::app::thread::view::timeline) const SEMANTIC_TURN_WORK_GROUP_PREFIX: &str =
@@ -117,7 +119,7 @@ fn pending_request_from_semantic_block(block: &TimelineBlock) -> Option<PendingR
     else {
         return None;
     };
-    if *status != CLIRuntimePendingRequestStatus::Pending {
+    if !status.is_open() {
         return None;
     }
 

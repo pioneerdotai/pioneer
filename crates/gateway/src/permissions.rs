@@ -20,29 +20,63 @@ pub struct GatewayPermissionApprovalRequest {
     pub respond_to: oneshot::Sender<PermissionApprovalResolution>,
 }
 
+#[derive(Debug)]
+pub struct GatewayPermissionContextRevalidationRequest {
+    pub context: PermissionEvaluationContext,
+    pub respond_to: oneshot::Sender<Result<PermissionEvaluationContext, String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayPermissionApprovalBroker {
-    request_tx: mpsc::UnboundedSender<GatewayPermissionApprovalEvent>,
+    request_tx: mpsc::Sender<GatewayPermissionApprovalEvent>,
 }
 
 #[derive(Debug)]
 pub enum GatewayPermissionApprovalEvent {
+    Revalidate(GatewayPermissionContextRevalidationRequest),
     Open(GatewayPermissionApprovalRequest),
     Cancelled { request_id: String },
+    Expired { request_id: String },
 }
 
 impl GatewayPermissionApprovalBroker {
-    pub fn channel() -> (
-        Self,
-        mpsc::UnboundedReceiver<GatewayPermissionApprovalEvent>,
-    ) {
-        let (request_tx, request_rx) = mpsc::unbounded_channel();
+    pub fn channel() -> (Self, mpsc::Receiver<GatewayPermissionApprovalEvent>) {
+        let (request_tx, request_rx) = mpsc::channel(64);
         (Self { request_tx }, request_rx)
     }
 }
 
 #[async_trait]
 impl PermissionApprovalBroker for GatewayPermissionApprovalBroker {
+    async fn revalidate_permission_context(
+        &self,
+        context: &PermissionEvaluationContext,
+        invocation: &ToolInvocation,
+    ) -> Result<PermissionEvaluationContext, String> {
+        let (respond_tx, respond_rx) = oneshot::channel();
+        let request = GatewayPermissionContextRevalidationRequest {
+            context: context.clone(),
+            respond_to: respond_tx,
+        };
+        if tokio::select! {
+            result = self.request_tx.send(GatewayPermissionApprovalEvent::Revalidate(request)) => result.is_err(),
+            _ = invocation.cancellation.cancelled() => true,
+        } {
+            return Err("tool permission authority broker is unavailable".to_owned());
+        }
+        tokio::select! {
+            _ = invocation.cancellation.cancelled() => {
+                Err("tool permission revalidation was cancelled".to_owned())
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                Err("tool permission revalidation timed out".to_owned())
+            }
+            result = respond_rx => result.unwrap_or_else(|_| {
+                Err("tool permission authority broker closed".to_owned())
+            }),
+        }
+    }
+
     async fn request_approval(
         &self,
         context: &PermissionEvaluationContext,
@@ -66,22 +100,27 @@ impl PermissionApprovalBroker for GatewayPermissionApprovalBroker {
             respond_to: respond_tx,
         };
 
-        if self
-            .request_tx
-            .send(GatewayPermissionApprovalEvent::Open(request))
-            .is_err()
-        {
+        if tokio::select! {
+            result = self.request_tx.send(GatewayPermissionApprovalEvent::Open(request)) => result.is_err(),
+            _ = invocation.cancellation.cancelled() => true,
+        } {
             return PermissionApprovalResolution::Deny {
-                message: "permission approval broker is not connected".to_owned(),
+                message: "permission approval broker is unavailable".to_owned(),
             };
         }
 
         tokio::select! {
             _ = invocation.cancellation.cancelled() => {
-                let _ = self.request_tx.send(GatewayPermissionApprovalEvent::Cancelled {
+                let _ = self.request_tx.try_send(GatewayPermissionApprovalEvent::Cancelled {
                     request_id,
                 });
                 PermissionApprovalResolution::Cancelled
+            }
+            _ = tokio::time::sleep(crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT) => {
+                let _ = self.request_tx.try_send(GatewayPermissionApprovalEvent::Expired {
+                    request_id,
+                });
+                PermissionApprovalResolution::Expired
             }
             resolution = respond_rx => resolution.unwrap_or(PermissionApprovalResolution::Expired),
         }

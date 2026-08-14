@@ -1,20 +1,75 @@
 use super::{MessageProcessor, now_timestamp_secs, task_agent_executor::TaskParentRuntimeContext};
 use anyhow::{Context, Result, anyhow};
-use pioneer_artifacts::{
-    ArtifactBindingTarget, ArtifactListFilter, ArtifactLocalPathPolicy, ArtifactSource,
-    BindArtifactRequest, IngestArtifactSourceRequest,
-};
+use pioneer_artifacts::{ArtifactBindingTarget, ArtifactListFilter, BindArtifactRequest};
 use pioneer_protocol::{
-    ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind,
-    ArtifactCreatedNotification, ArtifactKind, ArtifactRole, ArtifactSummary, Task,
-    TaskAgentContext, TaskAgentInput, TaskAgentInputAttachmentKind, TaskAgentInputReferenceKind,
-    TaskArtifact, TaskError, TaskErrorClass, TaskResult, TaskRunTurn, TaskThreadLineage, TaskValue,
-    UserInput, constants::events,
+    ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, Task, TaskAgentContext,
+    TaskAgentInput, TaskAgentInputAttachmentKind, TaskAgentInputReferenceKind, TaskArtifact,
+    TaskError, TaskErrorClass, TaskResult, TaskRunTurn, TaskThreadLineage, TaskValue, UserInput,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Short-lived proof that model-owned Task Result artifact references were
+/// intersected with the current collaboration lease immediately before the
+/// post-turn binding side effect. The constructor is private to this module so
+/// production callers cannot invoke the normalizer with an unproved action.
+pub(super) enum TaskResultArtifactAuthorization {
+    NoExistingArtifacts,
+    ExistingArtifacts {
+        _read: crate::authorization::RevalidatedExecutionAuthorization,
+        _bind: crate::authorization::RevalidatedExecutionAuthorization,
+    },
+}
+
+pub(super) async fn authorize_task_result_artifacts(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    task_run_turn: &TaskRunTurn,
+    result: &TaskResult,
+) -> Result<TaskResultArtifactAuthorization> {
+    let has_existing_artifact = result.artifacts.iter().any(|artifact| {
+        artifact
+            .artifact_id
+            .as_deref()
+            .is_some_and(|artifact_id| !artifact_id.trim().is_empty())
+    });
+    if !has_existing_artifact {
+        return Ok(TaskResultArtifactAuthorization::NoExistingArtifacts);
+    }
+
+    let read = processor
+        .revalidate_post_turn_execution_authorization(
+            task.workspace_id.as_str(),
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            None,
+            crate::authorization::ResourceAction::ArtifactRead,
+        )
+        .await
+        .context("task result execution no longer has artifact read authority")?;
+    let bind = processor
+        .revalidate_post_turn_execution_authorization(
+            task.workspace_id.as_str(),
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+            None,
+            crate::authorization::ResourceAction::ArtifactBindThread,
+        )
+        .await
+        .context("task result execution no longer has artifact bind authority")?;
+    Ok(TaskResultArtifactAuthorization::ExistingArtifacts {
+        _read: read,
+        _bind: bind,
+    })
+}
+
+#[cfg(test)]
+impl TaskResultArtifactAuthorization {
+    pub(super) fn structural_test_proof() -> Self {
+        Self::NoExistingArtifacts
+    }
+}
 
 pub(super) fn task_agent_artifact_user_inputs(
     agent_spec: &pioneer_protocol::TaskAgentSpec,
@@ -58,7 +113,7 @@ fn collect_task_agent_input_artifacts(
         {
             artifacts.push(UserInput::Artifact {
                 artifact_id: artifact_id.to_owned(),
-                version_id: None,
+                version_id: attachment.version_id.clone(),
             });
         }
     }
@@ -68,7 +123,7 @@ fn collect_task_agent_input_artifacts(
         {
             artifacts.push(UserInput::Artifact {
                 artifact_id: reference.id.clone(),
-                version_id: None,
+                version_id: reference.version_id.clone(),
             });
         }
     }
@@ -125,6 +180,7 @@ pub(super) async fn normalize_task_result_artifacts(
     task: &Task,
     task_run_turn: &TaskRunTurn,
     lineage: &TaskThreadLineage,
+    _authorization: &TaskResultArtifactAuthorization,
     result: TaskResult,
 ) -> Result<std::result::Result<TaskResult, TaskError>> {
     normalize_task_result_artifacts_with_binding(
@@ -144,6 +200,7 @@ pub(super) async fn normalize_task_result_candidate_artifacts(
     task_run_turn: &TaskRunTurn,
     lineage: &TaskThreadLineage,
     candidate_id: &str,
+    _authorization: &TaskResultArtifactAuthorization,
     result: TaskResult,
 ) -> Result<std::result::Result<TaskResult, TaskError>> {
     normalize_task_result_artifacts_with_binding(
@@ -210,12 +267,42 @@ async fn normalize_task_result_artifact(
     artifact: &mut TaskArtifact,
     index: usize,
 ) -> Result<Option<String>> {
+    if artifact
+        .path
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+        || artifact
+            .url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty())
+    {
+        anyhow::bail!(
+            "raw task result paths and URLs are not accepted; register an execution-owned artifact and return its exact artifact/version handle"
+        );
+    }
     if let Some(artifact_id) = artifact
         .artifact_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        let version_id = artifact
+            .version_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("task result artifact requires an exact version")?;
+        processor
+            .validate_turn_artifact_user_inputs(
+                task.workspace_id.as_str(),
+                lineage.root_thread_id.as_str(),
+                &[UserInput::Artifact {
+                    artifact_id: artifact_id.to_owned(),
+                    version_id: Some(version_id.to_owned()),
+                }],
+            )
+            .await
+            .context("task result artifact is outside the authorized collaboration root")?;
         let summary = processor
             .artifact_service
             .get_artifact(
@@ -248,84 +335,7 @@ async fn normalize_task_result_artifact(
         return Ok(Some(summary.artifact.artifact_id));
     }
 
-    let Some(path) = artifact
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-    else {
-        return Ok(None);
-    };
-
-    let summary = ingest_task_result_path(
-        processor,
-        task,
-        task_run_turn,
-        lineage,
-        binding,
-        artifact,
-        path.as_str(),
-        index,
-    )
-    .await?;
-    artifact.artifact_id = Some(summary.artifact.artifact_id.clone());
-    artifact.version_id = summary.artifact.version_id.clone();
-    if artifact.mime_type.is_none() {
-        artifact.mime_type = summary.artifact.mime_type.clone();
-    }
-    Ok(Some(summary.artifact.artifact_id))
-}
-
-async fn ingest_task_result_path(
-    processor: &Arc<MessageProcessor>,
-    task: &Task,
-    task_run_turn: &TaskRunTurn,
-    lineage: &TaskThreadLineage,
-    binding: &TaskResultArtifactBinding,
-    artifact: &TaskArtifact,
-    path: &str,
-    index: usize,
-) -> Result<ArtifactSummary> {
-    let allowed_root = std::env::current_dir().context("failed to resolve task artifact root")?;
-    let mut metadata = task_result_artifact_metadata(artifact, binding);
-    metadata.insert("source_path".to_owned(), json!(path));
-    let summary = processor
-        .artifact_service
-        .ingest_source(IngestArtifactSourceRequest {
-            workspace_id: task.workspace_id.clone(),
-            primary_thread_id: task_result_thread_id(task, lineage),
-            source: ArtifactSource::LocalPath(PathBuf::from(path)),
-            display_name: display_name_from_task_artifact_path(path),
-            kind: Some(ArtifactKind::WorkspaceFile),
-            mime_type: artifact.mime_type.clone(),
-            created_by_kind: ArtifactCreatedByKind::Task,
-            created_by_actor_id: Some(task.id.clone()),
-            binding: Some(task_result_binding_target(
-                task,
-                task_run_turn,
-                lineage,
-                binding,
-                index,
-            )),
-            metadata,
-            local_path_policy: Some(ArtifactLocalPathPolicy::new(vec![allowed_root])),
-        })
-        .await
-        .with_context(|| format!("failed to ingest task result artifact path `{path}`"))?;
-    processor
-        .send_notification_to_thread_subscribers(
-            task_result_thread_id(task, lineage)
-                .as_deref()
-                .unwrap_or(lineage.parent_thread_id.as_str()),
-            events::ARTIFACT_CREATED,
-            &ArtifactCreatedNotification {
-                workspace_id: task.workspace_id.clone(),
-                artifact: summary.clone(),
-            },
-        )
-        .await;
-    Ok(summary)
+    Ok(None)
 }
 
 async fn bind_task_result_artifact(
@@ -475,14 +485,6 @@ fn task_artifacts_changed_reason(binding: &TaskResultArtifactBinding) -> &'stati
         TaskResultArtifactBinding::FinalResult => "task_result",
         TaskResultArtifactBinding::ResultCandidate { .. } => "task_result_candidate",
     }
-}
-
-fn display_name_from_task_artifact_path(path: &str) -> Option<String> {
-    Path::new(path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
 }
 
 pub(super) fn parse_task_artifacts(values: &[TaskValue]) -> Vec<TaskArtifact> {

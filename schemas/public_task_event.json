@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskEvent",
+  "type": "object",
+  "properties": {
+    "createdAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "eventType": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "runId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sequence": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "taskId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "taskId",
+    "sequence",
+    "eventType",
+    "createdAt"
+  ]
+}

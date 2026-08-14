@@ -8631,6 +8631,7 @@ dependencies = [
  "pioneer-cli-agent-runtime",
  "pioneer-cli-mcp-bridge",
  "pioneer-client",
+ "pioneer-client-ffi",
  "pioneer-config",
  "pioneer-crud",
  "pioneer-entity",

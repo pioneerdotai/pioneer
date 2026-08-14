@@ -216,6 +216,69 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
     }
 }
 
+fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
+    match event {
+        AgentDurableEvent::PromptManifestCompiled { turn_id, .. }
+        | AgentDurableEvent::TurnSkillsResolved { turn_id, .. }
+        | AgentDurableEvent::TurnCapabilitiesResolved { turn_id, .. }
+        | AgentDurableEvent::SkillAuditEvents { turn_id, .. }
+        | AgentDurableEvent::TurnLlmContextAppended { turn_id, .. }
+        | AgentDurableEvent::TurnProviderHistoryAppended { turn_id, .. }
+        | AgentDurableEvent::ProviderFailureDetected { turn_id, .. }
+        | AgentDurableEvent::RecoveryAttemptSucceeded { turn_id, .. }
+        | AgentDurableEvent::TurnCompleted { turn_id, .. }
+        | AgentDurableEvent::TurnFailed { turn_id, .. }
+        | AgentDurableEvent::TurnBlocked { turn_id, .. }
+        | AgentDurableEvent::TurnInterrupted { turn_id, .. } => Some(turn_id.as_str()),
+        AgentDurableEvent::TurnPermissionAudit { event } => Some(event.turn_id.as_str()),
+        AgentDurableEvent::ItemStarted { notification } => Some(notification.turn_id.as_str()),
+        AgentDurableEvent::ItemCompleted { notification }
+        | AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::ItemToolRetryScheduled { notification } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::ItemToolRetryResolved { notification } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::ItemToolRetryExhausted { notification } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::TurnToolLoopBudgetExceeded { notification } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowStarted { notification } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowCheckpointed { notification, .. } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowContinued { notification } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::TurnExecutionWindowBlocked { notification } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::TaskEvent { .. } | AgentDurableEvent::ThreadLineageCreated { .. } => {
+            None
+        }
+    }
+}
+
+fn terminal_durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
+    match event {
+        AgentDurableEvent::TurnCompleted { turn_id, .. }
+        | AgentDurableEvent::TurnFailed { turn_id, .. }
+        | AgentDurableEvent::TurnBlocked { turn_id, .. }
+        | AgentDurableEvent::TurnInterrupted { turn_id, .. } => Some(turn_id.as_str()),
+        _ => None,
+    }
+}
+
 fn tool_result_view_from_protocol(
     payload: pioneer_protocol::ToolResultView,
 ) -> pioneer_tools::ToolResultView {
@@ -795,8 +858,17 @@ impl MessageProcessor {
             } => self.handle_turn_skills_resolved_event(thread_id, turn_id, bindings),
             event => message_future(async move {
                 let thread_id = durable_event_thread_id(&event).map(str::to_owned);
+                let terminal_turn_id = terminal_durable_event_turn_id(&event).map(str::to_owned);
+                if let Some(turn_id) = durable_event_turn_id(&event)
+                    && self.guard_execution_commit(turn_id).await.is_err()
+                {
+                    return false;
+                }
                 let committed = self.persist_durable_agent_event(event.clone()).await;
                 if committed {
+                    if let Some(turn_id) = terminal_turn_id.as_deref() {
+                        self.execution_leases.finish(turn_id).await;
+                    }
                     self.kick_native_turn_event_deliveries();
                     if let Some(thread_id) = thread_id {
                         self.agent_manager
@@ -816,6 +888,9 @@ impl MessageProcessor {
         bindings: Vec<pioneer_protocol::TurnSkillBinding>,
     ) -> MessageFuture<'a, bool> {
         message_future(async move {
+            if self.guard_execution_commit(turn_id.as_str()).await.is_err() {
+                return false;
+            }
             if let Err(error) = self
                 .reconcile_turn_runtime_snapshot_agent_overlay(
                     thread_id.as_str(),
@@ -952,44 +1027,35 @@ impl MessageProcessor {
         turn_id: &str,
         bindings: &[pioneer_protocol::TurnSkillBinding],
     ) -> Result<()> {
-        let context = self
+        let mut context = self
             .load_turn_execution_authorization_context(turn_id)
             .await
             .context("failed to load execution authorization for skill projection")?;
-        let context = if let Some(mut context) = context {
-            let revalidated = context
-                .revalidate_for_turn_scope(
-                    self.crud_store.as_ref(),
-                    context.workspace_id(),
-                    thread_id,
-                    turn_id,
-                    crate::authorization::ResourceAction::ThreadWrite,
-                    self.authorization_invalidation_hub.current_revision(),
-                )
-                .await
-                .context("current execution authorization no longer permits skill use")?;
-            if revalidated.principal().kind == pioneer_protocol::PrincipalKind::User {
-                self.revalidate_member_skill_bindings(
-                    revalidated.principal(),
-                    context.workspace_id(),
-                    bindings,
-                )
-                .await?;
-            }
-            let workspace_id = context.workspace_id().to_owned();
-            context
-                .bind_skill_projection(workspace_id.as_str(), bindings)
-                .context("failed to bind exact skill projection")?;
-            Some(context)
-        } else {
-            crate::authorization::ensure_contextless_execution_is_trusted(
+        let revalidated = self
+            .execution_leases
+            .revalidate_for_turn(
                 self.crud_store.as_ref(),
+                &context,
+                context.workspace_id(),
+                thread_id,
                 turn_id,
+                crate::authorization::ResourceAction::SkillUse,
+                self.current_authorization_revision()
+                    .await
+                    .context("agent continuation policy generation is unavailable")?,
             )
             .await
-            .context("contextless skill projection is not a trusted legacy execution")?;
-            None
-        };
+            .context("current execution authorization no longer permits skill use")?;
+        self.revalidate_collaboration_skill_bindings(
+            revalidated.principal(),
+            context.workspace_id(),
+            bindings,
+        )
+        .await?;
+        let workspace_id = context.workspace_id().to_owned();
+        context
+            .bind_skill_projection(workspace_id.as_str(), bindings)
+            .context("failed to bind exact skill projection")?;
 
         let event_timestamp = now_timestamp_secs();
         let binding_records = bindings
@@ -1004,29 +1070,22 @@ impl MessageProcessor {
                 resolved_reason: binding.resolved_reason.clone(),
             })
             .collect::<Vec<_>>();
-        if let Some(context) = context {
-            let encoded = context
-                .to_persisted_json()
-                .context("failed to encode skill-bound execution authorization")?;
-            self.crud_store
-                .replace_turn_skill_bindings_with_authorization_context(
-                    turn_id,
-                    binding_records.as_slice(),
-                    event_timestamp,
-                    encoded.as_str(),
-                )
-                .await
-                .context("failed to persist authorized turn skill projection")?;
-        } else {
-            self.crud_store
-                .replace_turn_skill_bindings(turn_id, binding_records.as_slice(), event_timestamp)
-                .await
-                .context("failed to persist exact turn skill bindings")?;
-        }
+        let encoded = context
+            .to_persisted_json()
+            .context("failed to encode skill-bound execution authorization")?;
+        self.crud_store
+            .replace_turn_skill_bindings_with_authorization_context(
+                turn_id,
+                binding_records.as_slice(),
+                event_timestamp,
+                encoded.as_str(),
+            )
+            .await
+            .context("failed to persist authorized turn skill projection")?;
         Ok(())
     }
 
-    async fn revalidate_member_skill_bindings(
+    async fn revalidate_collaboration_skill_bindings(
         &self,
         principal: &crate::auth::AuthenticatedSessionPrincipal,
         workspace_id: &str,
@@ -1039,20 +1098,30 @@ impl MessageProcessor {
         );
         let resolver =
             crate::authorization::AuthorizationResolver::new(self.crud_store.as_ref().clone());
-        let base_catalog = if bindings
+        let (base_catalog, base_policy_set) = if bindings
             .iter()
             .any(|binding| binding.source_kind != "agent")
         {
             let context = self
                 .skills_runtime_context(workspace_id)
                 .context("failed to resolve current skills runtime context")?;
-            Some(
-                self.load_skills_catalog(workspace_id, &context)
-                    .await
-                    .context("failed to load current skills catalog")?,
-            )
+            let catalog = self
+                .load_skills_catalog(workspace_id, &context)
+                .await
+                .context("failed to load current skills catalog")?;
+            let workspace_policies = self
+                .crud_store
+                .list_workspace_skill_policies(workspace_id)
+                .await
+                .context("failed to load current workspace skill policies")?;
+            let policy_set = self.build_policy_set(
+                catalog.skills.as_slice(),
+                workspace_policies.as_slice(),
+                &context,
+            );
+            (Some(catalog), Some(policy_set))
         } else {
-            None
+            (None, None)
         };
         let installations = self
             .crud_store
@@ -1133,6 +1202,19 @@ impl MessageProcessor {
                         .find(|skill| skill.identity.skill_id == binding.skill_id)
                 })
                 .with_context(|| format!("skill `{}` is no longer installed", binding.skill_id))?;
+            if !pioneer_skills::effective_policy_for_skill(
+                skill,
+                base_policy_set
+                    .as_ref()
+                    .context("skill policy projection is unavailable")?,
+            )
+            .enabled
+            {
+                bail!(
+                    "current effective policy no longer permits skill `{}`",
+                    binding.skill_id
+                );
+            }
             if !skill.is_available()
                 || skill.identity.fingerprint != binding.fingerprint
                 || skill.identity.version_hint != binding.skill_version
@@ -1170,19 +1252,10 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<()> {
-        let Some(context) = self
+        let context = self
             .load_turn_execution_authorization_context(turn_id)
             .await
-            .context("failed to load persisted execution authorization for skills")?
-        else {
-            crate::authorization::ensure_contextless_execution_is_trusted(
-                self.crud_store.as_ref(),
-                turn_id,
-            )
-            .await
-            .context("contextless skill continuation is not a trusted legacy execution")?;
-            return Ok(());
-        };
+            .context("failed to load persisted execution authorization for skills")?;
         let bindings = self
             .crud_store
             .find_turn_skill_bindings(turn_id)
@@ -1202,25 +1275,27 @@ impl MessageProcessor {
         context
             .verify_skill_projection(context.workspace_id(), bindings.as_slice())
             .context("persisted turn skill projection is stale or unbound")?;
-        let revalidated = context
-            .revalidate_for_turn_scope(
+        let revalidated = self
+            .execution_leases
+            .revalidate_for_turn(
                 self.crud_store.as_ref(),
+                &context,
                 context.workspace_id(),
                 thread_id,
                 turn_id,
-                crate::authorization::ResourceAction::ThreadWrite,
-                self.authorization_invalidation_hub.current_revision(),
+                crate::authorization::ResourceAction::SkillUse,
+                self.current_authorization_revision()
+                    .await
+                    .context("agent continuation policy generation is unavailable")?,
             )
             .await
             .context("current execution authorization no longer permits skill continuation")?;
-        if revalidated.principal().kind == pioneer_protocol::PrincipalKind::User {
-            self.revalidate_member_skill_bindings(
-                revalidated.principal(),
-                context.workspace_id(),
-                bindings.as_slice(),
-            )
-            .await?;
-        }
+        self.revalidate_collaboration_skill_bindings(
+            revalidated.principal(),
+            context.workspace_id(),
+            bindings.as_slice(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1237,8 +1312,7 @@ impl MessageProcessor {
         let context = self
             .load_turn_execution_authorization_context(turn_id)
             .await
-            .context("failed to load execution authorization for skill continuation")?
-            .context("skill continuation has no execution authorization context")?;
+            .context("failed to load execution authorization for skill continuation")?;
         if context.workspace_id() != workspace_id {
             bail!("skill continuation differs from its authorized execution boundary");
         }
@@ -1262,91 +1336,177 @@ impl MessageProcessor {
         turn_id: &str,
         action: crate::authorization::ResourceAction,
     ) -> Result<crate::authorization::ExecutionAuthorizationContext> {
-        let context = self
-            .load_turn_execution_authorization_context(turn_id)
-            .await
-            .context("failed to load execution authorization context")?
-            .context("turn has no initiating execution authorization context")?;
-        context
-            .revalidate_for_turn_scope(
-                self.crud_store.as_ref(),
+        let (context, _) = self
+            .revalidate_execution_authorization_projection_for_turn(
                 workspace_id,
                 thread_id,
                 turn_id,
                 action,
-                self.authorization_invalidation_hub.current_revision(),
             )
-            .await
-            .context("initiating authority no longer permits turn continuation")?;
+            .await?;
         Ok(context)
     }
 
-    /// Revalidates the immutable authority envelope used by in-process tool
-    /// providers. Legacy System/Superuser turns may have no envelope; a
-    /// persisted Member initiator may never fall back to that unrestricted
-    /// boundary.
+    pub(crate) async fn revalidate_execution_authorization_projection_for_turn(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        action: crate::authorization::ResourceAction,
+    ) -> Result<(
+        crate::authorization::ExecutionAuthorizationContext,
+        crate::authorization::RevalidatedExecutionAuthorization,
+    )> {
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .context("failed to load execution authorization context")?;
+        context
+            .verify_current_provider_authority(self.provider_registry.as_ref())
+            .context("execution provider authority is no longer current")?;
+        let revalidated = self
+            .execution_leases
+            .revalidate_for_turn(
+                self.crud_store.as_ref(),
+                &context,
+                workspace_id,
+                thread_id,
+                turn_id,
+                action,
+                self.current_authorization_revision()
+                    .await
+                    .context("agent continuation policy generation is unavailable")?,
+            )
+            .await
+            .context("current collaboration authority no longer permits turn continuation")?;
+        Ok((context, revalidated))
+    }
+
+    /// Reprojects the immutable tool permission profile through the current
+    /// role and root-collaboration authority before every native tool call.
+    /// The broker returns the same execution identity and may only narrow the
+    /// admitted profile.
+    pub(crate) async fn revalidate_native_tool_permission_context(
+        &self,
+        requested: &pioneer_tools::PermissionEvaluationContext,
+    ) -> Result<pioneer_tools::PermissionEvaluationContext> {
+        let workspace_id = requested
+            .workspace_id
+            .as_deref()
+            .context("tool permission context has no workspace")?;
+        let thread_id = requested
+            .thread_id
+            .as_deref()
+            .context("tool permission context has no thread")?;
+        let turn_id = requested
+            .turn_id
+            .as_deref()
+            .context("tool permission context has no turn")?;
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .context("failed to load tool execution authorization context")?;
+        context
+            .verify_current_provider_authority(self.provider_registry.as_ref())
+            .context("tool provider authority is no longer current")?;
+        let revalidated = self
+            .execution_leases
+            .revalidate_for_turn(
+                self.crud_store.as_ref(),
+                &context,
+                workspace_id,
+                thread_id,
+                turn_id,
+                context.continuation_action(),
+                self.current_authorization_revision()
+                    .await
+                    .context("tool permission policy generation is unavailable")?,
+            )
+            .await
+            .context("tool permission authority is no longer current")?;
+        Ok(pioneer_tools::PermissionEvaluationContext {
+            workspace_id: requested.workspace_id.clone(),
+            thread_id: requested.thread_id.clone(),
+            turn_id: requested.turn_id.clone(),
+            permission_profile: revalidated.effective_permission_profile().clone(),
+        })
+    }
+
+    /// Revalidates the mandatory immutable authority envelope used by
+    /// in-process tool providers.
     pub(crate) async fn revalidate_tool_execution_authorization(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
-        member_principal_hint: Option<&str>,
+        scoped_principal_hint: Option<&str>,
         action: crate::authorization::ResourceAction,
-    ) -> Result<Option<crate::authorization::RevalidatedExecutionAuthorization>> {
-        if let Some(context) = self
+    ) -> Result<crate::authorization::RevalidatedExecutionAuthorization> {
+        let context = self
             .load_turn_execution_authorization_context(turn_id)
             .await
-            .context("failed to load tool execution authorization context")?
+            .context("failed to load tool execution authorization context")?;
+        context
+            .verify_current_provider_authority(self.provider_registry.as_ref())
+            .context("tool provider authority is no longer current")?;
+        if let Some(principal_id) = scoped_principal_hint
+            && context.initiating_principal_id().as_str() != principal_id
         {
-            let current = context
-                .revalidate_for_turn_scope(
-                    self.crud_store.as_ref(),
-                    workspace_id,
-                    thread_id,
-                    turn_id,
-                    action,
-                    self.authorization_invalidation_hub.current_revision(),
-                )
-                .await
-                .context("tool execution authority is no longer current")?;
-            if let Some(principal_id) = member_principal_hint
-                && current.principal().principal_id.as_str() != principal_id
-            {
-                anyhow::bail!("tool execution principal differs from its turn context");
-            }
-            return Ok(Some(current));
+            anyhow::bail!("tool execution actor differs from its turn authority envelope");
         }
-
-        if member_principal_hint.is_some() {
-            anyhow::bail!("Member tool execution has no authorization context");
-        }
-
-        let Some((stored_workspace_id, _)) = self.crud_store.get_turn(thread_id, turn_id).await?
-        else {
-            // Synthetic internal providers and pre-persistence tests retain
-            // the legacy boundary only when they carry no Member identity.
-            return Ok(None);
-        };
-        if stored_workspace_id != workspace_id {
-            anyhow::bail!("tool turn is outside its declared workspace");
-        }
-
-        if let Some(pioneer_protocol::PersistedActorRef::Principal(principal_id)) =
-            pioneer_crud::find_turn_initiator(&self.crud_store.database_connection(), turn_id)
-                .await?
-        {
-            let principal = pioneer_crud::load_principal_by_id(
-                &self.crud_store.database_connection(),
-                &principal_id,
+        self.execution_leases
+            .revalidate_for_turn(
+                self.crud_store.as_ref(),
+                &context,
+                workspace_id,
+                thread_id,
+                turn_id,
+                action,
+                self.current_authorization_revision()
+                    .await
+                    .context("agent continuation policy generation is unavailable")?,
             )
-            .await?
-            .context("tool turn initiator no longer exists")?;
-            if principal.kind == pioneer_protocol::PrincipalKind::User {
-                anyhow::bail!("Member tool execution has no authorization context");
-            }
-        }
+            .await
+            .context("tool execution authority is no longer current")
+    }
 
-        Ok(None)
+    /// Revalidates a post-turn hook against its immutable turn envelope and
+    /// current root collaboration without requiring the foreground execution
+    /// lease to remain active after the turn reached a terminal state.
+    pub(crate) async fn revalidate_post_turn_execution_authorization(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        scoped_principal_hint: Option<&str>,
+        action: crate::authorization::ResourceAction,
+    ) -> Result<crate::authorization::RevalidatedExecutionAuthorization> {
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await
+            .context("failed to load post-turn execution authorization context")?;
+        context
+            .verify_current_provider_authority(self.provider_registry.as_ref())
+            .context("post-turn provider authority is no longer current")?;
+        if let Some(principal_id) = scoped_principal_hint
+            && context.initiating_principal_id().as_str() != principal_id
+        {
+            anyhow::bail!("post-turn actor differs from its turn authority envelope");
+        }
+        self.execution_leases
+            .revalidate_post_turn(
+                self.crud_store.as_ref(),
+                &context,
+                workspace_id,
+                thread_id,
+                turn_id,
+                action,
+                self.current_authorization_revision()
+                    .await
+                    .context("post-turn execution policy generation is unavailable")?,
+            )
+            .await
+            .context("post-turn execution authority is no longer current")
     }
 
     pub(super) async fn handle_snapshot_agent_event(
@@ -1357,6 +1517,9 @@ impl MessageProcessor {
             crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated { notification } => {
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
+                if self.guard_execution_commit(turn_id.as_str()).await.is_err() {
+                    return;
+                }
                 let event_timestamp = now_timestamp_secs();
                 let persist_snapshot = || {
                     let crud_store = self.crud_store.clone();
@@ -2835,6 +2998,15 @@ impl MessageProcessor {
     }
 
     pub(super) async fn handle_progress_agent_event(&self, event: AgentProgressEvent) {
+        let turn_id = match &event {
+            AgentProgressEvent::ItemDelta { notification } => notification.turn_id.as_str(),
+            AgentProgressEvent::ItemHeartbeat { turn_id, .. }
+            | AgentProgressEvent::ToolOutputDelta { turn_id, .. }
+            | AgentProgressEvent::TaskProgress { turn_id, .. } => turn_id.as_str(),
+        };
+        if self.guard_execution_commit(turn_id).await.is_err() {
+            return;
+        }
         match event {
             AgentProgressEvent::ItemDelta { notification } => {
                 let mut notification = notification;

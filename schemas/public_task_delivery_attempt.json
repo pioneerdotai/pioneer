@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskDeliveryAttempt",
+  "type": "object",
+  "properties": {
+    "attemptNumber": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "completedAt": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "deliveryId": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "startedAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskDeliveryAttemptStatus"
+    }
+  },
+  "required": [
+    "id",
+    "deliveryId",
+    "attemptNumber",
+    "status",
+    "startedAt"
+  ],
+  "$defs": {
+    "TaskDeliveryAttemptStatus": {
+      "type": "string",
+      "enum": [
+        "started",
+        "delivered",
+        "failed"
+      ]
+    }
+  }
+}

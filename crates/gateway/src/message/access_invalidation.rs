@@ -20,6 +20,71 @@ impl MessageProcessor {
         &self,
         signal: &AccessChangeSignal,
     ) {
+        let lease_reprojection = self
+            .execution_leases
+            .reproject_scope(self.crud_store.as_ref(), signal)
+            .await;
+        match lease_reprojection {
+            Ok(reprojection) => {
+                // A fenced shared execution must stop its autonomous backend
+                // as well: waiting for a later domain-tool guard would leave
+                // native shell/provider/CLI side effects running under the
+                // superseded policy. The durable turn remains blocked and can
+                // be resumed only through a fresh current admission.
+                for execution_id in reprojection.fenced_execution_ids {
+                    let scope = pioneer_crud::resolve_turn_authorization_scope(
+                        &self.crud_store.database_connection(),
+                        execution_id.as_str(),
+                        Some(signal.workspace_id.as_str()),
+                        None,
+                    )
+                    .await;
+                    let Ok(Some(scope)) = scope else {
+                        continue;
+                    };
+                    let reason = format!(
+                        "execution authority fenced at policy generation {}",
+                        signal.authorization_revision
+                    );
+                    self.mcp_service
+                        .cancel_turn_mcp_invocations(execution_id.as_str());
+                    match self
+                        .cancel_task_cli_runtime_turn(
+                            scope.thread_id.as_str(),
+                            execution_id.as_str(),
+                            reason.as_str(),
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => {
+                            let _ = self
+                                .agent_manager
+                                .cancel_turn(
+                                    scope.thread_id.as_str(),
+                                    execution_id.as_str(),
+                                    reason.as_str(),
+                                )
+                                .await;
+                            self.mark_turn_blocked(scope.thread_id, execution_id.clone(), reason)
+                                .await;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                // The durable generation has already advanced. Every later
+                // side-effect guard will retry the projection and fail closed;
+                // log only protected-content-free scope identifiers here.
+                warn!(
+                    workspace_id = signal.workspace_id,
+                    thread_id = signal.thread_id.as_deref(),
+                    authorization_revision = signal.authorization_revision,
+                    error = %format!("{error:#}"),
+                    "execution lease reprojection failed after committed ACL change"
+                );
+            }
+        }
         // The signal exists only after the ACL mutation commits. Cancel the
         // exact principal/workspace HTTP scope before any further delivery.
         self.cancel_artifact_streams_for_access_change(signal);
@@ -188,9 +253,15 @@ impl MessageProcessor {
             }
         }
 
-        for (access_lost, recipients) in [
-            (false, retained_access_recipients),
-            (true, lost_access_recipients),
+        for (outcome, recipients) in [
+            (
+                pioneer_protocol::AccessChangeOutcome::Retained,
+                retained_access_recipients,
+            ),
+            (
+                pioneer_protocol::AccessChangeOutcome::Revoked,
+                lost_access_recipients,
+            ),
         ] {
             self.send_notification_to_connections(
                 events::ACCESS_CHANGED,
@@ -198,9 +269,15 @@ impl MessageProcessor {
                     authorization_revision: signal.authorization_revision,
                     workspace_id: signal.workspace_id.clone(),
                     thread_id: signal.thread_id.clone(),
-                    access_lost: Some(access_lost),
+                    outcome,
                     change: signal.kind,
                 },
+                recipients.clone(),
+            )
+            .await;
+            self.send_notification_to_connections(
+                events::AUTHORIZATION_PROJECTION_CHANGED,
+                &signal.change,
                 recipients,
             )
             .await;

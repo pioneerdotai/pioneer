@@ -26,6 +26,7 @@ pub struct Model {
     pub revoke_reason: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub target_role_key: String,
     #[sea_orm(
         belongs_to,
         relation_enum = "AuthSession2",

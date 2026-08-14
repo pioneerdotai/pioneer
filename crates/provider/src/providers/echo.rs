@@ -1,5 +1,5 @@
 use crate::{
-    attachments::{ensure_no_unrendered_attachments, prepare_messages_for_provider},
+    attachments::{ensure_no_unrendered_attachments, prepare_messages_for_provider_async},
     tools::parse::parse_embedded_tool_payload,
     types::{
         ChatMessage, ChatRequest, ChatResponse, ProviderCapabilities, ProviderInputCapabilities,
@@ -38,11 +38,12 @@ impl crate::traits::Provider for EchoProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider(
+        let prepared = prepare_messages_for_provider_async(
             self.name(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
-        )?;
+        )
+        .await?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = prepared.messages;
         let raw_text = extract_last_user_text(rendered_messages.as_slice());
@@ -99,8 +100,10 @@ fn extract_last_user_text(messages: &[ChatMessage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::ProviderRegistry;
     use crate::traits::Provider;
     use futures_util::StreamExt;
+    use std::sync::Arc;
 
     #[test]
     fn echo_provider_name() {
@@ -110,7 +113,10 @@ mod tests {
 
     #[tokio::test]
     async fn echo_provider_chat_returns_user_text() {
-        let provider = EchoProvider::new();
+        let registry = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
+        let provider = registry
+            .get_or_create("echo")
+            .expect("test provider should resolve with an authority fingerprint");
         let request = ChatRequest {
             model: "test".into(),
             messages: vec![
@@ -132,7 +138,10 @@ mod tests {
 
     #[tokio::test]
     async fn echo_provider_stream_returns_user_text() {
-        let provider = EchoProvider::new();
+        let registry = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
+        let provider = registry
+            .get_or_create("echo")
+            .expect("test provider should resolve with an authority fingerprint");
         let request = ChatRequest {
             model: "test".into(),
             messages: vec![ChatMessage::user("streaming test")],

@@ -1,12 +1,233 @@
 use super::*;
+use crate::authorization::AuthorizationExternalError;
 use anyhow::{Result, anyhow, bail};
 use pioneer_protocol::{TaskDeliveryStatus, TaskGetResponse, TaskRunStatus, ThreadMode};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const DELIVERY_TURN_ID_LEN: usize = 21;
 
 impl MessageProcessor {
+    pub(super) async fn task_user_notification_list(
+        &self,
+        request_context: &RequestContext,
+        workspace: &crate::authorization::AuthorizedWorkspace,
+        request_id: RequestId,
+        params: pioneer_protocol::TaskUserNotificationListParams,
+    ) {
+        let connection_id = request_context.connection_id();
+        if params.workspace_id.trim().is_empty()
+            || params.workspace_id.trim() != workspace.workspace_id()
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    "invalid task notification workspace",
+                ),
+            )
+            .await;
+            return;
+        }
+        const DEFAULT_LIMIT: usize = 50;
+        const HARD_LIMIT: usize = 100;
+        let limit = params
+            .limit
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_LIMIT)
+            .clamp(1, HARD_LIMIT);
+        let principal_id = request_context.principal().principal_id.as_str();
+        let before = match params.cursor.as_deref() {
+            Some(cursor) if cursor.trim().is_empty() => {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        "invalid task notification cursor",
+                    ),
+                )
+                .await;
+                return;
+            }
+            Some(cursor) => match pioneer_crud::find_user_notification_for_recipient(
+                &self.crud_store.database_connection(),
+                workspace.workspace_id(),
+                principal_id,
+                cursor,
+            )
+            .await
+            {
+                Ok(Some(row)) => Some((row.created_at.timestamp(), row.id)),
+                Ok(None) => {
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::NotFound.response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to resolve task notification cursor");
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::Unavailable.response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            None => None,
+        };
+        let rows = match pioneer_crud::list_user_notifications_for_recipient(
+            &self.crud_store.database_connection(),
+            workspace.workspace_id(),
+            principal_id,
+            before
+                .as_ref()
+                .map(|(created_at, id)| (*created_at, id.as_str())),
+            limit.saturating_add(1),
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "failed to list task notifications");
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        let has_more = rows.len() > limit;
+        let mut notifications = Vec::with_capacity(rows.len().min(limit));
+        for row in rows.into_iter().take(limit) {
+            match task_user_notification_from_row(row) {
+                Ok(notification) => notifications.push(notification),
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "durable task notification is invalid");
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::Unavailable.response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        let next_cursor = has_more
+            .then(|| {
+                notifications
+                    .last()
+                    .map(|item| item.notification_id.clone())
+            })
+            .flatten();
+        let response = pioneer_protocol::TaskUserNotificationListResponse {
+            notifications,
+            next_cursor,
+        };
+        match JsonRpcResponse::from_result(request_id.clone(), &response) {
+            Ok(response) => {
+                if let Err(error) = self.send_json(connection_id, &response).await {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to send task notification inbox");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to encode task notification inbox");
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(super) async fn task_user_notification_acknowledge(
+        &self,
+        request_context: &RequestContext,
+        workspace: &crate::authorization::AuthorizedWorkspace,
+        request_id: RequestId,
+        params: pioneer_protocol::TaskUserNotificationAcknowledgeParams,
+    ) {
+        let connection_id = request_context.connection_id();
+        if params.workspace_id.trim().is_empty()
+            || params.workspace_id.trim() != workspace.workspace_id()
+            || params.notification_id.trim().is_empty()
+        {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    "invalid task notification acknowledgement",
+                ),
+            )
+            .await;
+            return;
+        }
+        let row = match pioneer_crud::acknowledge_user_notification(
+            &self.crud_store.database_connection(),
+            workspace.workspace_id(),
+            request_context.principal().principal_id.as_str(),
+            params.notification_id.trim(),
+            now_timestamp_secs(),
+        )
+        .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "failed to acknowledge task notification");
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        let notification = match task_user_notification_from_row(row) {
+            Ok(notification) => notification,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "acknowledged task notification is invalid");
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            }
+        };
+        let response = pioneer_protocol::TaskUserNotificationAcknowledgeResponse { notification };
+        match JsonRpcResponse::from_result(request_id.clone(), &response) {
+            Ok(response) => {
+                if let Err(error) = self.send_json(connection_id, &response).await {
+                    tracing::warn!(error = %format!("{error:#}"), "failed to send task notification acknowledgement");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to encode task notification acknowledgement");
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+            }
+        }
+    }
+
     pub(super) async fn task_run_awaits_owner_thread_delivery(
         &self,
         task_response: &TaskGetResponse,
@@ -119,7 +340,23 @@ impl MessageProcessor {
                     .await
             }
             TaskDeliveryMode::UserNotification => {
-                let notification_id = pioneer_protocol::generate_id(DELIVERY_TURN_ID_LEN);
+                let notification = self.deliver_user_notification(&delivery).await?;
+                let notification_id = notification.notification_id.clone();
+                // The committed exact-recipient inbox row above is the
+                // delivery receipt. Live fanout is deliberately best-effort:
+                // an offline user recovers the same deterministic receipt,
+                // and a crash/retry cannot create a second notification.
+                let _ = self
+                    .send_task_user_notification(
+                        delivery.workspace_id.as_str(),
+                        delivery
+                            .target_user_id
+                            .as_deref()
+                            .context("user notification delivery has no recipient")?,
+                        events::TASK_USER_NOTIFICATION_DELIVERED,
+                        &notification,
+                    )
+                    .await;
                 self.complete_delivery(delivery, attempt, None, Some(notification_id), None, None)
                     .await
             }
@@ -131,70 +368,67 @@ impl MessageProcessor {
         let Some(task_response) = self.crud_store.get_task(delivery.task_id.as_str()).await? else {
             bail!("task delivery root task is unavailable");
         };
-        let root_task = match task_response.task.root_task_id.as_deref() {
-            Some(root_task_id) => self
-                .crud_store
-                .get_task(root_task_id)
-                .await?
-                .map(|response| response.task)
-                .ok_or_else(|| anyhow!("task delivery root task is unavailable"))?,
-            None => task_response.task,
-        };
-        if root_task.owner_kind != pioneer_protocol::TaskOwnerKind::User {
-            return Ok(());
+        let task = task_response.task;
+        if task.executor_kind == pioneer_protocol::TaskExecutorKind::System {
+            return ensure_system_task_delivery_boundary(&task, delivery);
         }
-        let owner_id = root_task
-            .owner_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("user-owned task delivery has no initiating principal"))?;
-        let root_thread_id = root_task
-            .created_by_thread_id
-            .as_deref()
-            .or_else(|| {
-                (root_task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
-                    .then_some(root_task.owner_id.as_deref())
-                    .flatten()
-            })
-            .ok_or_else(|| anyhow!("user-owned task delivery has no authoritative root thread"))?;
-        let root_turn_id = root_task
-            .created_by_turn_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("user-owned task delivery has no initiating turn"))?;
+        let admission = self
+            .crud_store
+            .get_task_execution_admission(task.id.as_str())
+            .await?
+            .context("Agent Task delivery has no durable execution admission")?;
+        let context = crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+            self.crud_store.as_ref(),
+            &admission,
+        )
+        .await
+        .context("agent Task delivery execution admission is invalid")?;
+        if admission.workspace_id != task.workspace_id
+            || admission.workspace_id != delivery.workspace_id
+            || admission.workspace_id != context.workspace_id()
+            || admission.root_thread_id != context.root_thread_id()
+            || admission.initiating_principal_id != context.initiating_principal_id().as_str()
+        {
+            bail!("task delivery differs from its durable execution boundary");
+        }
         let current = self
-            .revalidate_tool_execution_authorization(
-                root_task.workspace_id.as_str(),
-                root_thread_id,
-                root_turn_id,
-                Some(owner_id),
-                crate::authorization::ResourceAction::ThreadWrite,
+            .execution_leases
+            .revalidate_context(
+                self.crud_store.as_ref(),
+                &context,
+                crate::authorization::ResourceAction::MessageCreate,
+                self.current_authorization_revision().await?,
             )
             .await
-            .map_err(|_| {
-                anyhow!("task delivery withheld because initiating authority is no longer active")
-            })?
-            .ok_or_else(|| {
-                anyhow!("task delivery withheld because initiating authority is unavailable")
-            })?;
-        if current.principal().principal_id.as_str() != owner_id {
-            bail!("task delivery withheld because initiating principal lost root-thread access");
-        }
+            .context("task delivery has no current collaboration authority")?;
 
         match delivery.mode {
             TaskDeliveryMode::None => {}
             TaskDeliveryMode::UserNotification => {
-                if delivery.target_user_id.as_deref() != Some(owner_id) {
+                if delivery.target_user_id.as_deref()
+                    != Some(context.initiating_principal_id().as_str())
+                {
                     bail!("task delivery target does not match the initiating principal");
                 }
             }
             TaskDeliveryMode::Webhook => {
-                bail!("webhook task delivery is unavailable to a Member execution");
+                let role_key = pioneer_protocol::RoleKey::new(context.role_key().to_owned())
+                    .context("task delivery execution role is invalid")?;
+                let definition = crate::authorization::RoleDefinitionRegistry::new()
+                    .resolve_key(&role_key)
+                    .context("task delivery execution role is not registered")?;
+                if definition.runtime_principal
+                    != crate::authorization::RuntimePrincipalPolicy::Absolute
+                {
+                    bail!("webhook task delivery is unavailable to a scoped execution");
+                }
             }
             TaskDeliveryMode::OwnerThread | TaskDeliveryMode::Thread => {
                 let target_thread_id = delivery
                     .target_thread_id
                     .as_deref()
                     .ok_or_else(|| anyhow!("task delivery has no target thread"))?;
-                let action = crate::authorization::ResourceAction::ThreadWrite;
+                let action = crate::authorization::ResourceAction::MessageCreate;
                 let gate = crate::authorization::AuthorizationService::new().authorize_action(
                     current.principal().kind,
                     current.principal().role_key.as_ref(),
@@ -266,6 +500,56 @@ impl MessageProcessor {
             .await
             .map_err(|error| anyhow!("{error:#}"))?;
         Ok(())
+    }
+
+    async fn deliver_user_notification(
+        &self,
+        delivery: &TaskDelivery,
+    ) -> Result<pioneer_protocol::TaskUserNotificationDeliveredNotification> {
+        let recipient_principal_id = delivery
+            .target_user_id
+            .as_deref()
+            .context("user notification delivery has no recipient")?;
+        let notification_id = task_user_notification_id(delivery.id.as_str());
+        let notification = pioneer_protocol::TaskUserNotificationDeliveredNotification {
+            notification_id: notification_id.clone(),
+            workspace_id: delivery.workspace_id.clone(),
+            recipient_principal_id: recipient_principal_id.to_owned(),
+            task_id: delivery.task_id.clone(),
+            run_id: delivery.run_id.clone(),
+            delivery_id: delivery.id.clone(),
+            result: delivery
+                .result_snapshot
+                .as_ref()
+                .map(crate::task_projection::project_result),
+            error: delivery
+                .error_snapshot
+                .as_ref()
+                .map(crate::task_projection::project_error),
+            created_at: delivery.created_at,
+        };
+        let payload_json = serde_json::to_string(&notification)
+            .context("failed to encode durable user notification")?;
+        let persisted = pioneer_crud::insert_task_notification_idempotent(
+            &self.crud_store.database_connection(),
+            pioneer_crud::NewUserNotificationOutbox {
+                id: notification_id,
+                task_delivery_id: delivery.id.clone(),
+                workspace_id: delivery.workspace_id.clone(),
+                recipient_principal_id: recipient_principal_id.to_owned(),
+                task_id: delivery.task_id.clone(),
+                run_id: delivery.run_id.clone(),
+                payload_json,
+                created_at_unix: now_timestamp_secs(),
+            },
+        )
+        .await?;
+        let notification = serde_json::from_str(persisted.payload_json.as_str())
+            .context("durable user notification payload is invalid")?;
+        if persisted.status != "delivered" {
+            bail!("durable user notification receipt is not delivered");
+        }
+        Ok(notification)
     }
 
     async fn deliver_to_owner_thread(&self, delivery: &TaskDelivery) -> Result<String> {
@@ -368,12 +652,11 @@ impl MessageProcessor {
         };
         if let Err(error) = self
             .crud_store
-            .materialize_turn_start_with_permission_audit(
+            .materialize_non_executable_system_turn_start_with_permission_audit(
                 &turn_outcome.materialization.thread,
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
-                pioneer_protocol::PersistedActorRef::System,
                 profile_selected_audit,
             )
             .await
@@ -578,6 +861,92 @@ impl MessageProcessor {
             "occurredAt": delivery.updated_at,
         }))
     }
+}
+
+fn task_user_notification_from_row(
+    row: pioneer_entity::user_notification_outbox::Model,
+) -> Result<pioneer_protocol::TaskUserNotification> {
+    let payload: pioneer_protocol::TaskUserNotificationDeliveredNotification =
+        serde_json::from_str(row.payload_json.as_str())
+            .context("durable user notification payload is invalid")?;
+    if payload.notification_id != row.id
+        || payload.workspace_id != row.workspace_id
+        || payload.task_id != row.task_id
+        || payload.run_id != row.run_id
+        || payload.delivery_id != row.task_delivery_id
+        || payload.recipient_principal_id != row.recipient_principal_id
+    {
+        bail!("durable user notification payload differs from its recipient envelope");
+    }
+    Ok(pioneer_protocol::TaskUserNotification {
+        notification_id: payload.notification_id,
+        workspace_id: payload.workspace_id,
+        task_id: payload.task_id,
+        run_id: payload.run_id,
+        delivery_id: payload.delivery_id,
+        result: payload.result,
+        error: payload.error,
+        created_at: payload.created_at,
+        acknowledged_at: row.acknowledged_at.map(|value| value.timestamp()),
+    })
+}
+
+/// System tasks are a Gateway-owned execution class, not a principal grant.
+/// They cannot carry an Agent execution admission (enforced by `pioneer-tasks`)
+/// and collaborative RPC callers cannot select this executor. Revalidate the
+/// immutable delivery boundary here so an internal worker cannot redirect a
+/// persisted System task to another workspace, owner, or thread.
+fn ensure_system_task_delivery_boundary(
+    task: &pioneer_protocol::Task,
+    delivery: &TaskDelivery,
+) -> Result<()> {
+    if task.workspace_id != delivery.workspace_id {
+        bail!("System Task delivery belongs to another workspace");
+    }
+    let policy = task
+        .delivery_policy
+        .as_ref()
+        .context("System Task has no durable delivery policy")?;
+    if policy.mode != delivery.mode {
+        bail!("System Task delivery mode differs from its durable policy");
+    }
+    match policy.mode {
+        TaskDeliveryMode::None => {}
+        TaskDeliveryMode::OwnerThread => {
+            let expected = task.created_by_thread_id.as_deref().or_else(|| {
+                (task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
+                    .then_some(task.owner_id.as_deref())
+                    .flatten()
+            });
+            if expected != delivery.target_thread_id.as_deref() {
+                bail!("System Task owner-thread delivery target is invalid");
+            }
+        }
+        TaskDeliveryMode::Thread => {
+            if policy.thread_id.as_deref() != delivery.target_thread_id.as_deref() {
+                bail!("System Task thread delivery target is invalid");
+            }
+        }
+        TaskDeliveryMode::UserNotification => {
+            let expected = (task.owner_kind == pioneer_protocol::TaskOwnerKind::User)
+                .then_some(task.owner_id.as_deref())
+                .flatten();
+            if expected != delivery.target_user_id.as_deref() {
+                bail!("System Task notification recipient is invalid");
+            }
+        }
+        TaskDeliveryMode::Webhook => {
+            if policy.webhook_url.as_deref() != delivery.webhook_url.as_deref() {
+                bail!("System Task webhook delivery target is invalid");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn task_user_notification_id(delivery_id: &str) -> String {
+    let digest = Sha256::digest(delivery_id.as_bytes());
+    format!("un_{}", hex::encode(&digest[..9]))
 }
 
 fn delivery_summary_item(delivery: &TaskDelivery) -> TurnItem {

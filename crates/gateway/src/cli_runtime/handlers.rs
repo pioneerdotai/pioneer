@@ -50,14 +50,15 @@ use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-const CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_CHARS: usize = 16_384;
+const CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_BYTES: usize = 4 * 1024;
 const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_KEYS: usize = 128;
 const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_PER_TURN: usize = 512;
 const CLI_RUNTIME_STALE_TURN_SCAN_LIMIT: u64 = 128;
 const CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS: i64 = 150_000;
 const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
 const CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS: i64 = 30_000;
-const CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1_000;
+const CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS: i64 =
+    crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS;
 const CLI_RUNTIME_TERMINAL_NATIVE_EVENT_CLEANUP_BATCH_SIZE: u64 = 16_384;
 const CLI_RUNTIME_MAX_PENDING_MACHINE_REQUESTS: usize = 4096;
 const CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE: i64 = -32000;
@@ -65,6 +66,44 @@ const CLI_RUNTIME_MACHINE_REQUEST_TIMEOUT_CODE: i64 = -32001;
 const CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE: i64 = -32002;
 const CLI_RUNTIME_MACHINE_REQUEST_INVALID_PARAMS_CODE: i64 = -32602;
 const CLI_RUNTIME_MACHINE_REQUEST_UNKNOWN_METHOD_CODE: i64 = -32601;
+
+fn cli_runtime_public_error(
+    request_id: Option<RequestId>,
+    jsonrpc_code: i64,
+    diagnostic: impl Into<String>,
+) -> JsonRpcErrorResponse {
+    let public_code = if jsonrpc_code == INVALID_PARAMS_CODE {
+        pioneer_protocol::PublicErrorCode::InvalidInput
+    } else {
+        pioneer_protocol::PublicErrorCode::Internal
+    };
+    crate::public_error::agent_rpc_error(
+        request_id,
+        jsonrpc_code,
+        public_code,
+        pioneer_protocol::PublicErrorStage::Execution,
+        diagnostic.into(),
+    )
+}
+
+fn cli_runtime_discovery_error(
+    request_id: Option<RequestId>,
+    jsonrpc_code: i64,
+    diagnostic: impl Into<String>,
+) -> JsonRpcErrorResponse {
+    let public_code = if jsonrpc_code == INVALID_PARAMS_CODE {
+        pioneer_protocol::PublicErrorCode::InvalidInput
+    } else {
+        pioneer_protocol::PublicErrorCode::Unavailable
+    };
+    crate::public_error::agent_rpc_error(
+        request_id,
+        jsonrpc_code,
+        public_code,
+        pioneer_protocol::PublicErrorStage::Discovery,
+        diagnostic.into(),
+    )
+}
 
 enum CLIRuntimeAttemptRecoveryState {
     Normal,
@@ -79,7 +118,7 @@ enum CLIRuntimeAttemptRecoveryState {
 /// account identity and raw process output belong to Gateway management.
 /// Keep the capability/model metadata used by composers while returning a
 /// deliberately non-secret presentation of failures.
-fn member_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
+fn collaborator_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
     runtime.account = None;
     runtime.binary_path = None;
     runtime.home_path = None;
@@ -87,7 +126,7 @@ fn member_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
     runtime.proxy_url = None;
     runtime.debug_native_events_enabled = false;
     runtime.recent_stderr.clear();
-    runtime.diagnostics = member_safe_runtime_diagnostics(runtime.diagnostics);
+    runtime.diagnostics = collaborator_safe_runtime_diagnostics(runtime.diagnostics);
     runtime.status = match runtime.status {
         RuntimeStatus::MissingBinary { .. } => RuntimeStatus::MissingBinary { binary_path: None },
         RuntimeStatus::SpawnFailed { .. } => RuntimeStatus::SpawnFailed {
@@ -104,7 +143,9 @@ fn member_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
     runtime
 }
 
-fn member_safe_runtime_diagnostics(diagnostics: Vec<RuntimeDiagnostic>) -> Vec<RuntimeDiagnostic> {
+fn collaborator_safe_runtime_diagnostics(
+    diagnostics: Vec<RuntimeDiagnostic>,
+) -> Vec<RuntimeDiagnostic> {
     diagnostics
         .into_iter()
         .map(|diagnostic| RuntimeDiagnostic {
@@ -116,6 +157,70 @@ fn member_safe_runtime_diagnostics(diagnostics: Vec<RuntimeDiagnostic>) -> Vec<R
 }
 
 impl MessageProcessor {
+    fn uses_collaborator_cli_disclosure(request_context: &RequestContext) -> bool {
+        crate::authorization::AuthorizationService::new().role_disclosure_policy(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+        ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator)
+    }
+
+    async fn cli_binding_operator_details_allowed(
+        &self,
+        request_context: &RequestContext,
+        workspace_id: &str,
+        thread_id: &str,
+        runtime_id: &str,
+    ) -> bool {
+        let service = AuthorizationService::new();
+        if !service.cli_runtime_allowed(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            runtime_id,
+        ) {
+            return false;
+        }
+        let action = ResourceAction::CliRuntimeReadOperator;
+        let gate = service.authorize_action(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            action,
+        );
+        match gate {
+            crate::authorization::ActionGateDecision::AllowAbsolute => true,
+            crate::authorization::ActionGateDecision::Deny { .. } => false,
+            crate::authorization::ActionGateDecision::RequireResource { .. } => {
+                let resolver = AuthorizationResolver::new(self.crud_store.as_ref().clone());
+                let mut resolution = resolver
+                    .authorize_thread(
+                        request_context.principal(),
+                        &gate,
+                        action,
+                        thread_id,
+                        Some(workspace_id),
+                    )
+                    .await;
+                if matches!(
+                    resolution.as_ref().ok().and_then(|value| value.denial()),
+                    Some(crate::authorization::AuthorizationDecision::Deny {
+                        reason: crate::authorization::DenyReason::MissingAuthoritativeResource,
+                        ..
+                    })
+                ) {
+                    resolution = resolver
+                        .authorize_internal_thread_via_root(
+                            request_context.principal(),
+                            &gate,
+                            action,
+                            thread_id,
+                            Some(workspace_id),
+                        )
+                        .await;
+                }
+                matches!(resolution, Ok(ProofResolution::Authorized(_)))
+            }
+        }
+    }
+
     pub(super) async fn cli_runtime_list(
         &self,
         request_context: &RequestContext,
@@ -140,7 +245,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_discovery_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load CLI runtime catalog: {error:#}"),
@@ -150,10 +255,17 @@ impl MessageProcessor {
                 return;
             }
         };
-        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+        runtimes.retain(|runtime| {
+            crate::authorization::AuthorizationService::new().cli_runtime_allowed(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
+                runtime.runtime_id.as_str(),
+            )
+        });
+        if Self::uses_collaborator_cli_disclosure(request_context) {
             runtimes = runtimes
                 .into_iter()
-                .map(member_safe_runtime_summary)
+                .map(collaborator_safe_runtime_summary)
                 .collect();
         }
 
@@ -196,8 +308,8 @@ impl MessageProcessor {
         else {
             return;
         };
-        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
-            runtime = member_safe_runtime_summary(runtime);
+        if Self::uses_collaborator_cli_disclosure(request_context) {
+            runtime = collaborator_safe_runtime_summary(runtime);
         }
 
         self.send_cli_runtime_response(
@@ -239,8 +351,8 @@ impl MessageProcessor {
         else {
             return;
         };
-        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
-            runtime = member_safe_runtime_summary(runtime);
+        if Self::uses_collaborator_cli_disclosure(request_context) {
+            runtime = collaborator_safe_runtime_summary(runtime);
         }
 
         self.send_cli_runtime_response(
@@ -276,7 +388,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_discovery_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load CLI runtime catalog: {error:#}"),
@@ -298,7 +410,16 @@ impl MessageProcessor {
             }
         } else {
             instances
-        };
+        }
+        .into_iter()
+        .filter(|instance| {
+            crate::authorization::AuthorizationService::new().cli_runtime_allowed(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
+                instance.id.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
         let mut runtimes = Vec::with_capacity(instances.len());
         for instance in instances {
             runtimes.push(
@@ -306,13 +427,12 @@ impl MessageProcessor {
                     .await,
             );
         }
-        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
+        if Self::uses_collaborator_cli_disclosure(request_context) {
             runtimes = runtimes
                 .into_iter()
-                .map(member_safe_runtime_summary)
+                .map(collaborator_safe_runtime_summary)
                 .collect();
         }
-
         self.send_cli_runtime_response(
             connection_id,
             request_id,
@@ -383,18 +503,26 @@ impl MessageProcessor {
                 error_message: Some(format!("CLI runtime `{}` is disabled", instance.id)),
             }
         };
-        if request_context.principal().kind == pioneer_protocol::PrincipalKind::User {
-            model_list.diagnostics = member_safe_runtime_diagnostics(model_list.diagnostics);
+        if Self::uses_collaborator_cli_disclosure(request_context) {
+            model_list.diagnostics = collaborator_safe_runtime_diagnostics(model_list.diagnostics);
             if model_list.error_message.is_some() {
                 model_list.error_message = Some("runtime models are unavailable".to_owned());
             }
         }
+        model_list.models.retain(|model| {
+            crate::authorization::AuthorizationService::new().cli_model_allowed(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
+                params.runtime_id.as_str(),
+                model.id.as_str(),
+            )
+        });
 
         if model_list.models.is_empty() {
             if let Some(error_message) = model_list.error_message.as_deref() {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_discovery_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
@@ -444,7 +572,7 @@ impl MessageProcessor {
         if thread_id.is_empty() {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -457,7 +585,7 @@ impl MessageProcessor {
             return;
         }
 
-        let binding = match self
+        let (binding, management) = match self
             .crud_store
             .get_cli_runtime_thread_binding(thread_id.as_str())
             .await
@@ -466,7 +594,7 @@ impl MessageProcessor {
                 if binding.workspace_id != workspace_id {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_PARAMS_CODE,
                             format!(
@@ -478,12 +606,22 @@ impl MessageProcessor {
                     .await;
                     return;
                 }
+                let management_allowed = self
+                    .cli_binding_operator_details_allowed(
+                        request_context,
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                        binding.runtime_id.as_str(),
+                    )
+                    .await;
                 match cli_runtime_thread_binding_from_record(binding) {
-                    Ok(binding) => Some(binding),
+                    Ok((binding, management)) => {
+                        (Some(binding), management_allowed.then_some(management))
+                    }
                     Err(error) => {
                         self.send_error(
                             connection_id,
-                            JsonRpcErrorResponse::new(
+                            cli_runtime_public_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
                                 format!(
@@ -496,11 +634,11 @@ impl MessageProcessor {
                     }
                 }
             }
-            Ok(None) => None,
+            Ok(None) => (None, None),
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
@@ -517,7 +655,10 @@ impl MessageProcessor {
             connection_id,
             request_id,
             methods::CLI_RUNTIME_THREAD_BINDING_GET,
-            &CLIRuntimeThreadBindingGetResponse { binding },
+            &CLIRuntimeThreadBindingGetResponse {
+                binding,
+                management,
+            },
         )
         .await;
     }
@@ -543,7 +684,7 @@ impl MessageProcessor {
 
         self.send_error(
             connection_id,
-            JsonRpcErrorResponse::new(
+            cli_runtime_public_error(
                 Some(request_id),
                 INVALID_REQUEST_CODE,
                 "CLI runtime thread compaction is not supported for managed Pioneer CLI runtime threads".to_owned(),
@@ -579,13 +720,13 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(Some(request_id), INVALID_PARAMS_CODE, error),
+                        cli_runtime_public_error(Some(request_id), INVALID_PARAMS_CODE, error),
                     )
                     .await;
                     return;
                 }
             };
-            let create_action = ResourceAction::ThreadCreate;
+            let create_action = ResourceAction::ThreadCreatePrivate;
             let create_action_gate = AuthorizationService::new().authorize_action(
                 request_context.principal().kind,
                 request_context.principal().role_key.as_ref(),
@@ -630,7 +771,7 @@ impl MessageProcessor {
             else {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("thread `{}` is not loaded", params.source_thread_id),
@@ -642,7 +783,7 @@ impl MessageProcessor {
             if source_thread.workspace_id != workspace_id {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -650,6 +791,87 @@ impl MessageProcessor {
                             params.source_thread_id, source_thread.workspace_id
                         ),
                     ),
+                )
+                .await;
+                return;
+            }
+            let source_scope = match pioneer_crud::resolve_thread_authorization_scope(
+                &self.crud_store.database_connection(),
+                params.source_thread_id.as_str(),
+                Some(workspace_id.as_str()),
+            )
+            .await
+            {
+                Ok(Some(scope)) => scope,
+                _ => {
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::NotFound.response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let source_members = match pioneer_crud::list_thread_memberships_for_thread(
+                &self.crud_store.database_connection(),
+                params.source_thread_id.as_str(),
+            )
+            .await
+            {
+                Ok(members) => members
+                    .into_iter()
+                    .map(|membership| pioneer_protocol::PrincipalId::new(membership.principal_id))
+                    .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>(),
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::Unavailable.response(request_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let Ok(source_members) = source_members else {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::Unavailable.response(request_id),
+                )
+                .await;
+                return;
+            };
+            let destination_members = std::collections::BTreeSet::from([request_context
+                .principal()
+                .principal_id
+                .clone()]);
+            let source_access_class = match source_scope.access_class {
+                pioneer_crud::PersistedThreadAccessClass::Private => {
+                    crate::authorization::ThreadAccessClass::Private
+                }
+                pioneer_crud::PersistedThreadAccessClass::Workspace => {
+                    crate::authorization::ThreadAccessClass::Workspace
+                }
+                pioneer_crud::PersistedThreadAccessClass::Internal => {
+                    crate::authorization::ThreadAccessClass::Internal
+                }
+            };
+            // A provider-native fork clones opaque state. The typed export
+            // policy therefore permits it only when the planned caller-only
+            // destination has exactly the same audience as the source.
+            if !AuthorizationService::new().cli_thread_fork_export_allowed(
+                request_context.principal().kind,
+                request_context.principal().role_key.as_ref(),
+                crate::authorization::CliThreadForkExportFacts {
+                    source_access_class,
+                    source_principals: &source_members,
+                    destination_access_class: crate::authorization::ThreadAccessClass::Private,
+                    destination_principals: &destination_members,
+                    projection:
+                        crate::authorization::CliThreadForkExportProjection::OpaqueNativeState,
+                },
+            ) {
+                self.send_error(
+                    connection_id,
+                    AuthorizationExternalError::NotFound.response(request_id),
                 )
                 .await;
                 return;
@@ -662,7 +884,7 @@ impl MessageProcessor {
             {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!("thread `{}` already exists", params.fork_thread_id),
@@ -679,7 +901,7 @@ impl MessageProcessor {
                 Ok(Some(_)) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_PARAMS_CODE,
                             format!("thread `{}` already exists", params.fork_thread_id),
@@ -692,7 +914,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!(
@@ -727,7 +949,7 @@ impl MessageProcessor {
                     Err(error) => {
                         self.send_error(
                             connection_id,
-                            JsonRpcErrorResponse::new(
+                            cli_runtime_public_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
                                 format!("failed to prepare fork thread: {error:#}"),
@@ -748,7 +970,7 @@ impl MessageProcessor {
                 Ok(None) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!(
@@ -763,7 +985,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!(
@@ -779,7 +1001,7 @@ impl MessageProcessor {
             if binding.workspace_id != workspace_id {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -794,7 +1016,7 @@ impl MessageProcessor {
             if binding.runtime_id != params.runtime_id {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -812,7 +1034,7 @@ impl MessageProcessor {
             if !supports_fork {
                 self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     format!(
@@ -830,7 +1052,7 @@ impl MessageProcessor {
             let Some(manager) = self.cli_runtime_manager.as_ref() else {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         "CLI runtime manager is not available for thread fork".to_owned(),
@@ -848,7 +1070,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_PARAMS_CODE,
                             format!("invalid CLI runtime fork key: {error:#}"),
@@ -861,10 +1083,25 @@ impl MessageProcessor {
             let proxy_url = self
                 .cli_runtime_proxy_url(workspace_id.as_str(), params.runtime_id.as_str())
                 .await;
+            let workspace_cwd = match self
+                .turn_security_workspace_root(workspace_id.as_str())
+                .await
+            {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(Some(request_id), INVALID_REQUEST_CODE, error),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let handle = match manager
                 .existing_or_start_management(
                     key,
                     crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        cwd: Some(workspace_cwd),
                         env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                         ..Default::default()
                     },
@@ -875,7 +1112,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!("failed to start CLI runtime session for fork: {error:#}"),
@@ -896,7 +1133,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!("failed to fork CLI runtime thread: {error:#}"),
@@ -907,8 +1144,8 @@ impl MessageProcessor {
                 }
             };
 
-            let is_superuser = create_authorization.decision().is_absolute_superuser();
-            let persist_result = if is_superuser {
+            let has_absolute_authority = create_authorization.decision().is_absolute();
+            let persist_result = if has_absolute_authority {
                 self.crud_store
                     .create_superuser_thread(
                         &fork_thread,
@@ -929,7 +1166,7 @@ impl MessageProcessor {
             if let Err(error) = persist_result {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to commit fork thread creation: {error:#}"),
@@ -938,7 +1175,7 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            if !is_superuser {
+            if !has_absolute_authority {
                 self.publish_committed_authorization_invalidation(
                     AccessChangeKind::ThreadCreated,
                     Some(request_context.principal().principal_id.clone()),
@@ -980,7 +1217,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!("failed to publish committed fork thread: {error:#}"),
@@ -1000,7 +1237,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!("failed to encode fork CLI runtime cursor: {error:#}"),
@@ -1034,7 +1271,7 @@ impl MessageProcessor {
             {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to persist fork CLI runtime binding: {error:#}"),
@@ -1053,8 +1290,6 @@ impl MessageProcessor {
                     runtime_id: params.runtime_id,
                     source_thread_id: params.source_thread_id,
                     thread: outcome.response.thread.clone(),
-                    native_thread_id: fork.native_thread_id,
-                    raw: fork.raw,
                 },
             )
             .await;
@@ -1094,7 +1329,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(Some(request_id), INVALID_PARAMS_CODE, error),
+                        cli_runtime_public_error(Some(request_id), INVALID_PARAMS_CODE, error),
                     )
                     .await;
                     return;
@@ -1108,7 +1343,7 @@ impl MessageProcessor {
             else {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("thread `{}` is not loaded", params.thread_id),
@@ -1120,7 +1355,7 @@ impl MessageProcessor {
             if thread.workspace_id != workspace_id {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -1142,7 +1377,7 @@ impl MessageProcessor {
                 Ok(None) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!("turn `{}` is not bound to a CLI runtime", params.turn_id),
@@ -1154,7 +1389,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!(
@@ -1172,7 +1407,7 @@ impl MessageProcessor {
             {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -1187,7 +1422,7 @@ impl MessageProcessor {
             if turn_binding.runtime_id != params.runtime_id {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -1205,7 +1440,7 @@ impl MessageProcessor {
             if !supports_steer {
                 self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     format!(
@@ -1223,7 +1458,7 @@ impl MessageProcessor {
             {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
@@ -1250,18 +1485,13 @@ impl MessageProcessor {
                 .load_turn_execution_authorization_context(params.turn_id.as_str())
                 .await
             {
-                Ok(Some(context)) => {
-                    context
-                        .revalidate_for_turn_scope(
-                            self.crud_store.as_ref(),
-                            workspace_id.as_str(),
-                            params.thread_id.as_str(),
-                            params.turn_id.as_str(),
-                            ResourceAction::CliRuntimeUse,
-                            self.authorization_invalidation_hub.current_revision(),
-                        )
-                        .await
-                        .is_ok()
+                Ok(context) => {
+                    self.guard_execution_side_effect(
+                        params.turn_id.as_str(),
+                        ResourceAction::CliRuntimeUse,
+                    )
+                    .await
+                    .is_ok()
                         && context
                             .verify_cli_runtime_projection(
                                 workspace_id.as_str(),
@@ -1270,12 +1500,6 @@ impl MessageProcessor {
                             )
                             .is_ok()
                 }
-                Ok(None) => crate::authorization::ensure_contextless_execution_is_trusted(
-                    self.crud_store.as_ref(),
-                    params.turn_id.as_str(),
-                )
-                .await
-                .is_ok(),
                 Err(_) => false,
             };
             let runtime_is_current = self.load_cli_runtime_instances().is_ok_and(|instances| {
@@ -1299,7 +1523,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!("failed to resolve active CLI runtime segment: {error:#}"),
@@ -1312,7 +1536,7 @@ impl MessageProcessor {
             let Some(native_turn_id) = native_turn_id else {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
@@ -1328,7 +1552,7 @@ impl MessageProcessor {
             let Some(manager) = self.cli_runtime_manager.as_ref() else {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         "CLI runtime manager is not available for turn steering".to_owned(),
@@ -1346,7 +1570,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_PARAMS_CODE,
                             format!("invalid CLI runtime steering key: {error:#}"),
@@ -1359,7 +1583,7 @@ impl MessageProcessor {
             let Some(handle) = manager.existing_session(&key).await else {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         "CLI runtime session is not active for turn steering".to_owned(),
@@ -1381,7 +1605,7 @@ impl MessageProcessor {
                 Err(error) => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!("failed to steer CLI runtime turn: {error:#}"),
@@ -1409,9 +1633,6 @@ impl MessageProcessor {
                     runtime_id: params.runtime_id,
                     thread_id: params.thread_id,
                     turn_id: params.turn_id,
-                    native_thread_id: steer.native_thread_id,
-                    native_turn_id: steer.native_turn_id,
-                    raw: steer.raw,
                 },
             )
             .await;
@@ -1439,7 +1660,7 @@ impl MessageProcessor {
 
         self.send_error(
             connection_id,
-            JsonRpcErrorResponse::new(
+            cli_runtime_public_error(
                 Some(request_id),
                 INVALID_REQUEST_CODE,
                 "CLI runtime review start is not supported for managed Pioneer CLI runtime threads"
@@ -1498,7 +1719,7 @@ impl MessageProcessor {
                 unsupported_kind => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!(
@@ -1581,7 +1802,7 @@ impl MessageProcessor {
                 unsupported_kind => {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!(
@@ -1645,7 +1866,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -1668,7 +1889,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to save CLI runtime proxy: {error:#}"),
@@ -1732,7 +1953,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to delete CLI runtime proxy: {error:#}"),
@@ -1760,12 +1981,13 @@ impl MessageProcessor {
     pub(super) async fn cli_runtime_request_respond(
         &self,
         request_context: &RequestContext,
-        authorization: Option<&crate::authorization::AuthorizedTurn>,
+        authorization: &crate::authorization::AuthorizedTurn,
         request_id: RequestId,
         params: CLIRuntimeRequestRespondParams,
     ) {
         let connection_id = request_context.connection_id();
-        let resolution = params.resolution.clone();
+        let mut resolution =
+            crate::human_interaction::EphemeralCliResolution::new(params.resolution);
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -1796,7 +2018,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
@@ -1813,7 +2035,7 @@ impl MessageProcessor {
         if pending.workspace_id != workspace_id {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -1828,7 +2050,7 @@ impl MessageProcessor {
         if pending.runtime_id != params.runtime_id {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -1840,10 +2062,12 @@ impl MessageProcessor {
             .await;
             return;
         }
-        if pending.status != StoredCliRuntimePendingRequestStatus::Pending {
+        let retrying_delivery =
+            pending.status == StoredCliRuntimePendingRequestStatus::DeliveryFailed;
+        if pending.status != StoredCliRuntimePendingRequestStatus::Pending && !retrying_delivery {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -1857,14 +2081,13 @@ impl MessageProcessor {
             return;
         }
 
-        if authorization.is_some_and(|authorization| {
-            authorization.workspace_id() != pending.workspace_id
-                || authorization.thread_id() != pending.thread_id
-                || pending
-                    .turn_id
-                    .as_deref()
-                    .is_none_or(|turn_id| authorization.turn_id() != turn_id)
-        }) {
+        if authorization.workspace_id() != pending.workspace_id
+            || authorization.thread_id() != pending.thread_id
+            || pending
+                .turn_id
+                .as_deref()
+                .is_none_or(|turn_id| authorization.turn_id() != turn_id)
+        {
             self.send_error(
                 connection_id,
                 AuthorizationExternalError::NotFound.response(request_id),
@@ -1873,48 +2096,77 @@ impl MessageProcessor {
             return;
         }
 
-        if let Some(turn_id) = pending.turn_id.as_deref() {
-            let Some(binding) = pending.authorization_binding.as_ref() else {
-                self.send_error(
-                    connection_id,
-                    AuthorizationExternalError::NotFound.response(request_id),
-                )
-                .await;
-                return;
-            };
-            if request_context.principal().principal_id.as_str() != binding.initiating_principal_id
-                || request_context.principal().session_id.as_str() != binding.initiating_session_id
-            {
-                self.send_error(
-                    connection_id,
-                    AuthorizationExternalError::NotFound.response(request_id),
-                )
-                .await;
-                return;
-            }
-            let authorization_context = match self
-                .revalidate_execution_authorization_for_turn(
-                    pending.workspace_id.as_str(),
-                    pending.thread_id.as_str(),
-                    turn_id,
-                    crate::authorization::ResourceAction::CliRuntimeUse,
-                )
-                .await
-            {
-                Ok(context)
-                    if context.initiating_principal_id().as_str()
-                        == binding.initiating_principal_id
-                        && context.initiating_session_id().as_str()
-                            == binding.initiating_session_id
-                        && context
-                            .authorization_fingerprint()
-                            .is_ok_and(|fingerprint| {
-                                fingerprint == binding.authorization_context_fingerprint
-                            }) =>
+        let (interaction_budget, current_permission_profile) =
+            if let Some(turn_id) = pending.turn_id.as_deref() {
+                let Some(binding) = pending.authorization_binding.as_ref() else {
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::NotFound.response(request_id),
+                    )
+                    .await;
+                    return;
+                };
+                let (authorization_context, revalidated_authorization) = match self
+                    .revalidate_execution_authorization_projection_for_turn(
+                        pending.workspace_id.as_str(),
+                        pending.thread_id.as_str(),
+                        turn_id,
+                        crate::authorization::ResourceAction::AgentRequestRespond,
+                    )
+                    .await
                 {
-                    context
-                }
-                Ok(_) | Err(_) => {
+                    Ok((context, revalidated))
+                        if context.initiating_principal_id().as_str()
+                            == binding.initiating_principal_id
+                            && context.initiating_session_id().as_str()
+                                == binding.initiating_session_id
+                            && context
+                                .authorization_fingerprint()
+                                .is_ok_and(|fingerprint| {
+                                    fingerprint == binding.authorization_context_fingerprint
+                                }) =>
+                    {
+                        (context, revalidated)
+                    }
+                    Ok(_) | Err(_) => {
+                        if let Err(error) = self
+                            .expire_cli_runtime_pending_request_as_stale(&pending)
+                            .await
+                        {
+                            warn!(
+                                request_id = pending.request_id.as_str(),
+                                error = %format!("{error:#}"),
+                                "failed to expire CLI request after authorization loss"
+                            );
+                        }
+                        self.send_error(
+                            connection_id,
+                            AuthorizationExternalError::NotFound.response(request_id),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let runtime_kind =
+                    cli_runtime_kind_config_from_stored_kind(pending.runtime_kind.as_str())
+                        .map(cli_runtime_kind_from_config);
+                let runtime_is_current = runtime_kind.is_some_and(|runtime_kind| {
+                    authorization_context
+                        .verify_cli_runtime_projection(
+                            pending.workspace_id.as_str(),
+                            pending.runtime_id.as_str(),
+                            runtime_kind,
+                        )
+                        .is_ok()
+                        && self.load_cli_runtime_instances().is_ok_and(|instances| {
+                            instances.into_iter().any(|instance| {
+                                instance.id == pending.runtime_id
+                                    && instance.enabled
+                                    && cli_runtime_kind_from_config(instance.kind) == runtime_kind
+                            })
+                        })
+                });
+                if !runtime_is_current {
                     if let Err(error) = self
                         .expire_cli_runtime_pending_request_as_stale(&pending)
                         .await
@@ -1922,7 +2174,7 @@ impl MessageProcessor {
                         warn!(
                             request_id = pending.request_id.as_str(),
                             error = %format!("{error:#}"),
-                            "failed to expire CLI request after authorization loss"
+                            "failed to expire CLI request after runtime projection changed"
                         );
                     }
                     self.send_error(
@@ -1932,79 +2184,38 @@ impl MessageProcessor {
                     .await;
                     return;
                 }
-            };
-            let current_session = pioneer_crud::load_session(
-                &self.crud_store.database_connection(),
-                authorization_context.initiating_session_id(),
-            )
-            .await;
-            if !matches!(
-                current_session,
-                Ok(Some(session))
-                    if session.refresh_generation == binding.initiating_session_generation
-            ) {
-                if let Err(error) = self
-                    .expire_cli_runtime_pending_request_as_stale(&pending)
-                    .await
-                {
-                    warn!(
-                        request_id = pending.request_id.as_str(),
-                        error = %format!("{error:#}"),
-                        "failed to expire CLI request after session generation changed"
-                    );
-                }
-                self.send_error(
-                    connection_id,
-                    AuthorizationExternalError::NotFound.response(request_id),
+                (
+                    authorization_context.human_interaction_budget(),
+                    Some(
+                        revalidated_authorization
+                            .effective_permission_profile()
+                            .clone(),
+                    ),
                 )
-                .await;
-                return;
-            }
-            let runtime_kind =
-                cli_runtime_kind_config_from_stored_kind(pending.runtime_kind.as_str())
-                    .map(cli_runtime_kind_from_config);
-            let runtime_is_current = runtime_kind.is_some_and(|runtime_kind| {
-                authorization_context
-                    .verify_cli_runtime_projection(
-                        pending.workspace_id.as_str(),
-                        pending.runtime_id.as_str(),
-                        runtime_kind,
+            } else {
+                let policy = crate::authorization::AuthorizationService::new();
+                if !policy.cli_management_details_allowed(
+                    request_context.principal().kind,
+                    request_context.principal().role_key.as_ref(),
+                    pending.runtime_id.as_str(),
+                ) {
+                    self.send_error(
+                        connection_id,
+                        AuthorizationExternalError::NotFound.response(request_id),
                     )
-                    .is_ok()
-                    && self.load_cli_runtime_instances().is_ok_and(|instances| {
-                        instances.into_iter().any(|instance| {
-                            instance.id == pending.runtime_id
-                                && instance.enabled
-                                && cli_runtime_kind_from_config(instance.kind) == runtime_kind
-                        })
-                    })
-            });
-            if !runtime_is_current {
-                if let Err(error) = self
-                    .expire_cli_runtime_pending_request_as_stale(&pending)
-                    .await
-                {
-                    warn!(
-                        request_id = pending.request_id.as_str(),
-                        error = %format!("{error:#}"),
-                        "failed to expire CLI request after runtime projection changed"
-                    );
+                    .await;
+                    return;
                 }
-                self.send_error(
-                    connection_id,
-                    AuthorizationExternalError::NotFound.response(request_id),
+                (
+                    policy
+                        .human_interaction_budget(
+                            request_context.principal().kind,
+                            request_context.principal().role_key.as_ref(),
+                        )
+                        .expect("authorized CLI management role has an interaction budget"),
+                    None,
                 )
-                .await;
-                return;
-            }
-        } else if request_context.principal().kind != pioneer_protocol::PrincipalKind::Superuser {
-            self.send_error(
-                connection_id,
-                AuthorizationExternalError::NotFound.response(request_id),
-            )
-            .await;
-            return;
-        }
+            };
 
         if let Err(error) = self
             .validate_cli_runtime_pending_request_active_turn(&pending)
@@ -2026,7 +2237,7 @@ impl MessageProcessor {
             }
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -2055,7 +2266,7 @@ impl MessageProcessor {
                     {
                         self.send_error(
                             connection_id,
-                            JsonRpcErrorResponse::new(
+                            cli_runtime_public_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
                                 format!(
@@ -2073,7 +2284,7 @@ impl MessageProcessor {
                 {
                     self.send_error(
                         connection_id,
-                        JsonRpcErrorResponse::new(
+                        cli_runtime_public_error(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!(
@@ -2087,7 +2298,7 @@ impl MessageProcessor {
                 }
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
@@ -2104,7 +2315,7 @@ impl MessageProcessor {
         if let Err(error) = validate_cli_runtime_native_request_resolution(&pending, &resolution) {
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     format!(
@@ -2116,6 +2327,50 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if let Some(permission_profile) = current_permission_profile.as_ref()
+            && let Err(error) = validate_cli_runtime_resolution_against_permission_profile(
+                cli_runtime_request_kind_from_stored(pending.request_kind.as_str()),
+                &resolution,
+                permission_profile,
+            )
+        {
+            self.send_error(
+                connection_id,
+                cli_runtime_public_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "CLI runtime request `{}` resolution exceeds the current execution permission ceiling: {error:#}",
+                        pending.request_id
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let interaction = cli_runtime_pending_request_from_record(&pending);
+        let interaction_service =
+            crate::human_interaction::HumanInteractionService::from_budget(interaction_budget);
+        let validated_interaction =
+            match interaction_service.validate_client_resolution(&interaction, &resolution) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            format!(
+                                "invalid CLI runtime request `{}` canonical response: {error:#}",
+                                pending.request_id
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
         let native_response_session = match self
             .cli_runtime_existing_session_for_pending_request(&pending)
@@ -2139,7 +2394,7 @@ impl MessageProcessor {
                 }
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
@@ -2153,12 +2408,15 @@ impl MessageProcessor {
             }
         };
 
-        let response_json = match pioneer_crud::serialize_cli_runtime_json(&resolution) {
+        let contains_secret = validated_interaction.contains_secret_answer(&resolution);
+        let durable_resolution =
+            interaction_service.durable_resolution(&resolution, contains_secret);
+        let response_json = match pioneer_crud::serialize_cli_runtime_json(&durable_resolution) {
             Ok(payload) => Some(payload),
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to encode CLI runtime request resolution: {error:#}"),
@@ -2169,37 +2427,140 @@ impl MessageProcessor {
             }
         };
         let now = cli_runtime_request_timestamp();
-        let status = cli_runtime_request_status_for_resolution(&resolution);
-        let resolved = match self
+        let response_revision = match self.current_authorization_revision().await {
+            Ok(revision) => match i64::try_from(revision) {
+                Ok(revision) => revision,
+                Err(_) => {
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            "authorization revision exceeds the durable interaction range",
+                        ),
+                    )
+                    .await;
+                    interaction_service.zeroize_resolution(&mut resolution);
+                    return;
+                }
+            },
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    cli_runtime_public_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to resolve interaction policy generation: {error:#}"),
+                    ),
+                )
+                .await;
+                interaction_service.zeroize_resolution(&mut resolution);
+                return;
+            }
+        };
+        let accepted = if retrying_delivery {
+            if contains_secret || pending.response_json != response_json {
+                interaction_service.zeroize_resolution(&mut resolution);
+                self.send_error(
+                    connection_id,
+                    cli_runtime_public_error(
+                        Some(request_id),
+                        INVALID_PARAMS_CODE,
+                        "delivery retry must repeat the exact accepted non-secret response",
+                    ),
+                )
+                .await;
+                return;
+            }
+            pending.clone()
+        } else {
+            match self
+                .crud_store
+                .accept_cli_runtime_pending_request_response(
+                    pioneer_crud::AcceptCliRuntimePendingRequestResponse {
+                        request_id: pending.request_id.clone(),
+                        response_json,
+                        responding_principal_id: request_context
+                            .principal()
+                            .principal_id
+                            .to_string(),
+                        responding_session_id: request_context.principal().session_id.to_string(),
+                        response_authorization_revision: response_revision,
+                        response_contains_secret: contains_secret,
+                        updated_at: now,
+                    },
+                )
+                .await
+            {
+                Ok(Some(accepted)) => accepted,
+                Ok(None) => {
+                    interaction_service.zeroize_resolution(&mut resolution);
+                    self.send_stale_cli_runtime_request_error(
+                        connection_id,
+                        request_id,
+                        pending.request_id.as_str(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    interaction_service.zeroize_resolution(&mut resolution);
+                    self.send_error(
+                        connection_id,
+                        cli_runtime_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to accept CLI runtime request `{}`: {error:#}",
+                                pending.request_id
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        };
+
+        let delivering = match self
             .crud_store
-            .resolve_cli_runtime_pending_request(ResolveCliRuntimePendingRequest {
-                request_id: pending.request_id.clone(),
-                status,
-                response_json,
-                updated_at: now,
-                resolved_at: now,
-            })
+            .transition_cli_runtime_pending_request_delivery(
+                pioneer_crud::TransitionCliRuntimePendingRequestDelivery {
+                    request_id: accepted.request_id.clone(),
+                    expected_status: if retrying_delivery {
+                        StoredCliRuntimePendingRequestStatus::DeliveryFailed
+                    } else {
+                        StoredCliRuntimePendingRequestStatus::ResponseAccepted
+                    },
+                    status: StoredCliRuntimePendingRequestStatus::Delivering,
+                    delivery_error: None,
+                    updated_at: now,
+                    resolved_at: None,
+                },
+            )
             .await
         {
-            Ok(Some(resolved)) => resolved,
+            Ok(Some(delivering)) => delivering,
             Ok(None) => {
+                interaction_service.zeroize_resolution(&mut resolution);
                 self.send_stale_cli_runtime_request_error(
                     connection_id,
                     request_id,
-                    pending.request_id.as_str(),
+                    accepted.request_id.as_str(),
                 )
                 .await;
                 return;
             }
             Err(error) => {
+                interaction_service.zeroize_resolution(&mut resolution);
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!(
-                            "failed to resolve CLI runtime request `{}`: {error:#}",
-                            pending.request_id
+                            "failed to begin native delivery for CLI runtime request `{}`: {error:#}",
+                            accepted.request_id
                         ),
                     ),
                 )
@@ -2209,23 +2570,89 @@ impl MessageProcessor {
         };
 
         if let Err(error) = self
-            .respond_to_cli_runtime_native_request(&resolved, &resolution, native_response_session)
+            .respond_to_cli_runtime_native_request(
+                &delivering,
+                &resolution,
+                native_response_session,
+            )
             .await
         {
+            let retry_status = if contains_secret {
+                StoredCliRuntimePendingRequestStatus::Pending
+            } else {
+                StoredCliRuntimePendingRequestStatus::DeliveryFailed
+            };
+            let _ = self
+                .crud_store
+                .transition_cli_runtime_pending_request_delivery(
+                    pioneer_crud::TransitionCliRuntimePendingRequestDelivery {
+                        request_id: delivering.request_id.clone(),
+                        expected_status: StoredCliRuntimePendingRequestStatus::Delivering,
+                        status: retry_status,
+                        delivery_error: Some("native response lane did not acknowledge".to_owned()),
+                        updated_at: cli_runtime_request_timestamp(),
+                        resolved_at: None,
+                    },
+                )
+                .await;
+            interaction_service.zeroize_resolution(&mut resolution);
             self.send_error(
                 connection_id,
-                JsonRpcErrorResponse::new(
+                cli_runtime_public_error(
                     Some(request_id),
                     INVALID_REQUEST_CODE,
                     format!(
                         "failed to respond to native CLI runtime request `{}`: {error:#}",
-                        resolved.request_id
+                        delivering.request_id
                     ),
                 ),
             )
             .await;
             return;
         }
+
+        interaction_service.zeroize_resolution(&mut resolution);
+        let final_status = cli_runtime_request_status_for_resolution(&durable_resolution);
+        let resolved = match self
+            .crud_store
+            .transition_cli_runtime_pending_request_delivery(
+                pioneer_crud::TransitionCliRuntimePendingRequestDelivery {
+                    request_id: delivering.request_id.clone(),
+                    expected_status: StoredCliRuntimePendingRequestStatus::Delivering,
+                    status: final_status,
+                    delivery_error: None,
+                    updated_at: cli_runtime_request_timestamp(),
+                    resolved_at: Some(cli_runtime_request_timestamp()),
+                },
+            )
+            .await
+        {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                self.send_stale_cli_runtime_request_error(
+                    connection_id,
+                    request_id,
+                    delivering.request_id.as_str(),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    cli_runtime_public_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!(
+                            "native response was delivered but request `{}` could not be acknowledged durably: {error:#}",
+                            delivering.request_id
+                        ),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
 
         if let Some(turn_id) = resolved.turn_id.as_deref()
             && let Err(error) = self
@@ -2248,7 +2675,7 @@ impl MessageProcessor {
             );
         }
 
-        self.emit_cli_runtime_request_resolved(resolved.clone(), resolution.clone())
+        self.emit_cli_runtime_request_resolved(resolved.clone(), durable_resolution.clone())
             .await;
 
         self.send_cli_runtime_response(
@@ -2263,7 +2690,7 @@ impl MessageProcessor {
                 turn_id: resolved.turn_id.clone(),
                 item_id: resolved.native_item_id.clone(),
                 status: protocol_status_from_stored_status(resolved.status),
-                resolution,
+                resolution: durable_resolution,
             },
         )
         .await;
@@ -2274,16 +2701,29 @@ impl MessageProcessor {
         &self,
         request: NewCliRuntimePendingRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
+        let interaction = pioneer_crud::deserialize_cli_runtime_json::<CLIRuntimePendingRequest>(
+            request.payload_json.as_str(),
+        )
+        .context("failed to decode CLI human interaction before admission")?;
         let opened = if let Some(turn_id) = request.turn_id.as_deref() {
             let authorization_context = self
                 .revalidate_execution_authorization_for_turn(
                     request.workspace_id.as_str(),
                     request.thread_id.as_str(),
                     turn_id,
-                    crate::authorization::ResourceAction::CliRuntimeUse,
+                    crate::authorization::ResourceAction::AgentRequestObserve,
                 )
                 .await
-                .context("CLI runtime request initiating authority is no longer active")?;
+                .context(
+                    "CLI runtime request collaboration observation authority is no longer active",
+                )?;
+            let interaction_service =
+                crate::human_interaction::HumanInteractionService::from_budget(
+                    authorization_context.human_interaction_budget(),
+                );
+            interaction_service
+                .validate_cli_request(&interaction)
+                .context("CLI human interaction exceeds its immutable execution budget")?;
             let runtime_kind =
                 cli_runtime_kind_config_from_stored_kind(request.runtime_kind.as_str())
                     .map(cli_runtime_kind_from_config)
@@ -2295,32 +2735,33 @@ impl MessageProcessor {
                     runtime_kind,
                 )
                 .context("CLI runtime request is outside its immutable runtime projection")?;
-            let session = pioneer_crud::load_session(
-                &self.crud_store.database_connection(),
-                authorization_context.initiating_session_id(),
-            )
-            .await
-            .context("failed to load CLI runtime request initiating session")?
-            .context("CLI runtime request initiating session is missing")?;
-            if session.refresh_generation < 0 {
-                anyhow::bail!("CLI runtime request initiating session generation is invalid");
-            }
             let binding = pioneer_crud::CliRuntimeRequestAuthorizationBinding {
                 initiating_principal_id: authorization_context
                     .initiating_principal_id()
                     .to_string(),
                 initiating_session_id: authorization_context.initiating_session_id().to_string(),
-                initiating_session_generation: session.refresh_generation,
+                // Credential rotation is not part of collaborative request
+                // authority. Keep the legacy column as provenance-only data.
+                initiating_session_generation: 0,
                 authorization_context_fingerprint: authorization_context
                     .authorization_fingerprint()
                     .context("failed to fingerprint CLI runtime request authorization")?,
             };
             self.crud_store
-                .open_cli_runtime_pending_request_with_authorization(request, binding)
+                .open_cli_runtime_pending_request_with_authorization(
+                    request,
+                    binding,
+                    interaction_service
+                        .budget()
+                        .max_pending_requests_per_execution,
+                )
                 .await?
         } else {
             // Machine-level requests cannot be approved by a Member and have no
             // user turn whose immutable authority could be bound here.
+            crate::human_interaction::HumanInteractionService::new()
+                .validate_cli_request(&interaction)
+                .context("CLI machine interaction exceeds its server budget")?;
             self.crud_store
                 .open_cli_runtime_pending_request(request)
                 .await?
@@ -2922,6 +3363,7 @@ impl MessageProcessor {
         debug_native_events: bool,
     ) {
         let processor = self.clone();
+        let native_event_budget = receivers.native_event_budget;
         tokio::spawn(async move {
             let key = instance.key();
             let mut events = receivers.events;
@@ -2938,6 +3380,7 @@ impl MessageProcessor {
                             runtime_kind.as_str(),
                             &event,
                             debug_native_events,
+                            native_event_budget,
                         )
                         .await;
                 }
@@ -2968,6 +3411,7 @@ impl MessageProcessor {
         receivers: CLIAgentRuntimeCodexEventReceivers,
         debug_native_events: bool,
     ) {
+        let native_event_budget = receivers.native_event_budget;
         let options = RuntimeEventMappingOptions {
             include_redacted_native_payload: debug_native_events,
         };
@@ -3009,6 +3453,7 @@ impl MessageProcessor {
                             notification.method.as_str(),
                             notification.params.as_ref(),
                             debug_native_events,
+                            native_event_budget,
                         )
                         .await;
                 }
@@ -3071,6 +3516,7 @@ impl MessageProcessor {
                         request.method.as_str(),
                         request.params.as_ref(),
                         debug_native_events,
+                        native_event_budget,
                     )
                     .await;
                 let event = map_codex_server_request_event(&request, options);
@@ -3134,6 +3580,7 @@ impl MessageProcessor {
         native_method: &str,
         params: Option<&JsonValue>,
         include_payload: bool,
+        native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
     ) {
         if !self.cli_runtime_instance_is_current(instance).await {
             self.audit_stale_cli_runtime_process_activity(instance, "native_journal");
@@ -3178,7 +3625,10 @@ impl MessageProcessor {
                 "nativeItemId": native_item_id,
             })
         };
-        let payload_redacted_json = match pioneer_crud::serialize_cli_runtime_json(&payload) {
+        let payload_redacted_json = match bounded_cli_runtime_journal_json(
+            &payload,
+            native_event_budget.max_journal_payload_bytes,
+        ) {
             Ok(payload) => payload,
             Err(error) => {
                 warn!(
@@ -3227,6 +3677,7 @@ impl MessageProcessor {
         runtime_kind: &str,
         event: &RuntimeEvent,
         include_payload: bool,
+        native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
     ) {
         if !self.cli_runtime_instance_is_current(instance).await {
             self.audit_stale_cli_runtime_process_activity(instance, "canonical_journal");
@@ -3257,7 +3708,10 @@ impl MessageProcessor {
                 "nativeItemId": native_item_id,
             })
         };
-        let payload_redacted_json = match pioneer_crud::serialize_cli_runtime_json(&payload) {
+        let payload_redacted_json = match bounded_cli_runtime_journal_json(
+            &payload,
+            native_event_budget.max_journal_payload_bytes,
+        ) {
             Ok(payload) => payload,
             Err(error) => {
                 warn!(
@@ -3842,38 +4296,54 @@ impl MessageProcessor {
             return;
         }
         let key = instance.key();
-        let pending_requests = match self
-            .crud_store
-            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-                workspace_id: Some(key.workspace_id.clone()),
-                runtime_id: Some(key.runtime_id.clone()),
-                thread_id: Some(key.thread_id.clone()),
-                status: Some(StoredCliRuntimePendingRequestStatus::Pending),
-                limit: None,
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(requests) => requests,
-            Err(error) => {
-                warn!(
-                    workspace_id = key.workspace_id.as_str(),
-                    runtime_id = key.runtime_id.as_str(),
-                    thread_id = key.thread_id.as_str(),
-                    native_request_id = resolved.native_request_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed to list pending CLI runtime requests for native cancellation"
-                );
-                return;
+        let mut after = None;
+        let request = loop {
+            let pending_requests = match self
+                .crud_store
+                .list_cli_runtime_pending_requests(
+                    pioneer_crud::CliRuntimePendingRequestListFilter {
+                        workspace_id: Some(key.workspace_id.clone()),
+                        runtime_id: Some(key.runtime_id.clone()),
+                        thread_id: Some(key.thread_id.clone()),
+                        open_only: true,
+                        after,
+                        limit: Some(pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(requests) => requests,
+                Err(error) => {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        native_request_id = resolved.native_request_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to list pending CLI runtime requests for native cancellation"
+                    );
+                    return;
+                }
+            };
+            let next = pending_requests
+                .last()
+                .map(|request| (request.created_at, request.request_id.clone()));
+            if let Some(request) = pending_requests.into_iter().find(|request| {
+                cli_runtime_pending_request_from_record(request)
+                    .native_request_id
+                    .as_deref()
+                    == Some(resolved.native_request_id.as_str())
+            }) {
+                break Some(request);
             }
+            let Some(next) = next else {
+                break None;
+            };
+            after = Some(next);
         };
 
-        let Some(request) = pending_requests.into_iter().find(|request| {
-            cli_runtime_pending_request_from_record(request)
-                .native_request_id
-                .as_deref()
-                == Some(resolved.native_request_id.as_str())
-        }) else {
+        let Some(request) = request else {
             debug!(
                 workspace_id = key.workspace_id.as_str(),
                 runtime_id = key.runtime_id.as_str(),
@@ -4956,7 +5426,7 @@ impl MessageProcessor {
             .crud_store
             .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
                 turn_id: Some(turn_id.to_owned()),
-                status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                open_only: true,
                 limit: None,
                 ..Default::default()
             })
@@ -4968,6 +5438,40 @@ impl MessageProcessor {
                 cli_runtime_pending_request_is_human_wait(request.request_kind.as_str())
             })
             .collect::<Vec<_>>();
+        for request in &mut human_requests {
+            if !matches!(
+                request.status,
+                StoredCliRuntimePendingRequestStatus::ResponseAccepted
+                    | StoredCliRuntimePendingRequestStatus::Delivering
+            ) || now_unix_ms.saturating_sub(request.updated_at.timestamp_millis()) < 30_000
+            {
+                continue;
+            }
+            let recovered_status = if request.response_contains_secret {
+                StoredCliRuntimePendingRequestStatus::Pending
+            } else {
+                StoredCliRuntimePendingRequestStatus::DeliveryFailed
+            };
+            if let Some(recovered) = self
+                .crud_store
+                .transition_cli_runtime_pending_request_delivery(
+                    pioneer_crud::TransitionCliRuntimePendingRequestDelivery {
+                        request_id: request.request_id.clone(),
+                        expected_status: request.status,
+                        status: recovered_status,
+                        delivery_error: Some(
+                            "delivery acknowledgement was interrupted; retry is required"
+                                .to_owned(),
+                        ),
+                        updated_at: cli_runtime_request_timestamp(),
+                        resolved_at: None,
+                    },
+                )
+                .await?
+            {
+                *request = recovered;
+            }
+        }
         if human_requests.is_empty() {
             return Ok(false);
         }
@@ -7259,131 +7763,141 @@ impl MessageProcessor {
     }
 
     async fn expire_cli_runtime_pending_requests_for_turn(&self, turn_id: &str) {
-        let pending_requests = match self
-            .crud_store
-            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-                turn_id: Some(turn_id.to_owned()),
-                status: Some(StoredCliRuntimePendingRequestStatus::Pending),
-                limit: None,
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(requests) => requests,
-            Err(error) => {
-                warn!(
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "failed to list CLI runtime pending requests for terminal cleanup"
-                );
-                return;
-            }
-        };
-
-        for request in pending_requests {
-            if let Err(error) = self
-                .expire_cli_runtime_pending_request_as_stale(&request)
+        let mut after = None;
+        loop {
+            let pending_requests = match self
+                .crud_store
+                .list_cli_runtime_pending_requests(
+                    pioneer_crud::CliRuntimePendingRequestListFilter {
+                        turn_id: Some(turn_id.to_owned()),
+                        open_only: true,
+                        after,
+                        limit: Some(pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX),
+                        ..Default::default()
+                    },
+                )
                 .await
             {
-                warn!(
-                    workspace_id = request.workspace_id.as_str(),
-                    runtime_id = request.runtime_id.as_str(),
-                    thread_id = request.thread_id.as_str(),
-                    turn_id = request.turn_id.as_deref(),
-                    request_id = request.request_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed to expire CLI runtime pending request for terminal cleanup"
-                );
+                Ok(requests) => requests,
+                Err(error) => {
+                    warn!(
+                        turn_id,
+                        error = %format!("{error:#}"),
+                        "failed to list CLI runtime pending requests for terminal cleanup"
+                    );
+                    return;
+                }
+            };
+            let next = pending_requests
+                .last()
+                .map(|request| (request.created_at, request.request_id.clone()));
+            for request in pending_requests {
+                if let Err(error) = self
+                    .expire_cli_runtime_pending_request_as_stale(&request)
+                    .await
+                {
+                    warn!(
+                        workspace_id = request.workspace_id.as_str(),
+                        runtime_id = request.runtime_id.as_str(),
+                        thread_id = request.thread_id.as_str(),
+                        turn_id = request.turn_id.as_deref(),
+                        request_id = request.request_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to expire CLI runtime pending request for terminal cleanup"
+                    );
+                }
             }
+            let Some(next) = next else {
+                return;
+            };
+            after = Some(next);
         }
     }
 
     pub(super) async fn expire_cli_runtime_pending_requests_without_current_authority(
         &self,
         workspace_id: &str,
-        affected_principal_id: Option<&pioneer_protocol::PrincipalId>,
+        _affected_principal_id: Option<&pioneer_protocol::PrincipalId>,
     ) {
-        let pending_requests = match self
-            .crud_store
-            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-                workspace_id: Some(workspace_id.to_owned()),
-                status: Some(StoredCliRuntimePendingRequestStatus::Pending),
-                limit: None,
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(requests) => requests,
-            Err(error) => {
-                warn!(
-                    workspace_id,
-                    error = %format!("{error:#}"),
-                    "failed to list CLI runtime requests for authorization invalidation"
-                );
-                return;
-            }
-        };
-
-        for request in pending_requests {
-            let (Some(turn_id), Some(binding)) = (
-                request.turn_id.as_deref(),
-                request.authorization_binding.as_ref(),
-            ) else {
-                continue;
-            };
-            if affected_principal_id.is_some_and(|principal_id| {
-                principal_id.as_str() != binding.initiating_principal_id
-            }) {
-                continue;
-            }
-            let authority_is_current = match self
-                .revalidate_execution_authorization_for_turn(
-                    request.workspace_id.as_str(),
-                    request.thread_id.as_str(),
-                    turn_id,
-                    crate::authorization::ResourceAction::CliRuntimeUse,
+        let mut after = None;
+        loop {
+            let pending_requests = match self
+                .crud_store
+                .list_cli_runtime_pending_requests(
+                    pioneer_crud::CliRuntimePendingRequestListFilter {
+                        workspace_id: Some(workspace_id.to_owned()),
+                        open_only: true,
+                        after,
+                        limit: Some(pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX),
+                        ..Default::default()
+                    },
                 )
                 .await
             {
-                Ok(context)
-                    if context.initiating_principal_id().as_str()
-                        == binding.initiating_principal_id
-                        && context.initiating_session_id().as_str()
-                            == binding.initiating_session_id
-                        && context.authorization_fingerprint().is_ok_and(|current| {
-                            current == binding.authorization_context_fingerprint
-                        }) =>
-                {
-                    matches!(
-                        pioneer_crud::load_session(
-                            &self.crud_store.database_connection(),
-                            context.initiating_session_id(),
-                        )
-                        .await,
-                        Ok(Some(session))
-                            if session.refresh_generation
-                                == binding.initiating_session_generation
-                    )
+                Ok(requests) => requests,
+                Err(error) => {
+                    warn!(
+                        workspace_id,
+                        error = %format!("{error:#}"),
+                        "failed to list CLI runtime requests for authorization invalidation"
+                    );
+                    return;
                 }
-                Ok(_) | Err(_) => false,
             };
-            if authority_is_current {
-                continue;
+            let next = pending_requests
+                .last()
+                .map(|request| (request.created_at, request.request_id.clone()));
+            for request in pending_requests {
+                let (Some(turn_id), Some(binding)) = (
+                    request.turn_id.as_deref(),
+                    request.authorization_binding.as_ref(),
+                ) else {
+                    continue;
+                };
+                let authority_is_current = match self
+                    .revalidate_execution_authorization_for_turn(
+                        request.workspace_id.as_str(),
+                        request.thread_id.as_str(),
+                        turn_id,
+                        crate::authorization::ResourceAction::AgentRequestRespond,
+                    )
+                    .await
+                {
+                    Ok(context)
+                        if context.initiating_principal_id().as_str()
+                            == binding.initiating_principal_id
+                            && context.initiating_session_id().as_str()
+                                == binding.initiating_session_id
+                            && context.authorization_fingerprint().is_ok_and(|current| {
+                                current == binding.authorization_context_fingerprint
+                            }) =>
+                    {
+                        true
+                    }
+                    Ok(_) | Err(_) => false,
+                };
+                if authority_is_current {
+                    continue;
+                }
+                if let Err(error) = self
+                    .expire_cli_runtime_pending_request_as_stale(&request)
+                    .await
+                {
+                    warn!(
+                        workspace_id = request.workspace_id.as_str(),
+                        runtime_id = request.runtime_id.as_str(),
+                        thread_id = request.thread_id.as_str(),
+                        turn_id,
+                        request_id = request.request_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to expire CLI runtime request after authorization invalidation"
+                    );
+                }
             }
-            if let Err(error) = self
-                .expire_cli_runtime_pending_request_as_stale(&request)
-                .await
-            {
-                warn!(
-                    workspace_id = request.workspace_id.as_str(),
-                    runtime_id = request.runtime_id.as_str(),
-                    thread_id = request.thread_id.as_str(),
-                    turn_id,
-                    request_id = request.request_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed to expire CLI runtime request after authorization invalidation"
-                );
-            }
+            let Some(next) = next else {
+                return;
+            };
+            after = Some(next);
         }
     }
 
@@ -7652,6 +8166,15 @@ impl MessageProcessor {
             .await
             .by_pioneer_request_id
             .contains_key(pioneer_request_id)
+    }
+
+    async fn cli_runtime_machine_request(
+        &self,
+        pioneer_request_id: &str,
+    ) -> Option<CLIRuntimePendingMachineRequest> {
+        let registry = self.cli_runtime_machine_requests.lock().await;
+        let key = registry.by_pioneer_request_id.get(pioneer_request_id)?;
+        registry.by_lane.get(key).cloned()
     }
 
     async fn take_cli_runtime_machine_request(
@@ -8009,7 +8532,7 @@ impl MessageProcessor {
         let native_request_id = cli_runtime_native_request_id_json_from_record(request)?;
         let response_session = if request.runtime_kind == "codex" {
             let Some(pending) = self
-                .take_cli_runtime_machine_request(request.request_id.as_str())
+                .cli_runtime_machine_request(request.request_id.as_str())
                 .await
             else {
                 anyhow::bail!(
@@ -8018,6 +8541,9 @@ impl MessageProcessor {
                 );
             };
             if pending.responder.native_request_id() != &native_request_id {
+                let _ = self
+                    .take_cli_runtime_machine_request(request.request_id.as_str())
+                    .await;
                 self.fail_codex_machine_request(
                     &pending.responder,
                     CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
@@ -8031,6 +8557,9 @@ impl MessageProcessor {
                 );
             }
             pending.responder.respond(response).await?;
+            let _ = self
+                .take_cli_runtime_machine_request(request.request_id.as_str())
+                .await;
             Some(pending.responder.session())
         } else {
             let Some(handle) = native_response_session else {
@@ -8141,12 +8670,10 @@ impl MessageProcessor {
         method: &str,
         notification: &T,
     ) {
-        if let Some(binding) = request.authorization_binding.as_ref() {
-            self.send_execution_initiator_notification(
+        if request.authorization_binding.is_some() {
+            self.send_execution_collaborator_notification(
                 request.thread_id.as_str(),
-                binding.initiating_principal_id.as_str(),
-                binding.initiating_session_id.as_str(),
-                crate::authorization::ResourceAction::CliRuntimeUse,
+                crate::authorization::ResourceAction::AgentRequestObserve,
                 method,
                 notification,
             )
@@ -8173,7 +8700,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!("failed to validate workspace for `{method}`: {error}"),
@@ -8226,7 +8753,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_discovery_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load CLI runtime catalog: {error:#}"),
@@ -8258,7 +8785,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_discovery_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load CLI runtime catalog: {error:#}"),
@@ -8291,7 +8818,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_discovery_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         format!("failed to load CLI runtime catalog: {error:#}"),
@@ -8476,7 +9003,7 @@ impl MessageProcessor {
     ) {
         self.send_error(
             connection_id,
-            JsonRpcErrorResponse::new(
+            cli_runtime_discovery_error(
                 Some(request_id),
                 INVALID_PARAMS_CODE,
                 format!("unknown CLI runtime `{runtime_id}`"),
@@ -8493,7 +9020,7 @@ impl MessageProcessor {
     ) {
         self.send_error(
             connection_id,
-            JsonRpcErrorResponse::new(
+            cli_runtime_public_error(
                 Some(request_id),
                 INVALID_PARAMS_CODE,
                 format!("unknown or stale CLI runtime request `{pending_request_id}`"),
@@ -8514,7 +9041,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    JsonRpcErrorResponse::new(
+                    cli_runtime_public_error(
                         None,
                         INVALID_REQUEST_CODE,
                         format!("failed to encode `{method}` response: {error}"),
@@ -8556,23 +9083,27 @@ fn find_cli_runtime_instance(
 
 fn cli_runtime_thread_binding_from_record(
     binding: pioneer_crud::CliRuntimeThreadBindingRecord,
-) -> anyhow::Result<CLIRuntimeThreadBinding> {
+) -> anyhow::Result<(CLIRuntimeThreadBinding, CLIRuntimeThreadBindingManagement)> {
     let runtime_kind = match binding.runtime_kind.as_str() {
         "codex" => CLIAgentRuntimeKind::Codex,
         "claude" => CLIAgentRuntimeKind::Claude,
         other => anyhow::bail!("unknown CLI runtime kind `{other}`"),
     };
 
-    Ok(CLIRuntimeThreadBinding {
-        workspace_id: binding.workspace_id,
-        thread_id: binding.thread_id,
-        runtime_id: binding.runtime_id,
-        runtime_kind,
-        native_thread_id: binding.native_thread_id,
-        native_cwd: binding.native_cwd,
-        native_model: binding.native_model,
-        status: binding.status,
-    })
+    Ok((
+        CLIRuntimeThreadBinding {
+            workspace_id: binding.workspace_id,
+            thread_id: binding.thread_id,
+            runtime_id: binding.runtime_id,
+            runtime_kind,
+            status: binding.status,
+        },
+        CLIRuntimeThreadBindingManagement {
+            native_thread_id: binding.native_thread_id,
+            native_cwd: binding.native_cwd,
+            native_model: binding.native_model,
+        },
+    ))
 }
 
 fn validate_cli_runtime_thread_fork_params(
@@ -9344,7 +9875,7 @@ fn cli_runtime_file_change_approval_pending_request(
     });
     let diff_preview = request.diff.as_ref().map(|diff| {
         let (text, truncated, original_chars) =
-            truncate_string_preview(diff, CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_CHARS);
+            truncate_string_preview(diff, CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_BYTES);
         json!({
             "text": text,
             "truncated": truncated,
@@ -9388,16 +9919,16 @@ fn cli_runtime_file_change_changed_files(request: &CodexFileChangeApprovalReques
         .unwrap_or_default()
 }
 
-fn truncate_string_preview(value: &str, max_chars: usize) -> (String, bool, usize) {
+fn truncate_string_preview(value: &str, max_bytes: usize) -> (String, bool, usize) {
     let original_chars = value.chars().count();
-    if original_chars <= max_chars {
+    if value.len() <= max_bytes {
         return (value.to_owned(), false, original_chars);
     }
-    (
-        value.chars().take(max_chars).collect::<String>(),
-        true,
-        original_chars,
-    )
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_owned(), true, original_chars)
 }
 
 fn cli_runtime_user_input_pending_request(
@@ -9570,9 +10101,41 @@ fn validate_cli_runtime_native_request_resolution(
             let _ = codex_file_change_approval_decision_from_resolution(resolution)?;
         }
         CLIRuntimeRequestKind::UserInput => {
-            let _ = codex_user_input_response_from_resolution(record, resolution)?;
+            let mut response = codex_user_input_response_from_resolution(record, resolution)?;
+            crate::human_interaction::HumanInteractionService::new()
+                .zeroize_json_value(&mut response);
         }
         CLIRuntimeRequestKind::Other => {}
+    }
+    Ok(())
+}
+
+fn validate_cli_runtime_resolution_against_permission_profile(
+    request_kind: CLIRuntimeRequestKind,
+    resolution: &CLIRuntimeRequestResolution,
+    permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
+) -> anyhow::Result<()> {
+    if !matches!(resolution, CLIRuntimeRequestResolution::Approved) {
+        return Ok(());
+    }
+
+    let behavior = match request_kind {
+        CLIRuntimeRequestKind::CommandApproval => permission_profile.effective_policy.shell_command,
+        CLIRuntimeRequestKind::FileChangeApproval => permission_profile.effective_policy.file_write,
+        CLIRuntimeRequestKind::UserInput => return Ok(()),
+        CLIRuntimeRequestKind::Other => {
+            anyhow::bail!("opaque CLI approval request has no typed permission class")
+        }
+    };
+    if behavior == pioneer_protocol::PermissionBehavior::Deny {
+        anyhow::bail!(
+            "current `{}` permission is deny",
+            match request_kind {
+                CLIRuntimeRequestKind::CommandApproval => "shell_command",
+                CLIRuntimeRequestKind::FileChangeApproval => "file_write",
+                CLIRuntimeRequestKind::UserInput | CLIRuntimeRequestKind::Other => unreachable!(),
+            }
+        );
     }
     Ok(())
 }
@@ -9587,6 +10150,41 @@ fn json_string_path(value: &JsonValue, path: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+struct BoundedCliRuntimeJsonWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl std::io::Write for BoundedCliRuntimeJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::other(format!(
+                "CLI runtime journal payload exceeds {} bytes",
+                self.max_bytes
+            )));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_cli_runtime_journal_json(value: &JsonValue, max_bytes: usize) -> anyhow::Result<String> {
+    if max_bytes == 0 {
+        anyhow::bail!("CLI runtime journal payload budget cannot be zero");
+    }
+    let mut writer = BoundedCliRuntimeJsonWriter {
+        bytes: Vec::with_capacity(max_bytes.min(8 * 1024)),
+        max_bytes,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .context("failed to serialize bounded CLI runtime journal payload")?;
+    String::from_utf8(writer.bytes).context("CLI runtime journal JSON is not UTF-8")
 }
 
 fn redact_cli_runtime_native_payload(value: &JsonValue) -> JsonValue {
@@ -9633,47 +10231,9 @@ fn codex_command_approval_decision_from_resolution(
         CLIRuntimeRequestResolution::Cancelled => Ok(CodexCommandApprovalDecision::Cancel),
         CLIRuntimeRequestResolution::Expired => Ok(CodexCommandApprovalDecision::Cancel),
         CLIRuntimeRequestResolution::Error { .. } => Ok(CodexCommandApprovalDecision::Decline),
-        CLIRuntimeRequestResolution::Answered { response } => {
-            let Some(response) = response.as_ref() else {
-                anyhow::bail!("answered command approval did not include a response payload");
-            };
-            codex_command_approval_decision_from_value(response).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unsupported command approval decision response `{}`",
-                    response
-                )
-            })
-        }
-    }
-}
-
-fn codex_command_approval_decision_from_value(
-    value: &JsonValue,
-) -> Option<CodexCommandApprovalDecision> {
-    if let Some(decision) = value.get("decision") {
-        return codex_command_approval_decision_from_value(decision);
-    }
-    if value.get("acceptWithExecpolicyAmendment").is_some()
-        || value.get("applyNetworkPolicyAmendment").is_some()
-    {
-        return Some(CodexCommandApprovalDecision::Other(value.clone()));
-    }
-    let decision = value.as_str()?;
-    let normalized = decision
-        .chars()
-        .filter(|char| !matches!(char, '_' | '-' | ' '))
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    match normalized.as_str() {
-        "accept" | "allow" | "approve" | "approved" => Some(CodexCommandApprovalDecision::Accept),
-        "acceptforsession" | "allowforsession" | "approvedforsession" => {
-            Some(CodexCommandApprovalDecision::AcceptForSession)
-        }
-        "decline" | "deny" | "denied" | "reject" | "rejected" => {
-            Some(CodexCommandApprovalDecision::Decline)
-        }
-        "cancel" | "cancelled" | "abort" | "aborted" => Some(CodexCommandApprovalDecision::Cancel),
-        _ => None,
+        CLIRuntimeRequestResolution::Answered { .. } => anyhow::bail!(
+            "command approvals accept only canonical approve, deny, or cancel decisions"
+        ),
     }
 }
 
@@ -9686,17 +10246,9 @@ fn codex_file_change_approval_decision_from_resolution(
         CLIRuntimeRequestResolution::Cancelled => Ok(CodexFileChangeApprovalDecision::Cancel),
         CLIRuntimeRequestResolution::Expired => Ok(CodexFileChangeApprovalDecision::Cancel),
         CLIRuntimeRequestResolution::Error { .. } => Ok(CodexFileChangeApprovalDecision::Decline),
-        CLIRuntimeRequestResolution::Answered { response } => {
-            let Some(response) = response.as_ref() else {
-                anyhow::bail!("answered file change approval did not include a response payload");
-            };
-            codex_file_change_approval_decision_from_value(response).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unsupported file change approval decision response `{}`",
-                    response
-                )
-            })
-        }
+        CLIRuntimeRequestResolution::Answered { .. } => anyhow::bail!(
+            "file-change approvals accept only canonical approve, deny, or cancel decisions"
+        ),
     }
 }
 
@@ -9709,11 +10261,14 @@ fn claude_permission_response_from_resolution(
         .unwrap_or(JsonValue::Null);
     let original_input = payload.get("input").cloned().unwrap_or(JsonValue::Null);
     let response = match resolution {
-        CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::Answered { .. } => {
+        CLIRuntimeRequestResolution::Approved => {
             json!({
                 "behavior": "allow",
                 "updatedInput": original_input,
             })
+        }
+        CLIRuntimeRequestResolution::Answered { .. } => {
+            anyhow::bail!("Claude permission responses do not accept opaque answer payloads")
         }
         CLIRuntimeRequestResolution::Denied { reason } => {
             json!({
@@ -9740,35 +10295,6 @@ fn claude_permission_response_from_resolution(
         CLIRuntimeRequestResolution::Cancelled | CLIRuntimeRequestResolution::Expired
     );
     Ok((response, should_interrupt))
-}
-
-fn codex_file_change_approval_decision_from_value(
-    value: &JsonValue,
-) -> Option<CodexFileChangeApprovalDecision> {
-    if let Some(decision) = value.get("decision") {
-        return codex_file_change_approval_decision_from_value(decision);
-    }
-    let decision = value.as_str()?;
-    let normalized = decision
-        .chars()
-        .filter(|char| !matches!(char, '_' | '-' | ' '))
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    match normalized.as_str() {
-        "accept" | "allow" | "approve" | "approved" => {
-            Some(CodexFileChangeApprovalDecision::Accept)
-        }
-        "acceptforsession" | "allowforsession" | "approvedforsession" => {
-            Some(CodexFileChangeApprovalDecision::AcceptForSession)
-        }
-        "decline" | "deny" | "denied" | "reject" | "rejected" => {
-            Some(CodexFileChangeApprovalDecision::Decline)
-        }
-        "cancel" | "cancelled" | "abort" | "aborted" => {
-            Some(CodexFileChangeApprovalDecision::Cancel)
-        }
-        _ => None,
-    }
 }
 
 fn file_change_approval_timeline_status_for_resolution(
@@ -10207,6 +10733,15 @@ fn protocol_status_from_stored_status(
 ) -> CLIRuntimePendingRequestStatus {
     match status {
         StoredCliRuntimePendingRequestStatus::Pending => CLIRuntimePendingRequestStatus::Pending,
+        StoredCliRuntimePendingRequestStatus::ResponseAccepted => {
+            CLIRuntimePendingRequestStatus::ResponseAccepted
+        }
+        StoredCliRuntimePendingRequestStatus::Delivering => {
+            CLIRuntimePendingRequestStatus::Delivering
+        }
+        StoredCliRuntimePendingRequestStatus::DeliveryFailed => {
+            CLIRuntimePendingRequestStatus::DeliveryFailed
+        }
         StoredCliRuntimePendingRequestStatus::Answered => CLIRuntimePendingRequestStatus::Answered,
         StoredCliRuntimePendingRequestStatus::Resolved => CLIRuntimePendingRequestStatus::Resolved,
         StoredCliRuntimePendingRequestStatus::Cancelled => {
@@ -10236,6 +10771,65 @@ mod tests {
     };
     use pioneer_protocol::RUNTIME_DIAGNOSTIC_MAX_LINES;
     use serde_json::json;
+
+    fn permission_profile_with(
+        behavior: pioneer_protocol::PermissionBehavior,
+    ) -> pioneer_protocol::TurnPermissionProfileSnapshot {
+        pioneer_protocol::TurnPermissionProfileSnapshot {
+            mode: pioneer_protocol::TurnPermissionMode::Supervised,
+            source: pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
+            effective_policy: pioneer_protocol::ToolPermissionPolicySnapshot::all(behavior),
+        }
+    }
+
+    #[test]
+    fn current_cli_permission_ceiling_cannot_be_raised_by_human_approval() {
+        let denied = permission_profile_with(pioneer_protocol::PermissionBehavior::Deny);
+        for kind in [
+            CLIRuntimeRequestKind::CommandApproval,
+            CLIRuntimeRequestKind::FileChangeApproval,
+            CLIRuntimeRequestKind::Other,
+        ] {
+            assert!(
+                validate_cli_runtime_resolution_against_permission_profile(
+                    kind,
+                    &CLIRuntimeRequestResolution::Approved,
+                    &denied,
+                )
+                .is_err(),
+                "approved {kind:?} must not widen a denied current cap"
+            );
+        }
+
+        assert!(
+            validate_cli_runtime_resolution_against_permission_profile(
+                CLIRuntimeRequestKind::CommandApproval,
+                &CLIRuntimeRequestResolution::Denied { reason: None },
+                &denied,
+            )
+            .is_ok()
+        );
+        let asking = permission_profile_with(pioneer_protocol::PermissionBehavior::Ask);
+        assert!(
+            validate_cli_runtime_resolution_against_permission_profile(
+                CLIRuntimeRequestKind::CommandApproval,
+                &CLIRuntimeRequestResolution::Approved,
+                &asking,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn native_journal_serialization_enforces_encoded_byte_ceiling() {
+        let value = json!({ "payload": "x".repeat(128) });
+        let exact = serde_json::to_string(&value).expect("fixture serializes");
+        assert_eq!(
+            bounded_cli_runtime_journal_json(&value, exact.len()).expect("exact boundary is valid"),
+            exact
+        );
+        assert!(bounded_cli_runtime_journal_json(&value, exact.len() - 1).is_err());
+    }
 
     fn effective_instance(
         id: &str,

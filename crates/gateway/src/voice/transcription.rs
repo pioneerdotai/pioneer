@@ -147,15 +147,30 @@ pub(crate) struct VoiceTranscriptionError {
 
 impl VoiceTranscriptionError {
     pub(crate) fn into_voice_error(self) -> VoiceError {
-        let kind = match self.kind {
+        let (kind, public_code) = match self.kind {
             VoiceTranscriptionErrorKind::ModelUnavailable
-            | VoiceTranscriptionErrorKind::EngineNotImplemented => VoiceErrorKind::ModelUnavailable,
-            VoiceTranscriptionErrorKind::UnsupportedAudioFormat
-            | VoiceTranscriptionErrorKind::RuntimeFailure => VoiceErrorKind::TranscriptionFailed,
+            | VoiceTranscriptionErrorKind::EngineNotImplemented => (
+                VoiceErrorKind::ModelUnavailable,
+                pioneer_protocol::PublicErrorCode::Unavailable,
+            ),
+            VoiceTranscriptionErrorKind::UnsupportedAudioFormat => (
+                VoiceErrorKind::TranscriptionFailed,
+                pioneer_protocol::PublicErrorCode::InvalidInput,
+            ),
+            VoiceTranscriptionErrorKind::RuntimeFailure => (
+                VoiceErrorKind::TranscriptionFailed,
+                pioneer_protocol::PublicErrorCode::Internal,
+            ),
         };
+        let public_error = crate::public_error::map_agent_failure(
+            public_code,
+            pioneer_protocol::PublicErrorStage::Execution,
+            self.message,
+        );
         VoiceError {
             kind,
-            message: self.message,
+            message: public_error.message.clone(),
+            public_error: Some(public_error),
         }
     }
 }

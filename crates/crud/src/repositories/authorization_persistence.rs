@@ -510,15 +510,15 @@ fn validate_membership_principal(
             AuthorizationPersistenceInvariantKind::MembershipPrincipalCrossGateway,
         );
     }
-    let role_supported = principal
+    let role_is_valid = principal
         .role_key
         .as_deref()
         .and_then(|value| RoleKey::new(value).ok())
-        .is_some_and(|role| role.is_supported());
+        .is_some();
     if principal_kind_from_db(principal.kind.as_str()).ok() != Some(PrincipalKind::User)
         || principal_status_from_db(principal.status.as_str()).ok()
             == Some(PrincipalStatus::Removed)
-        || !role_supported
+        || !role_is_valid
     {
         push_violation(
             violations,

@@ -101,6 +101,8 @@ pub struct MemberListRow {
     pub display_name: String,
     pub nickname: String,
     pub role_key: Option<RoleKey>,
+    pub role: pioneer_protocol::AuthorizationRolePresentation,
+    pub lifecycle_managed: bool,
     pub status: MemberPresentationStatus,
     /// Revision-addressed key for the authenticated HTTP avatar cache.
     pub avatar_revision: Option<String>,
@@ -187,7 +189,7 @@ pub fn member_list_row(
 ) -> MemberListRow {
     let status = MemberPresentationStatus::from_protocol(Some(member.status));
     let is_self = current_principal_id == Some(&member.principal_id);
-    let manageable_target = member.kind == PrincipalKind::User && !is_self;
+    let manageable_target = member.lifecycle_managed && !is_self;
     let lifecycle = capabilities.can_manage_member_lifecycle && manageable_target;
     MemberListRow {
         principal_id: member.principal_id.clone(),
@@ -195,6 +197,8 @@ pub fn member_list_row(
         display_name: member.display_name.clone(),
         nickname: member.nickname.clone(),
         role_key: member.role_key.clone(),
+        role: member.role.clone(),
+        lifecycle_managed: member.lifecycle_managed,
         status,
         avatar_revision: member.avatar_revision.clone(),
         actions: MemberPresentationActions {
@@ -630,6 +634,13 @@ mod tests {
             display_name: principal_id.to_owned(),
             nickname: principal_id.to_owned(),
             role_key: Some(RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
             status: PrincipalStatus::Active,
             avatar_revision: None,
         }
@@ -638,6 +649,7 @@ mod tests {
     fn invitation(invitation_id: &str) -> InvitationSummary {
         InvitationSummary {
             invitation_id: InvitationId::new(invitation_id).expect("valid invitation id"),
+            role_key: RoleKey::member(),
             status: InvitationStatus::Pending,
             revoke_reason: None,
             inviter: InvitationInviterSummary {
@@ -707,7 +719,7 @@ mod tests {
             authorization_revision: 9,
             workspace_id: "WAAAAAAAAAAAAAAAAAAAA".to_owned(),
             thread_id: None,
-            access_lost: None,
+            outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
             change: AccessChangeKind::WorkspaceMembership,
         });
 
@@ -939,6 +951,8 @@ mod tests {
         let root = PrincipalPresentationCapabilities {
             can_create_workspace: true,
             can_manage_workspace: true,
+            can_read_own_notifications: true,
+            can_acknowledge_own_notifications: true,
             can_manage_gateway_settings: true,
             can_manage_capabilities: true,
             can_use_providers: true,
@@ -964,6 +978,8 @@ mod tests {
         let member_capabilities = PrincipalPresentationCapabilities {
             can_create_workspace: false,
             can_manage_workspace: false,
+            can_read_own_notifications: true,
+            can_acknowledge_own_notifications: true,
             can_manage_gateway_settings: false,
             can_manage_capabilities: false,
             can_use_providers: true,
@@ -997,6 +1013,18 @@ mod tests {
                 can_remove_from_workspace: false,
             }
         );
+
+        let mut externally_managed_role = target.clone();
+        externally_managed_role.role_key = Some(RoleKey::new("external_operator").unwrap());
+        externally_managed_role.role = pioneer_protocol::AuthorizationRolePresentation {
+            key: "external_operator".to_owned(),
+            display_name: "External operator".to_owned(),
+            description: "Managed by an external identity policy".to_owned(),
+            built_in: false,
+        };
+        externally_managed_role.lifecycle_managed = false;
+        let external_row = member_list_row(&externally_managed_role, None, root, true);
+        assert_eq!(external_row.actions, self_row.actions);
 
         let unknown = member_list_row(
             &target,

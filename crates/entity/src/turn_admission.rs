@@ -19,6 +19,9 @@ pub struct Model {
     pub workspace_id: String,
     pub request_digest: String,
     pub created_at: DateTimeWithTimeZone,
+    pub policy_generation: Option<i64>,
+    pub role_key: Option<String>,
+    pub policy_fingerprint: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",

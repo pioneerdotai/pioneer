@@ -6,8 +6,8 @@ use pioneer_protocol::{
     AgentExecutionBackend, BackendSecurityCapabilities, CLIAgentRuntimeKind, SandboxBackendKind,
     SandboxBackendRequirement, TaskAgentSecurityCap, TurnCommandRiskPolicy, TurnEnvironmentPolicy,
     TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
-    TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnNetworkMode,
-    TurnNetworkPolicySnapshot, TurnPermissionMode, TurnPermissionProfileSelection,
+    TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnFilesystemSandboxPolicy,
+    TurnNetworkMode, TurnNetworkPolicySnapshot, TurnPermissionMode, TurnPermissionProfileSelection,
     TurnPermissionProfileSnapshot, TurnProcessPolicySnapshot, TurnProcessTimeoutPolicy,
     TurnSandboxMode, TurnSecurityBackendSnapshot, TurnSecurityCapabilityKind,
     TurnSecurityDegradation, TurnSecurityEnforcementStatus, TurnSecurityExecutionBackendKind,
@@ -153,6 +153,9 @@ pub(crate) fn resolve_turn_execution_security(
     };
     snapshot.permission_profile = input.resolved_permission_profile.clone();
 
+    snapshot.authority_cap.resource_binding_id = format!("workspace:{}:agent", input.workspace_id);
+    snapshot.authority_cap.resource_binding_revision = 1;
+
     Ok(apply_turn_security_backend_capabilities(snapshot, input))
 }
 
@@ -268,6 +271,22 @@ pub(crate) fn resolve_task_child_execution_security_for_backend(
     snapshot.network = network.clone();
     snapshot.sandbox.network = network;
     snapshot.process = process;
+    let authority_cap = &mut snapshot.authority_cap;
+    authority_cap.resource_binding_id = format!("workspace:{workspace_id}:agent");
+    authority_cap.resource_binding_revision = 1;
+    authority_cap.filesystem = TurnFilesystemSandboxPolicy {
+        kind: TurnFilesystemSandboxKind::Restricted,
+        entries: task_cap.max_filesystem_entries.clone(),
+    };
+    authority_cap.network = intersect_network_policies(
+        &parent_snapshot.authority_cap.network,
+        &task_cap.max_network_policy,
+    );
+    authority_cap.process = intersect_process_policies(
+        &parent_snapshot.authority_cap.process,
+        &task_cap.max_process_policy,
+    );
+    authority_cap.approval = approval_scope_policy_for_mode(task_cap.max_permission_profile.mode);
     snapshot.parent_cap = Some(TurnSecurityParentCapSnapshot {
         parent_turn_id: parent_turn_id.to_owned(),
         max_permission_profile: task_cap.max_permission_profile.clone(),
@@ -533,7 +552,7 @@ fn filesystem_entries(
 ) -> Vec<TurnFilesystemSandboxEntry> {
     let mut entries =
         Vec::with_capacity(1 + input.project_roots.len() + input.app_read_roots.len());
-    entries.push(TurnFilesystemSandboxEntry::current_working_directory(
+    entries.push(TurnFilesystemSandboxEntry::workspace_root(
         access,
         input.cwd.to_string_lossy().into_owned(),
     ));
@@ -724,6 +743,22 @@ fn process_policy_for_permission_mode(mode: TurnPermissionMode) -> TurnProcessPo
         TurnPermissionMode::FullAccess => TurnProcessPolicySnapshot::unrestricted(),
         TurnPermissionMode::AutoAcceptEdits | TurnPermissionMode::Supervised => {
             TurnProcessPolicySnapshot::restricted()
+        }
+    }
+}
+
+fn approval_scope_policy_for_mode(
+    mode: TurnPermissionMode,
+) -> pioneer_protocol::TurnApprovalScopePolicySnapshot {
+    match mode {
+        TurnPermissionMode::FullAccess => {
+            pioneer_protocol::TurnApprovalScopePolicySnapshot::full_access()
+        }
+        TurnPermissionMode::AutoAcceptEdits => {
+            pioneer_protocol::TurnApprovalScopePolicySnapshot::auto_accept_edits()
+        }
+        TurnPermissionMode::Supervised => {
+            pioneer_protocol::TurnApprovalScopePolicySnapshot::supervised()
         }
     }
 }
@@ -1204,10 +1239,10 @@ mod tests {
             .filesystem
             .entries
             .iter()
-            .find(|entry| entry.path == TurnFilesystemSandboxPath::CurrentWorkingDirectory)
+            .find(|entry| entry.path == TurnFilesystemSandboxPath::WorkspaceRoot)
             .expect("cwd root should be included");
         assert_eq!(cwd_entry.access, TurnFilesystemAccess::Write);
-        assert_eq!(cwd_entry.provenance, TurnSecurityRuleProvenance::Runtime);
+        assert_eq!(cwd_entry.provenance, TurnSecurityRuleProvenance::Workspace);
 
         let app_entry = snapshot
             .sandbox
@@ -1244,14 +1279,14 @@ mod tests {
         )
         .expect("workspace-write snapshot should resolve");
         assert!(workspace_write.process.shell.enabled);
-        assert!(workspace_write.process.environment.inherit);
+        assert!(!workspace_write.process.environment.inherit);
+        assert!(workspace_write.process.environment.allowed_vars.is_empty());
         assert!(
             workspace_write
                 .process
                 .environment
                 .denied_patterns
-                .iter()
-                .any(|pattern| pattern.contains("TOKEN"))
+                .is_empty()
         );
         assert_eq!(
             workspace_write.process.timeout.max_duration_ms,
@@ -1709,7 +1744,7 @@ mod tests {
         assert!(snapshot.backend.capabilities.can_enforce_network);
         assert!(snapshot.backend.capabilities.can_enforce_process);
         assert!(snapshot.backend.capabilities.supports_request_permissions);
-        assert!(snapshot.backend.capabilities.supports_turn_scope_approval);
+        assert!(!snapshot.backend.capabilities.supports_turn_scope_approval);
         assert!(
             !snapshot
                 .backend
@@ -1765,7 +1800,7 @@ mod tests {
         assert!(!snapshot.backend.capabilities.can_enforce_network);
         assert!(!snapshot.backend.capabilities.can_enforce_process);
         assert!(snapshot.backend.capabilities.supports_request_permissions);
-        assert!(snapshot.backend.capabilities.supports_turn_scope_approval);
+        assert!(!snapshot.backend.capabilities.supports_turn_scope_approval);
         assert!(matches!(
             snapshot.enforcement,
             TurnSecurityEnforcementStatus::Unavailable { .. }
