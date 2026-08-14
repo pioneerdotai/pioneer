@@ -189,7 +189,7 @@ impl PioneerDesktop {
             .child(
                 h_flex()
                     .items_center()
-                    .gap_4()
+                    .gap_2()
                     .when(show_dino, |this| {
                         this.child(
                             div()
@@ -201,7 +201,7 @@ impl PioneerDesktop {
                         v_flex()
                             .pt_1()
                             .gap_1()
-                            .when(!show_dino, |this| this.pt_0().pl_2().mb(px(2.)))
+                            .when(!show_dino, |this| this.pt_0().mb(px(2.)))
                             .child(div().font_semibold().child(status_label))
                             .when_some(security_summary, |this, summary| {
                                 this.child(self.render_turn_security_summary(summary, cx))
