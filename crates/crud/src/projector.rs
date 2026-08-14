@@ -437,42 +437,151 @@ impl TurnProjector {
         actor: Option<&PersistedActorRef>,
         event_sequence: i64,
     ) -> Result<()> {
-        // Sequence 1 may legitimately be replayed after projection-state loss,
-        // and the explicit legacy seam may revisit an actorless in-progress
-        // row to perform its idempotent actor backfill. A second TurnStarted is
-        // necessarily later in the same canonical stream. Fence that identity
-        // reuse before touching Thread/input projections. A terminal read model
-        // is also monotonic even when imported legacy history has no event row.
-        if let Some(existing) = turn::find_turn_by_id(db, payload.turn.id.as_str()).await?
-            && (event_sequence != 1 || existing.status != "in_progress")
-        {
-            anyhow::bail!(
-                "turn `{}` already exists with status `{}`; TurnStarted identity reuse is forbidden",
-                payload.turn.id,
-                existing.status
-            );
-        }
+        self.project_turn_started_identity(db, payload, event_sequence)
+            .await?;
 
         let thread_created_at = unix_to_datetime(payload.thread.created_at);
         let thread_updated_at = unix_to_datetime(payload.thread.updated_at);
         let is_task_run_occurrence = payload.turn.turn_kind == TurnKind::TaskRun;
 
-        if is_task_run_occurrence {
-            // A task-run occurrence is only a parent-timeline projection. The
-            // parent thread and its foreground policy already exist, and a
-            // stale task payload must not overwrite metadata or foreground
-            // state written by a concurrent conversation turn.
-            if thread::find_thread_by_id(db, payload.thread.id.as_str())
-                .await?
-                .is_none()
+        self.project_turn_started_thread(
+            db,
+            payload,
+            actor,
+            thread_created_at,
+            thread_updated_at,
+            is_task_run_occurrence,
+        )
+        .await?;
+        self.project_turn_started_turn(db, payload, actor, thread_updated_at)
+            .await?;
+        self.project_turn_started_input_and_status(
+            db,
+            payload,
+            thread_updated_at,
+            is_task_run_occurrence,
+        )
+        .await
+    }
+
+    fn project_turn_started_identity<'a, C: ConnectionTrait + Sync>(
+        &'a self,
+        db: &'a C,
+        payload: &'a TurnStartedEventPayload,
+        event_sequence: i64,
+    ) -> ProjectFuture<'a> {
+        project_future(async move {
+            // Sequence 1 may legitimately be replayed after projection-state loss,
+            // and the explicit legacy seam may revisit an actorless in-progress
+            // row to perform its idempotent actor backfill. A second TurnStarted is
+            // necessarily later in the same canonical stream. Fence that identity
+            // reuse before touching Thread/input projections. A terminal read model
+            // is also monotonic even when imported legacy history has no event row.
+            if let Some(existing) = turn::find_turn_by_id(db, payload.turn.id.as_str()).await?
+                && (event_sequence != 1 || existing.status != "in_progress")
             {
-                let mut parent = payload.thread.clone();
-                parent.status = ThreadStatus::Idle;
+                anyhow::bail!(
+                    "turn `{}` already exists with status `{}`; TurnStarted identity reuse is forbidden",
+                    payload.turn.id,
+                    existing.status
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_turn_started_thread<'a, C: ConnectionTrait + Sync>(
+        &'a self,
+        db: &'a C,
+        payload: &'a TurnStartedEventPayload,
+        actor: Option<&'a PersistedActorRef>,
+        thread_created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        thread_updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        is_task_run_occurrence: bool,
+    ) -> ProjectFuture<'a> {
+        project_future(async move {
+            if is_task_run_occurrence {
+                // A task-run occurrence is only a parent-timeline projection. The
+                // parent thread and its foreground policy already exist, and a
+                // stale task payload must not overwrite metadata or foreground
+                // state written by a concurrent conversation turn.
+                if thread::find_thread_by_id(db, payload.thread.id.as_str())
+                    .await?
+                    .is_none()
+                {
+                    let mut parent = payload.thread.clone();
+                    parent.status = ThreadStatus::Idle;
+                    match actor {
+                        Some(actor) => {
+                            thread::upsert_thread_with_creator(
+                                db,
+                                &parent,
+                                actor,
+                                thread_created_at,
+                                thread_updated_at,
+                            )
+                            .await?;
+                        }
+                        None => {
+                            thread::upsert_thread(
+                                db,
+                                &parent,
+                                thread_created_at,
+                                thread_updated_at,
+                            )
+                            .await?;
+                        }
+                    }
+                    policy::upsert_thread_sandbox_policy(
+                        db,
+                        parent.id.as_str(),
+                        payload.sandbox_mode,
+                        thread_created_at,
+                        thread_updated_at,
+                    )
+                    .await?;
+                }
+            } else if payload.turn.mode == ThreadMode::Message
+                && thread::find_thread_by_id(db, payload.thread.id.as_str())
+                    .await?
+                    .is_some()
+            {
+                // Message reuses the canonical TurnStarted envelope, but it must
+                // not replay the envelope's full Thread snapshot over concurrent
+                // execution or management changes. New threads still take the
+                // normal insertion path below.
+                let derived_preview = message_thread_preview(payload.input.as_slice());
+                thread::touch_thread_for_completed_message(
+                    db,
+                    payload.thread.id.as_str(),
+                    derived_preview.as_str(),
+                    thread_updated_at,
+                )
+                .await?;
+                if policy::find_thread_sandbox_mode(db, payload.thread.id.as_str())
+                    .await?
+                    .is_none()
+                {
+                    // Atomic first-Message materialization inserts the user thread
+                    // before this event is projected. Seed its existing policy row
+                    // without replacing a policy changed by another operation.
+                    policy::upsert_thread_sandbox_policy(
+                        db,
+                        payload.thread.id.as_str(),
+                        payload.sandbox_mode,
+                        thread_created_at,
+                        thread_updated_at,
+                    )
+                    .await?;
+                }
+            } else {
                 match actor {
                     Some(actor) => {
                         thread::upsert_thread_with_creator(
                             db,
-                            &parent,
+                            &payload.thread,
                             actor,
                             thread_created_at,
                             thread_updated_at,
@@ -480,43 +589,15 @@ impl TurnProjector {
                         .await?;
                     }
                     None => {
-                        thread::upsert_thread(db, &parent, thread_created_at, thread_updated_at)
-                            .await?;
+                        thread::upsert_thread(
+                            db,
+                            &payload.thread,
+                            thread_created_at,
+                            thread_updated_at,
+                        )
+                        .await?;
                     }
                 }
-                policy::upsert_thread_sandbox_policy(
-                    db,
-                    parent.id.as_str(),
-                    payload.sandbox_mode,
-                    thread_created_at,
-                    thread_updated_at,
-                )
-                .await?;
-            }
-        } else if payload.turn.mode == ThreadMode::Message
-            && thread::find_thread_by_id(db, payload.thread.id.as_str())
-                .await?
-                .is_some()
-        {
-            // Message reuses the canonical TurnStarted envelope, but it must
-            // not replay the envelope's full Thread snapshot over concurrent
-            // execution or management changes. New threads still take the
-            // normal insertion path below.
-            let derived_preview = message_thread_preview(payload.input.as_slice());
-            thread::touch_thread_for_completed_message(
-                db,
-                payload.thread.id.as_str(),
-                derived_preview.as_str(),
-                thread_updated_at,
-            )
-            .await?;
-            if policy::find_thread_sandbox_mode(db, payload.thread.id.as_str())
-                .await?
-                .is_none()
-            {
-                // Atomic first-Message materialization inserts the user thread
-                // before this event is projected. Seed its existing policy row
-                // without replacing a policy changed by another operation.
                 policy::upsert_thread_sandbox_policy(
                     db,
                     payload.thread.id.as_str(),
@@ -526,81 +607,70 @@ impl TurnProjector {
                 )
                 .await?;
             }
-        } else {
+
+            Ok(())
+        })
+    }
+
+    fn project_turn_started_turn<'a, C: ConnectionTrait + Sync>(
+        &'a self,
+        db: &'a C,
+        payload: &'a TurnStartedEventPayload,
+        actor: Option<&'a PersistedActorRef>,
+        thread_updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> ProjectFuture<'a> {
+        project_future(async move {
             match actor {
                 Some(actor) => {
-                    thread::upsert_thread_with_creator(
+                    turn::upsert_turn_with_initiator(
                         db,
-                        &payload.thread,
+                        payload.turn.id.as_str(),
+                        payload.thread.id.as_str(),
+                        &payload.turn,
+                        None,
+                        payload.reasoning_effort.as_deref(),
                         actor,
-                        thread_created_at,
+                        thread_updated_at,
                         thread_updated_at,
                     )
                     .await?;
                 }
                 None => {
-                    thread::upsert_thread(
+                    turn::upsert_turn(
                         db,
-                        &payload.thread,
-                        thread_created_at,
+                        payload.turn.id.as_str(),
+                        payload.thread.id.as_str(),
+                        &payload.turn,
+                        None,
+                        payload.reasoning_effort.as_deref(),
+                        thread_updated_at,
                         thread_updated_at,
                     )
                     .await?;
                 }
             }
-            policy::upsert_thread_sandbox_policy(
+
+            Ok(())
+        })
+    }
+
+    fn project_turn_started_input_and_status<'a, C: ConnectionTrait + Sync>(
+        &'a self,
+        db: &'a C,
+        payload: &'a TurnStartedEventPayload,
+        thread_updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        is_task_run_occurrence: bool,
+    ) -> ProjectFuture<'a> {
+        project_future(async move {
+            turn::replace_turn_input(
                 db,
-                payload.thread.id.as_str(),
-                payload.sandbox_mode,
-                thread_created_at,
+                payload.turn.id.as_str(),
+                payload.input.as_slice(),
                 thread_updated_at,
             )
             .await?;
-        }
 
-        let turn_error = payload.turn.error.clone();
-
-        match actor {
-            Some(actor) => {
-                turn::upsert_turn_with_initiator(
-                    db,
-                    payload.turn.id.as_str(),
-                    payload.thread.id.as_str(),
-                    &payload.turn,
-                    None,
-                    payload.reasoning_effort.as_deref(),
-                    actor,
-                    thread_updated_at,
-                    thread_updated_at,
-                )
-                .await?;
-            }
-            None => {
-                turn::upsert_turn(
-                    db,
-                    payload.turn.id.as_str(),
-                    payload.thread.id.as_str(),
-                    &payload.turn,
-                    None,
-                    payload.reasoning_effort.as_deref(),
-                    thread_updated_at,
-                    thread_updated_at,
-                )
-                .await?;
-            }
-        }
-
-        turn::replace_turn_input(
-            db,
-            payload.turn.id.as_str(),
-            payload.input.as_slice(),
-            thread_updated_at,
-        )
-        .await?;
-
-        let should_append_status = true;
-
-        if should_append_status {
+            let turn_error = payload.turn.error.clone();
             turn::append_turn_status_history(
                 db,
                 payload.turn.id.as_str(),
@@ -609,18 +679,18 @@ impl TurnProjector {
                 thread_updated_at,
             )
             .await?;
-        }
 
-        if is_task_run_occurrence {
-            self.project_thread_foreground_status(
-                db,
-                payload.thread.id.as_str(),
-                thread_updated_at,
-            )
-            .await?;
-        }
+            if is_task_run_occurrence {
+                self.project_thread_foreground_status(
+                    db,
+                    payload.thread.id.as_str(),
+                    thread_updated_at,
+                )
+                .await?;
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn project_turn_finished<C: ConnectionTrait + Sync>(

@@ -34518,9 +34518,12 @@ mod tests {
             )
             .await
             .expect_err("terminal projection without turn/start must fail closed");
+        let error = format!("{error:#}");
         assert!(
-            format!("{error:#}").contains("has no preceding turn/start projection"),
-            "unexpected terminal projection error: {error:#}"
+            error.contains("refusing to append orphan `turn/completed` event")
+                && error.contains("missing turn `turn_terminal_without_start`")
+                && error.contains("thread `thr_terminal_without_start`"),
+            "unexpected terminal projection error: {error}"
         );
 
         assert!(
@@ -34531,28 +34534,14 @@ mod tests {
                 .is_none(),
             "failed terminal projection must not insert an actorless turn"
         );
-        let event = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
-            .one(&connection)
-            .await
-            .expect("turn event lookup should succeed")
-            .expect("failed projection must preserve its append-only event");
-        let projection_state =
-            pioneer_entity::turn_event_projection_state::Entity::find_by_id(event.id)
+        assert!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
                 .one(&connection)
                 .await
-                .expect("projection state lookup should succeed")
-                .expect("failed projection must preserve its projection state");
-        assert_eq!(
-            projection_state.status,
-            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED
-        );
-        assert!(
-            projection_state
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains("has no preceding turn/start projection")),
-            "projection failure must retain the terminal-without-start diagnostic"
+                .expect("turn event lookup should succeed")
+                .is_none(),
+            "orphan terminal event must be rejected before append"
         );
     }
 

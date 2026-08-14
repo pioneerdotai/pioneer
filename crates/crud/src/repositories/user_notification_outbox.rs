@@ -150,7 +150,8 @@ pub async fn acknowledge_user_notification<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{Database, DbBackend, Schema};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::Database;
 
     use super::*;
 
@@ -159,9 +160,18 @@ mod tests {
         let db = Database::connect("sqlite::memory:")
             .await
             .expect("in-memory database");
-        let statement = Schema::new(DbBackend::Sqlite)
-            .create_table_from_entity(user_notification_outbox::Entity);
-        db.execute(&statement).await.expect("outbox table");
+        Migrator::up(&db, None).await.expect("migrations");
+        db.execute_unprepared(
+            "INSERT INTO task_delivery \
+             (id, workspace_id, task_id, run_id, delivery_key, mode, status, \
+              attempt_count, max_attempts, created_at, updated_at) \
+             VALUES \
+             ('delivery-a', 'workspace-a', 'task-a', 'run-a', \
+              'delivery-key-a', 'user_notification', 'running', 1, 3, \
+              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .await
+        .expect("parent task delivery");
         let notification = NewUserNotificationOutbox {
             id: "notification-a".to_owned(),
             task_delivery_id: "delivery-a".to_owned(),

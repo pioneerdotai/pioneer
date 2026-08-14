@@ -584,209 +584,225 @@ impl TaskAgentExecutor {
         });
         let child_execution_backend = turn_params.execution_backend.clone();
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
-            let conversation_history = frozen_conversation_scope
-                .as_ref()
-                .map(|(_, history)| history.clone())
-                .unwrap_or_default();
-            let child_security_snapshot = resolve_task_child_cli_execution_security_snapshot(
-                processor,
-                context.workspace_id.as_str(),
-                parent,
-                agent_spec,
-                child_permission_profile.clone(),
-                runtime_id.as_str(),
-                runtime_kind,
-                child_thread_id.as_str(),
-                child_turn_id.as_str(),
-            )
-            .await
-            .context("failed to resolve hidden task CLI runtime execution security")?;
-            let cli_execution_backend = AgentExecutionBackend::CLIAgentRuntime {
-                runtime_id: runtime_id.clone(),
-                runtime_kind,
-            };
-            let child_authorization_context = resolve_task_child_execution_authorization_context(
-                processor,
-                task,
-                parent,
-                effective_model_provider.as_str(),
-                effective_model.model.as_str(),
-                Some(&cli_execution_backend),
-                turn_params.capabilities.as_slice(),
-                &child_security_snapshot.permission_profile,
-            )
-            .await
-            .context("failed to resolve hidden task CLI runtime authorization")?;
-            // Child-scoped authorization is revalidated while CLI MCP and skill
-            // projections are committed. Persist the durable lineage first so
-            // those checks can prove that the hidden thread belongs to the
-            // parent's authorization root.
-            handle
-                .link_child_thread_with_runtime(
-                    child_runtime.lineage.clone(),
-                    binding,
-                    child_runtime.task_run_turn.clone(),
-                    now,
+            return message_future(async move {
+                let conversation_history = frozen_conversation_scope
+                    .as_ref()
+                    .map(|(_, history)| history.clone())
+                    .unwrap_or_default();
+                let child_security_snapshot = resolve_task_child_cli_execution_security_snapshot(
+                    processor,
+                    context.workspace_id.as_str(),
+                    parent,
+                    agent_spec,
+                    child_permission_profile.clone(),
+                    runtime_id.as_str(),
+                    runtime_kind,
+                    child_thread_id.as_str(),
+                    child_turn_id.as_str(),
                 )
                 .await
-                .context("failed to link hidden task CLI runtime turn")?;
-            // The shared CLI preparation future is deliberately large. Run it
-            // from a fresh Tokio task so Task scheduler dispatch frames do not
-            // consume the native runtime worker's stack before preparation
-            // begins.
-            let prepare_processor = processor.clone();
-            let continuation_thread_id = parent.parent_thread_id.clone();
-            let task_run_id = run.id.clone();
-            let execution_id = execution.id.clone();
-            let prepared = message_fresh_task(async move {
-                prepare_processor
-                    .prepare_task_cli_runtime_turn(
-                        TurnStartParams {
-                            input: child_input,
-                            model: Some(effective_model.model),
-                            model_provider: Some(effective_model_provider),
-                            mode: Some(child_mode),
-                            ..turn_params
-                        },
-                        runtime_id,
-                        runtime_kind,
-                        child_permission_profile,
-                        child_security_snapshot,
-                        child_authorization_context,
-                        continuation_thread_id.clone(),
-                        continuation_thread_id,
-                        task_run_id,
-                        execution_id,
-                        conversation_history,
+                .context("failed to resolve hidden task CLI runtime execution security")?;
+                let cli_execution_backend = AgentExecutionBackend::CLIAgentRuntime {
+                    runtime_id: runtime_id.clone(),
+                    runtime_kind,
+                };
+                let child_authorization_context =
+                    resolve_task_child_execution_authorization_context(
+                        processor,
+                        task,
+                        parent,
+                        effective_model_provider.as_str(),
+                        effective_model.model.as_str(),
+                        Some(&cli_execution_backend),
+                        turn_params.capabilities.as_slice(),
+                        &child_security_snapshot.permission_profile,
                     )
                     .await
-            })
-            .await
-            .map_err(|error| anyhow!("task CLI runtime preparation task failed: {error}"))?;
-            let prepared = match prepared {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    if processor
-                        .crud_store
-                        .get_task_run(run.id.as_str())
-                        .await?
-                        .is_some_and(|current| current.status.is_terminal())
-                    {
-                        return Ok(TaskExecutorStartOutcome::Started);
+                    .context("failed to resolve hidden task CLI runtime authorization")?;
+                // Child-scoped authorization is revalidated while CLI MCP and skill
+                // projections are committed. Persist the durable lineage first so
+                // those checks can prove that the hidden thread belongs to the
+                // parent's authorization root.
+                handle
+                    .link_child_thread_with_runtime(
+                        child_runtime.lineage.clone(),
+                        binding,
+                        child_runtime.task_run_turn.clone(),
+                        now,
+                    )
+                    .await
+                    .context("failed to link hidden task CLI runtime turn")?;
+                // The shared CLI preparation future is deliberately large. Run it
+                // from a fresh Tokio task so Task scheduler dispatch frames do not
+                // consume the native runtime worker's stack before preparation
+                // begins.
+                let prepare_processor = processor.clone();
+                let continuation_thread_id = parent.parent_thread_id.clone();
+                let task_run_id = run.id.clone();
+                let execution_id = execution.id.clone();
+                let prepared = message_fresh_task(async move {
+                    prepare_processor
+                        .prepare_task_cli_runtime_turn(
+                            TurnStartParams {
+                                input: child_input,
+                                model: Some(effective_model.model),
+                                model_provider: Some(effective_model_provider),
+                                mode: Some(child_mode),
+                                ..turn_params
+                            },
+                            runtime_id,
+                            runtime_kind,
+                            child_permission_profile,
+                            child_security_snapshot,
+                            child_authorization_context,
+                            continuation_thread_id.clone(),
+                            continuation_thread_id,
+                            task_run_id,
+                            execution_id,
+                            conversation_history,
+                        )
+                        .await
+                })
+                .await
+                .map_err(|error| anyhow!("task CLI runtime preparation task failed: {error}"))?;
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        if processor
+                            .crud_store
+                            .get_task_run(run.id.as_str())
+                            .await?
+                            .is_some_and(|current| current.status.is_terminal())
+                        {
+                            return Ok(TaskExecutorStartOutcome::Started);
+                        }
+                        record_task_run_turn_failure(
+                            &handle,
+                            &child_runtime.task_run_turn,
+                            TaskRunTurnStatus::Failed,
+                            Some(task_error(
+                                "task_cli_runtime_prepare_failed",
+                                format!(
+                                    "failed to prepare hidden task CLI runtime turn: {error:#}"
+                                ),
+                                TaskErrorClass::Internal,
+                                Some(run.id.clone()),
+                            )),
+                            now_timestamp_secs(),
+                        )
+                        .await
+                        .context("failed to record hidden task CLI runtime preparation failure")?;
+                        return Err(error)
+                            .context("failed to prepare hidden task CLI runtime turn");
                     }
+                };
+                if processor
+                    .crud_store
+                    .get_task_run(run.id.as_str())
+                    .await?
+                    .is_none_or(|current| current.status.is_terminal())
+                {
+                    processor
+                        .abort_prepared_task_cli_runtime_turn(
+                            prepared,
+                            "task run became terminal before its CLI runtime turn was activated"
+                                .to_owned(),
+                        )
+                        .await;
                     record_task_run_turn_failure(
                         &handle,
                         &child_runtime.task_run_turn,
-                        TaskRunTurnStatus::Failed,
+                        TaskRunTurnStatus::Blocked,
                         Some(task_error(
-                            "task_cli_runtime_prepare_failed",
-                            format!("failed to prepare hidden task CLI runtime turn: {error:#}"),
-                            TaskErrorClass::Internal,
+                            "task_cli_runtime_start_superseded",
+                            "task run became terminal before its CLI runtime turn was activated",
+                            TaskErrorClass::Cancelled,
                             Some(run.id.clone()),
                         )),
                         now_timestamp_secs(),
                     )
                     .await
-                    .context("failed to record hidden task CLI runtime preparation failure")?;
-                    return Err(error).context("failed to prepare hidden task CLI runtime turn");
+                    .context("failed to close superseded hidden task CLI runtime turn")?;
+                    return Ok(TaskExecutorStartOutcome::Started);
                 }
-            };
-            if processor
-                .crud_store
-                .get_task_run(run.id.as_str())
-                .await?
-                .is_none_or(|current| current.status.is_terminal())
-            {
-                processor
-                    .abort_prepared_task_cli_runtime_turn(
-                        prepared,
-                        "task run became terminal before its CLI runtime turn was activated"
-                            .to_owned(),
+
+                if let Err(error) =
+                    verify_durable_task_child_admission(processor, &child_runtime, &execution).await
+                {
+                    let abort_reason = format!(
+                        "task CLI runtime child admission could not be verified: {error:#}"
+                    );
+                    processor
+                        .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
+                        .await;
+                    return Err(error).context("failed to verify task CLI runtime child admission");
+                }
+
+                let started_at = now_timestamp_secs();
+                if let Err(error) = handle.mark_started(started_at).await {
+                    let abort_reason =
+                        format!("failed to mark task CLI runtime run started: {error:#}");
+                    processor
+                        .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
+                        .await;
+                    return Err(error).context("failed to mark task CLI runtime run started");
+                }
+                if let Err(error) = processor
+                    .crud_store
+                    .mark_execution_running(
+                        execution.id.as_str(),
+                        started_at,
+                        Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
                     )
-                    .await;
-                record_task_run_turn_failure(
-                    &handle,
-                    &child_runtime.task_run_turn,
-                    TaskRunTurnStatus::Blocked,
-                    Some(task_error(
-                        "task_cli_runtime_start_superseded",
-                        "task run became terminal before its CLI runtime turn was activated",
-                        TaskErrorClass::Cancelled,
-                        Some(run.id.clone()),
-                    )),
-                    now_timestamp_secs(),
-                )
-                .await
-                .context("failed to close superseded hidden task CLI runtime turn")?;
+                    .await
+                {
+                    let abort_reason =
+                        format!("failed to mark task CLI runtime execution running: {error:#}");
+                    processor
+                        .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
+                        .await;
+                    return Err(error).context("failed to mark task CLI runtime execution running");
+                }
+
+                // Activation publishes the canonical user-message lifecycle before
+                // it starts the native runtime. Keep that projection on the same
+                // fresh-task boundary as preparation instead of rebuilding the
+                // scheduler -> executor -> SeaORM poll chain here.
+                let activation_processor = processor.clone();
+                let activation_result = message_fresh_task(async move {
+                    activation_processor
+                        .activate_prepared_task_cli_runtime_turn(prepared)
+                        .await
+                })
+                .await;
+                if matches!(activation_result, Ok(Ok(()))) {
+                    spawn_execution_heartbeat(
+                        processor,
+                        execution.id,
+                        child_thread_id,
+                        child_turn_id,
+                        run.id.clone(),
+                    );
+                }
                 return Ok(TaskExecutorStartOutcome::Started);
-            }
-
-            if let Err(error) =
-                verify_durable_task_child_admission(processor, &child_runtime, &execution).await
-            {
-                let abort_reason =
-                    format!("task CLI runtime child admission could not be verified: {error:#}");
-                processor
-                    .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
-                    .await;
-                return Err(error).context("failed to verify task CLI runtime child admission");
-            }
-
-            let started_at = now_timestamp_secs();
-            if let Err(error) = handle.mark_started(started_at).await {
-                let abort_reason =
-                    format!("failed to mark task CLI runtime run started: {error:#}");
-                processor
-                    .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
-                    .await;
-                return Err(error).context("failed to mark task CLI runtime run started");
-            }
-            if let Err(error) = processor
-                .crud_store
-                .mark_execution_running(
-                    execution.id.as_str(),
-                    started_at,
-                    Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+            })
+            .await;
+        }
+        message_future(async move {
+            let turn_outcome = processor
+                .thread_manager
+                .system_turn_start_with_permission_profile(
+                    TurnStartParams {
+                        input: child_input,
+                        model: Some(effective_model.model),
+                        model_provider: Some(effective_model.model_provider),
+                        mode: Some(child_mode),
+                        ..turn_params
+                    },
+                    child_permission_profile,
                 )
                 .await
-            {
-                let abort_reason =
-                    format!("failed to mark task CLI runtime execution running: {error:#}");
-                processor
-                    .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
-                    .await;
-                return Err(error).context("failed to mark task CLI runtime execution running");
-            }
-
-            if processor
-                .activate_prepared_task_cli_runtime_turn(prepared)
-                .await
-                .is_ok()
-            {
-                spawn_execution_heartbeat(
-                    processor,
-                    execution.id,
-                    child_thread_id,
-                    child_turn_id,
-                    run.id.clone(),
-                );
-            }
-            return Ok(TaskExecutorStartOutcome::Started);
-        }
-        let turn_outcome = processor
-            .thread_manager
-            .system_turn_start_with_permission_profile(
-                TurnStartParams {
-                    input: child_input,
-                    model: Some(effective_model.model),
-                    model_provider: Some(effective_model.model_provider),
-                    mode: Some(child_mode),
-                    ..turn_params
-                },
-                child_permission_profile,
-            )
-            .await
-            .context("failed to create hidden task turn")?;
+                .context("failed to create hidden task turn")?;
 
         if let Err(error) = processor
             .validate_turn_artifact_user_inputs(
@@ -884,24 +900,36 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to reserve hidden task execution quota");
             }
         };
-        if let Err(error) = message_future(
-            processor
-                .crud_store
+        // Turn-start projection is one atomic CRUD operation, but its SeaORM
+        // future is intentionally large. Poll it from a fresh task so the
+        // scheduler -> TaskExecutor -> child-admission frames are not stacked
+        // underneath the projector. Abort-on-drop preserves cancellation and
+        // lets the transaction roll back if its caller disappears.
+        let materialize_store = processor.crud_store.clone();
+        let materialize_thread = turn_outcome.materialization.thread.clone();
+        let materialize_sandbox_mode = turn_outcome.materialization.sandbox_mode;
+        let materialize_turn = turn_outcome.materialization.turn.clone();
+        let materialize_input = turn_outcome.materialization.input.clone();
+        let materialize_reasoning_effort = reasoning_effort.clone();
+        let materialize_result = message_fresh_task(async move {
+            materialize_store
                 .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
-                    &turn_outcome.materialization.thread,
-                    turn_outcome.materialization.sandbox_mode,
-                    &turn_outcome.materialization.turn,
-                    &turn_outcome.materialization.input,
-                    reasoning_effort.as_deref(),
+                    &materialize_thread,
+                    materialize_sandbox_mode,
+                    &materialize_turn,
+                    &materialize_input,
+                    materialize_reasoning_effort.as_deref(),
                     pioneer_protocol::PersistedActorRef::System,
                     profile_selected_audit,
                     child_authority_json.as_str(),
                     None,
                     Some(child_turn_admission),
-                ),
-        )
+                )
+                .await
+        })
         .await
-        {
+        .map_err(|error| anyhow!("hidden task turn projection task failed: {error}"))?;
+        if let Err(error) = materialize_result {
             processor
                 .thread_manager
                 .rollback_turn_start(turn_outcome.rollback_context)
@@ -1198,7 +1226,9 @@ impl TaskAgentExecutor {
             run.id.clone(),
         );
 
-        Ok(TaskExecutorStartOutcome::Started)
+            Ok(TaskExecutorStartOutcome::Started)
+        })
+        .await
     }
 
     pub(crate) async fn dispatch_revision_turn(
