@@ -44,6 +44,7 @@ impl PioneerDesktop {
             .child(
                 h_flex()
                     .items_center()
+                    .gap_0p5()
                     .child(
                         Button::new("bottom-bar-open-threads")
                             .ghost()
@@ -69,7 +70,7 @@ impl PioneerDesktop {
                                 cx.notify();
                             })),
                     )
-                    .child(Separator::vertical().h_4().mx_1())
+                    .child(Separator::vertical().h_4().mx_0p5())
                     .child(
                         Button::new("bottom-bar-open-providers")
                             .ghost()
@@ -138,7 +139,7 @@ impl PioneerDesktop {
                                 cx.notify();
                             })),
                     )
-                    .child(Separator::vertical().h_4().mx_1())
+                    .child(Separator::vertical().h_4().mx_0p5())
                     .child(
                         Button::new("bottom-bar-open-administration")
                             .ghost()
@@ -190,6 +191,7 @@ impl PioneerDesktop {
             .child(
                 h_flex()
                     .items_center()
+                    .gap_0p5()
                     .child(if show_task_notifications {
                         self.render_task_user_notifications_button(cx)
                     } else {

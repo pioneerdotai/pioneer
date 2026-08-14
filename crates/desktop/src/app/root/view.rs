@@ -161,7 +161,7 @@ impl Render for PioneerDesktop {
                                         // })
                                         .child(
                                             h_flex()
-                                                .gap_1()
+                                                .gap_0p5()
                                                 .child(if !is_gateway_setup_required {
                                                     Button::new("toggle-keepawake")
                                                         .ghost()
