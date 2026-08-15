@@ -1926,6 +1926,16 @@ pub struct DueTaskTriggerReconciliation {
     pub appended_events: Vec<AppendedTaskEvent>,
 }
 
+/// Result of reconciling the canonical TaskRun occurrence Turn with its
+/// authoritative TaskRun aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRunOccurrenceTerminalizationOutcome {
+    Changed,
+    AlreadyConsistent,
+    NotFound,
+    InvalidBinding,
+}
+
 #[derive(Debug, Clone)]
 pub struct EditTurnMessageRequest {
     pub workspace_id: String,
@@ -11276,6 +11286,149 @@ impl CrudStore {
             .collect()
     }
 
+    /// Atomically compare the canonical occurrence Turn (`Turn.id == TaskRun.id`)
+    /// with its authoritative terminal TaskRun and materialize the terminal Turn
+    /// event only when their statuses differ.
+    pub async fn compare_and_materialize_task_run_occurrence_terminal(
+        &self,
+        run_id: &str,
+        fallback_completed_at: i64,
+    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
+        let run_id = run_id.to_owned();
+        self.run_serialized_write(|| {
+            self.compare_and_materialize_task_run_occurrence_terminal_once(
+                run_id.clone(),
+                fallback_completed_at,
+            )
+        })
+        .await
+    }
+
+    async fn compare_and_materialize_task_run_occurrence_terminal_once(
+        &self,
+        run_id: String,
+        fallback_completed_at: i64,
+    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin TaskRun occurrence terminalization transaction")?;
+
+        let result = async {
+            let Some(run_model) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
+            else {
+                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
+            };
+            let run = task_run_from_db_model(run_model)?;
+            let (desired_status, desired_error) = match run.status {
+                TaskRunStatus::Succeeded => (TurnStatus::Completed, None),
+                TaskRunStatus::Failed | TaskRunStatus::TimedOut => (
+                    TurnStatus::Failed,
+                    run.error.as_ref().map(|error| error.message.clone()),
+                ),
+                TaskRunStatus::Blocked => (
+                    TurnStatus::Blocked,
+                    run.error.as_ref().map(|error| error.message.clone()),
+                ),
+                TaskRunStatus::Cancelled => (
+                    TurnStatus::Interrupted,
+                    run.error.as_ref().map(|error| error.message.clone()),
+                ),
+                TaskRunStatus::Queued
+                | TaskRunStatus::Starting
+                | TaskRunStatus::Running
+                | TaskRunStatus::Waiting
+                | TaskRunStatus::WaitingReview => {
+                    bail!(
+                        "TaskRun `{}` is not terminal and cannot terminalize its occurrence Turn",
+                        run.id
+                    );
+                }
+            };
+
+            // The occurrence identity is canonical and does not depend on
+            // optional/legacy lineage rows: Turn.id is exactly TaskRun.id.
+            let Some(turn_model) = turn::find_turn_by_id(&transaction, run.id.as_str()).await?
+            else {
+                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
+            };
+            if turn_kind_from_db(turn_model.turn_kind.as_str()) != Some(TurnKind::TaskRun) {
+                return Ok(TaskRunOccurrenceTerminalizationOutcome::InvalidBinding);
+            }
+            let current_status = turn_status_from_db(turn_model.status.as_str())
+                .with_context(|| format!("occurrence Turn `{}` has an unknown status", run.id))?;
+            if current_status == desired_status {
+                return Ok(TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent);
+            }
+            let thread_model =
+                thread::find_thread_by_id(&transaction, turn_model.thread_id.as_str()).await?;
+            let Some(thread_model) = thread_model else {
+                return Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound);
+            };
+            let Some(mut terminal_turn) = turn_from_db_model(turn_model)? else {
+                bail!("occurrence Turn `{}` has an unknown status", run.id);
+            };
+            terminal_turn.status = desired_status;
+            terminal_turn.error = desired_error;
+
+            let terminal_event = match desired_status {
+                TurnStatus::Completed => {
+                    TurnEventPayload::TurnCompleted(pioneer_protocol::TurnCompletedNotification {
+                        workspace_id: thread_model.workspace_id,
+                        thread_id: thread_model.id,
+                        turn: terminal_turn,
+                    })
+                }
+                TurnStatus::Failed | TurnStatus::Interrupted => {
+                    TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
+                        workspace_id: thread_model.workspace_id,
+                        thread_id: thread_model.id,
+                        turn: terminal_turn,
+                    })
+                }
+                TurnStatus::Blocked => {
+                    TurnEventPayload::TurnBlocked(pioneer_protocol::TurnBlockedNotification {
+                        workspace_id: thread_model.workspace_id,
+                        thread_id: thread_model.id,
+                        turn: terminal_turn,
+                        resume: None,
+                    })
+                }
+                TurnStatus::InProgress => unreachable!("TaskRun terminal status mapping"),
+            };
+            let completed_at = run.completed_at.unwrap_or(fallback_completed_at);
+            let created_at = unix_to_datetime(completed_at);
+            let claim_expires_at =
+                unix_to_datetime(completed_at.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
+            self.append_and_project_turn_event_in_transaction(
+                &transaction,
+                terminal_event,
+                created_at,
+                claim_expires_at,
+                false,
+            )
+            .await?;
+
+            Ok(TaskRunOccurrenceTerminalizationOutcome::Changed)
+        }
+        .await;
+
+        match result {
+            Ok(outcome) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit TaskRun occurrence terminalization transaction")?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn reserve_execution_for_run(
         &self,
         run_id: &str,
@@ -13005,32 +13158,7 @@ impl CrudStore {
             return Ok(None);
         };
 
-        let Some(status) = turn_status_from_db(turn_model.status.as_str()) else {
-            return Ok(None);
-        };
-
-        let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
-        let permission_profile = parse_turn_permission_profile(&turn_model)?;
-        let collaboration = turn::collaboration_from_model(&turn_model)?;
-
-        Ok(Some((
-            thread_model.workspace_id,
-            Turn {
-                id: turn_model.id,
-                status,
-                turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str()).unwrap_or_default(),
-                origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
-                mode: collaboration.mode.effective_mode,
-                author: collaboration.author,
-                reply_to_turn_id: collaboration.reply_to_turn_id,
-                mentions: collaboration.mentions,
-                message_revision: collaboration.message_revision,
-                message_deleted: collaboration.message_deleted,
-                error: turn_model.error,
-                prompt_manifest,
-                permission_profile,
-            },
-        )))
+        Ok(turn_from_db_model(turn_model)?.map(|turn| (thread_model.workspace_id, turn)))
     }
 
     pub async fn get_turns_by_thread_and_ids(
@@ -22788,6 +22916,31 @@ fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Res
     }))
 }
 
+fn turn_from_db_model(model: pioneer_entity::turn::Model) -> Result<Option<Turn>> {
+    let Some(status) = turn_status_from_db(model.status.as_str()) else {
+        return Ok(None);
+    };
+    let prompt_manifest = parse_turn_prompt_manifest(&model)?;
+    let permission_profile = parse_turn_permission_profile(&model)?;
+    let collaboration = turn::collaboration_from_model(&model)?;
+
+    Ok(Some(Turn {
+        id: model.id,
+        status,
+        turn_kind: turn_kind_from_db(model.turn_kind.as_str()).unwrap_or_default(),
+        origin: turn_origin_from_db(model.origin.as_str()).unwrap_or_default(),
+        mode: collaboration.mode.effective_mode,
+        author: collaboration.author,
+        reply_to_turn_id: collaboration.reply_to_turn_id,
+        mentions: collaboration.mentions,
+        message_revision: collaboration.message_revision,
+        message_deleted: collaboration.message_deleted,
+        error: model.error,
+        prompt_manifest,
+        permission_profile,
+    }))
+}
+
 fn decode_turn_input_model(model: pioneer_entity::turn_input::Model) -> Result<UserInput> {
     match serde_json::from_str::<UserInput>(model.payload.as_str()) {
         Ok(input) => Ok(input),
@@ -22995,18 +23148,18 @@ mod tests {
         THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
         TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskOwnedTurnResumeOutcome,
-        TaskRunChildAnchor, ThreadAgentsDocError, ThreadAgentsDocSaveReason, ThreadAgentsDocStatus,
-        ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
-        ThreadEpisodicCapsuleWriteState, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
-        ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
-        ThreadEpisodicWorkspaceActiveWriteSegmentRequest, ThreadTimelineApprovalScope,
-        ThreadTimelineBlockRecord, TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord,
-        TurnExecutionWindowUsageAggregateRecord, TurnItemAttemptDeadlines, TurnMcpBindingRecord,
-        TurnMcpProjectionPersistenceError, TurnMcpProjectionRecord, TurnMcpProjectionReplacement,
-        TurnMessageMutationFailure, TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
-        create_gateway_singleton, create_member_principal, create_superuser,
-        delete_workspace_membership, insert_workspace_membership,
-        list_abandoned_runtime_draft_artifact_ids,
+        TaskRunChildAnchor, TaskRunOccurrenceTerminalizationOutcome, ThreadAgentsDocError,
+        ThreadAgentsDocSaveReason, ThreadAgentsDocStatus, ThreadEpisodicActiveWriteSegmentRequest,
+        ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
+        ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicSourceActorRole,
+        ThreadEpisodicSourceRuntimeKind, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
+        ThreadTimelineApprovalScope, ThreadTimelineBlockRecord, TurnExecutionCheckpointKind,
+        TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
+        TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnMcpProjectionPersistenceError,
+        TurnMcpProjectionRecord, TurnMcpProjectionReplacement, TurnMessageMutationFailure,
+        TurnSkillBindingRecord, WorkspaceSkillPolicyRecord, create_gateway_singleton,
+        create_member_principal, create_superuser, delete_workspace_membership,
+        insert_workspace_membership, list_abandoned_runtime_draft_artifact_ids,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
         tool_call_status, upsert_thread_timeline_block,
@@ -28808,6 +28961,183 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
         }
+    }
+
+    async fn terminal_task_run_occurrence_fixture(
+        occurrence_kind: Option<TurnKind>,
+    ) -> (CrudStore, Thread, TaskRun) {
+        let store = test_store_with_workspace("ws_task").await;
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: "ws_task".to_owned(),
+            id: "thr_task".to_owned(),
+            name: Some("TaskRun occurrence reconciliation".to_owned()),
+            preview: String::new(),
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::System)
+            .await
+            .expect("parent thread should persist");
+
+        let task = sample_task(timestamp);
+        let mut run = sample_task_run(timestamp);
+        run.trigger_id = None;
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                    TaskEventPayload::RunStarted {
+                        task_id: task.id.clone(),
+                        run_id: run.id.clone(),
+                        started_at: timestamp + 1,
+                    },
+                    TaskEventPayload::RunCompleted {
+                        task_id: task.id,
+                        run_id: run.id.clone(),
+                        result: None,
+                        completed_at: timestamp + 2,
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("terminal TaskRun should persist");
+        let run = store
+            .get_task_run(run.id.as_str())
+            .await
+            .expect("TaskRun should load")
+            .expect("TaskRun should exist");
+        assert_eq!(run.status, TaskRunStatus::Succeeded);
+
+        if let Some(turn_kind) = occurrence_kind {
+            let occurrence = Turn {
+                id: run.id.clone(),
+                status: TurnStatus::InProgress,
+                turn_kind,
+                origin: TurnOrigin::ScheduledTask,
+                ..sample_turn(run.id.as_str())
+            };
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &occurrence,
+                    &[],
+                    PersistedActorRef::System,
+                )
+                .await
+                .expect("occurrence Turn should persist");
+        }
+
+        (store, thread, run)
+    }
+
+    #[tokio::test]
+    async fn task_run_occurrence_terminalization_returns_not_found_for_missing_canonical_turn() {
+        let (store, _thread, run) = terminal_task_run_occurrence_fixture(None).await;
+
+        assert_eq!(
+            store
+                .compare_and_materialize_task_run_occurrence_terminal(
+                    run.id.as_str(),
+                    1_700_000_003,
+                )
+                .await
+                .expect("missing occurrence should be classified"),
+            TaskRunOccurrenceTerminalizationOutcome::NotFound,
+        );
+    }
+
+    #[tokio::test]
+    async fn task_run_occurrence_terminalization_rejects_non_task_run_canonical_binding() {
+        let (store, _thread, run) =
+            terminal_task_run_occurrence_fixture(Some(TurnKind::Conversation)).await;
+
+        assert_eq!(
+            store
+                .compare_and_materialize_task_run_occurrence_terminal(
+                    run.id.as_str(),
+                    1_700_000_003,
+                )
+                .await
+                .expect("invalid occurrence binding should be classified"),
+            TaskRunOccurrenceTerminalizationOutcome::InvalidBinding,
+        );
+        let occurrence = store
+            .get_turn("thr_task", run.id.as_str())
+            .await
+            .expect("occurrence should load")
+            .expect("occurrence should remain present")
+            .1;
+        assert_eq!(occurrence.status, TurnStatus::InProgress);
+        assert_eq!(occurrence.turn_kind, TurnKind::Conversation);
+    }
+
+    #[tokio::test]
+    async fn task_run_occurrence_terminalization_repairs_legacy_canonical_binding_once() {
+        let (store, _thread, run) =
+            terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
+
+        assert_eq!(
+            store
+                .list_mismatched_terminal_task_run_occurrence_ids(10)
+                .await
+                .expect("mismatched occurrences should list"),
+            vec![run.id.clone()],
+        );
+        assert_eq!(
+            store
+                .compare_and_materialize_task_run_occurrence_terminal(
+                    run.id.as_str(),
+                    1_700_000_003,
+                )
+                .await
+                .expect("legacy canonical occurrence should reconcile"),
+            TaskRunOccurrenceTerminalizationOutcome::Changed,
+        );
+        assert_eq!(
+            store
+                .compare_and_materialize_task_run_occurrence_terminal(
+                    run.id.as_str(),
+                    1_700_000_004,
+                )
+                .await
+                .expect("repeated reconciliation should be idempotent"),
+            TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent,
+        );
+        assert!(
+            store
+                .list_mismatched_terminal_task_run_occurrence_ids(10)
+                .await
+                .expect("reconciled occurrences should list")
+                .is_empty(),
+            "a repaired occurrence must leave the polling candidate set",
+        );
+        let occurrence = store
+            .get_turn("thr_task", run.id.as_str())
+            .await
+            .expect("occurrence should load")
+            .expect("occurrence should exist")
+            .1;
+        assert_eq!(occurrence.status, TurnStatus::Completed);
+        assert_eq!(occurrence.turn_kind, TurnKind::TaskRun);
     }
 
     #[tokio::test]

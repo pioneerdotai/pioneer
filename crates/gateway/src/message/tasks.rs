@@ -1,9 +1,10 @@
 use super::*;
 use anyhow::{Result, bail};
+use pioneer_crud::TaskRunOccurrenceTerminalizationOutcome;
 use pioneer_protocol::{
     ItemUpdatedNotification, TaskAttachmentMode, TaskDeliveryStatus, TaskEventPayload,
     TaskExecutorKind, TaskGetResponse, TaskRescheduleReason, TaskResultCandidateStatus,
-    TaskRunThreadBindingKind, TaskThreadLineage, TaskTriggerKind, TurnKind,
+    TaskTriggerKind,
 };
 use serde_json::json;
 
@@ -129,9 +130,23 @@ impl MessageProcessor {
             {
                 continue;
             }
-            self.mark_task_run_occurrence_turn_terminal(&task_response, run.id.as_str())
-                .await?;
-            reconciled = reconciled.saturating_add(1);
+            match self
+                .mark_task_run_occurrence_turn_terminal(run.id.as_str())
+                .await?
+            {
+                TaskRunOccurrenceTerminalizationOutcome::Changed => {
+                    reconciled = reconciled.saturating_add(1);
+                }
+                TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent => {}
+                TaskRunOccurrenceTerminalizationOutcome::NotFound => warn!(
+                    run_id = run.id.as_str(),
+                    "TaskRun occurrence reconciliation could not find the canonical occurrence Turn"
+                ),
+                TaskRunOccurrenceTerminalizationOutcome::InvalidBinding => warn!(
+                    run_id = run.id.as_str(),
+                    "TaskRun occurrence reconciliation rejected a non-task_run canonical Turn binding"
+                ),
+            }
         }
         Ok(reconciled)
     }
@@ -313,7 +328,7 @@ impl MessageProcessor {
             }
             TaskEventPayload::RunCompleted { run_id, .. } => {
                 if !awaits_origin_thread_delivery {
-                    self.mark_task_run_occurrence_turn_terminal(&task_response, run_id.as_str())
+                    self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                         .await?;
                 }
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
@@ -330,7 +345,7 @@ impl MessageProcessor {
                 }
             }
             TaskEventPayload::RunFailed { run_id, .. } => {
-                self.mark_task_run_occurrence_turn_terminal(&task_response, run_id.as_str())
+                self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
@@ -346,7 +361,7 @@ impl MessageProcessor {
                 }
             }
             TaskEventPayload::RunBlocked { run_id, .. } => {
-                self.mark_task_run_occurrence_turn_terminal(&task_response, run_id.as_str())
+                self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
@@ -362,7 +377,7 @@ impl MessageProcessor {
                 }
             }
             TaskEventPayload::RunCancelled { run_id, .. } => {
-                self.mark_task_run_occurrence_turn_terminal(&task_response, run_id.as_str())
+                self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
@@ -615,11 +630,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::DeliveryDelivered { delivery, attempt } => {
-                self.mark_task_run_occurrence_turn_terminal(
-                    &task_response,
-                    delivery.run_id.as_str(),
-                )
-                .await?;
+                self.mark_task_run_occurrence_turn_terminal(delivery.run_id.as_str())
+                    .await?;
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
@@ -634,11 +646,8 @@ impl MessageProcessor {
             }
             TaskEventPayload::DeliveryFailed { delivery, attempt } => {
                 if delivery.status == TaskDeliveryStatus::Failed {
-                    self.mark_task_run_occurrence_turn_terminal(
-                        &task_response,
-                        delivery.run_id.as_str(),
-                    )
-                    .await?;
+                    self.mark_task_run_occurrence_turn_terminal(delivery.run_id.as_str())
+                        .await?;
                 }
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
@@ -653,11 +662,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::DeliveryCancelled { delivery, reason } => {
-                self.mark_task_run_occurrence_turn_terminal(
-                    &task_response,
-                    delivery.run_id.as_str(),
-                )
-                .await?;
+                self.mark_task_run_occurrence_turn_terminal(delivery.run_id.as_str())
+                    .await?;
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
@@ -1112,70 +1118,62 @@ impl MessageProcessor {
 impl MessageProcessor {
     pub(super) async fn mark_task_run_occurrence_turn_terminal(
         &self,
-        response: &TaskGetResponse,
         run_id: &str,
-    ) -> Result<()> {
-        let Some(run) = response.runs.iter().find(|run| run.id == run_id) else {
-            return Ok(());
-        };
-        let (status, error) = match run.status {
-            pioneer_protocol::TaskRunStatus::Succeeded => (TurnStatus::Completed, None),
-            pioneer_protocol::TaskRunStatus::Failed | pioneer_protocol::TaskRunStatus::TimedOut => {
-                (
-                    TurnStatus::Failed,
-                    run.error.as_ref().map(|error| error.message.clone()),
-                )
-            }
-            pioneer_protocol::TaskRunStatus::Blocked => (
-                TurnStatus::Blocked,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            pioneer_protocol::TaskRunStatus::Cancelled => (
-                TurnStatus::Interrupted,
-                run.error.as_ref().map(|error| error.message.clone()),
-            ),
-            pioneer_protocol::TaskRunStatus::Queued
-            | pioneer_protocol::TaskRunStatus::Starting
-            | pioneer_protocol::TaskRunStatus::Running
-            | pioneer_protocol::TaskRunStatus::Waiting
-            | pioneer_protocol::TaskRunStatus::WaitingReview => return Ok(()),
-        };
-        let Some(lineage) = task_run_primary_thread_lineage(response, run_id) else {
-            return Ok(());
-        };
-        let Some(parent_turn_id) = lineage.created_by_turn_id.as_deref() else {
-            return Ok(());
-        };
-        let parent_thread_id = lineage
-            .created_by_thread_id
-            .as_deref()
-            .unwrap_or(lineage.parent_thread_id.as_str());
-        let Some((workspace_id, mut turn)) = self
+    ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
+        let outcome = self
             .crud_store
-            .get_turn(parent_thread_id, parent_turn_id)
-            .await?
-        else {
-            return Ok(());
-        };
-        if turn.turn_kind != TurnKind::TaskRun || turn.status == status {
-            return Ok(());
+            .compare_and_materialize_task_run_occurrence_terminal(run_id, now_timestamp_secs())
+            .await?;
+        if outcome != TaskRunOccurrenceTerminalizationOutcome::Changed {
+            return Ok(outcome);
         }
 
-        turn.status = status;
-        turn.error = error;
-        let completed_at = run.completed_at.unwrap_or_else(now_timestamp_secs);
-        match status {
+        // Durable CAS is authoritative. Subscriber fan-out is deliberately
+        // best-effort and cannot turn an already committed reconciliation into
+        // an apparent failure that would be retried and counted again.
+        let Some((parent_thread_id, _workspace_id)) =
+            (match self.crud_store.get_turn_location(run_id).await {
+                Ok(location) => location,
+                Err(error) => {
+                    warn!(
+                        run_id,
+                        error = %format!("{error:#}"),
+                        "failed to locate reconciled TaskRun occurrence for subscriber fan-out"
+                    );
+                    None
+                }
+            })
+        else {
+            return Ok(outcome);
+        };
+        let Some((workspace_id, turn)) = (match self
+            .crud_store
+            .get_turn(parent_thread_id.as_str(), run_id)
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                warn!(
+                    run_id,
+                    thread_id = parent_thread_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to load reconciled TaskRun occurrence for subscriber fan-out"
+                );
+                None
+            }
+        }) else {
+            return Ok(outcome);
+        };
+
+        match turn.status {
             TurnStatus::Completed => {
                 let notification = TurnCompletedNotification {
                     workspace_id,
-                    thread_id: parent_thread_id.to_owned(),
+                    thread_id: parent_thread_id.clone(),
                     turn,
                 };
-                self.crud_store
-                    .materialize_turn_completed(notification.clone(), completed_at)
-                    .await?;
                 self.send_notification_to_thread_subscribers(
-                    parent_thread_id,
+                    parent_thread_id.as_str(),
                     events::TURN_COMPLETED,
                     &notification,
                 )
@@ -1190,14 +1188,11 @@ impl MessageProcessor {
             TurnStatus::Failed | TurnStatus::Interrupted => {
                 let notification = TurnFailedNotification {
                     workspace_id,
-                    thread_id: parent_thread_id.to_owned(),
+                    thread_id: parent_thread_id.clone(),
                     turn,
                 };
-                self.crud_store
-                    .materialize_turn_failed(notification.clone(), completed_at)
-                    .await?;
                 self.send_notification_to_thread_subscribers(
-                    parent_thread_id,
+                    parent_thread_id.as_str(),
                     events::TURN_FAILED,
                     &notification,
                 )
@@ -1212,15 +1207,12 @@ impl MessageProcessor {
             TurnStatus::Blocked => {
                 let notification = TurnBlockedNotification {
                     workspace_id,
-                    thread_id: parent_thread_id.to_owned(),
+                    thread_id: parent_thread_id.clone(),
                     turn,
                     resume: None,
                 };
-                self.crud_store
-                    .materialize_turn_blocked(notification.clone(), completed_at)
-                    .await?;
                 self.send_notification_to_thread_subscribers(
-                    parent_thread_id,
+                    parent_thread_id.as_str(),
                     events::TURN_BLOCKED,
                     &notification,
                 )
@@ -1232,29 +1224,13 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            TurnStatus::InProgress => {}
+            TurnStatus::InProgress => warn!(
+                run_id,
+                "TaskRun occurrence remained in_progress after terminal CAS"
+            ),
         }
-        Ok(())
+        Ok(outcome)
     }
-}
-
-fn task_run_primary_thread_lineage<'a>(
-    response: &'a TaskGetResponse,
-    run_id: &str,
-) -> Option<&'a TaskThreadLineage> {
-    response
-        .task_run_thread_bindings
-        .iter()
-        .find(|binding| {
-            binding.run_id == run_id
-                && binding.binding_kind == TaskRunThreadBindingKind::PrimaryExecutor
-        })
-        .and_then(|binding| {
-            response
-                .thread_lineage
-                .iter()
-                .find(|lineage| lineage.child_thread_id == binding.thread_id)
-        })
 }
 
 fn should_refresh_parent_task_anchor(

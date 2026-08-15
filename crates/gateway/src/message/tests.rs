@@ -16081,6 +16081,14 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         1,
         "durable delivery state must repair a missed live fanout"
     );
+    assert_eq!(
+        processor
+            .reconcile_terminal_task_run_occurrence_turns(10)
+            .await
+            .expect("idempotent terminal occurrence reconciliation should succeed"),
+        0,
+        "an already repaired occurrence must not be counted or polled again"
+    );
     let delivery_delivered_event = processor
         .task_runtime
         .service()
