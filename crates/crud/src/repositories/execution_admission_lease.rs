@@ -164,6 +164,83 @@ pub async fn reserve<C: ConnectionTrait>(
         .context("execution admission lease is missing after reservation")
 }
 
+/// Reacquires an immutable lease after an explicit blocked-Task readmission.
+///
+/// A released lease is never reopened by the ordinary `reserve` path: that
+/// would let a replayed creation write resurrect terminal work. This separate
+/// operation is used only by the transactional Task resume path after Gateway
+/// has validated an explicit authorization readmission.
+pub async fn reacquire<C: ConnectionTrait>(
+    db: &C,
+    lease: NewExecutionAdmissionLease,
+    reacquired_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+) -> Result<execution_admission_lease::Model> {
+    let Some(existing) = find_by_subject(db, &lease.subject_kind, &lease.subject_id).await? else {
+        return reserve(db, lease, reacquired_at).await;
+    };
+    ensure_same_immutable_lease(&existing, &lease)?;
+    if existing.status == EXECUTION_LEASE_STATUS_ACTIVE {
+        return Ok(existing);
+    }
+    if existing.status != EXECUTION_LEASE_STATUS_RELEASED {
+        bail!(
+            "execution admission lease `{}` has unknown status `{}`",
+            existing.id,
+            existing.status
+        );
+    }
+
+    let bucket = lease.operation_class.bucket();
+    let ceilings = lease.policy.ceilings(bucket);
+    enforce_scope_ceiling(
+        db,
+        bucket,
+        execution_admission_lease::Column::PrincipalId,
+        lease.principal_id.as_str(),
+        ceilings.per_principal,
+        "principal",
+    )
+    .await?;
+    enforce_scope_ceiling(
+        db,
+        bucket,
+        execution_admission_lease::Column::RoleKey,
+        lease.role_key.as_str(),
+        ceilings.per_role,
+        "role",
+    )
+    .await?;
+    enforce_scope_ceiling(
+        db,
+        bucket,
+        execution_admission_lease::Column::WorkspaceId,
+        lease.workspace_id.as_str(),
+        ceilings.per_workspace,
+        "workspace",
+    )
+    .await?;
+    let gateway_count = active_bucket_query(bucket).count(db).await?;
+    if gateway_count >= u64::from(ceilings.gateway) {
+        bail!(
+            "Gateway {} execution quota is exhausted (limit {})",
+            bucket.as_str(),
+            ceilings.gateway
+        );
+    }
+
+    let mut active: execution_admission_lease::ActiveModel = existing.into();
+    active.status = Set(EXECUTION_LEASE_STATUS_ACTIVE.to_owned());
+    active.released_at = Set(None);
+    active
+        .update(db)
+        .await
+        .context("failed to reacquire durable execution admission lease")?;
+
+    find_by_subject(db, &lease.subject_kind, &lease.subject_id)
+        .await?
+        .context("execution admission lease is missing after reacquisition")
+}
+
 pub async fn release_by_subject<C: ConnectionTrait>(
     db: &C,
     subject_kind: &str,

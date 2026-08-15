@@ -1653,7 +1653,6 @@ impl AuthorizedTask {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn root_thread_id(&self) -> Option<&str> {
         match self.resource() {
             AuthorizationResource::Task { root_thread_id, .. } => {

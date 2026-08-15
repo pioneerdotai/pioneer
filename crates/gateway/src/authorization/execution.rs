@@ -5,9 +5,9 @@ use pioneer_crud::{CrudStore, PersistedThreadAccessClass};
 use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
     AgentExecutionBackend, AuthSessionId, CLIAgentRuntimeKind, GatewayId, PolicyGeneration,
-    PrincipalId, PrincipalKind, RoleKey, TaskCreateParams, TaskTriggerKind, ThreadVisibility,
-    TurnCapability, TurnPermissionProfileCap, TurnPermissionProfileSnapshot, TurnSkillBinding,
-    TurnStartParams, UserInput,
+    PrincipalId, PrincipalKind, RoleKey, TaskCreateParams, TaskGetResponse, TaskTriggerKind,
+    ThreadVisibility, TurnCapability, TurnPermissionProfileCap, TurnPermissionProfileSnapshot,
+    TurnSkillBinding, TurnStartParams, UserInput,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -214,6 +214,89 @@ impl ExecutionAdmissionRequest {
             required_root_action: ResourceAction::TaskCreate,
             additional_required_actions,
             workspace_id: params.workspace_id.clone(),
+            root_thread_id: root_thread_id.to_owned(),
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            execution_backend: launch.and_then(|launch| launch.execution_backend.clone()),
+            capabilities: launch
+                .map(|launch| launch.capabilities.clone())
+                .unwrap_or_default(),
+            artifacts: input_sources.artifacts,
+            has_local_attachment_sources: input_sources.has_local_paths,
+            has_url_attachment_sources: input_sources.has_urls,
+            provider_authority_fingerprint,
+        })
+    }
+
+    pub(crate) fn for_existing_task(
+        response: &TaskGetResponse,
+        root_thread_id: &str,
+        fallback_provider: &str,
+        fallback_model: &str,
+        provider_authority_fingerprint: Option<String>,
+    ) -> Result<Self> {
+        let launch = response
+            .task
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.composer_work.as_ref())
+            .map(|work| &work.launch);
+        let agent_spec = response
+            .agent_specs
+            .iter()
+            .rev()
+            .find(|spec| spec.run_id.is_none());
+        let provider = launch
+            .and_then(|launch| launch.model_provider.as_deref())
+            .or_else(|| agent_spec.and_then(|spec| spec.model_provider.as_deref()))
+            .unwrap_or(fallback_provider)
+            .trim();
+        let model = launch
+            .and_then(|launch| launch.model.as_deref())
+            .or_else(|| agent_spec.and_then(|spec| spec.model.as_deref()))
+            .unwrap_or(fallback_model)
+            .trim();
+        let entry_point = if response
+            .triggers
+            .first()
+            .is_some_and(|trigger| trigger.kind() == TaskTriggerKind::Immediate)
+        {
+            ExecutionAdmissionEntryPoint::Task
+        } else {
+            ExecutionAdmissionEntryPoint::Scheduler
+        };
+        let mut input_sources = match launch {
+            Some(launch) => execution_input_sources(launch.input.as_slice())?,
+            None => ExecutionInputSources::default(),
+        };
+        if let Some(agent_spec) = agent_spec {
+            if let Some(input) = agent_spec.prompt.input.as_ref() {
+                input_sources.merge(task_agent_input_sources(input)?);
+            }
+            if let Some(context) = agent_spec.context_policy.as_ref()
+                && let Some(custom_context) = context.custom_context.as_ref()
+            {
+                input_sources.merge(task_agent_input_sources(
+                    &pioneer_protocol::TaskAgentInput {
+                        text: None,
+                        variables: Vec::new(),
+                        attachments: custom_context.attachments.clone(),
+                        references: custom_context.references.clone(),
+                    },
+                )?);
+            }
+        }
+        let additional_required_actions = agent_spec
+            .and_then(|spec| spec.context_policy.as_ref())
+            .is_some_and(|policy| policy.include_artifacts)
+            .then_some(ResourceAction::ArtifactRead)
+            .into_iter()
+            .collect();
+        Ok(Self {
+            entry_point,
+            required_root_action: ResourceAction::TaskCreate,
+            additional_required_actions,
+            workspace_id: response.task.workspace_id.clone(),
             root_thread_id: root_thread_id.to_owned(),
             provider: provider.to_owned(),
             model: model.to_owned(),

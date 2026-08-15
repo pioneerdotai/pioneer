@@ -1692,11 +1692,22 @@ impl TaskToolHandler {
         {
             return Ok(function_output(output));
         }
+        let execution_admission = self
+            .processor
+            .task_execution_readmission_seed(
+                &authorization.principal,
+                Some(authorization.root_thread_id.as_str()),
+                params.task_id.as_str(),
+            )
+            .await
+            .map_err(|_| task_tool_authorization_error())?;
+        let mut mutation_context = authorization.mutation_context(&self.context);
+        mutation_context.execution_admission = execution_admission;
         let response = self
             .processor
             .task_runtime
             .service()
-            .resume_task(authorization.mutation_context(&self.context), params)
+            .resume_task(mutation_context, params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let output = json!({

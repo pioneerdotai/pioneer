@@ -36,6 +36,10 @@ pub struct TaskMutationContext {
     pub actor_id: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
+    /// Gateway-validated authority used only when explicitly reopening a
+    /// blocked Agent Task. Ordinary mutations and non-Agent Tasks leave this
+    /// empty.
+    pub execution_admission: Option<TaskExecutionAdmissionSeed>,
     pub task_resource_budget: Option<pioneer_protocol::TaskResourceBudget>,
 }
 
@@ -45,6 +49,7 @@ impl TaskMutationContext {
             actor_id: None,
             thread_id: Some(thread_id.into()),
             turn_id: Some(turn_id.into()),
+            execution_admission: None,
             task_resource_budget: None,
         }
     }
@@ -54,6 +59,7 @@ impl TaskMutationContext {
             actor_id: Some(actor_id.into()),
             thread_id: None,
             turn_id: None,
+            execution_admission: None,
             task_resource_budget: None,
         }
     }

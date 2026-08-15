@@ -5,8 +5,8 @@ use crate::executor::{
     TaskExecutionContext, TaskExecutionHandle, TaskExecutor, TaskExecutorRegistry,
 };
 use crate::policy::{
-    TaskCreateContext, TaskMutationContext, TaskWaitContext, default_delivery_policy,
-    default_lifecycle_policy, default_retry_policy,
+    TaskCreateContext, TaskExecutionAdmissionSeed, TaskMutationContext, TaskWaitContext,
+    default_delivery_policy, default_lifecycle_policy, default_retry_policy,
 };
 use crate::projector::TaskProjector;
 use crate::reconciliation::TaskStartupReconciler;
@@ -1789,39 +1789,7 @@ impl TaskService {
             };
         let execution_admission = context
             .execution_admission
-            .map(|seed| {
-                if seed.workspace_id != task.workspace_id {
-                    bail!("Task execution admission belongs to another workspace");
-                }
-                Ok(pioneer_crud::NewTaskExecutionAdmission {
-                    task_id: task.id.clone(),
-                    workspace_id: seed.workspace_id,
-                    root_thread_id: seed.root_thread_id,
-                    initiating_principal_id: seed.initiating_principal_id.clone(),
-                    authorization_context_json: seed.authorization_context_json,
-                    created_at: chrono::Utc::now().fixed_offset(),
-                    execution_lease: Some(pioneer_crud::NewExecutionAdmissionLease {
-                        id: format!("quota:task:{}", task.id),
-                        subject_kind: "task".to_owned(),
-                        subject_id: task.id.clone(),
-                        operation_class: if matches!(
-                            trigger_kind,
-                            TaskTriggerKind::ScheduledAt
-                                | TaskTriggerKind::Interval
-                                | TaskTriggerKind::Cron
-                        ) {
-                            pioneer_crud::ExecutionAdmissionClass::ScheduledTask
-                        } else {
-                            pioneer_crud::ExecutionAdmissionClass::QueuedTask
-                        },
-                        principal_id: seed.initiating_principal_id,
-                        role_key: seed.role_key,
-                        workspace_id: task.workspace_id.clone(),
-                        policy_fingerprint: seed.policy_fingerprint,
-                        policy: seed.execution_resources,
-                    }),
-                })
-            })
+            .map(|seed| new_task_execution_admission(&task, std::slice::from_ref(&trigger), seed))
             .transpose()?;
         let append_result = match execution_admission {
             Some(admission) => {
@@ -2016,7 +1984,9 @@ impl TaskService {
         };
         self.ensure_execution_can_cancel_task(&context, params.task_id.as_str())
             .await?;
-        if is_terminal_task(root_response.task.status) {
+        if is_terminal_task(root_response.task.status)
+            && root_response.task.status != TaskStatus::Blocked
+        {
             return Ok(TaskCancelResponse {
                 task: root_response.task,
                 cancelled_tasks: Vec::new(),
@@ -2692,15 +2662,37 @@ impl TaskService {
 
     pub async fn resume_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskResumeParams,
     ) -> TaskRuntimeResult<TaskResumeResponse> {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
-        if is_terminal_task(response.task.status) {
+        let was_blocked = response.task.status == TaskStatus::Blocked;
+        if is_terminal_task(response.task.status) && !was_blocked {
             bail!("terminal task `{}` cannot be resumed", params.task_id);
         }
+        let readmission = match (
+            was_blocked,
+            response.task.executor_kind,
+            context.execution_admission,
+        ) {
+            (true, TaskExecutorKind::Agent, Some(seed)) => Some(new_task_execution_admission(
+                &response.task,
+                &response.triggers,
+                seed,
+            )?),
+            (true, TaskExecutorKind::Agent, None) => {
+                bail!("blocked Agent Task requires an execution authorization readmission")
+            }
+            (true, _, None) | (false, _, None) => None,
+            (true, _, Some(_)) => {
+                bail!("non-agent Task cannot carry an agent execution authorization admission")
+            }
+            (false, _, Some(_)) => {
+                bail!("execution readmission is only valid for a blocked Agent Task")
+            }
+        };
         let now = now_timestamp_secs();
         let mut task = response.task;
         let mut resumed_any = false;
@@ -2714,7 +2706,7 @@ impl TaskService {
             }
             triggers.push(trigger);
         }
-        if !resumed_any {
+        if !resumed_any && !was_blocked {
             return Ok(TaskResumeResponse { task, triggers });
         }
         task.status = if triggers
@@ -2725,19 +2717,28 @@ impl TaskService {
         } else {
             TaskStatus::Waiting
         };
+        task.error = None;
+        task.completed_at = None;
         task.updated_at = now;
         task.revision = task.revision.saturating_add(1);
-        let appended = task_service_future(self.append_event(
-            TaskEventPayload::TaskResumed {
-                task: task.clone(),
-                triggers: triggers.clone(),
-                reason: params.reason,
-                resumed_at: now,
-            },
-            now,
-        ))
-        .await?;
-        self.publish_and_wake(vec![appended]).await;
+        let event = TaskEventPayload::TaskResumed {
+            task: task.clone(),
+            triggers: triggers.clone(),
+            reason: params.reason,
+            resumed_at: now,
+        };
+        let appended = match readmission {
+            Some(admission) => {
+                task_service_future(self.projector.append_events_with_execution_readmission(
+                    vec![event],
+                    now,
+                    admission,
+                ))
+                .await?
+            }
+            None => vec![task_service_future(self.append_event(event, now)).await?],
+        };
+        self.publish_and_wake(appended).await;
         self.process_due_once(now).await?;
         Ok(TaskResumeResponse { task, triggers })
     }
@@ -3734,7 +3735,7 @@ impl TaskService {
         cancelled_deliveries: &mut Vec<TaskDelivery>,
         cancelled_executions: &mut Vec<(String, Option<TaskError>)>,
     ) -> TaskRuntimeResult<()> {
-        if is_terminal_task(response.task.status) {
+        if is_terminal_task(response.task.status) && response.task.status != TaskStatus::Blocked {
             return Ok(());
         }
         for run in response
@@ -3793,11 +3794,12 @@ impl TaskService {
             self.push_cancelled_write_locks_for_run(run.id.as_str(), reason, now, events)
                 .await?;
         }
-        for trigger in response
-            .triggers
-            .iter()
-            .filter(|trigger| trigger.status == TaskTriggerStatus::Active)
-        {
+        for trigger in response.triggers.iter().filter(|trigger| {
+            matches!(
+                trigger.status,
+                TaskTriggerStatus::Active | TaskTriggerStatus::Paused
+            )
+        }) {
             let mut trigger = trigger.clone();
             trigger.status = TaskTriggerStatus::Cancelled;
             trigger.next_fire_at = None;
@@ -3833,6 +3835,7 @@ impl TaskService {
         }
         if let Some(current_response) = self.store.get_task(response.task.id.as_str()).await?
             && is_terminal_task(current_response.task.status)
+            && current_response.task.status != TaskStatus::Blocked
         {
             return Ok(());
         }
@@ -5037,6 +5040,45 @@ pub(crate) fn now_timestamp_secs() -> i64 {
 
 pub(crate) fn is_terminal_task(status: TaskStatus) -> bool {
     status.is_terminal()
+}
+
+fn new_task_execution_admission(
+    task: &Task,
+    triggers: &[TaskTrigger],
+    seed: TaskExecutionAdmissionSeed,
+) -> TaskRuntimeResult<pioneer_crud::NewTaskExecutionAdmission> {
+    if seed.workspace_id != task.workspace_id {
+        bail!("Task execution admission belongs to another workspace");
+    }
+    let scheduled = triggers.iter().any(|trigger| {
+        matches!(
+            trigger.kind(),
+            TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+        )
+    });
+    Ok(pioneer_crud::NewTaskExecutionAdmission {
+        task_id: task.id.clone(),
+        workspace_id: seed.workspace_id,
+        root_thread_id: seed.root_thread_id,
+        initiating_principal_id: seed.initiating_principal_id.clone(),
+        authorization_context_json: seed.authorization_context_json,
+        created_at: chrono::Utc::now().fixed_offset(),
+        execution_lease: Some(pioneer_crud::NewExecutionAdmissionLease {
+            id: format!("quota:task:{}", task.id),
+            subject_kind: "task".to_owned(),
+            subject_id: task.id.clone(),
+            operation_class: if scheduled {
+                pioneer_crud::ExecutionAdmissionClass::ScheduledTask
+            } else {
+                pioneer_crud::ExecutionAdmissionClass::QueuedTask
+            },
+            principal_id: seed.initiating_principal_id,
+            role_key: seed.role_key,
+            workspace_id: task.workspace_id.clone(),
+            policy_fingerprint: seed.policy_fingerprint,
+            policy: seed.execution_resources,
+        }),
+    })
 }
 
 pub(crate) fn is_terminal_run(status: TaskRunStatus) -> bool {

@@ -32,6 +32,13 @@ pub async fn insert_immutable<C: ConnectionTrait>(
     let task_id = admission.task_id.clone();
     let execution_lease = admission.execution_lease.clone();
     let created_at = admission.created_at;
+    if let Some(persisted) = find_by_task(db, task_id.as_str()).await? {
+        ensure_matches(&persisted, &expected)?;
+        if let Some(execution_lease) = execution_lease {
+            super::execution_admission_lease::reserve(db, execution_lease, created_at).await?;
+        }
+        return Ok(persisted);
+    }
     task_execution_admission::Entity::insert(task_execution_admission::ActiveModel {
         task_id: Set(admission.task_id),
         workspace_id: Set(admission.workspace_id),
@@ -55,13 +62,23 @@ pub async fn insert_immutable<C: ConnectionTrait>(
     let persisted = find_by_task(db, task_id.as_str())
         .await?
         .context("Task execution admission is missing after insert")?;
-    if persisted.task_id != expected.task_id
-        || persisted.workspace_id != expected.workspace_id
-        || persisted.root_thread_id != expected.root_thread_id
-        || persisted.initiating_principal_id != expected.initiating_principal_id
-        || persisted.authorization_context_json != expected.authorization_context_json
-    {
-        anyhow::bail!("Task execution admission conflicts with its immutable persisted value");
+    ensure_matches(&persisted, &expected)?;
+    Ok(persisted)
+}
+
+/// Persists (or verifies) the immutable Task authority and reacquires its
+/// released quota lease for an explicit blocked-Task resume.
+pub async fn readmit_immutable<C: ConnectionTrait>(
+    db: &C,
+    admission: NewTaskExecutionAdmission,
+) -> Result<TaskExecutionAdmissionRecord> {
+    let execution_lease = admission.execution_lease.clone();
+    let reacquired_at = admission.created_at;
+    let mut admission_without_lease = admission;
+    admission_without_lease.execution_lease = None;
+    let persisted = insert_immutable(db, admission_without_lease).await?;
+    if let Some(execution_lease) = execution_lease {
+        super::execution_admission_lease::reacquire(db, execution_lease, reacquired_at).await?;
     }
     Ok(persisted)
 }
@@ -86,4 +103,19 @@ fn record_from_model(model: task_execution_admission::Model) -> TaskExecutionAdm
         authorization_context_json: model.authorization_context_json,
         created_at: model.created_at,
     }
+}
+
+fn ensure_matches(
+    persisted: &TaskExecutionAdmissionRecord,
+    expected: &NewTaskExecutionAdmission,
+) -> Result<()> {
+    if persisted.task_id != expected.task_id
+        || persisted.workspace_id != expected.workspace_id
+        || persisted.root_thread_id != expected.root_thread_id
+        || persisted.initiating_principal_id != expected.initiating_principal_id
+        || persisted.authorization_context_json != expected.authorization_context_json
+    {
+        anyhow::bail!("Task execution admission conflicts with its immutable persisted value");
+    }
+    Ok(())
 }

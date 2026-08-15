@@ -10704,6 +10704,22 @@ impl CrudStore {
         .await
     }
 
+    pub async fn append_task_events_with_execution_readmission(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        admission: NewTaskExecutionAdmission,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.run_serialized_write(|| {
+            self.append_task_events_with_execution_readmission_once(
+                events.clone(),
+                event_timestamp_secs,
+                admission.clone(),
+            )
+        })
+        .await
+    }
+
     pub async fn append_due_trigger_task_events(
         &self,
         trigger_id: &str,
@@ -21261,6 +21277,41 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         }
     }
 
+    async fn append_task_events_with_execution_readmission_once(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        admission: NewTaskExecutionAdmission,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin blocked Task readmission transaction")?;
+        let result = async {
+            let appended_events = self
+                .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
+                .await?;
+            task_execution_admission::readmit_immutable(&transaction, admission).await?;
+            Ok(appended_events)
+        }
+        .await;
+
+        match result {
+            Ok(appended_events) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit blocked Task readmission transaction")?;
+                Ok(appended_events)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     async fn append_due_trigger_task_events_once(
         &self,
         trigger_id: String,
@@ -22790,10 +22841,10 @@ mod tests {
         IngestArtifactMetadataRecord, McpAuditEventRecord, McpServerCatalogSnapshotRecord,
         McpServerInstallationRecord, NativeExecutionWindowTransition, NewArtifactBlobRecord,
         NewCliRuntimeInstructionProjection, NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest,
-        NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, NewMemberPrincipalRow,
-        NewThreadEpisodicItemRecord, NewTurnExecutionCheckpointRecord,
-        NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
-        NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
+        NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, NewExecutionAdmissionLease,
+        NewMemberPrincipalRow, NewTaskExecutionAdmission, NewThreadEpisodicItemRecord,
+        NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
+        NewTurnRuntimeSnapshot, NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
         PrepareTurnFinalizationOutcome, PreparedClaudeProviderSessionMode, ProjectionPageAnchor,
         RecoveryJobRecord, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
         SkillDependencySnapshotRecord, SkillInstallationPatch, SkillInstallationRecord,
@@ -28814,6 +28865,103 @@ mod tests {
         assert_eq!(blocked.triggers[0].status, TaskTriggerStatus::Paused);
         assert_eq!(blocked.triggers[0].next_fire_at, None);
         assert_eq!(blocked.triggers[0].updated_at, timestamp + 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_task_missing_admission_is_readmitted_with_resume_atomically() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection);
+        let timestamp = 1_700_000_000;
+        let task = sample_task(timestamp);
+        let trigger = sample_task_trigger(timestamp);
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::TriggerCreated {
+                        trigger: trigger.clone(),
+                    },
+                    TaskEventPayload::TaskBlocked {
+                        task_id: task.id.clone(),
+                        error: None,
+                        blocked_at: timestamp + 1,
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("legacy task should block without an admission row");
+
+        let mut resumed_task = task.clone();
+        resumed_task.status = TaskStatus::Scheduled;
+        resumed_task.updated_at = timestamp + 2;
+        resumed_task.revision += 1;
+        let mut resumed_trigger = trigger;
+        resumed_trigger.status = TaskTriggerStatus::Active;
+        resumed_trigger.next_fire_at = Some(timestamp + 3600);
+        resumed_trigger.updated_at = timestamp + 2;
+        let ceilings = super::ExecutionQuotaCeilings {
+            per_principal: 10,
+            per_role: 10,
+            per_workspace: 10,
+            gateway: 10,
+        };
+        store
+            .append_task_events_with_execution_readmission(
+                vec![TaskEventPayload::TaskResumed {
+                    task: resumed_task,
+                    triggers: vec![resumed_trigger],
+                    reason: Some("permissions confirmed".to_owned()),
+                    resumed_at: timestamp + 2,
+                }],
+                timestamp + 2,
+                NewTaskExecutionAdmission {
+                    task_id: task.id.clone(),
+                    workspace_id: task.workspace_id.clone(),
+                    root_thread_id: "thr_task".to_owned(),
+                    initiating_principal_id: "principal_task".to_owned(),
+                    authorization_context_json: "{\"test\":true}".to_owned(),
+                    created_at: unix_to_datetime(timestamp + 2),
+                    execution_lease: Some(NewExecutionAdmissionLease {
+                        id: format!("quota:task:{}", task.id),
+                        subject_kind: "task".to_owned(),
+                        subject_id: task.id.clone(),
+                        operation_class: super::ExecutionAdmissionClass::ScheduledTask,
+                        principal_id: "principal_task".to_owned(),
+                        role_key: "test_role".to_owned(),
+                        workspace_id: task.workspace_id.clone(),
+                        policy_fingerprint: "test_policy".to_owned(),
+                        policy: super::ExecutionAdmissionQuotaPolicy {
+                            active: ceilings,
+                            queued: ceilings,
+                            scheduled: ceilings,
+                        },
+                    }),
+                },
+            )
+            .await
+            .expect("resume and missing admission insert should commit together");
+
+        let resumed = store
+            .get_task(task.id.as_str())
+            .await
+            .expect("resumed task should load")
+            .expect("resumed task should exist");
+        assert_eq!(resumed.task.status, TaskStatus::Scheduled);
+        assert_eq!(resumed.triggers[0].status, TaskTriggerStatus::Active);
+        assert!(
+            store
+                .get_task_execution_admission(task.id.as_str())
+                .await
+                .expect("admission should query")
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -3909,6 +3909,137 @@ async fn pause_excludes_due_trigger_and_resume_restores_future_fire() {
 }
 
 #[tokio::test]
+async fn blocked_task_can_be_cancelled_and_closes_paused_trigger() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 4_000_000_000,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("scheduled task should create");
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskBlocked {
+                task_id: response.task.id.clone(),
+                error: None,
+                blocked_at: 1_700_000_001,
+            },
+            1_700_000_001,
+        )
+        .await
+        .expect("task should block");
+
+    let cancelled = runtime
+        .service()
+        .cancel_task(
+            TaskMutationContext::default(),
+            TaskCancelParams {
+                task_id: response.task.id.clone(),
+                reason: Some("close blocked work".to_owned()),
+                scope: pioneer_protocol::TaskCancelScope::TaskOnly,
+            },
+        )
+        .await
+        .expect("blocked task should cancel");
+    assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+    let persisted = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .expect("cancelled task should read");
+    assert_eq!(persisted.task.status, TaskStatus::Cancelled);
+    assert_eq!(persisted.triggers[0].status, TaskTriggerStatus::Cancelled);
+    assert_eq!(persisted.triggers[0].next_fire_at, None);
+}
+
+#[tokio::test]
+async fn blocked_agent_task_requires_readmission_and_resumes_atomically() {
+    let runtime = runtime().await;
+    let mut params = create_params(TaskTriggerSpec::Cron {
+        cron_expr: "0 5 * * *".to_owned(),
+        timezone: "Europe/Moscow".to_owned(),
+        catch_up_policy: None,
+    });
+    params.executor_kind = TaskExecutorKind::Agent;
+    let mut spec = agent_spec(3);
+    spec.prompt.instructions = vec![
+        "Use currently available runtime capabilities by capability.".to_owned(),
+        "Fail clearly when required data is unavailable.".to_owned(),
+    ];
+    spec.prompt.output_instructions =
+        Some("Return concise markdown or a clear failure reason.".to_owned());
+    params.agent_spec = Some(spec);
+    let create_context = task_create_context_for(&params);
+    let execution_admission = create_context
+        .execution_admission
+        .clone()
+        .expect("agent task should have admission");
+    let response = runtime
+        .service()
+        .create_task(create_context, params)
+        .await
+        .expect("scheduled Agent task should create");
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskBlocked {
+                task_id: response.task.id.clone(),
+                error: Some(TaskError {
+                    code: "authorization_missing".to_owned(),
+                    message: "execution admission is missing".to_owned(),
+                    class: TaskErrorClass::Policy,
+                    details: None,
+                    failed_run_id: None,
+                }),
+                blocked_at: 1_700_000_001,
+            },
+            1_700_000_001,
+        )
+        .await
+        .expect("task should block");
+
+    let error = runtime
+        .service()
+        .resume_task(
+            TaskMutationContext::default(),
+            TaskResumeParams {
+                task_id: response.task.id.clone(),
+                reason: Some("retry without authority".to_owned()),
+            },
+        )
+        .await
+        .expect_err("blocked Agent task must fail closed without readmission");
+    assert!(error.to_string().contains("authorization readmission"));
+
+    let mut context = TaskMutationContext::default();
+    context.execution_admission = Some(execution_admission);
+    let resumed = runtime
+        .service()
+        .resume_task(
+            context,
+            TaskResumeParams {
+                task_id: response.task.id,
+                reason: Some("permissions confirmed".to_owned()),
+            },
+        )
+        .await
+        .expect("blocked Agent task should resume with readmission");
+    assert_eq!(resumed.task.status, TaskStatus::Scheduled);
+    assert_eq!(resumed.task.error, None);
+    assert_eq!(resumed.triggers[0].status, TaskTriggerStatus::Active);
+    assert!(resumed.triggers[0].next_fire_at.is_some());
+}
+
+#[tokio::test]
 async fn cron_trigger_can_fire_repeatedly_with_timezone() {
     let runtime = runtime().await;
     runtime

@@ -1882,8 +1882,10 @@ impl TaskEventPayload {
             )),
             Self::TaskCompleted { task_id, .. }
             | Self::TaskFailed { task_id, .. }
-            | Self::TaskBlocked { task_id, .. }
-            | Self::TaskCancelled { task_id, .. } => Some(format!("task:{task_id}:terminal")),
+            | Self::TaskBlocked { task_id, .. } => Some(format!("task:{task_id}:terminal")),
+            // `Blocked` ends execution but remains administrable. An explicit
+            // cancellation is therefore a legitimate second terminal event.
+            Self::TaskCancelled { task_id, .. } => Some(format!("task:{task_id}:cancelled")),
             Self::TaskDetached { task, detached_at } => Some(format!(
                 "task:{}:detached:{}:{detached_at}",
                 task.id, task.revision

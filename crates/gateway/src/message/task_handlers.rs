@@ -35,6 +35,116 @@ fn task_public_error(
 }
 
 impl MessageProcessor {
+    pub(crate) async fn task_execution_readmission_seed(
+        &self,
+        principal: &crate::auth::AuthenticatedSessionPrincipal,
+        preferred_root_thread_id: Option<&str>,
+        task_id: &str,
+    ) -> anyhow::Result<Option<pioneer_tasks::TaskExecutionAdmissionSeed>> {
+        let response = self
+            .crud_store
+            .get_task(task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task `{task_id}` not found"))?;
+        if response.task.status != pioneer_protocol::TaskStatus::Blocked
+            || response.task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
+        {
+            return Ok(None);
+        }
+        let authorization_policy = crate::authorization::AuthorizationService::new();
+        let execution_resources = authorization_policy
+            .execution_resource_policy(principal.kind, principal.role_key.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Task role has no execution resource policy"))?;
+        let task_resources = authorization_policy
+            .task_resource_budget(principal.kind, principal.role_key.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Task role has no Task resource budget"))?;
+        if let Some(persisted) = self
+            .crud_store
+            .get_task_execution_admission(task_id)
+            .await?
+        {
+            let context = crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+                persisted.authorization_context_json.as_str(),
+            )?;
+            let seed = pioneer_tasks::TaskExecutionAdmissionSeed {
+                workspace_id: persisted.workspace_id,
+                root_thread_id: persisted.root_thread_id,
+                initiating_principal_id: persisted.initiating_principal_id,
+                authorization_context_json: persisted.authorization_context_json,
+                role_key: context.role_key().to_owned(),
+                policy_fingerprint: context.policy_fingerprint().to_owned(),
+                execution_resources,
+                task_resources,
+            };
+            self.validate_task_execution_admission_seed(&seed).await?;
+            return Ok(Some(seed));
+        }
+        let root_thread_id = preferred_root_thread_id
+            .map(str::to_owned)
+            .or_else(|| response.task.created_by_thread_id.clone())
+            .or_else(|| {
+                (response.task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
+                    .then(|| response.task.owner_id.clone())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("blocked Agent Task `{task_id}` has no authoritative root thread")
+            })?;
+        let root_thread = self
+            .crud_store
+            .get_thread_by_id(root_thread_id.as_str())
+            .await?
+            .filter(|thread| thread.workspace_id == response.task.workspace_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("blocked Agent Task `{task_id}` root thread is unavailable")
+            })?;
+        let mut request = crate::authorization::ExecutionAdmissionRequest::for_existing_task(
+            &response,
+            root_thread_id.as_str(),
+            root_thread.model_provider.as_str(),
+            root_thread.model.as_str(),
+            None,
+        )?;
+        if !matches!(
+            request.execution_backend,
+            Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
+                | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. })
+        ) {
+            request.provider_authority_fingerprint = Some(
+                self.provider_registry
+                    .authority_fingerprint_for_workspace(
+                        response.task.workspace_id.as_str(),
+                        request.provider.as_str(),
+                    )
+                    .as_str()
+                    .to_owned(),
+            );
+        }
+        let revision = self.current_authorization_revision().await?;
+        let requested_permission_cap = response
+            .agent_specs
+            .iter()
+            .rev()
+            .find(|spec| spec.run_id.is_none())
+            .and_then(|spec| spec.permission_cap.as_ref());
+        let context =
+            crate::authorization::ExecutionAdmissionService::new(self.crud_store.as_ref().clone())
+                .admit_context(principal, revision, &request, requested_permission_cap)
+                .await?;
+        let seed = pioneer_tasks::TaskExecutionAdmissionSeed {
+            workspace_id: context.workspace_id().to_owned(),
+            root_thread_id: context.root_thread_id().to_owned(),
+            initiating_principal_id: context.initiating_principal_id().to_string(),
+            authorization_context_json: context.to_persisted_json()?,
+            role_key: context.role_key().to_owned(),
+            policy_fingerprint: context.policy_fingerprint().to_owned(),
+            execution_resources,
+            task_resources,
+        };
+        self.validate_task_execution_admission_seed(&seed).await?;
+        Ok(Some(seed))
+    }
+
     async fn acquire_task_observation_page(
         &self,
         request_context: &RequestContext,
@@ -1414,10 +1524,35 @@ impl MessageProcessor {
             return;
         }
         let connection_id = request_context.connection_id();
+        let execution_admission = match self
+            .task_execution_readmission_seed(
+                request_context.principal(),
+                authorized_task.and_then(|proof| proof.root_thread_id()),
+                params.task_id.as_str(),
+            )
+            .await
+        {
+            Ok(admission) => admission,
+            Err(_) => {
+                self.send_error(
+                    connection_id,
+                    task_authorization_unavailable(
+                        request_id,
+                        ResourceAction::TaskCreate,
+                        "execution_intent",
+                        "readmission",
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let mut mutation_context = Self::task_mutation_context(request_context);
+        mutation_context.execution_admission = execution_admission;
         match message_future(
             self.task_runtime
                 .service()
-                .resume_task(Self::task_mutation_context(request_context), params),
+                .resume_task(mutation_context, params),
         )
         .await
         {

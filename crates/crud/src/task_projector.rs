@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use tracing::warn;
 
-use crate::convention::{is_terminal_task_status_db, task_run_status_from_db};
+use crate::convention::{is_terminal_task_status_db, task_run_status_from_db, task_status_from_db};
 use crate::repositories::{
     ProjectionWriteOutcome, task, task_agent_spec, task_delivery, task_dependency,
     task_result_candidate, task_result_review_event, task_run, task_run_execution,
@@ -377,13 +377,25 @@ impl TaskProjector {
                 task: task_model,
                 triggers,
                 ..
-            }
-            | TaskEventPayload::TaskResumed {
+            } => project_future(async move {
+                if task_is_terminal_db(db, task_model.id.as_str()).await? {
+                    return Ok(());
+                }
+                task::upsert_task(db, task_model).await?;
+                for trigger in triggers {
+                    task_trigger::upsert_trigger(db, trigger).await?;
+                }
+                Ok(())
+            }),
+            TaskEventPayload::TaskResumed {
                 task: task_model,
                 triggers,
                 ..
             } => project_future(async move {
-                if task_is_terminal_db(db, task_model.id.as_str()).await? {
+                let current_status = task_status_db(db, task_model.id.as_str()).await?;
+                if current_status
+                    .is_some_and(|status| status.is_terminal() && status != TaskStatus::Blocked)
+                {
                     return Ok(());
                 }
                 task::upsert_task(db, task_model).await?;
@@ -721,6 +733,23 @@ async fn task_is_terminal_db<C: ConnectionTrait + Sync>(db: &C, task_id: &str) -
     Ok(task::find_task_by_id(db, task_id)
         .await?
         .is_some_and(|model| is_terminal_task_status_db(model.status.as_str())))
+}
+
+async fn task_status_db<C: ConnectionTrait + Sync>(
+    db: &C,
+    task_id: &str,
+) -> Result<Option<TaskStatus>> {
+    task::find_task_by_id(db, task_id)
+        .await?
+        .map(|model| {
+            task_status_from_db(model.status.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "task `{task_id}` has unknown persisted status `{}`",
+                    model.status
+                )
+            })
+        })
+        .transpose()
 }
 
 async fn task_has_nonterminal_run_db<C: ConnectionTrait + Sync>(

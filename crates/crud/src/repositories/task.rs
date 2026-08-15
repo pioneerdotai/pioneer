@@ -398,6 +398,11 @@ fn terminal_task_transition_guard(
     if !is_terminal_task_status(current_status) {
         return None;
     }
+    // `Blocked` is terminal for execution, but remains explicitly
+    // administrable: a caller with TaskCancel authority may close it.
+    if current_status == TaskStatus::Blocked && next_status == TaskStatus::Cancelled {
+        return None;
+    }
     if current_status == next_status {
         return Some(ProjectionWriteOutcome::NoopDuplicateTerminal);
     }
