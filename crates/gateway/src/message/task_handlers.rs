@@ -239,7 +239,6 @@ impl MessageProcessor {
         };
         match policy.mode {
             pioneer_protocol::TaskDeliveryMode::None
-            | pioneer_protocol::TaskDeliveryMode::OwnerThread
             | pioneer_protocol::TaskDeliveryMode::UserNotification => true,
             pioneer_protocol::TaskDeliveryMode::Webhook => {
                 self.send_error(
@@ -657,22 +656,80 @@ impl MessageProcessor {
                     }
                 }
             }
-            if !self
-                .require_scoped_task_delivery_policy(
-                    request_context,
-                    &request_id,
-                    authorized_thread.workspace_id(),
-                    params.delivery_policy.as_ref(),
-                )
-                .await
-            {
-                return;
-            }
+        }
+
+        let trigger_kind = params.trigger.spec.kind();
+        if params.delivery_policy.is_none() {
+            let attachment = params
+                .lifecycle_policy
+                .as_ref()
+                .map(|policy| policy.attachment)
+                .unwrap_or_else(|| {
+                    pioneer_tasks::default_lifecycle_policy(
+                        trigger_kind,
+                        params.created_by_turn_id.is_some(),
+                    )
+                    .attachment
+                });
+            params.delivery_policy = Some(pioneer_tasks::default_delivery_policy(
+                trigger_kind,
+                attachment,
+                params.owner_kind,
+                params.owner_id.as_deref(),
+                authorized_thread
+                    .map(|proof| proof.collaboration_root_thread_id())
+                    .or(params.created_by_thread_id.as_deref()),
+            ));
+        }
+        let current_thread_id = authorized_thread
+            .map(|proof| proof.thread_id())
+            .or(params.created_by_thread_id.as_deref())
+            .or_else(|| {
+                (params.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
+                    .then_some(params.owner_id.as_deref())
+                    .flatten()
+            });
+        let collaboration_root_thread_id = authorized_thread
+            .map(|proof| proof.collaboration_root_thread_id())
+            .or(current_thread_id);
+        if let Some(policy) = params.delivery_policy.as_mut()
+            && let Err(error) = crate::task_delivery_policy::resolve_task_delivery_policy(
+                policy,
+                crate::task_delivery_policy::TaskDeliveryThreadContext {
+                    current_thread_id,
+                    origin_thread_id: collaboration_root_thread_id,
+                    collaboration_root_thread_id,
+                },
+            )
+        {
+            self.send_error(
+                connection_id,
+                crate::public_error::agent_rpc_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    pioneer_protocol::PublicErrorCode::InvalidInput,
+                    pioneer_protocol::PublicErrorStage::Admission,
+                    error,
+                ),
+            )
+            .await;
+            return;
+        }
+        if !self
+            .require_scoped_task_delivery_policy(
+                request_context,
+                &request_id,
+                params.workspace_id.as_str(),
+                params.delivery_policy.as_ref(),
+            )
+            .await
+        {
+            return;
         }
         let mut task_execution_admission = None;
         if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent {
             let Some(root_thread_id) = authorized_thread
-                .map(|proof| proof.thread_id())
+                .map(|proof| proof.collaboration_root_thread_id())
                 .or(params.created_by_thread_id.as_deref())
             else {
                 self.send_error(

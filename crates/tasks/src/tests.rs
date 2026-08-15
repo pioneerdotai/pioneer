@@ -3522,8 +3522,9 @@ async fn failed_run_schedules_retry_and_defers_terminal_delivery_until_exhausted
         retry_on: vec![TaskErrorClass::Internal],
     });
     params.delivery_policy = Some(TaskDeliveryPolicy {
-        mode: TaskDeliveryMode::OwnerThread,
-        thread_id: None,
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        thread_id: Some("thr_retry_owner".to_owned()),
         webhook_url: None,
         include_result: true,
         format: pioneer_protocol::TaskDeliveryFormat::Summary,
@@ -4211,7 +4212,7 @@ async fn cron_trigger_can_fire_repeatedly_with_timezone() {
 }
 
 #[tokio::test]
-async fn terminal_run_enqueues_owner_thread_delivery_from_normalized_result() {
+async fn terminal_run_enqueues_origin_thread_delivery_from_normalized_result() {
     let runtime = runtime().await;
     runtime
         .register_executor(Arc::new(CompletingSystemExecutor))
@@ -4230,6 +4231,17 @@ async fn terminal_run_enqueues_owner_thread_delivery_from_normalized_result() {
         .create_task(task_create_context_for(&params), params)
         .await
         .expect("scheduled task should create");
+    let policy = response
+        .task
+        .delivery_policy
+        .as_ref()
+        .expect("scheduled task should persist delivery policy");
+    assert_eq!(policy.mode, TaskDeliveryMode::Thread);
+    assert_eq!(
+        policy.thread_target,
+        Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
+    );
+    assert_eq!(policy.thread_id.as_deref(), Some("thr_owner"));
     runtime
         .process_due_once(4_000_000_000)
         .await
@@ -4248,7 +4260,11 @@ async fn terminal_run_enqueues_owner_thread_delivery_from_normalized_result() {
         .expect("deliveries should read");
     assert_eq!(deliveries.deliveries.len(), 1);
     let delivery = &deliveries.deliveries[0];
-    assert_eq!(delivery.mode, TaskDeliveryMode::OwnerThread);
+    assert_eq!(delivery.mode, TaskDeliveryMode::Thread);
+    assert_eq!(
+        delivery.thread_target,
+        Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
+    );
     assert_eq!(delivery.status, TaskDeliveryStatus::Pending);
     assert_eq!(delivery.target_thread_id.as_deref(), Some("thr_owner"));
     assert_eq!(
@@ -4261,7 +4277,7 @@ async fn terminal_run_enqueues_owner_thread_delivery_from_normalized_result() {
 }
 
 #[tokio::test]
-async fn immediate_detached_thread_task_defaults_to_owner_thread_delivery() {
+async fn immediate_detached_thread_task_defaults_to_origin_thread_delivery() {
     let runtime = runtime().await;
     runtime
         .register_executor(Arc::new(CompletingSystemExecutor))
@@ -4290,7 +4306,23 @@ async fn immediate_detached_thread_task_defaults_to_owner_thread_delivery() {
             .delivery_policy
             .as_ref()
             .map(|policy| policy.mode),
-        Some(TaskDeliveryMode::OwnerThread)
+        Some(TaskDeliveryMode::Thread)
+    );
+    assert_eq!(
+        response
+            .task
+            .delivery_policy
+            .as_ref()
+            .and_then(|policy| policy.thread_target),
+        Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
+    );
+    assert_eq!(
+        response
+            .task
+            .delivery_policy
+            .as_ref()
+            .and_then(|policy| policy.thread_id.as_deref()),
+        Some("thr_background_owner")
     );
     assert_eq!(
         response
@@ -4318,7 +4350,11 @@ async fn immediate_detached_thread_task_defaults_to_owner_thread_delivery() {
         .expect("deliveries should read");
     assert_eq!(deliveries.deliveries.len(), 1);
     let delivery = &deliveries.deliveries[0];
-    assert_eq!(delivery.mode, TaskDeliveryMode::OwnerThread);
+    assert_eq!(delivery.mode, TaskDeliveryMode::Thread);
+    assert_eq!(
+        delivery.thread_target,
+        Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
+    );
     assert_eq!(delivery.status, TaskDeliveryStatus::Pending);
     assert_eq!(
         delivery.target_thread_id.as_deref(),
@@ -4397,8 +4433,9 @@ async fn cancel_task_cancels_pending_deliveries() {
     params.owner_id = Some("thr_owner".to_owned());
     params.created_by_thread_id = Some("thr_owner".to_owned());
     params.delivery_policy = Some(TaskDeliveryPolicy {
-        mode: TaskDeliveryMode::OwnerThread,
-        thread_id: None,
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        thread_id: Some("thr_owner".to_owned()),
         webhook_url: None,
         include_result: true,
         format: pioneer_protocol::TaskDeliveryFormat::Summary,

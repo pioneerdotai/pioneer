@@ -8796,6 +8796,7 @@ dependencies = [
  "pioneer-sqlite",
  "sea-orm",
  "sea-orm-migration",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

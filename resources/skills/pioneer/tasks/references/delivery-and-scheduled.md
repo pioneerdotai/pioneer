@@ -28,7 +28,7 @@ Use this mental model:
 
 ## Delivery Modes
 
-### owner_thread
+### thread + origin_thread
 
 Use when the user says:
 
@@ -38,12 +38,13 @@ Post the report in this conversation.
 Every morning, check this and tell me here.
 ```
 
-`owner_thread` targets the task owner's thread. It is usually the best default for scheduled tasks created from the current thread.
+`origin_thread` targets the visible thread where the work originated. It is the default for scheduled tasks created from a thread.
 
 ```json
 {
   "deliveryPolicy": {
-    "mode": "owner_thread",
+    "mode": "thread",
+    "threadTarget": "origin_thread",
     "includeResult": true,
     "format": "full_result"
   }
@@ -52,12 +53,13 @@ Every morning, check this and tell me here.
 
 ### thread
 
-Use when you know the exact target thread id or are updating an existing task to point to a specific thread.
+Use `exact_thread` when you know the exact target thread id or are updating an existing task to point to a specific thread.
 
 ```json
 {
   "deliveryPolicy": {
     "mode": "thread",
+    "threadTarget": "exact_thread",
     "threadId": "THREAD_ID",
     "includeResult": true,
     "format": "full_result"
@@ -147,7 +149,7 @@ When the user says a result did not appear in the main thread:
 1. Inspect the task with `task_get`.
 2. Check `deliveryPolicy.mode`.
 3. If it is `user_notification`, `webhook`, or `none`, explain that it did not write a chat message.
-4. Update future delivery to `owner_thread` or `thread`.
+4. Update future delivery to `thread` with the appropriate `threadTarget`.
 5. Verify the updated policy.
 6. Tell the user the change applies to future runs.
 
@@ -158,6 +160,7 @@ Example update:
   "taskId": "TASK_ID",
   "deliveryPolicy": {
     "mode": "thread",
+    "threadTarget": "exact_thread",
     "threadId": "CURRENT_THREAD_ID",
     "includeResult": true,
     "format": "full_result"

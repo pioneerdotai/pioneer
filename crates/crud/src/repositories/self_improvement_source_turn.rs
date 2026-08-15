@@ -24,11 +24,11 @@ use super::membership::{
 use crate::SelfImprovementSourceTurnRecord;
 use crate::convention::{
     is_terminal_task_run_status_db, is_terminal_task_status_db, task_delivery_mode_to_db,
-    task_result_candidate_status_to_db, task_run_status_to_db, task_run_thread_binding_kind_to_db,
-    task_run_turn_kind_from_db, task_status_to_db, thread_origin_kind_from_db,
-    thread_origin_kind_to_db, thread_sidebar_visibility_from_db, thread_sidebar_visibility_to_db,
-    turn_kind_from_db, turn_kind_to_db, turn_origin_from_db, turn_origin_to_db,
-    turn_status_from_db, turn_status_to_db,
+    task_delivery_thread_target_to_db, task_result_candidate_status_to_db, task_run_status_to_db,
+    task_run_thread_binding_kind_to_db, task_run_turn_kind_from_db, task_status_to_db,
+    thread_origin_kind_from_db, thread_origin_kind_to_db, thread_sidebar_visibility_from_db,
+    thread_sidebar_visibility_to_db, turn_kind_from_db, turn_kind_to_db, turn_origin_from_db,
+    turn_origin_to_db, turn_status_from_db, turn_status_to_db,
 };
 use crate::util::unix_to_datetime;
 
@@ -258,7 +258,11 @@ async fn collaborative_parent_turn_id_for_delivery<C: ConnectionTrait>(
         return Ok(None);
     };
     if delivery.workspace_id != workspace_id
-        || delivery.mode != task_delivery_mode_to_db(TaskDeliveryMode::OwnerThread)
+        || delivery.mode != task_delivery_mode_to_db(TaskDeliveryMode::Thread)
+        || delivery.thread_target.as_deref()
+            != Some(task_delivery_thread_target_to_db(
+                pioneer_protocol::TaskDeliveryThreadTarget::OriginThread,
+            ))
         || delivery.target_thread_id.as_deref() != Some(parent_thread_id)
     {
         return Ok(None);
@@ -318,7 +322,11 @@ pub(crate) async fn verify_collaborative_exchange<C: ConnectionTrait>(
         delivery.error_snapshot_json.is_some() && delivery.result_snapshot_json.is_none()
     };
     if !matches!(delivery.status.as_str(), "delivering" | "delivered")
-        || delivery.mode != task_delivery_mode_to_db(TaskDeliveryMode::OwnerThread)
+        || delivery.mode != task_delivery_mode_to_db(TaskDeliveryMode::Thread)
+        || delivery.thread_target.as_deref()
+            != Some(task_delivery_thread_target_to_db(
+                pioneer_protocol::TaskDeliveryThreadTarget::OriginThread,
+            ))
         || delivery.workspace_id != workspace_id
         || delivery.target_thread_id.as_deref() != Some(parent_thread_id)
         || delivery
@@ -383,7 +391,7 @@ pub(crate) async fn verify_collaborative_exchange<C: ConnectionTrait>(
     let Some(delivery_turn) = turn::Entity::find_by_id(delivery_turn_id.to_owned())
         .one(db)
         .await
-        .context("failed to load collaborative owner delivery turn")?
+        .context("failed to load collaborative origin delivery turn")?
     else {
         return Ok(None);
     };

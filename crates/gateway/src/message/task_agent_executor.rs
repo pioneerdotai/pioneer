@@ -2953,7 +2953,7 @@ impl TaskAgentExecutor {
                 )
                 .await?;
             if !processor
-                .task_run_awaits_owner_thread_delivery(
+                .task_run_awaits_origin_thread_delivery(
                     &task_response,
                     child_runtime.task_run_turn.run_id.as_str(),
                 )
@@ -3060,7 +3060,7 @@ impl TaskAgentExecutor {
                     .await?;
                 handle.complete_run(Some(result), completed_at).await?;
                 if !processor
-                    .task_run_awaits_owner_thread_delivery(
+                    .task_run_awaits_origin_thread_delivery(
                         &task_response,
                         child_runtime.task_run_turn.run_id.as_str(),
                     )

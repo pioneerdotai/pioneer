@@ -35,6 +35,7 @@ Fix for future runs:
   "taskId": "TASK_ID",
   "deliveryPolicy": {
     "mode": "thread",
+    "threadTarget": "exact_thread",
     "threadId": "CURRENT_THREAD_ID",
     "includeResult": true,
     "format": "full_result"

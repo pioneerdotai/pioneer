@@ -124,7 +124,7 @@ impl MessageProcessor {
             };
             if run.status == pioneer_protocol::TaskRunStatus::Succeeded
                 && self
-                    .task_run_awaits_owner_thread_delivery(&task_response, run.id.as_str())
+                    .task_run_awaits_origin_thread_delivery(&task_response, run.id.as_str())
                     .await?
             {
                 continue;
@@ -161,9 +161,9 @@ impl MessageProcessor {
         let notification_task_id = context.task_id.clone();
         let is_progress_event = matches!(event.payload, TaskEventPayload::Progress { .. });
         let is_terminal_event = event.payload.is_terminal();
-        let awaits_owner_thread_delivery = match event.payload.run_id() {
+        let awaits_origin_thread_delivery = match event.payload.run_id() {
             Some(run_id) => {
-                self.task_run_awaits_owner_thread_delivery(&task_response, run_id)
+                self.task_run_awaits_origin_thread_delivery(&task_response, run_id)
                     .await?
             }
             None => false,
@@ -182,12 +182,12 @@ impl MessageProcessor {
                 .await
         };
         let refresh_parent_anchor = !is_progress_event
-            && !awaits_owner_thread_delivery
+            && !awaits_origin_thread_delivery
             && should_refresh_parent_task_anchor(&task_response, &event.payload);
         if refresh_parent_anchor {
             self.refresh_parent_task_anchor(&task_response).await?;
         }
-        if !awaits_owner_thread_delivery
+        if !awaits_origin_thread_delivery
             && let Some(notification) = timeline_changed.as_ref()
             && task_response.task.created_by_turn_id.as_deref()
                 != Some(notification.turn_id.as_str())
@@ -312,7 +312,7 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::RunCompleted { run_id, .. } => {
-                if !awaits_owner_thread_delivery {
+                if !awaits_origin_thread_delivery {
                     self.mark_task_run_occurrence_turn_terminal(&task_response, run_id.as_str())
                         .await?;
                 }

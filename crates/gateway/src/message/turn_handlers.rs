@@ -1749,8 +1749,11 @@ impl MessageProcessor {
                         completion: pioneer_protocol::TaskCompletionBehavior::CompleteOnTerminalRun,
                     }),
                     delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
-                        mode: pioneer_protocol::TaskDeliveryMode::OwnerThread,
-                        thread_id: None,
+                        mode: pioneer_protocol::TaskDeliveryMode::Thread,
+                        thread_target: Some(
+                            pioneer_protocol::TaskDeliveryThreadTarget::OriginThread,
+                        ),
+                        thread_id: Some(thread.id.clone()),
                         webhook_url: None,
                         include_result: true,
                         format: pioneer_protocol::TaskDeliveryFormat::FullResult,

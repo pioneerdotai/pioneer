@@ -94,13 +94,14 @@ Send it to me.
 
 Use delivery to match the user experience:
 
-- `owner_thread`: write the result to the task owner's thread. Best default for "send the answer back here" when the task is owned by the current thread.
-- `thread`: write the result to a specific `threadId`. Best when updating an existing task or targeting a known thread explicitly.
+- `thread` + `origin_thread`: write the result to the visible thread where the work originated. Best default for "send the answer back here".
+- `thread` + `current_thread` or `collaboration_root`: target the current execution thread or collaboration root without supplying an id.
+- `thread` + `exact_thread`: write the result to an explicitly supplied `threadId`.
 - `user_notification`: notify the user without necessarily writing a durable chat message. Good for lightweight alerts, but bad when the user expects the full answer in the main thread.
 - `webhook`: send the result outside Pioneer.
 - `none`: keep the result in task state only.
 
-If the user says "send it here", "post the report in this thread", "make the answer appear in this chat", or "not just a notification", do not use `user_notification`. Use `owner_thread` or `thread`.
+If the user says "send it here", "post the report in this thread", "make the answer appear in this chat", or "not just a notification", do not use `user_notification`. Use `thread` with `threadTarget:"origin_thread"`.
 
 Changing delivery affects future runs. It does not retroactively materialize already delivered results in the parent thread.
 

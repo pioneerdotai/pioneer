@@ -1,7 +1,7 @@
 use pioneer_protocol::{
     TaskAttachmentMode, TaskCompletionBehavior, TaskDeliveryFormat, TaskDeliveryMode,
-    TaskDeliveryPolicy, TaskLifecyclePolicy, TaskOwnerKind, TaskParentTerminalAction,
-    TaskRetryBackoffKind, TaskRetryPolicy, TaskTriggerKind,
+    TaskDeliveryPolicy, TaskDeliveryThreadTarget, TaskLifecyclePolicy, TaskOwnerKind,
+    TaskParentTerminalAction, TaskRetryBackoffKind, TaskRetryPolicy, TaskTriggerKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,11 +120,21 @@ pub fn default_delivery_policy(
         trigger_kind == TaskTriggerKind::Immediate && attachment == TaskAttachmentMode::Detached;
     TaskDeliveryPolicy {
         mode: if (is_scheduled || is_immediate_detached) && has_thread_target {
-            TaskDeliveryMode::OwnerThread
+            TaskDeliveryMode::Thread
         } else {
             TaskDeliveryMode::None
         },
-        thread_id: None,
+        thread_target: ((is_scheduled || is_immediate_detached) && has_thread_target)
+            .then_some(TaskDeliveryThreadTarget::OriginThread),
+        thread_id: ((is_scheduled || is_immediate_detached) && has_thread_target)
+            .then(|| {
+                created_by_thread_id.map(str::to_owned).or_else(|| {
+                    (owner_kind == TaskOwnerKind::Thread)
+                        .then(|| owner_id.map(str::to_owned))
+                        .flatten()
+                })
+            })
+            .flatten(),
         webhook_url: None,
         include_result: true,
         format: TaskDeliveryFormat::Summary,

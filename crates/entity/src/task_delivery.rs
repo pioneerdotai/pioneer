@@ -15,6 +15,7 @@ pub struct Model {
     #[sea_orm(unique)]
     pub delivery_key: String,
     pub mode: String,
+    pub thread_target: Option<String>,
     pub target_thread_id: Option<String>,
     pub target_user_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]

@@ -4,7 +4,6 @@
   "type": "string",
   "enum": [
     "none",
-    "owner_thread",
     "thread",
     "user_notification",
     "webhook"

@@ -364,6 +364,7 @@ mod tests {
                 lifecycle_policy: None,
                 delivery_policy: Some(pioneer_protocol::TaskDeliveryPolicy {
                     mode: pioneer_protocol::TaskDeliveryMode::Webhook,
+                    thread_target: None,
                     thread_id: None,
                     webhook_url: Some(canary_webhook.to_owned()),
                     include_result: true,

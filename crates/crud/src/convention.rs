@@ -7,11 +7,11 @@ use pioneer_protocol::{
     MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus, MemoryWriteRelation,
     NewMemberProfile, PromptManifestProfile, ProviderFailureClass, ProviderFailureStage,
     RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
-    TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskExecutorKind,
-    TaskOwnerKind, TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
-    TaskResultReviewerKind, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBindingKind,
-    TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus,
-    TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
+    TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskDeliveryThreadTarget,
+    TaskExecutorKind, TaskOwnerKind, TaskResultCandidateStatus, TaskResultReviewDecision,
+    TaskResultReviewEventKind, TaskResultReviewerKind, TaskRunExecutionStatus, TaskRunStatus,
+    TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskTriggerKind,
+    TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
     ThreadSidebarVisibility, ThreadStatus, TurnAuthorSnapshot, TurnItem, TurnItemAttemptStatus,
     TurnItemTimeoutReason, TurnItemType, TurnMention, TurnPermissionMode,
     TurnPermissionProfileSource, TurnStatus, UserInput,
@@ -785,7 +785,6 @@ pub fn task_result_review_decision_from_db(value: &str) -> Result<TaskResultRevi
 pub fn task_delivery_mode_to_db(mode: TaskDeliveryMode) -> &'static str {
     match mode {
         TaskDeliveryMode::None => "none",
-        TaskDeliveryMode::OwnerThread => "owner_thread",
         TaskDeliveryMode::Thread => "thread",
         TaskDeliveryMode::UserNotification => "user_notification",
         TaskDeliveryMode::Webhook => "webhook",
@@ -795,10 +794,28 @@ pub fn task_delivery_mode_to_db(mode: TaskDeliveryMode) -> &'static str {
 pub fn task_delivery_mode_from_db(value: &str) -> Option<TaskDeliveryMode> {
     match value {
         "none" => Some(TaskDeliveryMode::None),
-        "owner_thread" => Some(TaskDeliveryMode::OwnerThread),
         "thread" => Some(TaskDeliveryMode::Thread),
         "user_notification" => Some(TaskDeliveryMode::UserNotification),
         "webhook" => Some(TaskDeliveryMode::Webhook),
+        _ => None,
+    }
+}
+
+pub fn task_delivery_thread_target_to_db(target: TaskDeliveryThreadTarget) -> &'static str {
+    match target {
+        TaskDeliveryThreadTarget::OriginThread => "origin_thread",
+        TaskDeliveryThreadTarget::CurrentThread => "current_thread",
+        TaskDeliveryThreadTarget::CollaborationRoot => "collaboration_root",
+        TaskDeliveryThreadTarget::ExactThread => "exact_thread",
+    }
+}
+
+pub fn task_delivery_thread_target_from_db(value: &str) -> Option<TaskDeliveryThreadTarget> {
+    match value {
+        "origin_thread" => Some(TaskDeliveryThreadTarget::OriginThread),
+        "current_thread" => Some(TaskDeliveryThreadTarget::CurrentThread),
+        "collaboration_root" => Some(TaskDeliveryThreadTarget::CollaborationRoot),
+        "exact_thread" => Some(TaskDeliveryThreadTarget::ExactThread),
         _ => None,
     }
 }

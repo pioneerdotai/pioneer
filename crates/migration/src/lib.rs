@@ -47,6 +47,7 @@ mod m20260805_000001_native_durable_delivery;
 mod m20260806_000001_atomic_turn_terminalization;
 mod m20260810_000001_immutable_principal_avatar_revisions;
 mod m20260813_000001_authorization_governance;
+mod m20260815_000001_task_delivery_thread_targets;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -95,6 +96,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260806_000001_atomic_turn_terminalization::Migration),
             Box::new(m20260810_000001_immutable_principal_avatar_revisions::Migration),
             Box::new(m20260813_000001_authorization_governance::Migration),
+            Box::new(m20260815_000001_task_delivery_thread_targets::Migration),
         ]
     }
 }

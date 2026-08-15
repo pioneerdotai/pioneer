@@ -547,7 +547,7 @@ async fn load_collaborative_child_events<C: ConnectionTrait>(
             .is_none_or(|completed_at| completed_at > owner_delivery_completed_at)
         {
             bail!(
-                "canonical collaborative child `{}` did not complete before its owner delivery",
+                "canonical collaborative child `{}` did not complete before its origin delivery",
                 run_turn.id
             );
         }
@@ -651,7 +651,7 @@ async fn load_collaborative_child_events<C: ConnectionTrait>(
             })?;
         if &terminal.created_at > owner_delivery_completed_at {
             bail!(
-                "canonical collaborative child turn `{}` terminated after its owner delivery",
+                "canonical collaborative child turn `{}` terminated after its origin delivery",
                 child_turn.id
             );
         }

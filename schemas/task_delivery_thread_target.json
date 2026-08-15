@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskDeliveryThreadTarget",
+  "description": "Semantic thread target resolved and persisted by Gateway.",
+  "type": "string",
+  "enum": [
+    "origin_thread",
+    "current_thread",
+    "collaboration_root",
+    "exact_thread"
+  ]
+}

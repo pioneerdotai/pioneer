@@ -241,11 +241,12 @@ async fn seed_successful_collaborative_delivery(
                 CURRENT_TIMESTAMP
             );
             INSERT INTO task_delivery (
-                id, workspace_id, task_id, run_id, delivery_key, mode, target_thread_id,
+                id, workspace_id, task_id, run_id, delivery_key, mode, thread_target,
+                target_thread_id,
                 status, result_snapshot_json, attempt_count, max_attempts
             ) VALUES (
                 '{delivery_id}', '{workspace_id}', '{task_id}', '{run_id}',
-                'delivery_key_{delivery_id}', 'owner_thread', '{parent_thread_id}',
+                'delivery_key_{delivery_id}', 'thread', 'origin_thread', '{parent_thread_id}',
                 'delivering', '{result_json}', 1, 1
             );
             "#,

@@ -276,7 +276,7 @@ pub use task::{
     TaskDeliveryCancelledNotification, TaskDeliveryDeliveredNotification,
     TaskDeliveryFailedNotification, TaskDeliveryFormat, TaskDeliveryMode, TaskDeliveryPolicy,
     TaskDeliveryQueuedNotification, TaskDeliveryStartedNotification, TaskDeliveryStatus,
-    TaskDependency, TaskDependencyCondition, TaskDependencyTriggerMode,
+    TaskDeliveryThreadTarget, TaskDependency, TaskDependencyCondition, TaskDependencyTriggerMode,
     TaskDependencyTriggerPolicy, TaskDetachParams, TaskDetachResponse, TaskDetachedNotification,
     TaskError, TaskErrorClass, TaskEvent, TaskEventPayload, TaskEventsParams, TaskEventsResponse,
     TaskExecutorKind, TaskExternalTriggerFilter, TaskFailedNotification, TaskGetParams,

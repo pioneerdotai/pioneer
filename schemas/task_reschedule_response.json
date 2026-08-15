@@ -431,7 +431,6 @@
       "type": "string",
       "enum": [
         "none",
-        "owner_thread",
         "thread",
         "user_notification",
         "webhook"
@@ -450,9 +449,21 @@
           "$ref": "#/$defs/TaskDeliveryMode"
         },
         "threadId": {
+          "description": "Canonical target persisted by Gateway. Callers provide this only for\n`ExactThread`; for semantic targets it is server-owned output.",
           "type": [
             "string",
             "null"
+          ]
+        },
+        "threadTarget": {
+          "description": "Required for `Thread` delivery. Gateway resolves semantic targets to a\ncanonical `thread_id` before persisting the Task.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskDeliveryThreadTarget"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "webhookUrl": {
@@ -466,6 +477,16 @@
         "mode",
         "includeResult",
         "format"
+      ]
+    },
+    "TaskDeliveryThreadTarget": {
+      "description": "Semantic thread target resolved and persisted by Gateway.",
+      "type": "string",
+      "enum": [
+        "origin_thread",
+        "current_thread",
+        "collaboration_root",
+        "exact_thread"
       ]
     },
     "TaskDependencyTriggerMode": {

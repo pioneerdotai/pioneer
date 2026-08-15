@@ -4482,10 +4482,15 @@ fn validate_delivery_policy(
     policy: &pioneer_protocol::TaskDeliveryPolicy,
 ) -> TaskRuntimeResult<()> {
     match policy.mode {
-        TaskDeliveryMode::None
-        | TaskDeliveryMode::OwnerThread
-        | TaskDeliveryMode::UserNotification => {}
+        TaskDeliveryMode::None | TaskDeliveryMode::UserNotification => {
+            if policy.thread_target.is_some() || policy.thread_id.is_some() {
+                bail!("non-thread delivery cannot carry a thread target");
+            }
+        }
         TaskDeliveryMode::Thread => {
+            if policy.thread_target.is_none() {
+                bail!("thread delivery requires threadTarget");
+            }
             if policy
                 .thread_id
                 .as_deref()
@@ -4497,6 +4502,9 @@ fn validate_delivery_policy(
             }
         }
         TaskDeliveryMode::Webhook => {
+            if policy.thread_target.is_some() || policy.thread_id.is_some() {
+                bail!("webhook delivery cannot carry a thread target");
+            }
             let Some(url) = policy
                 .webhook_url
                 .as_deref()

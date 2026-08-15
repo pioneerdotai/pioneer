@@ -228,7 +228,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn task_run_awaits_owner_thread_delivery(
+    pub(super) async fn task_run_awaits_origin_thread_delivery(
         &self,
         task_response: &TaskGetResponse,
         run_id: &str,
@@ -257,10 +257,11 @@ impl MessageProcessor {
                 limit: Some(100),
             })
             .await?;
-        Ok(deliveries
-            .deliveries
-            .iter()
-            .any(|delivery| delivery.mode == TaskDeliveryMode::OwnerThread))
+        Ok(deliveries.deliveries.iter().any(|delivery| {
+            delivery.mode == TaskDeliveryMode::Thread
+                && delivery.thread_target
+                    == Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
+        }))
     }
 
     pub(super) async fn process_due_task_deliveries(&self, now: i64, limit: u64) -> Result<()> {
@@ -329,13 +330,20 @@ impl MessageProcessor {
                 self.complete_delivery(delivery, attempt, None, None, None, None)
                     .await
             }
-            TaskDeliveryMode::OwnerThread => {
-                let turn_id = self.deliver_to_owner_thread(&delivery).await?;
-                self.complete_delivery(delivery, attempt, Some(turn_id), None, None, None)
-                    .await
-            }
             TaskDeliveryMode::Thread => {
-                let turn_id = self.deliver_to_thread(&delivery).await?;
+                let turn_id = match delivery
+                    .thread_target
+                    .context("thread delivery has no thread_target")?
+                {
+                    pioneer_protocol::TaskDeliveryThreadTarget::OriginThread => {
+                        self.deliver_to_origin_thread(&delivery).await?
+                    }
+                    pioneer_protocol::TaskDeliveryThreadTarget::CurrentThread
+                    | pioneer_protocol::TaskDeliveryThreadTarget::CollaborationRoot
+                    | pioneer_protocol::TaskDeliveryThreadTarget::ExactThread => {
+                        self.deliver_to_thread(&delivery).await?
+                    }
+                };
                 self.complete_delivery(delivery, attempt, Some(turn_id), None, None, None)
                     .await
             }
@@ -423,7 +431,7 @@ impl MessageProcessor {
                     bail!("webhook task delivery is unavailable to a scoped execution");
                 }
             }
-            TaskDeliveryMode::OwnerThread | TaskDeliveryMode::Thread => {
+            TaskDeliveryMode::Thread => {
                 let target_thread_id = delivery
                     .target_thread_id
                     .as_deref()
@@ -552,14 +560,14 @@ impl MessageProcessor {
         Ok(notification)
     }
 
-    async fn deliver_to_owner_thread(&self, delivery: &TaskDelivery) -> Result<String> {
+    async fn deliver_to_origin_thread(&self, delivery: &TaskDelivery) -> Result<String> {
         let thread_id = delivery
             .target_thread_id
             .as_deref()
-            .ok_or_else(|| anyhow!("owner thread delivery has no target_thread_id"))?;
+            .ok_or_else(|| anyhow!("origin thread delivery has no target_thread_id"))?;
 
         if let Some(parent_turn_id) = self
-            .lineage_parent_turn_for_owner_delivery(delivery, thread_id)
+            .lineage_parent_turn_for_origin_delivery(delivery, thread_id)
             .await?
         {
             self.ensure_delivery_thread_loaded(thread_id, delivery.workspace_id.as_str())
@@ -577,7 +585,7 @@ impl MessageProcessor {
         self.deliver_to_thread(delivery).await
     }
 
-    async fn lineage_parent_turn_for_owner_delivery(
+    async fn lineage_parent_turn_for_origin_delivery(
         &self,
         delivery: &TaskDelivery,
         target_thread_id: &str,
@@ -910,18 +918,11 @@ fn ensure_system_task_delivery_boundary(
     if policy.mode != delivery.mode {
         bail!("System Task delivery mode differs from its durable policy");
     }
-    match policy.mode {
+    if policy.thread_target != delivery.thread_target {
+        bail!("System Task delivery thread target differs from its durable policy");
+    }
+    match delivery.mode {
         TaskDeliveryMode::None => {}
-        TaskDeliveryMode::OwnerThread => {
-            let expected = task.created_by_thread_id.as_deref().or_else(|| {
-                (task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
-                    .then_some(task.owner_id.as_deref())
-                    .flatten()
-            });
-            if expected != delivery.target_thread_id.as_deref() {
-                bail!("System Task owner-thread delivery target is invalid");
-            }
-        }
         TaskDeliveryMode::Thread => {
             if policy.thread_id.as_deref() != delivery.target_thread_id.as_deref() {
                 bail!("System Task thread delivery target is invalid");

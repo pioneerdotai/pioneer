@@ -12,6 +12,7 @@ use sea_orm::{
 
 use crate::convention::{
     task_delivery_attempt_status_to_db, task_delivery_mode_to_db, task_delivery_status_to_db,
+    task_delivery_thread_target_to_db,
 };
 use crate::repositories::task::{TaskRootAccessFilter, accessible_task_ids};
 use crate::util::{optional_typed_json_to_db, unix_to_datetime};
@@ -28,6 +29,7 @@ pub async fn upsert_delivery<C: ConnectionTrait>(db: &C, delivery: &TaskDelivery
                     task_delivery::Column::RunId,
                     task_delivery::Column::DeliveryKey,
                     task_delivery::Column::Mode,
+                    task_delivery::Column::ThreadTarget,
                     task_delivery::Column::TargetThreadId,
                     task_delivery::Column::TargetUserId,
                     task_delivery::Column::WebhookUrl,
@@ -245,6 +247,10 @@ fn active_model_from_delivery(delivery: &TaskDelivery) -> Result<task_delivery::
         run_id: Set(delivery.run_id.clone()),
         delivery_key: Set(delivery.delivery_key.clone()),
         mode: Set(task_delivery_mode_to_db(delivery.mode).to_owned()),
+        thread_target: Set(delivery
+            .thread_target
+            .map(task_delivery_thread_target_to_db)
+            .map(str::to_owned)),
         target_thread_id: Set(delivery.target_thread_id.clone()),
         target_user_id: Set(delivery.target_user_id.clone()),
         webhook_url: Set(delivery.webhook_url.clone()),

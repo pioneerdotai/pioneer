@@ -827,9 +827,7 @@ impl TaskToolAuthorizationScope {
         };
 
         match policy.mode {
-            TaskDeliveryMode::None
-            | TaskDeliveryMode::OwnerThread
-            | TaskDeliveryMode::UserNotification => Ok(()),
+            TaskDeliveryMode::None | TaskDeliveryMode::UserNotification => Ok(()),
             TaskDeliveryMode::Thread => {
                 let thread_id = policy
                     .thread_id
@@ -1437,7 +1435,18 @@ impl TaskToolHandler {
                 crate::authorization::ResourceAction::TaskScheduleManage,
             )
             .await?;
-        let params = self.update_params(input).await?;
+        let mut params = self.update_params(input).await?;
+        if let Some(policy) = params.delivery_policy.as_mut() {
+            crate::task_delivery_policy::resolve_task_delivery_policy(
+                policy,
+                crate::task_delivery_policy::TaskDeliveryThreadContext {
+                    current_thread_id: Some(self.context.thread_id.as_str()),
+                    origin_thread_id: Some(authorization.root_thread_id.as_str()),
+                    collaboration_root_thread_id: Some(authorization.root_thread_id.as_str()),
+                },
+            )
+            .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+        }
         authorization
             .authorize_delivery_policy(
                 self.processor.crud_store.as_ref(),
@@ -1799,6 +1808,37 @@ impl TaskToolHandler {
             metadata: input.metadata,
         };
         authorization.constrain_create_params(&mut params);
+        if params.delivery_policy.is_none() {
+            let attachment = params
+                .lifecycle_policy
+                .as_ref()
+                .map(|policy| policy.attachment)
+                .unwrap_or_else(|| {
+                    pioneer_tasks::default_lifecycle_policy(
+                        trigger_kind,
+                        params.created_by_turn_id.is_some(),
+                    )
+                    .attachment
+                });
+            params.delivery_policy = Some(pioneer_tasks::default_delivery_policy(
+                trigger_kind,
+                attachment,
+                params.owner_kind,
+                params.owner_id.as_deref(),
+                Some(authorization.root_thread_id.as_str()),
+            ));
+        }
+        if let Some(policy) = params.delivery_policy.as_mut() {
+            crate::task_delivery_policy::resolve_task_delivery_policy(
+                policy,
+                crate::task_delivery_policy::TaskDeliveryThreadContext {
+                    current_thread_id: Some(self.context.thread_id.as_str()),
+                    origin_thread_id: Some(authorization.root_thread_id.as_str()),
+                    collaboration_root_thread_id: Some(authorization.root_thread_id.as_str()),
+                },
+            )
+            .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
+        }
         authorization
             .authorize_delivery_policy(
                 self.processor.crud_store.as_ref(),
@@ -2034,7 +2074,7 @@ struct TaskCreateToolInput {
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
     trigger: Option<TaskTriggerToolInput>,
     #[serde(default)]
-    /// Set true only when the user explicitly asks to run immediate work in the background. Omit trigger (or use kind "immediate"). This creates an Immediate + Detached Task that keeps running after the parent turn, delivers its result to the parent thread, and must not be joined with task_wait.
+    /// Set true only when the user explicitly asks to run immediate work in the background. Omit trigger (or use kind "immediate"). This creates an Immediate + Detached Task that keeps running after the parent turn, delivers its result to the origin thread, and must not be joined with task_wait.
     background: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Model-facing task tools currently create agent tasks only. Omit this field unless explicitly setting "agent".
@@ -2077,7 +2117,7 @@ struct TaskCreateToolInput {
     /// Advanced lifecycle policy. Omit for normal attached work and when background=true. background=true already selects Detached + KeepRunning + CompleteOnTerminalRun.
     lifecycle_policy: Option<TaskLifecyclePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Advanced delivery policy for scheduled or detached work. Omit for attached subagent work and for background=true, which defaults to owner_thread delivery with the result included.
+    /// Advanced delivery policy for scheduled or detached work. Omit for attached subagent work and for background=true, which defaults to mode=thread, threadTarget=origin_thread, includeResult=true. Use current_thread for the executing agent's thread, collaboration_root for the durable collaboration root, or exact_thread with an explicit threadId. Gateway resolves semantic targets.
     delivery_policy: Option<TaskDeliveryPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Advanced retry policy. Omit to use the task service default.
@@ -2137,11 +2177,11 @@ fn task_create_delivery_policy(
     }
     match delivery_policy {
         None => Ok(None),
-        Some(policy) if policy.mode == TaskDeliveryMode::OwnerThread && policy.include_result => {
+        Some(policy) if policy.mode == TaskDeliveryMode::Thread && policy.include_result => {
             Ok(Some(policy))
         }
         Some(_) => Err(ToolError::invalid_arguments(
-            "`background=true` delivers the completed result to the parent thread; omit deliveryPolicy or use owner_thread with includeResult=true",
+            "`background=true` requires thread delivery with includeResult=true; omit deliveryPolicy for origin_thread or select an explicit threadTarget",
         )),
     }
 }
@@ -2749,7 +2789,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the parent thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or subagent. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and delivers the result to the origin thread. For scheduled, interval, and cron work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -3511,6 +3551,9 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
         "deliveryMode": response.task.delivery_policy.as_ref().map(|policy| {
             task_delivery_mode_label(policy.mode)
         }),
+        "deliveryThreadTarget": response.task.delivery_policy.as_ref().and_then(|policy| {
+            policy.thread_target.map(task_delivery_thread_target_label)
+        }),
         "trigger": task_trigger_model_output(&response.trigger),
         "triggerKind": trigger_kind_label(response.trigger.kind()),
         "nextFireAt": response.trigger.next_fire_at,
@@ -3696,9 +3739,9 @@ fn task_create_validation_hints(
             .task
             .delivery_policy
             .as_ref()
-            .is_some_and(|policy| policy.mode == TaskDeliveryMode::OwnerThread)
+            .is_some_and(task_delivery_policy_targets_origin_thread)
         {
-            hints.push("result_will_be_delivered_to_owner_thread");
+            hints.push("result_will_be_delivered_to_origin_thread");
         }
     }
     hints
@@ -3727,7 +3770,7 @@ fn task_create_wait_recommendation(response: &TaskCreateResponse, waitable: bool
         TaskTriggerKind::Immediate
             if task_create_response_attachment(response) == TaskAttachmentMode::Detached =>
         {
-            "do_not_call_task_wait_background_result_delivers_to_parent"
+            "do_not_call_task_wait_background_result_delivers_to_origin"
         }
         _ => "do_not_call_task_wait_unless_an_active_run_exists",
     }
@@ -3745,11 +3788,26 @@ fn task_create_response_attachment(response: &TaskCreateResponse) -> TaskAttachm
 fn task_delivery_mode_label(mode: TaskDeliveryMode) -> &'static str {
     match mode {
         TaskDeliveryMode::None => "none",
-        TaskDeliveryMode::OwnerThread => "owner_thread",
         TaskDeliveryMode::Thread => "thread",
         TaskDeliveryMode::UserNotification => "user_notification",
         TaskDeliveryMode::Webhook => "webhook",
     }
+}
+
+fn task_delivery_thread_target_label(
+    target: pioneer_protocol::TaskDeliveryThreadTarget,
+) -> &'static str {
+    match target {
+        pioneer_protocol::TaskDeliveryThreadTarget::OriginThread => "origin_thread",
+        pioneer_protocol::TaskDeliveryThreadTarget::CurrentThread => "current_thread",
+        pioneer_protocol::TaskDeliveryThreadTarget::CollaborationRoot => "collaboration_root",
+        pioneer_protocol::TaskDeliveryThreadTarget::ExactThread => "exact_thread",
+    }
+}
+
+fn task_delivery_policy_targets_origin_thread(policy: &TaskDeliveryPolicy) -> bool {
+    policy.mode == TaskDeliveryMode::Thread
+        && policy.thread_target == Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
 }
 
 fn task_update_tool_output(response: &TaskUpdateResponse) -> JsonValue {
@@ -4534,17 +4592,15 @@ mod tests {
         let policy =
             |mode, thread_id: Option<&str>, webhook_url: Option<&str>| TaskDeliveryPolicy {
                 mode,
+                thread_target: (mode == TaskDeliveryMode::Thread)
+                    .then_some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
                 thread_id: thread_id.map(str::to_owned),
                 webhook_url: webhook_url.map(str::to_owned),
                 include_result: true,
                 format: pioneer_protocol::TaskDeliveryFormat::Summary,
             };
 
-        for mode in [
-            TaskDeliveryMode::None,
-            TaskDeliveryMode::OwnerThread,
-            TaskDeliveryMode::UserNotification,
-        ] {
+        for mode in [TaskDeliveryMode::None, TaskDeliveryMode::UserNotification] {
             scope
                 .authorize_delivery_policy(&store, Some(&policy(mode, None, None)))
                 .await
@@ -5190,8 +5246,9 @@ mod tests {
             completion: TaskCompletionBehavior::CompleteOnTerminalRun,
         });
         task.delivery_policy = Some(TaskDeliveryPolicy {
-            mode: TaskDeliveryMode::OwnerThread,
-            thread_id: None,
+            mode: TaskDeliveryMode::Thread,
+            thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+            thread_id: Some("thread_12345678901234".to_owned()),
             webhook_url: None,
             include_result: true,
             format: pioneer_protocol::TaskDeliveryFormat::Summary,
@@ -5219,11 +5276,12 @@ mod tests {
         let output = task_create_tool_output(&response, &anchor);
 
         assert_eq!(output["attachment"], "detached");
-        assert_eq!(output["deliveryMode"], "owner_thread");
+        assert_eq!(output["deliveryMode"], "thread");
+        assert_eq!(output["deliveryThreadTarget"], "origin_thread");
         assert_eq!(output["waitable"], JsonValue::Bool(false));
         assert_eq!(
             output["waitRecommendation"],
-            "do_not_call_task_wait_background_result_delivers_to_parent"
+            "do_not_call_task_wait_background_result_delivers_to_origin"
         );
         let hints = output["validationHints"]
             .as_array()
@@ -5231,7 +5289,7 @@ mod tests {
         for expected in [
             "immediate_detached_task_runs_in_background",
             "do_not_call_task_wait_for_detached_task",
-            "result_will_be_delivered_to_owner_thread",
+            "result_will_be_delivered_to_origin_thread",
         ] {
             assert!(
                 hints.iter().any(|hint| hint == expected),
@@ -5251,6 +5309,7 @@ mod tests {
         });
         task.delivery_policy = Some(TaskDeliveryPolicy {
             mode: TaskDeliveryMode::None,
+            thread_target: None,
             thread_id: None,
             webhook_url: None,
             include_result: true,
@@ -5316,6 +5375,7 @@ mod tests {
                 true,
                 Some(TaskDeliveryPolicy {
                     mode: TaskDeliveryMode::None,
+                    thread_target: None,
                     thread_id: None,
                     webhook_url: None,
                     include_result: true,
@@ -5544,7 +5604,7 @@ mod tests {
         for expected in [
             "Do not pass runtime-owned fields",
             "background=true",
-            "delivers its result to the parent thread",
+            "delivers its result to the origin thread",
             "self-contained for future runs",
             "currently available tools/skills/MCP/built-ins",
             "Final result format and delivery contract",

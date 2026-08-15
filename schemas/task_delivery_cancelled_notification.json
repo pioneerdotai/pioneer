@@ -165,6 +165,17 @@
         "taskId": {
           "type": "string"
         },
+        "threadTarget": {
+          "description": "Immutable semantic target captured when a thread delivery is created.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskDeliveryThreadTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "updatedAt": {
           "type": "integer",
           "format": "int64"
@@ -203,7 +214,6 @@
       "type": "string",
       "enum": [
         "none",
-        "owner_thread",
         "thread",
         "user_notification",
         "webhook"
@@ -217,6 +227,16 @@
         "delivered",
         "failed",
         "cancelled"
+      ]
+    },
+    "TaskDeliveryThreadTarget": {
+      "description": "Semantic thread target resolved and persisted by Gateway.",
+      "type": "string",
+      "enum": [
+        "origin_thread",
+        "current_thread",
+        "collaboration_root",
+        "exact_thread"
       ]
     },
     "TaskError": {

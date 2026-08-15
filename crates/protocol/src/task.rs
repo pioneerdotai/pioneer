@@ -515,10 +515,19 @@ pub struct TaskLifecyclePolicy {
 #[serde(rename_all = "snake_case")]
 pub enum TaskDeliveryMode {
     None,
-    OwnerThread,
     Thread,
     UserNotification,
     Webhook,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+/// Semantic thread target resolved and persisted by Gateway.
+pub enum TaskDeliveryThreadTarget {
+    OriginThread,
+    CurrentThread,
+    CollaborationRoot,
+    ExactThread,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,6 +541,12 @@ pub enum TaskDeliveryFormat {
 #[serde(rename_all = "camelCase")]
 pub struct TaskDeliveryPolicy {
     pub mode: TaskDeliveryMode,
+    /// Required for `Thread` delivery. Gateway resolves semantic targets to a
+    /// canonical `thread_id` before persisting the Task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_target: Option<TaskDeliveryThreadTarget>,
+    /// Canonical target persisted by Gateway. Callers provide this only for
+    /// `ExactThread`; for semantic targets it is server-owned output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -567,6 +582,9 @@ pub struct TaskDelivery {
     pub run_id: String,
     pub delivery_key: String,
     pub mode: TaskDeliveryMode,
+    /// Immutable semantic target captured when a thread delivery is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_target: Option<TaskDeliveryThreadTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

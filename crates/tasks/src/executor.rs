@@ -828,13 +828,13 @@ fn delivery_for_terminal_run(
     if policy.mode == TaskDeliveryMode::None {
         return None;
     }
+    let thread_target = (policy.mode == TaskDeliveryMode::Thread)
+        .then_some(policy.thread_target)
+        .flatten();
+    if policy.mode == TaskDeliveryMode::Thread && thread_target.is_none() {
+        return None;
+    }
     let target_thread_id = match policy.mode {
-        TaskDeliveryMode::OwnerThread => task_response
-            .task
-            .owner_id
-            .clone()
-            .filter(|_| task_response.task.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
-            .or_else(|| task_response.task.created_by_thread_id.clone()),
         TaskDeliveryMode::Thread => policy.thread_id.clone(),
         _ => None,
     };
@@ -844,11 +844,7 @@ fn delivery_for_terminal_run(
     let webhook_url = (policy.mode == TaskDeliveryMode::Webhook)
         .then(|| policy.webhook_url.clone())
         .flatten();
-    if matches!(
-        policy.mode,
-        TaskDeliveryMode::OwnerThread | TaskDeliveryMode::Thread
-    ) && target_thread_id.is_none()
-    {
+    if policy.mode == TaskDeliveryMode::Thread && target_thread_id.is_none() {
         return None;
     }
     if policy.mode == TaskDeliveryMode::Webhook && webhook_url.is_none() {
@@ -871,13 +867,23 @@ fn delivery_for_terminal_run(
         .or_else(|| target_user_id.clone())
         .or_else(|| webhook_url.clone())
         .unwrap_or_else(|| "none".to_owned());
-    let delivery_key = format!(
-        "{}:{}:{}:{}",
-        task_response.task.id,
-        run_id,
-        delivery_mode_key(policy.mode),
-        target
-    );
+    let delivery_key = match thread_target {
+        Some(thread_target) => format!(
+            "{}:{}:{}:{}:{}",
+            task_response.task.id,
+            run_id,
+            delivery_mode_key(policy.mode),
+            delivery_thread_target_key(thread_target),
+            target
+        ),
+        None => format!(
+            "{}:{}:{}:{}",
+            task_response.task.id,
+            run_id,
+            delivery_mode_key(policy.mode),
+            target
+        ),
+    };
     Some(pioneer_protocol::TaskDelivery {
         id: generate_id(ID_LEN),
         workspace_id: task_response.task.workspace_id.clone(),
@@ -885,6 +891,7 @@ fn delivery_for_terminal_run(
         run_id: run_id.to_owned(),
         delivery_key,
         mode: policy.mode,
+        thread_target,
         target_thread_id,
         target_user_id,
         webhook_url: webhook_url.clone(),
@@ -911,10 +918,18 @@ fn delivery_for_terminal_run(
 fn delivery_mode_key(mode: TaskDeliveryMode) -> &'static str {
     match mode {
         TaskDeliveryMode::None => "none",
-        TaskDeliveryMode::OwnerThread => "owner_thread",
         TaskDeliveryMode::Thread => "thread",
         TaskDeliveryMode::UserNotification => "user_notification",
         TaskDeliveryMode::Webhook => "webhook",
+    }
+}
+
+fn delivery_thread_target_key(target: pioneer_protocol::TaskDeliveryThreadTarget) -> &'static str {
+    match target {
+        pioneer_protocol::TaskDeliveryThreadTarget::OriginThread => "origin_thread",
+        pioneer_protocol::TaskDeliveryThreadTarget::CurrentThread => "current_thread",
+        pioneer_protocol::TaskDeliveryThreadTarget::CollaborationRoot => "collaboration_root",
+        pioneer_protocol::TaskDeliveryThreadTarget::ExactThread => "exact_thread",
     }
 }
 

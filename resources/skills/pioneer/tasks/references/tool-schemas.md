@@ -53,7 +53,8 @@ Common cron task:
   "inputText": "Repository: https://github.com/OWNER/REPO. Baseline release tag: vX.Y.Z.",
   "outputInstructions": "Return Russian Markdown. If a new release exists, include a product summary with concise sections. If no release changed, return 'Новых релизов нет.'",
   "deliveryPolicy": {
-    "mode": "owner_thread",
+    "mode": "thread",
+    "threadTarget": "origin_thread",
     "includeResult": true,
     "format": "full_result"
   }
@@ -157,6 +158,7 @@ Change delivery to this thread:
   "taskId": "TASK_ID",
   "deliveryPolicy": {
     "mode": "thread",
+    "threadTarget": "exact_thread",
     "threadId": "CURRENT_THREAD_ID",
     "includeResult": true,
     "format": "full_result"
@@ -164,13 +166,14 @@ Change delivery to this thread:
 }
 ```
 
-Change delivery to owner thread:
+Change delivery to the origin thread:
 
 ```json
 {
   "taskId": "TASK_ID",
   "deliveryPolicy": {
-    "mode": "owner_thread",
+    "mode": "thread",
+    "threadTarget": "origin_thread",
     "includeResult": true,
     "format": "full_result"
   }
@@ -210,7 +213,8 @@ After pausing or resuming, verify the current task status with the tool result o
 
 ```json
 {
-  "mode": "none | owner_thread | thread | user_notification | webhook",
+  "mode": "none | thread | user_notification | webhook",
+  "threadTarget": "origin_thread | current_thread | collaboration_root | exact_thread",
   "threadId": "THREAD_ID",
   "webhookUrl": "https://example.com/hook",
   "includeResult": true,
@@ -220,9 +224,10 @@ After pausing or resuming, verify the current task status with the tool result o
 
 Rules:
 
-- `threadId` is required for `mode:"thread"`.
+- `threadTarget` is required for `mode:"thread"`.
+- `threadId` is supplied by the caller only for `threadTarget:"exact_thread"`; Gateway resolves the other targets.
 - `webhookUrl` is required for `mode:"webhook"`.
-- `owner_thread`, `user_notification`, and `none` do not need `threadId`.
+- `user_notification` and `none` do not use `threadTarget` or `threadId`.
 - Use `includeResult:true` when the user expects the answer text.
 - Use `format:"full_result"` when preserving markdown, citations, sections, or artifacts matters.
 

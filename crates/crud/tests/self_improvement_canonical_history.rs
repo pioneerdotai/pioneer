@@ -361,11 +361,12 @@ async fn seed_failed_collaborative_context(
                 datetime({child_completed_at}, 'unixepoch')
             );
             INSERT INTO task_delivery (
-                id, workspace_id, task_id, run_id, delivery_key, mode, target_thread_id,
+                id, workspace_id, task_id, run_id, delivery_key, mode, thread_target,
+                target_thread_id,
                 status, error_snapshot_json, attempt_count, max_attempts
             ) VALUES (
                 '{delivery_id}', '{workspace_id}', '{task_id}', '{run_id}',
-                'delivery_key_{delivery_id}', 'owner_thread', '{parent_thread_id}',
+                'delivery_key_{delivery_id}', 'thread', 'origin_thread', '{parent_thread_id}',
                 'delivering', '{error_json}', 1, 1
             );
             "#,
@@ -1053,11 +1054,12 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
                 'accepted', '{result_json}', '[]', CURRENT_TIMESTAMP
             );
             INSERT INTO task_delivery (
-                id, workspace_id, task_id, run_id, delivery_key, mode, target_thread_id,
+                id, workspace_id, task_id, run_id, delivery_key, mode, thread_target,
+                target_thread_id,
                 status, result_snapshot_json, attempt_count, max_attempts
             ) VALUES (
                 'delivery_hist_ok', 'ws_history_a', 'task_hist_collab', 'run_hist_collab',
-                'delivery_key_hist', 'owner_thread', '{parent_thread_id}', 'delivering',
+                'delivery_key_hist', 'thread', 'origin_thread', '{parent_thread_id}', 'delivering',
                 '{result_json}', 1, 1
             );
             "#,
@@ -1187,7 +1189,7 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
     assert_eq!(
         records.last().map(|record| record.event_id.as_str()),
         Some(sources[0].terminal_event_id.as_str()),
-        "the exact owner-thread delivery ItemCompleted is the frozen boundary"
+        "the exact origin-thread delivery ItemCompleted is the frozen boundary"
     );
 
     let forged_revision_thread = thread_with_origin(
@@ -1280,8 +1282,8 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
             .await
             .unwrap_err()
             .to_string()
-            .contains("did not complete before its owner delivery"),
-        "a revision recorded after the frozen owner delivery must fail closed"
+            .contains("did not complete before its origin delivery"),
+        "a revision recorded after the frozen origin delivery must fail closed"
     );
 
     database
@@ -1301,8 +1303,8 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
             .await
             .unwrap_err()
             .to_string()
-            .contains("terminated after its owner delivery"),
-        "late child terminal content must not enter an earlier frozen owner delivery"
+            .contains("terminated after its origin delivery"),
+        "late child terminal content must not enter an earlier frozen origin delivery"
     );
 
     database
@@ -1321,7 +1323,7 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
             .unwrap_err()
             .to_string()
             .contains("occurs after the accepted execution turn"),
-        "a revision after the accepted result must not enter its owner delivery"
+        "a revision after the accepted result must not enter its origin delivery"
     );
 }
 

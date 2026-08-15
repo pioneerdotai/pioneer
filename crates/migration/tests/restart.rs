@@ -133,3 +133,138 @@ async fn migration_previous_release_upgrades_after_database_restart() {
         .await
         .expect("close upgraded database connection");
 }
+
+#[tokio::test]
+async fn migration_upgrades_legacy_task_delivery_contract_without_runtime_fallbacks() {
+    let directory = tempfile::tempdir().expect("create migration test directory");
+    let url = sqlite_url(&directory);
+    let previous = connect(&url).await;
+    BeforeLatestMigrator::up(&previous, None)
+        .await
+        .expect("apply previous release schema");
+    previous
+        .execute_unprepared(
+            r#"
+            INSERT INTO workspace (id, name, is_active, is_current)
+            VALUES ('workspace_migration', 'Migration test', 1, 1);
+
+            INSERT INTO task (
+                id, workspace_id, owner_kind, owner_id, created_by_thread_id,
+                executor_kind, status, title, goal, delivery_policy_json
+            ) VALUES
+                ('task_legacy_origin', (SELECT id FROM workspace LIMIT 1), 'thread',
+                 'thread_old_owner', 'thread_old_current', 'agent', 'scheduled',
+                 'Legacy origin delivery', 'Migrate it',
+                 '{"mode":"owner_thread","includeResult":true,"format":"summary"}'),
+                ('task_legacy_exact', (SELECT id FROM workspace LIMIT 1), 'thread',
+                 'thread_old_owner', 'thread_old_current', 'system', 'scheduled',
+                 'Legacy exact delivery', 'Migrate it',
+                 '{"mode":"thread","threadId":"thread_exact","includeResult":true,"format":"summary"}');
+
+            INSERT INTO task_execution_admission (
+                task_id, workspace_id, root_thread_id, initiating_principal_id,
+                authorization_context_json
+            ) VALUES (
+                'task_legacy_origin', (SELECT id FROM workspace LIMIT 1),
+                'thread_origin', 'principal_test', '{}'
+            );
+
+            INSERT INTO task_delivery (
+                id, workspace_id, task_id, run_id, delivery_key, mode,
+                target_thread_id, status, attempt_count, max_attempts
+            ) VALUES
+                ('delivery_legacy_origin', (SELECT id FROM workspace LIMIT 1),
+                 'task_legacy_origin', 'run_origin',
+                 'task_legacy_origin:run_origin:owner_thread:thread_origin',
+                 'owner_thread', 'thread_origin', 'pending', 0, 1),
+                ('delivery_legacy_exact', (SELECT id FROM workspace LIMIT 1),
+                 'task_legacy_exact', 'run_exact',
+                 'task_legacy_exact:run_exact:thread:thread_exact',
+                 'thread', 'thread_exact', 'pending', 0, 1);
+            "#,
+        )
+        .await
+        .expect("seed legacy Task delivery rows");
+    previous.close().await.expect("close previous database");
+
+    let upgraded = connect(&url).await;
+    Migrator::up(&upgraded, None)
+        .await
+        .expect("migrate legacy Task delivery rows");
+
+    assert!(column_exists(&upgraded, "task_delivery", "thread_target").await);
+    let origin_policy = string_column(
+        &upgraded,
+        "SELECT delivery_policy_json AS value FROM task WHERE id = 'task_legacy_origin'",
+    )
+    .await;
+    let origin_policy: serde_json::Value =
+        serde_json::from_str(origin_policy.as_str()).expect("origin policy JSON");
+    assert_eq!(origin_policy["mode"], "thread");
+    assert_eq!(origin_policy["threadTarget"], "origin_thread");
+    assert_eq!(origin_policy["threadId"], "thread_origin");
+
+    let exact_policy = string_column(
+        &upgraded,
+        "SELECT delivery_policy_json AS value FROM task WHERE id = 'task_legacy_exact'",
+    )
+    .await;
+    let exact_policy: serde_json::Value =
+        serde_json::from_str(exact_policy.as_str()).expect("exact policy JSON");
+    assert_eq!(exact_policy["mode"], "thread");
+    assert_eq!(exact_policy["threadTarget"], "exact_thread");
+    assert_eq!(exact_policy["threadId"], "thread_exact");
+
+    assert_delivery_row(
+        &upgraded,
+        "delivery_legacy_origin",
+        "origin_thread",
+        "task_legacy_origin:run_origin:thread:origin_thread:thread_origin",
+    )
+    .await;
+    assert_delivery_row(
+        &upgraded,
+        "delivery_legacy_exact",
+        "exact_thread",
+        "task_legacy_exact:run_exact:thread:exact_thread:thread_exact",
+    )
+    .await;
+}
+
+async fn string_column(database: &DatabaseConnection, sql: &str) -> String {
+    let row = database
+        .query_one_raw(Statement::from_string(DbBackend::Sqlite, sql))
+        .await
+        .expect("query string column")
+        .expect("string column row");
+    String::try_get(&row, "", "value").expect("decode string column")
+}
+
+async fn assert_delivery_row(
+    database: &DatabaseConnection,
+    delivery_id: &str,
+    expected_target: &str,
+    expected_key: &str,
+) {
+    let row = database
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT mode, thread_target, delivery_key FROM task_delivery WHERE id = ?",
+            [delivery_id.into()],
+        ))
+        .await
+        .expect("query migrated delivery")
+        .expect("migrated delivery row");
+    assert_eq!(
+        String::try_get(&row, "", "mode").expect("delivery mode"),
+        "thread"
+    );
+    assert_eq!(
+        String::try_get(&row, "", "thread_target").expect("delivery thread target"),
+        expected_target
+    );
+    assert_eq!(
+        String::try_get(&row, "", "delivery_key").expect("delivery key"),
+        expected_key
+    );
+}

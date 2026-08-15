@@ -167,19 +167,19 @@ use crate::convention::{
     recovery_action_from_db, recovery_action_to_db, recovery_job_status_from_db,
     recovery_trigger_from_db, task_concurrency_conflict_policy_from_db,
     task_delivery_attempt_status_from_db, task_delivery_mode_from_db, task_delivery_status_from_db,
-    task_executor_kind_from_db, task_owner_kind_from_db, task_owner_kind_to_db,
-    task_result_candidate_status_from_db, task_result_review_decision_from_db,
-    task_result_review_event_kind_from_db, task_result_reviewer_kind_from_db,
-    task_run_execution_status_from_db, task_run_execution_status_to_db, task_run_status_from_db,
-    task_run_status_to_db, task_run_thread_binding_kind_from_db, task_run_turn_kind_from_db,
-    task_run_turn_status_from_db, task_run_turn_status_to_db, task_status_from_db,
-    task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
-    task_write_lock_scope_kind_from_db, task_write_lock_status_from_db,
-    task_write_lock_status_to_db, thread_mode_from_db, thread_origin_kind_from_db,
-    thread_sidebar_visibility_from_db, thread_status_from_db, turn_item_type_from_db,
-    turn_item_type_to_db, turn_kind_from_db, turn_kind_to_db, turn_origin_from_db,
-    turn_permission_mode_from_db, turn_permission_profile_source_from_db, turn_status_from_db,
-    turn_status_to_db,
+    task_delivery_thread_target_from_db, task_executor_kind_from_db, task_owner_kind_from_db,
+    task_owner_kind_to_db, task_result_candidate_status_from_db,
+    task_result_review_decision_from_db, task_result_review_event_kind_from_db,
+    task_result_reviewer_kind_from_db, task_run_execution_status_from_db,
+    task_run_execution_status_to_db, task_run_status_from_db, task_run_status_to_db,
+    task_run_thread_binding_kind_from_db, task_run_turn_kind_from_db, task_run_turn_status_from_db,
+    task_run_turn_status_to_db, task_status_from_db, task_status_to_db, task_trigger_kind_from_db,
+    task_trigger_status_from_db, task_write_lock_scope_kind_from_db,
+    task_write_lock_status_from_db, task_write_lock_status_to_db, thread_mode_from_db,
+    thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
+    turn_item_type_from_db, turn_item_type_to_db, turn_kind_from_db, turn_kind_to_db,
+    turn_origin_from_db, turn_permission_mode_from_db, turn_permission_profile_source_from_db,
+    turn_status_from_db, turn_status_to_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -22094,6 +22094,14 @@ fn task_delivery_from_db_model(
         .with_context(|| format!("unknown task delivery mode `{}`", model.mode))?;
     let status = task_delivery_status_from_db(model.status.as_str())
         .with_context(|| format!("unknown task delivery status `{}`", model.status))?;
+    let thread_target = model
+        .thread_target
+        .as_deref()
+        .map(|value| {
+            task_delivery_thread_target_from_db(value)
+                .with_context(|| format!("unknown task delivery thread target `{value}`"))
+        })
+        .transpose()?;
     Ok(TaskDelivery {
         id: model.id,
         workspace_id: model.workspace_id,
@@ -22101,6 +22109,7 @@ fn task_delivery_from_db_model(
         run_id: model.run_id,
         delivery_key: model.delivery_key,
         mode,
+        thread_target,
         target_thread_id: model.target_thread_id,
         target_user_id: model.target_user_id,
         webhook_url: model.webhook_url,

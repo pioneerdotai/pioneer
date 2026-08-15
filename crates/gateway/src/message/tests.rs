@@ -5932,6 +5932,7 @@ fn test_task_create_params(
         }),
         delivery_policy: Some(TaskDeliveryPolicy {
             mode: TaskDeliveryMode::None,
+            thread_target: None,
             thread_id: None,
             webhook_url: None,
             include_result: true,
@@ -5988,8 +5989,9 @@ fn detached_cli_task_create_params(
         completion: TaskCompletionBehavior::CompleteOnTerminalRun,
     });
     params.delivery_policy = Some(TaskDeliveryPolicy {
-        mode: TaskDeliveryMode::OwnerThread,
-        thread_id: None,
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        thread_id: Some(parent_thread_id.to_owned()),
         webhook_url: None,
         include_result: true,
         format: TaskDeliveryFormat::Summary,
@@ -8311,12 +8313,12 @@ async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
     assert_eq!(
         task_b_deliveries.deliveries.len(),
         1,
-        "Task B must have one exact owner-thread delivery: {task_b_deliveries:#?}"
+        "Task B must have one exact origin-thread delivery: {task_b_deliveries:#?}"
     );
     assert_eq!(
         task_b_deliveries.deliveries[0].status,
         TaskDeliveryStatus::Delivered,
-        "Task B owner-thread delivery must commit before it becomes a source: {task_b_deliveries:#?}"
+        "Task B origin-thread delivery must commit before it becomes a source: {task_b_deliveries:#?}"
     );
     assert_eq!(
         task_b_deliveries.deliveries[0].delivered_turn_id.as_deref(),
@@ -15224,8 +15226,9 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         3,
     );
     params.delivery_policy = Some(TaskDeliveryPolicy {
-        mode: TaskDeliveryMode::OwnerThread,
-        thread_id: None,
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        thread_id: Some("thr_parent_task_test".to_owned()),
         webhook_url: None,
         include_result: true,
         format: TaskDeliveryFormat::Summary,
@@ -15550,8 +15553,9 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
         3,
     );
     params.delivery_policy = Some(TaskDeliveryPolicy {
-        mode: TaskDeliveryMode::OwnerThread,
-        thread_id: None,
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        thread_id: Some("thr_parent_review_success".to_owned()),
         webhook_url: None,
         include_result: true,
         format: TaskDeliveryFormat::Summary,
@@ -15930,8 +15934,9 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         completion: TaskCompletionBehavior::CompleteOnTerminalRun,
     });
     params.delivery_policy = Some(TaskDeliveryPolicy {
-        mode: TaskDeliveryMode::OwnerThread,
-        thread_id: None,
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        thread_id: Some(parent_thread_id.to_owned()),
         webhook_url: None,
         include_result: true,
         format: TaskDeliveryFormat::Summary,
@@ -18623,8 +18628,8 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             .delivery_policy
             .as_ref()
             .map(|policy| policy.mode),
-        Some(TaskDeliveryMode::OwnerThread),
-        "immediate detached thread work should inherit scheduled-style owner delivery"
+        Some(TaskDeliveryMode::Thread),
+        "immediate detached thread work should inherit origin-thread delivery"
     );
     assert!(
         !response.task.status.is_terminal(),
@@ -18795,7 +18800,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     assert_eq!(
         pending_delivery_anchor.status,
         TaskStatus::Running,
-        "the parent Task card must remain running while owner-thread delivery is pending"
+        "the parent Task card must remain running while origin-thread delivery is pending"
     );
 
     let occurrence_items = crud_store
@@ -18898,7 +18903,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         )
         .await,
         TurnStatus::Completed,
-        "the parent occurrence may complete only after owner-thread delivery"
+        "the parent occurrence may complete only after origin-thread delivery"
     );
     let delivered_anchor = wait_for_task_anchor_item_status(
         crud_store.clone(),
@@ -20583,7 +20588,7 @@ async fn assert_detached_native_child_turn_cancellation() {
         TurnStatus::Interrupted
     );
 
-    // Cancellation also produces a terminal owner-thread delivery. That
+    // Cancellation also produces a terminal origin-thread delivery. That
     // delivery must never overwrite the already-interrupted occurrence turn
     // with `Completed`; reloading the parent timeline reads this durable turn.
     processor
@@ -20604,7 +20609,7 @@ async fn assert_detached_native_child_turn_cancellation() {
         .expect("cancelled child deliveries should reload");
     assert!(
         !deliveries.deliveries.is_empty(),
-        "cancelled child should enqueue an owner-thread delivery"
+        "cancelled child should enqueue an origin-thread delivery"
     );
     assert!(
         deliveries
@@ -22169,7 +22174,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
+async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("must connect to sqlite memory");
@@ -22206,7 +22211,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         .register_executor(Arc::new(CompletingSystemExecutor))
         .await;
 
-    let owner_thread_id = "thr_delivery_owner";
+    let origin_thread_id = "thr_delivery_origin";
     processor
         .process_request_for_connection(
             connection_id,
@@ -22215,7 +22220,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
                 "id": "taskdeliverythread001",
                 "method": "thread/start",
                 "params": {
-                    "thread_id": owner_thread_id,
+                    "thread_id": origin_thread_id,
                     "workspace_id": workspace_id,
                     "mode": "Agent"
                 }
@@ -22233,8 +22238,8 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
             TaskCreateParams {
                 workspace_id: workspace_id.clone(),
                 owner_kind: TaskOwnerKind::Thread,
-                owner_id: Some(owner_thread_id.to_owned()),
-                created_by_thread_id: Some(owner_thread_id.to_owned()),
+                owner_id: Some(origin_thread_id.to_owned()),
+                created_by_thread_id: Some(origin_thread_id.to_owned()),
                 created_by_turn_id: None,
                 parent_task_id: None,
                 executor_kind: TaskExecutorKind::System,
@@ -22251,8 +22256,9 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
                 agent_spec: None,
                 lifecycle_policy: None,
                 delivery_policy: Some(TaskDeliveryPolicy {
-                    mode: TaskDeliveryMode::OwnerThread,
-                    thread_id: None,
+                    mode: TaskDeliveryMode::Thread,
+                    thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+                    thread_id: Some(origin_thread_id.to_owned()),
                     webhook_url: None,
                     include_result: true,
                     format: TaskDeliveryFormat::Summary,
@@ -22286,7 +22292,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         .clone();
     let parent_thread = processor
         .thread_manager
-        .thread_get(owner_thread_id)
+        .thread_get(origin_thread_id)
         .await
         .expect("owner thread should be loaded");
     let occurrence_turn = Turn {
@@ -22323,7 +22329,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         .materialize_turn_completed(
             TurnCompletedNotification {
                 workspace_id: workspace_id.clone(),
-                thread_id: owner_thread_id.to_owned(),
+                thread_id: origin_thread_id.to_owned(),
                 turn: occurrence_turn,
             },
             4_000_000_000,
@@ -22338,11 +22344,11 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
                 run_id: run.id.clone(),
                 lineage: TaskThreadLineage {
                     child_thread_id: "child_delivery_thread_1".to_owned(),
-                    parent_thread_id: owner_thread_id.to_owned(),
-                    root_thread_id: owner_thread_id.to_owned(),
+                    parent_thread_id: origin_thread_id.to_owned(),
+                    root_thread_id: origin_thread_id.to_owned(),
                     depth: 0,
                     origin_kind: Some("task_run".to_owned()),
-                    created_by_thread_id: Some(owner_thread_id.to_owned()),
+                    created_by_thread_id: Some(origin_thread_id.to_owned()),
                     created_by_turn_id: Some(run.id.clone()),
                     created_at: 4_000_000_000,
                 },
@@ -22428,7 +22434,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         "owner thread delivery must use target binding -> lineage created_by turn instead of creating a delivery turn"
     );
     let items = crud_store
-        .get_turn_item_events(owner_thread_id, delivered_turn_id)
+        .get_turn_item_events(origin_thread_id, delivered_turn_id)
         .await
         .expect("items should read")
         .expect("occurrence turn should exist");
@@ -22469,7 +22475,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
     assert_eq!(ingestion_calls.len(), 1);
     let delivered_call = &ingestion_calls[0];
     assert_eq!(delivered_call.workspace_id, workspace_id);
-    assert_eq!(delivered_call.thread_id, owner_thread_id);
+    assert_eq!(delivered_call.thread_id, origin_thread_id);
     assert_eq!(delivered_call.turn_id, run.id);
     assert_eq!(delivered_call.item_type, TurnItemType::AgentMessage);
     assert_eq!(
@@ -22482,12 +22488,12 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
             if text == "delivered scheduled result\nfull detail"
     ));
     drop(ingestion_calls);
-    let owner_thread = crud_store
-        .get_thread_model(owner_thread_id)
+    let origin_thread = crud_store
+        .get_thread_model(origin_thread_id)
         .await
         .expect("owner thread should read")
         .expect("owner thread should still exist");
-    assert_eq!(owner_thread.mode, ThreadMode::Agent);
+    assert_eq!(origin_thread.mode, ThreadMode::Agent);
 
     let deliveries_request = json!({
         "jsonrpc": "2.0",
@@ -22520,7 +22526,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_owner_thread() {
         "params": {
             "workspaceId": workspace_id,
             "ownerKind": "thread",
-            "ownerId": owner_thread_id,
+            "ownerId": origin_thread_id,
             "includeCompleted": true,
             "limit": 10
         }
@@ -22640,6 +22646,7 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
                 lifecycle_policy: None,
                 delivery_policy: Some(TaskDeliveryPolicy {
                     mode: TaskDeliveryMode::Thread,
+                    thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
                     thread_id: Some(target_thread_id.to_owned()),
                     webhook_url: None,
                     include_result: true,

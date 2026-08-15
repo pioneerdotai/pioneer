@@ -44,6 +44,7 @@ mod self_improvement;
 mod session;
 mod settings;
 mod system_skills;
+mod task_delivery_policy;
 mod task_projection;
 mod task_tools;
 #[cfg(test)]
