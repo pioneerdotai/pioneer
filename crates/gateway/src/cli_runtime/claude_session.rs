@@ -13,9 +13,10 @@ use crate::cli_runtime::manager::{
     CLIAgentRuntimeEventReceivers, CLIAgentRuntimeMcpTurnMetadata,
     CLIAgentRuntimeObservedTurnStatus, CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory,
     CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionStartOptions, CLIAgentRuntimeThreadOpenParams,
-    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnObservation,
-    CLIAgentRuntimeTurnStartParams, CLIAgentRuntimeTurnStartSnapshot,
-    CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
+    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnLivenessProbe,
+    CLIAgentRuntimeTurnObservation, CLIAgentRuntimeTurnStartParams,
+    CLIAgentRuntimeTurnStartSnapshot, CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeTurnSteerResult,
 };
 use crate::cli_runtime::mcp::coordinator::{
     CliMcpProjectionFingerprint, CliMcpProjectionGeneration,
@@ -1821,21 +1822,31 @@ impl CLIAgentRuntimeSession for ClaudeCLIAgentRuntimeSession {
         Ok(())
     }
 
-    async fn observe_turn(
+    async fn probe_turn_liveness(
+        &self,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> Result<CLIAgentRuntimeTurnLivenessProbe> {
+        let state = self.client.state.lock().await;
+        if state.native_thread_id.as_deref() == Some(native_thread_id)
+            && state.active_turn_id.as_deref() == Some(native_turn_id)
+        {
+            return Ok(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
+        }
+        if state.native_thread_id.as_deref() == Some(native_thread_id)
+            && state.observed_turn_id.as_deref() == Some(native_turn_id)
+        {
+            return Ok(CLIAgentRuntimeTurnLivenessProbe::SnapshotRequired);
+        }
+        Ok(CLIAgentRuntimeTurnLivenessProbe::Unavailable)
+    }
+
+    async fn load_turn_snapshot(
         &self,
         native_thread_id: &str,
         native_turn_id: &str,
     ) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
         let state = self.client.state.lock().await;
-        if state.native_thread_id.as_deref() == Some(native_thread_id)
-            && state.active_turn_id.as_deref() == Some(native_turn_id)
-        {
-            return Ok(Some(CLIAgentRuntimeTurnObservation {
-                status: CLIAgentRuntimeObservedTurnStatus::InProgress,
-                message: None,
-                reconciliation_events: Vec::new(),
-            }));
-        }
         if state.native_thread_id.as_deref() == Some(native_thread_id)
             && state.observed_turn_id.as_deref() == Some(native_turn_id)
         {

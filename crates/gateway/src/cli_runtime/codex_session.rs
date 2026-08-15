@@ -16,9 +16,9 @@ use crate::cli_runtime::manager::{
     CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadForkResult,
     CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeThreadNameSetResult,
     CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
-    CLIAgentRuntimeTurnObservation, CLIAgentRuntimeTurnStartParams,
-    CLIAgentRuntimeTurnStartSnapshot, CLIAgentRuntimeTurnSteerRequest,
-    CLIAgentRuntimeTurnSteerResult,
+    CLIAgentRuntimeTurnLivenessProbe, CLIAgentRuntimeTurnObservation,
+    CLIAgentRuntimeTurnStartParams, CLIAgentRuntimeTurnStartSnapshot,
+    CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
 };
 use crate::cli_runtime::mcp::coordinator::{
     CliMcpProjectionFingerprint, CliMcpProjectionGeneration,
@@ -2007,6 +2007,110 @@ struct CodexThreadContinuationState {
     bound_native_thread_id: Option<String>,
 }
 
+async fn probe_codex_turn_liveness(
+    client: &CodexAppServerClient,
+    native_thread_id: &str,
+    timeout: Duration,
+) -> Result<CLIAgentRuntimeTurnLivenessProbe> {
+    let snapshot = client
+        .thread_read_raw(native_thread_id, false, timeout)
+        .await
+        .context("Codex thread/read liveness probe failed")?;
+    if snapshot.pointer("/thread/id").and_then(JsonValue::as_str) != Some(native_thread_id) {
+        bail!("Codex thread/read liveness probe returned a different native thread id");
+    }
+    Ok(
+        match snapshot
+            .pointer("/thread/status/type")
+            .and_then(JsonValue::as_str)
+        {
+            Some("active") => CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive,
+            Some("idle" | "notLoaded" | "systemError") => {
+                CLIAgentRuntimeTurnLivenessProbe::SnapshotRequired
+            }
+            _ => CLIAgentRuntimeTurnLivenessProbe::Unavailable,
+        },
+    )
+}
+
+async fn load_codex_turn_snapshot(
+    client: &CodexAppServerClient,
+    native_thread_id: &str,
+    native_turn_id: &str,
+    timeout: Duration,
+) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
+    let snapshot = client
+        .thread_read_turn_snapshot_raw(native_thread_id, native_turn_id, timeout)
+        .await
+        .context("Codex thread/read terminal snapshot failed")?;
+    codex_turn_observation_from_snapshot(&snapshot, native_thread_id, native_turn_id)
+}
+
+fn codex_turn_observation_from_snapshot(
+    snapshot: &JsonValue,
+    native_thread_id: &str,
+    native_turn_id: &str,
+) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
+    if snapshot.pointer("/thread/id").and_then(JsonValue::as_str) != Some(native_thread_id) {
+        bail!("Codex terminal snapshot returned a different native thread id");
+    }
+    let Some(turn) = snapshot
+        .pointer("/thread/turns")
+        .and_then(JsonValue::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| turn.get("id").and_then(JsonValue::as_str) == Some(native_turn_id))
+        })
+    else {
+        return Ok(None);
+    };
+    let status = match turn.get("status").and_then(JsonValue::as_str) {
+        Some("inProgress" | "in_progress") => CLIAgentRuntimeObservedTurnStatus::InProgress,
+        Some("completed") => CLIAgentRuntimeObservedTurnStatus::Completed,
+        Some("failed") => CLIAgentRuntimeObservedTurnStatus::Failed,
+        Some("blocked") => CLIAgentRuntimeObservedTurnStatus::Blocked,
+        Some("interrupted") => CLIAgentRuntimeObservedTurnStatus::Interrupted,
+        _ => return Ok(None),
+    };
+    let message = turn
+        .pointer("/error/message")
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned);
+    let reconciliation_events = if status == CLIAgentRuntimeObservedTurnStatus::InProgress {
+        Vec::new()
+    } else {
+        turn.get("items")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                let params = serde_json::json!({
+                    "threadId": native_thread_id,
+                    "turnId": native_turn_id,
+                    "item": item,
+                });
+                map_codex_notification_event(
+                    &CodexJsonlRpcNotificationEvent {
+                        method: "item/completed".to_owned(),
+                        params: Some(params.clone()),
+                        raw: serde_json::json!({
+                            "method": "item/completed",
+                            "params": params,
+                        }),
+                    },
+                    RuntimeEventMappingOptions::default(),
+                )
+            })
+            .collect()
+    };
+    Ok(Some(CLIAgentRuntimeTurnObservation {
+        status,
+        message,
+        reconciliation_events,
+    }))
+}
+
 #[async_trait]
 impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
     async fn close(&self) -> Result<()> {
@@ -2355,71 +2459,26 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
         Ok(())
     }
 
-    async fn observe_turn(
+    async fn probe_turn_liveness(
+        &self,
+        native_thread_id: &str,
+        _native_turn_id: &str,
+    ) -> Result<CLIAgentRuntimeTurnLivenessProbe> {
+        probe_codex_turn_liveness(&self.client, native_thread_id, self.request_timeout).await
+    }
+
+    async fn load_turn_snapshot(
         &self,
         native_thread_id: &str,
         native_turn_id: &str,
     ) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
-        let snapshot = self
-            .client
-            .thread_read_raw(native_thread_id, true, self.request_timeout)
-            .await
-            .context("Codex thread/read reconciliation failed")?;
-        let Some(turn) = snapshot
-            .pointer("/thread/turns")
-            .and_then(JsonValue::as_array)
-            .and_then(|turns| {
-                turns
-                    .iter()
-                    .find(|turn| turn.get("id").and_then(JsonValue::as_str) == Some(native_turn_id))
-            })
-        else {
-            return Ok(None);
-        };
-        let status = match turn.get("status").and_then(JsonValue::as_str) {
-            Some("inProgress" | "in_progress") => CLIAgentRuntimeObservedTurnStatus::InProgress,
-            Some("completed") => CLIAgentRuntimeObservedTurnStatus::Completed,
-            Some("failed") => CLIAgentRuntimeObservedTurnStatus::Failed,
-            Some("blocked") => CLIAgentRuntimeObservedTurnStatus::Blocked,
-            Some("interrupted") => CLIAgentRuntimeObservedTurnStatus::Interrupted,
-            _ => return Ok(None),
-        };
-        let message = turn
-            .pointer("/error/message")
-            .and_then(JsonValue::as_str)
-            .map(str::to_owned);
-        let reconciliation_events = if status == CLIAgentRuntimeObservedTurnStatus::InProgress {
-            Vec::new()
-        } else {
-            turn.get("items")
-                .and_then(JsonValue::as_array)
-                .into_iter()
-                .flatten()
-                .map(|item| {
-                    let params = serde_json::json!({
-                        "threadId": native_thread_id,
-                        "turnId": native_turn_id,
-                        "item": item,
-                    });
-                    map_codex_notification_event(
-                        &CodexJsonlRpcNotificationEvent {
-                            method: "item/completed".to_owned(),
-                            params: Some(params.clone()),
-                            raw: serde_json::json!({
-                                "method": "item/completed",
-                                "params": params,
-                            }),
-                        },
-                        RuntimeEventMappingOptions::default(),
-                    )
-                })
-                .collect()
-        };
-        Ok(Some(CLIAgentRuntimeTurnObservation {
-            status,
-            message,
-            reconciliation_events,
-        }))
+        load_codex_turn_snapshot(
+            &self.client,
+            native_thread_id,
+            native_turn_id,
+            self.request_timeout,
+        )
+        .await
     }
 
     async fn set_thread_name(
@@ -2651,6 +2710,111 @@ mod tests {
                 .await
                 .expect("fake Codex server should write response");
         }
+    }
+
+    #[tokio::test]
+    async fn codex_liveness_probe_confirms_active_thread_without_loading_turns() {
+        let mut fake = FakeCodexIsolationServer::new();
+        let client = fake.client.clone();
+        let probe = tokio::spawn(async move {
+            probe_codex_turn_liveness(&client, "native-thread", Duration::from_secs(2)).await
+        });
+
+        let request = fake.read_request().await;
+        assert_eq!(request["method"], json!("thread/read"));
+        assert_eq!(request["params"]["threadId"], json!("native-thread"));
+        assert_eq!(request["params"]["includeTurns"], json!(false));
+        fake.write_result(
+            request["id"].clone(),
+            json!({
+                "thread": {
+                    "id": "native-thread",
+                    "cwd": "/workspace",
+                    "status": {"type": "active", "activeFlags": []}
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            probe
+                .await
+                .expect("probe task should join")
+                .expect("active probe should succeed"),
+            CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_inactive_probe_defers_history_to_terminal_snapshot() {
+        let mut fake = FakeCodexIsolationServer::new();
+        let client = fake.client.clone();
+        let probe_client = client.clone();
+        let probe = tokio::spawn(async move {
+            probe_codex_turn_liveness(&probe_client, "native-thread", Duration::from_secs(2)).await
+        });
+
+        let request = fake.read_request().await;
+        assert_eq!(request["params"]["includeTurns"], json!(false));
+        fake.write_result(
+            request["id"].clone(),
+            json!({
+                "thread": {
+                    "id": "native-thread",
+                    "cwd": "/workspace",
+                    "status": {"type": "idle"}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            probe
+                .await
+                .expect("probe task should join")
+                .expect("idle probe should succeed"),
+            CLIAgentRuntimeTurnLivenessProbe::SnapshotRequired
+        );
+
+        let snapshot = tokio::spawn(async move {
+            load_codex_turn_snapshot(
+                &client,
+                "native-thread",
+                "native-turn",
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let request = fake.read_request().await;
+        assert_eq!(request["method"], json!("thread/read"));
+        assert_eq!(request["params"]["includeTurns"], json!(true));
+        fake.write_result(
+            request["id"].clone(),
+            json!({
+                "thread": {
+                    "id": "native-thread",
+                    "turns": [{
+                        "id": "native-turn",
+                        "status": "completed",
+                        "items": [{
+                            "id": "message",
+                            "type": "agentMessage",
+                            "text": "done"
+                        }]
+                    }]
+                }
+            }),
+        )
+        .await;
+        let observation = snapshot
+            .await
+            .expect("snapshot task should join")
+            .expect("terminal snapshot should load")
+            .expect("native Turn should exist");
+        assert_eq!(
+            observation.status,
+            CLIAgentRuntimeObservedTurnStatus::Completed
+        );
+        assert_eq!(observation.reconciliation_events.len(), 1);
     }
 
     fn safe_empty_config_read_result() -> JsonValue {

@@ -242,6 +242,7 @@ const DEFAULT_MCP_INVOCATION_RESOURCES: McpInvocationResourceLimits = McpInvocat
 const DEFAULT_NATIVE_EVENT_RESOURCES: NativeEventBudget = NativeEventBudget {
     profile_version: 1,
     max_frame_bytes: 1024 * 1024,
+    max_recovery_frame_bytes: 64 * 1024 * 1024,
     max_json_depth: 64,
     max_json_nodes: 16_384,
     max_string_bytes: 256 * 1024,
@@ -252,6 +253,7 @@ const DEFAULT_NATIVE_EVENT_RESOURCES: NativeEventBudget = NativeEventBudget {
 const SYNTHETIC_NATIVE_EVENT_RESOURCES: NativeEventBudget = NativeEventBudget {
     profile_version: 1,
     max_frame_bytes: 16 * 1024,
+    max_recovery_frame_bytes: 1024 * 1024,
     max_json_depth: 8,
     max_json_nodes: 256,
     max_string_bytes: 4 * 1024,

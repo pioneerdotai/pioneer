@@ -30,7 +30,7 @@ use pioneer_runtime_events::{
     OrderedEventIngress, OrderedIngressClass, OrderedIngressConfig, OrderedIngressEvent,
     OrderedIngressOffer,
 };
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -167,6 +167,7 @@ impl CodexJsonlRpcClient {
         let (notification_tx, notification_rx) = mpsc::channel(notification_capacity.max(1));
         let (server_request_tx, server_request_rx) = mpsc::channel(server_request_capacity);
         let (diagnostic_tx, diagnostic_rx) = mpsc::channel(diagnostic_capacity.max(1));
+        let oversized_recovery_request_ids = Arc::new(StdMutex::new(HashSet::new()));
         let notification_ingress = OrderedEventIngress::spawn(
             notification_tx,
             OrderedIngressConfig {
@@ -180,6 +181,7 @@ impl CodexJsonlRpcClient {
             reader,
             incoming_tx,
             native_event_budget,
+            Arc::clone(&oversized_recovery_request_ids),
         ));
         tokio::spawn(run_codex_jsonl_rpc_worker(
             writer,
@@ -192,6 +194,7 @@ impl CodexJsonlRpcClient {
             },
             server_request_capacity,
             server_request_timeout,
+            oversized_recovery_request_ids,
         ));
 
         Self {
@@ -234,6 +237,29 @@ impl CodexJsonlRpcClient {
         let id = self.next_request_id();
         self.request_value_with_id(id, method, params, timeout)
             .await
+    }
+
+    async fn request_thread_turn_snapshot_value(
+        &self,
+        native_thread_id: &str,
+        native_turn_id: &str,
+        timeout: Duration,
+    ) -> Result<JsonValue, CodexJsonlRpcClientError> {
+        let id = self.next_request_id();
+        self.request_value_with_id_and_recovery(
+            id,
+            "thread/read",
+            Some(json!({
+                "threadId": native_thread_id,
+                "includeTurns": true,
+            })),
+            timeout,
+            Some(OversizedSuccessRecovery::ThreadTurnSnapshot {
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: native_turn_id.to_owned(),
+            }),
+        )
+        .await
     }
 
     pub async fn notify(
@@ -334,6 +360,18 @@ impl CodexJsonlRpcClient {
         params: Option<JsonValue>,
         timeout: Duration,
     ) -> Result<JsonValue, CodexJsonlRpcClientError> {
+        self.request_value_with_id_and_recovery(id, method, params, timeout, None)
+            .await
+    }
+
+    async fn request_value_with_id_and_recovery(
+        &self,
+        id: JsonlRpcId,
+        method: &str,
+        params: Option<JsonValue>,
+        timeout: Duration,
+        oversized_success_recovery: Option<OversizedSuccessRecovery>,
+    ) -> Result<JsonValue, CodexJsonlRpcClientError> {
         let request = JsonlRpcRequest::new(id.clone(), method, params);
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -341,6 +379,7 @@ impl CodexJsonlRpcClient {
             .send(CodexJsonlRpcCommand::Request {
                 request,
                 response_tx,
+                oversized_success_recovery,
             })
             .await
             .map_err(|_| CodexJsonlRpcClientError::TransportClosed {
@@ -610,6 +649,17 @@ impl CodexAppServerClient {
                 })),
                 timeout,
             )
+            .await
+    }
+
+    pub async fn thread_read_turn_snapshot_raw(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        timeout: Duration,
+    ) -> Result<JsonValue, CodexJsonlRpcClientError> {
+        self.rpc
+            .request_thread_turn_snapshot_value(thread_id, turn_id, timeout)
             .await
     }
 
@@ -4663,6 +4713,7 @@ enum CodexJsonlRpcCommand {
     Request {
         request: JsonlRpcRequest,
         response_tx: oneshot::Sender<Result<JsonValue, CodexJsonlRpcClientError>>,
+        oversized_success_recovery: Option<OversizedSuccessRecovery>,
     },
     Notify {
         notification: JsonlRpcNotification,
@@ -4681,14 +4732,26 @@ enum CodexJsonlRpcCommand {
 
 enum CodexJsonlRpcIncoming {
     Message(JsonlRpcIncomingMessage),
-    OversizedSuccessResponse { id: JsonlRpcId, total_bytes: usize },
+    OversizedSuccessResponse {
+        id: JsonlRpcId,
+        file: File,
+        total_bytes: usize,
+    },
     DecodeError(JsonlRpcDecodeError),
     Closed,
 }
 
 struct PendingCodexJsonlRpcRequest {
     response_tx: oneshot::Sender<Result<JsonValue, CodexJsonlRpcClientError>>,
-    oversized_success_fallback: Option<JsonValue>,
+    oversized_success_recovery: Option<OversizedSuccessRecovery>,
+}
+
+enum OversizedSuccessRecovery {
+    Fallback(JsonValue),
+    ThreadTurnSnapshot {
+        native_thread_id: String,
+        native_turn_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4871,22 +4934,28 @@ async fn run_codex_jsonl_rpc_reader<R>(
     mut reader: R,
     incoming_tx: mpsc::Sender<CodexJsonlRpcIncoming>,
     native_event_budget: crate::NativeEventBudget,
+    oversized_recovery_request_ids: Arc<StdMutex<HashSet<JsonlRpcId>>>,
 ) where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
     let codec = crate::BoundedNativeEventCodec::new(native_event_budget);
     loop {
         match codec
-            .read_frame_or_drain_if(&mut reader, |prefix| {
-                decode_oversized_codex_success_response_prefix(
+            .read_frame_or_spool_if(&mut reader, |prefix| {
+                let Ok(id) = decode_oversized_codex_success_response_prefix(
                     prefix,
                     native_event_budget.max_frame_bytes,
-                )
-                .is_ok()
+                ) else {
+                    return false;
+                };
+                oversized_recovery_request_ids
+                    .lock()
+                    .expect("oversized recovery request registry should not be poisoned")
+                    .contains(&id)
             })
             .await
         {
-            Ok(Some(crate::BoundedNativeFrame::Complete(frame))) => {
+            Ok(Some(crate::native_event::SpooledNativeFrame::Complete(frame))) => {
                 let message =
                     match decode_jsonl_rpc_frame_with_budget(frame.as_slice(), native_event_budget)
                     {
@@ -4906,8 +4975,9 @@ async fn run_codex_jsonl_rpc_reader<R>(
                     return;
                 }
             }
-            Ok(Some(crate::BoundedNativeFrame::Oversized {
+            Ok(Some(crate::native_event::SpooledNativeFrame::Oversized {
                 prefix,
+                file,
                 total_bytes,
                 last_non_whitespace,
             })) => {
@@ -4925,7 +4995,11 @@ async fn run_codex_jsonl_rpc_reader<R>(
                     }
                 };
                 if incoming_tx
-                    .send(CodexJsonlRpcIncoming::OversizedSuccessResponse { id, total_bytes })
+                    .send(CodexJsonlRpcIncoming::OversizedSuccessResponse {
+                        id,
+                        file,
+                        total_bytes,
+                    })
                     .await
                     .is_err()
                 {
@@ -5023,6 +5097,517 @@ fn oversized_codex_success_fallback(request: &JsonlRpcRequest) -> Option<JsonVal
     }))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LocatedThreadTurn {
+    index: usize,
+}
+
+fn extract_thread_turn_snapshot_from_spooled_response(
+    mut file: File,
+    native_thread_id: &str,
+    native_turn_id: &str,
+) -> Result<JsonValue, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind spooled thread/read response: {error}"))?;
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut file);
+    let located = ThreadTurnLocationResponseSeed {
+        native_thread_id,
+        native_turn_id,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| format!("failed to locate requested Turn in thread/read response: {error}"))?
+    .ok_or_else(|| {
+        format!(
+            "thread/read response omitted native Turn `{native_turn_id}` from thread `{native_thread_id}`"
+        )
+    })?;
+    deserializer
+        .end()
+        .map_err(|error| format!("thread/read response has trailing data: {error}"))?;
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind spooled thread/read response: {error}"))?;
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut file);
+    let turn = ThreadTurnExtractionResponseSeed {
+        native_thread_id,
+        target_index: located.index,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| {
+        format!("failed to extract requested Turn from thread/read response: {error}")
+    })?
+    .ok_or_else(|| {
+        format!("thread/read response changed while extracting native Turn `{native_turn_id}`")
+    })?;
+    deserializer
+        .end()
+        .map_err(|error| format!("thread/read response has trailing data: {error}"))?;
+
+    if turn.get("id").and_then(JsonValue::as_str) != Some(native_turn_id) {
+        return Err(format!(
+            "thread/read extracted a different native Turn at index {}",
+            located.index
+        ));
+    }
+
+    Ok(json!({
+        "thread": {
+            "id": native_thread_id,
+            "turns": [turn],
+        },
+        "_pioneerTargetedSnapshot": true,
+    }))
+}
+
+struct ThreadTurnLocationResponseSeed<'a> {
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnLocationResponseSeed<'_> {
+    type Value = Option<LocatedThreadTurn>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadTurnLocationResponseVisitor {
+            native_thread_id: self.native_thread_id,
+            native_turn_id: self.native_turn_id,
+        })
+    }
+}
+
+struct ThreadTurnLocationResponseVisitor<'a> {
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for ThreadTurnLocationResponseVisitor<'_> {
+    type Value = Option<LocatedThreadTurn>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC response object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut located = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "result" {
+                located = map.next_value_seed(ThreadTurnLocationResultSeed {
+                    native_thread_id: self.native_thread_id,
+                    native_turn_id: self.native_turn_id,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(located)
+    }
+}
+
+struct ThreadTurnLocationResultSeed<'a> {
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnLocationResultSeed<'_> {
+    type Value = Option<LocatedThreadTurn>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadTurnLocationResultVisitor {
+            native_thread_id: self.native_thread_id,
+            native_turn_id: self.native_turn_id,
+        })
+    }
+}
+
+struct ThreadTurnLocationResultVisitor<'a> {
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for ThreadTurnLocationResultVisitor<'_> {
+    type Value = Option<LocatedThreadTurn>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a thread/read result object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut located = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "thread" {
+                located = map.next_value_seed(ThreadTurnLocationThreadSeed {
+                    native_thread_id: self.native_thread_id,
+                    native_turn_id: self.native_turn_id,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(located)
+    }
+}
+
+struct ThreadTurnLocationThreadSeed<'a> {
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnLocationThreadSeed<'_> {
+    type Value = Option<LocatedThreadTurn>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadTurnLocationThreadVisitor {
+            native_thread_id: self.native_thread_id,
+            native_turn_id: self.native_turn_id,
+        })
+    }
+}
+
+struct ThreadTurnLocationThreadVisitor<'a> {
+    native_thread_id: &'a str,
+    native_turn_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for ThreadTurnLocationThreadVisitor<'_> {
+    type Value = Option<LocatedThreadTurn>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a thread object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut returned_thread_id = None;
+        let mut located = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" => returned_thread_id = Some(map.next_value::<String>()?),
+                "turns" => {
+                    located = map.next_value_seed(ThreadTurnIndexSeed {
+                        native_turn_id: self.native_turn_id,
+                    })?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        if returned_thread_id.as_deref() != Some(self.native_thread_id) {
+            return Err(serde::de::Error::custom(
+                "thread/read returned a different native thread id",
+            ));
+        }
+        Ok(located.map(|index| LocatedThreadTurn { index }))
+    }
+}
+
+struct ThreadTurnIndexSeed<'a> {
+    native_turn_id: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnIndexSeed<'_> {
+    type Value = Option<usize>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ThreadTurnIndexVisitor {
+            native_turn_id: self.native_turn_id,
+        })
+    }
+}
+
+struct ThreadTurnIndexVisitor<'a> {
+    native_turn_id: &'a str,
+}
+
+impl<'de> Visitor<'de> for ThreadTurnIndexVisitor<'_> {
+    type Value = Option<usize>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of native Turns")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut index = 0usize;
+        let mut located = None;
+        while let Some(turn_id) = sequence.next_element_seed(ThreadTurnIdSeed)? {
+            if located.is_none() && turn_id.as_deref() == Some(self.native_turn_id) {
+                located = Some(index);
+            }
+            index = index.saturating_add(1);
+        }
+        Ok(located)
+    }
+}
+
+struct ThreadTurnIdSeed;
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnIdSeed {
+    type Value = Option<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadTurnIdVisitor)
+    }
+}
+
+struct ThreadTurnIdVisitor;
+
+impl<'de> Visitor<'de> for ThreadTurnIdVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a native Turn object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut turn_id = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "id" {
+                turn_id = Some(map.next_value::<String>()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(turn_id)
+    }
+}
+
+struct ThreadTurnExtractionResponseSeed<'a> {
+    native_thread_id: &'a str,
+    target_index: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionResponseSeed<'_> {
+    type Value = Option<JsonValue>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadTurnExtractionResponseVisitor {
+            native_thread_id: self.native_thread_id,
+            target_index: self.target_index,
+        })
+    }
+}
+
+struct ThreadTurnExtractionResponseVisitor<'a> {
+    native_thread_id: &'a str,
+    target_index: usize,
+}
+
+impl<'de> Visitor<'de> for ThreadTurnExtractionResponseVisitor<'_> {
+    type Value = Option<JsonValue>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC response object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut turn = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "result" {
+                turn = map.next_value_seed(ThreadTurnExtractionResultSeed {
+                    native_thread_id: self.native_thread_id,
+                    target_index: self.target_index,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(turn)
+    }
+}
+
+struct ThreadTurnExtractionResultSeed<'a> {
+    native_thread_id: &'a str,
+    target_index: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionResultSeed<'_> {
+    type Value = Option<JsonValue>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadTurnExtractionResultVisitor {
+            native_thread_id: self.native_thread_id,
+            target_index: self.target_index,
+        })
+    }
+}
+
+struct ThreadTurnExtractionResultVisitor<'a> {
+    native_thread_id: &'a str,
+    target_index: usize,
+}
+
+impl<'de> Visitor<'de> for ThreadTurnExtractionResultVisitor<'_> {
+    type Value = Option<JsonValue>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a thread/read result object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut turn = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "thread" {
+                turn = map.next_value_seed(ThreadTurnExtractionThreadSeed {
+                    native_thread_id: self.native_thread_id,
+                    target_index: self.target_index,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(turn)
+    }
+}
+
+struct ThreadTurnExtractionThreadSeed<'a> {
+    native_thread_id: &'a str,
+    target_index: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionThreadSeed<'_> {
+    type Value = Option<JsonValue>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadTurnExtractionThreadVisitor {
+            native_thread_id: self.native_thread_id,
+            target_index: self.target_index,
+        })
+    }
+}
+
+struct ThreadTurnExtractionThreadVisitor<'a> {
+    native_thread_id: &'a str,
+    target_index: usize,
+}
+
+impl<'de> Visitor<'de> for ThreadTurnExtractionThreadVisitor<'_> {
+    type Value = Option<JsonValue>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a thread object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut returned_thread_id = None;
+        let mut turn = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" => returned_thread_id = Some(map.next_value::<String>()?),
+                "turns" => {
+                    turn = map.next_value_seed(ThreadTurnAtIndexSeed {
+                        target_index: self.target_index,
+                    })?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        if returned_thread_id.as_deref() != Some(self.native_thread_id) {
+            return Err(serde::de::Error::custom(
+                "thread/read returned a different native thread id",
+            ));
+        }
+        Ok(turn)
+    }
+}
+
+struct ThreadTurnAtIndexSeed {
+    target_index: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ThreadTurnAtIndexSeed {
+    type Value = Option<JsonValue>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ThreadTurnAtIndexVisitor {
+            target_index: self.target_index,
+        })
+    }
+}
+
+struct ThreadTurnAtIndexVisitor {
+    target_index: usize,
+}
+
+impl<'de> Visitor<'de> for ThreadTurnAtIndexVisitor {
+    type Value = Option<JsonValue>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of native Turns")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut index = 0usize;
+        let mut target = None;
+        while index <= self.target_index {
+            if index == self.target_index {
+                target = sequence.next_element::<JsonValue>()?;
+                break;
+            }
+            if sequence.next_element::<IgnoredAny>()?.is_none() {
+                break;
+            }
+            index = index.saturating_add(1);
+        }
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(target)
+    }
+}
+
 async fn run_codex_jsonl_rpc_worker<W>(
     mut writer: W,
     mut command_rx: mpsc::Receiver<CodexJsonlRpcCommand>,
@@ -5030,6 +5615,7 @@ async fn run_codex_jsonl_rpc_worker<W>(
     event_sinks: CodexJsonlRpcEventSinks,
     max_pending_server_requests: usize,
     server_request_timeout: Duration,
+    oversized_recovery_request_ids: Arc<StdMutex<HashSet<JsonlRpcId>>>,
 ) where
     W: AsyncWrite + Send + Unpin + 'static,
 {
@@ -5043,20 +5629,32 @@ async fn run_codex_jsonl_rpc_worker<W>(
         tokio::select! {
             command = command_rx.recv() => {
                 match command {
-                    Some(CodexJsonlRpcCommand::Request { request, response_tx }) => {
+                    Some(CodexJsonlRpcCommand::Request {
+                        request,
+                        response_tx,
+                        oversized_success_recovery,
+                    }) => {
                         let id = request.id.clone();
                         if pending.contains(&id) {
                             let _ = response_tx.send(Err(CodexJsonlRpcClientError::DuplicateRequestId { id }));
                             continue;
                         }
 
-                        let oversized_success_fallback =
-                            oversized_codex_success_fallback(&request);
+                        let oversized_success_recovery = oversized_success_recovery.or_else(|| {
+                            oversized_codex_success_fallback(&request)
+                                .map(OversizedSuccessRecovery::Fallback)
+                        });
+                        if oversized_success_recovery.is_some() {
+                            oversized_recovery_request_ids
+                                .lock()
+                                .expect("oversized recovery request registry should not be poisoned")
+                                .insert(id.clone());
+                        }
                         pending.insert(
                             id.clone(),
                             PendingCodexJsonlRpcRequest {
                                 response_tx,
-                                oversized_success_fallback,
+                                oversized_success_recovery,
                             },
                         );
                         if let Err(error) = write_jsonl_rpc_request(&mut writer, &request).await {
@@ -5066,6 +5664,10 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             if let Some(pending_request) = pending.remove(&id) {
                                 let _ = pending_request.response_tx.send(Err(write_error.clone()));
                             }
+                            oversized_recovery_request_ids
+                                .lock()
+                                .expect("oversized recovery request registry should not be poisoned")
+                                .remove(&id);
                             break write_error;
                         }
                     }
@@ -5099,6 +5701,10 @@ async fn run_codex_jsonl_rpc_worker<W>(
                     }
                     Some(CodexJsonlRpcCommand::Cancel { id }) => {
                         let _ = pending.remove(&id);
+                        oversized_recovery_request_ids
+                            .lock()
+                            .expect("oversized recovery request registry should not be poisoned")
+                            .remove(&id);
                     }
                     Some(CodexJsonlRpcCommand::Shutdown) => {
                         complete_all_codex_server_requests(
@@ -5128,6 +5734,7 @@ async fn run_codex_jsonl_rpc_worker<W>(
                         handle_codex_jsonl_rpc_incoming(
                             message,
                             &mut pending,
+                            &oversized_recovery_request_ids,
                             &mut pending_server_requests,
                             &event_sinks,
                             max_pending_server_requests,
@@ -5135,7 +5742,15 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             &mut writer,
                         ).await;
                     }
-                    Some(CodexJsonlRpcIncoming::OversizedSuccessResponse { id, total_bytes }) => {
+                    Some(CodexJsonlRpcIncoming::OversizedSuccessResponse {
+                        id,
+                        file,
+                        total_bytes,
+                    }) => {
+                        oversized_recovery_request_ids
+                            .lock()
+                            .expect("oversized recovery request registry should not be poisoned")
+                            .remove(&id);
                         let Some(pending_request) = pending.remove(&id) else {
                             complete_all_codex_server_requests(
                                 &mut writer,
@@ -5148,7 +5763,7 @@ async fn run_codex_jsonl_rpc_worker<W>(
                                 ),
                             };
                         };
-                        let Some(fallback) = pending_request.oversized_success_fallback else {
+                        let Some(recovery) = pending_request.oversized_success_recovery else {
                             let error = CodexJsonlRpcClientError::TransportClosed {
                                 message: format!(
                                     "codex jsonl-rpc response for request {id} exceeds the native event budget ({total_bytes} bytes)"
@@ -5162,7 +5777,33 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             ).await;
                             break error;
                         };
-                        let _ = pending_request.response_tx.send(Ok(fallback));
+                        match recovery {
+                            OversizedSuccessRecovery::Fallback(fallback) => {
+                                let _ = pending_request.response_tx.send(Ok(fallback));
+                            }
+                            OversizedSuccessRecovery::ThreadTurnSnapshot {
+                                native_thread_id,
+                                native_turn_id,
+                            } => {
+                                let recovered = tokio::task::spawn_blocking(move || {
+                                    extract_thread_turn_snapshot_from_spooled_response(
+                                        file,
+                                        native_thread_id.as_str(),
+                                        native_turn_id.as_str(),
+                                    )
+                                })
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|result| result);
+                                let recovered = recovered.map_err(|message| {
+                                    CodexJsonlRpcClientError::Decode {
+                                        method: "thread/read".to_owned(),
+                                        message,
+                                    }
+                                });
+                                let _ = pending_request.response_tx.send(recovered);
+                            }
+                        }
                     }
                     Some(CodexJsonlRpcIncoming::DecodeError(error)) => {
                         complete_all_codex_server_requests(
@@ -5209,12 +5850,17 @@ async fn run_codex_jsonl_rpc_worker<W>(
     if !pending.is_empty() {
         let _ = pending.fail_all(close_error);
     }
+    oversized_recovery_request_ids
+        .lock()
+        .expect("oversized recovery request registry should not be poisoned")
+        .clear();
     event_sinks.notification_ingress.close();
 }
 
 async fn handle_codex_jsonl_rpc_incoming(
     message: JsonlRpcIncomingMessage,
     pending: &mut PendingCodexJsonlRpcRequests,
+    oversized_recovery_request_ids: &Arc<StdMutex<HashSet<JsonlRpcId>>>,
     pending_server_requests: &mut HashMap<JsonlRpcId, PendingCodexServerRequest>,
     event_sinks: &CodexJsonlRpcEventSinks,
     max_pending_server_requests: usize,
@@ -5226,6 +5872,10 @@ async fn handle_codex_jsonl_rpc_incoming(
             let Some(id) = response.id.clone() else {
                 return;
             };
+            oversized_recovery_request_ids
+                .lock()
+                .expect("oversized recovery request registry should not be poisoned")
+                .remove(&id);
             let Some(pending_request) = pending.remove(&id) else {
                 return;
             };
@@ -7932,6 +8582,117 @@ while read line; do :; done
                 .expect("transport should remain aligned")
                 .native_thread_id,
             "codex-thread-large"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_terminal_snapshot_streams_only_the_requested_turn_from_large_history() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 512,
+            max_recovery_frame_bytes: 4 * 1024 * 1024,
+            max_json_depth: 32,
+            max_json_nodes: 512,
+            max_string_bytes: 256,
+            max_journal_payload_bytes: 512,
+            ..crate::NativeEventBudget::default()
+        };
+        let (rpc, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let client = CodexAppServerClient::new(rpc);
+        let snapshot_client = client.clone();
+        let snapshot = tokio::spawn(async move {
+            snapshot_client
+                .thread_read_turn_snapshot_raw(
+                    "native-thread",
+                    "target-turn",
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+
+        let request = read_server_line(&mut server_reader).await;
+        assert_eq!(request["method"], json!("thread/read"));
+        assert_eq!(request["params"]["includeTurns"], json!(true));
+        let response = json!({
+            "id": request["id"].clone(),
+            "result": {
+                "thread": {
+                    "id": "native-thread",
+                    "cwd": "/tmp/project",
+                    "turns": [
+                        {
+                            "id": "unrelated-turn",
+                            "status": "completed",
+                            "items": [{
+                                "id": "large-history-item",
+                                "type": "agentMessage",
+                                "text": "x".repeat(1024 * 1024),
+                            }],
+                        },
+                        {
+                            "id": "target-turn",
+                            "status": "completed",
+                            "items": [{
+                                "id": "target-message",
+                                "type": "agentMessage",
+                                "text": "done",
+                            }],
+                        },
+                    ],
+                },
+            },
+        })
+        .to_string();
+        assert!(response.len() > budget.max_frame_bytes);
+        server_writer
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write oversized terminal snapshot");
+
+        let recovered = snapshot
+            .await
+            .expect("snapshot task should join")
+            .expect("targeted terminal snapshot should recover");
+        let turns = recovered["thread"]["turns"]
+            .as_array()
+            .expect("targeted turns array");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["id"], json!("target-turn"));
+        assert_eq!(turns[0]["items"][0]["text"], json!("done"));
+        assert_eq!(recovered["_pioneerTargetedSnapshot"], json!(true));
+
+        let metadata_client = client.clone();
+        let metadata = tokio::spawn(async move {
+            metadata_client
+                .thread_read_metadata("native-thread", Duration::from_secs(2))
+                .await
+        });
+        let request = read_server_line(&mut server_reader).await;
+        assert_eq!(request["method"], json!("thread/read"));
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "id": request["id"].clone(),
+                        "result": {
+                            "thread": {
+                                "id": "native-thread",
+                                "cwd": "/tmp/project"
+                            }
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write metadata response");
+        assert_eq!(
+            metadata
+                .await
+                .expect("metadata task should join")
+                .expect("transport should remain aligned")
+                .native_thread_id,
+            "native-thread"
         );
     }
 

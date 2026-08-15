@@ -713,7 +713,7 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         Ok(())
     }
 
-    async fn observe_turn(
+    async fn load_turn_snapshot(
         &self,
         _native_thread_id: &str,
         _native_turn_id: &str,

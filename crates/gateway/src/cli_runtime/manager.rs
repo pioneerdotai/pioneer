@@ -179,6 +179,18 @@ pub(crate) struct CLIAgentRuntimeNativeMcpApprovalRequest {
 
 pub(crate) use pioneer_runtime_events::ExecutionTurnStatus as CLIAgentRuntimeObservedTurnStatus;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CLIAgentRuntimeTurnLivenessProbe {
+    /// The provider confirms that the native thread currently owns a live
+    /// Turn. No history hydration is required.
+    ConfirmedActive,
+    /// The provider is not currently active, so the bound Turn must be read
+    /// from its authoritative terminal snapshot.
+    SnapshotRequired,
+    /// The provider cannot currently establish either condition.
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CLIAgentRuntimeTurnObservation {
     pub status: CLIAgentRuntimeObservedTurnStatus,
@@ -326,7 +338,15 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
         bail!("CLI runtime session does not support turn interrupt");
     }
 
-    async fn observe_turn(
+    async fn probe_turn_liveness(
+        &self,
+        _native_thread_id: &str,
+        _native_turn_id: &str,
+    ) -> Result<CLIAgentRuntimeTurnLivenessProbe> {
+        Ok(CLIAgentRuntimeTurnLivenessProbe::SnapshotRequired)
+    }
+
+    async fn load_turn_snapshot(
         &self,
         native_thread_id: &str,
         native_turn_id: &str,

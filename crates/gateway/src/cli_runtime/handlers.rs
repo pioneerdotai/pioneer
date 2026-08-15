@@ -13,7 +13,7 @@ use crate::cli_runtime::manager::{
     CLIAgentRuntimeNativeMcpApprovalRequest, CLIAgentRuntimeObservedTurnStatus,
     CLIAgentRuntimeSession, CLIAgentRuntimeSessionHandle, CLIAgentRuntimeSessionKey,
     CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadNameSetRequest,
-    CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeTurnLivenessProbe, CLIAgentRuntimeTurnSteerRequest,
 };
 use crate::cli_runtime::mcp::readiness::CliRuntimeCapabilityPolicy;
 use crate::cli_runtime::session_instance::{CliSessionInstanceId, CliSessionInstanceOrigin};
@@ -5873,9 +5873,38 @@ impl MessageProcessor {
         let Some(handle) = manager.existing_session(&key).await else {
             return Ok(false);
         };
+        let probe = handle
+            .session()
+            .probe_turn_liveness(binding.native_thread_id.as_str(), native_turn_id.as_str())
+            .await?;
+
+        if probe == CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive {
+            let renewed = self
+                .timeout_supervisor
+                .renew_running_attempt_deadlines_after_runtime_activity(
+                    binding.turn_id.as_str(),
+                    now_unix_ms.saturating_div(1_000),
+                    "runtime/liveness_probe_confirmed_active",
+                )
+                .await?;
+            debug!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                native_turn_id = native_turn_id.as_str(),
+                renewed,
+                "runtime liveness probe confirmed Pioneer Turn is still active"
+            );
+            return Ok(true);
+        }
+        if probe == CLIAgentRuntimeTurnLivenessProbe::Unavailable {
+            return Ok(false);
+        }
+
         let Some(observation) = handle
             .session()
-            .observe_turn(binding.native_thread_id.as_str(), native_turn_id.as_str())
+            .load_turn_snapshot(binding.native_thread_id.as_str(), native_turn_id.as_str())
             .await?
         else {
             return Ok(false);
