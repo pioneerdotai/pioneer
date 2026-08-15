@@ -3350,6 +3350,43 @@ impl MessageProcessor {
         self.handle_recovery_event(event, now_unix).await
     }
 
+    pub(super) async fn ensure_turn_observation_recovery(
+        &self,
+        turn_id: &str,
+        kind: TurnFailureRecoveryKind,
+        reason: String,
+        source_attempt_id: Option<&str>,
+    ) -> Result<()> {
+        let mut open_jobs = self
+            .crud_store
+            .find_open_recovery_jobs_for_turn(turn_id)
+            .await?;
+        if open_jobs.is_empty() {
+            let Some((thread_id, _workspace_id)) =
+                self.crud_store.get_turn_location(turn_id).await?
+            else {
+                bail!("Turn `{turn_id}` disappeared before observation recovery could be opened");
+            };
+            let _ = self
+                .report_turn_failure(thread_id, turn_id.to_owned(), kind, reason)
+                .await;
+            open_jobs = self
+                .crud_store
+                .find_open_recovery_jobs_for_turn(turn_id)
+                .await?;
+        }
+        let Some(job) = open_jobs.first() else {
+            bail!("failed to durably open observation recovery for Turn `{turn_id}`");
+        };
+        if let Some(attempt_id) = source_attempt_id {
+            let _ = self
+                .crud_store
+                .mark_attempt_recovery_action(attempt_id, job.action, now_timestamp_secs())
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn handle_provider_failure_detected(
         &self,
         thread_id: String,
@@ -3796,36 +3833,73 @@ impl MessageProcessor {
             .await?;
         let now_unix_ms = now_unix.saturating_mul(1_000);
         let mut timed_out = Vec::new();
-        let mut cli_runtime_activity = HashMap::<String, bool>::new();
-        let mut native_runtime_activity = HashMap::<String, bool>::new();
+        let mut cli_runtime_activity =
+            HashMap::<String, crate::resilience::RuntimeTimeoutObservation>::new();
+        let mut native_runtime_activity =
+            HashMap::<String, crate::resilience::RuntimeTimeoutObservation>::new();
         for candidate in candidates {
-            let cli_active = if let Some(active) = cli_runtime_activity.get(&candidate.turn_id) {
-                *active
+            let cli_observation = if let Some(observation) =
+                cli_runtime_activity.get(&candidate.turn_id)
+            {
+                *observation
             } else {
-                let active = self
+                let observation = self
                     .renew_active_cli_runtime_turn_deadlines(candidate.turn_id.as_str(), now_unix)
                     .await?;
-                cli_runtime_activity.insert(candidate.turn_id.clone(), active);
-                active
+                cli_runtime_activity.insert(candidate.turn_id.clone(), observation);
+                observation
             };
-            if cli_active {
-                continue;
-            }
-            let native_active =
-                if let Some(active) = native_runtime_activity.get(&candidate.turn_id) {
-                    *active
-                } else {
-                    let active = self
-                        .renew_active_native_runtime_turn_deadlines(
-                            candidate.turn_id.as_str(),
-                            now_unix,
-                        )
-                        .await?;
-                    native_runtime_activity.insert(candidate.turn_id.clone(), active);
-                    active
-                };
-            if native_active {
-                continue;
+            let (runtime_observation, recovery_kind) = match cli_observation {
+                crate::resilience::RuntimeTimeoutObservation::NotApplicable => {
+                    let native_observation = if let Some(observation) =
+                        native_runtime_activity.get(&candidate.turn_id)
+                    {
+                        *observation
+                    } else {
+                        let observation = self
+                            .renew_active_native_runtime_turn_deadlines(
+                                candidate.turn_id.as_str(),
+                                now_unix,
+                            )
+                            .await?;
+                        native_runtime_activity.insert(candidate.turn_id.clone(), observation);
+                        observation
+                    };
+                    (native_observation, TurnFailureRecoveryKind::RuntimeFailure)
+                }
+                observation => (observation, TurnFailureRecoveryKind::ObservationGap),
+            };
+
+            match runtime_observation {
+                crate::resilience::RuntimeTimeoutObservation::Terminal => continue,
+                crate::resilience::RuntimeTimeoutObservation::Active
+                    if crate::resilience::timeout_requires_runtime_evidence(
+                        candidate.timeout_reason,
+                    ) =>
+                {
+                    continue;
+                }
+                crate::resilience::RuntimeTimeoutObservation::Unavailable
+                    if crate::resilience::timeout_requires_runtime_evidence(
+                        candidate.timeout_reason,
+                    ) =>
+                {
+                    let reason = format!(
+                        "runtime observation is unavailable after {:?} for Turn `{}` item `{}`; recovery must establish authoritative state before timeout terminalization",
+                        candidate.timeout_reason, candidate.turn_id, candidate.item_id
+                    );
+                    self.ensure_turn_observation_recovery(
+                        candidate.turn_id.as_str(),
+                        recovery_kind,
+                        reason,
+                        Some(candidate.attempt_id.as_str()),
+                    )
+                    .await?;
+                    continue;
+                }
+                crate::resilience::RuntimeTimeoutObservation::NotApplicable
+                | crate::resilience::RuntimeTimeoutObservation::Active
+                | crate::resilience::RuntimeTimeoutObservation::Unavailable => {}
             }
             if self
                 .reconcile_cli_runtime_human_wait_for_turn(
@@ -3852,17 +3926,20 @@ impl MessageProcessor {
         &self,
         turn_id: &str,
         now_unix: i64,
-    ) -> Result<bool> {
+    ) -> Result<crate::resilience::RuntimeTimeoutObservation> {
         let Some((thread_id, _workspace_id)) = self.crud_store.get_turn_location(turn_id).await?
         else {
-            return Ok(false);
+            return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
         };
+        if !self.agent_manager.has_thread(thread_id.as_str()).await {
+            return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
+        }
         let Some(observation) = self
             .agent_manager
             .observe_turn(thread_id.as_str(), turn_id)
             .await
         else {
-            return Ok(false);
+            return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
         };
         self.ensure_agent_listener_task(thread_id.as_str()).await?;
         if observation.status != pioneer_agent::ExecutionTurnStatus::InProgress {
@@ -3872,7 +3949,7 @@ impl MessageProcessor {
                 status = ?observation.status,
                 "native runtime has queued a terminal lifecycle event; deferring item timeout until the durable listener commits it"
             );
-            return Ok(true);
+            return Ok(crate::resilience::RuntimeTimeoutObservation::Terminal);
         }
 
         let renewed = self
@@ -3885,11 +3962,14 @@ impl MessageProcessor {
             renewed,
             "renewed item deadlines from authoritative active native runtime turn"
         );
-        // An in-process actor is not itself proof of liveness.  Return true
+        // An in-process actor is not itself proof of liveness. Report Active
         // only when a causal durable frontier actually renewed an item lease;
-        // otherwise the normal timeout/recovery path remains active for a hung
-        // native Turn.
-        Ok(renewed > 0)
+        // otherwise preserve the distinct Unavailable state for recovery.
+        Ok(if renewed > 0 {
+            crate::resilience::RuntimeTimeoutObservation::Active
+        } else {
+            crate::resilience::RuntimeTimeoutObservation::Unavailable
+        })
     }
 
     pub(super) async fn handle_recovery_terminal_outcome(

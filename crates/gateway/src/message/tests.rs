@@ -142,12 +142,12 @@ use pioneer_protocol::{
     ToolStoragePayload, Turn, TurnAcceptedCapability, TurnCancelResponse, TurnCapability,
     TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
     TurnCompletedNotification, TurnFailedNotification, TurnGetResponse, TurnItem,
-    TurnItemEventPayload, TurnItemType, TurnKind, TurnOrigin, TurnRejectedCapability,
-    TurnSkillBinding, TurnStartResponse, TurnStatus, UserInput, UserMessageAttachment,
-    VoiceAudioFormat, VoiceErrorKind, VoiceSessionOutcome, VoiceSessionResultNotification,
-    VoiceSessionStartContext, VoiceStatus, WorkspaceChangeKind, WorkspaceChangedNotification,
-    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
-    WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
+    TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnKind, TurnOrigin,
+    TurnRejectedCapability, TurnSkillBinding, TurnStartResponse, TurnStatus, UserInput,
+    UserMessageAttachment, VoiceAudioFormat, VoiceErrorKind, VoiceSessionOutcome,
+    VoiceSessionResultNotification, VoiceSessionStartContext, VoiceStatus, WorkspaceChangeKind,
+    WorkspaceChangedNotification, WorkspaceCreateResponse, WorkspaceDefaultResponse,
+    WorkspaceListResponse, WorkspaceSelectResponse, WorkspaceUpdateResponse, constants::events,
 };
 use pioneer_provider::providers::EchoProvider;
 use pioneer_provider::{
@@ -32013,6 +32013,7 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery() {
         .expect("pending recovery jobs should load");
     assert_eq!(pending_jobs.len(), 1);
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+    assert_eq!(pending_jobs[0].action, RecoveryAction::RehydrateTurnState);
     assert!(cli_session.interrupts.lock().await.is_empty());
     assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
 }
@@ -33656,11 +33657,12 @@ async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
             .expect("attempt should terminalize")
     );
 
-    assert!(
+    assert_eq!(
         processor
             .renew_active_cli_runtime_turn_deadlines(turn_id, chrono::Utc::now().timestamp())
             .await
-            .expect("completed attempt reconciliation should succeed")
+            .expect("completed attempt reconciliation should succeed"),
+        crate::resilience::RuntimeTimeoutObservation::Terminal
     );
 
     let (_, turn) = crud_store
@@ -37327,6 +37329,130 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
             .any(|candidate| candidate.item_id == "non-cli-command"),
         "stray CLI pending request without a CLI turn binding must not pause non-CLI timeout transitions"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_cli_runtime_observation_defers_soft_timeout_into_recovery() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::Unavailable);
+    let now = chrono::Utc::now().timestamp();
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id,
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item: command_execution_item("codex-item-soft-timeout-unavailable"),
+            },
+            now.saturating_sub(120),
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now.saturating_sub(10)),
+                idle_deadline_at_unix: Some(now.saturating_add(30 * 60)),
+                hard_deadline_at_unix: Some(now.saturating_add(6 * 60 * 60)),
+            },
+        )
+        .await
+        .expect("soft-expired CLI attempt should materialize");
+    for poll in 1..=2 {
+        let timed_out = processor
+            .poll_timeouts_respecting_human_wait(now, 64)
+            .await
+            .expect("timeout poll should survive unavailable runtime observation");
+        assert!(
+            timed_out.is_empty(),
+            "poll {poll} must not terminalize a soft timeout without runtime evidence"
+        );
+    }
+
+    let (_, turn) = crud_store
+        .get_turn("thread_cli_command_approval", "codex-turn-command")
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::InProgress);
+    assert!(turn.error.is_none());
+    let running = crud_store
+        .list_running_turn_item_attempts_for_turn("codex-turn-command")
+        .await
+        .expect("running attempts should load");
+    assert!(
+        running
+            .iter()
+            .any(|attempt| { attempt.item_id == "codex-item-soft-timeout-unavailable" })
+    );
+    let pending_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status("codex-turn-command", RecoveryJobStatus::Pending)
+        .await
+        .expect("observation recovery jobs should load");
+    assert_eq!(pending_jobs.len(), 1, "repeated polls must be idempotent");
+    assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+    assert_eq!(pending_jobs[0].action, RecoveryAction::RehydrateTurnState);
+
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
+    assert_eq!(
+        processor
+            .renew_active_cli_runtime_turn_deadlines("codex-turn-command", now.saturating_add(1))
+            .await
+            .expect("confirmed activity should renew the recovered attempt"),
+        crate::resilience::RuntimeTimeoutObservation::Active
+    );
+    crud_store
+        .configure_turn_item_attempt_deadlines(
+            "codex-turn-command",
+            "codex-item-soft-timeout-unavailable",
+            now.saturating_add(2),
+            Some(now.saturating_add(1)),
+            Some(now.saturating_add(30 * 60)),
+            Some(now.saturating_add(6 * 60 * 60)),
+        )
+        .await
+        .expect("renewed attempt should accept a test lease boundary");
+    assert!(
+        crud_store
+            .list_timeout_candidates(now.saturating_add(2), 64)
+            .await
+            .expect("timeout candidates should load after confirmed activity")
+            .iter()
+            .any(|candidate| candidate.item_id == "codex-item-soft-timeout-unavailable")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_cli_runtime_observation_does_not_disable_hard_deadline() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::Unavailable);
+    let now = chrono::Utc::now().timestamp();
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id,
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item: command_execution_item("codex-item-hard-timeout-unavailable"),
+            },
+            now.saturating_sub(120),
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now.saturating_add(30 * 60)),
+                idle_deadline_at_unix: Some(now.saturating_add(30 * 60)),
+                hard_deadline_at_unix: Some(now.saturating_sub(1)),
+            },
+        )
+        .await
+        .expect("hard-expired CLI attempt should materialize");
+
+    let timed_out = processor
+        .poll_timeouts_respecting_human_wait(now, 64)
+        .await
+        .expect("hard-deadline timeout poll should succeed");
+    assert!(timed_out.iter().any(|candidate| {
+        candidate.item_id == "codex-item-hard-timeout-unavailable"
+            && candidate.timeout_reason == TurnItemTimeoutReason::HardDeadlineExceeded
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

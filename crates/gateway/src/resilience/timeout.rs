@@ -3,7 +3,7 @@ use pioneer_config::{
     GatewayCommandExecutionTimeoutConfig, GatewayProviderStreamItemTimeoutConfig,
 };
 use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines, TurnLivenessRecord};
-use pioneer_protocol::{TurnItem, TurnItemType};
+use pioneer_protocol::{TurnItem, TurnItemTimeoutReason, TurnItemType};
 use pioneer_provider::ProviderTimeoutPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +17,24 @@ pub struct TimeoutPolicy {
     pub lease_secs: u64,
     pub idle_secs: u64,
     pub hard_secs: u64,
+}
+
+/// Authoritative runtime evidence available when a running item reaches a
+/// timeout boundary. `Unavailable` is deliberately distinct from terminal:
+/// absence of observation is not evidence that execution stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTimeoutObservation {
+    NotApplicable,
+    Active,
+    Terminal,
+    Unavailable,
+}
+
+pub const fn timeout_requires_runtime_evidence(reason: TurnItemTimeoutReason) -> bool {
+    matches!(
+        reason,
+        TurnItemTimeoutReason::LeaseExpired | TurnItemTimeoutReason::IdleDeadlineExceeded
+    )
 }
 
 impl TimeoutPolicy {

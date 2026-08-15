@@ -5984,16 +5984,16 @@ impl MessageProcessor {
         &self,
         turn_id: &str,
         now_unix: i64,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<crate::resilience::RuntimeTimeoutObservation> {
         let Some(binding) = self
             .crud_store
             .get_cli_runtime_turn_binding(turn_id)
             .await?
         else {
-            return Ok(false);
+            return Ok(crate::resilience::RuntimeTimeoutObservation::NotApplicable);
         };
         if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
-            return Ok(false);
+            return Ok(crate::resilience::RuntimeTimeoutObservation::NotApplicable);
         }
         let Some((workspace_id, turn)) = (if let Some((workspace_id, turn)) = self
             .thread_manager
@@ -6006,7 +6006,7 @@ impl MessageProcessor {
                 .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
                 .await?
         }) else {
-            return Ok(false);
+            return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
         };
         if turn.status != TurnStatus::InProgress {
             self.cleanup_cli_runtime_terminal_turn_status(
@@ -6015,7 +6015,7 @@ impl MessageProcessor {
                 "timeout supervisor observed terminal Pioneer turn",
             )
             .await;
-            return Ok(false);
+            return Ok(crate::resilience::RuntimeTimeoutObservation::Terminal);
         }
 
         match self
@@ -6030,10 +6030,14 @@ impl MessageProcessor {
                         evidence.activity_kind(),
                     )
                     .await?;
-                Ok(true)
+                Ok(crate::resilience::RuntimeTimeoutObservation::Active)
             }
-            Ok(CLIRuntimeAuthoritativeTurnState::Terminal) => Ok(true),
-            Ok(CLIRuntimeAuthoritativeTurnState::Unavailable) => Ok(false),
+            Ok(CLIRuntimeAuthoritativeTurnState::Terminal) => {
+                Ok(crate::resilience::RuntimeTimeoutObservation::Terminal)
+            }
+            Ok(CLIRuntimeAuthoritativeTurnState::Unavailable) => {
+                Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable)
+            }
             Err(error) => {
                 warn!(
                     workspace_id = binding.workspace_id.as_str(),
@@ -6043,7 +6047,7 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "runtime observation failed while evaluating item timeout; deferring destructive timeout transition"
                 );
-                Ok(true)
+                Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable)
             }
         }
     }
@@ -6128,88 +6132,21 @@ impl MessageProcessor {
                 return Ok(());
             }
             CLIRuntimeAuthoritativeTurnState::Terminal => return Ok(()),
-            CLIRuntimeAuthoritativeTurnState::Unavailable => {}
-        }
-
-        let latest_native_turn_id = self.cli_runtime_latest_native_turn_id(&binding).await?;
-        let message = if let Some(native_turn_id) = latest_native_turn_id.as_deref() {
-            if observed_activity_ms.is_some() {
-                format!(
-                    "CLI runtime turn `{}` stopped emitting native events for native turn `{native_turn_id}` after {} ms of inactivity",
-                    binding.turn_id, stale_after_ms
-                )
-            } else {
-                format!(
-                    "CLI runtime turn `{}` did not emit any native events for native turn `{native_turn_id}` within {} ms",
-                    binding.turn_id, stale_after_ms
-                )
-            }
-        } else {
-            format!(
-                "CLI runtime turn `{}` did not receive a native turn id within {} ms",
-                binding.turn_id, stale_after_ms
-            )
-        };
-
-        self.ensure_cli_runtime_turn_loaded_for_lifecycle(
-            workspace_id.as_str(),
-            binding.thread_id.as_str(),
-            &turn,
-        )
-        .await?;
-        let attempt = self
-            .crud_store
-            .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
-            .await?;
-        if let Some(attempt) = attempt.as_ref() {
-            if attempt.turn_id != binding.turn_id
-                || attempt.runtime_id != binding.runtime_id
-                || attempt.native_thread_id != binding.native_thread_id
-            {
-                anyhow::bail!(
-                    "stale CLI runtime attempt `{}` does not match turn binding `{}`",
-                    attempt.id,
+            CLIRuntimeAuthoritativeTurnState::Unavailable => {
+                let reason = format!(
+                    "CLI runtime observation is unavailable for stale turn `{}`; authoritative state rehydration is required",
                     binding.turn_id
                 );
-            }
-            let recovery_state = self.cli_runtime_attempt_recovery_state(attempt).await?;
-            if attempt.status.is_active() {
-                let _ = self
-                    .crud_store
-                    .mark_cli_runtime_turn_attempt_terminal(
-                        attempt.id.as_str(),
-                        pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted,
-                        Some(message.clone()),
-                        chrono::Utc::now().fixed_offset(),
-                    )
-                    .await?;
-            }
-            match recovery_state {
-                CLIRuntimeAttemptRecoveryState::Active(recovery) => {
-                    self.handle_cli_runtime_recovery_native_failure(
-                        binding.turn_id.clone(),
-                        recovery,
-                        message,
-                    )
-                    .await;
-                    return Ok(());
-                }
-                CLIRuntimeAttemptRecoveryState::Inactive { .. } => {
-                    return Ok(());
-                }
-                CLIRuntimeAttemptRecoveryState::Normal => {}
+                self.ensure_turn_observation_recovery(
+                    binding.turn_id.as_str(),
+                    TurnFailureRecoveryKind::ObservationGap,
+                    reason,
+                    None,
+                )
+                .await?;
+                return Ok(());
             }
         }
-        let _ = self
-            .report_turn_failure(
-                binding.thread_id.clone(),
-                binding.turn_id.clone(),
-                TurnFailureRecoveryKind::RuntimeFailure,
-                message,
-            )
-            .await;
-
-        Ok(())
     }
 
     pub(super) async fn reconcile_cli_runtime_turn_from_runtime(
