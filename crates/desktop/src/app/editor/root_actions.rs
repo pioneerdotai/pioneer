@@ -60,14 +60,11 @@ impl PioneerDesktop {
         }
 
         let input = cx.new(|cx| {
-            let state = EditorState::new("markdown", window, cx)
+            EditorState::new(window, cx)
+                .language("markdown")
                 .line_number(true)
-                .default_value("");
-            // The typed editor facade does not expose soft-wrap configuration yet.
-            state
-                .base_state()
-                .update(cx, |state, cx| state.set_soft_wrap(true, window, cx));
-            state
+                .soft_wrap(true)
+                .default_value("")
         });
         let editor_workspace_id = workspace_id.clone();
         let editor_folder_id = folder_id.clone();
