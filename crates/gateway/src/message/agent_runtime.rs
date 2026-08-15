@@ -5323,10 +5323,11 @@ impl MessageProcessor {
         true
     }
 
-    /// Native provider success is acknowledged only after the previously
-    /// prepared final response, final AgentMessage and Completed Turn commit in
-    /// one authoritative transaction. Legacy execution-free callers retain
-    /// `complete_turn`, which has no provider final response to bind.
+    /// Native provider success with a final response is acknowledged only after
+    /// the prepared final AgentMessage and Completed Turn commit in one
+    /// authoritative transaction. A success with no final AgentMessage has only
+    /// one terminal event to commit and therefore uses `complete_turn` as its
+    /// atomic terminal-only boundary.
     pub(super) async fn complete_native_turn(
         &self,
         thread_id: String,
@@ -5356,11 +5357,10 @@ impl MessageProcessor {
         }
 
         // TurnCompleted is shared by native API providers, CLI runtimes and
-        // older native workers. Current providers and CLI runtimes emit the
-        // preceding durable finalization intent. Preserve the existing
-        // terminal lifecycle only for older intent-less producers during the
-        // rolling expand/migrate/contract window; every prepared response
-        // takes the atomic path below.
+        // older native workers. A finalization intent means provider output and
+        // terminal state must commit together. Without an intent there is no
+        // final item to bind, so the single durable TurnCompleted event is the
+        // complete atomic outcome.
         match self
             .crud_store
             .has_turn_finalization_intent(turn_id.as_str())

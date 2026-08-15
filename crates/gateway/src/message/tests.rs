@@ -33678,6 +33678,13 @@ async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
         binding.status,
         crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
     );
+    assert!(
+        !crud_store
+            .has_turn_finalization_intent(turn_id)
+            .await
+            .expect("finalization intent lookup should succeed"),
+        "a CLI success without a final AgentMessage must use the atomic terminal-only path"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -46610,6 +46617,19 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
     assert_eq!(
         binding.status,
         crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED
+    );
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn should load")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert!(
+        !crud_store
+            .has_turn_finalization_intent(turn_id)
+            .await
+            .expect("finalization intent lookup should succeed"),
+        "a live CLI success without a final AgentMessage must use the atomic terminal-only path"
     );
 }
 

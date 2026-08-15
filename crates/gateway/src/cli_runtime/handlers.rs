@@ -115,6 +115,12 @@ enum CLIRuntimeAttemptRecoveryState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CLIRuntimeSuccessFinalizationPreparation {
+    WithFinalMessage,
+    WithoutFinalMessage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CLIRuntimeAuthoritativeTurnState {
     Active(CLIRuntimeActivityEvidence),
     Terminal,
@@ -5383,7 +5389,7 @@ impl MessageProcessor {
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         generation: i64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<CLIRuntimeSuccessFinalizationPreparation> {
         let final_item = self
             .crud_store
             .list_completed_agent_messages(binding.turn_id.as_str())
@@ -5398,13 +5404,17 @@ impl MessageProcessor {
                         ..
                     }
                 )
-            })
-            .with_context(|| {
-                format!(
-                    "CLI Turn `{}` has no completed final AgentMessage",
-                    binding.turn_id
-                )
-            })?;
+            });
+        let Some(final_item) = final_item else {
+            debug!(
+                workspace_id = binding.workspace_id.as_str(),
+                runtime_id = binding.runtime_id.as_str(),
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                "CLI Turn success has no final AgentMessage; using atomic terminal-only finalization"
+            );
+            return Ok(CLIRuntimeSuccessFinalizationPreparation::WithoutFinalMessage);
+        };
         let revision = self
             .crud_store
             .task_finalization_revision(binding.thread_id.as_str(), binding.turn_id.as_str())
@@ -5422,7 +5432,7 @@ impl MessageProcessor {
                 now_timestamp_secs(),
             )
             .await?;
-        Ok(())
+        Ok(CLIRuntimeSuccessFinalizationPreparation::WithFinalMessage)
     }
 
     async fn apply_authoritative_cli_runtime_snapshot_event(
