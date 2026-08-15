@@ -311,6 +311,7 @@ where
 
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
 const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
+const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MessageProcessorResilienceConfig {
@@ -1736,6 +1737,11 @@ impl MessageProcessor {
                     next_skill_upload_cleanup = now.saturating_add(60);
                 }
 
+                // Confirm live native command activity before timeout polling.
+                // A command whose lease is near its boundary must get the
+                // authoritative liveness check before any destructive claim.
+                this.heartbeat_due_cli_runtime_command_items(now).await;
+
                 match retry_transient_storage_access(|| {
                     this.poll_timeouts_respecting_human_wait(now, 64)
                 })
@@ -1960,7 +1966,6 @@ impl MessageProcessor {
 
                 this.fail_stale_cli_runtime_turns(now_timestamp_millis())
                     .await;
-                this.heartbeat_due_cli_runtime_command_items(now).await;
 
                 sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
             }
@@ -1980,40 +1985,182 @@ impl MessageProcessor {
             .await;
     }
 
-    #[cfg(test)]
-    async fn register_cli_runtime_command_item<
-        O: crate::cli_runtime::session_instance::CliSessionInstanceOrigin + ?Sized,
-    >(
-        &self,
-        origin: &O,
-        turn_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
-        item_id: &str,
-        native_thread_id: Option<String>,
-        native_turn_id: String,
-    ) {
-        let instance = origin.to_session_instance();
-        self.cli_runtime_command_heartbeats
-            .register(
-                &instance,
-                turn_binding,
-                item_id,
-                native_thread_id,
-                native_turn_id,
-                now_timestamp_secs(),
-            )
-            .await;
-    }
-
-    async fn remove_cli_runtime_command_items_for_session(
+    async fn detach_cli_runtime_command_observer(
         &self,
         instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
     ) {
         self.cli_runtime_command_heartbeats
-            .remove_session(instance)
+            .detach_observer(instance)
             .await;
     }
 
+    async fn rehydrate_cli_runtime_command_items(
+        &self,
+        observer: Option<&crate::cli_runtime::session_instance::CliSessionInstanceId>,
+        limit: u64,
+    ) -> usize {
+        let attempts = match self
+            .crud_store
+            .list_running_turn_item_attempts_by_type(TurnItemType::CommandExecution, limit)
+            .await
+        {
+            Ok(attempts) => attempts,
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to load durable CLI runtime command supervision candidates"
+                );
+                return 0;
+            }
+        };
+        let mut restored = 0usize;
+        for attempt in attempts {
+            let binding = match self
+                .crud_store
+                .get_cli_runtime_turn_binding(attempt.turn_id.as_str())
+                .await
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        turn_id = attempt.turn_id.as_str(),
+                        item_id = attempt.item_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to load CLI runtime command owner binding"
+                    );
+                    continue;
+                }
+            };
+            if !matches!(
+                binding.status.as_str(),
+                crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                    | crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+            ) {
+                continue;
+            }
+            if let Some(observer) = observer
+                && (observer.key().workspace_id != binding.workspace_id
+                    || observer.key().runtime_id != binding.runtime_id
+                    || observer.key().thread_id != binding.continuation_thread_id)
+            {
+                continue;
+            }
+            let owner_attempt = match self
+                .crud_store
+                .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
+                .await
+            {
+                Ok(Some(owner_attempt)) if owner_attempt.status.is_active() => owner_attempt,
+                Ok(_) => continue,
+                Err(error) => {
+                    warn!(
+                        turn_id = binding.turn_id.as_str(),
+                        item_id = attempt.item_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to load durable CLI runtime command execution attempt"
+                    );
+                    continue;
+                }
+            };
+            if owner_attempt.runtime_id != binding.runtime_id
+                || owner_attempt.native_thread_id != binding.native_thread_id
+            {
+                continue;
+            }
+            let running_segment = match self
+                .crud_store
+                .latest_running_cli_runtime_execution_segment_for_turn(binding.turn_id.as_str())
+                .await
+            {
+                Ok(segment) => segment,
+                Err(error) => {
+                    warn!(
+                        turn_id = binding.turn_id.as_str(),
+                        item_id = attempt.item_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to load durable CLI runtime command execution segment"
+                    );
+                    continue;
+                }
+            };
+            let Some(native_turn_id) = running_segment
+                .as_ref()
+                .map(|segment| segment.native_turn_id.clone())
+                .or_else(|| owner_attempt.native_turn_id.clone())
+            else {
+                continue;
+            };
+            let owner = match self
+                .crud_store
+                .resolve_cli_runtime_native_turn_owner(
+                    binding.runtime_id.as_str(),
+                    native_turn_id.as_str(),
+                )
+                .await
+            {
+                Ok(Some(owner)) => owner,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        turn_id = binding.turn_id.as_str(),
+                        item_id = attempt.item_id.as_str(),
+                        native_turn_id = native_turn_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to resolve durable CLI runtime command native owner"
+                    );
+                    continue;
+                }
+            };
+            if owner.attempt.id != owner_attempt.id
+                || owner.binding.turn_id != binding.turn_id
+                || !owner.attempt.status.is_active()
+                || owner.segment.as_ref().is_some_and(|segment| {
+                    segment.status != pioneer_crud::CliRuntimeExecutionSegmentStatus::Running
+                })
+            {
+                continue;
+            }
+
+            let attached_observer = if let Some(observer) = observer {
+                Some(observer.clone())
+            } else if let Some(manager) = self.cli_runtime_manager.as_ref() {
+                let key = match crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+                    binding.workspace_id.clone(),
+                    binding.runtime_id.clone(),
+                    binding.continuation_thread_id.clone(),
+                ) {
+                    Ok(key) => key,
+                    Err(_) => continue,
+                };
+                manager
+                    .existing_session(&key)
+                    .await
+                    .map(|handle| handle.instance().clone())
+            } else {
+                None
+            };
+            self.cli_runtime_command_heartbeats
+                .restore_from_durable(
+                    attached_observer.as_ref(),
+                    &binding,
+                    &attempt,
+                    native_turn_id,
+                )
+                .await;
+            restored = restored.saturating_add(1);
+        }
+        restored
+    }
+
     async fn heartbeat_due_cli_runtime_command_items(&self, now_unix: i64) -> usize {
+        if self
+            .cli_runtime_command_heartbeats
+            .should_rehydrate(now_unix, CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS)
+            .await
+        {
+            self.rehydrate_cli_runtime_command_items(None, 1_024).await;
+        }
         let due = self
             .cli_runtime_command_heartbeats
             .due_items(now_unix)
@@ -2021,7 +2168,7 @@ impl MessageProcessor {
         let mut heartbeated = 0usize;
         for item in due {
             let key = item.key.clone();
-            let active_binding = match self
+            let owner = match self
                 .crud_store
                 .resolve_cli_runtime_native_turn_owner(
                     key.runtime_id.as_str(),
@@ -2029,30 +2176,11 @@ impl MessageProcessor {
                 )
                 .await
             {
-                Ok(Some(owner)) => item.matches_active_native_turn_owner(&owner),
-                Ok(None) => match self
-                    .crud_store
-                    .get_cli_runtime_turn_binding(key.turn_id.as_str())
-                    .await
-                {
-                    Ok(Some(binding)) => item.matches_active_turn_binding(&binding),
-                    Ok(None) => false,
-                    Err(error) => {
-                        warn!(
-                            workspace_id = key.workspace_id.as_str(),
-                            runtime_id = key.runtime_id.as_str(),
-                            thread_id = key.thread_id.as_str(),
-                            turn_id = key.turn_id.as_str(),
-                            item_id = key.item_id.as_str(),
-                            error = %format!("{error:#}"),
-                            "failed to validate legacy CLI runtime command heartbeat binding"
-                        );
-                        self.cli_runtime_command_heartbeats
-                            .mark_attempt_failed(&key, now_unix)
-                            .await;
-                        continue;
-                    }
-                },
+                Ok(Some(owner)) if item.matches_active_native_turn_owner(&owner) => owner,
+                Ok(_) => {
+                    self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                    continue;
+                }
                 Err(error) => {
                     warn!(
                         workspace_id = key.workspace_id.as_str(),
@@ -2070,9 +2198,96 @@ impl MessageProcessor {
                 }
             };
 
-            if !active_binding {
+            let open_command = match self
+                .crud_store
+                .list_running_turn_item_attempts_for_turn(key.turn_id.as_str())
+                .await
+            {
+                Ok(attempts) => attempts.into_iter().any(|attempt| {
+                    attempt.item_id == key.item_id
+                        && attempt.item_type == TurnItemType::CommandExecution
+                }),
+                Err(error) => {
+                    warn!(
+                        turn_id = key.turn_id.as_str(),
+                        item_id = key.item_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to validate durable CLI runtime open command item"
+                    );
+                    self.cli_runtime_command_heartbeats
+                        .mark_attempt_failed(&key, now_unix)
+                        .await;
+                    continue;
+                }
+            };
+            if !open_command {
                 self.cli_runtime_command_heartbeats.remove_key(&key).await;
                 continue;
+            }
+
+            let Some((workspace_id, turn)) = (match self
+                .crud_store
+                .get_turn(
+                    owner.binding.thread_id.as_str(),
+                    owner.binding.turn_id.as_str(),
+                )
+                .await
+            {
+                Ok(turn) => turn,
+                Err(error) => {
+                    warn!(
+                        turn_id = key.turn_id.as_str(),
+                        item_id = key.item_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to load Pioneer turn for CLI runtime command supervision"
+                    );
+                    self.cli_runtime_command_heartbeats
+                        .mark_attempt_failed(&key, now_unix)
+                        .await;
+                    continue;
+                }
+            }) else {
+                self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                continue;
+            };
+            if turn.status != TurnStatus::InProgress {
+                self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                continue;
+            }
+            match self
+                .reconcile_cli_runtime_turn_from_runtime(
+                    &owner.binding,
+                    workspace_id.as_str(),
+                    &turn,
+                )
+                .await
+            {
+                Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Active(_)) => {}
+                Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Terminal) => {
+                    self.cli_runtime_command_heartbeats.remove_key(&key).await;
+                    continue;
+                }
+                Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Unavailable) => {
+                    self.cli_runtime_command_heartbeats
+                        .mark_attempt_failed(&key, now_unix)
+                        .await;
+                    continue;
+                }
+                Err(error) => {
+                    warn!(
+                        workspace_id = key.workspace_id.as_str(),
+                        runtime_id = key.runtime_id.as_str(),
+                        thread_id = key.thread_id.as_str(),
+                        turn_id = key.turn_id.as_str(),
+                        item_id = key.item_id.as_str(),
+                        error = %format!("{error:#}"),
+                        "failed to confirm CLI runtime command activity"
+                    );
+                    self.cli_runtime_command_heartbeats
+                        .mark_attempt_failed(&key, now_unix)
+                        .await;
+                    continue;
+                }
             }
 
             if let Err(error) = self

@@ -13,9 +13,9 @@ use crate::cli_runtime::manager::{
     CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadForkResult,
     CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeThreadNameSetResult,
     CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
-    CLIAgentRuntimeTurnObservation, CLIAgentRuntimeTurnStartParams,
-    CLIAgentRuntimeTurnStartSnapshot, CLIAgentRuntimeTurnSteerRequest,
-    CLIAgentRuntimeTurnSteerResult,
+    CLIAgentRuntimeTurnLivenessProbe, CLIAgentRuntimeTurnObservation,
+    CLIAgentRuntimeTurnStartParams, CLIAgentRuntimeTurnStartSnapshot,
+    CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
 };
 use crate::memory_runtime::GatewayMemoryRuntime;
 use crate::secrets::GatewaySecrets;
@@ -511,6 +511,7 @@ struct RecordingCliRuntimeSession {
     turn_steers: TokioMutex<Vec<CLIAgentRuntimeTurnSteerRequest>>,
     turn_steer_result: TokioMutex<Option<CLIAgentRuntimeTurnSteerResult>>,
     turn_observation: TokioMutex<Option<CLIAgentRuntimeTurnObservation>>,
+    turn_liveness_probe: TokioMutex<Option<CLIAgentRuntimeTurnLivenessProbe>>,
     mcp_preparations: TokioMutex<Vec<(String, String)>>,
     projected_mcp_store: TokioMutex<Option<Arc<CrudStore>>>,
     mcp_retargets: TokioMutex<Vec<(String, String, String)>>,
@@ -720,6 +721,18 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         _native_turn_id: &str,
     ) -> anyhow::Result<Option<CLIAgentRuntimeTurnObservation>> {
         Ok(self.turn_observation.lock().await.clone())
+    }
+
+    async fn probe_turn_liveness(
+        &self,
+        _native_thread_id: &str,
+        _native_turn_id: &str,
+    ) -> anyhow::Result<CLIAgentRuntimeTurnLivenessProbe> {
+        Ok(self
+            .turn_liveness_probe
+            .lock()
+            .await
+            .unwrap_or(CLIAgentRuntimeTurnLivenessProbe::SnapshotRequired))
     }
 
     async fn thread_compact(
@@ -37378,8 +37391,10 @@ async fn cli_runtime_request_response_renews_running_attempt_deadlines() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_active_command_heartbeat_renews_silent_command_deadlines() {
-    let (processor, _connection_id, _rx, workspace_id, crud_store, _cli_session) =
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
     let now = chrono::Utc::now().timestamp();
     crud_store
         .materialize_item_started_with_attempt_deadlines(
@@ -37399,27 +37414,6 @@ async fn cli_runtime_active_command_heartbeat_renews_silent_command_deadlines() 
         .await
         .expect("silent CLI command attempt should materialize");
 
-    let key = CLIAgentRuntimeSessionKey::new(
-        workspace_id.as_str(),
-        "codex",
-        "thread_cli_command_approval",
-    )
-    .expect("session key should build");
-    let binding = crud_store
-        .get_cli_runtime_turn_binding("codex-turn-command")
-        .await
-        .expect("turn binding should load")
-        .expect("turn binding should exist");
-    processor
-        .register_cli_runtime_command_item(
-            &key,
-            &binding,
-            "codex-item-command",
-            Some("codex-thread-command".to_owned()),
-            "codex-turn-command".to_owned(),
-        )
-        .await;
-
     let heartbeat_now = now
         .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
         .saturating_add(2);
@@ -37438,6 +37432,121 @@ async fn cli_runtime_active_command_heartbeat_renews_silent_command_deadlines() 
             .iter()
             .all(|candidate| candidate.item_id != "codex-item-command"),
         "active CLI command heartbeat should renew silent command idle deadlines"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_command_heartbeat_does_not_renew_without_confirmed_runtime_activity() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::Unavailable);
+    let now = chrono::Utc::now().timestamp();
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id,
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item: command_execution_item("codex-item-command-unavailable"),
+            },
+            now.saturating_sub(120),
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now.saturating_sub(10)),
+                idle_deadline_at_unix: Some(now.saturating_sub(10)),
+                hard_deadline_at_unix: Some(now.saturating_add(6 * 60 * 60)),
+            },
+        )
+        .await
+        .expect("silent CLI command attempt should materialize");
+
+    let heartbeat_now = now
+        .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
+        .saturating_add(2);
+    assert_eq!(
+        processor
+            .heartbeat_due_cli_runtime_command_items(heartbeat_now)
+            .await,
+        0,
+        "durable ownership without confirmed runtime activity must not renew a heartbeat"
+    );
+    let candidates = crud_store
+        .list_timeout_candidates(heartbeat_now, 64)
+        .await
+        .expect("timeout candidates should query after unavailable probe");
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.item_id == "codex-item-command-unavailable"),
+        "unconfirmed execution must remain eligible for normal timeout supervision"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_turn() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::SnapshotRequired);
+    *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+        status: CLIAgentRuntimeObservedTurnStatus::Completed,
+        message: None,
+        reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            native_thread_id: Some("codex-thread-command".to_owned()),
+            native_turn_id: "codex-turn-command".to_owned(),
+            native_item_id: "codex-terminal-answer".to_owned(),
+            item_kind: "agentMessage".to_owned(),
+            text: Some("done".to_owned()),
+            summary: Vec::new(),
+            content: Vec::new(),
+            phase: RuntimeAgentMessagePhase::FinalAnswer,
+            metadata: None,
+            native_item_redacted: None,
+            native: None,
+        })],
+    });
+    let now = chrono::Utc::now().timestamp();
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id,
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item: command_execution_item("codex-item-command-terminal"),
+            },
+            now.saturating_sub(120),
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now.saturating_sub(10)),
+                idle_deadline_at_unix: Some(now.saturating_sub(10)),
+                hard_deadline_at_unix: Some(now.saturating_add(6 * 60 * 60)),
+            },
+        )
+        .await
+        .expect("silent CLI command attempt should materialize");
+
+    let heartbeat_now = now
+        .saturating_add(processor.cli_runtime_command_heartbeats.interval_secs())
+        .saturating_add(2);
+    assert_eq!(
+        processor
+            .heartbeat_due_cli_runtime_command_items(heartbeat_now)
+            .await,
+        0,
+        "terminal native observation must never produce another command heartbeat"
+    );
+    let (_, turn) = crud_store
+        .get_turn("thread_cli_command_approval", "codex-turn-command")
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert!(
+        processor
+            .cli_runtime_command_heartbeats
+            .due_items(i64::MAX)
+            .await
+            .is_empty(),
+        "terminal finalization must evict the command from the in-memory cache"
     );
 }
 
@@ -37750,28 +37859,43 @@ async fn seed_cli_runtime_approval_turn_for_runtime(
     .await;
 
     let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: turn_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            continuation_thread_id: thread_id.to_owned(),
-            workspace_id: workspace_id.to_owned(),
-            runtime_id: runtime_id.to_owned(),
-            runtime_kind: runtime_kind.to_owned(),
-            native_thread_id: native_thread_id.to_owned(),
-            native_turn_id: Some(turn_id.to_owned()),
-            request_id: None,
-            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
-            model: Some("gpt-5".to_owned()),
-            cwd: Some("/tmp/project".to_owned()),
-            sandbox_json: None,
-            approval_policy: None,
-            input_mapping_json: "{}".to_owned(),
-            created_at: now,
-            updated_at: now,
-        })
+    let (_, attempt) = crud_store
+        .prepare_cli_runtime_initial_turn_attempt(
+            NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                runtime_id: runtime_id.to_owned(),
+                runtime_kind: runtime_kind.to_owned(),
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: None,
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                created_at: now,
+                updated_at: now,
+            },
+            pioneer_protocol::generate_id(21),
+            1,
+        )
         .await
-        .expect("CLI approval test turn binding should upsert");
+        .expect("CLI approval test turn attempt should prepare");
+    crud_store
+        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), turn_id, None, now)
+        .await
+        .expect("CLI approval test turn attempt should activate");
+    if runtime_kind == "codex" {
+        crud_store
+            .register_cli_runtime_execution_segment(turn_id, native_thread_id, turn_id, now)
+            .await
+            .expect("Codex approval test execution segment should register");
+    }
 }
 
 async fn materialize_cli_runtime_approval_turn(

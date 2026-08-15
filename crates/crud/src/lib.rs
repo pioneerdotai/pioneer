@@ -18562,6 +18562,29 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .collect())
     }
 
+    pub async fn list_running_turn_item_attempts_by_type(
+        &self,
+        item_type: TurnItemType,
+        limit: u64,
+    ) -> Result<Vec<RunningTurnItemAttempt>> {
+        let rows = turn_item_attempt::list_running_attempts_by_item_type(
+            &self.connection,
+            item_type,
+            limit,
+        )
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| RunningTurnItemAttempt {
+                turn_id: row.turn_id,
+                item_id: row.item_id,
+                item_type: row.item_type,
+                started_at_unix: row.started_at.timestamp(),
+                last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
+            })
+            .collect())
+    }
+
     pub async fn list_unqueued_timeout_candidates(
         &self,
         limit: u64,

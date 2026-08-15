@@ -114,6 +114,28 @@ enum CLIRuntimeAttemptRecoveryState {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CLIRuntimeAuthoritativeTurnState {
+    Active(CLIRuntimeActivityEvidence),
+    Terminal,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CLIRuntimeActivityEvidence {
+    LivenessProbe,
+    ObservedInProgress,
+}
+
+impl CLIRuntimeActivityEvidence {
+    pub(super) const fn activity_kind(self) -> &'static str {
+        match self {
+            Self::LivenessProbe => "runtime/liveness_probe_confirmed_active",
+            Self::ObservedInProgress => "runtime/observed_in_progress",
+        }
+    }
+}
+
 /// Runtime discovery is operational for workspace Members, but local paths,
 /// account identity and raw process output belong to Gateway management.
 /// Keep the capability/model metadata used by composers while returning a
@@ -3052,6 +3074,8 @@ impl MessageProcessor {
         }
 
         self.ensure_cli_runtime_execution_event_hub(instance).await;
+        self.rehydrate_cli_runtime_command_items(Some(instance), 1_024)
+            .await;
         if let Some(receivers) = event_receivers {
             self.spawn_cli_runtime_event_pump(instance.clone(), receivers, debug_native_events);
         }
@@ -3399,7 +3423,7 @@ impl MessageProcessor {
                 .close_cli_runtime_execution_event_hub(&instance)
                 .await;
             processor
-                .remove_cli_runtime_command_items_for_session(&instance)
+                .detach_cli_runtime_command_observer(&instance)
                 .await;
         });
     }
@@ -3474,7 +3498,7 @@ impl MessageProcessor {
                 .close_cli_runtime_execution_event_hub(&notification_instance)
                 .await;
             notification_processor
-                .remove_cli_runtime_command_items_for_session(&notification_instance)
+                .detach_cli_runtime_command_observer(&notification_instance)
                 .await;
         });
 
@@ -5985,15 +6009,21 @@ impl MessageProcessor {
         }
 
         match self
-            .reconcile_cli_runtime_turn_from_runtime(
-                &binding,
-                now_unix.saturating_mul(1_000),
-                workspace_id.as_str(),
-                &turn,
-            )
+            .reconcile_cli_runtime_turn_from_runtime(&binding, workspace_id.as_str(), &turn)
             .await
         {
-            Ok(reconciled) => Ok(reconciled),
+            Ok(CLIRuntimeAuthoritativeTurnState::Active(evidence)) => {
+                self.timeout_supervisor
+                    .renew_running_attempt_deadlines_after_runtime_activity(
+                        binding.turn_id.as_str(),
+                        now_unix,
+                        evidence.activity_kind(),
+                    )
+                    .await?;
+                Ok(true)
+            }
+            Ok(CLIRuntimeAuthoritativeTurnState::Terminal) => Ok(true),
+            Ok(CLIRuntimeAuthoritativeTurnState::Unavailable) => Ok(false),
             Err(error) => {
                 warn!(
                     workspace_id = binding.workspace_id.as_str(),
@@ -6073,16 +6103,22 @@ impl MessageProcessor {
             return Ok(());
         }
 
-        if self
-            .reconcile_cli_runtime_turn_from_runtime(
-                &binding,
-                now_unix_ms,
-                workspace_id.as_str(),
-                &turn,
-            )
+        match self
+            .reconcile_cli_runtime_turn_from_runtime(&binding, workspace_id.as_str(), &turn)
             .await?
         {
-            return Ok(());
+            CLIRuntimeAuthoritativeTurnState::Active(evidence) => {
+                self.timeout_supervisor
+                    .renew_running_attempt_deadlines_after_runtime_activity(
+                        binding.turn_id.as_str(),
+                        now_unix_ms.saturating_div(1_000),
+                        evidence.activity_kind(),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            CLIRuntimeAuthoritativeTurnState::Terminal => return Ok(()),
+            CLIRuntimeAuthoritativeTurnState::Unavailable => {}
         }
 
         let latest_native_turn_id = self.cli_runtime_latest_native_turn_id(&binding).await?;
@@ -6166,13 +6202,12 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn reconcile_cli_runtime_turn_from_runtime(
+    pub(super) async fn reconcile_cli_runtime_turn_from_runtime(
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
-        now_unix_ms: i64,
         workspace_id: &str,
         turn: &Turn,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<CLIRuntimeAuthoritativeTurnState> {
         if let Some(attempt) = self
             .crud_store
             .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
@@ -6200,7 +6235,7 @@ impl MessageProcessor {
                         recovery_status = ?status,
                         "deferred completed CLI attempt reconciliation for inactive recovery"
                     );
-                    return Ok(false);
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
                 }
             };
             self.ensure_cli_runtime_turn_loaded_for_lifecycle(
@@ -6238,14 +6273,14 @@ impl MessageProcessor {
                 attempt_id = attempt.id.as_str(),
                 "reconciled Pioneer turn from completed CLI runtime attempt"
             );
-            return Ok(true);
+            return Ok(CLIRuntimeAuthoritativeTurnState::Terminal);
         }
 
         let Some(native_turn_id) = self.cli_runtime_running_native_turn_id(binding).await? else {
-            return Ok(false);
+            return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
         };
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
-            return Ok(false);
+            return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
         };
         let key = CLIAgentRuntimeSessionKey::new(
             binding.workspace_id.clone(),
@@ -6253,7 +6288,7 @@ impl MessageProcessor {
             binding.continuation_thread_id.clone(),
         )?;
         let Some(handle) = manager.existing_session(&key).await else {
-            return Ok(false);
+            return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
         };
         let probe = handle
             .session()
@@ -6261,27 +6296,20 @@ impl MessageProcessor {
             .await?;
 
         if probe == CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive {
-            let renewed = self
-                .timeout_supervisor
-                .renew_running_attempt_deadlines_after_runtime_activity(
-                    binding.turn_id.as_str(),
-                    now_unix_ms.saturating_div(1_000),
-                    "runtime/liveness_probe_confirmed_active",
-                )
-                .await?;
             debug!(
                 workspace_id = binding.workspace_id.as_str(),
                 runtime_id = binding.runtime_id.as_str(),
                 thread_id = binding.thread_id.as_str(),
                 turn_id = binding.turn_id.as_str(),
                 native_turn_id = native_turn_id.as_str(),
-                renewed,
                 "runtime liveness probe confirmed Pioneer Turn is still active"
             );
-            return Ok(true);
+            return Ok(CLIRuntimeAuthoritativeTurnState::Active(
+                CLIRuntimeActivityEvidence::LivenessProbe,
+            ));
         }
         if probe == CLIAgentRuntimeTurnLivenessProbe::Unavailable {
-            return Ok(false);
+            return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
         }
 
         let Some(observation) = handle
@@ -6289,28 +6317,21 @@ impl MessageProcessor {
             .load_turn_snapshot(binding.native_thread_id.as_str(), native_turn_id.as_str())
             .await?
         else {
-            return Ok(false);
+            return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
         };
 
         if observation.status == CLIAgentRuntimeObservedTurnStatus::InProgress {
-            let renewed = self
-                .timeout_supervisor
-                .renew_running_attempt_deadlines_after_runtime_activity(
-                    binding.turn_id.as_str(),
-                    now_unix_ms.saturating_div(1_000),
-                    "runtime/observed_in_progress",
-                )
-                .await?;
             debug!(
                 workspace_id = binding.workspace_id.as_str(),
                 runtime_id = binding.runtime_id.as_str(),
                 thread_id = binding.thread_id.as_str(),
                 turn_id = binding.turn_id.as_str(),
                 native_turn_id = native_turn_id.as_str(),
-                renewed,
                 "runtime reconciliation confirmed stale Pioneer turn is still active"
             );
-            return Ok(true);
+            return Ok(CLIRuntimeAuthoritativeTurnState::Active(
+                CLIRuntimeActivityEvidence::ObservedInProgress,
+            ));
         }
 
         for event in observation.reconciliation_events.iter().cloned() {
@@ -6391,7 +6412,7 @@ impl MessageProcessor {
                 .map_err(|error| {
                     anyhow::anyhow!("failed to commit reconciled blocked event: {error}")
                 })?;
-                return Ok(true);
+                return Ok(CLIRuntimeAuthoritativeTurnState::Terminal);
             }
             CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),
         };
@@ -6401,7 +6422,7 @@ impl MessageProcessor {
         {
             anyhow::bail!("failed to commit canonical runtime terminal observation");
         }
-        Ok(true)
+        Ok(CLIRuntimeAuthoritativeTurnState::Terminal)
     }
 
     async fn ensure_cli_runtime_turn_loaded_for_lifecycle(

@@ -485,6 +485,40 @@ pub async fn list_running_attempts_for_turn<C: ConnectionTrait>(
         .collect())
 }
 
+pub async fn list_running_attempts_by_item_type<C: ConnectionTrait>(
+    db: &C,
+    item_type: TurnItemType,
+    limit: u64,
+) -> Result<Vec<RunningAttemptSnapshot>> {
+    let running = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
+    let rows = turn_item_attempt::Entity::find()
+        .filter(turn_item_attempt::Column::Status.eq(running))
+        .filter(turn_item_attempt::Column::ItemType.eq(turn_item_type_to_db(item_type)))
+        .order_by_asc(turn_item_attempt::Column::StartedAt)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to list running attempts by item type")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| RunningAttemptSnapshot {
+            id: row.id,
+            turn_id: row.turn_id,
+            item_id: row.item_id,
+            item_type: turn_item_type_from_db(row.item_type.as_str())
+                .unwrap_or(TurnItemType::DynamicToolCall),
+            attempt_number: row.attempt_number,
+            started_at: row.started_at,
+            started_event_sequence: row.started_event_sequence,
+            last_heartbeat_at: row.last_heartbeat_at,
+            lease_expires_at: row.lease_expires_at,
+            idle_deadline_at: row.idle_deadline_at,
+            hard_deadline_at: row.hard_deadline_at,
+        })
+        .collect())
+}
+
 pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
     db: &C,
     limit: u64,
