@@ -28766,6 +28766,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_blocked_projection_pauses_active_triggers_atomically() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection);
+        let timestamp = 1_700_000_000;
+        let task = sample_task(timestamp);
+        let trigger = sample_task_trigger(timestamp);
+
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::TriggerCreated {
+                        trigger: trigger.clone(),
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("task and trigger should project");
+
+        store
+            .append_task_event(
+                TaskEventPayload::TaskBlocked {
+                    task_id: task.id.clone(),
+                    error: None,
+                    blocked_at: timestamp + 1,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("task blocked event should project");
+
+        let blocked = store
+            .get_task(task.id.as_str())
+            .await
+            .expect("blocked task should load")
+            .expect("blocked task should exist");
+        assert_eq!(blocked.task.status, TaskStatus::Blocked);
+        assert_eq!(blocked.triggers.len(), 1);
+        assert_eq!(blocked.triggers[0].status, TaskTriggerStatus::Paused);
+        assert_eq!(blocked.triggers[0].next_fire_at, None);
+        assert_eq!(blocked.triggers[0].updated_at, timestamp + 1);
+    }
+
+    #[tokio::test]
     async fn task_event_fanout_cursor_is_durable_and_monotonic() {
         let connection = Database::connect("sqlite::memory:")
             .await

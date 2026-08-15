@@ -292,6 +292,13 @@ impl TaskProjector {
                 )
                 .await?;
                 handle_projection_outcome("task_blocked", task_id, &outcome)?;
+                if matches!(
+                    &outcome,
+                    ProjectionWriteOutcome::Applied | ProjectionWriteOutcome::NoopDuplicateTerminal
+                ) {
+                    task_trigger::pause_active_triggers_for_blocked_task(db, task_id, blocked_at)
+                        .await?;
+                }
                 Ok(())
             }),
             TaskEventPayload::TaskCancelled {

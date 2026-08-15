@@ -98,6 +98,32 @@ pub async fn update_trigger_schedule<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Stops every schedulable trigger for a Task that entered a blocked state.
+///
+/// The caller supplies the same database transaction that projects the
+/// `TaskBlocked` event, so the Task status and its trigger schedules cannot
+/// become visible independently.
+pub async fn pause_active_triggers_for_blocked_task<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<u64> {
+    let next_fire_at: Option<DateTimeWithTimeZone> = None;
+    let result = task_trigger::Entity::update_many()
+        .filter(task_trigger::Column::TaskId.eq(task_id.to_owned()))
+        .filter(task_trigger::Column::Status.eq("active"))
+        .col_expr(
+            task_trigger::Column::Status,
+            Expr::value(task_trigger_status_to_db(TaskTriggerStatus::Paused)),
+        )
+        .col_expr(task_trigger::Column::NextFireAt, Expr::value(next_fire_at))
+        .col_expr(task_trigger::Column::UpdatedAt, Expr::value(updated_at))
+        .exec(db)
+        .await
+        .context("failed to pause active triggers for blocked task")?;
+    Ok(result.rows_affected)
+}
+
 fn active_model_from_trigger(trigger: &TaskTrigger) -> Result<task_trigger::ActiveModel> {
     let spec_json =
         serde_json::to_string(&trigger.spec).context("failed to serialize task trigger spec")?;
