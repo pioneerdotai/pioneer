@@ -34,6 +34,7 @@ use serde::de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAcc
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -167,7 +168,6 @@ impl CodexJsonlRpcClient {
         let (notification_tx, notification_rx) = mpsc::channel(notification_capacity.max(1));
         let (server_request_tx, server_request_rx) = mpsc::channel(server_request_capacity);
         let (diagnostic_tx, diagnostic_rx) = mpsc::channel(diagnostic_capacity.max(1));
-        let oversized_recovery_request_ids = Arc::new(StdMutex::new(HashSet::new()));
         let notification_ingress = OrderedEventIngress::spawn(
             notification_tx,
             OrderedIngressConfig {
@@ -181,7 +181,6 @@ impl CodexJsonlRpcClient {
             reader,
             incoming_tx,
             native_event_budget,
-            Arc::clone(&oversized_recovery_request_ids),
         ));
         tokio::spawn(run_codex_jsonl_rpc_worker(
             writer,
@@ -194,7 +193,7 @@ impl CodexJsonlRpcClient {
             },
             server_request_capacity,
             server_request_timeout,
-            oversized_recovery_request_ids,
+            native_event_budget,
         ));
 
         Self {
@@ -441,6 +440,11 @@ pub enum CodexJsonlRpcClientError {
     TransportClosed {
         message: String,
     },
+    ResponseTooLarge {
+        id: JsonlRpcId,
+        total_bytes: usize,
+        max_frame_bytes: usize,
+    },
     Decode {
         method: String,
         message: String,
@@ -479,6 +483,14 @@ impl fmt::Display for CodexJsonlRpcClientError {
                 timeout.as_millis()
             ),
             Self::TransportClosed { message } => f.write_str(message),
+            Self::ResponseTooLarge {
+                id,
+                total_bytes,
+                max_frame_bytes,
+            } => write!(
+                f,
+                "codex jsonl-rpc response for request `{id}` is {total_bytes} bytes and exceeds the {max_frame_bytes}-byte in-memory budget"
+            ),
             Self::Decode { method, message } => {
                 write!(f, "failed to decode codex `{method}` response: {message}")
             }
@@ -4698,6 +4710,9 @@ pub enum CodexJsonlRpcClientDiagnosticKind {
     ServerRequestChannelFull,
     ServerRequestChannelClosed,
     DuplicateServerRequestId,
+    /// The owning runtime session lost protocol alignment or exceeded its
+    /// finite spool allowance and must be recovered by the gateway.
+    SessionRecoveryRequired,
 }
 
 enum CodexJsonlRpcServerRequestAnswer {
@@ -4732,13 +4747,33 @@ enum CodexJsonlRpcCommand {
 
 enum CodexJsonlRpcIncoming {
     Message(JsonlRpcIncomingMessage),
-    OversizedSuccessResponse {
+    OversizedResponse {
         id: JsonlRpcId,
         file: File,
         total_bytes: usize,
+        kind: OversizedCodexResponseKind,
     },
+    OversizedNotification(CodexJsonlRpcNotificationEvent),
+    OversizedServerRequest(CodexJsonlRpcServerRequest),
     DecodeError(JsonlRpcDecodeError),
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OversizedCodexResponseKind {
+    Success,
+    Error,
+}
+
+enum OversizedCodexFrame {
+    Response {
+        id: JsonlRpcId,
+        file: File,
+        total_bytes: usize,
+        kind: OversizedCodexResponseKind,
+    },
+    Notification(CodexJsonlRpcNotificationEvent),
+    ServerRequest(CodexJsonlRpcServerRequest),
 }
 
 struct PendingCodexJsonlRpcRequest {
@@ -4934,27 +4969,12 @@ async fn run_codex_jsonl_rpc_reader<R>(
     mut reader: R,
     incoming_tx: mpsc::Sender<CodexJsonlRpcIncoming>,
     native_event_budget: crate::NativeEventBudget,
-    oversized_recovery_request_ids: Arc<StdMutex<HashSet<JsonlRpcId>>>,
 ) where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
     let codec = crate::BoundedNativeEventCodec::new(native_event_budget);
     loop {
-        match codec
-            .read_frame_or_spool_if(&mut reader, |prefix| {
-                let Ok(id) = decode_oversized_codex_success_response_prefix(
-                    prefix,
-                    native_event_budget.max_frame_bytes,
-                ) else {
-                    return false;
-                };
-                oversized_recovery_request_ids
-                    .lock()
-                    .expect("oversized recovery request registry should not be poisoned")
-                    .contains(&id)
-            })
-            .await
-        {
+        match codec.read_frame_or_spool(&mut reader).await {
             Ok(Some(crate::native_event::SpooledNativeFrame::Complete(frame))) => {
                 let message =
                     match decode_jsonl_rpc_frame_with_budget(frame.as_slice(), native_event_budget)
@@ -4976,33 +4996,54 @@ async fn run_codex_jsonl_rpc_reader<R>(
                 }
             }
             Ok(Some(crate::native_event::SpooledNativeFrame::Oversized {
-                prefix,
                 file,
                 total_bytes,
-                last_non_whitespace,
+                ..
             })) => {
-                let id = match decode_oversized_codex_success_response(
-                    prefix.as_slice(),
-                    last_non_whitespace,
-                    native_event_budget.max_frame_bytes,
-                ) {
-                    Ok(id) => id,
-                    Err(error) => {
+                let decoded = tokio::task::spawn_blocking(move || {
+                    decode_oversized_codex_frame(file, total_bytes, native_event_budget)
+                })
+                .await;
+                let decoded = match decoded {
+                    Ok(Ok(decoded)) => decoded,
+                    Ok(Err(error)) => {
                         let _ = incoming_tx
                             .send(CodexJsonlRpcIncoming::DecodeError(error))
                             .await;
                         return;
                     }
+                    Err(error) => {
+                        let _ = incoming_tx
+                            .send(CodexJsonlRpcIncoming::DecodeError(
+                                JsonlRpcDecodeError::new(
+                                    JsonlRpcDecodeErrorKind::InvalidMessage,
+                                    format!("oversized codex JSONL decoder task failed: {error}"),
+                                ),
+                            ))
+                            .await;
+                        return;
+                    }
                 };
-                if incoming_tx
-                    .send(CodexJsonlRpcIncoming::OversizedSuccessResponse {
+                let incoming = match decoded {
+                    OversizedCodexFrame::Response {
                         id,
                         file,
                         total_bytes,
-                    })
-                    .await
-                    .is_err()
-                {
+                        kind,
+                    } => CodexJsonlRpcIncoming::OversizedResponse {
+                        id,
+                        file,
+                        total_bytes,
+                        kind,
+                    },
+                    OversizedCodexFrame::Notification(notification) => {
+                        CodexJsonlRpcIncoming::OversizedNotification(notification)
+                    }
+                    OversizedCodexFrame::ServerRequest(request) => {
+                        CodexJsonlRpcIncoming::OversizedServerRequest(request)
+                    }
+                };
+                if incoming_tx.send(incoming).await.is_err() {
                     return;
                 }
             }
@@ -5025,54 +5066,462 @@ async fn run_codex_jsonl_rpc_reader<R>(
     }
 }
 
-fn decode_oversized_codex_success_response(
-    prefix: &[u8],
-    last_non_whitespace: Option<u8>,
-    max_frame_bytes: usize,
-) -> Result<JsonlRpcId, JsonlRpcDecodeError> {
-    if last_non_whitespace != Some(b'}') {
-        return Err(JsonlRpcDecodeError::new(
-            JsonlRpcDecodeErrorKind::InvalidMessage,
-            format!(
-                "native JSONL frame exceeds {max_frame_bytes} bytes and is not a complete response"
-            ),
-        ));
-    }
-    decode_oversized_codex_success_response_prefix(prefix, max_frame_bytes)
+struct OversizedCodexEnvelope {
+    id: Option<JsonlRpcId>,
+    method: Option<String>,
+    params: Option<JsonValue>,
+    has_result: bool,
+    has_error: bool,
 }
 
-fn decode_oversized_codex_success_response_prefix(
-    prefix: &[u8],
-    max_frame_bytes: usize,
-) -> Result<JsonlRpcId, JsonlRpcDecodeError> {
-    let prefix = std::str::from_utf8(prefix).map_err(|_| {
+struct OversizedCodexEnvelopeSeed {
+    budget: crate::NativeEventBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for OversizedCodexEnvelopeSeed {
+    type Value = OversizedCodexEnvelope;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(OversizedCodexEnvelopeVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+struct OversizedCodexEnvelopeVisitor {
+    budget: crate::NativeEventBudget,
+}
+
+impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
+    type Value = OversizedCodexEnvelope;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an oversized Codex JSONL-RPC object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut id = None;
+        let mut method = None;
+        let mut params = None;
+        let mut has_result = false;
+        let mut has_error = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" => {
+                    if id.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "oversized JSONL-RPC frame contains duplicate id",
+                        ));
+                    }
+                    id = Some(map.next_value::<JsonlRpcId>()?);
+                }
+                "method" => {
+                    if method.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "oversized JSONL-RPC frame contains duplicate method",
+                        ));
+                    }
+                    let value = map.next_value::<String>()?;
+                    if value.len() > self.budget.max_string_bytes {
+                        return Err(serde::de::Error::custom(
+                            "oversized JSONL-RPC method exceeds the control string budget",
+                        ));
+                    }
+                    method = Some(value);
+                }
+                "params" => {
+                    if params.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "oversized JSONL-RPC frame contains duplicate params",
+                        ));
+                    }
+                    let truncated = Cell::new(false);
+                    let nodes = Cell::new(0usize);
+                    let mut value = map.next_value_seed(CodexControlProjectionSeed {
+                        budget: self.budget,
+                        depth: 0,
+                        truncated: &truncated,
+                        nodes: &nodes,
+                    })?;
+                    attach_oversized_projection_marker(&mut value, truncated.get());
+                    params = Some(value);
+                }
+                "result" => {
+                    if has_result {
+                        return Err(serde::de::Error::custom(
+                            "oversized JSONL-RPC response contains duplicate result",
+                        ));
+                    }
+                    has_result = true;
+                    map.next_value::<IgnoredAny>()?;
+                }
+                "error" => {
+                    if has_error {
+                        return Err(serde::de::Error::custom(
+                            "oversized JSONL-RPC response contains duplicate error",
+                        ));
+                    }
+                    has_error = true;
+                    map.next_value::<IgnoredAny>()?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(OversizedCodexEnvelope {
+            id,
+            method,
+            params,
+            has_result,
+            has_error,
+        })
+    }
+}
+
+struct CodexControlProjectionSeed<'a> {
+    budget: crate::NativeEventBudget,
+    depth: usize,
+    truncated: &'a Cell<bool>,
+    nodes: &'a Cell<usize>,
+}
+
+impl CodexControlProjectionSeed<'_> {
+    fn child(&self) -> CodexControlProjectionSeed<'_> {
+        CodexControlProjectionSeed {
+            budget: self.budget,
+            depth: self.depth.saturating_add(1),
+            truncated: self.truncated,
+            nodes: self.nodes,
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for CodexControlProjectionSeed<'_> {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.depth > self.budget.max_json_depth {
+            return Err(serde::de::Error::custom(
+                "oversized JSONL-RPC control envelope exceeds the JSON depth budget",
+            ));
+        }
+        deserializer.deserialize_any(CodexControlProjectionVisitor { seed: self })
+    }
+}
+
+struct CodexControlProjectionVisitor<'a> {
+    seed: CodexControlProjectionSeed<'a>,
+}
+
+impl CodexControlProjectionVisitor<'_> {
+    fn bounded_string<E>(&self, mut value: String) -> Result<JsonValue, E>
+    where
+        E: serde::de::Error,
+    {
+        if value.len() > self.seed.budget.max_string_bytes {
+            let mut boundary = self.seed.budget.max_string_bytes.min(value.len());
+            while boundary > 0 && !value.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            value.truncate(boundary);
+            self.seed.truncated.set(true);
+        }
+        Ok(JsonValue::String(value))
+    }
+
+    fn admit_node<E>(&self) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        let next = self.seed.nodes.get().saturating_add(1);
+        if next > self.seed.budget.max_json_nodes {
+            return Err(E::custom(
+                "oversized JSONL-RPC control envelope exceeds the JSON node budget",
+            ));
+        }
+        self.seed.nodes.set(next);
+        Ok(())
+    }
+}
+
+impl<'de> Visitor<'de> for CodexControlProjectionVisitor<'_> {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded Codex lifecycle control value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.admit_node()?;
+        Ok(JsonValue::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.admit_node()?;
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.admit_node()?;
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.admit_node()?;
+        serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| E::custom("oversized JSONL-RPC control value is not finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.admit_node()?;
+        self.bounded_string(value.to_owned())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.admit_node()?;
+        self.bounded_string(value)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.admit_node()?;
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_none()
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.seed.deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        self.seed.truncated.set(true);
+        self.admit_node()?;
+        Ok(JsonValue::Array(Vec::new()))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        self.admit_node()?;
+        let mut projected = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if codex_control_projection_keeps(key.as_str()) {
+                let value = map.next_value_seed(self.seed.child())?;
+                projected.insert(key, value);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+                self.seed.truncated.set(true);
+                if let Some(placeholder) = codex_truncated_control_placeholder(key.as_str()) {
+                    projected.insert(key, placeholder);
+                }
+            }
+        }
+        Ok(JsonValue::Object(projected))
+    }
+}
+
+fn codex_control_projection_keeps(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "threadId"
+            | "thread_id"
+            | "turnId"
+            | "turn_id"
+            | "itemId"
+            | "item_id"
+            | "callId"
+            | "call_id"
+            | "requestId"
+            | "request_id"
+            | "status"
+            | "type"
+            | "kind"
+            | "phase"
+            | "code"
+            | "exitCode"
+            | "exit_code"
+            | "willRetry"
+            | "retryable"
+            | "success"
+            | "completed"
+            | "message"
+            | "reason"
+            | "title"
+            | "thread"
+            | "turn"
+            | "item"
+            | "error"
+            | "request"
+            | "goal"
+            | "metadata"
+    )
+}
+
+fn codex_truncated_control_placeholder(key: &str) -> Option<JsonValue> {
+    match key {
+        "text" | "delta" | "output" | "aggregatedOutput" | "stdout" | "stderr" => {
+            Some(JsonValue::String(String::new()))
+        }
+        "content" | "summary" => Some(JsonValue::Array(Vec::new())),
+        _ => None,
+    }
+}
+
+fn attach_oversized_projection_marker(value: &mut JsonValue, truncated: bool) {
+    let marker = json!({
+        "truncated": truncated,
+        "controlEnvelopeOnly": true,
+    });
+    match value {
+        JsonValue::Object(object) => {
+            object.insert("_pioneerOversizedPayload".to_owned(), marker);
+        }
+        _ => {
+            *value = json!({
+                "_pioneerOversizedPayload": marker,
+            });
+        }
+    }
+}
+
+fn decode_oversized_codex_frame(
+    mut file: File,
+    total_bytes: usize,
+    budget: crate::NativeEventBudget,
+) -> Result<OversizedCodexFrame, JsonlRpcDecodeError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::InvalidMessage,
-            "oversized native JSONL response prefix is not UTF-8",
+            format!("failed to rewind oversized JSONL-RPC frame: {error}"),
         )
     })?;
-    let Some(after_id) = prefix.trim_start().strip_prefix("{\"id\":") else {
-        return Err(JsonlRpcDecodeError::new(
-            JsonlRpcDecodeErrorKind::InvalidMessage,
-            format!(
-                "native JSONL frame exceeds {max_frame_bytes} bytes outside a success response"
-            ),
-        ));
-    };
-    let Some(result_separator) = after_id.find(",\"result\":") else {
-        return Err(JsonlRpcDecodeError::new(
-            JsonlRpcDecodeErrorKind::InvalidMessage,
-            format!(
-                "native JSONL frame exceeds {max_frame_bytes} bytes outside a success response"
-            ),
-        ));
-    };
-    serde_json::from_str::<JsonlRpcId>(&after_id[..result_separator]).map_err(|_| {
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut file);
+    let mut envelope = OversizedCodexEnvelopeSeed { budget }
+        .deserialize(&mut deserializer)
+        .map_err(|error| {
+            JsonlRpcDecodeError::new(
+                JsonlRpcDecodeErrorKind::MalformedJson,
+                format!("failed to stream oversized JSONL-RPC frame: {error}"),
+            )
+        })?;
+    deserializer.end().map_err(|error| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::MalformedJson,
+            format!("oversized JSONL-RPC frame has trailing data: {error}"),
+        )
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::InvalidMessage,
-            "oversized native JSONL response has an invalid id",
+            format!("failed to rewind decoded oversized JSONL-RPC frame: {error}"),
         )
-    })
+    })?;
+
+    if envelope.has_result || envelope.has_error {
+        if envelope.has_result == envelope.has_error || envelope.method.is_some() {
+            return Err(JsonlRpcDecodeError::new(
+                JsonlRpcDecodeErrorKind::InvalidMessage,
+                "oversized JSONL-RPC response must contain exactly one of result or error",
+            ));
+        }
+        let id = envelope.id.ok_or_else(|| {
+            JsonlRpcDecodeError::new(
+                JsonlRpcDecodeErrorKind::InvalidMessage,
+                "oversized JSONL-RPC response is missing id",
+            )
+        })?;
+        return Ok(OversizedCodexFrame::Response {
+            id,
+            file,
+            total_bytes,
+            kind: if envelope.has_result {
+                OversizedCodexResponseKind::Success
+            } else {
+                OversizedCodexResponseKind::Error
+            },
+        });
+    }
+
+    let method = envelope.method.ok_or_else(|| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::UnknownShape,
+            "oversized JSONL-RPC frame is not a response, notification, or server request",
+        )
+    })?;
+    let params = envelope.params.take();
+    if let Some(id) = envelope.id {
+        let raw = json!({
+            "id": id,
+            "method": method,
+            "params": params,
+            "_pioneerOversizedFrameBytes": total_bytes,
+        });
+        return Ok(OversizedCodexFrame::ServerRequest(
+            CodexJsonlRpcServerRequest {
+                id,
+                method,
+                params,
+                raw,
+            },
+        ));
+    }
+    let raw = json!({
+        "method": method,
+        "params": params,
+        "_pioneerOversizedFrameBytes": total_bytes,
+    });
+    Ok(OversizedCodexFrame::Notification(
+        CodexJsonlRpcNotificationEvent {
+            method,
+            params,
+            raw,
+        },
+    ))
 }
 
 fn oversized_codex_success_fallback(request: &JsonlRpcRequest) -> Option<JsonValue> {
@@ -5615,7 +6064,7 @@ async fn run_codex_jsonl_rpc_worker<W>(
     event_sinks: CodexJsonlRpcEventSinks,
     max_pending_server_requests: usize,
     server_request_timeout: Duration,
-    oversized_recovery_request_ids: Arc<StdMutex<HashSet<JsonlRpcId>>>,
+    native_event_budget: crate::NativeEventBudget,
 ) where
     W: AsyncWrite + Send + Unpin + 'static,
 {
@@ -5644,12 +6093,6 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             oversized_codex_success_fallback(&request)
                                 .map(OversizedSuccessRecovery::Fallback)
                         });
-                        if oversized_success_recovery.is_some() {
-                            oversized_recovery_request_ids
-                                .lock()
-                                .expect("oversized recovery request registry should not be poisoned")
-                                .insert(id.clone());
-                        }
                         pending.insert(
                             id.clone(),
                             PendingCodexJsonlRpcRequest {
@@ -5664,10 +6107,6 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             if let Some(pending_request) = pending.remove(&id) {
                                 let _ = pending_request.response_tx.send(Err(write_error.clone()));
                             }
-                            oversized_recovery_request_ids
-                                .lock()
-                                .expect("oversized recovery request registry should not be poisoned")
-                                .remove(&id);
                             break write_error;
                         }
                     }
@@ -5701,10 +6140,6 @@ async fn run_codex_jsonl_rpc_worker<W>(
                     }
                     Some(CodexJsonlRpcCommand::Cancel { id }) => {
                         let _ = pending.remove(&id);
-                        oversized_recovery_request_ids
-                            .lock()
-                            .expect("oversized recovery request registry should not be poisoned")
-                            .remove(&id);
                     }
                     Some(CodexJsonlRpcCommand::Shutdown) => {
                         complete_all_codex_server_requests(
@@ -5734,7 +6169,6 @@ async fn run_codex_jsonl_rpc_worker<W>(
                         handle_codex_jsonl_rpc_incoming(
                             message,
                             &mut pending,
-                            &oversized_recovery_request_ids,
                             &mut pending_server_requests,
                             &event_sinks,
                             max_pending_server_requests,
@@ -5742,77 +6176,52 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             &mut writer,
                         ).await;
                     }
-                    Some(CodexJsonlRpcIncoming::OversizedSuccessResponse {
+                    Some(CodexJsonlRpcIncoming::OversizedResponse {
                         id,
                         file,
                         total_bytes,
+                        kind,
                     }) => {
-                        oversized_recovery_request_ids
-                            .lock()
-                            .expect("oversized recovery request registry should not be poisoned")
-                            .remove(&id);
                         let Some(pending_request) = pending.remove(&id) else {
-                            complete_all_codex_server_requests(
-                                &mut writer,
-                                &mut pending_server_requests,
-                                CodexServerRequestTerminalState::Shutdown,
-                            ).await;
-                            break CodexJsonlRpcClientError::TransportClosed {
-                                message: format!(
-                                    "discarded oversized codex jsonl-rpc response ({total_bytes} bytes) did not match a pending request"
-                                ),
-                            };
+                            continue;
                         };
-                        let Some(recovery) = pending_request.oversized_success_recovery else {
-                            let error = CodexJsonlRpcClientError::TransportClosed {
-                                message: format!(
-                                    "codex jsonl-rpc response for request {id} exceeds the native event budget ({total_bytes} bytes)"
-                                ),
-                            };
-                            let _ = pending_request.response_tx.send(Err(error.clone()));
-                            complete_all_codex_server_requests(
-                                &mut writer,
-                                &mut pending_server_requests,
-                                CodexServerRequestTerminalState::Shutdown,
-                            ).await;
-                            break error;
-                        };
-                        match recovery {
-                            OversizedSuccessRecovery::Fallback(fallback) => {
-                                let _ = pending_request.response_tx.send(Ok(fallback));
-                            }
-                            OversizedSuccessRecovery::ThreadTurnSnapshot {
-                                native_thread_id,
-                                native_turn_id,
-                            } => {
-                                let recovered = tokio::task::spawn_blocking(move || {
-                                    extract_thread_turn_snapshot_from_spooled_response(
-                                        file,
-                                        native_thread_id.as_str(),
-                                        native_turn_id.as_str(),
-                                    )
-                                })
-                                .await
-                                .map_err(|error| error.to_string())
-                                .and_then(|result| result);
-                                let recovered = recovered.map_err(|message| {
-                                    CodexJsonlRpcClientError::Decode {
-                                        method: "thread/read".to_owned(),
-                                        message,
-                                    }
-                                });
-                                let _ = pending_request.response_tx.send(recovered);
-                            }
-                        }
+                        resolve_oversized_codex_response(
+                            pending_request,
+                            id,
+                            kind,
+                            file,
+                            total_bytes,
+                            native_event_budget.max_frame_bytes,
+                        ).await;
+                    }
+                    Some(CodexJsonlRpcIncoming::OversizedNotification(notification)) => {
+                        dispatch_notification(notification, &event_sinks).await;
+                    }
+                    Some(CodexJsonlRpcIncoming::OversizedServerRequest(request)) => {
+                        dispatch_server_request(
+                            request,
+                            &mut pending_server_requests,
+                            &event_sinks,
+                            max_pending_server_requests,
+                            server_request_timeout,
+                            &mut writer,
+                        ).await;
                     }
                     Some(CodexJsonlRpcIncoming::DecodeError(error)) => {
+                        let message = format!("failed to decode codex jsonl-rpc message: {error}");
+                        let _ = event_sinks.diagnostic_tx.send(CodexJsonlRpcClientDiagnostic {
+                            kind: CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired,
+                            message: message.clone(),
+                            method: None,
+                            raw: None,
+                        }).await;
                         complete_all_codex_server_requests(
                             &mut writer,
                             &mut pending_server_requests,
                             CodexServerRequestTerminalState::Shutdown,
                         ).await;
                         break CodexJsonlRpcClientError::TransportClosed {
-                            message: format!("failed to decode codex jsonl-rpc message: {error}"),
+                            message,
                         };
                     }
                     Some(CodexJsonlRpcIncoming::Closed) => {
@@ -5850,17 +6259,59 @@ async fn run_codex_jsonl_rpc_worker<W>(
     if !pending.is_empty() {
         let _ = pending.fail_all(close_error);
     }
-    oversized_recovery_request_ids
-        .lock()
-        .expect("oversized recovery request registry should not be poisoned")
-        .clear();
     event_sinks.notification_ingress.close();
+}
+
+async fn resolve_oversized_codex_response(
+    pending_request: PendingCodexJsonlRpcRequest,
+    id: JsonlRpcId,
+    kind: OversizedCodexResponseKind,
+    file: File,
+    total_bytes: usize,
+    max_frame_bytes: usize,
+) {
+    if kind == OversizedCodexResponseKind::Success {
+        match pending_request.oversized_success_recovery {
+            Some(OversizedSuccessRecovery::Fallback(fallback)) => {
+                let _ = pending_request.response_tx.send(Ok(fallback));
+                return;
+            }
+            Some(OversizedSuccessRecovery::ThreadTurnSnapshot {
+                native_thread_id,
+                native_turn_id,
+            }) => {
+                let recovered = tokio::task::spawn_blocking(move || {
+                    extract_thread_turn_snapshot_from_spooled_response(
+                        file,
+                        native_thread_id.as_str(),
+                        native_turn_id.as_str(),
+                    )
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result)
+                .map_err(|message| CodexJsonlRpcClientError::Decode {
+                    method: "thread/read".to_owned(),
+                    message,
+                });
+                let _ = pending_request.response_tx.send(recovered);
+                return;
+            }
+            None => {}
+        }
+    }
+    let _ = pending_request
+        .response_tx
+        .send(Err(CodexJsonlRpcClientError::ResponseTooLarge {
+            id,
+            total_bytes,
+            max_frame_bytes,
+        }));
 }
 
 async fn handle_codex_jsonl_rpc_incoming(
     message: JsonlRpcIncomingMessage,
     pending: &mut PendingCodexJsonlRpcRequests,
-    oversized_recovery_request_ids: &Arc<StdMutex<HashSet<JsonlRpcId>>>,
     pending_server_requests: &mut HashMap<JsonlRpcId, PendingCodexServerRequest>,
     event_sinks: &CodexJsonlRpcEventSinks,
     max_pending_server_requests: usize,
@@ -5872,10 +6323,6 @@ async fn handle_codex_jsonl_rpc_incoming(
             let Some(id) = response.id.clone() else {
                 return;
             };
-            oversized_recovery_request_ids
-                .lock()
-                .expect("oversized recovery request registry should not be poisoned")
-                .remove(&id);
             let Some(pending_request) = pending.remove(&id) else {
                 return;
             };
@@ -8697,9 +9144,10 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn oversized_codex_notification_still_fails_closed() {
+    async fn oversized_codex_notification_preserves_terminal_control_and_transport_alignment() {
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 256,
+            max_recovery_frame_bytes: 4 * 1024,
             max_json_depth: 16,
             max_json_nodes: 128,
             max_string_bytes: 128,
@@ -8707,6 +9155,161 @@ while read line; do :; done
             ..crate::NativeEventBudget::default()
         };
         let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let mut notifications = client
+            .take_notification_receiver()
+            .expect("notification receiver");
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        });
+        let request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"params\":{{\"threadId\":\"thread-control\",\"turnId\":\"turn-control\",\"item\":{{\"id\":\"item-control\",\"type\":\"commandExecution\",\"status\":\"completed\",\"exitCode\":0,\"aggregatedOutput\":\"{}\"}}}},\"method\":\"item/completed\"}}\n",
+            "x".repeat(1024)
+        );
+        assert!(payload.len() > budget.max_frame_bytes);
+        assert!(payload.len() <= budget.max_recovery_frame_bytes);
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write oversized notification");
+
+        let notification = tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+            .await
+            .expect("oversized notification should arrive")
+            .expect("notification channel should remain open");
+        assert_eq!(notification.method, "item/completed");
+        let params = notification.params.expect("sanitized params");
+        assert_eq!(params["threadId"], json!("thread-control"));
+        assert_eq!(params["turnId"], json!("turn-control"));
+        assert_eq!(params["item"]["id"], json!("item-control"));
+        assert_eq!(params["item"]["status"], json!("completed"));
+        assert_eq!(params["item"]["exitCode"], json!(0));
+        assert_eq!(params["item"]["aggregatedOutput"], json!(""));
+        assert_eq!(params["_pioneerOversizedPayload"]["truncated"], json!(true));
+
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": request["id"].clone(), "result": {"ok": true}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write response after oversized notification");
+        assert_eq!(
+            pending
+                .await
+                .expect("pending task should join")
+                .expect("oversized notification must not close transport"),
+            json!({"ok": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_response_fails_only_matching_request_and_preserves_transport() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_recovery_frame_bytes: 4 * 1024,
+            max_json_depth: 16,
+            max_json_nodes: 128,
+            max_string_bytes: 128,
+            max_journal_payload_bytes: 256,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+
+        let first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .request_value("first/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        });
+        let first_request = read_server_line(&mut server_reader).await;
+        let second_client = client.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .request_value("second/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        });
+        let second_request = read_server_line(&mut server_reader).await;
+
+        let oversized = format!(
+            "{{\"result\":{{\"payload\":\"{}\"}},\"id\":{}}}\n",
+            "x".repeat(1024),
+            first_request["id"],
+        );
+        server_writer
+            .write_all(oversized.as_bytes())
+            .await
+            .expect("write oversized response with non-canonical field order");
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": second_request["id"].clone(), "result": {"ok": 2}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write concurrent response");
+
+        assert!(matches!(
+            first.await.expect("first task should join"),
+            Err(CodexJsonlRpcClientError::ResponseTooLarge { .. })
+        ));
+        assert_eq!(
+            second
+                .await
+                .expect("second task should join")
+                .expect("concurrent request must survive"),
+            json!({"ok": 2})
+        );
+
+        let third_client = client.clone();
+        let third = tokio::spawn(async move {
+            third_client
+                .request_value("third/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        });
+        let third_request = read_server_line(&mut server_reader).await;
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": third_request["id"].clone(), "result": {"ok": 3}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write subsequent response");
+        assert_eq!(
+            third
+                .await
+                .expect("third task should join")
+                .expect("subsequent request must survive"),
+            json!({"ok": 3})
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_beyond_spool_budget_requests_session_recovery() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 128,
+            max_recovery_frame_bytes: 256,
+            max_json_depth: 16,
+            max_json_nodes: 128,
+            max_string_bytes: 64,
+            max_journal_payload_bytes: 128,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let mut diagnostics = client
+            .take_diagnostic_receiver()
+            .expect("diagnostic receiver");
         let pending_client = client.clone();
         let pending = tokio::spawn(async move {
             pending_client
@@ -8714,19 +9317,80 @@ while read line; do :; done
                 .await
         });
         let _request = read_server_line(&mut server_reader).await;
-        let payload = format!(
-            "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"{}\"}}}}\n",
+        server_writer
+            .write_all(
+                format!(
+                    "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"{}\"}}}}\n",
+                    "x".repeat(512)
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write frame beyond finite spool budget");
+
+        let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
+            .await
+            .expect("session recovery diagnostic should arrive")
+            .expect("diagnostic channel should deliver recovery request");
+        assert_eq!(
+            diagnostic.kind,
+            CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
+        );
+        assert!(
+            diagnostic
+                .message
+                .contains("recovery frame exceeds 256 bytes")
+        );
+        assert!(matches!(
+            pending.await.expect("pending task should join"),
+            Err(CodexJsonlRpcClientError::TransportClosed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_oversized_frame_requests_session_recovery() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 128,
+            max_recovery_frame_bytes: 2 * 1024,
+            max_json_depth: 16,
+            max_json_nodes: 128,
+            max_string_bytes: 64,
+            max_journal_payload_bytes: 128,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let mut diagnostics = client
+            .take_diagnostic_receiver()
+            .expect("diagnostic receiver");
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        });
+        let _request = read_server_line(&mut server_reader).await;
+        let malformed = format!(
+            "{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread\",\"text\":\"{}\"\n",
             "x".repeat(512)
         );
         server_writer
-            .write_all(payload.as_bytes())
+            .write_all(malformed.as_bytes())
             .await
-            .expect("write oversized notification");
-        let error = pending
+            .expect("write malformed oversized frame");
+
+        let diagnostic = tokio::time::timeout(Duration::from_secs(2), diagnostics.recv())
             .await
-            .expect("pending task should join")
-            .expect_err("oversized notification must close the transport");
-        assert!(error.to_string().contains("exceeds 256 bytes"));
+            .expect("session recovery diagnostic should arrive")
+            .expect("diagnostic channel should deliver recovery request");
+        assert_eq!(
+            diagnostic.kind,
+            CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
+        );
+        assert!(diagnostic.message.contains("failed to stream oversized"));
+        assert!(matches!(
+            pending.await.expect("pending task should join"),
+            Err(CodexJsonlRpcClientError::TransportClosed { .. })
+        ));
     }
 
     fn codex_account_probe_config(root: &Path, executable: &Path) -> CodexAccountProbeConfig {

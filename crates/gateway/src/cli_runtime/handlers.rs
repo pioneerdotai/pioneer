@@ -3550,6 +3550,25 @@ impl MessageProcessor {
             let diagnostic_key = diagnostic_instance.key();
             let mut diagnostics = receivers.diagnostics;
             while let Some(diagnostic) = diagnostics.recv().await {
+                if diagnostic.kind
+                    == pioneer_cli_agent_runtime::codex::CodexJsonlRpcClientDiagnosticKind::SessionRecoveryRequired
+                {
+                    warn!(
+                        workspace_id = diagnostic_key.workspace_id.as_str(),
+                        runtime_id = diagnostic_key.runtime_id.as_str(),
+                        thread_id = diagnostic_key.thread_id.as_str(),
+                        kind = ?diagnostic.kind,
+                        message = sanitize_runtime_diagnostic_line(diagnostic.message.as_str()),
+                        "Codex CLI runtime session requested recovery"
+                    );
+                    diagnostic_processor
+                        .enqueue_codex_transport_session_recovery(
+                            &diagnostic_instance,
+                            diagnostic.message.as_str(),
+                        )
+                        .await;
+                    continue;
+                }
                 if !diagnostic_processor
                     .cli_runtime_instance_is_current(&diagnostic_instance)
                     .await
@@ -3571,6 +3590,79 @@ impl MessageProcessor {
                 );
             }
         });
+    }
+
+    pub(crate) async fn enqueue_codex_transport_session_recovery(
+        &self,
+        instance: &CliSessionInstanceId,
+        reason: &str,
+    ) {
+        if let Some(manager) = self.cli_runtime_manager.as_ref()
+            && let Some(current) = manager.existing_session(instance.key()).await
+            && current.instance() != instance
+        {
+            self.audit_stale_cli_runtime_process_activity(instance, "transport_recovery");
+            return;
+        }
+        let key = instance.key();
+        let bindings = match self
+            .crud_store
+            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                workspace_id: Some(key.workspace_id.clone()),
+                runtime_id: Some(key.runtime_id.clone()),
+                continuation_thread_id: Some(key.thread_id.clone()),
+                statuses: vec![
+                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
+                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+                ],
+                limit: None,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to resolve active turns for Codex transport recovery"
+                );
+                return;
+            }
+        };
+
+        for binding in bindings {
+            if binding.runtime_kind != "codex"
+                || binding.workspace_id != key.workspace_id
+                || binding.runtime_id != key.runtime_id
+                || binding.continuation_thread_id != key.thread_id
+                || !cli_runtime_turn_binding_status_is_active(binding.status.as_str())
+            {
+                continue;
+            }
+            let recovery_reason = format!(
+                "Codex runtime session lost its JSONL-RPC observation channel and requires recovery: {reason}"
+            );
+            if !self
+                .report_turn_failure(
+                    binding.thread_id.clone(),
+                    binding.turn_id.clone(),
+                    TurnFailureRecoveryKind::RuntimeFailure,
+                    recovery_reason,
+                )
+                .await
+            {
+                warn!(
+                    workspace_id = binding.workspace_id.as_str(),
+                    runtime_id = binding.runtime_id.as_str(),
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    "failed to enqueue Codex transport recovery without terminalizing the turn"
+                );
+            }
+        }
     }
 
     async fn persist_codex_native_transport_event(

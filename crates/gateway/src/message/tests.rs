@@ -31989,6 +31989,92 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session);
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+
+    let thread_id = "thread_codex_transport_gap";
+    let turn_id = "turn_codex_transport_gap";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            continuation_thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "native-thread-transport-gap".to_owned(),
+            native_turn_id: Some("native-turn-transport-gap".to_owned()),
+            request_id: None,
+            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
+            model: Some("gpt-5".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("turn binding should upsert");
+
+    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+        .expect("session key should build");
+    let handle = cli_manager
+        .get_or_start(key)
+        .await
+        .expect("test CLI runtime session should start");
+    processor
+        .enqueue_codex_transport_session_recovery(
+            handle.instance(),
+            "oversized frame exceeded the finite spool budget",
+        )
+        .await;
+
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("turn lookup should succeed")
+        .expect("turn should exist");
+    assert_eq!(turn.status, TurnStatus::InProgress);
+    assert!(turn.error.is_none());
+    let pending_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+        .await
+        .expect("pending recovery jobs should load");
+    assert_eq!(pending_jobs.len(), 1);
+    assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_events() {
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());

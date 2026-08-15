@@ -8,8 +8,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
 pub struct NativeEventBudget {
     pub profile_version: u32,
     pub max_frame_bytes: usize,
-    /// Maximum size of a frame that may be spooled outside the in-memory
-    /// ingress budget for an explicit, request-scoped recovery decoder.
+    /// Maximum size of one frame that may be spooled outside the in-memory
+    /// ingress budget for bounded, streaming protocol recovery.
     pub max_recovery_frame_bytes: usize,
     pub max_json_depth: usize,
     pub max_json_nodes: usize,
@@ -166,12 +166,7 @@ pub enum BoundedNativeFrame {
 #[derive(Debug)]
 pub(crate) enum SpooledNativeFrame {
     Complete(Vec<u8>),
-    Oversized {
-        prefix: Vec<u8>,
-        file: File,
-        total_bytes: usize,
-        last_non_whitespace: Option<u8>,
-    },
+    Oversized { file: File, total_bytes: usize },
 }
 
 impl BoundedNativeEventCodec {
@@ -322,26 +317,22 @@ impl BoundedNativeEventCodec {
         }
     }
 
-    /// Reads one JSONL frame while retaining normal frames in memory and
-    /// spooling an explicitly approved oversized frame to an unnamed file.
+    /// Reads exactly one JSONL frame while retaining normal frames in memory
+    /// and spooling oversized frames to an unnamed file.
     ///
-    /// This is intentionally separate from normal ingress. Callers must opt
-    /// in with a protocol-specific predicate, and the secondary recovery
-    /// budget remains finite. The returned file owns its storage and is
-    /// deleted automatically when dropped.
-    pub(crate) async fn read_frame_or_spool_if<R, F>(
+    /// The secondary spool budget is finite. A frame that crosses it fails
+    /// the owning runtime session instead of consuming unbounded disk or time.
+    /// The returned file owns its storage and is deleted automatically when
+    /// dropped.
+    pub(crate) async fn read_frame_or_spool<R>(
         &self,
         reader: &mut R,
-        should_spool: F,
     ) -> Result<Option<SpooledNativeFrame>, NativeIngressError>
     where
         R: AsyncBufRead + Unpin,
-        F: FnOnce(&[u8]) -> bool,
     {
         let mut prefix = Vec::with_capacity(self.budget.max_frame_bytes.min(8 * 1024));
         let mut total_bytes = 0usize;
-        let mut last_non_whitespace = None;
-        let mut should_spool = Some(should_spool);
         let mut spool: Option<tokio::fs::File> = None;
 
         loop {
@@ -356,10 +347,8 @@ impl BoundedNativeEventCodec {
                         NativeIngressError::new(NativeIngressErrorKind::Io, error.to_string())
                     })?;
                     Ok(Some(SpooledNativeFrame::Oversized {
-                        prefix,
                         file: file.into_std().await,
                         total_bytes,
-                        last_non_whitespace,
                     }))
                 } else {
                     Ok(Some(SpooledNativeFrame::Complete(prefix)))
@@ -372,14 +361,6 @@ impl BoundedNativeEventCodec {
                 .map_or(available.len(), |index| index + 1);
             let chunk = &available[..consumed];
             total_bytes = total_bytes.saturating_add(consumed);
-            if let Some(byte) = chunk
-                .iter()
-                .rev()
-                .copied()
-                .find(|byte| !byte.is_ascii_whitespace())
-            {
-                last_non_whitespace = Some(byte);
-            }
 
             let retained = if prefix.len() < self.budget.max_frame_bytes {
                 let retained = (self.budget.max_frame_bytes - prefix.len()).min(chunk.len());
@@ -390,20 +371,6 @@ impl BoundedNativeEventCodec {
             };
 
             if spool.is_none() && total_bytes > self.budget.max_frame_bytes {
-                let approved = should_spool
-                    .take()
-                    .expect("oversized frame spool predicate should be evaluated once")(
-                    prefix.as_slice(),
-                );
-                if !approved {
-                    return Err(NativeIngressError::new(
-                        NativeIngressErrorKind::FrameTooLarge,
-                        format!(
-                            "native JSONL frame exceeds {} bytes",
-                            self.budget.max_frame_bytes
-                        ),
-                    ));
-                }
                 if total_bytes > self.budget.max_recovery_frame_bytes {
                     return Err(NativeIngressError::new(
                         NativeIngressErrorKind::FrameTooLarge,
@@ -449,10 +416,8 @@ impl BoundedNativeEventCodec {
                         NativeIngressError::new(NativeIngressErrorKind::Io, error.to_string())
                     })?;
                     Ok(Some(SpooledNativeFrame::Oversized {
-                        prefix,
                         file: file.into_std().await,
                         total_bytes,
-                        last_non_whitespace,
                     }))
                 } else {
                     Ok(Some(SpooledNativeFrame::Complete(prefix)))
@@ -629,7 +594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_oversized_frame_is_spooled_with_finite_budget_and_alignment() {
+    async fn oversized_frame_is_spooled_with_finite_budget_and_alignment() {
         let budget = NativeEventBudget {
             max_frame_bytes: 16,
             max_recovery_frame_bytes: 128,
@@ -646,9 +611,9 @@ mod tests {
         let mut reader = BufReader::new(input.as_slice());
 
         let frame = codec
-            .read_frame_or_spool_if(&mut reader, |prefix| prefix.starts_with(b"{\"id\":"))
+            .read_frame_or_spool(&mut reader)
             .await
-            .expect("approved frame should spool")
+            .expect("oversized frame should spool")
             .expect("spooled frame should exist");
         let SpooledNativeFrame::Oversized {
             mut file,
@@ -665,7 +630,7 @@ mod tests {
         assert_eq!(recovered, first);
 
         let next = codec
-            .read_frame_or_spool_if(&mut reader, |_| false)
+            .read_frame_or_spool(&mut reader)
             .await
             .expect("next frame should remain aligned")
             .expect("next frame should exist");
