@@ -887,9 +887,9 @@ use crate::repositories::{
     task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread,
     thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage, thread_tree,
     turn, turn_admission, turn_cli_runtime_instruction, turn_event, turn_event_delivery,
-    turn_event_projection_state, turn_execution_window, turn_finalization, turn_item_attempt,
-    turn_liveness, turn_llm_context, turn_mcp_binding, turn_mcp_projection, turn_runtime_snapshot,
-    turn_skill_binding,
+    turn_event_projection_state, turn_event_projection_stream_state, turn_execution_window,
+    turn_finalization, turn_item_attempt, turn_liveness, turn_llm_context, turn_mcp_binding,
+    turn_mcp_projection, turn_runtime_snapshot, turn_skill_binding,
 };
 
 pub use crate::repositories::execution_admission_lease::{
@@ -1347,8 +1347,10 @@ pub struct TurnProjectionReplaySummary {
     pub deferred: usize,
     pub failed: usize,
     pub exhausted: usize,
+    pub quarantined: usize,
     pub missing_events: usize,
     pub exhausted_records: Vec<TurnProjectionReplayExhaustedRecord>,
+    pub quarantined_streams: Vec<TurnProjectionStreamQuarantineRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1357,6 +1359,46 @@ pub struct TurnProjectionReplayExhaustedRecord {
     pub thread_id: String,
     pub turn_id: String,
     pub error_message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnProjectionStreamQuarantineRecord {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub blocking_event_id: String,
+    pub error_message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnProjectionStreamHealth {
+    Healthy,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnProjectionStreamStateRecord {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub health: TurnProjectionStreamHealth,
+    pub blocking_event_id: Option<String>,
+    pub last_error: Option<String>,
+    pub quarantined_at_unix: Option<i64>,
+    pub restored_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnProjectionStreamBackfillBatch {
+    pub streams_scanned: usize,
+    pub streams_quarantined: usize,
+    pub last_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreTurnProjectionStreamOutcome {
+    Restored,
+    AlreadyHealthy,
+    NotFound,
+    BlockingEventMismatch,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
@@ -1371,6 +1413,13 @@ struct TurnEventProjectionContext {
 enum TurnEventProjectionOutcome {
     Projected,
     DeferredByPredecessor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnEventProjectionFailureOutcome {
+    LostClaim,
+    Failed,
+    Quarantined,
 }
 
 #[derive(Debug, Clone)]
@@ -20545,6 +20594,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     || {
                         self.mark_turn_event_projection_failure_once(
                             appended_event.id.clone(),
+                            appended_event.thread_id.clone(),
+                            appended_event.turn_id.clone(),
                             claim_token.clone(),
                             0,
                             error_message.clone(),
@@ -21086,12 +21137,14 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     async fn mark_turn_event_projection_failure_once(
         &self,
         event_id: String,
+        thread_id: String,
+        turn_id: String,
         claim_token: String,
         attempt_count: i64,
         error_message: String,
         failed_at_unix: i64,
         force_exhausted: bool,
-    ) -> Result<bool> {
+    ) -> Result<TurnEventProjectionFailureOutcome> {
         let transaction = self
             .connection
             .begin()
@@ -21106,7 +21159,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 &transaction,
                 event_id.as_str(),
                 claim_token.as_str(),
-                error_message,
+                error_message.clone(),
                 failed_at,
             )
             .await
@@ -21119,7 +21172,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 &transaction,
                 event_id.as_str(),
                 claim_token.as_str(),
-                error_message,
+                error_message.clone(),
                 next_run_at,
                 failed_at,
             )
@@ -21134,12 +21187,308 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             }
         };
 
+        if !marked {
+            transaction
+                .commit()
+                .await
+                .context("failed to commit lost turn event projection claim transaction")?;
+            return Ok(TurnEventProjectionFailureOutcome::LostClaim);
+        }
+
+        if exhausted
+            && let Err(error) = turn_event_projection_stream_state::quarantine(
+                &transaction,
+                thread_id.as_str(),
+                turn_id.as_str(),
+                event_id.as_str(),
+                error_message,
+                failed_at,
+            )
+            .await
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+
         transaction
             .commit()
             .await
             .context("failed to commit turn event projection failure transaction")?;
 
-        Ok(marked)
+        Ok(if exhausted {
+            TurnEventProjectionFailureOutcome::Quarantined
+        } else {
+            TurnEventProjectionFailureOutcome::Failed
+        })
+    }
+
+    pub async fn get_turn_event_projection_stream_state(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<TurnProjectionStreamStateRecord>> {
+        let Some(state) =
+            turn_event_projection_stream_state::find(&self.connection, turn_id).await?
+        else {
+            return Ok(None);
+        };
+
+        let health = match state.status.as_str() {
+            turn_event_projection_stream_state::STREAM_STATUS_HEALTHY => {
+                TurnProjectionStreamHealth::Healthy
+            }
+            turn_event_projection_stream_state::STREAM_STATUS_QUARANTINED => {
+                TurnProjectionStreamHealth::Quarantined
+            }
+            unknown => bail!(
+                "projection stream for Turn `{turn_id}` has unknown health status `{unknown}`"
+            ),
+        };
+
+        Ok(Some(TurnProjectionStreamStateRecord {
+            thread_id: state.thread_id,
+            turn_id: state.turn_id,
+            health,
+            blocking_event_id: state.blocking_event_id,
+            last_error: state.last_error,
+            quarantined_at_unix: state.quarantined_at.map(|value| value.timestamp()),
+            restored_at_unix: state.restored_at.map(|value| value.timestamp()),
+        }))
+    }
+
+    pub async fn backfill_turn_event_projection_stream_states_batch(
+        &self,
+        after_turn_id: Option<&str>,
+        limit: u64,
+    ) -> Result<TurnProjectionStreamBackfillBatch> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin projection stream state backfill transaction")?;
+            let result = async {
+                let candidates = turn_event_projection_state::list_stream_backfill_candidates(
+                    &transaction,
+                    after_turn_id,
+                    limit,
+                )
+                .await?;
+                if candidates.is_empty() {
+                    return Ok(TurnProjectionStreamBackfillBatch::default());
+                }
+
+                let turn_ids = candidates
+                    .iter()
+                    .map(|candidate| candidate.turn_id.clone())
+                    .collect::<Vec<_>>();
+                let blockers =
+                    turn_event_projection_state::list_exhausted_causal_heads_for_turns(
+                        &transaction,
+                        turn_ids,
+                    )
+                    .await?;
+                let mut blockers_by_turn = HashMap::with_capacity(blockers.len());
+                for blocker in blockers {
+                    let turn_id = blocker.turn_id.clone();
+                    if blockers_by_turn.insert(turn_id.clone(), blocker).is_some() {
+                        bail!(
+                            "projection stream for Turn `{turn_id}` has multiple exhausted causal heads"
+                        );
+                    }
+                }
+
+                let streams_scanned = candidates.len();
+                let last_turn_id = candidates.last().map(|candidate| candidate.turn_id.clone());
+                let mut streams_quarantined = 0usize;
+                for candidate in candidates {
+                    if candidate.first_thread_id != candidate.last_thread_id {
+                        bail!(
+                            "projection stream for Turn `{}` spans threads `{}` and `{}`",
+                            candidate.turn_id,
+                            candidate.first_thread_id,
+                            candidate.last_thread_id
+                        );
+                    }
+
+                    if let Some(blocker) = blockers_by_turn.remove(candidate.turn_id.as_str()) {
+                        let error_message = blocker.last_error.unwrap_or_else(|| {
+                            "legacy exhausted projection causal head has no recorded error"
+                                .to_owned()
+                        });
+                        if turn_event_projection_stream_state::quarantine(
+                            &transaction,
+                            candidate.first_thread_id.as_str(),
+                            candidate.turn_id.as_str(),
+                            blocker.event_id.as_str(),
+                            error_message,
+                            blocker.updated_at,
+                        )
+                        .await?
+                        {
+                            streams_quarantined = streams_quarantined.saturating_add(1);
+                        }
+                    } else {
+                        let stream = turn_event_projection_stream_state::ensure_healthy(
+                            &transaction,
+                            candidate.first_thread_id.as_str(),
+                            candidate.turn_id.as_str(),
+                            candidate.created_at,
+                        )
+                        .await?;
+                        if stream.thread_id != candidate.first_thread_id {
+                            bail!(
+                                "projection stream `{}` belongs to thread `{}`, not `{}`",
+                                candidate.turn_id,
+                                stream.thread_id,
+                                candidate.first_thread_id
+                            );
+                        }
+                    }
+                }
+
+                Ok(TurnProjectionStreamBackfillBatch {
+                    streams_scanned,
+                    streams_quarantined,
+                    last_turn_id,
+                })
+            }
+            .await;
+
+            match result {
+                Ok(batch) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit projection stream state backfill transaction")?;
+                    Ok(batch)
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+
+    /// Re-enables a quarantined projection stream after an operator has
+    /// repaired its causal blocker. The expected blocker fences stale repair
+    /// commands. Resetting the exhausted head and clearing quarantine happen
+    /// atomically so replay can never observe a healthy stream with an
+    /// exhausted causal head.
+    pub async fn restore_turn_event_projection_stream(
+        &self,
+        turn_id: &str,
+        expected_blocking_event_id: &str,
+        restored_at_unix: i64,
+    ) -> Result<RestoreTurnProjectionStreamOutcome> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin projection stream restoration transaction")?;
+
+            let result = async {
+                let Some(stream) =
+                    turn_event_projection_stream_state::find(&transaction, turn_id).await?
+                else {
+                    return Ok(RestoreTurnProjectionStreamOutcome::NotFound);
+                };
+                if stream.status
+                    == turn_event_projection_stream_state::STREAM_STATUS_HEALTHY
+                {
+                    return Ok(RestoreTurnProjectionStreamOutcome::AlreadyHealthy);
+                }
+                if stream.status
+                    != turn_event_projection_stream_state::STREAM_STATUS_QUARANTINED
+                {
+                    bail!(
+                        "projection stream for Turn `{turn_id}` has unknown health status `{}`",
+                        stream.status
+                    );
+                }
+                if stream.blocking_event_id.as_deref() != Some(expected_blocking_event_id) {
+                    return Ok(RestoreTurnProjectionStreamOutcome::BlockingEventMismatch);
+                }
+
+                let blocker = turn_event_projection_state::find_by_event_id(
+                    &transaction,
+                    expected_blocking_event_id,
+                )
+                .await?
+                .with_context(|| {
+                    format!(
+                        "quarantine blocker `{expected_blocking_event_id}` for Turn `{turn_id}` is missing"
+                    )
+                })?;
+                if blocker.turn_id != turn_id
+                    || blocker.status
+                        != turn_event_projection_state::PROJECTION_STATUS_EXHAUSTED
+                {
+                    bail!(
+                        "quarantine blocker `{expected_blocking_event_id}` is not the exhausted causal head for Turn `{turn_id}`"
+                    );
+                }
+
+                let raw_event =
+                    turn_event::find_event_by_id(&transaction, expected_blocking_event_id)
+                        .await?
+                        .with_context(|| {
+                            format!(
+                                "raw quarantine blocker `{expected_blocking_event_id}` for Turn `{turn_id}` is still missing"
+                            )
+                        })?;
+                if raw_event.turn_id != turn_id {
+                    bail!(
+                        "raw quarantine blocker `{expected_blocking_event_id}` belongs to Turn `{}`, not `{turn_id}`",
+                        raw_event.turn_id
+                    );
+                }
+
+                let restored_at = unix_to_datetime(restored_at_unix);
+                let reset = turn_event_projection_state::reset_exhausted_as_pending(
+                    &transaction,
+                    expected_blocking_event_id,
+                    turn_id,
+                    restored_at,
+                )
+                .await?;
+                if !reset {
+                    bail!(
+                        "exhausted quarantine blocker `{expected_blocking_event_id}` changed during restoration"
+                    );
+                }
+                let restored = turn_event_projection_stream_state::restore(
+                    &transaction,
+                    turn_id,
+                    expected_blocking_event_id,
+                    restored_at,
+                )
+                .await?;
+                if !restored {
+                    bail!("projection stream for Turn `{turn_id}` changed during restoration");
+                }
+
+                Ok(RestoreTurnProjectionStreamOutcome::Restored)
+            }
+            .await;
+
+            match result {
+                Ok(outcome) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit projection stream restoration transaction")?;
+                    Ok(outcome)
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
+        })
+        .await
     }
 
     pub async fn replay_due_turn_event_projections(
@@ -21194,6 +21543,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                         .run_serialized_write(|| {
                             self.mark_turn_event_projection_failure_once(
                                 event_id.clone(),
+                                thread_id.clone(),
+                                turn_id.clone(),
                                 claim_token.clone(),
                                 attempt_count,
                                 "raw turn_event row is missing for projection replay".to_owned(),
@@ -21203,10 +21554,11 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                         })
                         .await?;
                     summary.missing_events += 1;
-                    if marked {
+                    if marked == TurnEventProjectionFailureOutcome::Quarantined {
                         summary.exhausted += 1;
+                        summary.quarantined += 1;
                         summary
-                        .exhausted_records
+                            .exhausted_records
                         .push(TurnProjectionReplayExhaustedRecord {
                             event_id: event_id.clone(),
                             thread_id: thread_id.clone(),
@@ -21214,6 +21566,16 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                             error_message: "raw turn_event row is missing for projection replay"
                                 .to_owned(),
                         });
+                        summary.quarantined_streams.push(
+                            TurnProjectionStreamQuarantineRecord {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                blocking_event_id: event_id.clone(),
+                                error_message:
+                                    "raw turn_event row is missing for projection replay"
+                                        .to_owned(),
+                            },
+                        );
                     }
                     continue;
                 };
@@ -21229,6 +21591,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                             .run_serialized_write(|| {
                                 self.mark_turn_event_projection_failure_once(
                                     event_id.clone(),
+                                    thread_id.clone(),
+                                    turn_id.clone(),
                                     claim_token.clone(),
                                     attempt_count,
                                     error_message.clone(),
@@ -21237,16 +21601,25 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                                 )
                             })
                             .await?;
-                        if marked {
+                        if marked == TurnEventProjectionFailureOutcome::Quarantined {
                             summary.exhausted += 1;
+                            summary.quarantined += 1;
                             summary
                                 .exhausted_records
                                 .push(TurnProjectionReplayExhaustedRecord {
                                     event_id: event_id.clone(),
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
-                                    error_message,
+                                    error_message: error_message.clone(),
                                 });
+                            summary.quarantined_streams.push(
+                                TurnProjectionStreamQuarantineRecord {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    blocking_event_id: event_id.clone(),
+                                    error_message,
+                                },
+                            );
                         }
                         continue;
                     }
@@ -21283,12 +21656,12 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     }
                     Err(error) => {
                         let error_message = format!("{error:#}");
-                        let will_exhaust =
-                            attempt_count.saturating_add(1) >= TURN_EVENT_PROJECTION_MAX_ATTEMPTS;
                         let marked = self
                             .run_serialized_write(|| {
                                 self.mark_turn_event_projection_failure_once(
                                     event_id.clone(),
+                                    thread_id.clone(),
+                                    turn_id.clone(),
                                     claim_token.clone(),
                                     attempt_count,
                                     error_message.clone(),
@@ -21297,20 +21670,31 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                                 )
                             })
                             .await?;
-                        if marked {
-                            if will_exhaust {
+                        match marked {
+                            TurnEventProjectionFailureOutcome::Quarantined => {
                                 summary.exhausted += 1;
+                                summary.quarantined += 1;
                                 summary.exhausted_records.push(
                                     TurnProjectionReplayExhaustedRecord {
                                         event_id: event_id.clone(),
                                         thread_id: thread_id.clone(),
                                         turn_id: turn_id.clone(),
+                                        error_message: error_message.clone(),
+                                    },
+                                );
+                                summary.quarantined_streams.push(
+                                    TurnProjectionStreamQuarantineRecord {
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        blocking_event_id: event_id.clone(),
                                         error_message,
                                     },
                                 );
-                            } else {
+                            }
+                            TurnEventProjectionFailureOutcome::Failed => {
                                 summary.failed += 1;
                             }
+                            TurnEventProjectionFailureOutcome::LostClaim => {}
                         }
                     }
                 }
@@ -23165,9 +23549,9 @@ mod tests {
         NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
         NewTurnRuntimeSnapshot, NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
         PrepareTurnFinalizationOutcome, PreparedClaudeProviderSessionMode, ProjectionPageAnchor,
-        RecoveryJobRecord, ResolveCliRuntimePendingRequest, SkillAuditEventRecord,
-        SkillDependencySnapshotRecord, SkillInstallationPatch, SkillInstallationRecord,
-        SkillPackChildDiff, SkillPackInstallationRecord,
+        RecoveryJobRecord, ResolveCliRuntimePendingRequest, RestoreTurnProjectionStreamOutcome,
+        SkillAuditEventRecord, SkillDependencySnapshotRecord, SkillInstallationPatch,
+        SkillInstallationRecord, SkillPackChildDiff, SkillPackInstallationRecord,
         THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
         TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskOwnedTurnResumeOutcome,
@@ -23180,9 +23564,10 @@ mod tests {
         TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
         TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnMcpProjectionPersistenceError,
         TurnMcpProjectionRecord, TurnMcpProjectionReplacement, TurnMessageMutationFailure,
-        TurnSkillBindingRecord, WorkspaceSkillPolicyRecord, create_gateway_singleton,
-        create_member_principal, create_superuser, delete_workspace_membership,
-        insert_workspace_membership, list_abandoned_runtime_draft_artifact_ids,
+        TurnProjectionStreamHealth, TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
+        create_gateway_singleton, create_member_principal, create_superuser,
+        delete_workspace_membership, insert_workspace_membership,
+        list_abandoned_runtime_draft_artifact_ids,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
         tool_call_status, upsert_thread_timeline_block,
@@ -23229,13 +23614,15 @@ mod tests {
     };
     use sea_orm::sea_query::Expr;
     use sea_orm::{
-        ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, QueryFilter,
-        QueryOrder, Set, Statement, TransactionTrait,
+        ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
+        QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
     };
     use std::collections::BTreeMap;
 
     const NATIVE_DELIVERY_MIGRATION: &str = "m20260805_000001_native_durable_delivery";
     const ATOMIC_TERMINALIZATION_MIGRATION: &str = "m20260806_000001_atomic_turn_terminalization";
+    const PROJECTION_STREAM_STATE_MIGRATION: &str =
+        "m20260815_000002_turn_event_projection_stream_state";
 
     fn migrations_before(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
         let migrations = Migrator::migrations();
@@ -23271,6 +23658,14 @@ mod tests {
     impl MigratorTrait for PreAtomicTerminalizationMigrator {
         fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
             migrations_before(ATOMIC_TERMINALIZATION_MIGRATION)
+        }
+    }
+
+    struct PreProjectionStreamStateMigrator;
+
+    impl MigratorTrait for PreProjectionStreamStateMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            migrations_before(PROJECTION_STREAM_STATE_MIGRATION)
         }
     }
 
@@ -30911,6 +31306,397 @@ mod tests {
         assert_eq!(
             attempt.hard_deadline_at,
             deadlines.hard_deadline_at_unix.map(unix_to_datetime)
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_projection_stream_is_quarantined_and_operator_restore_resumes_in_order() {
+        let store = test_store_with_workspace("ws_projection_quarantine").await;
+        let timestamp = 1_700_100_000;
+        let workspace_id = "ws_projection_quarantine";
+        let poisoned_thread_id = "thr_projection_poison";
+        let poisoned_turn_id = "turn_projection_poison";
+        let poisoned_item_id = "call_projection_poison";
+        let healthy_thread_id = "thr_projection_healthy";
+        let healthy_turn_id = "turn_projection_healthy";
+        let healthy_item_id = "call_projection_healthy";
+
+        for (thread_id, turn_id) in [
+            (poisoned_thread_id, poisoned_turn_id),
+            (healthy_thread_id, healthy_turn_id),
+        ] {
+            store
+                .materialize_turn_start(
+                    &sample_thread(workspace_id, thread_id, timestamp),
+                    SandboxMode::FullAccess,
+                    &sample_turn(turn_id),
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
+        }
+
+        let poisoned_start = pioneer_entity::turn_event_projection_state::Entity::find()
+            .filter(
+                pioneer_entity::turn_event_projection_state::Column::TurnId.eq(poisoned_turn_id),
+            )
+            .filter(pioneer_entity::turn_event_projection_state::Column::Sequence.eq(1))
+            .one(&store.connection)
+            .await
+            .expect("poisoned start projection lookup should succeed")
+            .expect("poisoned start projection should exist");
+        let repaired_projection_context = poisoned_start.projection_context_json.clone();
+        let healthy_start = pioneer_entity::turn_event_projection_state::Entity::find()
+            .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(healthy_turn_id))
+            .filter(pioneer_entity::turn_event_projection_state::Column::Sequence.eq(1))
+            .one(&store.connection)
+            .await
+            .expect("healthy start projection lookup should succeed")
+            .expect("healthy start projection should exist");
+
+        for (event_id, corrupt_context) in [
+            (poisoned_start.event_id.as_str(), true),
+            (healthy_start.event_id.as_str(), false),
+        ] {
+            let mut update = pioneer_entity::turn_event_projection_state::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::Status,
+                    sea_orm::sea_query::Expr::value(
+                        crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED,
+                    ),
+                )
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::NextRunAt,
+                    sea_orm::sea_query::Expr::value(unix_to_datetime(timestamp + 20)),
+                )
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::ClaimToken,
+                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::ClaimExpiresAt,
+                    sea_orm::sea_query::Expr::value(
+                        Option::<sea_orm::entity::prelude::DateTimeWithTimeZone>::None,
+                    ),
+                )
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(unix_to_datetime(timestamp + 2)),
+                )
+                .filter(pioneer_entity::turn_event_projection_state::Column::EventId.eq(event_id));
+            if corrupt_context {
+                update = update.col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::ProjectionContextJson,
+                    sea_orm::sea_query::Expr::value("{"),
+                );
+            }
+            update
+                .exec(&store.connection)
+                .await
+                .expect("projection head should become replayable");
+        }
+
+        for (thread_id, turn_id, item_id) in [
+            (poisoned_thread_id, poisoned_turn_id, poisoned_item_id),
+            (healthy_thread_id, healthy_turn_id, healthy_item_id),
+        ] {
+            let error = store
+                .materialize_native_agent_turn_event(
+                    CanonicalTurnEventPayload::ItemStarted(ItemStartedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: safe_web_fetch_item(item_id),
+                    }),
+                    timestamp + 1,
+                    None,
+                )
+                .await
+                .expect_err("successor should wait behind its unprojected causal head");
+            assert!(super::turn_event_was_appended_before_error(&error));
+        }
+
+        let poisoned_raw_before = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(poisoned_turn_id))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("poisoned raw stream should query");
+        assert_eq!(poisoned_raw_before.len(), 2);
+        let poisoned_raw_ids_before = poisoned_raw_before
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>();
+        let poisoned_successor_id = poisoned_raw_before[1].id.clone();
+
+        let replay = store
+            .replay_due_turn_event_projections(timestamp + 30, 64)
+            .await
+            .expect("independent projection streams should replay");
+        assert_eq!(replay.claimed, 3);
+        assert_eq!(replay.projected, 2);
+        assert_eq!(replay.failed, 0);
+        assert_eq!(replay.exhausted, 1);
+        assert_eq!(replay.quarantined, 1);
+        assert_eq!(replay.quarantined_streams.len(), 1);
+        assert_eq!(
+            replay.quarantined_streams[0].blocking_event_id,
+            poisoned_start.event_id
+        );
+
+        let quarantined = store
+            .get_turn_event_projection_stream_state(poisoned_turn_id)
+            .await
+            .expect("quarantine state should query")
+            .expect("poisoned stream state should exist");
+        assert_eq!(quarantined.health, TurnProjectionStreamHealth::Quarantined);
+        assert_eq!(
+            quarantined.blocking_event_id.as_deref(),
+            Some(poisoned_start.event_id.as_str())
+        );
+        assert!(quarantined.last_error.is_some());
+        assert_eq!(quarantined.quarantined_at_unix, Some(timestamp + 30));
+
+        let poisoned_states = pioneer_entity::turn_event_projection_state::Entity::find()
+            .filter(
+                pioneer_entity::turn_event_projection_state::Column::TurnId.eq(poisoned_turn_id),
+            )
+            .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("poisoned projection states should query");
+        assert_eq!(poisoned_states.len(), 2);
+        assert_eq!(
+            poisoned_states[0].status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_EXHAUSTED
+        );
+        assert_eq!(
+            poisoned_states[1].status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PENDING
+        );
+        assert_eq!(poisoned_states[1].attempt_count, 0);
+        assert!(poisoned_states[1].last_error.is_none());
+
+        let healthy_states = pioneer_entity::turn_event_projection_state::Entity::find()
+            .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(healthy_turn_id))
+            .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("healthy projection states should query");
+        assert!(healthy_states.iter().all(|state| {
+            state.status
+                == crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED
+        }));
+        assert!(
+            pioneer_entity::turn_item::Entity::find()
+                .filter(pioneer_entity::turn_item::Column::TurnId.eq(healthy_turn_id))
+                .filter(pioneer_entity::turn_item::Column::ItemId.eq(healthy_item_id))
+                .one(&store.connection)
+                .await
+                .expect("healthy item should query")
+                .is_some(),
+            "a quarantined stream must not block healthy streams"
+        );
+
+        let repeated = store
+            .replay_due_turn_event_projections(timestamp + 40, 64)
+            .await
+            .expect("quarantined stream should be excluded idempotently");
+        assert_eq!(repeated.claimed, 0);
+        assert_eq!(repeated.quarantined, 0);
+        assert_eq!(
+            pioneer_entity::turn_event_projection_stream_state::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event_projection_stream_state::Column::TurnId
+                        .eq(poisoned_turn_id),
+                )
+                .count(&store.connection)
+                .await
+                .expect("quarantine row count should query"),
+            1
+        );
+
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ProjectionContextJson,
+                sea_orm::sea_query::Expr::value(repaired_projection_context),
+            )
+            .filter(
+                pioneer_entity::turn_event_projection_state::Column::EventId
+                    .eq(poisoned_start.event_id.clone()),
+            )
+            .exec(&store.connection)
+            .await
+            .expect("operator should repair blocker payload before restoring stream");
+
+        assert_eq!(
+            store
+                .restore_turn_event_projection_stream(
+                    poisoned_turn_id,
+                    poisoned_successor_id.as_str(),
+                    timestamp + 50,
+                )
+                .await
+                .expect("stale repair command should be rejected without mutation"),
+            RestoreTurnProjectionStreamOutcome::BlockingEventMismatch
+        );
+        assert_eq!(
+            store
+                .restore_turn_event_projection_stream(
+                    poisoned_turn_id,
+                    poisoned_start.event_id.as_str(),
+                    timestamp + 50,
+                )
+                .await
+                .expect("matching operator repair should restore stream"),
+            RestoreTurnProjectionStreamOutcome::Restored
+        );
+        assert_eq!(
+            store
+                .restore_turn_event_projection_stream(
+                    poisoned_turn_id,
+                    poisoned_start.event_id.as_str(),
+                    timestamp + 51,
+                )
+                .await
+                .expect("operator repair retry should be idempotent"),
+            RestoreTurnProjectionStreamOutcome::AlreadyHealthy
+        );
+
+        let restored = store
+            .get_turn_event_projection_stream_state(poisoned_turn_id)
+            .await
+            .expect("restored stream should query")
+            .expect("restored stream state should exist");
+        assert_eq!(restored.health, TurnProjectionStreamHealth::Healthy);
+        assert!(restored.blocking_event_id.is_none());
+        assert!(restored.last_error.is_none());
+        assert!(restored.quarantined_at_unix.is_none());
+        assert_eq!(restored.restored_at_unix, Some(timestamp + 50));
+
+        let resumed = store
+            .replay_due_turn_event_projections(timestamp + 60, 64)
+            .await
+            .expect("restored stream should resume from its repaired causal head");
+        assert_eq!(resumed.claimed, 2);
+        assert_eq!(resumed.projected, 2);
+        assert_eq!(resumed.quarantined, 0);
+
+        let poisoned_states = pioneer_entity::turn_event_projection_state::Entity::find()
+            .filter(
+                pioneer_entity::turn_event_projection_state::Column::TurnId.eq(poisoned_turn_id),
+            )
+            .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("restored projection states should query");
+        assert!(poisoned_states.iter().all(|state| {
+            state.status
+                == crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED
+        }));
+
+        let poisoned_raw_after = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(poisoned_turn_id))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("restored raw stream should query");
+        assert_eq!(
+            poisoned_raw_after
+                .iter()
+                .map(|event| event.id.clone())
+                .collect::<Vec<_>>(),
+            poisoned_raw_ids_before,
+            "quarantine and repair must preserve the raw log and its order"
+        );
+        assert!(
+            pioneer_entity::turn_item::Entity::find()
+                .filter(pioneer_entity::turn_item::Column::TurnId.eq(poisoned_turn_id))
+                .filter(pioneer_entity::turn_item::Column::ItemId.eq(poisoned_item_id))
+                .one(&store.connection)
+                .await
+                .expect("restored item should query")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_stream_state_migration_is_schema_only() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        PreProjectionStreamStateMigrator::up(&connection, None)
+            .await
+            .expect("pre-quarantine migrations must succeed");
+
+        connection
+            .execute_unprepared(
+                r#"
+INSERT INTO turn_event_projection_state (
+    event_id, thread_id, turn_id, sequence, status, attempt_count,
+    last_error, next_run_at, claim_token, claim_expires_at,
+    projection_context_json, projected_at, created_at, updated_at
+) VALUES
+    (
+        'projection_poison_1', 'thread_poison', 'turn_poison', 1,
+        'exhausted', 10, 'invalid projection context', CURRENT_TIMESTAMP,
+        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    ),
+    (
+        'projection_poison_2', 'thread_poison', 'turn_poison', 2,
+        'pending', 0, NULL, CURRENT_TIMESTAMP,
+        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    ),
+    (
+        'projection_healthy_1', 'thread_healthy', 'turn_healthy', 1,
+        'pending', 0, NULL, CURRENT_TIMESTAMP,
+        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    )
+"#,
+            )
+            .await
+            .expect("legacy projection backlog should insert");
+
+        Migrator::up(&connection, None)
+            .await
+            .expect("projection stream state migration must succeed");
+
+        assert!(
+            pioneer_entity::turn_event_projection_stream_state::Entity::find()
+                .all(&connection)
+                .await
+                .expect("new stream state table should query")
+                .is_empty(),
+            "schema migration must not scan or backfill projection data"
+        );
+
+        let successor =
+            pioneer_entity::turn_event_projection_state::Entity::find_by_id("projection_poison_2")
+                .one(&connection)
+                .await
+                .expect("successor state should query")
+                .expect("successor state should remain present");
+        assert_eq!(
+            successor.status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PENDING
+        );
+        assert_eq!(successor.attempt_count, 0);
+        assert!(successor.last_error.is_none());
+
+        Migrator::down(&connection, Some(1))
+            .await
+            .expect("projection stream state migration down must succeed");
+        assert!(
+            connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_event_projection_stream_state'"
+                        .to_owned(),
+                ))
+                .await
+                .expect("stream state table lookup after down should succeed")
+                .is_none()
         );
     }
 

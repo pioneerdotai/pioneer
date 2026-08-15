@@ -4,8 +4,8 @@ use pioneer_protocol::generate_id;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::ExprTrait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 pub const PROJECTION_STATUS_PENDING: &str = "pending";
@@ -34,10 +34,89 @@ pub struct NewTurnEventProjectionState {
     pub created_at: DateTimeWithTimeZone,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub struct TurnEventProjectionStreamBackfillCandidate {
+    pub turn_id: String,
+    pub first_thread_id: String,
+    pub last_thread_id: String,
+    pub created_at: DateTimeWithTimeZone,
+}
+
+pub async fn list_stream_backfill_candidates<C: ConnectionTrait>(
+    db: &C,
+    after_turn_id: Option<&str>,
+    limit: u64,
+) -> Result<Vec<TurnEventProjectionStreamBackfillCandidate>> {
+    let mut query = turn_event_projection_state::Entity::find()
+        .select_only()
+        .column(turn_event_projection_state::Column::TurnId)
+        .column_as(
+            turn_event_projection_state::Column::ThreadId.min(),
+            "first_thread_id",
+        )
+        .column_as(
+            turn_event_projection_state::Column::ThreadId.max(),
+            "last_thread_id",
+        )
+        .column_as(
+            turn_event_projection_state::Column::CreatedAt.min(),
+            "created_at",
+        );
+    if let Some(after_turn_id) = after_turn_id {
+        query =
+            query.filter(turn_event_projection_state::Column::TurnId.gt(after_turn_id.to_owned()));
+    }
+
+    query
+        .group_by(turn_event_projection_state::Column::TurnId)
+        .order_by_asc(turn_event_projection_state::Column::TurnId)
+        .limit(std::cmp::max(limit, 1))
+        .into_model::<TurnEventProjectionStreamBackfillCandidate>()
+        .all(db)
+        .await
+        .context("failed to list projection stream state backfill candidates")
+}
+
+pub async fn list_exhausted_causal_heads_for_turns<C: ConnectionTrait>(
+    db: &C,
+    turn_ids: Vec<String>,
+) -> Result<Vec<turn_event_projection_state::Model>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let is_causal_head = sea_orm::sea_query::Expr::cust(
+        "NOT EXISTS (\
+            SELECT 1 FROM turn_event_projection_state AS predecessor \
+            WHERE predecessor.turn_id = turn_event_projection_state.turn_id \
+              AND predecessor.sequence < turn_event_projection_state.sequence \
+              AND predecessor.status <> 'projected'\
+        )",
+    );
+
+    turn_event_projection_state::Entity::find()
+        .filter(turn_event_projection_state::Column::TurnId.is_in(turn_ids))
+        .filter(turn_event_projection_state::Column::Status.eq(PROJECTION_STATUS_EXHAUSTED))
+        .filter(is_causal_head)
+        .order_by_asc(turn_event_projection_state::Column::TurnId)
+        .order_by_asc(turn_event_projection_state::Column::Sequence)
+        .order_by_asc(turn_event_projection_state::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("failed to list exhausted projection stream causal heads")
+}
+
 pub async fn insert_claimed<C: ConnectionTrait>(
     db: &C,
     record: NewTurnEventProjectionState,
 ) -> Result<turn_event_projection_state::Model> {
+    super::turn_event_projection_stream_state::ensure_healthy(
+        db,
+        record.thread_id.as_str(),
+        record.turn_id.as_str(),
+        record.created_at,
+    )
+    .await?;
+
     let active_model = turn_event_projection_state::ActiveModel {
         event_id: Set(record.event_id.clone()),
         thread_id: Set(record.thread_id),
@@ -113,6 +192,13 @@ pub async fn claim_due<C: ConnectionTrait>(
               AND predecessor.status <> 'projected'\
         )",
     );
+    let stream_is_healthy = sea_orm::sea_query::Expr::cust(
+        "NOT EXISTS (\
+            SELECT 1 FROM turn_event_projection_stream_state AS stream_state \
+            WHERE stream_state.turn_id = turn_event_projection_state.turn_id \
+              AND stream_state.status = 'quarantined'\
+        )",
+    );
 
     let candidates = turn_event_projection_state::Entity::find()
         .filter(
@@ -121,6 +207,7 @@ pub async fn claim_due<C: ConnectionTrait>(
                 .add(expired_projecting.clone()),
         )
         .filter(is_causal_head)
+        .filter(stream_is_healthy.clone())
         .order_by_asc(turn_event_projection_state::Column::NextRunAt)
         .order_by_asc(turn_event_projection_state::Column::TurnId)
         .order_by_asc(turn_event_projection_state::Column::Sequence)
@@ -156,6 +243,7 @@ pub async fn claim_due<C: ConnectionTrait>(
             )
             .filter(turn_event_projection_state::Column::EventId.eq(candidate.event_id.clone()))
             .filter(claimable)
+            .filter(stream_is_healthy.clone())
             .exec(db)
             .await
             .with_context(|| {
@@ -325,6 +413,59 @@ pub async fn mark_exhausted_claimed<C: ConnectionTrait>(
         exhausted_at,
     )
     .await
+}
+
+pub async fn reset_exhausted_as_pending<C: ConnectionTrait>(
+    db: &C,
+    event_id: &str,
+    turn_id: &str,
+    next_run_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let affected = turn_event_projection_state::Entity::update_many()
+        .col_expr(
+            turn_event_projection_state::Column::Status,
+            sea_orm::sea_query::Expr::value(PROJECTION_STATUS_PENDING.to_owned()),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::AttemptCount,
+            sea_orm::sea_query::Expr::value(0),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::LastError,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::NextRunAt,
+            sea_orm::sea_query::Expr::value(next_run_at),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::ProjectedAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            turn_event_projection_state::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(next_run_at),
+        )
+        .filter(turn_event_projection_state::Column::EventId.eq(event_id.to_owned()))
+        .filter(turn_event_projection_state::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_event_projection_state::Column::Status.eq(PROJECTION_STATUS_EXHAUSTED))
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!("failed to reset exhausted projection `{event_id}` for operator replay")
+        })?
+        .rows_affected
+        > 0;
+
+    Ok(affected)
 }
 
 async fn mark_claimed_failure_with_status<C: ConnectionTrait>(

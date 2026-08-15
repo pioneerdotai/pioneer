@@ -1843,22 +1843,23 @@ impl MessageProcessor {
                 .await
                 {
                     Ok(summary) => {
-                        if summary.exhausted > 0 || summary.missing_events > 0 {
+                        if summary.quarantined > 0 || summary.missing_events > 0 {
                             warn!(
                                 claimed = summary.claimed,
                                 projected = summary.projected,
                                 failed = summary.failed,
                                 exhausted = summary.exhausted,
+                                quarantined_streams = summary.quarantined,
                                 missing_events = summary.missing_events,
-                                "turn event projection replay found unrecoverable records"
+                                "turn event projection replay quarantined blocked streams"
                             );
-                            for record in &summary.exhausted_records {
+                            for record in &summary.quarantined_streams {
                                 error!(
-                                    event_id = record.event_id,
+                                    event_id = record.blocking_event_id,
                                     thread_id = record.thread_id,
                                     turn_id = record.turn_id,
                                     error = record.error_message,
-                                    "turn event projection requires operator repair; agent execution was not interrupted"
+                                    "turn event projection stream is quarantined until operator repair; raw events and successors were preserved"
                                 );
                             }
                         } else if summary.projected > 0

@@ -7,6 +7,7 @@ mod task_anchor_backfill;
 mod task_event_fanout_cursor_backfill;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
 mod timeline_pagination_backfill;
+mod turn_event_projection_stream_state_backfill;
 mod turn_item_attempt_payload_compaction;
 mod turn_permission_profile_backfill;
 mod zstd_payload_compression;
@@ -146,6 +147,7 @@ pub(crate) fn spawn(
 ) {
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let _handle = tokio::spawn(async move {
+        turn_event_projection_stream_state_backfill::run(crud_store.as_ref()).await;
         task_event_fanout_cursor_backfill::run(crud_store.as_ref()).await;
         authorization_legacy_backfill::run(crud_store.as_ref()).await;
         stable_skill_id_backfill::run(crud_store.as_ref(), message_processor.as_ref()).await;
