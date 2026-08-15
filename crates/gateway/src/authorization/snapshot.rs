@@ -8,6 +8,7 @@ use pioneer_protocol::{
     AuthorizationThreadCapabilitySnapshot, AuthorizationWorkspaceCapabilities,
     AuthorizationWorkspaceCapabilitySnapshot, ThreadVisibility,
 };
+use sha2::{Digest, Sha256};
 
 use crate::auth::AuthenticatedSessionPrincipal;
 
@@ -23,6 +24,33 @@ use super::{
 pub(crate) struct AuthorizationCapabilitySnapshotService {
     resolver: AuthorizationResolver,
     policy: AuthorizationService,
+}
+
+fn execution_draft_policy_fingerprint(
+    workspace_id: &str,
+    resources: &pioneer_protocol::AuthorizationOperationalResourceProjection,
+    permission_options: &[pioneer_protocol::AuthorizationAgentPermissionOption],
+    can_attach_artifacts: bool,
+    mcp_invocation_limits: &pioneer_protocol::McpInvocationResourceLimits,
+) -> Result<String> {
+    let semantic_policy = serde_json::json!({
+        "contract": "pioneer-execution-draft-policy-v1",
+        "workspace_id": workspace_id,
+        "providers": &resources.providers,
+        "provider_models_all": resources.provider_models_all,
+        "provider_models": &resources.provider_models,
+        "cli_runtimes": &resources.cli_runtimes,
+        "cli_models_all": resources.cli_models_all,
+        "cli_models": &resources.cli_models,
+        "skills": &resources.skills,
+        "mcp_servers": &resources.mcp_servers,
+        "permission_options": permission_options,
+        "can_attach_artifacts": can_attach_artifacts,
+        "mcp_invocation_limits": mcp_invocation_limits,
+    });
+    let encoded = serde_json::to_vec(&semantic_policy)
+        .context("failed to encode execution draft policy fingerprint")?;
+    Ok(hex::encode(Sha256::digest(encoded)))
 }
 
 impl AuthorizationCapabilitySnapshotService {
@@ -275,6 +303,18 @@ impl AuthorizationCapabilitySnapshotService {
         if !can_use_mcp {
             draft_resources.mcp_servers = Default::default();
         }
+        let can_attach_artifacts = can_write_artifacts && can_bind_artifacts;
+        let mcp_invocation_limits = self
+            .policy
+            .mcp_invocation_resource_limits(principal.kind, principal.role_key.as_ref())
+            .context("authorization role has no MCP invocation resource policy")?;
+        let draft_policy_fingerprint = execution_draft_policy_fingerprint(
+            workspace_id,
+            &draft_resources,
+            &agent_permission_options,
+            can_attach_artifacts,
+            &mcp_invocation_limits,
+        )?;
         Ok(Some(AuthorizationWorkspaceCapabilitySnapshot {
             workspace_id: workspace_id.to_owned(),
             // The public operational catalog is the exact selectable/useable
@@ -285,14 +325,11 @@ impl AuthorizationCapabilitySnapshotService {
             // with composite admission.
             operational_resources: draft_resources.clone(),
             execution_draft_policy: pioneer_protocol::AuthorizationExecutionDraftPolicyProjection {
-                fingerprint: operational_resources.fingerprint.clone(),
+                fingerprint: draft_policy_fingerprint,
                 resources: draft_resources,
                 permission_options: agent_permission_options.clone(),
-                can_attach_artifacts: can_write_artifacts && can_bind_artifacts,
-                mcp_invocation_limits: self
-                    .policy
-                    .mcp_invocation_resource_limits(principal.kind, principal.role_key.as_ref())
-                    .context("authorization role has no MCP invocation resource policy")?,
+                can_attach_artifacts,
+                mcp_invocation_limits,
             },
             capabilities: AuthorizationWorkspaceCapabilities {
                 can_read,
@@ -705,6 +742,43 @@ mod tests {
             .await
             .expect("member parity snapshot");
         assert_shell_projection_parity(&snapshot);
+    }
+
+    #[tokio::test]
+    async fn draft_policy_fingerprint_ignores_unrelated_authorization_generation_changes() {
+        let harness = IsolatedEpic4Harness::new()
+            .await
+            .expect("authorization fixture");
+        let service = AuthorizationCapabilitySnapshotService::new(AuthorizationResolver::new(
+            CrudStore::new(harness.database.clone()),
+        ));
+        let params = AuthorizationCapabilitiesParams {
+            workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
+            thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
+        };
+        let first = service
+            .snapshot(
+                &principal(MEMBER_A_ID, PrincipalKind::User),
+                params.clone(),
+                17,
+            )
+            .await
+            .expect("first member snapshot");
+        let next = service
+            .snapshot(&principal(MEMBER_A_ID, PrincipalKind::User), params, 18)
+            .await
+            .expect("next member snapshot");
+        let first_workspace = first.workspace.expect("first workspace policy");
+        let next_workspace = next.workspace.expect("next workspace policy");
+
+        assert_ne!(
+            first_workspace.operational_resources.fingerprint,
+            next_workspace.operational_resources.fingerprint
+        );
+        assert_eq!(
+            first_workspace.execution_draft_policy.fingerprint,
+            next_workspace.execution_draft_policy.fingerprint
+        );
     }
 
     #[tokio::test]

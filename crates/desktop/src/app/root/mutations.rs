@@ -20,11 +20,11 @@ impl PioneerDesktop {
             .and_then(|snapshot| snapshot.workspace.as_ref())
             .map(|workspace| workspace.execution_draft_policy.clone())
         else {
-            // Projection invalidation is a temporary fail-closed fence while
-            // the replacement snapshot is fetched. Keep the user's draft so
-            // the fresh policy can reconcile it, but remove the fingerprint
-            // required by every submit path until that reconciliation occurs.
-            self.composer_authorization_fingerprint = None;
+            // Projection invalidation is a temporary presentation fence while
+            // the replacement snapshot is fetched. Keep both the user's draft
+            // and the fingerprint captured for any submission already in
+            // flight. A fresh semantic policy will replace the fingerprint
+            // below; the Gateway remains authoritative for admission.
             return;
         };
 

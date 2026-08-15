@@ -92,8 +92,11 @@ impl AuthorizationProjectionStore {
                     .fingerprint
                     .trim()
                     .is_empty()
-                || workspace.execution_draft_policy.fingerprint
-                    != workspace.operational_resources.fingerprint
+                || workspace
+                    .execution_draft_policy
+                    .fingerprint
+                    .trim()
+                    .is_empty()
                 || workspace.execution_draft_policy.resources != workspace.operational_resources
         }) {
             return AuthorizationProjectionAcceptance::Incompatible;
@@ -795,15 +798,30 @@ mod tests {
             AuthorizationProjectionAcceptance::Incompatible
         );
 
-        let mut policy_mismatch = projection_snapshot(1, "future_role", Some("workspace-a"), None);
-        policy_mismatch
+        let mut semantic_draft_policy =
+            projection_snapshot(1, "future_role", Some("workspace-a"), None);
+        semantic_draft_policy
             .workspace
             .as_mut()
             .unwrap()
             .execution_draft_policy
             .fingerprint = "different-projection".to_owned();
         assert_eq!(
-            store.accept(policy_mismatch),
+            store.accept(semantic_draft_policy),
+            AuthorizationProjectionAcceptance::Accepted
+        );
+
+        let mut missing_draft_policy =
+            projection_snapshot(2, "future_role", Some("workspace-a"), None);
+        missing_draft_policy
+            .workspace
+            .as_mut()
+            .unwrap()
+            .execution_draft_policy
+            .fingerprint
+            .clear();
+        assert_eq!(
+            store.accept(missing_draft_policy),
             AuthorizationProjectionAcceptance::Incompatible
         );
 

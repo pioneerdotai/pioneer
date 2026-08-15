@@ -1842,20 +1842,6 @@ impl McpService {
                 status: McpServerStatus::from(protocol_runtime_state(snapshot.state)),
             },
         };
-        let policy_change = self
-            .inner
-            .authorization_invalidation_hub
-            .publish_change(
-                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
-                pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
-                    workspace_id: row.scope_key.clone(),
-                    selector: "mcp_runtime_status".to_owned(),
-                },
-            )
-            .await
-            .expect("MCP status change must advance durable policy generation");
-        self.send_workspace_authorization_notification(row.scope_key.as_str(), &policy_change)
-            .await;
         self.send_management_notification(events::MCP_SERVER_STATUS_CHANGED, &notification)
             .await;
     }
@@ -1929,20 +1915,6 @@ impl McpService {
             resource_templates_count: catalog.resource_templates_count(),
             prompts_count: catalog.prompts_count(),
         };
-        let policy_change = self
-            .inner
-            .authorization_invalidation_hub
-            .publish_change(
-                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
-                pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
-                    workspace_id: row.scope_key.clone(),
-                    selector: "mcp_catalog".to_owned(),
-                },
-            )
-            .await
-            .expect("MCP catalog change must advance durable policy generation");
-        self.send_workspace_authorization_notification(row.scope_key.as_str(), &policy_change)
-            .await;
         self.send_management_notification(events::MCP_SERVER_CATALOG_CHANGED, &notification)
             .await;
     }
@@ -2079,111 +2051,6 @@ impl McpService {
                 );
             }
         }
-    }
-
-    async fn send_workspace_authorization_notification<T: Serialize>(
-        &self,
-        workspace_id: &str,
-        payload: &T,
-    ) {
-        let candidates = self.inner.session_manager.connection_ids().await;
-        let initially_authorized = self
-            .authorized_workspace_notification_recipients(workspace_id, candidates)
-            .await;
-        if initially_authorized.is_empty() {
-            return;
-        }
-        let serialization_authorized = self
-            .authorized_workspace_notification_recipients(workspace_id, initially_authorized)
-            .await;
-        if serialization_authorized.is_empty() {
-            return;
-        }
-        let notification = match JsonRpcNotification::from_params(
-            events::AUTHORIZATION_PROJECTION_CHANGED,
-            payload,
-        ) {
-            Ok(notification) => notification,
-            Err(error) => {
-                error!(error = %error, "failed to encode MCP authorization notification");
-                return;
-            }
-        };
-        let serialized = match serde_json::to_string(&notification) {
-            Ok(payload) => payload,
-            Err(error) => {
-                error!(error = %error, "failed to serialize MCP authorization notification");
-                return;
-            }
-        };
-        let authorized = self
-            .authorized_workspace_notification_recipients(workspace_id, serialization_authorized)
-            .await;
-        for connection_id in authorized {
-            if let Err(error) = self
-                .inner
-                .session_manager
-                .send_text(connection_id, serialized.clone())
-                .await
-            {
-                warn!(
-                    connection_id,
-                    error = %format!("{error:#}"),
-                    "failed to send MCP authorization notification"
-                );
-            }
-        }
-    }
-
-    async fn authorized_workspace_notification_recipients(
-        &self,
-        workspace_id: &str,
-        candidate_connection_ids: Vec<u64>,
-    ) -> Vec<u64> {
-        let auth_service = self
-            .inner
-            .auth_service
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let authorization_service = AuthorizationService::new();
-        let resolver = crate::authorization::AuthorizationResolver::new(
-            self.inner.crud_store.as_ref().clone(),
-        );
-        let mut connection_ids = Vec::with_capacity(candidate_connection_ids.len());
-        for connection_id in candidate_connection_ids {
-            let Ok(principal) = self
-                .inner
-                .session_manager
-                .connection_principal(connection_id)
-                .await
-            else {
-                continue;
-            };
-            if let Some(auth_service) = auth_service.as_ref()
-                && auth_service
-                    .validate_session_lease(principal.as_ref())
-                    .await
-                    .is_err()
-            {
-                continue;
-            }
-            let action = ResourceAction::WorkspaceRead;
-            let gate = authorization_service.authorize_action(
-                principal.kind,
-                principal.role_key.as_ref(),
-                action,
-            );
-            if matches!(
-                resolver
-                    .authorize_workspace(principal.as_ref(), &gate, action, workspace_id)
-                    .await,
-                Ok(crate::authorization::ProofResolution::Authorized(_))
-            ) {
-                connection_ids.push(connection_id);
-            }
-        }
-        connection_ids
     }
 
     async fn authorized_management_notification_recipients(

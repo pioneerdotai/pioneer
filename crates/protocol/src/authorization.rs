@@ -261,6 +261,9 @@ pub struct AuthorizationOperationalResourceProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationExecutionDraftPolicyProjection {
+    // Stable semantic receipt for Composer selections. Unlike the enclosing
+    // capability snapshot generation, this changes only when the effective
+    // draft policy changes.
     pub fingerprint: String,
     pub resources: AuthorizationOperationalResourceProjection,
     pub permission_options: Vec<AuthorizationAgentPermissionOption>,

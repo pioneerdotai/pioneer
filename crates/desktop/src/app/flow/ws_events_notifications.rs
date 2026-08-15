@@ -421,6 +421,14 @@ impl PioneerDesktop {
         notification: pioneer_protocol::AuthorizationProjectionChangedNotification,
         cx: &mut Context<Self>,
     ) {
+        let (invalidate_workspace, invalidate_thread) = desktop_authorization_projection_effects(
+            &notification.affected,
+            self.active_workspace_id(),
+            self.current_active_thread_id(),
+        );
+        if !invalidate_workspace && !invalidate_thread {
+            return;
+        }
         let generation = notification.policy_generation.get();
         if self
             .gateway
@@ -809,7 +817,6 @@ impl PioneerDesktop {
     }
 }
 
-#[cfg(test)]
 fn desktop_authorization_projection_effects(
     affected: &pioneer_protocol::AuthorizationChangeScope,
     active_workspace_id: Option<&str>,
