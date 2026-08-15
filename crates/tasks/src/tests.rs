@@ -3909,6 +3909,128 @@ async fn pause_excludes_due_trigger_and_resume_restores_future_fire() {
 }
 
 #[tokio::test]
+async fn scheduler_reconciles_legacy_due_trigger_for_blocked_task_once() {
+    let connection = Database::connect("sqlite::memory:")
+        .await
+        .expect("sqlite memory database should connect");
+    Migrator::up(&connection, None)
+        .await
+        .expect("migration should apply");
+    let store = Arc::new(CrudStore::new(connection));
+    let runtime = TaskRuntime::new(store.clone());
+    let fire_at = 4_000_000_000;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: fire_at,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("scheduled task should create");
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskBlocked {
+                task_id: response.task.id.clone(),
+                error: None,
+                blocked_at: fire_at - 2,
+            },
+            fire_at - 2,
+        )
+        .await
+        .expect("task should block");
+
+    // Recreate the pre-fix production state: terminal Task with an overdue,
+    // still-active trigger. The terminal guard keeps the Task blocked while
+    // the trigger projection becomes schedulable again.
+    let mut stale_trigger = response.trigger;
+    stale_trigger.status = TaskTriggerStatus::Active;
+    stale_trigger.next_fire_at = Some(fire_at);
+    stale_trigger.updated_at = fire_at - 1;
+    runtime
+        .service()
+        .append_event(
+            TaskEventPayload::TaskRescheduled {
+                task_id: response.task.id.clone(),
+                trigger: stale_trigger,
+                rescheduled_at: fire_at - 1,
+                reason: TaskRescheduleReason::UserRequested,
+            },
+            fire_at - 1,
+        )
+        .await
+        .expect("legacy inconsistent trigger should materialize");
+    assert_eq!(
+        store
+            .list_due_active_task_triggers(fire_at)
+            .await
+            .expect("due triggers should list")
+            .len(),
+        1
+    );
+
+    assert_eq!(
+        runtime
+            .process_due_once(fire_at)
+            .await
+            .expect("scheduler reconciliation should succeed"),
+        0
+    );
+    let reconciled = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id.clone(),
+        })
+        .await
+        .expect("reconciled task should read");
+    assert_eq!(reconciled.task.status, TaskStatus::Blocked);
+    assert!(reconciled.runs.is_empty());
+    assert_eq!(reconciled.triggers[0].status, TaskTriggerStatus::Paused);
+    assert_eq!(reconciled.triggers[0].next_fire_at, None);
+    assert!(
+        store
+            .list_due_active_task_triggers(fire_at)
+            .await
+            .expect("due triggers should list after reconciliation")
+            .is_empty()
+    );
+    assert_eq!(
+        runtime
+            .process_due_once(fire_at)
+            .await
+            .expect("second scheduler pass should remain idle"),
+        0
+    );
+    let events = runtime
+        .service()
+        .get_task_events(TaskEventsParams {
+            task_id: response.task.id,
+            after_sequence: None,
+            limit: None,
+        })
+        .await
+        .expect("task events should read");
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event.payload,
+                TaskEventPayload::TaskRescheduled {
+                    reason: TaskRescheduleReason::RunTerminalStatusRefresh,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn blocked_task_can_be_cancelled_and_closes_paused_trigger() {
     let runtime = runtime().await;
     let response = runtime

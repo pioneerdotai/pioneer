@@ -122,18 +122,18 @@ use pioneer_protocol::{
     StorageOutputPolicy, Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec,
     TaskAttachmentMode, TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery,
     TaskDeliveryAttempt, TaskDependency, TaskError, TaskEventsResponse, TaskExecutorKind,
-    TaskGetResponse, TaskListParams, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewEvent, TaskRun, TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnStatus, TaskStatus,
-    TaskThreadLineage, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec, TaskWriteLock,
-    TaskWriteLockStatus, Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload,
-    ThreadMode, ThreadPlacement, ThreadReadResponse, ThreadStatus, ThreadVisibility,
-    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn,
-    TurnExecutionSecuritySnapshot, TurnItem, TurnItemEvent, TurnItemEventPayload,
-    TurnItemTimeoutReason, TurnItemType, TurnItemsResponse, TurnKind, TurnMention,
-    TurnMessageDeletedEvent, TurnMessageEditedEvent, TurnMessageRevision,
-    TurnMessageRevisionChangeKind, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
-    TurnStatus, UserInput, generate_id,
+    TaskGetResponse, TaskListParams, TaskRescheduleReason, TaskResult, TaskResultCandidate,
+    TaskResultCandidateStatus, TaskResultReviewEvent, TaskRun, TaskRunExecution,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTree, TaskTrigger,
+    TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskWriteLock, TaskWriteLockStatus,
+    Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode,
+    ThreadPlacement, ThreadReadResponse, ThreadStatus, ThreadVisibility, TimelineOutputPolicy,
+    ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnExecutionSecuritySnapshot,
+    TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
+    TurnItemsResponse, TurnKind, TurnMention, TurnMessageDeletedEvent, TurnMessageEditedEvent,
+    TurnMessageRevision, TurnMessageRevisionChangeKind, TurnPermissionProfileSnapshot,
+    TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
@@ -1914,6 +1914,16 @@ pub struct CrudStore {
     projector: TurnProjector,
     task_projector: TaskProjector,
     write_coordinator: SqliteWriteCoordinator,
+}
+
+#[derive(Debug, Clone)]
+pub struct DueTaskTriggerReconciliation {
+    pub task_id: String,
+    pub trigger_id: String,
+    /// `None` identifies an orphan trigger whose parent Task row is absent.
+    pub task_status: Option<TaskStatus>,
+    pub trigger_status: TaskTriggerStatus,
+    pub appended_events: Vec<AppendedTaskEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -10735,6 +10745,26 @@ impl CrudStore {
                 now,
                 events.clone(),
                 reserve_executions.clone(),
+            )
+        })
+        .await
+    }
+
+    /// Atomically removes a due trigger from the scheduler when its parent
+    /// Task cannot execute. A concurrent Task resume/reschedule wins by
+    /// changing either the Task status or the expected fire time, in which
+    /// case this method leaves the trigger untouched.
+    pub async fn reconcile_due_trigger_for_nonexecuting_task(
+        &self,
+        trigger_id: &str,
+        expected_next_fire_at: i64,
+        now: i64,
+    ) -> Result<Option<DueTaskTriggerReconciliation>> {
+        self.run_serialized_write(|| {
+            self.reconcile_due_trigger_for_nonexecuting_task_once(
+                trigger_id.to_owned(),
+                expected_next_fire_at,
+                now,
             )
         })
         .await
@@ -21304,6 +21334,110 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     .await
                     .context("failed to commit blocked Task readmission transaction")?;
                 Ok(appended_events)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn reconcile_due_trigger_for_nonexecuting_task_once(
+        &self,
+        trigger_id: String,
+        expected_next_fire_at: i64,
+        now: i64,
+    ) -> Result<Option<DueTaskTriggerReconciliation>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin due Task trigger reconciliation transaction")?;
+        let result = async {
+            let Some(trigger_model) =
+                task_trigger::find_trigger_by_id(&transaction, trigger_id.as_str()).await?
+            else {
+                return Ok(None);
+            };
+            if trigger_model.status != "active"
+                || trigger_model.next_fire_at.map(|value| value.timestamp())
+                    != Some(expected_next_fire_at)
+                || expected_next_fire_at > now
+            {
+                return Ok(None);
+            }
+
+            let task_model =
+                task_repository::find_task_by_id(&transaction, trigger_model.task_id.as_str())
+                    .await?;
+            let task_status = task_model
+                .as_ref()
+                .map(|task_model| {
+                    task_status_from_db(task_model.status.as_str()).with_context(|| {
+                        format!(
+                            "Task `{}` has unknown status `{}` during trigger reconciliation",
+                            task_model.id, task_model.status
+                        )
+                    })
+                })
+                .transpose()?;
+            if task_status.is_some_and(|status| !status.is_terminal()) {
+                return Ok(None);
+            }
+            let trigger_status = match task_status {
+                Some(TaskStatus::Blocked) => TaskTriggerStatus::Paused,
+                Some(TaskStatus::Cancelled) | None => TaskTriggerStatus::Cancelled,
+                Some(TaskStatus::Completed | TaskStatus::Failed) => TaskTriggerStatus::Exhausted,
+                Some(_) => return Ok(None),
+            };
+            let task_id = trigger_model.task_id.clone();
+            let mut trigger = task_trigger_from_db_model(trigger_model)?;
+            trigger.status = trigger_status;
+            trigger.next_fire_at = None;
+            trigger.updated_at = now;
+
+            let appended_events = if task_status.is_some() {
+                self.append_task_events_in_connection(
+                    &transaction,
+                    vec![TaskEventPayload::TaskRescheduled {
+                        task_id: task_id.clone(),
+                        trigger: trigger.clone(),
+                        rescheduled_at: now,
+                        reason: TaskRescheduleReason::RunTerminalStatusRefresh,
+                    }],
+                    now,
+                )
+                .await?
+            } else {
+                task_trigger::update_trigger_schedule(
+                    &transaction,
+                    trigger.id.as_str(),
+                    trigger.status,
+                    None,
+                    trigger.last_fire_at.map(unix_to_datetime),
+                    unix_to_datetime(now),
+                )
+                .await?;
+                Vec::new()
+            };
+
+            Ok(Some(DueTaskTriggerReconciliation {
+                task_id,
+                trigger_id: trigger.id,
+                task_status,
+                trigger_status,
+                appended_events,
+            }))
+        }
+        .await;
+
+        match result {
+            Ok(outcome) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit due Task trigger reconciliation transaction")?;
+                Ok(outcome)
             }
             Err(error) => {
                 let _ = transaction.rollback().await;

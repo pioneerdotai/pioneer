@@ -212,14 +212,38 @@ impl TaskScheduler {
     }
 
     async fn process_trigger(&self, trigger: TaskTrigger, now: i64) -> TaskRuntimeResult<usize> {
-        let Some(task_response) = self.store.get_task(trigger.task_id.as_str()).await? else {
-            return Ok(0);
-        };
-        if is_terminal_task(task_response.task.status)
-            || trigger.status != TaskTriggerStatus::Active
-        {
+        if trigger.status != TaskTriggerStatus::Active {
             return Ok(0);
         }
+        let Some(expected_next_fire_at) = trigger.next_fire_at else {
+            return Ok(0);
+        };
+        let task_response = match self.store.get_task(trigger.task_id.as_str()).await? {
+            Some(response) if !is_terminal_task(response.task.status) => response,
+            _ => {
+                if let Some(reconciliation) = self
+                    .store
+                    .reconcile_due_trigger_for_nonexecuting_task(
+                        trigger.id.as_str(),
+                        expected_next_fire_at,
+                        now,
+                    )
+                    .await?
+                {
+                    self.event_bus
+                        .publish_many(reconciliation.appended_events)
+                        .await;
+                    warn!(
+                        task_id = %reconciliation.task_id,
+                        trigger_id = %reconciliation.trigger_id,
+                        task_status = ?reconciliation.task_status,
+                        trigger_status = ?reconciliation.trigger_status,
+                        "reconciled due trigger for a non-executing Task"
+                    );
+                }
+                return Ok(0);
+            }
+        };
         if task_response.runs.iter().any(|run| {
             run.trigger_id.as_deref() == Some(trigger.id.as_str()) && !is_recurring(&trigger)
         }) {
@@ -332,9 +356,6 @@ impl TaskScheduler {
                 TaskRescheduleReason::TriggerFired
             },
         });
-        let Some(expected_next_fire_at) = trigger.next_fire_at else {
-            return Ok(0);
-        };
         let reserve_executions = runs
             .iter()
             .map(|run| (run.id.clone(), run.executor_kind))
