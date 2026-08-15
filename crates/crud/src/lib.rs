@@ -10086,10 +10086,10 @@ impl CrudStore {
         .await
     }
 
-    /// Returns whether this Turn participates in the atomic native-provider
-    /// finalization protocol. Turns emitted by an older native worker or by a
-    /// CLI runtime have no intent and retain the legacy terminal event path
-    /// during expand/migrate/contract rollout.
+    /// Returns whether this Turn participates in the atomic execution-success
+    /// finalization protocol. Native providers and CLI runtimes prepare an
+    /// intent before publishing success; only older workers retain the legacy
+    /// terminal event path during expand/migrate/contract rollout.
     pub async fn has_turn_finalization_intent(&self, turn_id: &str) -> Result<bool> {
         let turn_id = turn_id.to_owned();
         self.run_serialized_write(|| async {

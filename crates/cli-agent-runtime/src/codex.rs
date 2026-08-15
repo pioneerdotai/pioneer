@@ -5070,6 +5070,7 @@ struct OversizedCodexEnvelope {
     id: Option<JsonlRpcId>,
     method: Option<String>,
     params: Option<JsonValue>,
+    params_truncated: bool,
     has_result: bool,
     has_error: bool,
 }
@@ -5109,6 +5110,7 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
         let mut id = None;
         let mut method = None;
         let mut params = None;
+        let mut params_truncated = false;
         let mut has_result = false;
         let mut has_error = false;
         while let Some(key) = map.next_key::<String>()? {
@@ -5143,13 +5145,13 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
                     }
                     let truncated = Cell::new(false);
                     let nodes = Cell::new(0usize);
-                    let mut value = map.next_value_seed(CodexControlProjectionSeed {
+                    let value = map.next_value_seed(CodexControlProjectionSeed {
                         budget: self.budget,
                         depth: 0,
                         truncated: &truncated,
                         nodes: &nodes,
                     })?;
-                    attach_oversized_projection_marker(&mut value, truncated.get());
+                    params_truncated = truncated.get();
                     params = Some(value);
                 }
                 "result" => {
@@ -5179,6 +5181,7 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
             id,
             method,
             params,
+            params_truncated,
             has_result,
             has_error,
         })
@@ -5412,10 +5415,17 @@ fn codex_truncated_control_placeholder(key: &str) -> Option<JsonValue> {
     }
 }
 
-fn attach_oversized_projection_marker(value: &mut JsonValue, truncated: bool) {
+fn attach_oversized_projection_marker(
+    value: &mut JsonValue,
+    truncated: bool,
+    original_frame_bytes: usize,
+    frame_sha256: &str,
+) {
     let marker = json!({
         "truncated": truncated,
         "controlEnvelopeOnly": true,
+        "originalFrameBytes": original_frame_bytes,
+        "frameSha256": frame_sha256,
     });
     match value {
         JsonValue::Object(object) => {
@@ -5434,6 +5444,7 @@ fn decode_oversized_codex_frame(
     total_bytes: usize,
     budget: crate::NativeEventBudget,
 ) -> Result<OversizedCodexFrame, JsonlRpcDecodeError> {
+    let frame_sha256 = sha256_hex_file(&mut file)?;
     file.seek(SeekFrom::Start(0)).map_err(|error| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::InvalidMessage,
@@ -5493,7 +5504,14 @@ fn decode_oversized_codex_frame(
             "oversized JSONL-RPC frame is not a response, notification, or server request",
         )
     })?;
-    let params = envelope.params.take();
+    let mut params = envelope.params.take().unwrap_or_else(|| json!({}));
+    attach_oversized_projection_marker(
+        &mut params,
+        envelope.params_truncated,
+        total_bytes,
+        frame_sha256.as_str(),
+    );
+    let params = Some(params);
     if let Some(id) = envelope.id {
         let raw = json!({
             "id": id,
@@ -5522,6 +5540,34 @@ fn decode_oversized_codex_frame(
             raw,
         },
     ))
+}
+
+fn sha256_hex_file(file: &mut File) -> Result<String, JsonlRpcDecodeError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            format!("failed to rewind oversized JSONL-RPC frame for digest: {error}"),
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            JsonlRpcDecodeError::new(
+                JsonlRpcDecodeErrorKind::InvalidMessage,
+                format!("failed to digest oversized JSONL-RPC frame: {error}"),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn oversized_codex_success_fallback(request: &JsonlRpcRequest) -> Option<JsonValue> {
@@ -9189,6 +9235,14 @@ while read line; do :; done
         assert_eq!(params["item"]["exitCode"], json!(0));
         assert_eq!(params["item"]["aggregatedOutput"], json!(""));
         assert_eq!(params["_pioneerOversizedPayload"]["truncated"], json!(true));
+        assert_eq!(
+            params["_pioneerOversizedPayload"]["originalFrameBytes"],
+            json!(payload.len()),
+        );
+        assert_eq!(
+            params["_pioneerOversizedPayload"]["frameSha256"],
+            json!(sha256_hex_bytes(payload.as_bytes())),
+        );
 
         server_writer
             .write_all(
@@ -9206,6 +9260,76 @@ while read line; do :; done
                 .expect("pending task should join")
                 .expect("oversized notification must not close transport"),
             json!({"ok": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_turn_completed_preserves_terminal_outcome_and_transport_alignment() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_recovery_frame_bytes: 4 * 1024,
+            max_json_depth: 16,
+            max_json_nodes: 128,
+            max_string_bytes: 128,
+            max_journal_payload_bytes: 256,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let mut notifications = client
+            .take_notification_receiver()
+            .expect("notification receiver");
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        });
+        let request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"method\":\"turn/completed\",\"params\":{{\"threadId\":\"thread-terminal\",\"turn\":{{\"id\":\"turn-terminal\",\"status\":\"completed\",\"exitCode\":0,\"output\":\"{}\"}}}}}}\n",
+            "x".repeat(1024),
+        );
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write oversized terminal notification");
+
+        let notification = tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+            .await
+            .expect("oversized terminal notification should arrive")
+            .expect("notification channel should remain open");
+        assert_eq!(notification.method, "turn/completed");
+        let params = notification.params.expect("sanitized terminal params");
+        assert_eq!(params["threadId"], json!("thread-terminal"));
+        assert_eq!(params["turn"]["id"], json!("turn-terminal"));
+        assert_eq!(params["turn"]["status"], json!("completed"));
+        assert_eq!(params["turn"]["exitCode"], json!(0));
+        assert_eq!(params["turn"]["output"], json!(""));
+        assert_eq!(
+            params["_pioneerOversizedPayload"]["originalFrameBytes"],
+            json!(payload.len()),
+        );
+        assert_eq!(
+            params["_pioneerOversizedPayload"]["frameSha256"],
+            json!(sha256_hex_bytes(payload.as_bytes())),
+        );
+
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": request["id"].clone(), "result": {"ok": true}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write response after oversized terminal notification");
+        assert_eq!(
+            pending
+                .await
+                .expect("pending task should join")
+                .expect("oversized terminal notification must not close transport"),
+            json!({"ok": true}),
         );
     }
 

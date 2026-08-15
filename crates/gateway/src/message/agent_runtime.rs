@@ -311,6 +311,7 @@ pub(super) enum TurnFailureRecoveryKind {
     ArtifactFinalization,
     TaskDispatch,
     RuntimeFailure,
+    ObservationGap,
 }
 
 impl TurnFailureRecoveryKind {
@@ -323,6 +324,7 @@ impl TurnFailureRecoveryKind {
             Self::ArtifactFinalization => pioneer_protocol::RecoveryTrigger::ArtifactFinalization,
             Self::TaskDispatch => pioneer_protocol::RecoveryTrigger::TaskDispatch,
             Self::RuntimeFailure => pioneer_protocol::RecoveryTrigger::RuntimeFailure,
+            Self::ObservationGap => pioneer_protocol::RecoveryTrigger::RuntimeFailure,
         }
     }
 
@@ -335,6 +337,7 @@ impl TurnFailureRecoveryKind {
             | Self::ExecutionWindowContinuation
             | Self::TaskDispatch
             | Self::RuntimeFailure => pioneer_protocol::RecoveryAction::RestartTurn,
+            Self::ObservationGap => pioneer_protocol::RecoveryAction::RehydrateTurnState,
         }
     }
 
@@ -345,6 +348,7 @@ impl TurnFailureRecoveryKind {
             Self::ArtifactFinalization => "artifact_finalization",
             Self::TaskDispatch => "task_dispatch",
             Self::RuntimeFailure => "runtime_failure",
+            Self::ObservationGap => "observation_gap",
         }
     }
 }
@@ -4246,6 +4250,18 @@ impl MessageProcessor {
                     .await;
                     true
                 }
+                crate::resilience::RecoveryCoordinatorEvent::CliRuntimeTerminalReconciliationRequested(
+                    request,
+                ) => {
+                    message_future(
+                        self.handle_cli_runtime_terminal_reconciliation_requested(
+                            *request,
+                            event_timestamp,
+                        ),
+                    )
+                    .await;
+                    true
+                }
                 crate::resilience::RecoveryCoordinatorEvent::RecoverySucceeded {
                     job_id,
                     turn_id,
@@ -4341,6 +4357,91 @@ impl MessageProcessor {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    async fn handle_cli_runtime_terminal_reconciliation_requested(
+        &self,
+        request: crate::resilience::CliRuntimeTerminalReconciliationRequest,
+        event_timestamp: i64,
+    ) {
+        if !self
+            .handle_retry_attempt_started_event(
+                request.job_id.clone(),
+                request.turn_id.clone(),
+                request.item_id.clone(),
+                request.item_type,
+                request.attempt_number,
+                event_timestamp,
+            )
+            .await
+        {
+            self.record_cli_terminal_reconciliation_failure(
+                &request,
+                "failed to persist terminal reconciliation attempt start".to_owned(),
+                event_timestamp,
+            )
+            .await;
+            return;
+        }
+        let recovery = pioneer_protocol::RecoveryAttemptContext {
+            job_id: request.job_id.clone(),
+            attempt_id: request.recovery_attempt_id.clone(),
+        };
+        match self
+            .reconcile_cli_runtime_observation_gap(&request.binding, recovery)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.record_cli_terminal_reconciliation_failure(
+                    &request,
+                    "native runtime has no authoritative terminal snapshot yet".to_owned(),
+                    event_timestamp,
+                )
+                .await;
+            }
+            Err(error) => {
+                self.record_cli_terminal_reconciliation_failure(
+                    &request,
+                    format!("terminal snapshot reconciliation failed: {error:#}"),
+                    event_timestamp,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn record_cli_terminal_reconciliation_failure(
+        &self,
+        request: &crate::resilience::CliRuntimeTerminalReconciliationRequest,
+        failure: String,
+        event_timestamp: i64,
+    ) {
+        match self
+            .recovery_coordinator
+            .record_cli_runtime_attempt_failure(
+                request.job_id.as_str(),
+                request.recovery_attempt_id.as_str(),
+                failure,
+                event_timestamp,
+            )
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    self.handle_recovery_event(event, event_timestamp).await;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    turn_id = request.turn_id,
+                    recovery_job_id = request.job_id,
+                    recovery_attempt_id = request.recovery_attempt_id,
+                    error = %format!("{error:#}"),
+                    "failed to record terminal reconciliation failure"
+                );
             }
         }
     }
@@ -5255,10 +5356,10 @@ impl MessageProcessor {
         }
 
         // TurnCompleted is shared by native API providers, CLI runtimes and
-        // older native workers. Only the new provider protocol emits the
+        // older native workers. Current providers and CLI runtimes emit the
         // preceding durable finalization intent. Preserve the existing
-        // terminal lifecycle for intent-less producers during the rolling
-        // expand/migrate/contract window; a prepared native response always
+        // terminal lifecycle only for older intent-less producers during the
+        // rolling expand/migrate/contract window; every prepared response
         // takes the atomic path below.
         match self
             .crud_store

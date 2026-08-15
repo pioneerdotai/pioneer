@@ -58,11 +58,12 @@ use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructionTransp
 use pioneer_config::{GatewayHookRecoveryConfig, GatewayMemoryConfig, GatewayWebToolsConfig};
 use pioneer_crud::{
     AgentMemoryListFilter, BLOCK_KIND_DETACHED_TASK_RUN, BLOCK_KIND_TURN_WORK,
-    CliRuntimeExecutionSegmentStatus, CliRuntimeTurnAttemptStatus, CrudStore, MemoryActorRecord,
-    NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection, NewCliRuntimePendingRequest,
-    NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding, SkillInstallationPatch,
-    SkillInstallationRecord, SkillPackInstallationRecord, ThreadAgentsDocSaveReason,
-    TurnItemAttemptDeadlines, WorkspaceSkillPolicyRecord, global_agent_memory_scope_key,
+    CliRuntimeExecutionSegmentStatus, CliRuntimeNativeEventListFilter, CliRuntimeTurnAttemptStatus,
+    CrudStore, MemoryActorRecord, NewAgentMemoryCandidate, NewCliRuntimeInstructionProjection,
+    NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
+    SkillInstallationPatch, SkillInstallationRecord, SkillPackInstallationRecord,
+    ThreadAgentsDocSaveReason, TurnItemAttemptDeadlines, WorkspaceSkillPolicyRecord,
+    global_agent_memory_scope_key,
 };
 use pioneer_entity::{
     thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
@@ -19857,6 +19858,13 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             .as_str(),
         )
         .await;
+        assert!(
+            crud_store
+                .has_turn_finalization_intent(lineage.child_turn_id.as_str())
+                .await
+                .expect("native CLI child finalization intent should load"),
+            "native CLI child success must cross the durable finalization boundary"
+        );
         assert_eq!(
             wait_for_task_status(
                 crud_store.clone(),
@@ -31996,7 +32004,7 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let cli_manager = test_cli_runtime_manager(cli_session);
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
     let processor = MessageProcessor::new(
         thread_manager,
         test_provider(),
@@ -32072,6 +32080,76 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
         .expect("pending recovery jobs should load");
     assert_eq!(pending_jobs.len(), 1);
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
+    assert_eq!(pending_jobs[0].action, RecoveryAction::RehydrateTurnState);
+    let gap_events = crud_store
+        .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
+            runtime_id: Some("codex".to_owned()),
+            thread_id: Some(thread_id.to_owned()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("durable observation gap should load");
+    let gap = gap_events
+        .iter()
+        .find(|event| event.native_method == "observation_gap")
+        .expect("transport loss must create a durable observation gap");
+    let gap_payload: JsonValue = serde_json::from_str(gap.payload_redacted_json.as_str())
+        .expect("observation gap payload should be valid JSON");
+    assert_eq!(gap_payload["runtimeId"], json!("codex"));
+    assert_eq!(gap_payload["continuationThreadId"], json!(thread_id));
+    assert_eq!(gap_payload["activeTurnIds"], json!([turn_id]));
+
+    *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+        status: CLIAgentRuntimeObservedTurnStatus::Completed,
+        message: None,
+        reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            native_thread_id: Some("native-thread-transport-gap".to_owned()),
+            native_turn_id: "native-turn-transport-gap".to_owned(),
+            native_item_id: "transport_gap_final_item".to_owned(),
+            item_kind: "agentMessage".to_owned(),
+            text: Some("recovered after observation gap".to_owned()),
+            summary: Vec::new(),
+            content: Vec::new(),
+            phase: RuntimeAgentMessagePhase::FinalAnswer,
+            metadata: None,
+            native_item_redacted: None,
+            native: None,
+        })],
+    });
+    let events = processor
+        .recovery_coordinator
+        .run_ready_jobs(pending_jobs[0].scheduled_at_unix.saturating_add(10), 1)
+        .await
+        .expect("terminal reconciliation recovery should start");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            crate::resilience::RecoveryCoordinatorEvent::CliRuntimeTerminalReconciliationRequested(
+                _
+            )
+        ]
+    ));
+    for event in events {
+        assert!(
+            processor
+                .handle_recovery_event(event, chrono::Utc::now().timestamp())
+                .await
+        );
+    }
+    let (_workspace_id, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .expect("reconciled Turn lookup should succeed")
+        .expect("reconciled Turn should exist");
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert!(
+        crud_store
+            .has_turn_finalization_intent(turn_id)
+            .await
+            .expect("terminal reconciliation finalization intent should load")
+    );
+    assert!(cli_session.turn_starts.lock().await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -32206,6 +32284,21 @@ async fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_ter
         item,
         TurnItem::AgentMessage { text, .. } if text == "reconciled final answer"
     ));
+    assert!(
+        crud_store
+            .has_turn_finalization_intent(turn_id)
+            .await
+            .expect("CLI finalization intent lookup should succeed"),
+        "terminal CLI reconciliation must durably prepare success before completing the Turn",
+    );
+    assert_eq!(
+        crud_store
+            .reconcile_prepared_turn_finalizations(10, chrono::Utc::now().timestamp())
+            .await
+            .expect("committed finalization replay should succeed"),
+        0,
+        "a committed CLI finalization must be idempotent and leave no prepared backlog",
+    );
     assert!(cli_session.interrupts.lock().await.is_empty());
 }
 

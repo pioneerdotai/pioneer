@@ -580,6 +580,7 @@ pub enum RecoveryCoordinatorEvent {
         attempt_number: u32,
     },
     CliRuntimeRetryAttemptRequested(Box<CliRuntimeRecoveryAttemptRequest>),
+    CliRuntimeTerminalReconciliationRequested(Box<CliRuntimeTerminalReconciliationRequest>),
     RecoverySucceeded {
         job_id: String,
         turn_id: String,
@@ -605,6 +606,17 @@ pub struct CliRuntimeRecoveryAttemptRequest {
     pub attempt_number: u32,
     pub execution_window_index: u32,
     pub previous_failure_reason: String,
+    pub binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+}
+
+#[derive(Debug, Clone)]
+pub struct CliRuntimeTerminalReconciliationRequest {
+    pub job_id: String,
+    pub recovery_attempt_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: TurnItemType,
+    pub attempt_number: u32,
     pub binding: pioneer_crud::CliRuntimeTurnBindingRecord,
 }
 
@@ -2059,6 +2071,76 @@ impl RecoveryCoordinator {
                     reason,
                 });
             }
+            return Ok(events);
+        }
+
+        if job.action == RecoveryAction::RehydrateTurnState {
+            let Some(binding) = self
+                .crud_store
+                .get_cli_runtime_turn_binding(job.turn_id.as_str())
+                .await?
+            else {
+                let reason =
+                    "terminal reconciliation requires the durable CLI runtime binding".to_owned();
+                if self
+                    .crud_store
+                    .mark_claimed_recovery_job_terminal(
+                        job.id.as_str(),
+                        claim_token.as_str(),
+                        RecoveryJobStatus::Blocked,
+                        Some(reason.clone()),
+                        now_unix,
+                    )
+                    .await?
+                {
+                    events.push(RecoveryCoordinatorEvent::RecoveryBlocked {
+                        job_id: job.id,
+                        turn_id: job.turn_id,
+                        reason,
+                    });
+                }
+                return Ok(events);
+            };
+            let active_attempt_id = generate_id(RECOVERY_ATTEMPT_ID_LEN);
+            match self
+                .crud_store
+                .mark_claimed_recovery_job_active(
+                    job.id.as_str(),
+                    claim_token.as_str(),
+                    active_attempt_id.as_str(),
+                    now_unix,
+                )
+                .await?
+            {
+                ClaimedRecoveryActivation::Activated => {}
+                ClaimedRecoveryActivation::BlockedByActiveRecovery => {
+                    let _ = self
+                        .crud_store
+                        .release_claimed_recovery_job(
+                            job.id.as_str(),
+                            claim_token.as_str(),
+                            now_unix.saturating_add(ACTIVE_RECOVERY_RECHECK_SECS),
+                            Some("another recovery is already active for this turn".to_owned()),
+                            now_unix,
+                        )
+                        .await?;
+                    return Ok(events);
+                }
+                ClaimedRecoveryActivation::ClaimNotFound => return Ok(events),
+            }
+            events.push(
+                RecoveryCoordinatorEvent::CliRuntimeTerminalReconciliationRequested(Box::new(
+                    CliRuntimeTerminalReconciliationRequest {
+                        job_id: job.id,
+                        recovery_attempt_id: active_attempt_id,
+                        turn_id: job.turn_id,
+                        item_id: job.item_id,
+                        item_type: job.item_type,
+                        attempt_number,
+                        binding,
+                    },
+                )),
+            );
             return Ok(events);
         }
 

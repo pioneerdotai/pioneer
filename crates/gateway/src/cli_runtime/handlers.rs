@@ -3633,15 +3633,75 @@ impl MessageProcessor {
             }
         };
 
-        for binding in bindings {
-            if binding.runtime_kind != "codex"
-                || binding.workspace_id != key.workspace_id
-                || binding.runtime_id != key.runtime_id
-                || binding.continuation_thread_id != key.thread_id
-                || !cli_runtime_turn_binding_status_is_active(binding.status.as_str())
-            {
-                continue;
+        let active_bindings = bindings
+            .into_iter()
+            .filter(|binding| {
+                binding.runtime_kind == "codex"
+                    && binding.workspace_id == key.workspace_id
+                    && binding.runtime_id == key.runtime_id
+                    && binding.continuation_thread_id == key.thread_id
+                    && cli_runtime_turn_binding_status_is_active(binding.status.as_str())
+            })
+            .collect::<Vec<_>>();
+        if active_bindings.is_empty() {
+            return;
+        }
+        let active_turn_ids = active_bindings
+            .iter()
+            .map(|binding| binding.turn_id.clone())
+            .collect::<Vec<_>>();
+        let gap_payload = json!({
+            "sessionGeneration": instance.generation(),
+            "runtimeId": key.runtime_id,
+            "continuationThreadId": key.thread_id,
+            "activeTurnIds": active_turn_ids,
+            "reason": sanitize_runtime_diagnostic_line(reason),
+        });
+        let payload_redacted_json = match bounded_cli_runtime_journal_json(
+            &gap_payload,
+            pioneer_cli_agent_runtime::NativeEventBudget::default().max_journal_payload_bytes,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(
+                    workspace_id = key.workspace_id.as_str(),
+                    runtime_id = key.runtime_id.as_str(),
+                    thread_id = key.thread_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to serialize durable Codex observation gap"
+                );
+                return;
             }
+        };
+        if let Err(error) = self
+            .crud_store
+            .append_cli_runtime_native_event(NewCliRuntimeNativeEvent {
+                id: generate_id(24),
+                runtime_id: key.runtime_id.clone(),
+                runtime_kind: "codex".to_owned(),
+                workspace_id: Some(key.workspace_id.clone()),
+                thread_id: Some(key.thread_id.clone()),
+                turn_id: None,
+                native_thread_id: None,
+                native_turn_id: None,
+                native_method: "observation_gap".to_owned(),
+                payload_redacted_json,
+                sequence: now_timestamp_millis(),
+                created_at: chrono::Utc::now().fixed_offset(),
+            })
+            .await
+        {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = key.thread_id.as_str(),
+                error = %format!("{error:#}"),
+                "failed to persist durable Codex observation gap"
+            );
+            return;
+        }
+
+        for binding in active_bindings {
             let recovery_reason = format!(
                 "Codex runtime session lost its JSONL-RPC observation channel and requires recovery: {reason}"
             );
@@ -3649,7 +3709,7 @@ impl MessageProcessor {
                 .report_turn_failure(
                     binding.thread_id.clone(),
                     binding.turn_id.clone(),
-                    TurnFailureRecoveryKind::RuntimeFailure,
+                    TurnFailureRecoveryKind::ObservationGap,
                     recovery_reason,
                 )
                 .await
@@ -5021,6 +5081,43 @@ impl MessageProcessor {
             }
             return true;
         }
+        if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
+            let generation = turn_attempt
+                .map(|attempt| i64::from(attempt.attempt_index))
+                .unwrap_or(1);
+            if let Err(error) = self
+                .prepare_cli_runtime_success_finalization(&turn_binding, generation)
+                .await
+            {
+                let failure = format!(
+                    "CLI terminal outcome could not be durably prepared before Turn completion: {error:#}"
+                );
+                warn!(
+                    turn_id = turn_binding.turn_id.as_str(),
+                    native_turn_id = native_turn_id_label,
+                    error = %format!("{error:#}"),
+                    "refused to publish CLI TurnCompleted without durable finalization"
+                );
+                if let Some(recovery) = recovery.as_ref() {
+                    self.handle_cli_runtime_recovery_native_failure(
+                        turn_binding.turn_id.clone(),
+                        recovery.clone(),
+                        failure,
+                    )
+                    .await;
+                } else {
+                    let _ = self
+                        .report_turn_failure(
+                            turn_binding.thread_id.clone(),
+                            turn_binding.turn_id.clone(),
+                            TurnFailureRecoveryKind::ObservationGap,
+                            failure,
+                        )
+                        .await;
+                }
+                return false;
+            }
+        }
         if terminal_status.is_some()
             && let Some(recovery) = recovery.as_ref()
             && matches!(
@@ -5256,6 +5353,194 @@ impl MessageProcessor {
             }
         }
         true
+    }
+
+    async fn prepare_cli_runtime_success_finalization(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        generation: i64,
+    ) -> anyhow::Result<()> {
+        let final_item = self
+            .crud_store
+            .list_completed_agent_messages(binding.turn_id.as_str())
+            .await?
+            .into_iter()
+            .rev()
+            .find(|item| {
+                matches!(
+                    item,
+                    TurnItem::AgentMessage {
+                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        ..
+                    }
+                )
+            })
+            .with_context(|| {
+                format!(
+                    "CLI Turn `{}` has no completed final AgentMessage",
+                    binding.turn_id
+                )
+            })?;
+        let revision = self
+            .crud_store
+            .task_finalization_revision(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await?;
+        self.crud_store
+            .prepare_turn_finalization(
+                &ItemCompletedNotification {
+                    workspace_id: binding.workspace_id.clone(),
+                    thread_id: binding.thread_id.clone(),
+                    turn_id: binding.turn_id.clone(),
+                    item: final_item,
+                },
+                generation.max(1),
+                Some(revision.token.as_str()),
+                now_timestamp_secs(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn apply_authoritative_cli_runtime_snapshot_event(
+        &self,
+        instance: &CliSessionInstanceId,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: RuntimeEvent,
+    ) -> anyhow::Result<()> {
+        let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
+            workspace_id: binding.workspace_id.clone(),
+            thread_id: binding.thread_id.clone(),
+            turn_id: binding.turn_id.clone(),
+            recovery: None,
+        };
+        let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
+        for durable in projected.durable {
+            self.publish_cli_runtime_durable_and_wait(instance, durable)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to persist authoritative snapshot lifecycle event: {error}"
+                    )
+                })?;
+        }
+        let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
+        for snapshot in projected.snapshot {
+            if !event_hub.publish_snapshot(snapshot) {
+                anyhow::bail!("snapshot event hub closed during terminal reconciliation");
+            }
+        }
+        for progress in projected.progress {
+            event_hub.publish_progress(progress);
+        }
+        self.update_cli_runtime_command_item_registry(instance, binding, &event)
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn reconcile_cli_runtime_observation_gap(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        recovery: pioneer_protocol::RecoveryAttemptContext,
+    ) -> anyhow::Result<bool> {
+        let native_turn_id = binding
+            .native_turn_id
+            .as_deref()
+            .with_context(|| format!("CLI Turn `{}` has no native turn id", binding.turn_id))?;
+        let manager = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI runtime manager is unavailable")?;
+        let key = CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id.clone(),
+            binding.runtime_id.clone(),
+            binding.continuation_thread_id.clone(),
+        )?;
+        let handle = manager.get_or_start(key).await?;
+        let Some(observation) = handle
+            .session()
+            .load_turn_snapshot(binding.native_thread_id.as_str(), native_turn_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        if observation.status == CLIAgentRuntimeObservedTurnStatus::InProgress {
+            let now_unix = now_timestamp_secs();
+            self.timeout_supervisor
+                .renew_running_attempt_deadlines_after_runtime_activity(
+                    binding.turn_id.as_str(),
+                    now_unix,
+                    "runtime/observation_gap_reconciled_active",
+                )
+                .await?;
+            let events = self
+                .recovery_coordinator
+                .succeed_active_recovery_attempt(binding.turn_id.as_str(), &recovery, now_unix)
+                .await?;
+            for event in events {
+                self.handle_recovery_event(event, now_unix).await;
+            }
+            return Ok(true);
+        }
+
+        for event in observation.reconciliation_events {
+            self.apply_authoritative_cli_runtime_snapshot_event(handle.instance(), binding, event)
+                .await?;
+        }
+
+        match observation.status {
+            CLIAgentRuntimeObservedTurnStatus::Completed => {
+                let generation = self
+                    .crud_store
+                    .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
+                    .await?
+                    .map(|attempt| i64::from(attempt.attempt_index))
+                    .unwrap_or(1);
+                self.prepare_cli_runtime_success_finalization(binding, generation)
+                    .await?;
+                let turn = self
+                    .crud_store
+                    .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+                    .await?
+                    .map(|(_, turn)| turn)
+                    .with_context(|| format!("Turn `{}` disappeared", binding.turn_id))?;
+                self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+                    binding.workspace_id.as_str(),
+                    binding.thread_id.as_str(),
+                    &turn,
+                )
+                .await?;
+                if !self
+                    .complete_native_turn(
+                        binding.thread_id.clone(),
+                        binding.turn_id.clone(),
+                        Some(recovery),
+                    )
+                    .await
+                {
+                    anyhow::bail!("durable CLI terminal finalization could not be committed");
+                }
+                self.cleanup_cli_runtime_terminal_turn_status(
+                    binding,
+                    TurnStatus::Completed,
+                    "observation gap terminal reconciliation",
+                )
+                .await;
+                Ok(true)
+            }
+            CLIAgentRuntimeObservedTurnStatus::Failed
+            | CLIAgentRuntimeObservedTurnStatus::Interrupted
+            | CLIAgentRuntimeObservedTurnStatus::Blocked => {
+                anyhow::bail!(
+                    "native snapshot reported terminal status {:?}: {}",
+                    observation.status,
+                    observation
+                        .message
+                        .unwrap_or_else(|| "no runtime diagnostic".to_owned())
+                )
+            }
+            CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),
+        }
     }
 
     async fn commit_cli_runtime_final_diff_snapshot(
@@ -5924,8 +6209,13 @@ impl MessageProcessor {
                 turn,
             )
             .await?;
+            self.prepare_cli_runtime_success_finalization(
+                binding,
+                i64::from(attempt.attempt_index),
+            )
+            .await?;
             if !self
-                .complete_turn(binding.thread_id.clone(), binding.turn_id.clone(), recovery)
+                .complete_native_turn(binding.thread_id.clone(), binding.turn_id.clone(), recovery)
                 .await
             {
                 anyhow::bail!(
@@ -6024,14 +6314,8 @@ impl MessageProcessor {
         }
 
         for event in observation.reconciliation_events.iter().cloned() {
-            if !self
-                .process_bound_cli_runtime_event(handle.instance(), binding.clone(), event)
-                .await
-            {
-                anyhow::bail!(
-                    "failed to commit canonical runtime snapshot before terminal reconciliation"
-                );
-            }
+            self.apply_authoritative_cli_runtime_snapshot_event(handle.instance(), binding, event)
+                .await?;
         }
         self.ensure_cli_runtime_turn_loaded_for_lifecycle(
             workspace_id,
