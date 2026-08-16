@@ -66,9 +66,9 @@ use pioneer_crud::{
     global_agent_memory_scope_key,
 };
 use pioneer_entity::{
-    thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
-    turn_input, turn_item, turn_item_attempt, turn_status_history, turn_work_item_projection,
-    turn_work_projection,
+    cli_runtime_pending_request, thread, thread_sandox_policy, thread_timeline_block, turn,
+    turn_event_projection_state, turn_input, turn_item, turn_item_attempt, turn_status_history,
+    turn_work_item_projection, turn_work_projection,
 };
 use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookDiagnosticCode,
@@ -6117,8 +6117,6 @@ async fn create_task_for_test(
     let mut context = processor.task_create_context_for_params(&params).await?;
     let principal = authenticated_test_superuser();
     context.actor_id = Some(principal.principal_id.to_string());
-    context.task_resource_budget = crate::authorization::AuthorizationService::new()
-        .task_resource_budget(principal.kind, principal.role_key.as_ref());
     if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent {
         let root_thread_id = params
             .created_by_thread_id
@@ -36730,7 +36728,7 @@ async fn cli_runtime_command_approval_cancel_sends_cancel_and_interrupts_turn() 
     let responses = cli_session.responses.lock().await;
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].0, json!("approval-native-cancel"));
-    assert_eq!(responses[0].1, json!({"decision": "cancel"}));
+    assert_eq!(responses[0].1, json!({"decision": "decline"}));
     drop(responses);
 
     let interrupts = cli_session.interrupts.lock().await;
@@ -37219,6 +37217,71 @@ async fn cli_runtime_human_wait_defers_turn_item_timeout_transition() {
             .any(|candidate| candidate.item_id == "codex-item-command"),
         "deferred timeout candidate should remain running until the user responds"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_expired_human_wait_returns_control_before_timeout_transition() {
+    let (processor, _connection_id, mut rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let now = chrono::Utc::now().timestamp();
+    materialize_expired_cli_command_attempt(crud_store.as_ref(), workspace_id.as_str(), now).await;
+    let opened =
+        open_test_codex_command_approval(&processor, &mut rx, workspace_id.as_str(), json!(712))
+            .await;
+    let old = chrono::Utc::now().fixed_offset()
+        - chrono::Duration::milliseconds(
+            crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS + 2_000,
+        );
+    cli_runtime_pending_request::Entity::update_many()
+        .col_expr(
+            cli_runtime_pending_request::Column::CreatedAt,
+            Expr::value(old),
+        )
+        .filter(cli_runtime_pending_request::Column::RequestId.eq(opened.request_id.as_str()))
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("pending request should be aged past its response deadline");
+    let aged = crud_store
+        .get_cli_runtime_pending_request(opened.request_id.as_str())
+        .await
+        .expect("aged pending request should load")
+        .expect("aged pending request should exist");
+    assert!(
+        now.saturating_mul(1_000)
+            .saturating_sub(aged.created_at.timestamp_millis())
+            >= crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS,
+        "test request must be unambiguously older than the human response deadline"
+    );
+    assert!(
+        crud_store
+            .list_timeout_candidates(now, 64)
+            .await
+            .expect("timeout candidates should load")
+            .iter()
+            .any(|candidate| candidate.turn_id == "codex-turn-command"),
+        "the timeout supervisor must observe the waiting CLI turn"
+    );
+
+    let timed_out = processor
+        .poll_timeouts_respecting_human_wait(now, 64)
+        .await
+        .expect("timeout poll should expire the human request safely");
+    assert!(
+        timed_out.is_empty(),
+        "the same poll that returns control must not terminalize the waiting item"
+    );
+    let pending = crud_store
+        .get_cli_runtime_pending_request(opened.request_id.as_str())
+        .await
+        .expect("pending request should load")
+        .expect("pending request should exist");
+    assert_eq!(
+        pending.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Expired
+    );
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].1, json!({"decision": "decline"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -37899,7 +37962,7 @@ async fn cli_runtime_human_wait_defers_stale_turn_scan() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_human_wait_expires_after_response_sla_and_blocks_turn() {
+async fn cli_runtime_human_wait_expires_without_blocking_the_turn() {
     let (processor, _connection_id, mut rx, workspace_id, crud_store, _cli_session) =
         cli_runtime_approval_processor().await;
     let opened =
@@ -37926,15 +37989,8 @@ async fn cli_runtime_human_wait_expires_after_response_sla_and_blocks_turn() {
         .await
         .expect("turn lookup should succeed")
         .expect("turn should exist");
-    assert_eq!(turn.status, TurnStatus::Blocked);
-    assert!(
-        turn.error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("was not answered within"),
-        "blocked turn should explain the human response timeout: {:?}",
-        turn.error
-    );
+    assert_eq!(turn.status, TurnStatus::InProgress);
+    assert!(turn.error.is_none());
 
     let binding = crud_store
         .get_cli_runtime_turn_binding("codex-turn-command")
@@ -37943,46 +37999,28 @@ async fn cli_runtime_human_wait_expires_after_response_sla_and_blocks_turn() {
         .expect("binding should exist");
     assert_eq!(
         binding.status,
-        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED
+        crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_request_response_after_human_sla_expires_request_and_blocks_turn() {
+async fn cli_runtime_request_response_after_deadline_expires_request_without_blocking_turn() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
+    let opened =
+        open_test_codex_command_approval(&processor, &mut rx, workspace_id.as_str(), json!(715))
+            .await;
     let old = chrono::Utc::now().fixed_offset()
         - chrono::Duration::milliseconds(24 * 60 * 60 * 1_000 + 1);
-    let pending_payload = CLIRuntimePendingRequest {
-        kind: CLIRuntimeRequestKind::CommandApproval,
-        title: Some("Run expired command".to_owned()),
-        message: Some("Codex wants approval after the response SLA".to_owned()),
-        native_request_id: Some("native-approval-response-expired".to_owned()),
-        payload: Some(json!({
-            "nativeRequestIdJson": "native-approval-response-expired",
-            "command": "sleep 30"
-        })),
-    };
-    processor
-        .open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
-            request_id: "cli-approval-response-expired".to_owned(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            workspace_id: workspace_id.clone(),
-            thread_id: "thread_cli_command_approval".to_owned(),
-            turn_id: Some("codex-turn-command".to_owned()),
-            native_thread_id: Some("codex-thread-command".to_owned()),
-            native_turn_id: Some("codex-turn-command".to_owned()),
-            native_item_id: Some("codex-item-command-response-expired".to_owned()),
-            request_kind: "command_approval".to_owned(),
-            payload_json: pioneer_crud::serialize_cli_runtime_json(&pending_payload)
-                .expect("pending payload should serialize"),
-            created_at: old,
-            updated_at: old,
-        })
+    cli_runtime_pending_request::Entity::update_many()
+        .col_expr(
+            cli_runtime_pending_request::Column::CreatedAt,
+            Expr::value(old),
+        )
+        .filter(cli_runtime_pending_request::Column::RequestId.eq(opened.request_id.as_str()))
+        .exec(&crud_store.database_connection())
         .await
-        .expect("expired pending request should open");
-    let _opened = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+        .expect("pending request should be aged for the response-deadline regression test");
 
     processor
         .process_request_for_connection(
@@ -37994,7 +38032,7 @@ async fn cli_runtime_request_response_after_human_sla_expires_request_and_blocks
                 "params": {
                     "workspace_id": workspace_id,
                     "runtime_id": "codex",
-                    "request_id": "cli-approval-response-expired",
+                    "request_id": opened.request_id.clone(),
                     "resolution": { "status": "approved" }
                 }
             })
@@ -38003,14 +38041,10 @@ async fn cli_runtime_request_response_after_human_sla_expires_request_and_blocks
         .await;
 
     let error = recv_error_by_id(&mut rx, "cmdapproval_expired01").await;
-    assert_public_error(
-        &error,
-        PublicErrorCode::InvalidInput,
-        PublicErrorStage::Execution,
-    );
+    assert_eq!(error.error.code, INVALID_PARAMS_CODE);
 
     let pending = crud_store
-        .get_cli_runtime_pending_request("cli-approval-response-expired")
+        .get_cli_runtime_pending_request(opened.request_id.as_str())
         .await
         .expect("pending request should load")
         .expect("pending request should exist");
@@ -38024,8 +38058,10 @@ async fn cli_runtime_request_response_after_human_sla_expires_request_and_blocks
         .await
         .expect("turn lookup should succeed")
         .expect("turn should exist");
-    assert_eq!(turn.status, TurnStatus::Blocked);
-    assert!(cli_session.responses.lock().await.is_empty());
+    assert_eq!(turn.status, TurnStatus::InProgress);
+    let responses = cli_session.responses.lock().await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].1, json!({"decision": "decline"}));
 }
 
 async fn materialize_expired_cli_command_attempt(

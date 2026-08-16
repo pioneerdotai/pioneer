@@ -47,6 +47,9 @@ pub struct McpDynamicToolDescriptor {
     pub parameters: JsonValue,
     pub annotations: McpDynamicToolAnnotations,
     pub timeout_ms: Option<u64>,
+    /// Maximum serialized argument payload accepted at the MCP transport
+    /// boundary for this materialized tool.
+    pub max_arguments_bytes: usize,
     pub selection_reason: String,
     pub capability_id: Option<String>,
 }
@@ -90,6 +93,7 @@ pub struct McpToolCallRequest {
     pub catalog_version: String,
     pub arguments: JsonValue,
     pub timeout_ms: u64,
+    pub max_arguments_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -397,6 +401,7 @@ fn mcp_call_request(
             .timeout_ms
             .unwrap_or(DEFAULT_MCP_TOOL_TIMEOUT_MS)
             .max(1),
+        max_arguments_bytes: descriptor.max_arguments_bytes,
     }
 }
 
@@ -484,6 +489,7 @@ mod tests {
                 open_world_hint: Some(true),
             },
             timeout_ms: Some(4_321),
+            max_arguments_bytes: 128 * 1024,
             selection_reason: "explicit_composer_capability".to_owned(),
             capability_id: Some("mcp-tool:workspace:resend:send".to_owned()),
         }

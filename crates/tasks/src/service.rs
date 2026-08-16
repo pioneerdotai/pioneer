@@ -1561,16 +1561,7 @@ impl TaskService {
         context: TaskCreateContext,
         params: TaskCreateParams,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
-        let resource_budget = context
-            .task_resource_budget
-            .or_else(|| {
-                context
-                    .execution_admission
-                    .as_ref()
-                    .map(|seed| seed.task_resources)
-            })
-            .unwrap_or_default();
-        validate_create_params(&params, resource_budget)?;
+        validate_create_params(&params)?;
         self.validate_review_policy_create_gate(&params)?;
         match (
             params.executor_kind == TaskExecutorKind::Agent,
@@ -1702,7 +1693,7 @@ impl TaskService {
             created_at: now,
             updated_at: now,
         });
-        TaskAdmissionNormalizer::new(resource_budget).validate_durable(
+        TaskAdmissionNormalizer::new().validate_durable(
             &task,
             Some(&trigger),
             agent_spec.as_ref(),
@@ -1925,7 +1916,6 @@ impl TaskService {
             Err(_) => {
                 let mut response = self.collect_wait_state_for_plan(&plan).await?;
                 response.timed_out = true;
-                ensure_response_budget(&response, budget.max_response_bytes, "task wait")?;
                 Ok(response)
             }
         }
@@ -2196,11 +2186,10 @@ impl TaskService {
 
     pub async fn update_task(
         &self,
-        context: TaskMutationContext,
+        _context: TaskMutationContext,
         params: TaskUpdateParams,
     ) -> TaskRuntimeResult<TaskUpdateResponse> {
-        let resource_budget = context.task_resource_budget.unwrap_or_default();
-        validate_update_params(&params, resource_budget)?;
+        validate_update_params(&params)?;
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
@@ -2513,7 +2502,7 @@ impl TaskService {
             }
         }
 
-        TaskAdmissionNormalizer::new(resource_budget).validate_durable(
+        TaskAdmissionNormalizer::new().validate_durable(
             &task,
             updated_trigger.as_ref().or(current_trigger.as_ref()),
             updated_agent_spec.as_ref().or(base_agent_spec.as_ref()),
@@ -2758,7 +2747,12 @@ impl TaskService {
     ) -> TaskRuntimeResult<TaskAgendaResponse> {
         params.limit = Some(clamp_task_page_limit(params.limit, budget.max_page_items));
         let response = self.store.list_task_agenda(params).await?;
-        ensure_response_budget(&response, budget.max_response_bytes, "task agenda")?;
+        ensure_paginated_response_budget(
+            &response,
+            response.items.len(),
+            budget.max_page_bytes,
+            "task agenda",
+        )?;
         Ok(response)
     }
 
@@ -2782,7 +2776,12 @@ impl TaskService {
             .store
             .list_task_agenda_scoped(params, Some(access))
             .await?;
-        ensure_response_budget(&response, budget.max_response_bytes, "task agenda")?;
+        ensure_paginated_response_budget(
+            &response,
+            response.items.len(),
+            budget.max_page_bytes,
+            "task agenda",
+        )?;
         Ok(response)
     }
 
@@ -2801,7 +2800,12 @@ impl TaskService {
     ) -> TaskRuntimeResult<TaskDeliveriesResponse> {
         params.limit = Some(clamp_task_page_limit(params.limit, budget.max_page_items));
         let response = self.store.list_task_deliveries(params).await?;
-        ensure_response_budget(&response, budget.max_response_bytes, "task deliveries")?;
+        ensure_paginated_response_budget(
+            &response,
+            response.deliveries.len(),
+            budget.max_page_bytes,
+            "task deliveries",
+        )?;
         Ok(response)
     }
 
@@ -2825,7 +2829,12 @@ impl TaskService {
             .store
             .list_task_deliveries_scoped(params, Some(access))
             .await?;
-        ensure_response_budget(&response, budget.max_response_bytes, "task deliveries")?;
+        ensure_paginated_response_budget(
+            &response,
+            response.deliveries.len(),
+            budget.max_page_bytes,
+            "task deliveries",
+        )?;
         Ok(response)
     }
 
@@ -2963,22 +2972,10 @@ impl TaskService {
     }
 
     pub async fn get_task(&self, params: TaskGetParams) -> TaskRuntimeResult<TaskGetResponse> {
-        self.get_task_with_budget(params, TaskResourceBudget::default())
-            .await
-    }
-
-    pub async fn get_task_with_budget(
-        &self,
-        params: TaskGetParams,
-        budget: TaskResourceBudget,
-    ) -> TaskRuntimeResult<TaskGetResponse> {
-        let response = self
-            .store
+        self.store
             .get_task(params.task_id.as_str())
             .await?
-            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))?;
-        ensure_response_budget(&response, budget.max_response_bytes, "task get")?;
-        Ok(response)
+            .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))
     }
 
     pub async fn list_tasks(&self, params: TaskListParams) -> TaskRuntimeResult<TaskListResponse> {
@@ -3034,7 +3031,12 @@ impl TaskService {
             next_cursor: has_more.then_some(cursor.saturating_add(tasks.len() as u64)),
             tasks,
         };
-        ensure_response_budget(&response, budget.max_response_bytes, "task list")?;
+        ensure_paginated_response_budget(
+            &response,
+            response.tasks.len(),
+            budget.max_page_bytes,
+            "task list",
+        )?;
         Ok(response)
     }
 
@@ -3056,10 +3058,7 @@ impl TaskService {
             .get_task_tree_bounded(params.task_id.as_str(), budget.max_tree_nodes)
             .await?
             .ok_or_else(|| anyhow!("task `{}` not found", params.task_id))?;
-        validate_tree_depth(&tree, budget.max_tree_depth)?;
-        let response = TaskTreeResponse { tree };
-        ensure_response_budget(&response, budget.max_response_bytes, "task tree")?;
-        Ok(response)
+        Ok(TaskTreeResponse { tree })
     }
 
     pub async fn get_task_events(
@@ -3085,7 +3084,12 @@ impl TaskService {
             .store
             .get_task_events_page(params.task_id.as_str(), params.after_sequence, limit)
             .await?;
-        ensure_response_budget(&response, budget.max_response_bytes, "task events")?;
+        ensure_paginated_response_budget(
+            &response,
+            response.events.len(),
+            budget.max_page_bytes,
+            "task events",
+        )?;
         Ok(response)
     }
 
@@ -3670,11 +3674,6 @@ impl TaskService {
         response.total_count = response
             .total_count
             .saturating_add(response.non_waitable_count);
-        ensure_response_budget(
-            &response,
-            TaskResourceBudget::default().max_response_bytes,
-            "task wait",
-        )?;
         Ok(response)
     }
 
@@ -4172,11 +4171,8 @@ fn write_lock_paths_overlap(left: &str, right: &str) -> bool {
     left_parts.starts_with(right_parts.as_slice()) || right_parts.starts_with(left_parts.as_slice())
 }
 
-fn validate_create_params(
-    params: &TaskCreateParams,
-    resource_budget: TaskResourceBudget,
-) -> TaskRuntimeResult<()> {
-    TaskAdmissionNormalizer::new(resource_budget).validate_create(params)?;
+fn validate_create_params(params: &TaskCreateParams) -> TaskRuntimeResult<()> {
+    TaskAdmissionNormalizer::new().validate_create(params)?;
     if params.workspace_id.trim().is_empty() {
         bail!("workspace_id is required");
     }
@@ -4285,11 +4281,8 @@ fn validate_composer_work_create_params(params: &TaskCreateParams) -> TaskRuntim
     Ok(())
 }
 
-fn validate_update_params(
-    params: &TaskUpdateParams,
-    resource_budget: TaskResourceBudget,
-) -> TaskRuntimeResult<()> {
-    TaskAdmissionNormalizer::new(resource_budget).validate_update(params)?;
+fn validate_update_params(params: &TaskUpdateParams) -> TaskRuntimeResult<()> {
+    TaskAdmissionNormalizer::new().validate_update(params)?;
     required_trimmed(params.task_id.as_str(), "task_id")?;
     if params.clear_input && (params.input_text.is_some() || params.input.is_some()) {
         bail!("task update cannot clear and set input in the same request");
@@ -5160,27 +5153,20 @@ fn task_wait_governor(
     Ok(governor)
 }
 
-fn validate_tree_depth(tree: &TaskTree, maximum: usize) -> TaskRuntimeResult<()> {
-    let mut stack = vec![(tree, 1usize)];
-    while let Some((node, depth)) = stack.pop() {
-        if depth > maximum {
-            bail!("task tree exceeds server depth budget of {maximum}");
-        }
-        stack.extend(node.children.iter().map(|child| (child, depth + 1)));
-    }
-    Ok(())
-}
-
 fn clamp_task_page_limit(requested: Option<u32>, maximum: usize) -> u32 {
     let maximum = maximum.min(u32::MAX as usize).max(1) as u32;
     requested.unwrap_or(maximum).max(1).min(maximum)
 }
 
-fn ensure_response_budget<T: serde::Serialize>(
+fn ensure_paginated_response_budget<T: serde::Serialize>(
     response: &T,
+    item_count: usize,
     maximum: usize,
     operation: &str,
 ) -> TaskRuntimeResult<()> {
+    if item_count <= 1 {
+        return Ok(());
+    }
     struct Counter {
         bytes: usize,
         maximum: usize,
@@ -5193,18 +5179,23 @@ fn ensure_response_budget<T: serde::Serialize>(
             if self.bytes > self.maximum {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::FileTooLarge,
-                    "response budget exceeded",
+                    "response page limit exceeded",
                 ));
             }
             Ok(buffer.len())
         }
+
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let mut counter = Counter { bytes: 0, maximum };
+
+    let mut counter = Counter {
+        bytes: 0,
+        maximum: maximum.max(1),
+    };
     serde_json::to_writer(&mut counter, response)
-        .map_err(|_| anyhow!("{operation} response exceeds server byte budget"))?;
+        .map_err(|_| anyhow!("{operation} page is too large; retry with a smaller item limit"))?;
     Ok(())
 }
 
@@ -5320,5 +5311,18 @@ pub(crate) fn task_error(
         class,
         details: None,
         failed_run_id,
+    }
+}
+
+#[cfg(test)]
+mod resource_policy_tests {
+    use super::ensure_paginated_response_budget;
+
+    #[test]
+    fn page_size_target_never_hides_a_single_logical_record() {
+        let response = serde_json::json!({ "items": [{ "payload": "x".repeat(4096) }] });
+        ensure_paginated_response_budget(&response, 1, 64, "test page")
+            .expect("a single logical record must remain readable intact");
+        assert!(ensure_paginated_response_budget(&response, 2, 64, "test page").is_err());
     }
 }

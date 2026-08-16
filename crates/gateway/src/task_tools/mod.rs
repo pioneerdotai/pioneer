@@ -722,8 +722,6 @@ impl TaskToolAuthorizationScope {
             pioneer_tasks::TaskMutationContext::user(self.principal.principal_id.to_string());
         context.thread_id = Some(turn_context.thread_id.clone());
         context.turn_id = Some(turn_context.turn_id.clone());
-        context.task_resource_budget = crate::authorization::AuthorizationService::new()
-            .task_resource_budget(self.principal.kind, self.principal.role_key.as_ref());
         context
     }
 
@@ -1525,7 +1523,6 @@ impl TaskToolHandler {
             .limit
             .unwrap_or(DEFAULT_TASK_LIST_LIMIT)
             .max(1)
-            .min(100)
             .min(observation.budget.max_page_items.min(u32::MAX as usize) as u32);
         let current_execution_task_id = self
             .processor
@@ -1585,14 +1582,14 @@ impl TaskToolHandler {
                 crate::authorization::ResourceAction::TaskRead,
             )
             .await?;
-        let observation = authorization
+        let _observation = authorization
             .acquire_observation_page(self.processor.as_ref())
             .await?;
         let response = self
             .processor
             .task_runtime
             .service()
-            .get_task_with_budget(params, observation.budget)
+            .get_task(params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
         let payload =

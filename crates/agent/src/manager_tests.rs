@@ -805,6 +805,7 @@ fn explicit_mcp_tool_materialization(
         }),
         annotations: pioneer_tools::McpDynamicToolAnnotations::default(),
         timeout_ms: Some(5_000),
+        max_arguments_bytes: 128 * 1024,
         selection_reason: "explicit_composer_capability".to_owned(),
         capability_id: Some(capability_id.to_owned()),
     };

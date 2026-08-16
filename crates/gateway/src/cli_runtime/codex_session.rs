@@ -1474,7 +1474,6 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
             shutdown_grace: Duration::from_secs(2),
             event_receivers: StdMutex::new(Some(CLIAgentRuntimeCodexEventReceivers {
                 process_instance: process_instance.clone(),
-                native_event_budget: launch_spec.native_event_budget,
                 notifications,
                 server_requests,
                 diagnostics,
@@ -1717,7 +1716,6 @@ async fn resume_codex_thread_with_exact_isolation(
         return Err(error.into());
     }
     let open_params = codex_read_only_thread_open_params(params, persisted_cwd);
-    let expected_cwd = open_params.cwd.clone();
     let resume_result = match required_bridge {
         None => client
             .thread_resume_at_path(native_thread_id, open_params, stable_rollout_path, timeout)
@@ -1739,62 +1737,15 @@ async fn resume_codex_thread_with_exact_isolation(
         )
         .map(|(opened, ())| opened),
     };
-    let opened = match resume_result {
-        Ok(opened) => opened,
+    match resume_result {
+        Ok(opened) => Ok(opened),
         Err(error) => {
             if let Some(required_bridge) = required_bridge {
                 required_bridge.fail_closed().await;
             }
             return Err(error);
         }
-    };
-    match verify_oversized_codex_resume(
-        client,
-        opened,
-        native_thread_id,
-        expected_cwd.as_str(),
-        timeout,
-    )
-    .await
-    {
-        Ok(opened) => Ok(opened),
-        Err(error) => {
-            if let Some(required_bridge) = required_bridge {
-                required_bridge.fail_closed().await;
-            }
-            Err(error)
-        }
     }
-}
-
-async fn verify_oversized_codex_resume(
-    client: &CodexAppServerClient,
-    mut opened: CodexThreadOpenSnapshot,
-    expected_native_thread_id: &str,
-    expected_cwd: &str,
-    timeout: Duration,
-) -> Result<CodexThreadOpenSnapshot> {
-    if !opened.response_was_oversized {
-        return Ok(opened);
-    }
-    let verified = client
-        .thread_read_metadata(expected_native_thread_id, timeout)
-        .await
-        .context("Codex thread/read failed after discarding oversized thread/resume history")?;
-    if verified.native_thread_id != expected_native_thread_id || verified.cwd != expected_cwd {
-        bail!("Codex thread/resume post-verification returned mismatched native-thread metadata");
-    }
-    opened.native_thread_id = verified.native_thread_id.clone();
-    opened.cwd = Some(verified.cwd.clone());
-    opened.raw = serde_json::json!({
-        "thread": {
-            "id": verified.native_thread_id,
-            "cwd": verified.cwd,
-            "path": verified.rollout_path,
-        }
-    });
-    opened.response_was_oversized = false;
-    Ok(opened)
 }
 
 async fn attest_codex_exact_isolation(
@@ -3647,7 +3598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_thread_resume_postverifies_after_discarding_oversized_history() {
+    async fn codex_thread_resume_preserves_spooled_history() {
         let mut fake = FakeCodexIsolationServer::new();
         let client = fake.client.clone();
         let resume = tokio::spawn(async move {
@@ -3686,23 +3637,16 @@ mod tests {
         )
         .await;
 
-        let postverify = fake.read_request().await;
-        assert_eq!(postverify["method"], json!("thread/read"));
-        assert_eq!(postverify["params"]["includeTurns"], json!(false));
-        fake.write_result(
-            postverify["id"].clone(),
-            json!({ "thread": { "id": "native-thread", "cwd": "/persisted-cwd" } }),
-        )
-        .await;
-
         let opened = resume
             .await
             .expect("resume task should join")
-            .expect("oversized history should be discarded and verified");
+            .expect("spooled history should be preserved");
         assert_eq!(opened.native_thread_id, "native-thread");
         assert_eq!(opened.cwd.as_deref(), Some("/persisted-cwd"));
-        assert!(!opened.response_was_oversized);
-        assert!(opened.raw["thread"].get("turns").is_none());
+        assert_eq!(
+            opened.raw["thread"]["turns"][0],
+            json!("x".repeat(1024 * 1024 + 256))
+        );
     }
 
     #[tokio::test]

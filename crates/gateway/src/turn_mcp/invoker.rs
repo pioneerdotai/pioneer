@@ -142,7 +142,6 @@ pub(crate) struct ValidatedTurnMcpInvocation {
     pub(crate) manifest_hash: String,
     pub(crate) binding: TurnMcpBindingRecord,
     pub(crate) current_tool: CurrentMcpToolIdentity,
-    pub(crate) invocation_budget: pioneer_mcp::McpInvocationBudget,
     pub(crate) invocation_limits: pioneer_protocol::McpInvocationResourceLimits,
     _concurrency_permit: OwnedSemaphorePermit,
 }
@@ -239,7 +238,7 @@ impl McpInvocationGovernor {
             state: state.clone(),
         };
         let acquire = tokio::time::timeout(
-            Duration::from_millis(limits.max_timeout_ms),
+            Duration::from_millis(limits.max_queue_wait_ms),
             state.semaphore.clone().acquire_owned(),
         );
         let permit = tokio::select! {
@@ -252,7 +251,7 @@ impl McpInvocationGovernor {
                 Ok(Err(_)) => Err(internal_error("MCP invocation governor was closed")),
                 Err(_) => Err(invocation_error(
                     TurnMcpInvocationErrorCode::TimedOut,
-                    "MCP invocation timed out while waiting for capacity",
+                    "MCP invocation capacity wait timed out",
                 )),
             },
         };
@@ -322,16 +321,6 @@ impl GatewayTurnMcpInvoker {
         cancellation: &CancellationToken,
     ) -> Result<ValidatedTurnMcpInvocation, TurnMcpInvocationError> {
         validate_required_identity(&invocation)?;
-        pioneer_mcp::validate_mcp_arguments(
-            &invocation.arguments,
-            pioneer_mcp::McpInvocationBudget::default(),
-        )
-        .map_err(|error| {
-            invocation_error(
-                TurnMcpInvocationErrorCode::InvalidRequest,
-                format!("MCP invocation rejected: {}", error.reason_code()),
-            )
-        })?;
         let turn = self
             .crud_store
             .get_turn(invocation.thread_id.as_str(), invocation.turn_id.as_str())
@@ -405,23 +394,6 @@ impl GatewayTurnMcpInvoker {
         let invocation_limits = self
             .revalidate_execution_authorization(&invocation, &projection, &binding)
             .await?;
-        let invocation_budget = pioneer_mcp::McpInvocationBudget {
-            max_arguments_bytes: invocation_limits.max_arguments_bytes,
-            max_arguments_depth: invocation_limits.max_arguments_depth,
-            max_result_wire_bytes: invocation_limits.max_result_wire_bytes,
-            max_result_decoded_bytes: invocation_limits.max_result_decoded_bytes,
-            max_result_depth: invocation_limits.max_result_depth,
-            max_result_tokens: invocation_limits.max_result_tokens,
-            max_result_media: invocation_limits.max_result_media,
-        };
-        pioneer_mcp::validate_mcp_arguments(&invocation.arguments, invocation_budget).map_err(
-            |error| {
-                invocation_error(
-                    TurnMcpInvocationErrorCode::InvalidRequest,
-                    format!("MCP invocation rejected: {}", error.reason_code()),
-                )
-            },
-        )?;
         self.validate_origin_session(&invocation, &projection.manifest_hash, &binding)
             .await?;
         let current_tool = self
@@ -439,7 +411,6 @@ impl GatewayTurnMcpInvoker {
             manifest_hash: projection.manifest_hash,
             binding,
             current_tool,
-            invocation_budget,
             invocation_limits,
             _concurrency_permit: concurrency_permit,
         })
@@ -650,23 +621,7 @@ impl TurnMcpInvoker for GatewayTurnMcpInvoker {
         cancellation: CancellationToken,
     ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
         let validated = self.validate(invocation, &cancellation).await?;
-        let invocation_budget = validated.invocation_budget;
-        let result = self.execution.execute(validated, cancellation).await?;
-        pioneer_mcp::validate_mcp_result_parts(
-            &result.content,
-            result.structured_content.as_ref(),
-            result.is_error,
-            result.duration_ms,
-            result.meta.as_ref(),
-            invocation_budget,
-        )
-        .map_err(|error| {
-            invocation_error(
-                TurnMcpInvocationErrorCode::ResultInvalid,
-                format!("MCP result rejected: {}", error.reason_code()),
-            )
-        })?;
-        Ok(result)
+        self.execution.execute(validated, cancellation).await
     }
 }
 
@@ -728,10 +683,10 @@ fn internal_error(message: impl Into<String>) -> TurnMcpInvocationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn narrow_limits() -> pioneer_protocol::McpInvocationResourceLimits {
         pioneer_protocol::McpInvocationResourceLimits {
-            max_timeout_ms: 2_000,
             max_concurrent_calls: 1,
             max_queued_calls: 1,
             ..Default::default()
@@ -834,6 +789,30 @@ mod tests {
                 .load(Ordering::Acquire),
             0
         );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn governor_capacity_wait_has_a_recoverable_deadline() {
+        let governor = Arc::new(McpInvocationGovernor::default());
+        let limits = pioneer_protocol::McpInvocationResourceLimits {
+            max_queue_wait_ms: 10,
+            ..narrow_limits()
+        };
+        let first = governor
+            .acquire("turn-a", limits, &CancellationToken::new())
+            .await
+            .expect("first invocation acquires the active slot");
+        let result = governor
+            .acquire("turn-a", limits, &CancellationToken::new())
+            .await;
+        assert!(matches!(
+            result,
+            Err(TurnMcpInvocationError {
+                code: TurnMcpInvocationErrorCode::TimedOut,
+                ..
+            })
+        ));
         drop(first);
     }
 }

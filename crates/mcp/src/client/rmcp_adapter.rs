@@ -349,20 +349,13 @@ impl McpRuntimeSession for RmcpRuntimeSession {
                 McpRuntimeError::failed(format!("failed to encode MCP tool metadata: {error}"))
             })?;
 
-        let result = McpToolCallResult {
+        Ok(McpToolCallResult {
             content,
             structured_content: result.structured_content,
             is_error: result.is_error.unwrap_or(false),
             duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             meta,
-        };
-        crate::validate_mcp_result(&result, budget).map_err(|error| {
-            McpRuntimeError::failed(format!(
-                "MCP tools/call result rejected at transport boundary: {}",
-                error.reason_code()
-            ))
-        })?;
-        Ok(result)
+        })
     }
 
     async fn shutdown(&mut self) {

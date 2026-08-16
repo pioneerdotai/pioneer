@@ -28,7 +28,6 @@ pub struct TaskCreateContext {
     pub actor_id: Option<String>,
     pub conversation_snapshot: Option<TaskRunConversationSnapshotSeed>,
     pub execution_admission: Option<TaskExecutionAdmissionSeed>,
-    pub task_resource_budget: Option<pioneer_protocol::TaskResourceBudget>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -40,7 +39,6 @@ pub struct TaskMutationContext {
     /// blocked Agent Task. Ordinary mutations and non-Agent Tasks leave this
     /// empty.
     pub execution_admission: Option<TaskExecutionAdmissionSeed>,
-    pub task_resource_budget: Option<pioneer_protocol::TaskResourceBudget>,
 }
 
 impl TaskMutationContext {
@@ -50,7 +48,6 @@ impl TaskMutationContext {
             thread_id: Some(thread_id.into()),
             turn_id: Some(turn_id.into()),
             execution_admission: None,
-            task_resource_budget: None,
         }
     }
 
@@ -60,7 +57,6 @@ impl TaskMutationContext {
             thread_id: None,
             turn_id: None,
             execution_admission: None,
-            task_resource_budget: None,
         }
     }
 }

@@ -53,22 +53,28 @@ impl PermissionApprovalBroker for GatewayPermissionApprovalBroker {
         context: &PermissionEvaluationContext,
         invocation: &ToolInvocation,
     ) -> Result<PermissionEvaluationContext, String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let (respond_tx, respond_rx) = oneshot::channel();
         let request = GatewayPermissionContextRevalidationRequest {
             context: context.clone(),
             respond_to: respond_tx,
         };
-        if tokio::select! {
-            result = self.request_tx.send(GatewayPermissionApprovalEvent::Revalidate(request)) => result.is_err(),
-            _ = invocation.cancellation.cancelled() => true,
-        } {
-            return Err("tool permission authority broker is unavailable".to_owned());
+        tokio::select! {
+            result = self.request_tx.send(GatewayPermissionApprovalEvent::Revalidate(request)) => {
+                result.map_err(|_| "tool permission authority broker is unavailable".to_owned())?;
+            }
+            _ = invocation.cancellation.cancelled() => {
+                return Err("tool permission revalidation was cancelled".to_owned());
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err("tool permission revalidation timed out".to_owned());
+            }
         }
         tokio::select! {
             _ = invocation.cancellation.cancelled() => {
                 Err("tool permission revalidation was cancelled".to_owned())
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 Err("tool permission revalidation timed out".to_owned())
             }
             result = respond_rx => result.unwrap_or_else(|_| {
@@ -85,6 +91,8 @@ impl PermissionApprovalBroker for GatewayPermissionApprovalBroker {
         key: &PermissionRequestKey,
         reason: PermissionDecisionReason,
     ) -> PermissionApprovalResolution {
+        let deadline = tokio::time::Instant::now()
+            + crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT;
         let request_id = generate_id(21);
         let (respond_tx, respond_rx) = oneshot::channel();
         let request = GatewayPermissionApprovalRequest {
@@ -100,13 +108,20 @@ impl PermissionApprovalBroker for GatewayPermissionApprovalBroker {
             respond_to: respond_tx,
         };
 
-        if tokio::select! {
-            result = self.request_tx.send(GatewayPermissionApprovalEvent::Open(request)) => result.is_err(),
-            _ = invocation.cancellation.cancelled() => true,
-        } {
-            return PermissionApprovalResolution::Deny {
-                message: "permission approval broker is unavailable".to_owned(),
-            };
+        tokio::select! {
+            result = self.request_tx.send(GatewayPermissionApprovalEvent::Open(request)) => {
+                if result.is_err() {
+                    return PermissionApprovalResolution::Deny {
+                        message: "permission approval broker is unavailable".to_owned(),
+                    };
+                }
+            }
+            _ = invocation.cancellation.cancelled() => {
+                return PermissionApprovalResolution::Cancelled;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return PermissionApprovalResolution::Expired;
+            }
         }
 
         tokio::select! {
@@ -116,7 +131,7 @@ impl PermissionApprovalBroker for GatewayPermissionApprovalBroker {
                 });
                 PermissionApprovalResolution::Cancelled
             }
-            _ = tokio::time::sleep(crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 let _ = self.request_tx.try_send(GatewayPermissionApprovalEvent::Expired {
                     request_id,
                 });

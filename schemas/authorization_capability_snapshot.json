@@ -617,49 +617,19 @@
           "format": "uint",
           "minimum": 0
         },
-        "max_arguments_depth": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
         "max_concurrent_calls": {
           "type": "integer",
           "format": "uint",
           "minimum": 0
         },
+        "max_queue_wait_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "max_queued_calls": {
           "type": "integer",
           "format": "uint",
-          "minimum": 0
-        },
-        "max_result_decoded_bytes": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "max_result_depth": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "max_result_media": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "max_result_tokens": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "max_result_wire_bytes": {
-          "type": "integer",
-          "format": "uint",
-          "minimum": 0
-        },
-        "max_timeout_ms": {
-          "type": "integer",
-          "format": "uint64",
           "minimum": 0
         },
         "profile_version": {
@@ -672,13 +642,7 @@
       "required": [
         "profile_version",
         "max_arguments_bytes",
-        "max_arguments_depth",
-        "max_result_wire_bytes",
-        "max_result_decoded_bytes",
-        "max_result_depth",
-        "max_result_tokens",
-        "max_result_media",
-        "max_timeout_ms",
+        "max_queue_wait_ms",
         "max_concurrent_calls",
         "max_queued_calls"
       ]

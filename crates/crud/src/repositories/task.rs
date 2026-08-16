@@ -208,13 +208,15 @@ pub async fn list_tasks_by_parent_scoped<C: ConnectionTrait>(
 pub async fn list_tasks_by_root<C: ConnectionTrait>(
     db: &C,
     root_task_id: &str,
+    limit: Option<u64>,
 ) -> Result<Vec<task::Model>> {
-    task::Entity::find()
+    let mut query = task::Entity::find()
         .filter(task::Column::RootTaskId.eq(root_task_id.to_owned()))
-        .order_by_asc(task::Column::CreatedAt)
-        .all(db)
-        .await
-        .context("failed to list root task tree")
+        .order_by_asc(task::Column::CreatedAt);
+    if let Some(limit) = limit {
+        query = query.limit(limit);
+    }
+    query.all(db).await.context("failed to list root task tree")
 }
 
 pub async fn list_tasks_by_root_scoped<C: ConnectionTrait>(

@@ -4,20 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskResourceBudget {
     pub profile_version: u32,
-    pub max_encoded_bytes: usize,
-    pub max_title_bytes: usize,
-    pub max_string_bytes: usize,
-    pub max_collection_items: usize,
-    pub max_value_depth: usize,
-    pub max_value_nodes: usize,
-    pub min_interval_seconds: i64,
     pub max_page_items: usize,
-    pub max_response_bytes: usize,
+    pub max_page_bytes: usize,
     pub max_tree_nodes: usize,
-    pub max_tree_depth: usize,
     pub max_event_page_items: usize,
     pub max_wait_targets: usize,
     pub max_wait_duration_ms: u64,
@@ -27,21 +19,13 @@ pub struct TaskResourceBudget {
 impl Default for TaskResourceBudget {
     fn default() -> Self {
         Self {
-            profile_version: 1,
-            max_encoded_bytes: 512 * 1024,
-            max_title_bytes: 512,
-            max_string_bytes: 64 * 1024,
-            max_collection_items: 128,
-            max_value_depth: 32,
-            max_value_nodes: 4_096,
-            min_interval_seconds: 10,
+            profile_version: 5,
             max_page_items: 100,
-            max_response_bytes: 1024 * 1024,
+            max_page_bytes: 1024 * 1024,
             max_tree_nodes: 128,
-            max_tree_depth: 8,
             max_event_page_items: 200,
             max_wait_targets: 64,
-            max_wait_duration_ms: 120_000,
+            max_wait_duration_ms: 60 * 60 * 1_000,
             max_concurrent_waits: 4,
         }
     }

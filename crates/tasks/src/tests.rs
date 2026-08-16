@@ -501,7 +501,6 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
             },
             task_resources: TaskResourceBudget::default(),
         }),
-        task_resource_budget: Some(TaskResourceBudget::default()),
     }
 }
 
@@ -4513,7 +4512,7 @@ async fn invalid_interval_is_rejected() {
         )
         .await
         .expect_err("invalid interval should fail");
-    assert!(format!("{error:#}").contains("below resource minimum"));
+    assert!(format!("{error:#}").contains("must be at least 10 seconds"));
 }
 
 #[tokio::test]
@@ -5040,6 +5039,43 @@ async fn reschedule_updates_trigger_and_wakes_scheduler() {
         .await
         .expect("task should read");
     assert_eq!(task.runs.len(), 1);
+}
+
+#[tokio::test]
+async fn reschedule_cannot_bypass_minimum_interval() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 4_000_000_000,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("scheduled task should create");
+
+    let error = runtime
+        .service()
+        .reschedule_task(
+            TaskMutationContext::default(),
+            TaskRescheduleParams {
+                task_id: response.task.id,
+                trigger: TaskTriggerInput {
+                    spec: TaskTriggerSpec::Interval {
+                        interval_seconds: 1,
+                        interval_anchor_at: None,
+                        catch_up_policy: None,
+                    },
+                },
+            },
+        )
+        .await
+        .expect_err("reschedule must enforce the shared minimum interval");
+
+    assert!(error.to_string().contains("at least 10 seconds"));
 }
 
 #[tokio::test]
@@ -5652,6 +5688,47 @@ async fn wait_timeout_returns_partial_pending_state() {
         )
         .await
         .expect("wait should return timeout");
+    assert!(waited.timed_out);
+    assert_eq!(waited.pending.len(), 1);
+}
+
+#[tokio::test]
+async fn wait_without_requested_timeout_uses_the_role_deadline() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Manual {
+                allowed_actor: None,
+            }),
+        )
+        .await
+        .expect("task should create");
+    let budget = TaskResourceBudget {
+        max_wait_duration_ms: 5,
+        ..TaskResourceBudget::default()
+    };
+
+    let waited = runtime
+        .service()
+        .wait_tasks(
+            TaskWaitContext {
+                task_resource_budget: Some(budget),
+                ..TaskWaitContext::default()
+            },
+            TaskWaitParams {
+                task_ids: vec![response.task.id],
+                run_ids: Vec::new(),
+                timeout_ms: None,
+                return_completed: true,
+                return_pending: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("wait should return control at the role deadline");
+
     assert!(waited.timed_out);
     assert_eq!(waited.pending.len(), 1);
 }
@@ -6614,35 +6691,4 @@ async fn role_owned_task_observation_budget_clamps_list_and_event_pages() {
         .expect("bounded task events should succeed");
     assert_eq!(events.events.len(), 1);
     assert!(events.has_more);
-}
-
-#[tokio::test]
-async fn role_owned_task_observation_budget_rejects_oversized_response() {
-    let runtime = runtime().await;
-    let response = runtime
-        .service()
-        .create_task(
-            TaskCreateContext::default(),
-            create_params(TaskTriggerSpec::Manual {
-                allowed_actor: None,
-            }),
-        )
-        .await
-        .expect("task should create");
-    let budget = TaskResourceBudget {
-        max_response_bytes: 1,
-        ..TaskResourceBudget::default()
-    };
-
-    let error = runtime
-        .service()
-        .get_task_with_budget(
-            pioneer_protocol::TaskGetParams {
-                task_id: response.task.id,
-            },
-            budget,
-        )
-        .await
-        .expect_err("oversized observation response must fail closed");
-    assert!(format!("{error:#}").contains("task get response exceeds"));
 }

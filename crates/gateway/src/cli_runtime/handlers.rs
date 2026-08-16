@@ -2283,30 +2283,7 @@ impl MessageProcessor {
             if now_unix_ms.saturating_sub(pending.created_at.timestamp_millis())
                 >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
             {
-                if let Some(turn_id) = pending.turn_id.as_deref() {
-                    if let Err(error) =
-                        message_future(self.reconcile_cli_runtime_human_wait_for_turn(
-                            turn_id,
-                            now_unix_ms,
-                            "CLI runtime request response",
-                        ))
-                        .await
-                    {
-                        self.send_error(
-                            connection_id,
-                            cli_runtime_public_error(
-                                Some(request_id),
-                                INVALID_REQUEST_CODE,
-                                format!(
-                                    "failed to handle expired CLI runtime request `{}` after user response timeout: {error:#}",
-                                    pending.request_id
-                                ),
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
-                } else if let Err(error) = self
+                if let Err(error) = self
                     .expire_cli_runtime_pending_request_as_stale(&pending)
                     .await
                 {
@@ -2316,7 +2293,7 @@ impl MessageProcessor {
                             Some(request_id),
                             INVALID_REQUEST_CODE,
                             format!(
-                                "failed to expire CLI runtime request `{}` after user response timeout: {error:#}",
+                                "failed to expire CLI runtime request `{}` after the human response deadline: {error:#}",
                                 pending.request_id
                             ),
                         ),
@@ -2330,8 +2307,8 @@ impl MessageProcessor {
                         Some(request_id),
                         INVALID_PARAMS_CODE,
                         format!(
-                            "CLI runtime request `{}` expired after waiting for user response for {} ms",
-                            pending.request_id, CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
+                            "CLI runtime request `{}` expired before this response arrived",
+                            pending.request_id
                         ),
                     ),
                 )
@@ -3393,7 +3370,6 @@ impl MessageProcessor {
         debug_native_events: bool,
     ) {
         let processor = self.clone();
-        let native_event_budget = receivers.native_event_budget;
         tokio::spawn(async move {
             let key = instance.key();
             let mut events = receivers.events;
@@ -3410,7 +3386,6 @@ impl MessageProcessor {
                             runtime_kind.as_str(),
                             &event,
                             debug_native_events,
-                            native_event_budget,
                         )
                         .await;
                 }
@@ -3441,7 +3416,6 @@ impl MessageProcessor {
         receivers: CLIAgentRuntimeCodexEventReceivers,
         debug_native_events: bool,
     ) {
-        let native_event_budget = receivers.native_event_budget;
         let options = RuntimeEventMappingOptions {
             include_redacted_native_payload: debug_native_events,
         };
@@ -3483,7 +3457,6 @@ impl MessageProcessor {
                             notification.method.as_str(),
                             notification.params.as_ref(),
                             debug_native_events,
-                            native_event_budget,
                         )
                         .await;
                 }
@@ -3546,7 +3519,6 @@ impl MessageProcessor {
                         request.method.as_str(),
                         request.params.as_ref(),
                         debug_native_events,
-                        native_event_budget,
                     )
                     .await;
                 let event = map_codex_server_request_event(&request, options);
@@ -3687,10 +3659,7 @@ impl MessageProcessor {
             "activeTurnIds": active_turn_ids,
             "reason": sanitize_runtime_diagnostic_line(reason),
         });
-        let payload_redacted_json = match bounded_cli_runtime_journal_json(
-            &gap_payload,
-            pioneer_cli_agent_runtime::NativeEventBudget::default().max_journal_payload_bytes,
-        ) {
+        let payload_redacted_json = match serde_json::to_string(&gap_payload) {
             Ok(payload) => payload,
             Err(error) => {
                 warn!(
@@ -3762,7 +3731,6 @@ impl MessageProcessor {
         native_method: &str,
         params: Option<&JsonValue>,
         include_payload: bool,
-        native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
     ) {
         if !self.cli_runtime_instance_is_current(instance).await {
             self.audit_stale_cli_runtime_process_activity(instance, "native_journal");
@@ -3807,10 +3775,7 @@ impl MessageProcessor {
                 "nativeItemId": native_item_id,
             })
         };
-        let payload_redacted_json = match bounded_cli_runtime_journal_json(
-            &payload,
-            native_event_budget.max_journal_payload_bytes,
-        ) {
+        let payload_redacted_json = match serde_json::to_string(&payload) {
             Ok(payload) => payload,
             Err(error) => {
                 warn!(
@@ -3859,7 +3824,6 @@ impl MessageProcessor {
         runtime_kind: &str,
         event: &RuntimeEvent,
         include_payload: bool,
-        native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
     ) {
         if !self.cli_runtime_instance_is_current(instance).await {
             self.audit_stale_cli_runtime_process_activity(instance, "canonical_journal");
@@ -3890,10 +3854,7 @@ impl MessageProcessor {
                 "nativeItemId": native_item_id,
             })
         };
-        let payload_redacted_json = match bounded_cli_runtime_journal_json(
-            &payload,
-            native_event_budget.max_journal_payload_bytes,
-        ) {
+        let payload_redacted_json = match serde_json::to_string(&payload) {
             Ok(payload) => payload,
             Err(error) => {
                 warn!(
@@ -5931,52 +5892,41 @@ impl MessageProcessor {
             return Ok(false);
         }
 
-        human_requests.sort_by_key(|request| request.created_at);
-        let expired = human_requests
-            .iter()
-            .filter(|request| {
-                now_unix_ms.saturating_sub(request.created_at.timestamp_millis())
-                    >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
-            })
-            .collect::<Vec<_>>();
-        if expired.is_empty() {
+        let mut still_waiting = Vec::with_capacity(human_requests.len());
+        let mut expired_any = false;
+        for request in human_requests {
+            let wait_ms = now_unix_ms.saturating_sub(request.created_at.timestamp_millis());
+            if wait_ms < CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS {
+                still_waiting.push(request);
+                continue;
+            }
+            self.expire_cli_runtime_pending_request_as_stale(&request)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to expire CLI runtime request `{}` after the human response deadline",
+                        request.request_id
+                    )
+                })?;
+            expired_any = true;
+        }
+        if still_waiting.is_empty() {
             debug!(
                 turn_id,
-                source,
-                request_count = human_requests.len(),
-                "deferred turn timeout while waiting for CLI runtime user response"
+                source, "released CLI runtime turn after all pending human requests expired"
             );
-            return Ok(true);
+            // The expiry response has just returned control to the runtime.
+            // Skip this timeout pass so the model gets a chance to choose an
+            // alternative before an already-old item deadline is evaluated.
+            return Ok(expired_any);
         }
 
-        let first_expired = expired[0];
-        let wait_ms = now_unix_ms.saturating_sub(first_expired.created_at.timestamp_millis());
-        let reason = format!(
-            "CLI runtime turn `{turn_id}` was blocked because pending user response request `{}` ({}) was not answered within {} ms",
-            first_expired.request_id,
-            first_expired.request_kind,
-            CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
-        );
-        warn!(
-            workspace_id = first_expired.workspace_id.as_str(),
-            runtime_id = first_expired.runtime_id.as_str(),
-            thread_id = first_expired.thread_id.as_str(),
+        debug!(
             turn_id,
-            request_id = first_expired.request_id.as_str(),
-            request_kind = first_expired.request_kind.as_str(),
-            wait_ms,
             source,
-            "blocking CLI runtime turn after human response timeout"
+            request_count = still_waiting.len(),
+            "deferred turn timeout while waiting for CLI runtime user response"
         );
-        if !self
-            .mark_turn_blocked(first_expired.thread_id.clone(), turn_id.to_owned(), reason)
-            .await
-        {
-            anyhow::bail!(
-                "failed to mark CLI runtime turn `{turn_id}` blocked after human response timeout for request `{}`",
-                first_expired.request_id
-            );
-        }
         Ok(true)
     }
 
@@ -8311,6 +8261,32 @@ impl MessageProcessor {
             )),
         }?;
         if let Some(expired) = expired.as_ref() {
+            if cli_runtime_pending_request_is_human_wait(expired.request_kind.as_str()) {
+                match self
+                    .cli_runtime_existing_session_for_pending_request(expired)
+                    .await
+                {
+                    Ok(session) => {
+                        if let Err(error) = self
+                            .respond_to_cli_runtime_native_request(expired, &resolution, session)
+                            .await
+                        {
+                            warn!(
+                                request_id = expired.request_id.as_str(),
+                                error = %format!("{error:#}"),
+                                "failed to return expired human request to CLI runtime"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            request_id = expired.request_id.as_str(),
+                            error = %format!("{error:#}"),
+                            "CLI runtime response lane was unavailable while expiring human request"
+                        );
+                    }
+                }
+            }
             if cli_runtime_kind_config_from_stored_kind(expired.runtime_kind.as_str())
                 == Some(GatewayCliAgentRuntimeKindConfig::Codex)
                 && let Some(pending) = self
@@ -10526,41 +10502,6 @@ fn json_string_path(value: &JsonValue, path: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
-struct BoundedCliRuntimeJsonWriter {
-    bytes: Vec<u8>,
-    max_bytes: usize,
-}
-
-impl std::io::Write for BoundedCliRuntimeJsonWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
-            return Err(std::io::Error::other(format!(
-                "CLI runtime journal payload exceeds {} bytes",
-                self.max_bytes
-            )));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn bounded_cli_runtime_journal_json(value: &JsonValue, max_bytes: usize) -> anyhow::Result<String> {
-    if max_bytes == 0 {
-        anyhow::bail!("CLI runtime journal payload budget cannot be zero");
-    }
-    let mut writer = BoundedCliRuntimeJsonWriter {
-        bytes: Vec::with_capacity(max_bytes.min(8 * 1024)),
-        max_bytes,
-    };
-    serde_json::to_writer(&mut writer, value)
-        .context("failed to serialize bounded CLI runtime journal payload")?;
-    String::from_utf8(writer.bytes).context("CLI runtime journal JSON is not UTF-8")
-}
-
 fn redact_cli_runtime_native_payload(value: &JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(object) => JsonValue::Object(
@@ -10603,7 +10544,7 @@ fn codex_command_approval_decision_from_resolution(
         CLIRuntimeRequestResolution::Approved => Ok(CodexCommandApprovalDecision::Accept),
         CLIRuntimeRequestResolution::Denied { .. } => Ok(CodexCommandApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Cancelled => Ok(CodexCommandApprovalDecision::Cancel),
-        CLIRuntimeRequestResolution::Expired => Ok(CodexCommandApprovalDecision::Cancel),
+        CLIRuntimeRequestResolution::Expired => Ok(CodexCommandApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Error { .. } => Ok(CodexCommandApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Answered { .. } => anyhow::bail!(
             "command approvals accept only canonical approve, deny, or cancel decisions"
@@ -10618,7 +10559,7 @@ fn codex_file_change_approval_decision_from_resolution(
         CLIRuntimeRequestResolution::Approved => Ok(CodexFileChangeApprovalDecision::Accept),
         CLIRuntimeRequestResolution::Denied { .. } => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Cancelled => Ok(CodexFileChangeApprovalDecision::Cancel),
-        CLIRuntimeRequestResolution::Expired => Ok(CodexFileChangeApprovalDecision::Cancel),
+        CLIRuntimeRequestResolution::Expired => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Error { .. } => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Answered { .. } => anyhow::bail!(
             "file-change approvals accept only canonical approve, deny, or cancel decisions"
@@ -10650,11 +10591,18 @@ fn claude_permission_response_from_resolution(
                 "message": reason.clone().unwrap_or_else(|| "Denied by user".to_owned()),
             })
         }
-        CLIRuntimeRequestResolution::Cancelled | CLIRuntimeRequestResolution::Expired => {
+        CLIRuntimeRequestResolution::Cancelled => {
             json!({
                 "behavior": "deny",
                 "message": "Cancelled",
                 "interrupt": true,
+            })
+        }
+        CLIRuntimeRequestResolution::Expired => {
+            json!({
+                "behavior": "deny",
+                "message": "User response deadline expired",
+                "interrupt": false,
             })
         }
         CLIRuntimeRequestResolution::Error { message } => {
@@ -10664,10 +10612,7 @@ fn claude_permission_response_from_resolution(
             })
         }
     };
-    let should_interrupt = matches!(
-        resolution,
-        CLIRuntimeRequestResolution::Cancelled | CLIRuntimeRequestResolution::Expired
-    );
+    let should_interrupt = matches!(resolution, CLIRuntimeRequestResolution::Cancelled);
     Ok((response, should_interrupt))
 }
 
@@ -10678,12 +10623,10 @@ fn file_change_approval_timeline_status_for_resolution(
         CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::Answered { .. } => {
             "approval_accepted"
         }
-        CLIRuntimeRequestResolution::Denied { .. } | CLIRuntimeRequestResolution::Error { .. } => {
-            "approval_declined"
-        }
-        CLIRuntimeRequestResolution::Cancelled | CLIRuntimeRequestResolution::Expired => {
-            "approval_cancelled"
-        }
+        CLIRuntimeRequestResolution::Denied { .. }
+        | CLIRuntimeRequestResolution::Expired
+        | CLIRuntimeRequestResolution::Error { .. } => "approval_declined",
+        CLIRuntimeRequestResolution::Cancelled => "approval_cancelled",
     }
 }
 
@@ -11192,17 +11135,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn native_journal_serialization_enforces_encoded_byte_ceiling() {
-        let value = json!({ "payload": "x".repeat(128) });
-        let exact = serde_json::to_string(&value).expect("fixture serializes");
-        assert_eq!(
-            bounded_cli_runtime_journal_json(&value, exact.len()).expect("exact boundary is valid"),
-            exact
-        );
-        assert!(bounded_cli_runtime_journal_json(&value, exact.len() - 1).is_err());
     }
 
     fn effective_instance(

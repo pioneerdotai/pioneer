@@ -3859,11 +3859,29 @@ impl MessageProcessor {
             .await?;
         let now_unix_ms = now_unix.saturating_mul(1_000);
         let mut timed_out = Vec::new();
+        let mut human_waits = HashMap::<String, bool>::new();
         let mut cli_runtime_activity =
             HashMap::<String, crate::resilience::RuntimeTimeoutObservation>::new();
         let mut native_runtime_activity =
             HashMap::<String, crate::resilience::RuntimeTimeoutObservation>::new();
         for candidate in candidates {
+            let human_wait_active = if let Some(active) = human_waits.get(&candidate.turn_id) {
+                *active
+            } else {
+                let active = self
+                    .reconcile_cli_runtime_human_wait_for_turn(
+                        candidate.turn_id.as_str(),
+                        now_unix_ms,
+                        "timeout supervisor",
+                    )
+                    .await?;
+                human_waits.insert(candidate.turn_id.clone(), active);
+                active
+            };
+            if human_wait_active {
+                continue;
+            }
+
             let cli_observation = if let Some(observation) =
                 cli_runtime_activity.get(&candidate.turn_id)
             {
@@ -3928,16 +3946,6 @@ impl MessageProcessor {
                 crate::resilience::RuntimeTimeoutObservation::NotApplicable
                 | crate::resilience::RuntimeTimeoutObservation::Active
                 | crate::resilience::RuntimeTimeoutObservation::Unavailable => {}
-            }
-            if self
-                .reconcile_cli_runtime_human_wait_for_turn(
-                    candidate.turn_id.as_str(),
-                    now_unix_ms,
-                    "timeout supervisor",
-                )
-                .await?
-            {
-                continue;
             }
             if self
                 .timeout_supervisor

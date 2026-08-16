@@ -35,6 +35,6 @@ mod tests {
 }
 mod native_event;
 pub use native_event::{
-    BoundedNativeEventCodec, BoundedNativeFrame, NativeEventBudget, NativeIngressError,
-    NativeIngressErrorKind,
+    BoundedNativeEventCodec, NativeEventBudget, NativeIngressError, NativeIngressErrorKind,
+    SpooledNativeFrame,
 };

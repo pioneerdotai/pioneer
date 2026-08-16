@@ -254,6 +254,8 @@ impl ResolvedMcpTurnTool {
             parameters: canonical_schema.canonical_schema,
             annotations: self.annotations.clone().unwrap_or_default(),
             timeout_ms: Some(self.timeout_ms),
+            max_arguments_bytes: pioneer_protocol::McpInvocationResourceLimits::default()
+                .max_arguments_bytes,
             selection_reason: self.selection_reason.legacy_binding_value().to_owned(),
             capability_id: self.capability_id.clone(),
         }

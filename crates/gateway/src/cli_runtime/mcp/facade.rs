@@ -873,7 +873,6 @@ impl CliMcpToolFacade {
         if !arguments.is_object() {
             return Err(invalid_params());
         }
-        validate_arguments(&arguments, &self.limits)?;
         let progress_token = parse_progress_token(params.get("_meta"))?;
         let cancellation = authorization.cancellation.child_token();
         let process_instance = &context.bound_grant.scope().process_instance;
@@ -888,13 +887,7 @@ impl CliMcpToolFacade {
         };
         let leader = match self.ledger.begin(key, identity, cancellation.clone()) {
             Ok(CliMcpLedgerBegin::Follower(receiver)) => {
-                return wait_for_cached_outcome(
-                    receiver,
-                    self.limits
-                        .max_queue_wait
-                        .saturating_add(self.limits.max_execution_duration),
-                )
-                .await;
+                return wait_for_cached_outcome(receiver).await;
             }
             Ok(CliMcpLedgerBegin::Leader(leader)) => leader,
             Err(CliMcpLedgerBeginError::ConflictingDuplicate) => {
@@ -986,19 +979,7 @@ impl CliMcpToolFacade {
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(cancelled_error()),
-            outcome = timeout(self.limits.max_execution_duration, invocation) => {
-                match outcome {
-                    Ok(outcome) => outcome.map_err(invocation_error)?,
-                    Err(_) => {
-                        cancellation.cancel();
-                        return Err(FacadeProtocolError::new(
-                            FACADE_CALL_FAILED,
-                            "MCP tool call exceeded the facade execution limit",
-                            "execution_timed_out",
-                        ));
-                    }
-                }
-            }
+            outcome = invocation => outcome.map_err(invocation_error)?,
         };
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
@@ -1018,7 +999,6 @@ impl CliMcpToolFacade {
             .await;
         }
         let result = canonical_call_result(result)?;
-        validate_result(&result, &self.limits)?;
         Ok(result)
     }
 
@@ -1127,25 +1107,14 @@ impl FacadeProtocolError {
 
 async fn wait_for_cached_outcome(
     mut receiver: watch::Receiver<Option<Arc<CliMcpCachedOutcome>>>,
-    maximum: std::time::Duration,
 ) -> CliMcpCachedOutcome {
-    let wait = async {
-        loop {
-            if let Some(outcome) = receiver.borrow().clone() {
-                return (*outcome).clone();
-            }
-            if receiver.changed().await.is_err() {
-                return Err(shutting_down_error());
-            }
+    loop {
+        if let Some(outcome) = receiver.borrow().clone() {
+            return (*outcome).clone();
         }
-    };
-    match timeout(maximum, wait).await {
-        Ok(outcome) => outcome,
-        Err(_) => Err(FacadeProtocolError::new(
-            FACADE_BUSY,
-            "duplicate MCP request wait limit was exceeded",
-            "duplicate_wait_timed_out",
-        )),
+        if receiver.changed().await.is_err() {
+            return Err(shutting_down_error());
+        }
     }
 }
 
@@ -1169,72 +1138,6 @@ fn reserve_queue_slot(queued: &AtomicUsize, maximum: usize) -> Result<(), Facade
             Err(observed) => current = observed,
         }
     }
-}
-
-fn validate_arguments(
-    arguments: &JsonValue,
-    limits: &CliMcpFacadeLimits,
-) -> Result<(), FacadeProtocolError> {
-    pioneer_mcp::validate_mcp_arguments(arguments, common_invocation_budget(limits)).map_err(
-        |error| {
-            FacadeProtocolError::new(
-                FACADE_LIMIT_EXCEEDED,
-                "MCP tool arguments exceed the shared invocation budget",
-                error.reason_code(),
-            )
-        },
-    )
-}
-
-fn common_invocation_budget(limits: &CliMcpFacadeLimits) -> pioneer_mcp::McpInvocationBudget {
-    pioneer_mcp::McpInvocationBudget {
-        max_arguments_bytes: limits.max_arguments_bytes,
-        max_arguments_depth: limits.max_arguments_depth,
-        max_result_wire_bytes: limits.max_result_bytes,
-        max_result_decoded_bytes: limits.max_result_bytes,
-        max_result_depth: limits.max_arguments_depth,
-        max_result_tokens: limits.max_result_tokens,
-        max_result_media: limits.max_result_images,
-    }
-}
-
-fn validate_result(
-    result: &JsonValue,
-    limits: &CliMcpFacadeLimits,
-) -> Result<(), FacadeProtocolError> {
-    let content = result.get("content").ok_or_else(|| {
-        FacadeProtocolError::new(
-            INTERNAL_ERROR,
-            "MCP result is missing content",
-            "result_invalid",
-        )
-    })?;
-    pioneer_mcp::validate_mcp_result_parts(
-        content,
-        result
-            .get("structuredContent")
-            .filter(|value| !value.is_null()),
-        result
-            .get("isError")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false),
-        result
-            .get("durationMs")
-            .and_then(JsonValue::as_u64)
-            .unwrap_or_default(),
-        result
-            .get("_meta")
-            .or_else(|| result.get("meta"))
-            .filter(|value| !value.is_null()),
-        common_invocation_budget(limits),
-    )
-    .map_err(|error| {
-        FacadeProtocolError::new(
-            FACADE_LIMIT_EXCEEDED,
-            "MCP tool result exceeds the shared invocation budget",
-            error.reason_code(),
-        )
-    })
 }
 
 fn json_fingerprint(value: &JsonValue) -> Result<String, FacadeProtocolError> {
@@ -2052,23 +1955,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_mcp_limits_reject_arguments_before_shared_invoker() {
-        let (facade, invoker, mut context, coordinator) =
-            fixture(vec![fixture_tool("read")], basic_result(json!([]))).await;
-        initialize(&facade, &context).await;
-        activate(&facade, &mut context, &coordinator, "turn").await;
-        let response = facade
-            .handle_message(
-                &context,
-                call_message(json!(1), json!({"payload": "x".repeat(129 * 1024)})),
-            )
-            .await
-            .expect("limit response");
-        assert_eq!(response["error"]["data"]["kind"], "arguments_too_large");
-        assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 0);
-    }
-
-    #[tokio::test]
     async fn cli_mcp_limits_reject_frame_before_json_allocation() {
         let invoker = Arc::new(RecordingInvoker {
             calls: AtomicUsize::new(0),
@@ -2077,8 +1963,6 @@ mod tests {
         });
         let mut limits = CliMcpFacadeLimits::default();
         limits.max_frame_bytes = 2_048;
-        limits.max_arguments_bytes = 256;
-        limits.max_result_bytes = 512;
         let (facade, context, _) = fixture_with_invoker(Vec::new(), invoker.clone(), limits).await;
         let response = facade
             .handle_bytes(&context, &vec![b'x'; 2_049])
@@ -2090,27 +1974,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_mcp_limits_reject_oversized_result_without_truncated_success() {
+    async fn cli_mcp_large_result_is_not_rejected_after_completion() {
+        let text = "x".repeat(2 * 1024 * 1024);
         let (facade, invoker, mut context, coordinator) = fixture(
             vec![fixture_tool("read")],
             basic_result(json!([{
                 "type": "text",
-                "text": "x".repeat(300 * 1024),
+                "text": text,
             }])),
         )
         .await;
         initialize(&facade, &context).await;
         activate(&facade, &mut context, &coordinator, "turn").await;
+
         let response = facade
             .handle_message(&context, call_message(json!(1), json!({})))
             .await
-            .expect("limit response");
-        assert_eq!(
-            response["error"]["data"]["kind"],
-            "result_token_limit_exceeded"
-        );
-        assert!(response.get("result").is_none());
+            .expect("large valid result should remain successful");
+
         assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(response.get("error").is_none());
+        assert_eq!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .map(str::len),
+            Some(2 * 1024 * 1024)
+        );
     }
 
     #[tokio::test]
@@ -2304,26 +2193,6 @@ mod tests {
             "cancelled"
         );
         assert_eq!(facade.queued_calls.load(Ordering::Acquire), 0);
-        assert!(facade.shutdown().await.drained);
-    }
-
-    #[tokio::test]
-    async fn cli_mcp_limits_cancel_execution_at_facade_deadline() {
-        let invoker = Arc::new(CancellationInvoker {
-            calls: AtomicUsize::new(0),
-        });
-        let mut limits = CliMcpFacadeLimits::default();
-        limits.max_execution_duration = std::time::Duration::from_millis(10);
-        let (facade, mut context, coordinator) =
-            fixture_with_invoker(vec![fixture_tool("read")], invoker.clone(), limits).await;
-        initialize(&facade, &context).await;
-        activate(&facade, &mut context, &coordinator, "turn").await;
-        let response = facade
-            .handle_message(&context, call_message(json!(1), json!({})))
-            .await
-            .expect("timeout");
-        assert_eq!(response["error"]["data"]["kind"], "execution_timed_out");
-        assert_eq!(invoker.calls.load(AtomicOrdering::SeqCst), 1);
         assert!(facade.shutdown().await.drained);
     }
 

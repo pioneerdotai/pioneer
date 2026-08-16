@@ -226,7 +226,6 @@ mod tests {
                 .clone()
                 .with_native_event_budget(pioneer_cli_agent_runtime::NativeEventBudget {
                     max_frame_bytes: 4_096,
-                    max_string_bytes: 1_024,
                     ..pioneer_cli_agent_runtime::NativeEventBudget::default()
                 });
         assert!(requires_restart(&first, &narrowed));

@@ -125,13 +125,7 @@ pub struct AuthorizationExecutionResourceLimits {
 pub struct McpInvocationResourceLimits {
     pub profile_version: u32,
     pub max_arguments_bytes: usize,
-    pub max_arguments_depth: usize,
-    pub max_result_wire_bytes: usize,
-    pub max_result_decoded_bytes: usize,
-    pub max_result_depth: usize,
-    pub max_result_tokens: usize,
-    pub max_result_media: usize,
-    pub max_timeout_ms: u64,
+    pub max_queue_wait_ms: u64,
     pub max_concurrent_calls: usize,
     pub max_queued_calls: usize,
 }
@@ -139,15 +133,9 @@ pub struct McpInvocationResourceLimits {
 impl Default for McpInvocationResourceLimits {
     fn default() -> Self {
         Self {
-            profile_version: 1,
+            profile_version: 5,
             max_arguments_bytes: 128 * 1024,
-            max_arguments_depth: 32,
-            max_result_wire_bytes: 1024 * 1024,
-            max_result_decoded_bytes: 1024 * 1024,
-            max_result_depth: 32,
-            max_result_tokens: 64 * 1024,
-            max_result_media: 8,
-            max_timeout_ms: 120_000,
+            max_queue_wait_ms: 120_000,
             max_concurrent_calls: 8,
             max_queued_calls: 16,
         }
@@ -158,13 +146,7 @@ impl McpInvocationResourceLimits {
     pub const fn is_valid(self) -> bool {
         self.profile_version > 0
             && self.max_arguments_bytes > 0
-            && self.max_arguments_depth > 0
-            && self.max_result_wire_bytes > 0
-            && self.max_result_decoded_bytes > 0
-            && self.max_result_depth > 0
-            && self.max_result_tokens > 0
-            && self.max_result_media > 0
-            && self.max_timeout_ms > 0
+            && self.max_queue_wait_ms > 0
             && self.max_concurrent_calls > 0
             && self.max_queued_calls > 0
     }
@@ -182,19 +164,7 @@ impl McpInvocationResourceLimits {
         Some(Self {
             profile_version: self.profile_version,
             max_arguments_bytes: min_usize(self.max_arguments_bytes, current.max_arguments_bytes),
-            max_arguments_depth: min_usize(self.max_arguments_depth, current.max_arguments_depth),
-            max_result_wire_bytes: min_usize(
-                self.max_result_wire_bytes,
-                current.max_result_wire_bytes,
-            ),
-            max_result_decoded_bytes: min_usize(
-                self.max_result_decoded_bytes,
-                current.max_result_decoded_bytes,
-            ),
-            max_result_depth: min_usize(self.max_result_depth, current.max_result_depth),
-            max_result_tokens: min_usize(self.max_result_tokens, current.max_result_tokens),
-            max_result_media: min_usize(self.max_result_media, current.max_result_media),
-            max_timeout_ms: min_u64(self.max_timeout_ms, current.max_timeout_ms),
+            max_queue_wait_ms: min_u64(self.max_queue_wait_ms, current.max_queue_wait_ms),
             max_concurrent_calls: min_usize(
                 self.max_concurrent_calls,
                 current.max_concurrent_calls,
@@ -381,19 +351,16 @@ mod tests {
     fn mcp_resource_intersection_never_widens_either_ceiling() {
         let admitted = McpInvocationResourceLimits {
             max_arguments_bytes: 8_000,
-            max_timeout_ms: 4_000,
             max_concurrent_calls: 2,
             ..Default::default()
         };
         let current = McpInvocationResourceLimits {
             max_arguments_bytes: 4_000,
-            max_timeout_ms: 8_000,
             max_concurrent_calls: 1,
             ..Default::default()
         };
         let effective = admitted.intersect(current).expect("compatible profiles");
         assert_eq!(effective.max_arguments_bytes, 4_000);
-        assert_eq!(effective.max_timeout_ms, 4_000);
         assert_eq!(effective.max_concurrent_calls, 1);
 
         let incompatible = McpInvocationResourceLimits {

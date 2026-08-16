@@ -1293,22 +1293,34 @@ impl McpService {
         let _upstream_cancellation_guard = McpUpstreamCancellationGuard {
             cancellation: upstream_cancellation.clone(),
         };
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms.max(1));
         let (response_tx, response_rx) = oneshot::channel();
-        call_tx
-            .send(McpServerCallCommand {
-                request: request.clone(),
-                cancellation: upstream_cancellation.clone(),
-                response_tx,
-            })
-            .await
-            .map_err(|_| {
+        let command = McpServerCallCommand {
+            request: request.clone(),
+            cancellation: upstream_cancellation.clone(),
+            response_tx,
+        };
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(pioneer_tools::ToolError::cancelled(
+                    "MCP invocation cancelled before gateway runtime dispatch",
+                ));
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(pioneer_tools::ToolError::execution_failed(
+                    "MCP tool request timed out while waiting for runtime capacity",
+                ));
+            }
+            result = call_tx.send(command) => result.map_err(|_| {
                 pioneer_tools::ToolError::ExecutionFailed(format!(
                     "MCP server `{}` task is unavailable",
                     row.name
                 ))
-            })?;
+            })?,
+        }
 
-        let wait_timeout = Duration::from_millis(request.timeout_ms.max(1));
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
@@ -1317,7 +1329,7 @@ impl McpService {
                     "MCP invocation cancelled while awaiting the gateway runtime",
                 ))
             }
-            _ = tokio::time::sleep(wait_timeout) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 upstream_cancellation.cancel();
                 Err(pioneer_tools::ToolError::execution_failed(
                     "MCP tool request timed out",
@@ -1718,7 +1730,9 @@ impl McpService {
                             .call_tool(
                                 raw_tool_name.as_str(),
                                 arguments,
-                                pioneer_mcp::McpInvocationBudget::default(),
+                                pioneer_mcp::McpInvocationBudget {
+                                    max_arguments_bytes: command.request.max_arguments_bytes,
+                                },
                                 Duration::from_millis(command.request.timeout_ms.max(1)),
                                 command.cancellation,
                             )
@@ -2373,13 +2387,8 @@ impl TurnMcpValidatedExecution for McpService {
                 ),
                 parameters: validated.current_tool.canonical_schema.clone(),
                 annotations,
-                timeout_ms: Some(
-                    validated
-                        .current_tool
-                        .effective_timeout_ms
-                        .min(validated.invocation_limits.max_timeout_ms)
-                        .max(1),
-                ),
+                timeout_ms: Some(validated.current_tool.effective_timeout_ms.max(1)),
+                max_arguments_bytes: validated.invocation_limits.max_arguments_bytes,
                 selection_reason: validated.binding.selection_reason.clone(),
                 capability_id: validated.binding.capability_id.clone(),
             };

@@ -11093,14 +11093,20 @@ impl CrudStore {
         task_id: &str,
         max_nodes: usize,
     ) -> Result<Option<TaskTree>> {
+        if max_nodes == 0 {
+            anyhow::bail!("task tree node limit must be positive");
+        }
         let Some(root_model) = task_repository::find_task_by_id(&self.connection, task_id).await?
         else {
             return Ok(None);
         };
 
         let mut task_models = vec![root_model.clone()];
+        let maximum_children = max_nodes - 1;
+        let query_limit = (max_nodes != usize::MAX)
+            .then(|| u64::try_from(maximum_children.saturating_add(1)).unwrap_or(u64::MAX));
         let mut child_models =
-            task_repository::list_tasks_by_root(&self.connection, task_id).await?;
+            task_repository::list_tasks_by_root(&self.connection, task_id, query_limit).await?;
         if child_models.len().saturating_add(1) > max_nodes {
             anyhow::bail!("task tree exceeds server node budget of {max_nodes}");
         }
@@ -12568,7 +12574,7 @@ impl CrudStore {
         params: TaskAgendaParams,
         access: Option<&TaskRootAccessFilter>,
     ) -> Result<TaskAgendaResponse> {
-        let limit = params.limit.unwrap_or(100).max(1).min(500);
+        let limit = params.limit.unwrap_or(100).max(1);
         let tasks = self
             .list_tasks_scoped(
                 TaskListParams {

@@ -23,7 +23,7 @@ use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 const ATTACHMENT_BLOCKING_MAX_CONCURRENCY: usize = 16;
-const ATTACHMENT_BLOCKING_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTACHMENT_BLOCKING_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
 static ATTACHMENT_BLOCKING_GOVERNOR: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
@@ -103,9 +103,9 @@ pub fn prepare_messages_for_provider(
 }
 
 /// Runs filesystem, DNS, blocking HTTP and retry materialization outside the
-/// async worker pool. The bounded queue is the Gateway-wide ceiling; the
-/// durable execution governor provides principal/role/workspace fairness
-/// before a Turn can reach this stage.
+/// async worker pool. The semaphore bounds concurrent blocking work; the
+/// durable execution governor bounds how many Turns may wait to enter this
+/// stage.
 pub async fn prepare_messages_for_provider_async(
     provider_name: &str,
     capabilities: &ProviderCapabilities,
@@ -117,7 +117,7 @@ pub async fn prepare_messages_for_provider_async(
         attachment_blocking_governor().acquire_owned(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("attachment materialization queue deadline exceeded"))?
+    .map_err(|_| anyhow::anyhow!("attachment materialization capacity wait timed out"))?
     .map_err(|_| anyhow::anyhow!("attachment materialization governor is closed"))?;
     let provider_name = provider_name.to_owned();
     let capabilities = capabilities.clone();

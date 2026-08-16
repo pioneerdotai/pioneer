@@ -6,6 +6,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::io::{Seek, SeekFrom};
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -272,34 +273,43 @@ where
     R: AsyncBufRead + Unpin,
 {
     let codec = crate::BoundedNativeEventCodec::new(budget);
-    let Some(line) = codec.read_frame(reader).await.map_err(|error| {
+    let Some(frame) = codec.read_frame_or_spool(reader).await.map_err(|error| {
         JsonlRpcDecodeError::new(JsonlRpcDecodeErrorKind::InvalidMessage, error.to_string())
     })?
     else {
         return Ok(None);
     };
-    decode_jsonl_rpc_frame_with_budget(&line, budget).map(Some)
+    let decoded = match frame {
+        crate::SpooledNativeFrame::Complete(line) => decode_jsonl_rpc_frame(&line),
+        crate::SpooledNativeFrame::Oversized { mut file, .. } => {
+            file.seek(SeekFrom::Start(0)).map_err(|error| {
+                JsonlRpcDecodeError::new(
+                    JsonlRpcDecodeErrorKind::InvalidMessage,
+                    format!("failed to rewind spooled jsonl-rpc frame: {error}"),
+                )
+            })?;
+            let raw = serde_json::from_reader(&mut file).map_err(|error| {
+                JsonlRpcDecodeError::new(
+                    JsonlRpcDecodeErrorKind::MalformedJson,
+                    format!("malformed spooled jsonl-rpc json: {error}"),
+                )
+            })?;
+            decode_jsonl_rpc_value(raw)
+        }
+    }?;
+    Ok(Some(decoded))
 }
 
-pub(crate) fn decode_jsonl_rpc_frame_with_budget(
+pub(crate) fn decode_jsonl_rpc_frame(
     frame: &[u8],
-    budget: crate::NativeEventBudget,
 ) -> Result<JsonlRpcIncomingMessage, JsonlRpcDecodeError> {
-    let codec = crate::BoundedNativeEventCodec::new(budget);
     let line = std::str::from_utf8(frame).map_err(|_| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::InvalidMessage,
             "jsonl-rpc line is not UTF-8",
         )
     })?;
-    let message = decode_jsonl_rpc_line(line)?;
-    let raw = serde_json::from_str::<JsonValue>(line.trim_end_matches(['\r', '\n'])).map_err(
-        |error| JsonlRpcDecodeError::new(JsonlRpcDecodeErrorKind::MalformedJson, error.to_string()),
-    )?;
-    codec.validate_value(&raw).map_err(|error| {
-        JsonlRpcDecodeError::new(JsonlRpcDecodeErrorKind::InvalidMessage, error.to_string())
-    })?;
-    Ok(message)
+    decode_jsonl_rpc_line(line)
 }
 
 pub fn decode_jsonl_rpc_line(line: &str) -> Result<JsonlRpcIncomingMessage, JsonlRpcDecodeError> {
@@ -318,6 +328,12 @@ pub fn decode_jsonl_rpc_line(line: &str) -> Result<JsonlRpcIncomingMessage, Json
         )
     })?;
 
+    decode_jsonl_rpc_value(raw)
+}
+
+pub(crate) fn decode_jsonl_rpc_value(
+    raw: JsonValue,
+) -> Result<JsonlRpcIncomingMessage, JsonlRpcDecodeError> {
     let object = raw.as_object().ok_or_else(|| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::ExpectedObject,
@@ -419,7 +435,8 @@ mod tests {
     use super::{
         JsonlRpcDecodeErrorKind, JsonlRpcId, JsonlRpcIncomingMessage, JsonlRpcNotification,
         JsonlRpcRequest, decode_jsonl_rpc_line, encode_jsonl_rpc_notification_line,
-        encode_jsonl_rpc_request_line, read_jsonl_rpc_message, write_jsonl_rpc_request,
+        encode_jsonl_rpc_request_line, read_jsonl_rpc_message, read_jsonl_rpc_message_with_budget,
+        write_jsonl_rpc_request,
     };
     use serde_json::{Value as JsonValue, json};
     use tokio::io::BufReader;
@@ -579,6 +596,40 @@ mod tests {
         };
         assert_eq!(response.id, Some(JsonlRpcId::String("abc".to_owned())));
         assert_eq!(response.result, Some(json!({"ok": true})));
+    }
+
+    #[tokio::test]
+    async fn jsonl_rpc_spools_frame_above_memory_threshold_without_rejecting_it() {
+        let payload = "x".repeat(1_024);
+        let input = format!(
+            "{}\n",
+            json!({"id": "large", "result": {"payload": payload}})
+        );
+        let mut reader = BufReader::new(input.as_bytes());
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 32,
+            max_recovery_frame_bytes: 4_096,
+            ..crate::NativeEventBudget::default()
+        };
+
+        let message = read_jsonl_rpc_message_with_budget(&mut reader, budget)
+            .await
+            .expect("spooled frame should decode")
+            .expect("reader should produce message");
+
+        let JsonlRpcIncomingMessage::Response(response) = message else {
+            panic!("expected response");
+        };
+        assert_eq!(response.id, Some(JsonlRpcId::String("large".to_owned())));
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("payload"))
+                .and_then(JsonValue::as_str)
+                .map(str::len),
+            Some(1_024)
+        );
     }
 
     #[tokio::test]

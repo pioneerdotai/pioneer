@@ -785,9 +785,11 @@ impl MessageProcessor {
             .lock()
             .await
             .remove(request_id);
+
         let Some(pending) = pending else {
             return;
         };
+
         let notification_thread_id =
             native_permission_notification_thread_id(&pending.request).to_owned();
         let _ = pending
@@ -799,17 +801,19 @@ impl MessageProcessor {
             TurnPermissionApprovalResolution::Expired,
         )
         .await;
+
+        let notification = TurnPermissionRequestResolvedNotification {
+            request_id: request_id.to_owned(),
+            workspace_id: pending.workspace_id,
+            thread_id: pending.thread_id,
+            turn_id: pending.turn_id,
+            resolution: TurnPermissionApprovalResolution::Expired,
+        };
         self.send_execution_collaborator_notification(
             notification_thread_id.as_str(),
             crate::authorization::ResourceAction::AgentRequestObserve,
             events::TURN_PERMISSION_REQUEST_RESOLVED,
-            &TurnPermissionRequestResolvedNotification {
-                request_id: request_id.to_owned(),
-                workspace_id: pending.workspace_id,
-                thread_id: pending.thread_id,
-                turn_id: pending.turn_id,
-                resolution: TurnPermissionApprovalResolution::Expired,
-            },
+            &notification,
         )
         .await;
     }

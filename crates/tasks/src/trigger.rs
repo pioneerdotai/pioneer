@@ -10,6 +10,8 @@ use crate::TaskRuntimeResult;
 
 const DEFAULT_RUN_ALL_MISSED_MAX_COUNT: u32 = 32;
 const MAX_CATCH_UP_SCAN_COUNT: usize = 10_000;
+const MAX_TASK_DEPENDENCIES: usize = 128;
+const MIN_TASK_INTERVAL_SECONDS: i64 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTriggerCatchUpPlan {
@@ -45,13 +47,22 @@ impl TaskTriggerCalculator {
                 interval_anchor_at,
                 catch_up_policy,
             } => {
-                if *interval_seconds <= 0 {
-                    bail!("interval_seconds must be positive");
+                if *interval_seconds < MIN_TASK_INTERVAL_SECONDS {
+                    bail!("interval_seconds must be at least {MIN_TASK_INTERVAL_SECONDS} seconds");
                 }
                 if interval_anchor_at.is_some_and(|value| value <= 0) {
                     bail!("interval_anchor_at must be positive when present");
                 }
                 validate_catch_up_policy(catch_up_policy.as_ref())?;
+                Ok(())
+            }
+            TaskTriggerSpec::Dependency { policy } => {
+                if policy.depends_on_task_ids.len() > MAX_TASK_DEPENDENCIES {
+                    bail!(
+                        "dependency trigger has {} dependencies; maximum is {MAX_TASK_DEPENDENCIES}",
+                        policy.depends_on_task_ids.len()
+                    );
+                }
                 Ok(())
             }
             TaskTriggerSpec::Cron {
@@ -65,9 +76,7 @@ impl TaskTriggerCalculator {
                 let _ = tz;
                 Ok(())
             }
-            TaskTriggerSpec::Manual { .. }
-            | TaskTriggerSpec::External { .. }
-            | TaskTriggerSpec::Dependency { .. } => Ok(()),
+            TaskTriggerSpec::Manual { .. } | TaskTriggerSpec::External { .. } => Ok(()),
         }
     }
 

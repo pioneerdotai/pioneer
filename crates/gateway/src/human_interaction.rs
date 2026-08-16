@@ -9,22 +9,18 @@ use pioneer_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
-pub(crate) const HUMAN_INTERACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-pub(crate) const HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS: i64 = 15 * 60 * 1_000;
+const MAX_HUMAN_INTERACTION_QUESTIONS: usize = 16;
+const MAX_HUMAN_INTERACTION_OPTIONS_PER_QUESTION: usize = 32;
+const MAX_NATIVE_PERMISSION_DETAIL_ROWS: usize = 64;
+pub(crate) const HUMAN_INTERACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+pub(crate) const HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS: i64 = 6 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HumanInteractionBudget {
     pub(crate) max_pending_requests_per_execution: usize,
-    pub(crate) max_questions_per_request: usize,
-    pub(crate) max_options_per_question: usize,
-    pub(crate) max_field_bytes: usize,
-    pub(crate) max_aggregate_bytes: usize,
-    pub(crate) max_response_bytes: usize,
-    pub(crate) max_json_depth: usize,
-    pub(crate) max_json_nodes: usize,
 }
 
 impl Default for HumanInteractionBudget {
@@ -36,13 +32,6 @@ impl Default for HumanInteractionBudget {
 impl HumanInteractionBudget {
     pub(crate) const DEFAULT: Self = Self {
         max_pending_requests_per_execution: 8,
-        max_questions_per_request: 16,
-        max_options_per_question: 32,
-        max_field_bytes: 4 * 1024,
-        max_aggregate_bytes: 64 * 1024,
-        max_response_bytes: 64 * 1024,
-        max_json_depth: 16,
-        max_json_nodes: 2_048,
     };
 }
 
@@ -121,40 +110,8 @@ impl HumanInteractionService {
         self,
         request: &TurnPermissionApprovalRequest,
     ) -> Result<()> {
-        validate_field("native request id", request.request_id.as_str(), 256)?;
-        validate_field("native tool name", request.tool_name.as_str(), 256)?;
-        validate_field(
-            "native action",
-            request.action.as_str(),
-            self.budget.max_field_bytes,
-        )?;
-        validate_field(
-            "native scope hash",
-            request.scope_hash.as_str(),
-            self.budget.max_field_bytes,
-        )?;
-        if request.details.len() > 64 {
+        if request.details.len() > MAX_NATIVE_PERMISSION_DETAIL_ROWS {
             bail!("native permission request contains too many detail rows");
-        }
-        if let Some(summary) = request.summary.as_deref() {
-            validate_field(
-                "native request summary",
-                summary,
-                self.budget.max_field_bytes,
-            )?;
-        }
-        for detail in &request.details {
-            validate_field("native detail label", detail.label.as_str(), 256)?;
-            validate_field(
-                "native detail value",
-                detail.value.as_str(),
-                self.budget.max_field_bytes,
-            )?;
-        }
-        let encoded = serde_json::to_vec(request)
-            .context("failed to encode native human interaction for budget validation")?;
-        if encoded.len() > self.budget.max_aggregate_bytes {
-            bail!("native permission request exceeds the aggregate byte budget");
         }
         Ok(())
     }
@@ -163,23 +120,6 @@ impl HumanInteractionService {
         self,
         request: &CLIRuntimePendingRequest,
     ) -> Result<ValidatedHumanInteraction> {
-        if let Some(title) = request.title.as_deref() {
-            validate_field("CLI request title", title, 512)?;
-        }
-        if let Some(message) = request.message.as_deref() {
-            validate_field("CLI request message", message, self.budget.max_field_bytes)?;
-        }
-        let encoded = serde_json::to_vec(request)
-            .context("failed to encode CLI human interaction for budget validation")?;
-        if encoded.len() > self.budget.max_aggregate_bytes {
-            bail!("CLI human interaction exceeds the aggregate byte budget");
-        }
-
-        let mut nodes = 0usize;
-        if let Some(payload) = request.payload.as_ref() {
-            validate_json_shape(payload, 0, &mut nodes, self.budget)?;
-        }
-
         if request.kind != CLIRuntimeRequestKind::UserInput {
             return Ok(ValidatedHumanInteraction::default());
         }
@@ -189,10 +129,10 @@ impl HumanInteractionService {
             .and_then(|payload| payload.get("questions"))
             .and_then(JsonValue::as_array)
             .context("CLI user-input request has no questions")?;
-        if questions.is_empty() || questions.len() > self.budget.max_questions_per_request {
+        if questions.is_empty() || questions.len() > MAX_HUMAN_INTERACTION_QUESTIONS {
             bail!(
                 "CLI user-input request must contain between 1 and {} questions",
-                self.budget.max_questions_per_request
+                MAX_HUMAN_INTERACTION_QUESTIONS
             );
         }
 
@@ -205,39 +145,26 @@ impl HumanInteractionService {
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .context("CLI user-input question has no id")?;
-            validate_field("CLI question id", id, 128)?;
             if !ids.insert(id.to_owned()) {
                 bail!("CLI user-input request contains duplicate question id `{id}`");
             }
-            let prompt = question
+            question
                 .get("question")
                 .and_then(JsonValue::as_str)
                 .context("CLI user-input question has no prompt")?;
-            validate_field("CLI question prompt", prompt, self.budget.max_field_bytes)?;
-            if let Some(header) = question.get("header").and_then(JsonValue::as_str) {
-                validate_field("CLI question header", header, 256)?;
-            }
             let options = question
                 .get("options")
                 .and_then(JsonValue::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            if options.len() > self.budget.max_options_per_question {
+            if options.len() > MAX_HUMAN_INTERACTION_OPTIONS_PER_QUESTION {
                 bail!("CLI user-input question contains too many options");
             }
             for option in options {
-                let label = option
+                option
                     .get("label")
                     .and_then(JsonValue::as_str)
                     .context("CLI user-input option has no label")?;
-                validate_field("CLI option label", label, 512)?;
-                if let Some(description) = option.get("description").and_then(JsonValue::as_str) {
-                    validate_field(
-                        "CLI option description",
-                        description,
-                        self.budget.max_field_bytes,
-                    )?;
-                }
             }
             if question
                 .get("isSecret")
@@ -258,23 +185,12 @@ impl HumanInteractionService {
         resolution: &CLIRuntimeRequestResolution,
     ) -> Result<ValidatedHumanInteraction> {
         let validated = self.validate_cli_request(request)?;
-        let encoded = Zeroizing::new(
-            serde_json::to_vec(resolution)
-                .context("failed to encode human interaction response for budget validation")?,
-        );
-        if encoded.len() > self.budget.max_response_bytes {
-            bail!("human interaction response exceeds the response byte budget");
-        }
         match request.kind {
             CLIRuntimeRequestKind::CommandApproval
             | CLIRuntimeRequestKind::FileChangeApproval
             | CLIRuntimeRequestKind::Other => match resolution {
                 CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::Cancelled => {}
-                CLIRuntimeRequestResolution::Denied { reason } => {
-                    if let Some(reason) = reason.as_deref() {
-                        validate_field("denial reason", reason, self.budget.max_field_bytes)?;
-                    }
-                }
+                CLIRuntimeRequestResolution::Denied { .. } => {}
                 CLIRuntimeRequestResolution::Answered { .. }
                 | CLIRuntimeRequestResolution::Expired
                 | CLIRuntimeRequestResolution::Error { .. } => {
@@ -285,14 +201,12 @@ impl HumanInteractionService {
                 CLIRuntimeRequestResolution::Answered {
                     response: Some(response),
                 } => {
-                    let mut response_nodes = 0usize;
-                    validate_json_shape(response, 0, &mut response_nodes, self.budget)?;
                     let answer_count = response
                         .get("answers")
                         .and_then(JsonValue::as_object)
                         .map(|answers| answers.len())
                         .unwrap_or(1);
-                    if answer_count > self.budget.max_questions_per_request {
+                    if answer_count > MAX_HUMAN_INTERACTION_QUESTIONS {
                         bail!("CLI user-input response contains too many answers");
                     }
                 }
@@ -339,52 +253,6 @@ impl HumanInteractionService {
     }
 }
 
-fn validate_field(label: &str, value: &str, max_bytes: usize) -> Result<()> {
-    if value.as_bytes().len() > max_bytes {
-        bail!("{label} exceeds the {max_bytes}-byte limit");
-    }
-    Ok(())
-}
-
-fn validate_json_shape(
-    value: &JsonValue,
-    depth: usize,
-    nodes: &mut usize,
-    budget: HumanInteractionBudget,
-) -> Result<()> {
-    if depth > budget.max_json_depth {
-        bail!("human interaction JSON exceeds the depth budget");
-    }
-    *nodes = nodes.saturating_add(1);
-    if *nodes > budget.max_json_nodes {
-        bail!("human interaction JSON exceeds the node budget");
-    }
-    match value {
-        JsonValue::String(value) => {
-            validate_field("human interaction string", value, budget.max_field_bytes)?;
-        }
-        JsonValue::Array(values) => {
-            if values.len() > budget.max_json_nodes {
-                bail!("human interaction array exceeds the cardinality budget");
-            }
-            for value in values {
-                validate_json_shape(value, depth + 1, nodes, budget)?;
-            }
-        }
-        JsonValue::Object(values) => {
-            if values.len() > budget.max_json_nodes {
-                bail!("human interaction object exceeds the cardinality budget");
-            }
-            for (key, value) in values {
-                validate_field("human interaction key", key, 256)?;
-                validate_json_shape(value, depth + 1, nodes, budget)?;
-            }
-        }
-        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => {}
-    }
-    Ok(())
-}
-
 fn zeroize_json(value: &mut JsonValue) {
     match value {
         JsonValue::String(value) => value.zeroize(),
@@ -410,40 +278,30 @@ mod tests {
     }
 
     #[test]
-    fn human_interaction_budget_rejects_cardinality_fields_and_pending_overflow() {
+    fn human_interaction_enforces_product_cardinality_and_pending_overflow() {
         let budget = HumanInteractionBudget {
             max_pending_requests_per_execution: 2,
-            max_questions_per_request: 1,
-            max_options_per_question: 1,
-            max_field_bytes: 16,
-            max_aggregate_bytes: 4 * 1024,
-            max_response_bytes: 4 * 1024,
-            max_json_depth: 8,
-            max_json_nodes: 64,
         };
         let service = HumanInteractionService::from_budget(budget);
 
         assert!(service.validate_pending_count(1).is_ok());
         assert!(service.validate_pending_count(2).is_err());
 
-        let too_many_questions = user_input_request(json!([
-            { "id": "one", "question": "First?" },
-            { "id": "two", "question": "Second?" }
-        ]));
+        let too_many_questions = user_input_request(JsonValue::Array(
+            (0..=MAX_HUMAN_INTERACTION_QUESTIONS)
+                .map(|index| json!({ "id": index.to_string(), "question": "Question?" }))
+                .collect(),
+        ));
         assert!(service.validate_cli_request(&too_many_questions).is_err());
 
         let too_many_options = user_input_request(json!([{
             "id": "one",
             "question": "Choose",
-            "options": [{ "label": "A" }, { "label": "B" }]
+            "options": (0..=MAX_HUMAN_INTERACTION_OPTIONS_PER_QUESTION)
+                .map(|index| json!({ "label": index.to_string() }))
+                .collect::<Vec<_>>()
         }]));
         assert!(service.validate_cli_request(&too_many_options).is_err());
-
-        let oversized_field = user_input_request(json!([{
-            "id": "one",
-            "question": "this prompt is intentionally longer than sixteen bytes"
-        }]));
-        assert!(service.validate_cli_request(&oversized_field).is_err());
     }
 
     #[test]
@@ -477,11 +335,8 @@ mod tests {
     }
 
     #[test]
-    fn client_resolution_must_match_request_kind_and_response_budget() {
-        let service = HumanInteractionService::from_budget(HumanInteractionBudget {
-            max_response_bytes: 96,
-            ..HumanInteractionBudget::DEFAULT
-        });
+    fn client_resolution_must_match_request_kind() {
+        let service = HumanInteractionService::new();
         let approval = CLIRuntimePendingRequest {
             kind: CLIRuntimeRequestKind::CommandApproval,
             title: None,
@@ -497,19 +352,6 @@ mod tests {
                         response: Some(json!({ "answers": {} })),
                     },
                 )
-                .is_err()
-        );
-
-        let request = user_input_request(json!([{
-            "id": "answer",
-            "question": "Value?"
-        }]));
-        let oversized = CLIRuntimeRequestResolution::Answered {
-            response: Some(json!({ "answers": { "answer": "x".repeat(256) } })),
-        };
-        assert!(
-            service
-                .validate_client_resolution(&request, &oversized)
                 .is_err()
         );
     }

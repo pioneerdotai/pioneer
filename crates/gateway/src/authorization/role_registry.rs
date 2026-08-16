@@ -207,71 +207,43 @@ fn synthetic_observer_permission_cap() -> TurnPermissionProfileCap {
 }
 
 const DEFAULT_TASK_RESOURCES: TaskResourceBudget = TaskResourceBudget {
-    profile_version: 1,
-    max_encoded_bytes: 512 * 1024,
-    max_title_bytes: 512,
-    max_string_bytes: 64 * 1024,
-    max_collection_items: 128,
-    max_value_depth: 32,
-    max_value_nodes: 4_096,
-    min_interval_seconds: 10,
+    profile_version: 5,
     max_page_items: 100,
-    max_response_bytes: 1024 * 1024,
+    max_page_bytes: 1024 * 1024,
     max_tree_nodes: 128,
-    max_tree_depth: 8,
     max_event_page_items: 200,
     max_wait_targets: 64,
-    max_wait_duration_ms: 120_000,
+    max_wait_duration_ms: 60 * 60 * 1_000,
     max_concurrent_waits: 4,
 };
 
 const DEFAULT_MCP_INVOCATION_RESOURCES: McpInvocationResourceLimits = McpInvocationResourceLimits {
-    profile_version: 1,
+    profile_version: 5,
     max_arguments_bytes: 128 * 1024,
-    max_arguments_depth: 32,
-    max_result_wire_bytes: 1024 * 1024,
-    max_result_decoded_bytes: 1024 * 1024,
-    max_result_depth: 32,
-    max_result_tokens: 64 * 1024,
-    max_result_media: 8,
-    max_timeout_ms: 120_000,
+    max_queue_wait_ms: 120_000,
     max_concurrent_calls: 8,
     max_queued_calls: 16,
 };
 
 const DEFAULT_NATIVE_EVENT_RESOURCES: NativeEventBudget = NativeEventBudget {
-    profile_version: 1,
+    profile_version: 2,
     max_frame_bytes: 1024 * 1024,
     max_recovery_frame_bytes: 64 * 1024 * 1024,
-    max_json_depth: 64,
-    max_json_nodes: 16_384,
-    max_string_bytes: 256 * 1024,
-    max_journal_payload_bytes: 256 * 1024,
 };
 
 #[cfg(test)]
 const SYNTHETIC_NATIVE_EVENT_RESOURCES: NativeEventBudget = NativeEventBudget {
-    profile_version: 1,
+    profile_version: 2,
     max_frame_bytes: 16 * 1024,
     max_recovery_frame_bytes: 1024 * 1024,
-    max_json_depth: 8,
-    max_json_nodes: 256,
-    max_string_bytes: 4 * 1024,
-    max_journal_payload_bytes: 8 * 1024,
 };
 
 #[cfg(test)]
 const SYNTHETIC_MCP_INVOCATION_RESOURCES: McpInvocationResourceLimits =
     McpInvocationResourceLimits {
-        profile_version: 1,
+        profile_version: 5,
         max_arguments_bytes: 4 * 1024,
-        max_arguments_depth: 8,
-        max_result_wire_bytes: 16 * 1024,
-        max_result_decoded_bytes: 16 * 1024,
-        max_result_depth: 8,
-        max_result_tokens: 4 * 1024,
-        max_result_media: 1,
-        max_timeout_ms: 5_000,
+        max_queue_wait_ms: 5_000,
         max_concurrent_calls: 1,
         max_queued_calls: 1,
     };
@@ -347,9 +319,8 @@ const SYNTHETIC_OBSERVATION_RESOURCES: ObservationResourcePolicy = ObservationRe
 #[cfg(test)]
 const SYNTHETIC_TASK_RESOURCES: TaskResourceBudget = TaskResourceBudget {
     max_page_items: 7,
-    max_response_bytes: 64 * 1024,
+    max_page_bytes: 64 * 1024,
     max_tree_nodes: 9,
-    max_tree_depth: 3,
     max_event_page_items: 11,
     max_wait_targets: 5,
     max_wait_duration_ms: 2_000,
@@ -751,22 +722,12 @@ fn policy_fingerprint_for(definitions: &[RoleDefinition]) -> String {
             digest.update(preset.as_str().as_bytes());
             digest.update([0]);
         }
-        for value in [
-            definition
+        digest.update(
+            (definition
                 .human_interaction_budget
-                .max_pending_requests_per_execution,
-            definition
-                .human_interaction_budget
-                .max_questions_per_request,
-            definition.human_interaction_budget.max_options_per_question,
-            definition.human_interaction_budget.max_field_bytes,
-            definition.human_interaction_budget.max_aggregate_bytes,
-            definition.human_interaction_budget.max_response_bytes,
-            definition.human_interaction_budget.max_json_depth,
-            definition.human_interaction_budget.max_json_nodes,
-        ] {
-            digest.update((value as u64).to_le_bytes());
-        }
+                .max_pending_requests_per_execution as u64)
+                .to_le_bytes(),
+        );
         for ceilings in [
             definition.execution_resources.active,
             definition.execution_resources.queued,
@@ -798,17 +759,9 @@ fn policy_fingerprint_for(definitions: &[RoleDefinition]) -> String {
         }
         for value in [
             definition.task_resources.profile_version as u64,
-            definition.task_resources.max_encoded_bytes as u64,
-            definition.task_resources.max_title_bytes as u64,
-            definition.task_resources.max_string_bytes as u64,
-            definition.task_resources.max_collection_items as u64,
-            definition.task_resources.max_value_depth as u64,
-            definition.task_resources.max_value_nodes as u64,
-            definition.task_resources.min_interval_seconds as u64,
             definition.task_resources.max_page_items as u64,
-            definition.task_resources.max_response_bytes as u64,
+            definition.task_resources.max_page_bytes as u64,
             definition.task_resources.max_tree_nodes as u64,
-            definition.task_resources.max_tree_depth as u64,
             definition.task_resources.max_event_page_items as u64,
             definition.task_resources.max_wait_targets as u64,
             definition.task_resources.max_wait_duration_ms,
@@ -820,13 +773,7 @@ fn policy_fingerprint_for(definitions: &[RoleDefinition]) -> String {
         for value in [
             mcp.profile_version as u64,
             mcp.max_arguments_bytes as u64,
-            mcp.max_arguments_depth as u64,
-            mcp.max_result_wire_bytes as u64,
-            mcp.max_result_decoded_bytes as u64,
-            mcp.max_result_depth as u64,
-            mcp.max_result_tokens as u64,
-            mcp.max_result_media as u64,
-            mcp.max_timeout_ms,
+            mcp.max_queue_wait_ms,
             mcp.max_concurrent_calls as u64,
             mcp.max_queued_calls as u64,
         ] {
@@ -836,10 +783,7 @@ fn policy_fingerprint_for(definitions: &[RoleDefinition]) -> String {
         for value in [
             native.profile_version as u64,
             native.max_frame_bytes as u64,
-            native.max_json_depth as u64,
-            native.max_json_nodes as u64,
-            native.max_string_bytes as u64,
-            native.max_journal_payload_bytes as u64,
+            native.max_recovery_frame_bytes as u64,
         ] {
             digest.update(value.to_le_bytes());
         }

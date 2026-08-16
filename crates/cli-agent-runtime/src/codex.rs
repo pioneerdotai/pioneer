@@ -19,7 +19,8 @@ pub use mcp_config::{
 use crate::driver::{
     JsonlRpcDecodeError, JsonlRpcDecodeErrorKind, JsonlRpcError, JsonlRpcId,
     JsonlRpcIncomingMessage, JsonlRpcNotification, JsonlRpcRequest, JsonlRpcResponse,
-    decode_jsonl_rpc_frame_with_budget, write_jsonl_rpc_message, write_jsonl_rpc_request,
+    decode_jsonl_rpc_frame, decode_jsonl_rpc_value, write_jsonl_rpc_message,
+    write_jsonl_rpc_request,
 };
 use crate::input::CLIRuntimeTurnInputItem;
 use crate::process::{
@@ -34,7 +35,6 @@ use serde::de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAcc
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -193,7 +193,6 @@ impl CodexJsonlRpcClient {
             },
             server_request_capacity,
             server_request_timeout,
-            native_event_budget,
         ));
 
         Self {
@@ -440,11 +439,6 @@ pub enum CodexJsonlRpcClientError {
     TransportClosed {
         message: String,
     },
-    ResponseTooLarge {
-        id: JsonlRpcId,
-        total_bytes: usize,
-        max_frame_bytes: usize,
-    },
     Decode {
         method: String,
         message: String,
@@ -483,14 +477,6 @@ impl fmt::Display for CodexJsonlRpcClientError {
                 timeout.as_millis()
             ),
             Self::TransportClosed { message } => f.write_str(message),
-            Self::ResponseTooLarge {
-                id,
-                total_bytes,
-                max_frame_bytes,
-            } => write!(
-                f,
-                "codex jsonl-rpc response for request `{id}` is {total_bytes} bytes and exceeds the {max_frame_bytes}-byte in-memory budget"
-            ),
             Self::Decode { method, message } => {
                 write!(f, "failed to decode codex `{method}` response: {message}")
             }
@@ -3426,7 +3412,6 @@ pub struct CodexThreadOpenSnapshot {
     pub cwd: Option<String>,
     pub model: Option<String>,
     pub raw: JsonValue,
-    pub response_was_oversized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3884,10 +3869,6 @@ fn decode_codex_thread_open_response(
     method: &str,
     raw: JsonValue,
 ) -> Result<CodexThreadOpenSnapshot, CodexJsonlRpcClientError> {
-    let response_was_oversized = raw
-        .get("_pioneerOversizedResponseDiscarded")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
     let response: CodexThreadOpenResponse =
         serde_json::from_value(raw.clone()).map_err(|error| CodexJsonlRpcClientError::Decode {
             method: method.to_owned(),
@@ -3920,7 +3901,6 @@ fn decode_codex_thread_open_response(
         cwd: cwd_from_thread.or(cwd),
         model: model_from_thread.or(model),
         raw,
-        response_was_oversized,
     })
 }
 
@@ -4750,11 +4730,8 @@ enum CodexJsonlRpcIncoming {
     OversizedResponse {
         id: JsonlRpcId,
         file: File,
-        total_bytes: usize,
         kind: OversizedCodexResponseKind,
     },
-    OversizedNotification(CodexJsonlRpcNotificationEvent),
-    OversizedServerRequest(CodexJsonlRpcServerRequest),
     DecodeError(JsonlRpcDecodeError),
     Closed,
 }
@@ -4769,11 +4746,9 @@ enum OversizedCodexFrame {
     Response {
         id: JsonlRpcId,
         file: File,
-        total_bytes: usize,
         kind: OversizedCodexResponseKind,
     },
-    Notification(CodexJsonlRpcNotificationEvent),
-    ServerRequest(CodexJsonlRpcServerRequest),
+    Message(JsonlRpcIncomingMessage),
 }
 
 struct PendingCodexJsonlRpcRequest {
@@ -4782,7 +4757,6 @@ struct PendingCodexJsonlRpcRequest {
 }
 
 enum OversizedSuccessRecovery {
-    Fallback(JsonValue),
     ThreadTurnSnapshot {
         native_thread_id: String,
         native_turn_id: String,
@@ -4976,17 +4950,15 @@ async fn run_codex_jsonl_rpc_reader<R>(
     loop {
         match codec.read_frame_or_spool(&mut reader).await {
             Ok(Some(crate::native_event::SpooledNativeFrame::Complete(frame))) => {
-                let message =
-                    match decode_jsonl_rpc_frame_with_budget(frame.as_slice(), native_event_budget)
-                    {
-                        Ok(message) => message,
-                        Err(error) => {
-                            let _ = incoming_tx
-                                .send(CodexJsonlRpcIncoming::DecodeError(error))
-                                .await;
-                            return;
-                        }
-                    };
+                let message = match decode_jsonl_rpc_frame(frame.as_slice()) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        let _ = incoming_tx
+                            .send(CodexJsonlRpcIncoming::DecodeError(error))
+                            .await;
+                        return;
+                    }
+                };
                 if incoming_tx
                     .send(CodexJsonlRpcIncoming::Message(message))
                     .await
@@ -4995,15 +4967,9 @@ async fn run_codex_jsonl_rpc_reader<R>(
                     return;
                 }
             }
-            Ok(Some(crate::native_event::SpooledNativeFrame::Oversized {
-                file,
-                total_bytes,
-                ..
-            })) => {
-                let decoded = tokio::task::spawn_blocking(move || {
-                    decode_oversized_codex_frame(file, total_bytes, native_event_budget)
-                })
-                .await;
+            Ok(Some(crate::native_event::SpooledNativeFrame::Oversized { file, .. })) => {
+                let decoded =
+                    tokio::task::spawn_blocking(move || decode_oversized_codex_frame(file)).await;
                 let decoded = match decoded {
                     Ok(Ok(decoded)) => decoded,
                     Ok(Err(error)) => {
@@ -5025,22 +4991,11 @@ async fn run_codex_jsonl_rpc_reader<R>(
                     }
                 };
                 let incoming = match decoded {
-                    OversizedCodexFrame::Response {
-                        id,
-                        file,
-                        total_bytes,
-                        kind,
-                    } => CodexJsonlRpcIncoming::OversizedResponse {
-                        id,
-                        file,
-                        total_bytes,
-                        kind,
-                    },
-                    OversizedCodexFrame::Notification(notification) => {
-                        CodexJsonlRpcIncoming::OversizedNotification(notification)
+                    OversizedCodexFrame::Response { id, file, kind } => {
+                        CodexJsonlRpcIncoming::OversizedResponse { id, file, kind }
                     }
-                    OversizedCodexFrame::ServerRequest(request) => {
-                        CodexJsonlRpcIncoming::OversizedServerRequest(request)
+                    OversizedCodexFrame::Message(message) => {
+                        CodexJsonlRpcIncoming::Message(message)
                     }
                 };
                 if incoming_tx.send(incoming).await.is_err() {
@@ -5068,16 +5023,12 @@ async fn run_codex_jsonl_rpc_reader<R>(
 
 struct OversizedCodexEnvelope {
     id: Option<JsonlRpcId>,
-    method: Option<String>,
-    params: Option<JsonValue>,
-    params_truncated: bool,
+    has_method: bool,
     has_result: bool,
     has_error: bool,
 }
 
-struct OversizedCodexEnvelopeSeed {
-    budget: crate::NativeEventBudget,
-}
+struct OversizedCodexEnvelopeSeed;
 
 impl<'de> DeserializeSeed<'de> for OversizedCodexEnvelopeSeed {
     type Value = OversizedCodexEnvelope;
@@ -5086,15 +5037,11 @@ impl<'de> DeserializeSeed<'de> for OversizedCodexEnvelopeSeed {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(OversizedCodexEnvelopeVisitor {
-            budget: self.budget,
-        })
+        deserializer.deserialize_map(OversizedCodexEnvelopeVisitor)
     }
 }
 
-struct OversizedCodexEnvelopeVisitor {
-    budget: crate::NativeEventBudget,
-}
+struct OversizedCodexEnvelopeVisitor;
 
 impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
     type Value = OversizedCodexEnvelope;
@@ -5108,9 +5055,7 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
         A: MapAccess<'de>,
     {
         let mut id = None;
-        let mut method = None;
-        let mut params = None;
-        let mut params_truncated = false;
+        let mut has_method = false;
         let mut has_result = false;
         let mut has_error = false;
         while let Some(key) = map.next_key::<String>()? {
@@ -5124,35 +5069,13 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
                     id = Some(map.next_value::<JsonlRpcId>()?);
                 }
                 "method" => {
-                    if method.is_some() {
+                    if has_method {
                         return Err(serde::de::Error::custom(
                             "oversized JSONL-RPC frame contains duplicate method",
                         ));
                     }
-                    let value = map.next_value::<String>()?;
-                    if value.len() > self.budget.max_string_bytes {
-                        return Err(serde::de::Error::custom(
-                            "oversized JSONL-RPC method exceeds the control string budget",
-                        ));
-                    }
-                    method = Some(value);
-                }
-                "params" => {
-                    if params.is_some() {
-                        return Err(serde::de::Error::custom(
-                            "oversized JSONL-RPC frame contains duplicate params",
-                        ));
-                    }
-                    let truncated = Cell::new(false);
-                    let nodes = Cell::new(0usize);
-                    let value = map.next_value_seed(CodexControlProjectionSeed {
-                        budget: self.budget,
-                        depth: 0,
-                        truncated: &truncated,
-                        nodes: &nodes,
-                    })?;
-                    params_truncated = truncated.get();
-                    params = Some(value);
+                    has_method = true;
+                    map.next_value::<IgnoredAny>()?;
                 }
                 "result" => {
                     if has_result {
@@ -5179,272 +5102,16 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
         }
         Ok(OversizedCodexEnvelope {
             id,
-            method,
-            params,
-            params_truncated,
+            has_method,
             has_result,
             has_error,
         })
     }
 }
 
-struct CodexControlProjectionSeed<'a> {
-    budget: crate::NativeEventBudget,
-    depth: usize,
-    truncated: &'a Cell<bool>,
-    nodes: &'a Cell<usize>,
-}
-
-impl CodexControlProjectionSeed<'_> {
-    fn child(&self) -> CodexControlProjectionSeed<'_> {
-        CodexControlProjectionSeed {
-            budget: self.budget,
-            depth: self.depth.saturating_add(1),
-            truncated: self.truncated,
-            nodes: self.nodes,
-        }
-    }
-}
-
-impl<'de> DeserializeSeed<'de> for CodexControlProjectionSeed<'_> {
-    type Value = JsonValue;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        if self.depth > self.budget.max_json_depth {
-            return Err(serde::de::Error::custom(
-                "oversized JSONL-RPC control envelope exceeds the JSON depth budget",
-            ));
-        }
-        deserializer.deserialize_any(CodexControlProjectionVisitor { seed: self })
-    }
-}
-
-struct CodexControlProjectionVisitor<'a> {
-    seed: CodexControlProjectionSeed<'a>,
-}
-
-impl CodexControlProjectionVisitor<'_> {
-    fn bounded_string<E>(&self, mut value: String) -> Result<JsonValue, E>
-    where
-        E: serde::de::Error,
-    {
-        if value.len() > self.seed.budget.max_string_bytes {
-            let mut boundary = self.seed.budget.max_string_bytes.min(value.len());
-            while boundary > 0 && !value.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            value.truncate(boundary);
-            self.seed.truncated.set(true);
-        }
-        Ok(JsonValue::String(value))
-    }
-
-    fn admit_node<E>(&self) -> Result<(), E>
-    where
-        E: serde::de::Error,
-    {
-        let next = self.seed.nodes.get().saturating_add(1);
-        if next > self.seed.budget.max_json_nodes {
-            return Err(E::custom(
-                "oversized JSONL-RPC control envelope exceeds the JSON node budget",
-            ));
-        }
-        self.seed.nodes.set(next);
-        Ok(())
-    }
-}
-
-impl<'de> Visitor<'de> for CodexControlProjectionVisitor<'_> {
-    type Value = JsonValue;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a bounded Codex lifecycle control value")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.admit_node()?;
-        Ok(JsonValue::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.admit_node()?;
-        Ok(JsonValue::Number(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.admit_node()?;
-        Ok(JsonValue::Number(value.into()))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.admit_node()?;
-        serde_json::Number::from_f64(value)
-            .map(JsonValue::Number)
-            .ok_or_else(|| E::custom("oversized JSONL-RPC control value is not finite"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.admit_node()?;
-        self.bounded_string(value.to_owned())
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.admit_node()?;
-        self.bounded_string(value)
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.admit_node()?;
-        Ok(JsonValue::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_none()
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        self.seed.deserialize(deserializer)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        while sequence.next_element::<IgnoredAny>()?.is_some() {}
-        self.seed.truncated.set(true);
-        self.admit_node()?;
-        Ok(JsonValue::Array(Vec::new()))
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        self.admit_node()?;
-        let mut projected = serde_json::Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if codex_control_projection_keeps(key.as_str()) {
-                let value = map.next_value_seed(self.seed.child())?;
-                projected.insert(key, value);
-            } else {
-                map.next_value::<IgnoredAny>()?;
-                self.seed.truncated.set(true);
-                if let Some(placeholder) = codex_truncated_control_placeholder(key.as_str()) {
-                    projected.insert(key, placeholder);
-                }
-            }
-        }
-        Ok(JsonValue::Object(projected))
-    }
-}
-
-fn codex_control_projection_keeps(key: &str) -> bool {
-    matches!(
-        key,
-        "id" | "threadId"
-            | "thread_id"
-            | "turnId"
-            | "turn_id"
-            | "itemId"
-            | "item_id"
-            | "callId"
-            | "call_id"
-            | "requestId"
-            | "request_id"
-            | "status"
-            | "type"
-            | "kind"
-            | "phase"
-            | "code"
-            | "exitCode"
-            | "exit_code"
-            | "willRetry"
-            | "retryable"
-            | "success"
-            | "completed"
-            | "message"
-            | "reason"
-            | "title"
-            | "thread"
-            | "turn"
-            | "item"
-            | "error"
-            | "request"
-            | "goal"
-            | "metadata"
-    )
-}
-
-fn codex_truncated_control_placeholder(key: &str) -> Option<JsonValue> {
-    match key {
-        "text" | "delta" | "output" | "aggregatedOutput" | "stdout" | "stderr" => {
-            Some(JsonValue::String(String::new()))
-        }
-        "content" | "summary" => Some(JsonValue::Array(Vec::new())),
-        _ => None,
-    }
-}
-
-fn attach_oversized_projection_marker(
-    value: &mut JsonValue,
-    truncated: bool,
-    original_frame_bytes: usize,
-    frame_sha256: &str,
-) {
-    let marker = json!({
-        "truncated": truncated,
-        "controlEnvelopeOnly": true,
-        "originalFrameBytes": original_frame_bytes,
-        "frameSha256": frame_sha256,
-    });
-    match value {
-        JsonValue::Object(object) => {
-            object.insert("_pioneerOversizedPayload".to_owned(), marker);
-        }
-        _ => {
-            *value = json!({
-                "_pioneerOversizedPayload": marker,
-            });
-        }
-    }
-}
-
 fn decode_oversized_codex_frame(
     mut file: File,
-    total_bytes: usize,
-    budget: crate::NativeEventBudget,
 ) -> Result<OversizedCodexFrame, JsonlRpcDecodeError> {
-    let frame_sha256 = sha256_hex_file(&mut file)?;
     file.seek(SeekFrom::Start(0)).map_err(|error| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::InvalidMessage,
@@ -5452,7 +5119,7 @@ fn decode_oversized_codex_frame(
         )
     })?;
     let mut deserializer = serde_json::Deserializer::from_reader(&mut file);
-    let mut envelope = OversizedCodexEnvelopeSeed { budget }
+    let envelope = OversizedCodexEnvelopeSeed
         .deserialize(&mut deserializer)
         .map_err(|error| {
             JsonlRpcDecodeError::new(
@@ -5474,7 +5141,7 @@ fn decode_oversized_codex_frame(
     })?;
 
     if envelope.has_result || envelope.has_error {
-        if envelope.has_result == envelope.has_error || envelope.method.is_some() {
+        if envelope.has_result == envelope.has_error || envelope.has_method {
             return Err(JsonlRpcDecodeError::new(
                 JsonlRpcDecodeErrorKind::InvalidMessage,
                 "oversized JSONL-RPC response must contain exactly one of result or error",
@@ -5489,7 +5156,6 @@ fn decode_oversized_codex_frame(
         return Ok(OversizedCodexFrame::Response {
             id,
             file,
-            total_bytes,
             kind: if envelope.has_result {
                 OversizedCodexResponseKind::Success
             } else {
@@ -5498,98 +5164,13 @@ fn decode_oversized_codex_frame(
         });
     }
 
-    let method = envelope.method.ok_or_else(|| {
+    let raw = serde_json::from_reader(&mut file).map_err(|error| {
         JsonlRpcDecodeError::new(
-            JsonlRpcDecodeErrorKind::UnknownShape,
-            "oversized JSONL-RPC frame is not a response, notification, or server request",
+            JsonlRpcDecodeErrorKind::MalformedJson,
+            format!("failed to decode spooled JSONL-RPC frame: {error}"),
         )
     })?;
-    let mut params = envelope.params.take().unwrap_or_else(|| json!({}));
-    attach_oversized_projection_marker(
-        &mut params,
-        envelope.params_truncated,
-        total_bytes,
-        frame_sha256.as_str(),
-    );
-    let params = Some(params);
-    if let Some(id) = envelope.id {
-        let raw = json!({
-            "id": id,
-            "method": method,
-            "params": params,
-            "_pioneerOversizedFrameBytes": total_bytes,
-        });
-        return Ok(OversizedCodexFrame::ServerRequest(
-            CodexJsonlRpcServerRequest {
-                id,
-                method,
-                params,
-                raw,
-            },
-        ));
-    }
-    let raw = json!({
-        "method": method,
-        "params": params,
-        "_pioneerOversizedFrameBytes": total_bytes,
-    });
-    Ok(OversizedCodexFrame::Notification(
-        CodexJsonlRpcNotificationEvent {
-            method,
-            params,
-            raw,
-        },
-    ))
-}
-
-fn sha256_hex_file(file: &mut File) -> Result<String, JsonlRpcDecodeError> {
-    file.seek(SeekFrom::Start(0)).map_err(|error| {
-        JsonlRpcDecodeError::new(
-            JsonlRpcDecodeErrorKind::InvalidMessage,
-            format!("failed to rewind oversized JSONL-RPC frame for digest: {error}"),
-        )
-    })?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| {
-            JsonlRpcDecodeError::new(
-                JsonlRpcDecodeErrorKind::InvalidMessage,
-                format!("failed to digest oversized JSONL-RPC frame: {error}"),
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-fn oversized_codex_success_fallback(request: &JsonlRpcRequest) -> Option<JsonValue> {
-    if request.method != "thread/resume" {
-        return None;
-    }
-    let params = request.params.as_ref()?.as_object()?;
-    let thread_id = params.get("threadId")?.as_str()?.trim();
-    if thread_id.is_empty() {
-        return None;
-    }
-    let mut thread = serde_json::Map::new();
-    thread.insert("id".to_owned(), JsonValue::String(thread_id.to_owned()));
-    for field in ["cwd", "model"] {
-        if let Some(value) = params.get(field).cloned() {
-            thread.insert(field.to_owned(), value);
-        }
-    }
-    Some(json!({
-        "thread": JsonValue::Object(thread),
-        "_pioneerOversizedResponseDiscarded": true,
-    }))
+    decode_jsonl_rpc_value(raw).map(OversizedCodexFrame::Message)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6110,7 +5691,6 @@ async fn run_codex_jsonl_rpc_worker<W>(
     event_sinks: CodexJsonlRpcEventSinks,
     max_pending_server_requests: usize,
     server_request_timeout: Duration,
-    native_event_budget: crate::NativeEventBudget,
 ) where
     W: AsyncWrite + Send + Unpin + 'static,
 {
@@ -6135,10 +5715,6 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             continue;
                         }
 
-                        let oversized_success_recovery = oversized_success_recovery.or_else(|| {
-                            oversized_codex_success_fallback(&request)
-                                .map(OversizedSuccessRecovery::Fallback)
-                        });
                         pending.insert(
                             id.clone(),
                             PendingCodexJsonlRpcRequest {
@@ -6225,7 +5801,6 @@ async fn run_codex_jsonl_rpc_worker<W>(
                     Some(CodexJsonlRpcIncoming::OversizedResponse {
                         id,
                         file,
-                        total_bytes,
                         kind,
                     }) => {
                         let Some(pending_request) = pending.remove(&id) else {
@@ -6236,21 +5811,6 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             id,
                             kind,
                             file,
-                            total_bytes,
-                            native_event_budget.max_frame_bytes,
-                        ).await;
-                    }
-                    Some(CodexJsonlRpcIncoming::OversizedNotification(notification)) => {
-                        dispatch_notification(notification, &event_sinks).await;
-                    }
-                    Some(CodexJsonlRpcIncoming::OversizedServerRequest(request)) => {
-                        dispatch_server_request(
-                            request,
-                            &mut pending_server_requests,
-                            &event_sinks,
-                            max_pending_server_requests,
-                            server_request_timeout,
-                            &mut writer,
                         ).await;
                     }
                     Some(CodexJsonlRpcIncoming::DecodeError(error)) => {
@@ -6312,16 +5872,10 @@ async fn resolve_oversized_codex_response(
     pending_request: PendingCodexJsonlRpcRequest,
     id: JsonlRpcId,
     kind: OversizedCodexResponseKind,
-    file: File,
-    total_bytes: usize,
-    max_frame_bytes: usize,
+    mut file: File,
 ) {
     if kind == OversizedCodexResponseKind::Success {
         match pending_request.oversized_success_recovery {
-            Some(OversizedSuccessRecovery::Fallback(fallback)) => {
-                let _ = pending_request.response_tx.send(Ok(fallback));
-                return;
-            }
             Some(OversizedSuccessRecovery::ThreadTurnSnapshot {
                 native_thread_id,
                 native_turn_id,
@@ -6346,13 +5900,76 @@ async fn resolve_oversized_codex_response(
             None => {}
         }
     }
-    let _ = pending_request
-        .response_tx
-        .send(Err(CodexJsonlRpcClientError::ResponseTooLarge {
-            id,
-            total_bytes,
-            max_frame_bytes,
-        }));
+    let decoded = tokio::task::spawn_blocking(move || {
+        file.seek(SeekFrom::Start(0)).map_err(|error| {
+            JsonlRpcDecodeError::new(
+                JsonlRpcDecodeErrorKind::InvalidMessage,
+                format!("failed to rewind spooled JSONL-RPC response: {error}"),
+            )
+        })?;
+        let raw = serde_json::from_reader(&mut file).map_err(|error| {
+            JsonlRpcDecodeError::new(
+                JsonlRpcDecodeErrorKind::MalformedJson,
+                format!("malformed spooled JSONL-RPC response: {error}"),
+            )
+        })?;
+        match decode_jsonl_rpc_value(raw)? {
+            JsonlRpcIncomingMessage::Response(response) => Ok(response),
+            JsonlRpcIncomingMessage::Notification(_)
+            | JsonlRpcIncomingMessage::ServerRequest(_) => Err(JsonlRpcDecodeError::new(
+                JsonlRpcDecodeErrorKind::InvalidMessage,
+                "spooled JSONL-RPC response changed shape while decoding",
+            )),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+
+    match decoded {
+        Ok(response) if response.id.as_ref() == Some(&id) => {
+            complete_codex_jsonl_rpc_response(pending_request, id, response);
+        }
+        Ok(_) => {
+            let _ = pending_request
+                .response_tx
+                .send(Err(CodexJsonlRpcClientError::Decode {
+                    method: "jsonl-rpc".to_owned(),
+                    message: "spooled JSONL-RPC response id changed while decoding".to_owned(),
+                }));
+        }
+        Err(message) => {
+            let _ = pending_request
+                .response_tx
+                .send(Err(CodexJsonlRpcClientError::Decode {
+                    method: "jsonl-rpc".to_owned(),
+                    message,
+                }));
+        }
+    }
+}
+
+fn complete_codex_jsonl_rpc_response(
+    pending_request: PendingCodexJsonlRpcRequest,
+    id: JsonlRpcId,
+    response: JsonlRpcResponse,
+) {
+    if let Some(error) = response.error {
+        let _ = pending_request
+            .response_tx
+            .send(Err(CodexJsonlRpcClientError::Native(
+                CodexJsonlRpcNativeError {
+                    id: Some(id),
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                },
+            )));
+        return;
+    }
+
+    let result = response.result.unwrap_or(JsonValue::Null);
+    let _ = pending_request.response_tx.send(Ok(result));
 }
 
 async fn handle_codex_jsonl_rpc_incoming(
@@ -6373,22 +5990,7 @@ async fn handle_codex_jsonl_rpc_incoming(
                 return;
             };
 
-            if let Some(error) = response.error {
-                let _ = pending_request
-                    .response_tx
-                    .send(Err(CodexJsonlRpcClientError::Native(
-                        CodexJsonlRpcNativeError {
-                            id: Some(id),
-                            code: error.code,
-                            message: error.message,
-                            data: error.data,
-                        },
-                    )));
-                return;
-            }
-
-            let result = response.result.unwrap_or(JsonValue::Null);
-            let _ = pending_request.response_tx.send(Ok(result));
+            complete_codex_jsonl_rpc_response(pending_request, id, response);
         }
         JsonlRpcIncomingMessage::Notification(notification) => {
             dispatch_notification(notification.into(), event_sinks).await;
@@ -8997,17 +8599,12 @@ while read line; do :; done
         assert_eq!(snapshot.native_thread_id, "codex-thread-existing");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-5.1"));
-        assert!(!snapshot.response_was_oversized);
     }
 
     #[tokio::test]
-    async fn codex_thread_resume_discards_oversized_history_and_keeps_transport_aligned() {
+    async fn codex_thread_resume_preserves_spooled_history_and_keeps_transport_aligned() {
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 256,
-            max_json_depth: 16,
-            max_json_nodes: 128,
-            max_string_bytes: 128,
-            max_journal_payload_bytes: 256,
             ..crate::NativeEventBudget::default()
         };
         let (rpc, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
@@ -9033,7 +8630,7 @@ while read line; do :; done
 
         let request = read_server_line(&mut server_reader).await;
         let payload = format!(
-            "{{\"id\":{},\"result\":{{\"thread\":{{\"id\":\"codex-thread-large\",\"cwd\":\"/tmp/project\",\"turns\":[\"{}\"]}}}}}}\n",
+            "{{\"id\":{},\"result\":{{\"thread\":{{\"id\":\"codex-thread-large\",\"cwd\":\"/tmp/project\",\"model\":\"gpt-test\",\"turns\":[\"{}\"]}}}}}}\n",
             request["id"],
             "history".repeat(256),
         );
@@ -9046,11 +8643,14 @@ while read line; do :; done
         let snapshot = resume
             .await
             .expect("resume task should join")
-            .expect("oversized resume history should be discarded");
+            .expect("spooled resume history should be preserved");
         assert_eq!(snapshot.native_thread_id, "codex-thread-large");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-test"));
-        assert!(snapshot.response_was_oversized);
+        assert_eq!(
+            snapshot.raw["thread"]["turns"][0],
+            json!("history".repeat(256))
+        );
 
         let metadata_client = client.clone();
         let metadata = tokio::spawn(async move {
@@ -9083,10 +8683,6 @@ while read line; do :; done
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 512,
             max_recovery_frame_bytes: 4 * 1024 * 1024,
-            max_json_depth: 32,
-            max_json_nodes: 512,
-            max_string_bytes: 256,
-            max_journal_payload_bytes: 512,
             ..crate::NativeEventBudget::default()
         };
         let (rpc, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
@@ -9190,14 +8786,67 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn oversized_codex_notification_preserves_terminal_control_and_transport_alignment() {
+    async fn in_memory_bulk_string_does_not_close_codex_transport() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 2 * 1024,
+            max_recovery_frame_bytes: 4 * 1024,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let mut notifications = client
+            .take_notification_receiver()
+            .expect("notification receiver");
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(2))
+                .await
+        });
+        let request = read_server_line(&mut server_reader).await;
+        let output = "x".repeat(512);
+        let payload = format!(
+            "{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread-control\",\"turnId\":\"turn-control\",\"item\":{{\"id\":\"item-control\",\"type\":\"commandExecution\",\"status\":\"completed\",\"exitCode\":0,\"aggregatedOutput\":\"{output}\"}}}}}}\n"
+        );
+        assert!(payload.len() < budget.max_frame_bytes);
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write bounded notification with large bulk string");
+
+        let notification = tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+            .await
+            .expect("notification should arrive")
+            .expect("notification channel should remain open");
+        assert_eq!(notification.method, "item/completed");
+        assert_eq!(
+            notification.params.expect("notification params")["item"]["aggregatedOutput"],
+            json!(output)
+        );
+
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": request["id"].clone(), "result": {"ok": true}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write response after large in-memory string");
+        assert_eq!(
+            pending
+                .await
+                .expect("pending task should join")
+                .expect("large in-memory string must not close transport"),
+            json!({"ok": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn spooled_codex_notification_preserves_complete_payload_and_transport_alignment() {
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 256,
             max_recovery_frame_bytes: 4 * 1024,
-            max_json_depth: 16,
-            max_json_nodes: 128,
-            max_string_bytes: 128,
-            max_journal_payload_bytes: 256,
             ..crate::NativeEventBudget::default()
         };
         let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
@@ -9227,22 +8876,13 @@ while read line; do :; done
             .expect("oversized notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "item/completed");
-        let params = notification.params.expect("sanitized params");
+        let params = notification.params.expect("notification params");
         assert_eq!(params["threadId"], json!("thread-control"));
         assert_eq!(params["turnId"], json!("turn-control"));
         assert_eq!(params["item"]["id"], json!("item-control"));
         assert_eq!(params["item"]["status"], json!("completed"));
         assert_eq!(params["item"]["exitCode"], json!(0));
-        assert_eq!(params["item"]["aggregatedOutput"], json!(""));
-        assert_eq!(params["_pioneerOversizedPayload"]["truncated"], json!(true));
-        assert_eq!(
-            params["_pioneerOversizedPayload"]["originalFrameBytes"],
-            json!(payload.len()),
-        );
-        assert_eq!(
-            params["_pioneerOversizedPayload"]["frameSha256"],
-            json!(sha256_hex_bytes(payload.as_bytes())),
-        );
+        assert_eq!(params["item"]["aggregatedOutput"], json!("x".repeat(1024)));
 
         server_writer
             .write_all(
@@ -9264,14 +8904,10 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn oversized_turn_completed_preserves_terminal_outcome_and_transport_alignment() {
+    async fn spooled_turn_completed_preserves_complete_payload_and_transport_alignment() {
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 256,
             max_recovery_frame_bytes: 4 * 1024,
-            max_json_depth: 16,
-            max_json_nodes: 128,
-            max_string_bytes: 128,
-            max_journal_payload_bytes: 256,
             ..crate::NativeEventBudget::default()
         };
         let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
@@ -9299,20 +8935,12 @@ while read line; do :; done
             .expect("oversized terminal notification should arrive")
             .expect("notification channel should remain open");
         assert_eq!(notification.method, "turn/completed");
-        let params = notification.params.expect("sanitized terminal params");
+        let params = notification.params.expect("terminal params");
         assert_eq!(params["threadId"], json!("thread-terminal"));
         assert_eq!(params["turn"]["id"], json!("turn-terminal"));
         assert_eq!(params["turn"]["status"], json!("completed"));
         assert_eq!(params["turn"]["exitCode"], json!(0));
-        assert_eq!(params["turn"]["output"], json!(""));
-        assert_eq!(
-            params["_pioneerOversizedPayload"]["originalFrameBytes"],
-            json!(payload.len()),
-        );
-        assert_eq!(
-            params["_pioneerOversizedPayload"]["frameSha256"],
-            json!(sha256_hex_bytes(payload.as_bytes())),
-        );
+        assert_eq!(params["turn"]["output"], json!("x".repeat(1024)));
 
         server_writer
             .write_all(
@@ -9334,14 +8962,10 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn oversized_response_fails_only_matching_request_and_preserves_transport() {
+    async fn spooled_response_completes_matching_request_and_preserves_transport() {
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 256,
             max_recovery_frame_bytes: 4 * 1024,
-            max_json_depth: 16,
-            max_json_nodes: 128,
-            max_string_bytes: 128,
-            max_journal_payload_bytes: 256,
             ..crate::NativeEventBudget::default()
         };
         let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
@@ -9381,10 +9005,13 @@ while read line; do :; done
             .await
             .expect("write concurrent response");
 
-        assert!(matches!(
-            first.await.expect("first task should join"),
-            Err(CodexJsonlRpcClientError::ResponseTooLarge { .. })
-        ));
+        assert_eq!(
+            first
+                .await
+                .expect("first task should join")
+                .expect("spooled response should complete normally"),
+            json!({"payload": "x".repeat(1024)})
+        );
         assert_eq!(
             second
                 .await
@@ -9424,10 +9051,6 @@ while read line; do :; done
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 128,
             max_recovery_frame_bytes: 256,
-            max_json_depth: 16,
-            max_json_nodes: 128,
-            max_string_bytes: 64,
-            max_journal_payload_bytes: 128,
             ..crate::NativeEventBudget::default()
         };
         let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
@@ -9476,10 +9099,6 @@ while read line; do :; done
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 128,
             max_recovery_frame_bytes: 2 * 1024,
-            max_json_depth: 16,
-            max_json_nodes: 128,
-            max_string_bytes: 64,
-            max_journal_payload_bytes: 128,
             ..crate::NativeEventBudget::default()
         };
         let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);

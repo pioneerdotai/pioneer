@@ -66,6 +66,7 @@ use pioneer_protocol::ToolMetadataValue;
 use pioneer_runtime_events::{OrderedEventIngress, OrderedIngressConfig, OrderedIngressOffer};
 use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -958,7 +959,6 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             process_closed: std::sync::atomic::AtomicBool::new(false),
             event_receivers: std::sync::Mutex::new(Some(CLIAgentRuntimeEventReceivers {
                 process_instance: process_instance.clone(),
-                native_event_budget: launch_spec.native_event_budget,
                 runtime_kind: "claude".to_owned(),
                 events: event_rx,
             })),
@@ -2219,12 +2219,45 @@ impl ClaudeStreamClient {
         stdin.flush().await.context("failed to flush Claude stdin")
     }
 
+    fn decode_complete_stdout_frame(frame: Vec<u8>) -> Result<Option<JsonValue>> {
+        let line = String::from_utf8(frame).context("Claude stdout frame is not UTF-8")?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('{') {
+            return Ok(None);
+        }
+        serde_json::from_str(trimmed)
+            .map(Some)
+            .context("Claude stdout frame is not valid JSON")
+    }
+
+    fn decode_spooled_stdout_frame(mut file: std::fs::File) -> Result<Option<JsonValue>> {
+        file.seek(SeekFrom::Start(0))
+            .context("failed to rewind spooled Claude stdout frame")?;
+        let mut first = [0_u8; 1];
+        loop {
+            match file
+                .read(&mut first)
+                .context("failed to inspect spooled Claude stdout frame")?
+            {
+                0 => return Ok(None),
+                1 if first[0].is_ascii_whitespace() => continue,
+                1 if first[0] != b'{' => return Ok(None),
+                1 => break,
+                _ => unreachable!("single-byte read returned more than one byte"),
+            }
+        }
+        file.seek(SeekFrom::Start(0))
+            .context("failed to rewind inspected Claude stdout frame")?;
+        serde_json::from_reader(&mut file)
+            .map(Some)
+            .context("spooled Claude stdout frame is not valid JSON")
+    }
+
     async fn read_loop(&self, stdout: ChildStdout) {
         let mut reader = BufReader::new(stdout);
         let codec = BoundedNativeEventCodec::new(self.native_event_budget);
-        let mut buffer = String::new();
         loop {
-            let frame = match codec.read_frame(&mut reader).await {
+            let frame = match codec.read_frame_or_spool(&mut reader).await {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(error) => {
@@ -2244,14 +2277,36 @@ impl ClaudeStreamClient {
                     break;
                 }
             };
-            let line = match String::from_utf8(frame) {
-                Ok(line) => line,
-                Err(_) => {
+            let decoded = match frame {
+                pioneer_cli_agent_runtime::SpooledNativeFrame::Complete(frame) => {
+                    Self::decode_complete_stdout_frame(frame)
+                }
+                pioneer_cli_agent_runtime::SpooledNativeFrame::Oversized { file, .. } => {
+                    match tokio::task::spawn_blocking(move || {
+                        Self::decode_spooled_stdout_frame(file)
+                    })
+                    .await
+                    {
+                        Ok(decoded) => decoded,
+                        Err(error) => Err(anyhow!(
+                            "spooled Claude stdout decoder task failed: {error}"
+                        )),
+                    }
+                }
+            };
+            let value = match decoded {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                Err(error) => {
+                    let (native_thread_id, native_turn_id) = {
+                        let state = self.state.lock().await;
+                        (state.native_thread_id.clone(), state.active_turn_id.clone())
+                    };
                     self.emit(RuntimeEvent::Error(RuntimeErrorEvent {
-                        native_thread_id: None,
-                        native_turn_id: None,
-                        message: "Claude stdout frame is not UTF-8".to_owned(),
-                        code: Some("claude_stdout_ingress_limit".to_owned()),
+                        native_thread_id,
+                        native_turn_id,
+                        message: format!("Claude stdout decode failed: {error:#}"),
+                        code: Some("claude_stdout_decode_failed".to_owned()),
                         retryable: false,
                         native: None,
                     }))
@@ -2259,45 +2314,6 @@ impl ClaudeStreamClient {
                     break;
                 }
             };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if buffer.is_empty() && !trimmed.starts_with('{') {
-                continue;
-            }
-            if buffer.len().saturating_add(trimmed.len()) > codec.budget().max_frame_bytes {
-                self.emit(RuntimeEvent::Error(RuntimeErrorEvent {
-                    native_thread_id: None,
-                    native_turn_id: None,
-                    message: "Claude stdout JSON exceeds the native frame budget".to_owned(),
-                    code: Some("claude_stdout_ingress_limit".to_owned()),
-                    retryable: false,
-                    native: None,
-                }))
-                .await;
-                break;
-            }
-            buffer.push_str(trimmed);
-            let value = match serde_json::from_str::<JsonValue>(&buffer) {
-                Ok(value) => {
-                    buffer.clear();
-                    value
-                }
-                Err(_) => continue,
-            };
-            if let Err(error) = codec.validate_value(&value) {
-                self.emit(RuntimeEvent::Error(RuntimeErrorEvent {
-                    native_thread_id: None,
-                    native_turn_id: None,
-                    message: format!("Claude stdout JSON rejected: {error}"),
-                    code: Some("claude_stdout_ingress_limit".to_owned()),
-                    retryable: false,
-                    native: None,
-                }))
-                .await;
-                break;
-            }
             self.handle_incoming(value).await;
         }
         self.fail_pending_requests("Claude CLI process ended".to_owned())

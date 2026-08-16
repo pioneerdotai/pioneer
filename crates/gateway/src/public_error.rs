@@ -3,8 +3,6 @@ use pioneer_protocol::{
     PublicErrorCode, PublicErrorStage, RequestId,
 };
 
-const PUBLIC_ERROR_MESSAGE_MAX_BYTES: usize = 256;
-
 /// Maps internal failure chains to the only error shape allowed to cross a
 /// public transport or persistence projection boundary.
 pub(crate) fn map_agent_failure(
@@ -25,7 +23,7 @@ pub(crate) fn map_agent_failure(
         version: PUBLIC_ERROR_VERSION,
         code,
         stage,
-        message: bounded_message(public_message(code)),
+        message: public_message(code).to_owned(),
         retryable: matches!(
             code,
             PublicErrorCode::Unavailable | PublicErrorCode::Timeout | PublicErrorCode::Conflict
@@ -70,17 +68,6 @@ fn public_message(code: PublicErrorCode) -> &'static str {
         PublicErrorCode::Timeout => "The agent operation timed out.",
         PublicErrorCode::Internal => "The agent operation could not be completed.",
     }
-}
-
-fn bounded_message(message: &str) -> String {
-    if message.len() <= PUBLIC_ERROR_MESSAGE_MAX_BYTES {
-        return message.to_owned();
-    }
-    let mut end = PUBLIC_ERROR_MESSAGE_MAX_BYTES;
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    message[..end].to_owned()
 }
 
 #[cfg(test)]

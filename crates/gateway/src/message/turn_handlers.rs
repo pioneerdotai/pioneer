@@ -165,9 +165,9 @@ fn public_turn_start_error(
     )
 }
 
-/// Returns the largest sequence-preserving prefix that fits the role-owned
-/// observation budget. The cursor is moved only through events present in the
-/// returned prefix, so a byte clamp can never silently skip an event.
+/// Returns the largest sequence-preserving prefix that fits the response-page
+/// target. A single event is always returned intact so pagination can never
+/// make durable history unreadable.
 fn fit_turn_items_page_to_budget(
     page: pioneer_protocol::TurnItemsResponse,
     requested_after_sequence: Option<i64>,
@@ -194,7 +194,7 @@ fn fit_turn_items_page_to_budget(
                 .map(|event| event.sequence)
                 .unwrap_or(requested_cursor);
             if cursor <= requested_cursor {
-                return Err("one turn/items event exceeds the server observation budget".to_owned());
+                return Err("turn/items page could not advance its cursor".to_owned());
             }
             candidate.last_sequence = cursor;
             candidate.has_more = true;
@@ -212,12 +212,12 @@ fn fit_turn_items_page_to_budget(
     let requested_cursor = requested_after_sequence.unwrap_or(0);
     let upper = page.events.len().min(max_items);
     if upper == 0 {
-        return Err("turn/items page metadata exceeds the server observation budget".to_owned());
+        return Ok(page);
     }
 
     let smallest = prefix(&page, 1, requested_cursor)?;
     if encoded_len(&smallest)? > max_encoded_bytes {
-        return Err("one turn/items event exceeds the server observation budget".to_owned());
+        return Ok(smallest);
     }
 
     let mut best = smallest;
@@ -7094,8 +7094,6 @@ impl MessageProcessor {
             return;
         }
 
-        const HARD_MAX_TURN_ITEM_PAGE_ITEMS: usize = 200;
-        const HARD_MAX_TURN_ITEM_PAGE_BYTES: usize = 1024 * 1024;
         let principal = request_context.principal();
         let policy_service = AuthorizationService::new();
         let Some(role_key) =
@@ -7144,13 +7142,8 @@ impl MessageProcessor {
                 return;
             }
         };
-        let max_page_items = (observation_policy.max_turn_page_items as usize)
-            .min(HARD_MAX_TURN_ITEM_PAGE_ITEMS)
-            .max(1);
-        let max_page_bytes = observation_policy
-            .max_turn_page_bytes
-            .min(HARD_MAX_TURN_ITEM_PAGE_BYTES)
-            .max(1);
+        let max_page_items = (observation_policy.max_turn_page_items as usize).max(1);
+        let max_page_bytes = observation_policy.max_turn_page_bytes.max(1);
         let limit = params
             .limit
             .map(|limit| limit as usize)
@@ -8076,7 +8069,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_items_page_budget_returns_largest_lossless_prefix() {
+    fn turn_items_page_budget_preserves_progress_and_never_truncates_an_event() {
         let page = observation_page(3, 128);
         let mut two_event_prefix = page.clone();
         two_event_prefix.events.truncate(2);
@@ -8088,22 +8081,16 @@ mod tests {
         let fitted = fit_turn_items_page_to_budget(page, None, 200, budget)
             .expect("two-event prefix should fit exactly");
         assert_eq!(fitted.events.len(), 2);
-        assert_eq!(fitted.last_sequence, 2);
-        assert!(fitted.has_more);
-        assert_eq!(fitted.next_cursor, Some(2));
-        assert!(serde_json::to_vec(&fitted).unwrap().len() <= budget);
-    }
-
-    #[test]
-    fn turn_items_page_budget_clamps_item_count_and_rejects_oversized_single_event() {
-        let fitted = fit_turn_items_page_to_budget(observation_page(3, 16), None, 2, usize::MAX)
-            .expect("item clamp should return a continuation");
-        assert_eq!(fitted.events.len(), 2);
         assert_eq!(fitted.next_cursor, Some(2));
 
-        let error = fit_turn_items_page_to_budget(observation_page(1, 4096), None, 200, 256)
-            .expect_err("one oversized event cannot be skipped by advancing the cursor");
-        assert!(error.contains("one turn/items event"));
+        let oversized = fit_turn_items_page_to_budget(observation_page(2, 4_096), None, 200, 256)
+            .expect("one oversized event must remain readable");
+        assert_eq!(oversized.events.len(), 1);
+        assert_eq!(oversized.next_cursor, Some(1));
+        assert_eq!(
+            oversized.events[0].payload,
+            observation_event(1, 4_096).payload
+        );
     }
 
     #[test]

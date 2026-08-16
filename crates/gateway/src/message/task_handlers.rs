@@ -459,15 +459,9 @@ impl MessageProcessor {
     fn task_mutation_context(
         request_context: &RequestContext,
     ) -> pioneer_tasks::TaskMutationContext {
-        let mut context = pioneer_tasks::TaskMutationContext::user(
+        pioneer_tasks::TaskMutationContext::user(
             request_context.principal().principal_id.to_string(),
-        );
-        context.task_resource_budget = crate::authorization::AuthorizationService::new()
-            .task_resource_budget(
-                request_context.principal().kind,
-                request_context.principal().role_key.as_ref(),
-            );
-        context
+        )
     }
 
     pub(crate) async fn task_create_context_for_params(
@@ -906,11 +900,6 @@ impl MessageProcessor {
         };
         context.actor_id = Some(request_context.principal().principal_id.to_string());
         context.execution_admission = task_execution_admission;
-        context.task_resource_budget = crate::authorization::AuthorizationService::new()
-            .task_resource_budget(
-                request_context.principal().kind,
-                request_context.principal().role_key.as_ref(),
-            );
         if let Some(seed) = context.execution_admission.as_ref()
             && self
                 .validate_task_execution_admission_seed(seed)
@@ -980,7 +969,7 @@ impl MessageProcessor {
             .await;
             return;
         };
-        let Some(observation) = self
+        let Some(_observation) = self
             .acquire_task_observation_page(request_context, &request_id, workspace_id)
             .await
         else {
@@ -990,12 +979,7 @@ impl MessageProcessor {
         let operator_allowed = self
             .task_operator_projection_allowed(request_context, Some(params.task_id.as_str()), None)
             .await;
-        match self
-            .task_runtime
-            .service()
-            .get_task_with_budget(params, observation.budget)
-            .await
-        {
+        match self.task_runtime.service().get_task(params).await {
             Ok(response_payload) => {
                 let projected =
                     crate::task_projection::project_task_get(&response_payload, operator_allowed);
