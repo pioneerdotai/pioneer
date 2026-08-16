@@ -1,19 +1,30 @@
 use pioneer_protocol::{
     PublicErrorStage, PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse,
-    PublicTaskArtifact, PublicTaskDeliveriesResponse, PublicTaskDelivery,
-    PublicTaskDeliveryAttempt, PublicTaskDependency, PublicTaskEvent, PublicTaskEventsResponse,
+    PublicTaskAgentConfiguration, PublicTaskArtifact, PublicTaskConfiguration,
+    PublicTaskDeliveriesResponse, PublicTaskDelivery, PublicTaskDeliveryAttempt,
+    PublicTaskDeliveryPolicy, PublicTaskDependency, PublicTaskEvent, PublicTaskEventsResponse,
     PublicTaskFailure, PublicTaskGetResponse, PublicTaskListResponse, PublicTaskResult,
-    PublicTaskResultCandidate, PublicTaskRun, PublicTaskTree, PublicTaskTreeResponse,
-    PublicTaskTrigger, PublicTaskWaitItem, PublicTaskWaitNonWaitableItem, PublicTaskWaitResponse,
-    PublicTaskWaitReviewItem, Task, TaskAgendaResponse, TaskDeliveriesResponse, TaskDelivery,
-    TaskDeliveryAttempt, TaskError, TaskErrorClass, TaskEventsResponse, TaskGetResponse,
-    TaskListResponse, TaskOperatorDeliveries, TaskOperatorDetails, TaskResult, TaskResultCandidate,
-    TaskRun, TaskTree, TaskTreeResponse, TaskTrigger, TaskWaitItem, TaskWaitResponse,
+    PublicTaskResultCandidate, PublicTaskResultContractConfiguration, PublicTaskRun,
+    PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger, PublicTaskTriggerConfiguration,
+    PublicTaskTriggerSpec, PublicTaskWaitItem, PublicTaskWaitNonWaitableItem,
+    PublicTaskWaitResponse, PublicTaskWaitReviewItem, Task, TaskAgendaResponse,
+    TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt, TaskError, TaskErrorClass,
+    TaskEventsResponse, TaskGetResponse, TaskListResponse, TaskOperatorDeliveries,
+    TaskOperatorDetails, TaskResult, TaskResultCandidate, TaskRun, TaskTree, TaskTreeResponse,
+    TaskTrigger, TaskTriggerSpec, TaskWaitItem, TaskWaitResponse,
 };
 
 pub(crate) fn project_task_get(
     response: &TaskGetResponse,
     operator_allowed: bool,
+) -> PublicTaskGetResponse {
+    project_task_get_with_configuration(response, operator_allowed, false)
+}
+
+pub(crate) fn project_task_get_with_configuration(
+    response: &TaskGetResponse,
+    operator_allowed: bool,
+    configuration_allowed: bool,
 ) -> PublicTaskGetResponse {
     PublicTaskGetResponse {
         task: project_task(&response.task),
@@ -24,6 +35,7 @@ pub(crate) fn project_task_get(
             .iter()
             .map(project_dependency)
             .collect(),
+        configuration: configuration_allowed.then(|| project_task_configuration(response)),
         operator: operator_allowed.then(|| TaskOperatorDetails {
             task: response.task.clone(),
             agent_specs: response.agent_specs.clone(),
@@ -34,6 +46,117 @@ pub(crate) fn project_task_get(
             result_candidates: response.result_candidates.clone(),
             result_review_events: response.result_review_events.clone(),
         }),
+    }
+}
+
+fn project_task_configuration(response: &TaskGetResponse) -> PublicTaskConfiguration {
+    // A scheduled RunCreated event reuses the durable spec id, so its SQL
+    // projection can replace the base row with the frozen run snapshot. Prefer
+    // a separately materialized base row, but fall back to the latest effective
+    // snapshot so configuration remains readable after the first launch.
+    let agent_spec = response
+        .agent_specs
+        .iter()
+        .rev()
+        .find(|spec| spec.run_id.is_none())
+        .or_else(|| response.agent_specs.last());
+    PublicTaskConfiguration {
+        triggers: response
+            .triggers
+            .iter()
+            .map(project_trigger_configuration)
+            .collect(),
+        agent: agent_spec.map(|spec| PublicTaskAgentConfiguration {
+            agent_role: spec.agent_role.clone(),
+            agent_nickname: spec.agent_nickname.clone(),
+            model: spec.model.clone(),
+            model_provider: spec.model_provider.clone(),
+            instructions: spec.prompt.instructions.clone(),
+            output_instructions: spec.prompt.output_instructions.clone(),
+            input_configured: spec.prompt.input.is_some(),
+            context_policy_configured: spec.context_policy.is_some(),
+            tool_policy_configured: spec.tool_policy.is_some(),
+            result_contract: spec.result_contract.as_ref().map(|contract| {
+                PublicTaskResultContractConfiguration {
+                    format: contract.format,
+                    required: contract.required,
+                    schema_configured: contract.schema.is_some(),
+                }
+            }),
+            review_policy: spec.review_policy.clone(),
+            depth: spec.depth,
+            max_depth: spec.max_depth,
+        }),
+        lifecycle_policy: response.task.lifecycle_policy.clone(),
+        delivery_policy: response.task.delivery_policy.as_ref().map(|policy| {
+            PublicTaskDeliveryPolicy {
+                mode: policy.mode,
+                thread_target: policy.thread_target,
+                thread_id: policy.thread_id.clone(),
+                webhook_configured: policy.webhook_url.is_some(),
+                include_result: policy.include_result,
+                format: policy.format,
+            }
+        }),
+        retry_policy: response.task.retry_policy.clone(),
+        timeout_policy: response.task.timeout_policy.clone(),
+        concurrency_policy: response.task.concurrency_policy.clone(),
+    }
+}
+
+fn project_trigger_configuration(trigger: &TaskTrigger) -> PublicTaskTriggerConfiguration {
+    let spec = match &trigger.spec {
+        TaskTriggerSpec::Immediate => PublicTaskTriggerSpec::Immediate,
+        TaskTriggerSpec::ScheduledAt {
+            scheduled_at,
+            timezone,
+            catch_up_policy,
+        } => PublicTaskTriggerSpec::ScheduledAt {
+            scheduled_at: *scheduled_at,
+            timezone: timezone.clone(),
+            catch_up_policy: catch_up_policy.clone(),
+        },
+        TaskTriggerSpec::Interval {
+            interval_seconds,
+            interval_anchor_at,
+            catch_up_policy,
+        } => PublicTaskTriggerSpec::Interval {
+            interval_seconds: *interval_seconds,
+            interval_anchor_at: *interval_anchor_at,
+            catch_up_policy: catch_up_policy.clone(),
+        },
+        TaskTriggerSpec::Cron {
+            cron_expr,
+            timezone,
+            catch_up_policy,
+        } => PublicTaskTriggerSpec::Cron {
+            cron_expr: cron_expr.clone(),
+            timezone: timezone.clone(),
+            catch_up_policy: catch_up_policy.clone(),
+        },
+        TaskTriggerSpec::Manual { allowed_actor } => PublicTaskTriggerSpec::Manual {
+            allowed_actor: *allowed_actor,
+        },
+        TaskTriggerSpec::External {
+            source,
+            event_type,
+            filter,
+        } => PublicTaskTriggerSpec::External {
+            source: source.clone(),
+            event_type: event_type.clone(),
+            filter_configured: filter.is_some(),
+        },
+        TaskTriggerSpec::Dependency { policy } => PublicTaskTriggerSpec::Dependency {
+            policy: policy.clone(),
+        },
+    };
+    PublicTaskTriggerConfiguration {
+        id: trigger.id.clone(),
+        status: trigger.status,
+        kind: trigger.kind(),
+        spec,
+        next_fire_at: trigger.next_fire_at,
+        last_fire_at: trigger.last_fire_at,
     }
 }
 
@@ -335,18 +458,24 @@ fn project_dependency(dependency: &pioneer_protocol::TaskDependency) -> PublicTa
 #[cfg(test)]
 mod tests {
     use pioneer_protocol::{
-        Task, TaskError, TaskErrorClass, TaskExecutorKind, TaskGetResponse, TaskOwnerKind,
-        TaskStatus,
+        Task, TaskAgentInput, TaskAgentPrompt, TaskAgentSpec, TaskError, TaskErrorClass,
+        TaskExecutorKind, TaskExternalTriggerFilter, TaskGetResponse, TaskOwnerKind, TaskStatus,
+        TaskTrigger, TaskTriggerSpec, TaskTriggerStatus, TaskValue,
     };
+    use std::collections::BTreeMap;
 
-    use super::project_task_get;
+    use super::{project_task_get, project_task_get_with_configuration};
 
     #[test]
     fn collaborator_projection_drops_host_paths_webhooks_and_raw_diagnostics() {
         let canary_path = "/Users/operator/private/task-result.txt";
         let canary_webhook = "https://hooks.example.test/deliver?token=secret";
         let canary_error = "database failed at /var/lib/pioneer/private.sqlite";
-        let response = TaskGetResponse {
+        let canary_input = "private task input that must not be disclosed";
+        let canary_external_filter = "payload.secret == 'private'";
+        let latest_projected_instruction =
+            "effective instruction retained after the first scheduled run";
+        let mut response = TaskGetResponse {
             task: Task {
                 id: "task-1".to_owned(),
                 workspace_id: "workspace-1".to_owned(),
@@ -399,9 +528,73 @@ mod tests {
                 updated_at: 1,
                 completed_at: Some(1),
             },
-            triggers: Vec::new(),
+            triggers: vec![
+                TaskTrigger {
+                    id: "trigger-cron".to_owned(),
+                    task_id: "task-1".to_owned(),
+                    status: TaskTriggerStatus::Active,
+                    spec: TaskTriggerSpec::Cron {
+                        cron_expr: "0 5 * * *".to_owned(),
+                        timezone: "Europe/Moscow".to_owned(),
+                        catch_up_policy: None,
+                    },
+                    next_fire_at: Some(1_700_000_000),
+                    last_fire_at: None,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                TaskTrigger {
+                    id: "trigger-external".to_owned(),
+                    task_id: "task-1".to_owned(),
+                    status: TaskTriggerStatus::Active,
+                    spec: TaskTriggerSpec::External {
+                        source: "third-party".to_owned(),
+                        event_type: Some("release".to_owned()),
+                        filter: Some(TaskExternalTriggerFilter {
+                            expression: Some(canary_external_filter.to_owned()),
+                            fields: BTreeMap::from([(
+                                "secret".to_owned(),
+                                TaskValue::String("private".to_owned()),
+                            )]),
+                        }),
+                    },
+                    next_fire_at: None,
+                    last_fire_at: None,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ],
             runs: Vec::new(),
-            agent_specs: Vec::new(),
+            agent_specs: vec![TaskAgentSpec {
+                id: "agent-spec-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                run_id: None,
+                agent_role: Some("release-auditor".to_owned()),
+                agent_nickname: Some("Auditor".to_owned()),
+                model: Some("test-model".to_owned()),
+                model_provider: Some("test-provider".to_owned()),
+                prompt: TaskAgentPrompt {
+                    goal: "Audit releases".to_owned(),
+                    instructions: vec!["Inspect every new release.".to_owned()],
+                    input: Some(TaskAgentInput {
+                        text: Some(canary_input.to_owned()),
+                        variables: Vec::new(),
+                        attachments: Vec::new(),
+                        references: Vec::new(),
+                    }),
+                    output_instructions: Some("Return concise markdown.".to_owned()),
+                },
+                context_policy: None,
+                tool_policy: None,
+                permission_cap: None,
+                security_cap: None,
+                result_contract: None,
+                review_policy: None,
+                depth: 0,
+                max_depth: 3,
+                created_at: 1,
+                updated_at: 1,
+            }],
             dependencies: Vec::new(),
             write_locks: Vec::new(),
             thread_lineage: Vec::new(),
@@ -410,6 +603,11 @@ mod tests {
             result_candidates: Vec::new(),
             result_review_events: Vec::new(),
         };
+        let mut run_spec = response.agent_specs[0].clone();
+        run_spec.id = "agent-spec-run-1".to_owned();
+        run_spec.run_id = Some("run-1".to_owned());
+        run_spec.prompt.instructions = vec![latest_projected_instruction.to_owned()];
+        response.agent_specs.push(run_spec);
 
         let encoded = serde_json::to_string(&project_task_get(&response, false))
             .expect("public Task projection serializes");
@@ -420,5 +618,37 @@ mod tests {
         assert!(!encoded.contains("operator"));
         assert!(encoded.contains("\"error\":"));
         assert!(encoded.contains("correlation_id"));
+
+        let managed =
+            serde_json::to_string(&project_task_get_with_configuration(&response, false, true))
+                .expect("managed Task projection serializes");
+        assert!(managed.contains("\"configuration\":"));
+        assert!(managed.contains("Inspect every new release."));
+        assert!(managed.contains("Return concise markdown."));
+        assert!(managed.contains("0 5 * * *"));
+        assert!(managed.contains("Europe/Moscow"));
+        assert!(managed.contains("\"webhookConfigured\":true"));
+        assert!(!managed.contains(canary_webhook));
+        assert!(!managed.contains(canary_path));
+        assert!(!managed.contains(canary_error));
+        assert!(!managed.contains(canary_input));
+        assert!(!managed.contains(canary_external_filter));
+        assert!(!managed.contains(latest_projected_instruction));
+        assert!(!managed.contains("\"operator\":"));
+        assert!(managed.contains("\"filterConfigured\":true"));
+        assert!(managed.contains("third-party"));
+
+        // RunCreated snapshots intentionally reuse the durable spec id. The
+        // database projection therefore replaces the base row with the frozen
+        // run row after the first scheduled launch. Management reads must
+        // still expose that effective configuration when no separate base row
+        // remains, while continuing to redact the input and security details.
+        response.agent_specs.remove(0);
+        let post_run =
+            serde_json::to_string(&project_task_get_with_configuration(&response, false, true))
+                .expect("post-run managed Task projection serializes");
+        assert!(post_run.contains(latest_projected_instruction));
+        assert!(!post_run.contains(canary_input));
+        assert!(!post_run.contains("\"operator\":"));
     }
 }

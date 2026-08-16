@@ -256,11 +256,13 @@ pub use skills::{
 };
 pub use system_assets::PIONEER_AGENT_AVATAR_REVISION;
 pub use task::{
-    PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse, PublicTaskArtifact,
-    PublicTaskDeliveriesResponse, PublicTaskDelivery, PublicTaskDeliveryAttempt,
-    PublicTaskDependency, PublicTaskEvent, PublicTaskEventsResponse, PublicTaskFailure,
-    PublicTaskGetResponse, PublicTaskListResponse, PublicTaskResult, PublicTaskResultCandidate,
-    PublicTaskRun, PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger, PublicTaskWaitItem,
+    PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse, PublicTaskAgentConfiguration,
+    PublicTaskArtifact, PublicTaskConfiguration, PublicTaskDeliveriesResponse, PublicTaskDelivery,
+    PublicTaskDeliveryAttempt, PublicTaskDeliveryPolicy, PublicTaskDependency, PublicTaskEvent,
+    PublicTaskEventsResponse, PublicTaskFailure, PublicTaskGetResponse, PublicTaskListResponse,
+    PublicTaskResult, PublicTaskResultCandidate, PublicTaskResultContractConfiguration,
+    PublicTaskRun, PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger,
+    PublicTaskTriggerConfiguration, PublicTaskTriggerSpec, PublicTaskWaitItem,
     PublicTaskWaitNonWaitableItem, PublicTaskWaitResponse, PublicTaskWaitReviewItem,
     TASK_COMPOSER_WORK_VERSION, Task, TaskAcceptParams, TaskAcceptResponse, TaskAgendaItem,
     TaskAgendaParams, TaskAgendaResponse, TaskAgentContext, TaskAgentContextMode,

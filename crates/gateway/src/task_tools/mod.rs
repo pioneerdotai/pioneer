@@ -783,6 +783,46 @@ impl TaskToolAuthorizationScope {
         }
     }
 
+    /// Configuration is more sensitive than ordinary Task status. Expose it
+    /// only when the current execution may manage the exact Task; denial or an
+    /// unavailable authority check degrades to the existing public view.
+    async fn task_configuration_allowed(&self, store: &CrudStore, task_id: &str) -> bool {
+        let action = crate::authorization::ResourceAction::TaskScheduleManage;
+        let gate = crate::authorization::AuthorizationService::new().authorize_action(
+            self.principal.kind,
+            self.principal.role_key.as_ref(),
+            action,
+        );
+        match crate::authorization::AuthorizationResolver::new(store.clone())
+            .authorize_task(
+                &self.principal,
+                &gate,
+                action,
+                task_id,
+                Some(self.workspace_id.as_str()),
+                Some(self.root_thread_id.as_str()),
+            )
+            .await
+        {
+            Ok(crate::authorization::ProofResolution::Authorized(proof)) => {
+                crate::authorization::record_task_tool_decision(action, proof.decision());
+                true
+            }
+            Ok(crate::authorization::ProofResolution::Denied(decision)) => {
+                crate::authorization::record_task_tool_decision(action, &decision);
+                false
+            }
+            Err(_) => {
+                crate::authorization::record_authorization_unavailable(
+                    action.safe_name(),
+                    "task",
+                    "tool_configuration",
+                );
+                false
+            }
+        }
+    }
+
     async fn authorize_wait_targets(
         &self,
         store: &CrudStore,
@@ -1582,6 +1622,9 @@ impl TaskToolHandler {
                 crate::authorization::ResourceAction::TaskRead,
             )
             .await?;
+        let configuration_allowed = authorization
+            .task_configuration_allowed(self.processor.crud_store.as_ref(), params.task_id.as_str())
+            .await;
         let _observation = authorization
             .acquire_observation_page(self.processor.as_ref())
             .await?;
@@ -1592,11 +1635,14 @@ impl TaskToolHandler {
             .get_task(params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        let payload =
-            serde_json::to_value(crate::task_projection::project_task_get(&response, false))
-                .map_err(|error| {
-                    ToolError::execution_failed(format!("failed to project task: {error}"))
-                })?;
+        let payload = serde_json::to_value(
+            crate::task_projection::project_task_get_with_configuration(
+                &response,
+                false,
+                configuration_allowed,
+            ),
+        )
+        .map_err(|error| ToolError::execution_failed(format!("failed to project task: {error}")))?;
         Ok(function_output(payload))
     }
 
@@ -2846,7 +2892,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_GET_TOOL,
-            "Get full task details, including runs, triggers, agent specs, dependencies, and child lineage.",
+            "Get durable task status, runs, triggers, and dependencies. When the current execution may manage the exact task, the response also includes a safe configuration view with exact ordinary schedules, executor instructions, output instructions, and lifecycle/delivery/retry/timeout/concurrency settings. Secret webhook URLs, task input, external-trigger filters, internal host paths, raw diagnostics, and execution-security snapshots are never returned; executor instructions are returned exactly as authored.",
             task_id_schema(),
             safe_read_recovery(),
         ),
@@ -4479,6 +4525,32 @@ mod tests {
             .expect("initiating Member may manage its task");
         assert!(
             scope
+                .task_configuration_allowed(&store, "K0000000000000000000A")
+                .await,
+            "a principal that may manage the exact Task may inspect its safe configuration"
+        );
+
+        let mut read_only_scope = scope.clone();
+        read_only_scope.principal.role_key = Some(
+            pioneer_protocol::RoleKey::new("synthetic_observer")
+                .expect("synthetic observer role key"),
+        );
+        read_only_scope
+            .authorize_task(
+                &store,
+                "K0000000000000000000A",
+                crate::authorization::ResourceAction::TaskRead,
+            )
+            .await
+            .expect("read-only observer may inspect Task status");
+        assert!(
+            !read_only_scope
+                .task_configuration_allowed(&store, "K0000000000000000000A")
+                .await,
+            "read-only Task access must not disclose management configuration"
+        );
+        assert!(
+            scope
                 .authorize_task(
                     &store,
                     "K0000000000000000000B",
@@ -4487,6 +4559,12 @@ mod tests {
                 .await
                 .is_err(),
             "a guessed task id from another private thread must fail closed"
+        );
+        assert!(
+            !scope
+                .task_configuration_allowed(&store, "K0000000000000000000B")
+                .await,
+            "management authority over one root must not disclose another root's Task configuration"
         );
         assert_eq!(
             scope

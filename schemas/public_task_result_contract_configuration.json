@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskResultContractConfiguration",
+  "type": "object",
+  "properties": {
+    "format": {
+      "$ref": "#/$defs/TaskAgentResultFormat"
+    },
+    "required": {
+      "type": "boolean"
+    },
+    "schemaConfigured": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "format",
+    "required",
+    "schemaConfigured"
+  ],
+  "$defs": {
+    "TaskAgentResultFormat": {
+      "type": "string",
+      "enum": [
+        "text",
+        "markdown",
+        "json",
+        "artifact"
+      ]
+    }
+  }
+}

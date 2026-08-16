@@ -1,0 +1,813 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskConfiguration",
+  "description": "Safe, management-facing Task configuration. This is deliberately separate\nfrom `TaskOperatorDetails`: it contains the durable settings an authorized\ncaller may need to inspect before updating a Task, without exposing raw\ndiagnostics, internal/input host paths, webhook URLs, or execution-security\nsnapshots. Executor instructions are returned exactly as authored.",
+  "type": "object",
+  "properties": {
+    "agent": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PublicTaskAgentConfiguration"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "concurrencyPolicy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskConcurrencyPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "deliveryPolicy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PublicTaskDeliveryPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lifecyclePolicy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskLifecyclePolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "retryPolicy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskRetryPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "timeoutPolicy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskTimeoutPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "triggers": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/PublicTaskTriggerConfiguration"
+      }
+    }
+  },
+  "$defs": {
+    "PublicTaskAgentConfiguration": {
+      "type": "object",
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contextPolicyConfigured": {
+          "type": "boolean"
+        },
+        "depth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "inputConfigured": {
+          "type": "boolean"
+        },
+        "instructions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "maxDepth": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelProvider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputInstructions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resultContract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicTaskResultContractConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskAgentReviewPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "toolPolicyConfigured": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "inputConfigured",
+        "contextPolicyConfigured",
+        "toolPolicyConfigured",
+        "depth",
+        "maxDepth"
+      ]
+    },
+    "PublicTaskDeliveryPolicy": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/TaskDeliveryFormat"
+        },
+        "includeResult": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskDeliveryMode"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadTarget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskDeliveryThreadTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "webhookConfigured": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode",
+        "webhookConfigured",
+        "includeResult",
+        "format"
+      ]
+    },
+    "PublicTaskResultContractConfiguration": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/TaskAgentResultFormat"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "schemaConfigured": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "format",
+        "required",
+        "schemaConfigured"
+      ]
+    },
+    "PublicTaskTriggerConfiguration": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/TaskTriggerKind"
+        },
+        "lastFireAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "nextFireAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "spec": {
+          "$ref": "#/$defs/PublicTaskTriggerSpec"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskTriggerStatus"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "kind",
+        "spec"
+      ]
+    },
+    "PublicTaskTriggerSpec": {
+      "description": "Safe trigger configuration. Unlike `TaskTriggerSpec`, the external variant\ncannot contain a filter expression or arbitrary filter fields.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "immediate"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "catchUpPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "scheduled_at"
+            },
+            "scheduledAt": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "timezone": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "scheduledAt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "catchUpPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "intervalAnchorAt": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "intervalSeconds": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "interval"
+            }
+          },
+          "required": [
+            "kind",
+            "intervalSeconds"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "catchUpPolicy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cronExpr": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "cron"
+            },
+            "timezone": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "cronExpr",
+            "timezone"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allowedActor": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TaskManualActor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "manual"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "eventType": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "filterConfigured": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "external"
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "source",
+            "filterConfigured"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "dependency"
+            },
+            "policy": {
+              "$ref": "#/$defs/TaskDependencyTriggerPolicy"
+            }
+          },
+          "required": [
+            "kind",
+            "policy"
+          ]
+        }
+      ]
+    },
+    "TaskAgentResultFormat": {
+      "type": "string",
+      "enum": [
+        "text",
+        "markdown",
+        "json",
+        "artifact"
+      ]
+    },
+    "TaskAgentReviewMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "parent_agent",
+        "parent_agent_with_reviewers",
+        "user_approval"
+      ]
+    },
+    "TaskAgentReviewPolicy": {
+      "type": "object",
+      "properties": {
+        "maxRevisionRounds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskAgentReviewMode"
+        },
+        "requireExplicitAcceptance": {
+          "type": "boolean"
+        },
+        "resolutionStrategy": {
+          "$ref": "#/$defs/TaskResultReviewResolutionStrategy"
+        },
+        "reviewers": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskResultReviewerSpec"
+          }
+        }
+      },
+      "required": [
+        "mode",
+        "maxRevisionRounds",
+        "requireExplicitAcceptance",
+        "resolutionStrategy"
+      ]
+    },
+    "TaskAttachmentMode": {
+      "type": "string",
+      "enum": [
+        "attached",
+        "detached"
+      ]
+    },
+    "TaskCompletionBehavior": {
+      "type": "string",
+      "enum": [
+        "complete_on_terminal_run",
+        "keep_active_for_recurring",
+        "manual"
+      ]
+    },
+    "TaskConcurrencyConflictPolicy": {
+      "type": "string",
+      "enum": [
+        "queue",
+        "reject",
+        "cancel_existing",
+        "allow"
+      ]
+    },
+    "TaskConcurrencyPolicy": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "maxParallelRuns": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "onConflict": {
+          "$ref": "#/$defs/TaskConcurrencyConflictPolicy"
+        }
+      },
+      "required": [
+        "maxParallelRuns",
+        "onConflict"
+      ]
+    },
+    "TaskDeliveryFormat": {
+      "type": "string",
+      "enum": [
+        "summary",
+        "full_result"
+      ]
+    },
+    "TaskDeliveryMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "thread",
+        "user_notification",
+        "webhook"
+      ]
+    },
+    "TaskDeliveryThreadTarget": {
+      "description": "Semantic thread target resolved and persisted by Gateway.",
+      "type": "string",
+      "enum": [
+        "origin_thread",
+        "current_thread",
+        "collaboration_root",
+        "exact_thread"
+      ]
+    },
+    "TaskDependencyTriggerMode": {
+      "type": "string",
+      "enum": [
+        "all_succeeded",
+        "any_succeeded",
+        "all_terminal"
+      ]
+    },
+    "TaskDependencyTriggerPolicy": {
+      "type": "object",
+      "properties": {
+        "dependsOnTaskIds": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskDependencyTriggerMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TaskErrorClass": {
+      "type": "string",
+      "enum": [
+        "cancelled",
+        "timeout",
+        "provider",
+        "tool",
+        "validation",
+        "dependency",
+        "policy",
+        "internal",
+        "unknown"
+      ]
+    },
+    "TaskLifecyclePolicy": {
+      "type": "object",
+      "properties": {
+        "attachment": {
+          "$ref": "#/$defs/TaskAttachmentMode"
+        },
+        "completion": {
+          "$ref": "#/$defs/TaskCompletionBehavior"
+        },
+        "onParentCancel": {
+          "$ref": "#/$defs/TaskParentTerminalAction"
+        },
+        "onParentFailure": {
+          "$ref": "#/$defs/TaskParentTerminalAction"
+        }
+      },
+      "required": [
+        "attachment",
+        "onParentCancel",
+        "onParentFailure",
+        "completion"
+      ]
+    },
+    "TaskManualActor": {
+      "type": "string",
+      "enum": [
+        "owner",
+        "workspace_member",
+        "system",
+        "any"
+      ]
+    },
+    "TaskParentTerminalAction": {
+      "type": "string",
+      "enum": [
+        "cancel",
+        "detach",
+        "keep_running"
+      ]
+    },
+    "TaskResultReviewResolutionStrategy": {
+      "type": "string",
+      "enum": [
+        "parent_final",
+        "user_final",
+        "require_all_required_reviewers_then_parent",
+        "quorum_then_parent",
+        "any_required_reviewer_can_request_changes"
+      ]
+    },
+    "TaskResultReviewerKind": {
+      "type": "string",
+      "enum": [
+        "runtime_auto",
+        "parent_agent",
+        "review_agent",
+        "user",
+        "system"
+      ]
+    },
+    "TaskResultReviewerSpec": {
+      "type": "object",
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "reviewerKind": {
+          "$ref": "#/$defs/TaskResultReviewerKind"
+        },
+        "weight": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "reviewerKind",
+        "required"
+      ]
+    },
+    "TaskRetryBackoffKind": {
+      "type": "string",
+      "enum": [
+        "none",
+        "fixed",
+        "exponential"
+      ]
+    },
+    "TaskRetryPolicy": {
+      "type": "object",
+      "properties": {
+        "backoff": {
+          "$ref": "#/$defs/TaskRetryBackoffKind"
+        },
+        "initialDelaySeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "maxDelaySeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "retryOn": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TaskErrorClass"
+          }
+        }
+      },
+      "required": [
+        "maxAttempts",
+        "backoff"
+      ]
+    },
+    "TaskTimeoutPolicy": {
+      "type": "object",
+      "properties": {
+        "heartbeatTimeoutSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "queueTimeoutSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "runTimeoutSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "TaskTriggerCatchUpMode": {
+      "type": "string",
+      "enum": [
+        "run_once_for_latest_missed",
+        "skip_missed",
+        "run_all_missed"
+      ]
+    },
+    "TaskTriggerCatchUpPolicy": {
+      "type": "object",
+      "properties": {
+        "maxCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskTriggerCatchUpMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TaskTriggerKind": {
+      "type": "string",
+      "enum": [
+        "immediate",
+        "scheduled_at",
+        "interval",
+        "cron",
+        "manual",
+        "external",
+        "dependency"
+      ]
+    },
+    "TaskTriggerStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "paused",
+        "exhausted",
+        "cancelled"
+      ]
+    }
+  }
+}

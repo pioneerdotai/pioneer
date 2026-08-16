@@ -2755,6 +2755,135 @@ pub struct PublicTaskDependency {
     pub created_at: i64,
 }
 
+/// Safe, management-facing Task configuration. This is deliberately separate
+/// from `TaskOperatorDetails`: it contains the durable settings an authorized
+/// caller may need to inspect before updating a Task, without exposing raw
+/// diagnostics, internal/input host paths, webhook URLs, or execution-security
+/// snapshots. Executor instructions are returned exactly as authored.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskConfiguration {
+    #[serde(default)]
+    pub triggers: Vec<PublicTaskTriggerConfiguration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<PublicTaskAgentConfiguration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_policy: Option<TaskLifecyclePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_policy: Option<PublicTaskDeliveryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<TaskRetryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_policy: Option<TaskTimeoutPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_policy: Option<TaskConcurrencyPolicy>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskDeliveryPolicy {
+    pub mode: TaskDeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_target: Option<TaskDeliveryThreadTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub webhook_configured: bool,
+    pub include_result: bool,
+    pub format: TaskDeliveryFormat,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskTriggerConfiguration {
+    pub id: String,
+    pub status: TaskTriggerStatus,
+    pub kind: TaskTriggerKind,
+    pub spec: PublicTaskTriggerSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fire_at: Option<i64>,
+}
+
+/// Safe trigger configuration. Unlike `TaskTriggerSpec`, the external variant
+/// cannot contain a filter expression or arbitrary filter fields.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum PublicTaskTriggerSpec {
+    Immediate,
+    ScheduledAt {
+        scheduled_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timezone: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
+    },
+    Interval {
+        interval_seconds: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_anchor_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
+    },
+    Cron {
+        cron_expr: String,
+        timezone: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
+    },
+    Manual {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_actor: Option<TaskManualActor>,
+    },
+    External {
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_type: Option<String>,
+        filter_configured: bool,
+    },
+    Dependency {
+        policy: TaskDependencyTriggerPolicy,
+    },
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskAgentConfiguration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_nickname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub instructions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_instructions: Option<String>,
+    pub input_configured: bool,
+    pub context_policy_configured: bool,
+    pub tool_policy_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_contract: Option<PublicTaskResultContractConfiguration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<TaskAgentReviewPolicy>,
+    pub depth: i64,
+    pub max_depth: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskResultContractConfiguration {
+    pub format: TaskAgentResultFormat,
+    pub required: bool,
+    pub schema_configured: bool,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskOperatorDetails {
@@ -2785,6 +2914,8 @@ pub struct PublicTaskGetResponse {
     pub runs: Vec<PublicTaskRun>,
     #[serde(default)]
     pub dependencies: Vec<PublicTaskDependency>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<PublicTaskConfiguration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<TaskOperatorDetails>,
 }

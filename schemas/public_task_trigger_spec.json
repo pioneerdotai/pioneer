@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskTriggerSpec",
+  "description": "Safe trigger configuration. Unlike `TaskTriggerSpec`, the external variant\ncannot contain a filter expression or arbitrary filter fields.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "immediate"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "catchUpPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "const": "scheduled_at"
+        },
+        "scheduledAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "timezone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "scheduledAt"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "catchUpPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "intervalAnchorAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "intervalSeconds": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "kind": {
+          "type": "string",
+          "const": "interval"
+        }
+      },
+      "required": [
+        "kind",
+        "intervalSeconds"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "catchUpPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskTriggerCatchUpPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cronExpr": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "cron"
+        },
+        "timezone": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "cronExpr",
+        "timezone"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "allowedActor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskManualActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "const": "manual"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "eventType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filterConfigured": {
+          "type": "boolean"
+        },
+        "kind": {
+          "type": "string",
+          "const": "external"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "source",
+        "filterConfigured"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "dependency"
+        },
+        "policy": {
+          "$ref": "#/$defs/TaskDependencyTriggerPolicy"
+        }
+      },
+      "required": [
+        "kind",
+        "policy"
+      ]
+    }
+  ],
+  "$defs": {
+    "TaskDependencyTriggerMode": {
+      "type": "string",
+      "enum": [
+        "all_succeeded",
+        "any_succeeded",
+        "all_terminal"
+      ]
+    },
+    "TaskDependencyTriggerPolicy": {
+      "type": "object",
+      "properties": {
+        "dependsOnTaskIds": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskDependencyTriggerMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TaskManualActor": {
+      "type": "string",
+      "enum": [
+        "owner",
+        "workspace_member",
+        "system",
+        "any"
+      ]
+    },
+    "TaskTriggerCatchUpMode": {
+      "type": "string",
+      "enum": [
+        "run_once_for_latest_missed",
+        "skip_missed",
+        "run_all_missed"
+      ]
+    },
+    "TaskTriggerCatchUpPolicy": {
+      "type": "object",
+      "properties": {
+        "maxCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskTriggerCatchUpMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    }
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskDeliveryPolicy",
+  "type": "object",
+  "properties": {
+    "format": {
+      "$ref": "#/$defs/TaskDeliveryFormat"
+    },
+    "includeResult": {
+      "type": "boolean"
+    },
+    "mode": {
+      "$ref": "#/$defs/TaskDeliveryMode"
+    },
+    "threadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "threadTarget": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskDeliveryThreadTarget"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "webhookConfigured": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "mode",
+    "webhookConfigured",
+    "includeResult",
+    "format"
+  ],
+  "$defs": {
+    "TaskDeliveryFormat": {
+      "type": "string",
+      "enum": [
+        "summary",
+        "full_result"
+      ]
+    },
+    "TaskDeliveryMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "thread",
+        "user_notification",
+        "webhook"
+      ]
+    },
+    "TaskDeliveryThreadTarget": {
+      "description": "Semantic thread target resolved and persisted by Gateway.",
+      "type": "string",
+      "enum": [
+        "origin_thread",
+        "current_thread",
+        "collaboration_root",
+        "exact_thread"
+      ]
+    }
+  }
+}
