@@ -36371,6 +36371,157 @@ async fn native_permission_request_cancellation_resolves_and_removes_pending_req
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_permission_request_replays_and_accepts_durable_response_after_restart() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager.clone(),
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    );
+    let thread_id = "thread_native_permission_restart";
+    let turn_id = "turn_native_permission_restart";
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
+    let connection = processor
+        .session_manager
+        .connection_context(connection_id)
+        .await
+        .expect("test connection context");
+    persist_test_execution_authorization_context_for_principal_with_profile(
+        &processor,
+        connection.principal(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        &pioneer_protocol::system_turn_permission_profile_snapshot(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+        ),
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        thread_id,
+    )
+    .await;
+    ensure_test_superuser_secondary_session_authority(processor.crud_store.as_ref()).await;
+
+    let (respond_tx, _respond_rx) = tokio::sync::oneshot::channel();
+    processor
+        .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
+            request_id: "perm-approval-restart-1".to_owned(),
+            workspace_id: Some(workspace_id.clone()),
+            thread_id: Some(thread_id.to_owned()),
+            turn_id: Some(turn_id.to_owned()),
+            tool_name: "exec_command".to_owned(),
+            key: pioneer_tools::PermissionRequestKey {
+                profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
+                tool_name: "exec_command".to_owned(),
+                action: pioneer_tools::PermissionActionKind::ShellCommand,
+                normalized_scope_hash: "scope-hash-restart".to_owned(),
+                turn_id: turn_id.to_owned(),
+            },
+            reason: pioneer_tools::PermissionDecisionReason::PolicyRequiresApproval,
+            summary: Some("run shell command after restart".to_owned()),
+            details: Vec::new(),
+            respond_to: respond_tx,
+        })
+        .await;
+    let _ = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+
+    // Simulate a Gateway restart: the durable row remains, but the process
+    // local responder rendezvous is gone.
+    processor
+        .native_permission_pending_requests
+        .lock()
+        .await
+        .remove("perm-approval-restart-1");
+
+    let (replay_tx, mut replay_rx) = mpsc::channel(16);
+    let replay_connection_id = session_manager
+        .register_connection(replay_tx, authenticated_test_superuser_secondary_session())
+        .await
+        .expect("replay connection should register");
+    session_manager
+        .set_connection_workspace(replay_connection_id, Some(workspace_id.clone()))
+        .await;
+    subscribe_test_connection_to_materialized_thread(
+        &processor,
+        replay_connection_id,
+        workspace_id.as_str(),
+        thread_id,
+    )
+    .await;
+    processor
+        .replay_native_permission_requests_for_thread(
+            replay_connection_id,
+            workspace_id.as_str(),
+            thread_id,
+        )
+        .await;
+    let replayed =
+        recv_notification_by_method(&mut replay_rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    assert_eq!(
+        replayed.params.as_ref().expect("replayed params")["request"]["request_id"],
+        serde_json::json!("perm-approval-restart-1")
+    );
+
+    let response_id = "permissionrestart0001";
+    processor
+        .process_request_for_connection(
+            replay_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": response_id,
+                "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
+                "params": {
+                    "request_id": "perm-approval-restart-1",
+                    "workspace_id": workspace_id,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "resolution": "allow_once"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut replay_rx, response_id).await;
+    assert_eq!(
+        response.result["resolution"],
+        serde_json::json!("allow_once")
+    );
+    let stored = processor
+        .crud_store
+        .get_cli_runtime_pending_request("perm-approval-restart-1")
+        .await
+        .expect("durable request lookup should succeed")
+        .expect("durable request should survive restart");
+    assert_eq!(
+        stored.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::ResponseAccepted
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_request_respond_rejects_stale_request_ids() {
     let (tx, mut rx) = mpsc::channel(8);
     let session_manager = Arc::new(SessionManager::new());

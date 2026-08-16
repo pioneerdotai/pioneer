@@ -13,7 +13,9 @@ pub fn validate_proxy_url(proxy_url: &str) -> Result<String> {
     if proxy_url.is_empty() {
         return Err(anyhow!("provider proxy URL must not be empty"));
     }
-    Proxy::all(proxy_url).with_context(|| format!("invalid provider proxy URL `{proxy_url}`"))?;
+    // Proxy URLs may contain credentials.  Do not attach the raw value (or
+    // reqwest's parser error, which can echo it) to the returned diagnostic.
+    Proxy::all(proxy_url).map_err(|_| anyhow!("invalid provider proxy URL"))?;
     Ok(proxy_url.to_owned())
 }
 
@@ -32,10 +34,8 @@ fn build_client_with_proxy(
 ) -> Result<Client> {
     let mut builder = Client::builder().connect_timeout(policy.connect_timeout);
     if let Some(proxy_url) = proxy_url {
-        builder = builder.proxy(
-            Proxy::all(proxy_url)
-                .with_context(|| format!("invalid provider proxy URL `{proxy_url}`"))?,
-        );
+        builder = builder
+            .proxy(Proxy::all(proxy_url).map_err(|_| anyhow!("invalid provider proxy URL"))?);
     }
     builder.build().context("failed to build HTTP client")
 }
@@ -105,5 +105,28 @@ mod tests {
             format!("{error:#}").contains("proxy URL must not be empty"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn invalid_proxy_url_diagnostics_redact_embedded_credentials() {
+        let secret = "proxy-password-should-not-leak";
+        let raw = format!("http://proxy-user:{secret}@[");
+        let error = validate_proxy_url(raw.as_str()).expect_err("malformed proxy should fail");
+        let rendered = format!("{error:#}");
+        assert_eq!(rendered, "invalid provider proxy URL");
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("proxy-user"));
+    }
+
+    #[test]
+    fn client_builder_diagnostics_redact_embedded_credentials() {
+        let secret = "builder-password-should-not-leak";
+        let raw = format!("http://builder-user:{secret}@[");
+        let error = build_client_with_proxy(ProviderTimeoutPolicy::default(), Some(raw.as_str()))
+            .expect_err("malformed proxy should fail client construction");
+        let rendered = format!("{error:#}");
+        assert_eq!(rendered, "invalid provider proxy URL");
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("builder-user"));
     }
 }

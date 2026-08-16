@@ -13,6 +13,23 @@ impl MigratorTrait for BeforeLatestMigrator {
     }
 }
 
+struct BeforeTaskDeliveryTargetsMigrator;
+
+#[async_trait::async_trait]
+impl MigratorTrait for BeforeTaskDeliveryTargetsMigrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        let mut migrations = Migrator::migrations();
+        // The task-delivery migration is followed by a later stream-state
+        // migration.  This fixture must stop before the former, rather than
+        // merely before the current latest migration.
+        migrations.pop().expect("migration registry is not empty");
+        migrations
+            .pop()
+            .expect("task-delivery migration is registered");
+        migrations
+    }
+}
+
 fn sqlite_url(directory: &TempDir) -> String {
     format!(
         "sqlite://{}?mode=rwc",
@@ -139,7 +156,7 @@ async fn migration_upgrades_legacy_task_delivery_contract_without_runtime_fallba
     let directory = tempfile::tempdir().expect("create migration test directory");
     let url = sqlite_url(&directory);
     let previous = connect(&url).await;
-    BeforeLatestMigrator::up(&previous, None)
+    BeforeTaskDeliveryTargetsMigrator::up(&previous, None)
         .await
         .expect("apply previous release schema");
     previous

@@ -2250,6 +2250,23 @@ impl MessageProcessor {
             .validate_cli_runtime_pending_request_active_turn(&pending)
             .await
         {
+            // Validation checks the native owner before it checks the binding
+            // status. Once a turn has already terminalized, that owner lookup
+            // can fail because its attempt is no longer active, while sibling
+            // pending requests for the same turn still need the same terminal
+            // cleanup. Reconcile the durable binding here as well as expiring
+            // the request that was presented by the caller.
+            if let Some(turn_id) = pending.turn_id.as_deref()
+                && let Ok(Some(binding)) =
+                    self.crud_store.get_cli_runtime_turn_binding(turn_id).await
+                && !cli_runtime_turn_binding_status_is_active(binding.status.as_str())
+            {
+                self.cleanup_cli_runtime_terminal_binding_status(
+                    &binding,
+                    "stale CLI runtime request response",
+                )
+                .await;
+            }
             if let Err(expire_error) = self
                 .expire_cli_runtime_pending_request_as_stale(&pending)
                 .await
@@ -7525,12 +7542,16 @@ impl MessageProcessor {
         {
             return Ok(Some(segment.native_turn_id));
         }
-        if self
+        let latest_attempt = self
             .crud_store
             .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
-            .await?
-            .is_some()
-        {
+            .await?;
+        if let Some(attempt) = latest_attempt {
+            if attempt.status.is_active() {
+                return Ok(attempt
+                    .native_turn_id
+                    .or_else(|| binding.native_turn_id.clone()));
+            }
             return Ok(None);
         }
         Ok(binding.native_turn_id.clone())

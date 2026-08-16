@@ -640,6 +640,11 @@ impl ExecutionAdmissionService {
         validate_non_empty_identity("root thread", request.root_thread_id.as_str())?;
         validate_non_empty_identity("provider", request.provider.as_str())?;
         validate_non_empty_identity("model", request.model.as_str())?;
+        if native_api_provider_requires_artifacts(request) {
+            bail!(
+                "native API-provider attachments require an authorized exact-version artifact; server-local paths are not accepted"
+            );
+        }
         if self
             .policy
             .runtime_principal_policy(principal.kind, principal.role_key.as_ref())
@@ -993,6 +998,18 @@ impl ExecutionAdmissionService {
         })?;
         Ok(matches!(resolved, ProofResolution::Authorized(_)))
     }
+}
+
+fn native_api_provider_requires_artifacts(request: &ExecutionAdmissionRequest) -> bool {
+    request.has_local_attachment_sources
+        && matches!(
+            request.execution_backend,
+            None | Some(AgentExecutionBackend::ApiProvider { .. })
+        )
+        // Voice finalization materializes a server-owned recording after the
+        // authenticated upload path. Every other native API-provider ingress
+        // must use an exact-version artifact rather than a host path.
+        && request.entry_point != ExecutionAdmissionEntryPoint::VoiceTurn
 }
 
 /// Typed authority provenance. Missing provenance is never interpreted as an
@@ -3560,6 +3577,41 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn native_api_provider_rejects_untrusted_local_attachment_sources() {
+        let request = ExecutionAdmissionRequest {
+            entry_point: ExecutionAdmissionEntryPoint::InteractiveTurn,
+            required_root_action: ResourceAction::AgentTurnStart,
+            additional_required_actions: Vec::new(),
+            workspace_id: "workspace-a".to_owned(),
+            root_thread_id: "thread-a".to_owned(),
+            provider: "openai".to_owned(),
+            model: "model-a".to_owned(),
+            execution_backend: None,
+            capabilities: Vec::new(),
+            artifacts: Vec::new(),
+            has_local_attachment_sources: true,
+            has_url_attachment_sources: false,
+            provider_authority_fingerprint: Some("a".repeat(64)),
+        };
+        assert!(native_api_provider_requires_artifacts(&request));
+
+        let mut trusted_voice = request.clone();
+        trusted_voice.entry_point = ExecutionAdmissionEntryPoint::VoiceTurn;
+        assert!(!native_api_provider_requires_artifacts(&trusted_voice));
+
+        let mut recovery = request.clone();
+        recovery.entry_point = ExecutionAdmissionEntryPoint::Recovery;
+        assert!(native_api_provider_requires_artifacts(&recovery));
+
+        let mut cli = request;
+        cli.execution_backend = Some(AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: "codex".to_owned(),
+            runtime_kind: CLIAgentRuntimeKind::Codex,
+        });
+        assert!(!native_api_provider_requires_artifacts(&cli));
     }
 
     #[test]

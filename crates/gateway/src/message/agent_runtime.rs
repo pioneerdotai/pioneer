@@ -3916,6 +3916,17 @@ impl MessageProcessor {
                 observation => (observation, TurnFailureRecoveryKind::ObservationGap),
             };
 
+            // Reconcile the durable approval before interpreting an active
+            // runtime observation.  Otherwise the generic timeout evidence
+            // guard could `continue` first and leave a restart-orphaned
+            // approval pending forever.
+            if self
+                .reconcile_native_permission_wait_for_turn(candidate.turn_id.as_str(), now_unix_ms)
+                .await?
+            {
+                continue;
+            }
+
             match runtime_observation {
                 crate::resilience::RuntimeTimeoutObservation::Terminal => continue,
                 crate::resilience::RuntimeTimeoutObservation::Active
@@ -3969,6 +3980,23 @@ impl MessageProcessor {
         else {
             return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
         };
+        let native_permission_wait = self
+            .crud_store
+            .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+                runtime_id: Some("__native_permission__".to_owned()),
+                turn_id: Some(turn_id.to_owned()),
+                open_only: true,
+                limit: None,
+                ..Default::default()
+            })
+            .await?;
+        if !native_permission_wait.is_empty() {
+            // A human approval is a typed wait state, not causal execution
+            // progress. Do not renew tool-attempt leases merely because the
+            // native actor continues to emit heartbeats while awaiting a
+            // durable response.
+            return Ok(crate::resilience::RuntimeTimeoutObservation::Active);
+        }
         if !self.agent_manager.has_thread(thread_id.as_str()).await {
             return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
         }

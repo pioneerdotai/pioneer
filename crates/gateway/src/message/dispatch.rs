@@ -1882,7 +1882,8 @@ impl MessageProcessor {
                             AuthorizationExternalError::Validation.response(request.id.clone())
                         );
                     };
-                    self.native_permission_pending_requests
+                    let live_scope = self
+                        .native_permission_pending_requests
                         .lock()
                         .await
                         .get(request_id.trim())
@@ -1892,7 +1893,32 @@ impl MessageProcessor {
                                 pending.thread_id.clone(),
                                 pending.turn_id.clone(),
                             )
-                        })
+                        });
+                    if live_scope.is_some() {
+                        live_scope
+                    } else {
+                        self.crud_store
+                            .get_cli_runtime_pending_request(request_id.trim())
+                            .await
+                            .map_err(|_| {
+                                record_authorization_unavailable(
+                                    entry.action.safe_name(),
+                                    entry.resolver.safe_name(),
+                                    entry.audit.safe_name(),
+                                );
+                                AuthorizationExternalError::Unavailable.response(request.id.clone())
+                            })?
+                            .filter(|pending| {
+                                pending.runtime_id == "__native_permission__"
+                                    && pending.request_kind == "native_permission"
+                                    && pending.status.is_open()
+                            })
+                            .and_then(|pending| {
+                                pending.turn_id.map(|turn_id| {
+                                    (pending.workspace_id, pending.thread_id, turn_id)
+                                })
+                            })
+                    }
                 } else if request.method == methods::CLI_RUNTIME_REQUEST_RESPOND {
                     let request_id = params
                         .and_then(|params| {

@@ -462,4 +462,35 @@ mod tests {
             .unwrap();
         assert!(!Arc::ptr_eq(&first, &after_proxy_change));
     }
+
+    #[test]
+    fn workspace_lookup_never_reuses_global_credential_authority() {
+        let registry = ProviderRegistry::new_scoped(|workspace_id, _| match workspace_id {
+            None => "global-account-key".to_owned(),
+            Some("workspace-a") => "workspace-a-account-key".to_owned(),
+            Some(other) => format!("{other}-account-key"),
+        });
+        registry.insert("echo", Arc::new(EchoProvider::new()));
+
+        // Exercise both lookup orders.  A global-first cache hit must not
+        // become the workspace authority, and a workspace-first lookup must
+        // not poison the global scope.
+        let global = registry.get_or_create("echo").expect("global provider");
+        let workspace = registry
+            .get_or_create_for_workspace("workspace-a", "echo")
+            .expect("workspace provider");
+        assert!(!Arc::ptr_eq(&global, &workspace));
+        assert_ne!(
+            global.authority_fingerprint(),
+            workspace.authority_fingerprint(),
+            "credential/account authority must be part of the cache identity"
+        );
+
+        let workspace_again = registry
+            .get_or_create_for_workspace("workspace-a", "echo")
+            .expect("workspace provider cache hit");
+        let global_again = registry.get_or_create("echo").expect("global cache hit");
+        assert!(Arc::ptr_eq(&workspace, &workspace_again));
+        assert!(Arc::ptr_eq(&global, &global_again));
+    }
 }

@@ -186,6 +186,9 @@ struct FilesystemGrantCacheKey {
     profile_mode: TurnPermissionMode,
     authority_binding_id: String,
     authority_binding_revision: u64,
+    tool_name: String,
+    action: PermissionActionKind,
+    capability_scope_hash: String,
 }
 
 fn security_snapshot_audit_fields(
@@ -822,12 +825,28 @@ impl ToolOrchestrator {
         permission_grant: &PermissionEvaluationGrant,
         trace: &ToolEventTrace,
     ) -> Result<(), ToolError> {
-        self.apply_cached_filesystem_grants(invocation, permission_context);
-
         let requirements = filesystem_access_requirements(invocation, &permission_grant.intent);
         if requirements.is_empty() {
             return Ok(());
         }
+
+        // Build the capability identity before applying any cached authority.
+        // It includes the concrete tool/action/scope that was shown to the
+        // user, so a grant for one tool can never become ambient authority for
+        // another invocation in the same Turn.
+        let requested_grants = filesystem_grants_from_requirements(requirements.as_slice());
+        let capability_intent = filesystem_access_permission_intent(
+            invocation,
+            &permission_grant.intent,
+            requested_grants.as_slice(),
+        );
+        let cache_key = filesystem_grant_cache_key(
+            permission_context,
+            invocation.execution_security_snapshot.as_ref(),
+            invocation.tool_name.as_str(),
+            &capability_intent,
+        );
+        self.apply_cached_filesystem_grants(invocation, cache_key.as_ref());
 
         let missing = missing_filesystem_access_grants(
             invocation.execution_security_snapshot.as_ref(),
@@ -849,11 +868,11 @@ impl ToolOrchestrator {
         if permission_grant.approval_scope.can_apply_sandbox_grants() {
             self.apply_filesystem_grants(
                 invocation,
-                permission_context,
                 missing,
                 permission_grant.approval_scope,
                 trace,
                 "covered_by_tool_approval",
+                cache_key.as_ref(),
             );
             return Ok(());
         }
@@ -900,11 +919,11 @@ impl ToolOrchestrator {
                 .await?;
                 self.apply_filesystem_grants(
                     invocation,
-                    permission_context,
                     missing,
                     PermissionApprovalGrantScope::Once,
                     trace,
                     "approved_filesystem_grant_once",
+                    None,
                 );
                 Ok(())
             }
@@ -923,11 +942,11 @@ impl ToolOrchestrator {
                 .await?;
                 self.apply_filesystem_grants(
                     invocation,
-                    permission_context,
                     missing,
                     PermissionApprovalGrantScope::Turn,
                     trace,
                     "approved_filesystem_grant_for_turn",
+                    cache_key.as_ref(),
                 );
                 Ok(())
             }
@@ -988,12 +1007,35 @@ impl ToolOrchestrator {
         permission_grant: &PermissionEvaluationGrant,
         trace: &ToolEventTrace,
     ) -> Result<(), ToolError> {
-        self.apply_cached_network_grants(invocation, permission_context);
-
         let requirements = network_access_requirements(invocation, &permission_grant.intent);
         if requirements.is_empty() {
             return Ok(());
         }
+
+        // Compute the exact requested network capability before applying a
+        // cached grant.  Host A, web_search, and another tool are distinct
+        // capabilities even when they share one Turn and authority binding.
+        let pre_missing = missing_network_access_grants(
+            invocation.execution_security_snapshot.as_ref(),
+            requirements.as_slice(),
+        );
+        if !network_grants_within_authority_cap(
+            invocation.execution_security_snapshot.as_ref(),
+            pre_missing.as_slice(),
+        ) {
+            return Err(ToolError::Rejected(
+                "requested network access is outside the immutable execution authority".to_owned(),
+            ));
+        }
+        let capability_intent =
+            network_access_permission_intent(invocation, &permission_grant.intent, &pre_missing);
+        let cache_key = filesystem_grant_cache_key(
+            permission_context,
+            invocation.execution_security_snapshot.as_ref(),
+            invocation.tool_name.as_str(),
+            &capability_intent,
+        );
+        self.apply_cached_network_grants(invocation, cache_key.as_ref());
 
         let missing = missing_network_access_grants(
             invocation.execution_security_snapshot.as_ref(),
@@ -1014,11 +1056,11 @@ impl ToolOrchestrator {
         if permission_grant.approval_scope.can_apply_sandbox_grants() {
             self.apply_network_grants(
                 invocation,
-                permission_context,
                 missing,
                 permission_grant.approval_scope,
                 trace,
                 "covered_by_tool_approval",
+                cache_key.as_ref(),
             );
             return Ok(());
         }
@@ -1065,11 +1107,11 @@ impl ToolOrchestrator {
                 .await?;
                 self.apply_network_grants(
                     invocation,
-                    permission_context,
                     missing,
                     PermissionApprovalGrantScope::Once,
                     trace,
                     "approved_network_grant_once",
+                    None,
                 );
                 Ok(())
             }
@@ -1088,11 +1130,11 @@ impl ToolOrchestrator {
                 .await?;
                 self.apply_network_grants(
                     invocation,
-                    permission_context,
                     missing,
                     PermissionApprovalGrantScope::Turn,
                     trace,
                     "approved_network_grant_for_turn",
+                    cache_key.as_ref(),
                 );
                 Ok(())
             }
@@ -1149,12 +1191,9 @@ impl ToolOrchestrator {
     fn apply_cached_filesystem_grants(
         &self,
         invocation: &mut ToolInvocation,
-        permission_context: &PermissionEvaluationContext,
+        cache_key: Option<&FilesystemGrantCacheKey>,
     ) {
-        let Some(cache_key) = filesystem_grant_cache_key(
-            permission_context,
-            invocation.execution_security_snapshot.as_ref(),
-        ) else {
+        let Some(cache_key) = cache_key else {
             return;
         };
         let mut grants = self
@@ -1175,21 +1214,18 @@ impl ToolOrchestrator {
     fn apply_filesystem_grants(
         &self,
         invocation: &mut ToolInvocation,
-        permission_context: &PermissionEvaluationContext,
         grants: Vec<FilesystemAccessGrant>,
         scope: PermissionApprovalGrantScope,
         trace: &ToolEventTrace,
         reason: &str,
+        cache_key: Option<&FilesystemGrantCacheKey>,
     ) {
         apply_filesystem_grants_to_invocation(invocation, grants.as_slice());
         if scope == PermissionApprovalGrantScope::Turn
-            && let Some(cache_key) = filesystem_grant_cache_key(
-                permission_context,
-                invocation.execution_security_snapshot.as_ref(),
-            )
+            && let Some(cache_key) = cache_key
             && let Ok(mut cache) = self.filesystem_grants.lock()
         {
-            let cached = cache.entry(cache_key).or_default();
+            let cached = cache.entry(cache_key.clone()).or_default();
             merge_filesystem_grants(cached, grants.as_slice());
         }
         trace.emit_stage(
@@ -1211,12 +1247,9 @@ impl ToolOrchestrator {
     fn apply_cached_network_grants(
         &self,
         invocation: &mut ToolInvocation,
-        permission_context: &PermissionEvaluationContext,
+        cache_key: Option<&FilesystemGrantCacheKey>,
     ) {
-        let Some(cache_key) = filesystem_grant_cache_key(
-            permission_context,
-            invocation.execution_security_snapshot.as_ref(),
-        ) else {
+        let Some(cache_key) = cache_key else {
             return;
         };
         let mut grants = self
@@ -1237,21 +1270,18 @@ impl ToolOrchestrator {
     fn apply_network_grants(
         &self,
         invocation: &mut ToolInvocation,
-        permission_context: &PermissionEvaluationContext,
         grants: Vec<NetworkAccessGrant>,
         scope: PermissionApprovalGrantScope,
         trace: &ToolEventTrace,
         reason: &str,
+        cache_key: Option<&FilesystemGrantCacheKey>,
     ) {
         apply_network_grants_to_invocation(invocation, grants.as_slice());
         if scope == PermissionApprovalGrantScope::Turn
-            && let Some(cache_key) = filesystem_grant_cache_key(
-                permission_context,
-                invocation.execution_security_snapshot.as_ref(),
-            )
+            && let Some(cache_key) = cache_key
             && let Ok(mut cache) = self.network_grants.lock()
         {
-            let cached = cache.entry(cache_key).or_default();
+            let cached = cache.entry(cache_key.clone()).or_default();
             merge_network_grants(cached, grants.as_slice());
         }
         trace.emit_stage(
@@ -1487,6 +1517,8 @@ fn enforce_non_escalatable_mcp_network_policy(
 fn filesystem_grant_cache_key(
     permission_context: &PermissionEvaluationContext,
     snapshot: Option<&TurnExecutionSecuritySnapshot>,
+    tool_name: &str,
+    intent: &PermissionIntent,
 ) -> Option<FilesystemGrantCacheKey> {
     let authority_cap = &snapshot?.authority_cap;
     Some(FilesystemGrantCacheKey {
@@ -1495,7 +1527,25 @@ fn filesystem_grant_cache_key(
         profile_mode: permission_context.permission_profile.mode,
         authority_binding_id: authority_cap.resource_binding_id.clone(),
         authority_binding_revision: authority_cap.resource_binding_revision,
+        tool_name: tool_name.to_owned(),
+        action: intent.action,
+        capability_scope_hash: intent.scope.normalized_hash(),
     })
+}
+
+fn filesystem_grants_from_requirements(
+    requirements: &[FilesystemAccessRequirement],
+) -> Vec<FilesystemAccessGrant> {
+    let grants = requirements
+        .iter()
+        .map(|requirement| FilesystemAccessGrant {
+            root: normalize_path_lexically(requirement.grant_root.clone()),
+            access: requirement.grant_access,
+        })
+        .collect::<Vec<_>>();
+    let mut deduped = Vec::new();
+    merge_filesystem_grants(&mut deduped, grants.as_slice());
+    deduped
 }
 
 fn filesystem_grants_within_authority_cap(
@@ -2973,6 +3023,98 @@ mod tests {
         assert_eq!(broker_calls.load(Ordering::SeqCst), 0);
         assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn network_grant_for_web_search_does_not_widen_later_shell_invocation() {
+        let workspace = temp_path("cross-tool-network-grant");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
+        let web_calls = Arc::new(AtomicUsize::new(0));
+        let shell_calls = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_named_handlers([
+            (
+                "web_search",
+                Arc::new(NetworkSnapshotAssertHandler {
+                    calls: web_calls.clone(),
+                    required_url: None,
+                    expect_enabled: true,
+                }) as Arc<dyn ToolHandler>,
+            ),
+            (
+                "exec_command",
+                Arc::new(NetworkSnapshotAssertHandler {
+                    calls: shell_calls.clone(),
+                    required_url: None,
+                    expect_enabled: false,
+                }) as Arc<dyn ToolHandler>,
+            ),
+        ]);
+        let orchestrator = ToolOrchestrator::with_approval_broker(
+            OrchestratorPolicy::default(),
+            Arc::new(CountingApprovalBroker {
+                calls: Arc::new(AtomicUsize::new(0)),
+                resolution: PermissionApprovalResolution::AllowForTurn,
+            }),
+        );
+        let context = PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            "turn-cross-tool",
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+        );
+
+        let mut network_cap_snapshot = read_only_snapshot(workspace.as_path());
+        network_cap_snapshot.authority_cap.network = TurnNetworkPolicySnapshot::enabled();
+
+        let web_invocation = with_execution_security_snapshot(
+            invocation_for_tool(
+                "web_search",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "query": "scoped capability" }),
+                },
+            ),
+            network_cap_snapshot.clone(),
+        );
+        let web_trace = crate::events::ToolEventBus::default().start_trace(
+            "turn-cross-tool",
+            "web-search-call",
+            "web_search",
+        );
+        orchestrator
+            .run_with_context(&registry, web_invocation, &web_trace, &context)
+            .await
+            .expect("web search should consume its explicitly approved network grant");
+
+        let shell_invocation = with_execution_security_snapshot(
+            invocation_for_tool(
+                "exec_command",
+                ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                    command: Some(vec!["curl".to_owned(), "https://example.test".to_owned()]),
+                    workdir: None,
+                    timeout_ms: None,
+                    max_output_tokens: None,
+                    yield_time_ms: None,
+                    tty: None,
+                })),
+            ),
+            network_cap_snapshot,
+        );
+        let shell_trace = crate::events::ToolEventBus::default().start_trace(
+            "turn-cross-tool",
+            "shell-call",
+            "exec_command",
+        );
+        orchestrator
+            .run_with_context(&registry, shell_invocation, &shell_trace, &context)
+            .await
+            .expect("shell invocation should run with its original network snapshot");
+
+        assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shell_calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]

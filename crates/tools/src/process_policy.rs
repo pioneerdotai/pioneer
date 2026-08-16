@@ -378,6 +378,68 @@ mod tests {
     }
 
     #[test]
+    fn restricted_process_policy_does_not_inherit_authority_environment() {
+        let root = tempfile::tempdir().expect("root");
+        let snapshot = workspace_write_snapshot(root.path());
+        let invocation_env = BTreeMap::from([
+            ("OPENAI_API_KEY".to_owned(), "openai-canary".to_owned()),
+            (
+                "custom_workspace_credential".to_owned(),
+                "custom-canary".to_owned(),
+            ),
+        ]);
+        let host_env = BTreeMap::from([
+            ("AWS_ACCESS_KEY_ID".to_owned(), "aws-canary".to_owned()),
+            (
+                "AWS_SESSION_TOKEN".to_owned(),
+                "aws-session-canary".to_owned(),
+            ),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+                "gcp-canary".to_owned(),
+            ),
+            ("AZURE_CLIENT_ID".to_owned(), "azure-canary".to_owned()),
+            ("DATABASE_URL".to_owned(), "db-canary".to_owned()),
+            ("SSH_AUTH_SOCK".to_owned(), "ssh-canary".to_owned()),
+            ("PATH".to_owned(), "/trusted/bin".to_owned()),
+        ]);
+
+        let plan = build_process_spawn_plan_with_host_environment(
+            Some(&snapshot),
+            root.path(),
+            &exec_args(&["sh", "-c", "true"]),
+            &invocation_env,
+            host_env,
+            60_000,
+        )
+        .expect("restricted process plan should build");
+
+        assert!(!plan.inherit_environment);
+        for name in [
+            "OPENAI_API_KEY",
+            "custom_workspace_credential",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SESSION_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "AZURE_CLIENT_ID",
+            "DATABASE_URL",
+            "SSH_AUTH_SOCK",
+            "PATH",
+        ] {
+            assert!(
+                !plan.environment.contains_key(name),
+                "restricted child environment leaked {name}"
+            );
+            assert!(
+                plan.removed_environment
+                    .iter()
+                    .any(|removed| removed == name),
+                "restricted child environment did not account for removed {name}"
+            );
+        }
+    }
+
+    #[test]
     fn process_policy_denies_command_listed_by_risk_policy() {
         let root = tempfile::tempdir().expect("root");
         let mut snapshot = workspace_write_snapshot(root.path());

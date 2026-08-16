@@ -1,9 +1,10 @@
 use async_trait::async_trait;
-use pioneer_protocol::{TurnPermissionApprovalRequestDetail, generate_id};
+use pioneer_protocol::TurnPermissionApprovalRequestDetail;
 use pioneer_tools::{
     PermissionApprovalBroker, PermissionApprovalResolution, PermissionDecisionReason,
     PermissionEvaluationContext, PermissionIntent, PermissionRequestKey, ToolInvocation,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
@@ -93,7 +94,7 @@ impl PermissionApprovalBroker for GatewayPermissionApprovalBroker {
     ) -> PermissionApprovalResolution {
         let deadline = tokio::time::Instant::now()
             + crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT;
-        let request_id = generate_id(21);
+        let request_id = deterministic_native_permission_request_id(context, invocation, key);
         let (respond_tx, respond_rx) = oneshot::channel();
         let request = GatewayPermissionApprovalRequest {
             request_id: request_id.clone(),
@@ -140,6 +141,42 @@ impl PermissionApprovalBroker for GatewayPermissionApprovalBroker {
             resolution = respond_rx => resolution.unwrap_or(PermissionApprovalResolution::Expired),
         }
     }
+}
+
+/// The request identity is part of the durable approval contract.  A retry or
+/// a recovered native Turn must reopen the same logical request instead of
+/// creating a second approval row with a process-local random id.
+fn deterministic_native_permission_request_id(
+    context: &PermissionEvaluationContext,
+    invocation: &ToolInvocation,
+    key: &PermissionRequestKey,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pioneer-native-permission-v1\0");
+    digest.update(
+        context
+            .workspace_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest.update([0]);
+    digest.update(context.thread_id.as_deref().unwrap_or_default().as_bytes());
+    digest.update([0]);
+    digest.update(context.turn_id.as_deref().unwrap_or_default().as_bytes());
+    digest.update([0]);
+    digest.update(key.turn_id.as_bytes());
+    digest.update([0]);
+    digest.update(invocation.call_id.as_bytes());
+    digest.update([0]);
+    digest.update(invocation.tool_name.as_bytes());
+    digest.update([0]);
+    digest.update(key.action.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(format!("{:?}", key.profile_mode).as_bytes());
+    digest.update([0]);
+    digest.update(key.normalized_scope_hash.as_bytes());
+    format!("native-permission-{}", hex::encode(digest.finalize()))
 }
 
 fn permission_request_details(
