@@ -438,6 +438,63 @@ async fn persist_test_cli_execution_authorization_context(
             .await
             .expect("test CLI execution authorization should persist")
     );
+    if crud_store
+        .get_turn_execution_security_snapshot(turn_id)
+        .await
+        .expect("test CLI execution security lookup should succeed")
+        .is_none()
+    {
+        assert!(
+            crud_store
+                .set_turn_execution_security_snapshot(
+                    turn_id,
+                    &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                        "/tmp/project",
+                        chrono::Utc::now().timestamp_millis(),
+                    ),
+                )
+                .await
+                .expect("test CLI execution security snapshot should persist")
+        );
+    }
+}
+
+async fn persist_test_cli_instruction_projection(
+    crud_store: &CrudStore,
+    turn_id: &str,
+    runtime_kind: CLIAgentRuntimeKind,
+) {
+    let instruction_text =
+        "## Pioneer CLI Runtime Instructions\n\nContinue the interrupted Pioneer turn.";
+    let instruction_fingerprint = Sha256::digest(instruction_text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (runtime_kind_label, transport_kind) = match runtime_kind {
+        CLIAgentRuntimeKind::Codex => (
+            "codex",
+            CLIRuntimeElevatedInstructionTransport::CodexTurnCollaborationMode,
+        ),
+        CLIAgentRuntimeKind::Claude => (
+            "claude",
+            CLIRuntimeElevatedInstructionTransport::ClaudeAppendSystemPromptFile,
+        ),
+    };
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .insert_cli_runtime_instruction_projection_if_absent(NewCliRuntimeInstructionProjection {
+            turn_id: turn_id.to_owned(),
+            runtime_kind: runtime_kind_label.to_owned(),
+            transport_kind: transport_kind.as_str().to_owned(),
+            instruction_text: instruction_text.to_owned(),
+            instruction_fingerprint,
+            section_ids_json: r#"["pioneer_cli_runtime_instructions"]"#.to_owned(),
+            compiler_version: "recovery-test".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("test CLI runtime instruction projection should persist");
 }
 
 fn test_tools_permission_context(turn_id: &str) -> pioneer_tools::PermissionEvaluationContext {
@@ -805,13 +862,6 @@ struct StaticCliRuntimeSessionFactory {
 
 #[async_trait]
 impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
-    async fn start_session(
-        &self,
-        _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
-    ) -> anyhow::Result<Arc<dyn CLIAgentRuntimeSession>> {
-        Ok(self.session.clone())
-    }
-
     async fn start_session_with_launch_spec(
         &self,
         _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
@@ -32039,18 +32089,20 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     let thread_id = "thread_codex_transport_gap";
     let turn_id = "turn_codex_transport_gap";
@@ -32063,35 +32115,69 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
         turn_id,
     )
     .await;
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "codex",
+        "codex",
+    )
+    .await;
+    persist_test_cli_instruction_projection(
+        crud_store.as_ref(),
+        turn_id,
+        CLIAgentRuntimeKind::Codex,
+    )
+    .await;
+    let durable_cwd = load_persisted_security_snapshot(crud_store.as_ref(), turn_id)
+        .await
+        .sandbox
+        .cwd;
 
     let now = chrono::Utc::now().fixed_offset();
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: turn_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            continuation_thread_id: thread_id.to_owned(),
-            workspace_id: workspace_id.clone(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            native_thread_id: "native-thread-transport-gap".to_owned(),
-            native_turn_id: Some("native-turn-transport-gap".to_owned()),
-            request_id: None,
-            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
-            model: Some("gpt-5".to_owned()),
-            cwd: Some("/tmp/project".to_owned()),
-            sandbox_json: None,
-            approval_policy: None,
-            input_mapping_json: "{}".to_owned(),
-            created_at: now,
-            updated_at: now,
-        })
+    let (_, native_attempt) = crud_store
+        .prepare_cli_runtime_initial_turn_attempt(
+            NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread-transport-gap".to_owned(),
+                native_turn_id: None,
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some(durable_cwd),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                created_at: now,
+                updated_at: now,
+            },
+            "cli_attempt_transport_gap_1".to_owned(),
+            1,
+        )
         .await
-        .expect("turn binding should upsert");
+        .expect("turn binding and native attempt should persist");
+    crud_store
+        .activate_cli_runtime_turn_attempt(
+            turn_id,
+            native_attempt.id.as_str(),
+            "native-turn-transport-gap",
+            None,
+            now,
+        )
+        .await
+        .expect("native attempt should activate");
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
         .expect("session key should build");
     let handle = cli_manager
-        .get_or_start(key)
+        .get_or_start(key.clone())
         .await
         .expect("test CLI runtime session should start");
     processor
@@ -32100,6 +32186,10 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
             "oversized frame exceeded the finite spool budget",
         )
         .await;
+    cli_manager
+        .close_session(&key)
+        .await
+        .expect("observation-gap test process should close before recovery");
 
     let (_workspace_id, turn) = crud_store
         .get_turn(thread_id, turn_id)
@@ -32176,7 +32266,12 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
         .await
         .expect("reconciled Turn lookup should succeed")
         .expect("reconciled Turn should exist");
-    assert_eq!(turn.status, TurnStatus::Completed);
+    assert_eq!(
+        turn.status,
+        TurnStatus::Completed,
+        "terminal reconciliation error: {:?}",
+        turn.error
+    );
     assert!(
         crud_store
             .has_turn_finalization_intent(turn_id)
@@ -33810,7 +33905,7 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
 #[tokio::test]
 async fn interrupted_cli_runtime_turn_recovers_in_same_native_thread_and_new_window() {
     message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, false, false,
+        false, false, false, false,
     ))
     .await;
 }
@@ -33818,7 +33913,7 @@ async fn interrupted_cli_runtime_turn_recovers_in_same_native_thread_and_new_win
 #[tokio::test]
 async fn reconciled_cli_runtime_interruption_uses_same_recovery_lifecycle() {
     message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        true, false, false,
+        true, false, false, false,
     ))
     .await;
 }
@@ -33826,7 +33921,7 @@ async fn reconciled_cli_runtime_interruption_uses_same_recovery_lifecycle() {
 #[tokio::test]
 async fn confirmed_cli_runtime_recovery_failure_starts_new_recovery_job() {
     message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, true, false,
+        false, true, false, false,
     ))
     .await;
 }
@@ -33834,7 +33929,15 @@ async fn confirmed_cli_runtime_recovery_failure_starts_new_recovery_job() {
 #[tokio::test]
 async fn detached_native_child_recovery_uses_parent_continuation_and_child_projection() {
     message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, false, true,
+        false, false, true, false,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn cli_runtime_recovery_blocks_an_invalid_durable_working_directory() {
+    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
+        false, false, false, true,
     ))
     .await;
 }
@@ -33843,6 +33946,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     reconcile_from_runtime_observation: bool,
     fail_after_confirmation: bool,
     detached_child_owner: bool,
+    invalid_durable_cwd: bool,
 ) {
     let (tx, _rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
@@ -33998,29 +34102,12 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     )
     .await;
 
-    let recovery_instruction_text =
-        "## Pioneer CLI Runtime Instructions\n\nContinue the interrupted Pioneer turn.";
-    let recovery_instruction_fingerprint = Sha256::digest(recovery_instruction_text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let projection_time = chrono::Utc::now().fixed_offset();
-    crud_store
-        .insert_cli_runtime_instruction_projection_if_absent(NewCliRuntimeInstructionProjection {
-            turn_id: turn_id.to_owned(),
-            runtime_kind: "codex".to_owned(),
-            transport_kind: CLIRuntimeElevatedInstructionTransport::CodexTurnCollaborationMode
-                .as_str()
-                .to_owned(),
-            instruction_text: recovery_instruction_text.to_owned(),
-            instruction_fingerprint: recovery_instruction_fingerprint,
-            section_ids_json: r#"["pioneer_cli_runtime_instructions"]"#.to_owned(),
-            compiler_version: "recovery-test".to_owned(),
-            created_at: projection_time,
-            updated_at: projection_time,
-        })
-        .await
-        .expect("CLI recovery instruction projection should persist");
+    persist_test_cli_instruction_projection(
+        crud_store.as_ref(),
+        turn_id,
+        CLIAgentRuntimeKind::Codex,
+    )
+    .await;
 
     let now = chrono::Utc::now().fixed_offset();
     let (_, initial_attempt) = crud_store
@@ -34038,7 +34125,14 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                 status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
                     .to_owned(),
                 model: Some("o4-mini".to_owned()),
-                cwd: Some("/tmp/project".to_owned()),
+                cwd: Some(
+                    if invalid_durable_cwd {
+                        "/tmp/different-project"
+                    } else {
+                        "/tmp/project"
+                    }
+                    .to_owned(),
+                ),
                 sandbox_json: None,
                 approval_policy: Some("on-request".to_owned()),
                 input_mapping_json: "{}".to_owned(),
@@ -34079,10 +34173,6 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("session key should build");
 
     if reconcile_from_runtime_observation {
-        cli_manager
-            .get_or_start(key.clone())
-            .await
-            .expect("test CLI runtime session should start");
         *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
             status: CLIAgentRuntimeObservedTurnStatus::Interrupted,
             message: Some("native process disconnected".to_owned()),
@@ -34096,6 +34186,10 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                     .saturating_add(20 * 60 * 1_000),
             )
             .await;
+        assert!(
+            cli_session.turn_starts.lock().await.is_empty(),
+            "observation-gap reconciliation must inspect the durable native turn, not start another user execution"
+        );
     } else {
         processor
             .handle_cli_runtime_timeline_event(
@@ -34123,7 +34217,11 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("initial attempt should exist");
     assert_eq!(
         closed_initial.status,
-        CliRuntimeTurnAttemptStatus::Interrupted
+        if reconcile_from_runtime_observation {
+            CliRuntimeTurnAttemptStatus::Running
+        } else {
+            CliRuntimeTurnAttemptStatus::Interrupted
+        }
     );
     let pending_jobs = crud_store
         .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
@@ -34152,6 +34250,106 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .handle_recovery_event(recovery_event, chrono::Utc::now().timestamp())
         .await;
 
+    let recovery_job = if reconcile_from_runtime_observation {
+        assert!(
+            cli_session.turn_starts.lock().await.is_empty(),
+            "terminal observation reconciliation must not start another user execution"
+        );
+        let observation_launch = launch_specs
+            .lock()
+            .await
+            .last()
+            .cloned()
+            .expect("observation-gap reconciliation should restore a typed process launch");
+        assert_eq!(
+            observation_launch.options.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/project")),
+            "observation-gap reconciliation must restore the authorized working directory"
+        );
+        assert_eq!(
+            observation_launch.options.approval_policy.as_deref(),
+            Some("on-request")
+        );
+        assert_eq!(
+            observation_launch.continuation,
+            CliProviderContinuation::CodexRpcThread {
+                native_thread_id: Some(native_thread_id.to_owned()),
+            },
+            "observation-gap reconciliation must bind the durable native thread before process allocation"
+        );
+        let reconciled_attempt = crud_store
+            .get_cli_runtime_turn_attempt(initial_attempt.id.as_str())
+            .await
+            .expect("reconciled native attempt should load")
+            .expect("reconciled native attempt should exist");
+        assert_eq!(
+            reconciled_attempt.status,
+            CliRuntimeTurnAttemptStatus::Interrupted
+        );
+        cli_manager
+            .close_session(&key)
+            .await
+            .expect("observation process should close before retry");
+        let observation_job = crud_store
+            .get_recovery_job(pending_jobs[0].id.as_str())
+            .await
+            .expect("observation recovery job should load")
+            .expect("observation recovery job should exist");
+        assert_eq!(observation_job.status, RecoveryJobStatus::Succeeded);
+        let mut restart_jobs = crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .expect("runtime restart recovery job should load");
+        assert_eq!(restart_jobs.len(), 1);
+        let retry_job = restart_jobs.remove(0);
+        assert_ne!(retry_job.id, observation_job.id);
+        let retry_events = processor
+            .recovery_coordinator
+            .run_ready_jobs(retry_job.next_run_at_unix.saturating_add(10), 1)
+            .await
+            .expect("reconciled CLI recovery should claim its retry");
+        assert_eq!(retry_events.len(), 1);
+        let retry_event = retry_events
+            .into_iter()
+            .next()
+            .expect("reconciled CLI recovery retry should exist");
+        processor
+            .handle_recovery_event(retry_event.clone(), chrono::Utc::now().timestamp())
+            .await;
+        processor
+            .handle_recovery_event(retry_event, chrono::Utc::now().timestamp())
+            .await;
+        retry_job
+    } else {
+        pending_jobs[0].clone()
+    };
+
+    if invalid_durable_cwd {
+        assert!(cli_session.thread_resumes.lock().await.is_empty());
+        assert!(cli_session.turn_starts.lock().await.is_empty());
+        assert!(launch_specs.lock().await.is_empty());
+        let blocked_job = crud_store
+            .get_recovery_job(pending_jobs[0].id.as_str())
+            .await
+            .expect("invalid recovery job should load")
+            .expect("invalid recovery job should exist");
+        assert_eq!(blocked_job.status, RecoveryJobStatus::Blocked);
+        let (_, blocked_turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("invalid recovery Turn should load")
+            .expect("invalid recovery Turn should exist");
+        assert_eq!(blocked_turn.status, TurnStatus::Blocked);
+        assert!(
+            blocked_turn
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("working directory differs")
+        );
+        return;
+    }
+
     let resumes = cli_session.thread_resumes.lock().await.clone();
     assert_eq!(resumes.len(), 1);
     assert_eq!(resumes[0].0, native_thread_id);
@@ -34166,6 +34364,10 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
             native_thread_id: Some(native_thread_id.to_owned()),
         },
         "recovery must bind the durable Codex thread before process allocation"
+    );
+    assert_eq!(
+        recovery_launch.options.cwd.as_deref(),
+        Some(std::path::Path::new("/tmp/project"))
     );
     let starts = cli_session.turn_starts.lock().await.clone();
     let diagnostic_attempt = crud_store
@@ -34213,7 +34415,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                 ThreadHistoryEventPayload::ItemRetryAttemptStarted {
                     recovery_job_id,
                     ..
-                } if recovery_job_id == &pending_jobs[0].id
+                } if recovery_job_id == &recovery_job.id
             )
         })
         .count();
@@ -34235,7 +34437,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     assert!(recovery_attempt.recovery_attempt_id.is_some());
     assert!(recovery_attempt.recovery_confirmed_at.is_none());
     let active_job = crud_store
-        .get_recovery_job(pending_jobs[0].id.as_str())
+        .get_recovery_job(recovery_job.id.as_str())
         .await
         .expect("active CLI recovery job should load")
         .expect("active CLI recovery job should exist");
@@ -34289,7 +34491,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         )
         .await;
     let still_active_job = crud_store
-        .get_recovery_job(pending_jobs[0].id.as_str())
+        .get_recovery_job(recovery_job.id.as_str())
         .await
         .expect("CLI recovery job should load after user echo")
         .expect("CLI recovery job should exist after user echo");
@@ -34344,7 +34546,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .expect("confirmed recovery attempt should exist");
     assert!(confirmed_attempt.recovery_confirmed_at.is_some());
     let succeeded_before_completion = crud_store
-        .get_recovery_job(pending_jobs[0].id.as_str())
+        .get_recovery_job(recovery_job.id.as_str())
         .await
         .expect("confirmed CLI recovery job should load")
         .expect("confirmed CLI recovery job should exist");
@@ -34354,7 +34556,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     );
     let watchdog_events = processor
         .recovery_coordinator
-        .run_ready_jobs(pending_jobs[0].scheduled_at_unix.saturating_add(181), 16)
+        .run_ready_jobs(recovery_job.scheduled_at_unix.saturating_add(181), 16)
         .await
         .expect("recovery watchdog should run after the original wall-clock budget");
     assert!(watchdog_events.is_empty());
@@ -34396,9 +34598,9 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
             .await
             .expect("next recovery job should load");
         assert_eq!(next_jobs.len(), 1);
-        assert_ne!(next_jobs[0].id, pending_jobs[0].id);
+        assert_ne!(next_jobs[0].id, recovery_job.id);
         let prior_job = crud_store
-            .get_recovery_job(pending_jobs[0].id.as_str())
+            .get_recovery_job(recovery_job.id.as_str())
             .await
             .expect("prior recovery job should load")
             .expect("prior recovery job should exist");
@@ -34434,7 +34636,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         CliRuntimeTurnAttemptStatus::Completed
     );
     let succeeded_job = crud_store
-        .get_recovery_job(pending_jobs[0].id.as_str())
+        .get_recovery_job(recovery_job.id.as_str())
         .await
         .expect("succeeded CLI recovery job should load")
         .expect("succeeded CLI recovery job should exist");

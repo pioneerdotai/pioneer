@@ -614,9 +614,6 @@ pub struct CliRuntimeTerminalReconciliationRequest {
     pub job_id: String,
     pub recovery_attempt_id: String,
     pub turn_id: String,
-    pub item_id: String,
-    pub item_type: TurnItemType,
-    pub attempt_number: u32,
     pub binding: pioneer_crud::CliRuntimeTurnBindingRecord,
 }
 
@@ -1056,6 +1053,49 @@ impl RecoveryCoordinator {
             now_unix,
         )
         .await
+    }
+
+    /// Requeues an observation/restart attempt without consuming the retry or
+    /// no-progress budgets. Runtime unavailability is absence of evidence, not
+    /// a failed execution attempt; the Turn hard deadline remains the terminal
+    /// safety boundary.
+    pub async fn defer_cli_runtime_attempt_unavailable(
+        &self,
+        recovery_job_id: &str,
+        recovery_attempt_id: &str,
+        diagnostic: String,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        const UNAVAILABLE_RECHECK_SECS: i64 = 5;
+
+        let Some(job) = self.crud_store.get_recovery_job(recovery_job_id).await? else {
+            return Ok(Vec::new());
+        };
+        if job.status != RecoveryJobStatus::Active
+            || job.active_attempt_id.as_deref() != Some(recovery_attempt_id)
+        {
+            return Ok(Vec::new());
+        }
+
+        let next_run_at_unix = now_unix.saturating_add(UNAVAILABLE_RECHECK_SECS);
+        if !self
+            .crud_store
+            .defer_active_recovery_job(
+                job.id.as_str(),
+                recovery_attempt_id,
+                next_run_at_unix,
+                Some(diagnostic),
+                now_unix,
+            )
+            .await?
+        {
+            return Ok(Vec::new());
+        }
+
+        // The durable Pending transition is the retry schedule. Do not emit a
+        // RetryScheduled product event for each availability probe: repeated
+        // process restarts may last a long time and must not grow Turn history.
+        Ok(Vec::new())
     }
 
     pub async fn record_recovery_timeout_failure(
@@ -2134,9 +2174,6 @@ impl RecoveryCoordinator {
                         job_id: job.id,
                         recovery_attempt_id: active_attempt_id,
                         turn_id: job.turn_id,
-                        item_id: job.item_id,
-                        item_type: job.item_type,
-                        attempt_number,
                         binding,
                     },
                 )),
@@ -7994,6 +8031,61 @@ mod tests {
         assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
         assert_eq!(reloaded.run_count, 1);
         assert!(reloaded.active_attempt_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_cli_runtime_reconciliation_requeues_without_consuming_an_attempt() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_cli_runtime_temporarily_unavailable".to_owned(),
+                    item_id: "reasoning_1".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::NetworkTransient, "first"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("initial recovery should enqueue")
+            .into_job();
+        let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
+
+        let events = coordinator
+            .defer_cli_runtime_attempt_unavailable(
+                job.id.as_str(),
+                active_attempt_id.as_str(),
+                "runtime process is restarting".to_owned(),
+                1_700_000_010,
+            )
+            .await
+            .expect("temporary unavailability should defer recovery");
+        assert!(events.is_empty());
+
+        let deferred = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("deferred recovery should load")
+            .expect("deferred recovery should exist");
+        assert_eq!(deferred.status, RecoveryJobStatus::Pending);
+        assert_eq!(deferred.run_count, 0);
+        assert_eq!(
+            deferred.provider_attempt_number,
+            job.provider_attempt_number
+        );
+        assert!(deferred.active_attempt_id.is_none());
+        assert_eq!(deferred.next_run_at_unix, 1_700_000_015);
+
+        let stale_events = coordinator
+            .defer_cli_runtime_attempt_unavailable(
+                job.id.as_str(),
+                active_attempt_id.as_str(),
+                "late duplicate".to_owned(),
+                1_700_000_011,
+            )
+            .await
+            .expect("late duplicate should be an idempotent no-op");
+        assert!(stale_events.is_empty());
     }
 
     #[tokio::test]

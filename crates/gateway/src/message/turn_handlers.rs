@@ -430,6 +430,38 @@ struct CliRuntimeMaterializedPhase {
     native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
 }
 
+pub(super) struct RestoredCliRuntimeLaunchSpec {
+    pub(super) binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+    pub(super) runtime_kind: CLIAgentRuntimeKind,
+    pub(super) runtime: pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    pub(super) session_key: crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+    pub(super) launch_spec: crate::cli_runtime::continuation::CliSessionLaunchSpec,
+    pub(super) native_cwd: String,
+    pub(super) sandbox: Option<JsonValue>,
+    pub(super) permissions: Option<String>,
+    pub(super) elevated_instructions:
+        pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions,
+}
+
+pub(super) enum CliRuntimeLaunchSpecRestore {
+    Ready(RestoredCliRuntimeLaunchSpec),
+    Unavailable { diagnostic: String },
+    InvalidBinding { diagnostic: String },
+}
+
+pub(super) enum CliRuntimeRecoveryStartFailure {
+    Unavailable { diagnostic: String },
+    InvalidBinding { diagnostic: String },
+}
+
+impl From<anyhow::Error> for CliRuntimeRecoveryStartFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Unavailable {
+            diagnostic: format!("{error:#}"),
+        }
+    }
+}
+
 struct ComposerDetachedStartedPhase {
     launch: TurnStartParams,
     outcome: crate::thread::TurnStartOutcome,
@@ -5001,46 +5033,96 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn start_cli_runtime_recovery_attempt(
+    /// Reconstructs the exact durable process contract for every CLI runtime
+    /// continuation. No caller may substitute process cwd, Gateway cwd, `/`,
+    /// current MCP selection, or default session options.
+    pub(super) async fn restore_cli_runtime_launch_spec(
         &self,
-        request: crate::resilience::CliRuntimeRecoveryAttemptRequest,
-    ) -> anyhow::Result<bool> {
-        let requested_binding = request.binding.clone();
-        let binding = self
+        requested_binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> CliRuntimeLaunchSpecRestore {
+        let binding = match self
             .crud_store
-            .get_cli_runtime_turn_binding(request.turn_id.as_str())
-            .await?
-            .context("CLI runtime turn binding for recovery is missing")?;
+            .get_cli_runtime_turn_binding(requested_binding.turn_id.as_str())
+            .await
+        {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI runtime turn `{}` has no durable launch binding",
+                        requested_binding.turn_id
+                    ),
+                };
+            }
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!("failed to load durable CLI runtime binding: {error:#}"),
+                };
+            }
+        };
         if binding.thread_id != requested_binding.thread_id
+            || binding.continuation_thread_id != requested_binding.continuation_thread_id
             || binding.workspace_id != requested_binding.workspace_id
             || binding.runtime_id != requested_binding.runtime_id
             || binding.runtime_kind != requested_binding.runtime_kind
             || binding.native_thread_id != requested_binding.native_thread_id
         {
-            anyhow::bail!(
-                "CLI runtime turn binding `{}` changed owners after recovery was claimed",
-                request.turn_id
-            );
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: format!(
+                    "CLI runtime turn binding `{}` changed execution identity",
+                    binding.turn_id
+                ),
+            };
         }
-        let Some((_workspace_id, turn)) = self
+
+        let encoded_authority = match self
             .crud_store
-            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
-            .await?
-        else {
-            anyhow::bail!("Pioneer turn `{}` is missing", binding.turn_id);
-        };
-        if turn.status != TurnStatus::InProgress {
-            anyhow::bail!(
-                "Pioneer turn `{}` is `{}` and cannot start CLI recovery",
-                binding.turn_id,
-                format!("{:?}", turn.status).to_ascii_lowercase()
-            );
-        }
-        let authorization_context = self
-            .load_turn_execution_authorization_context(binding.turn_id.as_str())
+            .get_turn_execution_authorization_context(binding.turn_id.as_str())
             .await
-            .context("failed to load CLI recovery execution authorization")?;
-        self.execution_leases
+        {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI runtime turn `{}` has no durable authorization context",
+                        binding.turn_id
+                    ),
+                };
+            }
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!(
+                        "failed to load CLI runtime authorization context: {error:#}"
+                    ),
+                };
+            }
+        };
+        let authorization_context =
+            match crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+                encoded_authority.as_str(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                        diagnostic: format!(
+                            "CLI runtime turn `{}` has an invalid durable authorization context: {error:#}",
+                            binding.turn_id
+                        ),
+                    };
+                }
+            };
+        let policy_revision = match self.current_authorization_revision().await {
+            Ok(revision) => revision,
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!(
+                        "CLI runtime continuation policy generation is unavailable: {error:#}"
+                    ),
+                };
+            }
+        };
+        if let Err(error) = self
+            .execution_leases
             .revalidate_for_turn(
                 self.crud_store.as_ref(),
                 &authorization_context,
@@ -5048,27 +5130,372 @@ impl MessageProcessor {
                 binding.thread_id.as_str(),
                 binding.turn_id.as_str(),
                 crate::authorization::ResourceAction::CliRuntimeUse,
-                self.current_authorization_revision()
-                    .await
-                    .context("CLI recovery policy generation is unavailable")?,
+                policy_revision,
             )
             .await
-            .context("CLI recovery collaboration authority is no longer active")?;
+        {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: format!(
+                    "CLI runtime continuation authority is no longer active: {error:#}"
+                ),
+            };
+        }
+
         let runtime_kind = match binding.runtime_kind.as_str() {
             "codex" => CLIAgentRuntimeKind::Codex,
             "claude" => CLIAgentRuntimeKind::Claude,
-            other => anyhow::bail!("unsupported CLI runtime kind `{other}`"),
+            other => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!("unsupported durable CLI runtime kind `{other}`"),
+                };
+            }
         };
-        authorization_context
-            .verify_cli_runtime_projection(
+        if let Err(error) = authorization_context.verify_cli_runtime_projection(
+            binding.workspace_id.as_str(),
+            binding.runtime_id.as_str(),
+            runtime_kind,
+        ) {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: format!(
+                    "CLI runtime identity differs from its immutable authorization projection: {error:#}"
+                ),
+            };
+        }
+        let native_event_budget =
+            match authorization_context.effective_native_event_resource_budget() {
+                Ok(budget) => budget,
+                Err(error) => {
+                    return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                        diagnostic: format!(
+                            "CLI runtime native-event contract cannot be restored: {error:#}"
+                        ),
+                    };
+                }
+            };
+
+        let security_snapshot = match self
+            .crud_store
+            .get_turn_execution_security_snapshot(binding.turn_id.as_str())
+            .await
+        {
+            Ok(Some(record)) => record.snapshot,
+            Ok(None) => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI runtime turn `{}` has no durable execution security snapshot",
+                        binding.turn_id
+                    ),
+                };
+            }
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!(
+                        "failed to load CLI runtime execution security snapshot: {error:#}"
+                    ),
+                };
+            }
+        };
+        if security_snapshot.schema_version
+            != pioneer_protocol::TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION
+            || security_snapshot.version == 0
+        {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: "CLI runtime execution security snapshot has an unsupported identity"
+                    .to_owned(),
+            };
+        }
+        let native_cwd = security_snapshot.sandbox.cwd.trim().to_owned();
+        if native_cwd.is_empty() || !std::path::Path::new(native_cwd.as_str()).is_absolute() {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic:
+                    "CLI runtime execution security snapshot has no absolute working directory"
+                        .to_owned(),
+            };
+        }
+        if binding.cwd.as_deref() != Some(native_cwd.as_str()) {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: format!(
+                    "CLI runtime turn `{}` working directory differs from its immutable security snapshot",
+                    binding.turn_id
+                ),
+            };
+        }
+
+        let sandbox = match binding
+            .sandbox_json
+            .as_deref()
+            .map(pioneer_crud::deserialize_cli_runtime_json)
+            .transpose()
+        {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!("durable CLI runtime sandbox is invalid: {error:#}"),
+                };
+            }
+        };
+        let permissions = matches!(runtime_kind, CLIAgentRuntimeKind::Codex).then(|| {
+            crate::cli_runtime::permissions::codex_permissions_profile_for_security_snapshot(
+                &security_snapshot,
+            )
+            .to_owned()
+        });
+
+        let skill_bindings = match self
+            .crud_store
+            .find_turn_skill_bindings(binding.turn_id.as_str())
+            .await
+        {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!(
+                        "failed to load frozen CLI runtime skill projection: {error:#}"
+                    ),
+                };
+            }
+        };
+        if !skill_bindings.is_empty()
+            && let Err(error) = self
+                .revalidate_persisted_turn_skill_projection(
+                    binding.thread_id.as_str(),
+                    binding.turn_id.as_str(),
+                )
+                .await
+        {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: format!(
+                    "CLI runtime skill projection is no longer authorized: {error:#}"
+                ),
+            };
+        }
+
+        let projection_exists = match self
+            .crud_store
+            .get_cli_runtime_instruction_projection(binding.turn_id.as_str())
+            .await
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!(
+                        "failed to load frozen CLI runtime instruction projection: {error:#}"
+                    ),
+                };
+            }
+        };
+        if !projection_exists {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: format!(
+                    "CLI runtime turn `{}` has no frozen instruction projection",
+                    binding.turn_id
+                ),
+            };
+        }
+        let elevated_instructions = match crate::cli_runtime::instruction_projection::load_cli_runtime_instruction_projection(
+            self.crud_store.as_ref(),
+            binding.turn_id.as_str(),
+            runtime_kind,
+        )
+        .await
+        {
+            Ok(projection) => projection,
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI runtime frozen instruction projection is invalid: {error:#}"
+                    ),
+                };
+            }
+        };
+
+        let runtime = match self.load_cli_runtime_instances() {
+            Ok(runtimes) => match runtimes
+                .into_iter()
+                .find(|runtime| runtime.id == binding.runtime_id)
+            {
+                Some(runtime) => runtime,
+                None => {
+                    return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                        diagnostic: format!(
+                            "configured CLI runtime `{}` for continuation is missing",
+                            binding.runtime_id
+                        ),
+                    };
+                }
+            },
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!("CLI runtime configuration is unavailable: {error:#}"),
+                };
+            }
+        };
+        if !runtime.enabled {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: format!("CLI runtime `{}` is disabled", runtime.id),
+            };
+        }
+        if !cli_runtime_kind_matches_config(runtime_kind, runtime.kind) {
+            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                diagnostic: format!(
+                    "CLI runtime `{}` kind differs from its durable turn binding",
+                    runtime.id
+                ),
+            };
+        }
+
+        let proxy_url = match self
+            .prepare_cli_runtime_proxy_url(
                 binding.workspace_id.as_str(),
                 binding.runtime_id.as_str(),
-                runtime_kind,
             )
-            .context("CLI recovery runtime differs from its immutable projection")?;
-        let native_event_budget = authorization_context
-            .effective_native_event_resource_budget()
-            .context("CLI recovery native event resource policy is unavailable")?;
+            .await
+        {
+            Ok(proxy_url) => proxy_url,
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!(
+                        "CLI runtime proxy environment cannot be reconstructed: {error:#}"
+                    ),
+                };
+            }
+        };
+        let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+            cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
+            approval_policy: binding.approval_policy.clone(),
+            env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+            enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
+                && !skill_bindings.is_empty(),
+            elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
+                .then_some(elevated_instructions.clone()),
+            ..Default::default()
+        };
+        let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
+        let mcp = match crate::cli_runtime::mcp::recovery::restore_cli_mcp_session_launch(
+            self.crud_store.as_ref(),
+            self.mcp_service.as_ref(),
+            &binding,
+            runtime_kind,
+            crate::turn_mcp::McpProjectionLimits {
+                max_tools,
+                max_total_schema_bytes,
+                ..crate::turn_mcp::McpProjectionLimits::default()
+            },
+        )
+        .await
+        {
+            Ok(mcp) => mcp,
+            Err(
+                crate::cli_runtime::mcp::recovery::CliMcpSessionLaunchRestoreError::Unavailable(
+                    error,
+                ),
+            ) => {
+                return CliRuntimeLaunchSpecRestore::Unavailable {
+                    diagnostic: format!(
+                        "frozen CLI runtime MCP projection is temporarily unavailable: {error:#}"
+                    ),
+                };
+            }
+            Err(crate::cli_runtime::mcp::recovery::CliMcpSessionLaunchRestoreError::Invalid(
+                error,
+            )) => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!("frozen CLI runtime MCP projection is invalid: {error:#}"),
+                };
+            }
+        };
+        let launch_spec = match runtime_kind {
+            CLIAgentRuntimeKind::Codex => {
+                crate::cli_runtime::continuation::CliSessionLaunchSpec::codex(
+                    session_options,
+                    mcp,
+                    Some(binding.native_thread_id.clone()),
+                )
+                .with_native_event_budget(native_event_budget)
+            }
+            CLIAgentRuntimeKind::Claude => {
+                let provider_session_id =
+                    match uuid::Uuid::parse_str(binding.native_thread_id.as_str()) {
+                        Ok(provider_session_id) if !provider_session_id.is_nil() => {
+                            provider_session_id
+                        }
+                        _ => {
+                            return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                                diagnostic:
+                                    "durable Claude continuation identity is not a non-nil UUID"
+                                        .to_owned(),
+                            };
+                        }
+                    };
+                crate::cli_runtime::continuation::CliSessionLaunchSpec::claude_resume(
+                    session_options,
+                    mcp,
+                    provider_session_id,
+                )
+                .with_native_event_budget(native_event_budget)
+            }
+        };
+        let session_key = match crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id.as_str(),
+            binding.runtime_id.as_str(),
+            binding.continuation_thread_id.as_str(),
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                    diagnostic: format!(
+                        "durable CLI runtime session identity is invalid: {error:#}"
+                    ),
+                };
+            }
+        };
+
+        CliRuntimeLaunchSpecRestore::Ready(RestoredCliRuntimeLaunchSpec {
+            binding,
+            runtime_kind,
+            runtime,
+            session_key,
+            launch_spec,
+            native_cwd,
+            sandbox,
+            permissions,
+            elevated_instructions,
+        })
+    }
+
+    pub(super) async fn start_cli_runtime_recovery_attempt(
+        &self,
+        request: crate::resilience::CliRuntimeRecoveryAttemptRequest,
+    ) -> Result<bool, CliRuntimeRecoveryStartFailure> {
+        let restored = match self.restore_cli_runtime_launch_spec(&request.binding).await {
+            CliRuntimeLaunchSpecRestore::Ready(restored) => restored,
+            CliRuntimeLaunchSpecRestore::Unavailable { diagnostic } => {
+                return Err(CliRuntimeRecoveryStartFailure::Unavailable { diagnostic });
+            }
+            CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
+                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding { diagnostic });
+            }
+        };
+        let binding = restored.binding.clone();
+        let Some((_workspace_id, turn)) = self
+            .crud_store
+            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await?
+        else {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!("Pioneer turn `{}` is missing", binding.turn_id),
+            });
+        };
+        if turn.status != TurnStatus::InProgress {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!(
+                    "Pioneer turn `{}` is `{}` and cannot start CLI recovery",
+                    binding.turn_id,
+                    format!("{:?}", turn.status).to_ascii_lowercase()
+                ),
+            });
+        }
         if let Some(existing) = self
             .crud_store
             .get_cli_runtime_turn_attempt_by_recovery_attempt(request.recovery_attempt_id.as_str())
@@ -5081,10 +5508,12 @@ impl MessageProcessor {
                 || existing.runtime_kind != binding.runtime_kind
                 || existing.native_thread_id != binding.native_thread_id
             {
-                anyhow::bail!(
-                    "recovery attempt `{}` is owned by a different CLI runtime recovery",
-                    request.recovery_attempt_id
-                );
+                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                    diagnostic: format!(
+                        "recovery attempt `{}` is owned by a different CLI runtime recovery",
+                        request.recovery_attempt_id
+                    ),
+                });
             }
             match existing.status {
                 pioneer_crud::CliRuntimeTurnAttemptStatus::Running
@@ -5097,159 +5526,56 @@ impl MessageProcessor {
                 }
                 pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
                 status => {
-                    anyhow::bail!(
-                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
-                        existing.id,
-                        status.as_str()
-                    );
+                    return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                        diagnostic: format!(
+                            "CLI runtime recovery attempt `{}` is `{}` and cannot start",
+                            existing.id,
+                            status.as_str()
+                        ),
+                    });
                 }
             }
-        }
-        let runtime_kind = match binding.runtime_kind.as_str() {
-            "codex" => CLIAgentRuntimeKind::Codex,
-            "claude" => CLIAgentRuntimeKind::Claude,
-            other => anyhow::bail!("unsupported CLI runtime kind `{other}`"),
-        };
-        let elevated_instructions =
-            crate::cli_runtime::instruction_projection::load_cli_runtime_instruction_projection(
-                self.crud_store.as_ref(),
-                binding.turn_id.as_str(),
-                runtime_kind,
-            )
-            .await
-            .context("CLI runtime recovery cannot restore elevated instructions")?;
-        let runtime = self
-            .load_cli_runtime_instances()?
-            .into_iter()
-            .find(|runtime| runtime.id == binding.runtime_id)
-            .context("configured CLI runtime for recovery is missing")?;
-        if !runtime.enabled {
-            anyhow::bail!("CLI runtime `{}` is disabled", runtime.id);
-        }
-        if !cli_runtime_kind_matches_config(runtime_kind, runtime.kind) {
-            anyhow::bail!(
-                "CLI runtime `{}` kind no longer matches stored turn binding",
-                runtime.id
-            );
         }
         let manager = self
             .cli_runtime_manager
             .as_ref()
             .context("CLI runtime manager is unavailable")?;
-        let session_key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
-            binding.workspace_id.as_str(),
-            binding.runtime_id.as_str(),
-            binding.continuation_thread_id.as_str(),
-        )?;
-        let proxy_url = self
-            .prepare_cli_runtime_proxy_url(
-                binding.workspace_id.as_str(),
-                binding.runtime_id.as_str(),
-            )
-            .await?;
-        let native_cwd = binding
-            .cwd
-            .clone()
-            .context("CLI runtime recovery has no persisted workspace working directory")?;
-        let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
-            cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
-            approval_policy: binding.approval_policy.clone(),
-            env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
-            enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude),
-            elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                .then_some(elevated_instructions.clone()),
-            ..Default::default()
-        };
-        let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
-        let mcp = crate::cli_runtime::mcp::recovery::restore_cli_mcp_session_launch(
-            self.crud_store.as_ref(),
-            self.mcp_service.as_ref(),
-            &binding,
-            runtime_kind,
-            crate::turn_mcp::McpProjectionLimits {
-                max_tools,
-                max_total_schema_bytes,
-                ..crate::turn_mcp::McpProjectionLimits::default()
-            },
-        )
-        .await
-        .context("CLI runtime recovery cannot restore its frozen MCP projection")?;
-        let launch_spec = match runtime_kind {
-            CLIAgentRuntimeKind::Codex => {
-                crate::cli_runtime::continuation::CliSessionLaunchSpec::codex(
-                    session_options,
-                    mcp,
-                    Some(binding.native_thread_id.clone()),
-                )
-                .with_native_event_budget(native_event_budget)
-            }
-            CLIAgentRuntimeKind::Claude => {
-                let provider_session_id = uuid::Uuid::parse_str(binding.native_thread_id.as_str())
-                    .context("durable Claude recovery session identity is not a UUID")?;
-                if provider_session_id.is_nil() {
-                    anyhow::bail!("durable Claude recovery session identity cannot be nil");
-                }
-                crate::cli_runtime::continuation::CliSessionLaunchSpec::claude_resume(
-                    session_options,
-                    mcp,
-                    provider_session_id,
-                )
-                .with_native_event_budget(native_event_budget)
-            }
-        };
         let session_handle = manager
-            .get_or_start_with_launch_spec(session_key.clone(), launch_spec)
+            .get_or_start_with_launch_spec(
+                restored.session_key.clone(),
+                restored.launch_spec.clone(),
+            )
             .await?;
         let cli_session = session_handle.session();
         self.ensure_cli_runtime_session_event_pumps(
             session_handle.instance(),
             cli_session.clone(),
-            runtime.debug_native_events,
+            restored.runtime.debug_native_events,
         )
         .await;
-
-        let sandbox = binding
-            .sandbox_json
-            .as_deref()
-            .map(pioneer_crud::deserialize_cli_runtime_json)
-            .transpose()?;
-        let security_snapshot = self
-            .crud_store
-            .get_turn_execution_security_snapshot(binding.turn_id.as_str())
-            .await?
-            .map(|record| record.snapshot);
-        let permissions = if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
-            security_snapshot.as_ref().map(|snapshot| {
-                crate::cli_runtime::permissions::codex_permissions_profile_for_security_snapshot(
-                    snapshot,
-                )
-                .to_owned()
-            })
-        } else {
-            None
-        };
         let resumed = cli_session
             .resume_thread(
                 binding.native_thread_id.as_str(),
                 crate::cli_runtime::manager::CLIAgentRuntimeThreadOpenParams {
-                    cwd: native_cwd.clone(),
+                    cwd: restored.native_cwd.clone(),
                     model: binding.model.clone(),
                     approval_policy: binding.approval_policy.clone(),
-                    sandbox: sandbox.clone(),
-                    permissions: permissions.clone(),
+                    sandbox: restored.sandbox.clone(),
+                    permissions: restored.permissions.clone(),
                     service_tier: None,
                 },
-                std::time::Duration::from_millis(runtime.request_timeout_ms),
+                std::time::Duration::from_millis(restored.runtime.request_timeout_ms),
             )
             .await?;
         if resumed.native_thread_id != binding.native_thread_id {
-            anyhow::bail!(
-                "CLI runtime resumed native thread `{}` instead of `{}`",
-                resumed.native_thread_id,
-                binding.native_thread_id
-            );
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!(
+                    "CLI runtime resumed native thread `{}` instead of `{}`",
+                    resumed.native_thread_id, binding.native_thread_id
+                ),
+            });
         }
-        if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+        if matches!(restored.runtime_kind, CLIAgentRuntimeKind::Codex) {
             cli_session
                 .reset_native_thread_goal(binding.native_thread_id.as_str())
                 .await
@@ -5277,11 +5603,13 @@ impl MessageProcessor {
             }
             pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
             status => {
-                anyhow::bail!(
-                    "CLI runtime recovery attempt `{}` is `{}` and cannot start",
-                    attempt.id,
-                    status.as_str()
-                );
+                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
+                        attempt.id,
+                        status.as_str()
+                    ),
+                });
             }
         }
         if let Err(error) = self
@@ -5297,7 +5625,7 @@ impl MessageProcessor {
                 format!("failed to open CLI runtime recovery execution window: {error:#}"),
             )
             .await;
-            return Err(error);
+            return Err(error.into());
         }
 
         let native_turn = match cli_session
@@ -5305,17 +5633,17 @@ impl MessageProcessor {
                 crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
                     native_thread_id: prepared_binding.native_thread_id.clone(),
                     input: crate::cli_runtime::turn_recovery::cli_runtime_recovery_turn_input(),
-                    cwd: Some(native_cwd),
+                    cwd: Some(restored.native_cwd.clone()),
                     model: prepared_binding.model.clone(),
                     approval_policy: prepared_binding.approval_policy.clone(),
-                    sandbox,
-                    permissions,
+                    sandbox: restored.sandbox.clone(),
+                    permissions: restored.permissions.clone(),
                     effort: None,
                     personality: None,
                     summary: None,
-                    elevated_instructions,
+                    elevated_instructions: restored.elevated_instructions.clone(),
                 },
-                std::time::Duration::from_millis(runtime.request_timeout_ms),
+                std::time::Duration::from_millis(restored.runtime.request_timeout_ms),
             )
             .await
         {
@@ -5326,7 +5654,7 @@ impl MessageProcessor {
                     format!("failed to start native CLI recovery turn: {error:#}"),
                 )
                 .await;
-                return Err(error);
+                return Err(error.into());
             }
         };
         let native_turn_id = native_turn.native_turn_id.clone();
@@ -5352,7 +5680,7 @@ impl MessageProcessor {
                 format!("failed to persist native recovery owner: {error:#}"),
             )
             .await;
-            return Err(error);
+            return Err(error.into());
         }
         if prepared_binding.runtime_kind == "codex" {
             self.bind_buffered_codex_root_execution_segments(

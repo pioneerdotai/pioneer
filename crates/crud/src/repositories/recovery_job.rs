@@ -359,6 +359,69 @@ pub async fn mark_job_retrying<C: ConnectionTrait>(
     Ok(affected)
 }
 
+/// Returns an active observation attempt to the pending queue without
+/// consuming a recovery attempt. A temporarily unavailable authority or
+/// runtime is not evidence that the recovered execution made no progress.
+pub async fn defer_active_job<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    active_attempt_id: &str,
+    next_run_at: DateTimeWithTimeZone,
+    last_error: Option<String>,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
+    let active = recovery_job_status_to_db(RecoveryJobStatus::Active);
+
+    let affected = recovery_job::Entity::update_many()
+        .col_expr(
+            recovery_job::Column::Status,
+            sea_orm::sea_query::Expr::value(pending.to_owned()),
+        )
+        .col_expr(
+            recovery_job::Column::LastError,
+            sea_orm::sea_query::Expr::value(last_error),
+        )
+        .col_expr(
+            recovery_job::Column::NextRunAt,
+            sea_orm::sea_query::Expr::value(next_run_at),
+        )
+        .col_expr(
+            recovery_job::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimedAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ActiveAttemptId,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ActiveAttemptStartedAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
+        .filter(recovery_job::Column::Status.eq(active))
+        .filter(recovery_job::Column::ActiveAttemptId.eq(active_attempt_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to defer active recovery job `{job_id}`"))?
+        .rows_affected
+        > 0;
+
+    Ok(affected)
+}
+
 pub async fn mark_claimed_job_retrying<C: ConnectionTrait>(
     db: &C,
     job_id: &str,

@@ -12,13 +12,13 @@ use crate::cli_runtime::manager::CLIAgentRuntimeSessionKey;
 use crate::cli_runtime::manager::{
     CLIAgentRuntimeCodexEventReceivers, CLIAgentRuntimeManager, CLIAgentRuntimeMcpTurnMetadata,
     CLIAgentRuntimeNativeMcpApprovalRequest, CLIAgentRuntimeObservedTurnStatus,
-    CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionStartOptions,
-    CLIAgentRuntimeThreadForkRequest, CLIAgentRuntimeThreadForkResult,
-    CLIAgentRuntimeThreadNameSetRequest, CLIAgentRuntimeThreadNameSetResult,
-    CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
-    CLIAgentRuntimeTurnLivenessProbe, CLIAgentRuntimeTurnObservation,
-    CLIAgentRuntimeTurnStartParams, CLIAgentRuntimeTurnStartSnapshot,
-    CLIAgentRuntimeTurnSteerRequest, CLIAgentRuntimeTurnSteerResult,
+    CLIAgentRuntimeSession, CLIAgentRuntimeSessionFactory, CLIAgentRuntimeThreadForkRequest,
+    CLIAgentRuntimeThreadForkResult, CLIAgentRuntimeThreadNameSetRequest,
+    CLIAgentRuntimeThreadNameSetResult, CLIAgentRuntimeThreadOpenParams,
+    CLIAgentRuntimeThreadOpenSnapshot, CLIAgentRuntimeTurnLivenessProbe,
+    CLIAgentRuntimeTurnObservation, CLIAgentRuntimeTurnStartParams,
+    CLIAgentRuntimeTurnStartSnapshot, CLIAgentRuntimeTurnSteerRequest,
+    CLIAgentRuntimeTurnSteerResult,
 };
 use crate::cli_runtime::mcp::coordinator::{
     CliMcpProjectionFingerprint, CliMcpProjectionGeneration,
@@ -506,52 +506,6 @@ struct DispatchingCLIAgentRuntimeSessionFactory {
 
 #[async_trait]
 impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory {
-    async fn start_session(
-        &self,
-        process_instance: &CliSessionInstanceId,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-        self.start_session_with_options(
-            process_instance,
-            &CLIAgentRuntimeSessionStartOptions::default(),
-        )
-        .await
-    }
-
-    async fn start_session_with_options(
-        &self,
-        process_instance: &CliSessionInstanceId,
-        options: &CLIAgentRuntimeSessionStartOptions,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-        let key = process_instance.key();
-        let instance = load_effective_cli_runtime_instances(self.runtime_home.as_path())?
-            .into_iter()
-            .find(|instance| instance.id == key.runtime_id)
-            .ok_or_else(|| anyhow!("unknown CLI runtime `{}`", key.runtime_id))?;
-        match instance.kind {
-            GatewayCliAgentRuntimeKindConfig::Codex => {
-                CodexCLIAgentRuntimeSessionFactory {
-                    runtime_home: self.runtime_home.clone(),
-                    bridge_supervisor: self.bridge_supervisor.clone(),
-                    mcp_limits: self.mcp_limits,
-                    turn_mcp_invoker: self.turn_mcp_invoker.clone(),
-                }
-                .start_session_with_options(process_instance, options)
-                .await
-            }
-            GatewayCliAgentRuntimeKindConfig::Claude => {
-                crate::cli_runtime::claude_session::ClaudeCLIAgentRuntimeSessionFactory::new_with_bridge(
-                    self.runtime_home.clone(),
-                    self.bridge_supervisor.clone(),
-                    self.mcp_limits,
-                    self.turn_mcp_invoker.clone(),
-                    self.crud_store.clone(),
-                )
-                .start_session_with_options(process_instance, options)
-                .await
-            }
-        }
-    }
-
     async fn start_session_with_launch_spec(
         &self,
         process_instance: &CliSessionInstanceId,
@@ -1170,29 +1124,6 @@ impl CodexRequiredMcpBridge {
 
 #[async_trait]
 impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
-    async fn start_session(
-        &self,
-        process_instance: &CliSessionInstanceId,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-        self.start_session_with_options(
-            process_instance,
-            &CLIAgentRuntimeSessionStartOptions::default(),
-        )
-        .await
-    }
-
-    async fn start_session_with_options(
-        &self,
-        process_instance: &CliSessionInstanceId,
-        options: &CLIAgentRuntimeSessionStartOptions,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-        self.start_session_with_launch_spec(
-            process_instance,
-            &CliSessionLaunchSpec::unmanaged_codex(options.clone()),
-        )
-        .await
-    }
-
     async fn start_session_with_launch_spec(
         &self,
         process_instance: &CliSessionInstanceId,

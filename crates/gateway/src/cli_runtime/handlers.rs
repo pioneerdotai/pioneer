@@ -1,4 +1,5 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
+use super::turn_handlers::CliRuntimeLaunchSpecRestore;
 use super::*;
 use crate::authorization::{
     AuthorizationExternalError, AuthorizationResolver, AuthorizationService, ProofResolution,
@@ -131,6 +132,21 @@ pub(super) enum CLIRuntimeAuthoritativeTurnState {
 pub(super) enum CLIRuntimeActivityEvidence {
     LivenessProbe,
     ObservedInProgress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CLIRuntimeObservationGapReconciliation {
+    Active,
+    Terminal {
+        status: CLIAgentRuntimeObservedTurnStatus,
+        diagnostic: Option<String>,
+    },
+    Unavailable {
+        diagnostic: String,
+    },
+    InvalidBinding {
+        diagnostic: String,
+    },
 }
 
 impl CLIRuntimeActivityEvidence {
@@ -5432,79 +5448,302 @@ impl MessageProcessor {
         Ok(())
     }
 
-    pub(crate) async fn reconcile_cli_runtime_observation_gap(
+    pub(super) async fn reconcile_cli_runtime_observation_gap(
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         recovery: pioneer_protocol::RecoveryAttemptContext,
-    ) -> anyhow::Result<bool> {
-        let native_turn_id = binding
-            .native_turn_id
-            .as_deref()
-            .with_context(|| format!("CLI Turn `{}` has no native turn id", binding.turn_id))?;
+    ) -> CLIRuntimeObservationGapReconciliation {
+        let native_turn_id = match binding.native_turn_id.as_deref() {
+            Some(native_turn_id) if !native_turn_id.trim().is_empty() => native_turn_id,
+            _ => {
+                return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI Turn `{}` has no durable native turn identity",
+                        binding.turn_id
+                    ),
+                };
+            }
+        };
+        let restored = match self.restore_cli_runtime_launch_spec(binding).await {
+            CliRuntimeLaunchSpecRestore::Ready(restored) => restored,
+            CliRuntimeLaunchSpecRestore::Unavailable { diagnostic } => {
+                return CLIRuntimeObservationGapReconciliation::Unavailable { diagnostic };
+            }
+            CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
+                return CLIRuntimeObservationGapReconciliation::InvalidBinding { diagnostic };
+            }
+        };
         let manager = self
             .cli_runtime_manager
             .as_ref()
-            .context("CLI runtime manager is unavailable")?;
-        let key = CLIAgentRuntimeSessionKey::new(
-            binding.workspace_id.clone(),
-            binding.runtime_id.clone(),
-            binding.continuation_thread_id.clone(),
-        )?;
-        let handle = manager.get_or_start(key).await?;
-        let Some(observation) = handle
+            .ok_or_else(|| "CLI runtime manager is unavailable".to_owned());
+        let manager = match manager {
+            Ok(manager) => manager,
+            Err(diagnostic) => {
+                return CLIRuntimeObservationGapReconciliation::Unavailable { diagnostic };
+            }
+        };
+        let handle = match manager
+            .get_or_start_with_launch_spec(
+                restored.session_key.clone(),
+                restored.launch_spec.clone(),
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                return CLIRuntimeObservationGapReconciliation::Unavailable {
+                    diagnostic: format!(
+                        "CLI runtime process could not restore its durable launch contract: {error:#}"
+                    ),
+                };
+            }
+        };
+        self.ensure_cli_runtime_session_event_pumps(
+            handle.instance(),
+            handle.session(),
+            restored.runtime.debug_native_events,
+        )
+        .await;
+        let observation = match handle
             .session()
             .load_turn_snapshot(binding.native_thread_id.as_str(), native_turn_id)
-            .await?
-        else {
-            return Ok(false);
+            .await
+        {
+            Ok(Some(observation)) => observation,
+            Ok(None) => {
+                return CLIRuntimeObservationGapReconciliation::Unavailable {
+                    diagnostic: "native runtime has no authoritative turn snapshot yet".to_owned(),
+                };
+            }
+            Err(error) => {
+                return CLIRuntimeObservationGapReconciliation::Unavailable {
+                    diagnostic: format!("native runtime snapshot is unavailable: {error:#}"),
+                };
+            }
         };
 
         if observation.status == CLIAgentRuntimeObservedTurnStatus::InProgress {
             let now_unix = now_timestamp_secs();
-            self.timeout_supervisor
+            if let Err(error) = self
+                .timeout_supervisor
                 .renew_running_attempt_deadlines_after_runtime_activity(
                     binding.turn_id.as_str(),
                     now_unix,
                     "runtime/observation_gap_reconciled_active",
                 )
-                .await?;
-            let events = self
+                .await
+            {
+                return CLIRuntimeObservationGapReconciliation::Unavailable {
+                    diagnostic: format!(
+                        "failed to renew the reconciled runtime deadline: {error:#}"
+                    ),
+                };
+            }
+            let events = match self
                 .recovery_coordinator
                 .succeed_active_recovery_attempt(binding.turn_id.as_str(), &recovery, now_unix)
-                .await?;
+                .await
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    return CLIRuntimeObservationGapReconciliation::Unavailable {
+                        diagnostic: format!(
+                            "failed to persist active runtime reconciliation: {error:#}"
+                        ),
+                    };
+                }
+            };
             for event in events {
                 self.handle_recovery_event(event, now_unix).await;
             }
-            return Ok(true);
+            return CLIRuntimeObservationGapReconciliation::Active;
+        }
+
+        let observed_attempt_status = match observation.status {
+            CLIAgentRuntimeObservedTurnStatus::Completed => {
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+            }
+            CLIAgentRuntimeObservedTurnStatus::Failed
+            | CLIAgentRuntimeObservedTurnStatus::Blocked => {
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Failed
+            }
+            CLIAgentRuntimeObservedTurnStatus::Interrupted => {
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted
+            }
+            CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),
+        };
+        let observed_attempt = match self
+            .crud_store
+            .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
+            .await
+        {
+            Ok(Some(attempt)) => attempt,
+            Ok(None) => {
+                return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI Turn `{}` has no durable native attempt",
+                        binding.turn_id
+                    ),
+                };
+            }
+            Err(error) => {
+                return CLIRuntimeObservationGapReconciliation::Unavailable {
+                    diagnostic: format!(
+                        "failed to load the observed native runtime attempt: {error:#}"
+                    ),
+                };
+            }
+        };
+        if observed_attempt.turn_id != binding.turn_id
+            || observed_attempt.runtime_id != binding.runtime_id
+            || observed_attempt.runtime_kind != binding.runtime_kind
+            || observed_attempt.native_thread_id != binding.native_thread_id
+            || observed_attempt.native_turn_id.as_deref() != Some(native_turn_id)
+        {
+            return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                diagnostic: format!(
+                    "authoritative native snapshot does not match CLI attempt `{}`",
+                    observed_attempt.id
+                ),
+            };
+        }
+        if !observed_attempt.status.is_active()
+            && observed_attempt.status != observed_attempt_status
+        {
+            return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                diagnostic: format!(
+                    "native attempt `{}` is durably `{:?}` but its snapshot reports `{:?}`",
+                    observed_attempt.id, observed_attempt.status, observation.status
+                ),
+            };
         }
 
         for event in observation.reconciliation_events {
-            self.apply_authoritative_cli_runtime_snapshot_event(handle.instance(), binding, event)
-                .await?;
+            if let Err(error) = self
+                .apply_authoritative_cli_runtime_snapshot_event(
+                    handle.instance(),
+                    &restored.binding,
+                    event,
+                )
+                .await
+            {
+                return CLIRuntimeObservationGapReconciliation::Unavailable {
+                    diagnostic: format!(
+                        "failed to persist authoritative runtime snapshot event: {error:#}"
+                    ),
+                };
+            }
+        }
+
+        if observed_attempt.status.is_active() {
+            match self
+                .crud_store
+                .mark_cli_runtime_turn_attempt_terminal(
+                    observed_attempt.id.as_str(),
+                    observed_attempt_status,
+                    observation.message.clone(),
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    match self
+                        .crud_store
+                        .get_cli_runtime_turn_attempt(observed_attempt.id.as_str())
+                        .await
+                    {
+                        Ok(Some(attempt)) if attempt.status == observed_attempt_status => {}
+                        Ok(_) => {
+                            return CLIRuntimeObservationGapReconciliation::Unavailable {
+                                diagnostic: format!(
+                                    "native attempt `{}` changed while its terminal snapshot was committed",
+                                    observed_attempt.id
+                                ),
+                            };
+                        }
+                        Err(error) => {
+                            return CLIRuntimeObservationGapReconciliation::Unavailable {
+                                diagnostic: format!(
+                                    "failed to verify terminal native attempt `{}`: {error:#}",
+                                    observed_attempt.id
+                                ),
+                            };
+                        }
+                    }
+                }
+                Err(error) => {
+                    return CLIRuntimeObservationGapReconciliation::Unavailable {
+                        diagnostic: format!(
+                            "failed to persist authoritative native attempt status: {error:#}"
+                        ),
+                    };
+                }
+            }
         }
 
         match observation.status {
             CLIAgentRuntimeObservedTurnStatus::Completed => {
-                let generation = self
+                let generation = match self
                     .crud_store
                     .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
-                    .await?
-                    .map(|attempt| i64::from(attempt.attempt_index))
-                    .unwrap_or(1);
-                self.prepare_cli_runtime_success_finalization(binding, generation)
-                    .await?;
-                let turn = self
+                    .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        return CLIRuntimeObservationGapReconciliation::Unavailable {
+                            diagnostic: format!(
+                                "failed to load the reconciled runtime attempt: {error:#}"
+                            ),
+                        };
+                    }
+                }
+                .map(|attempt| i64::from(attempt.attempt_index))
+                .unwrap_or(1);
+                if let Err(error) = self
+                    .prepare_cli_runtime_success_finalization(&restored.binding, generation)
+                    .await
+                {
+                    return CLIRuntimeObservationGapReconciliation::Unavailable {
+                        diagnostic: format!(
+                            "failed to prepare authoritative runtime completion: {error:#}"
+                        ),
+                    };
+                }
+                let turn = match self
                     .crud_store
                     .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
-                    .await?
-                    .map(|(_, turn)| turn)
-                    .with_context(|| format!("Turn `{}` disappeared", binding.turn_id))?;
-                self.ensure_cli_runtime_turn_loaded_for_lifecycle(
-                    binding.workspace_id.as_str(),
-                    binding.thread_id.as_str(),
-                    &turn,
-                )
-                .await?;
+                    .await
+                {
+                    Ok(Some((_, turn))) => turn,
+                    Ok(None) => {
+                        return CLIRuntimeObservationGapReconciliation::InvalidBinding {
+                            diagnostic: format!("Turn `{}` disappeared", binding.turn_id),
+                        };
+                    }
+                    Err(error) => {
+                        return CLIRuntimeObservationGapReconciliation::Unavailable {
+                            diagnostic: format!(
+                                "failed to load the reconciled Pioneer Turn: {error:#}"
+                            ),
+                        };
+                    }
+                };
+                if let Err(error) = self
+                    .ensure_cli_runtime_turn_loaded_for_lifecycle(
+                        binding.workspace_id.as_str(),
+                        binding.thread_id.as_str(),
+                        &turn,
+                    )
+                    .await
+                {
+                    return CLIRuntimeObservationGapReconciliation::Unavailable {
+                        diagnostic: format!(
+                            "failed to restore the reconciled Pioneer Turn in memory: {error:#}"
+                        ),
+                    };
+                }
                 if !self
                     .complete_native_turn(
                         binding.thread_id.clone(),
@@ -5513,26 +5752,29 @@ impl MessageProcessor {
                     )
                     .await
                 {
-                    anyhow::bail!("durable CLI terminal finalization could not be committed");
+                    return CLIRuntimeObservationGapReconciliation::Unavailable {
+                        diagnostic: "durable CLI terminal finalization could not be committed"
+                            .to_owned(),
+                    };
                 }
                 self.cleanup_cli_runtime_terminal_turn_status(
-                    binding,
+                    &restored.binding,
                     TurnStatus::Completed,
                     "observation gap terminal reconciliation",
                 )
                 .await;
-                Ok(true)
+                CLIRuntimeObservationGapReconciliation::Terminal {
+                    status: CLIAgentRuntimeObservedTurnStatus::Completed,
+                    diagnostic: observation.message,
+                }
             }
             CLIAgentRuntimeObservedTurnStatus::Failed
             | CLIAgentRuntimeObservedTurnStatus::Interrupted
             | CLIAgentRuntimeObservedTurnStatus::Blocked => {
-                anyhow::bail!(
-                    "native snapshot reported terminal status {:?}: {}",
-                    observation.status,
-                    observation
-                        .message
-                        .unwrap_or_else(|| "no runtime diagnostic".to_owned())
-                )
+                CLIRuntimeObservationGapReconciliation::Terminal {
+                    status: observation.status,
+                    diagnostic: observation.message,
+                }
             }
             CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),
         }

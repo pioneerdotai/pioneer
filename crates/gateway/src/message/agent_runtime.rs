@@ -1,3 +1,5 @@
+use super::cli_runtime::CLIRuntimeObservationGapReconciliation;
+use super::turn_handlers::CliRuntimeRecoveryStartFailure;
 use super::*;
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt};
@@ -4439,40 +4441,32 @@ impl MessageProcessor {
                 .await;
             }
             Ok(false) => {}
-            Err(error) => {
-                let failure = format!("failed to start CLI runtime recovery attempt: {error:#}");
+            Err(CliRuntimeRecoveryStartFailure::Unavailable { diagnostic }) => {
                 warn!(
                     turn_id = request.turn_id,
                     recovery_job_id = request.job_id,
                     recovery_attempt_id = request.recovery_attempt_id,
-                    error = %format!("{error:#}"),
-                    "CLI runtime recovery attempt start failed"
+                    error = %diagnostic,
+                    "CLI runtime recovery attempt is temporarily unavailable"
                 );
-                match self
-                    .recovery_coordinator
-                    .record_cli_runtime_attempt_failure(
-                        request.job_id.as_str(),
-                        request.recovery_attempt_id.as_str(),
-                        failure,
-                        event_timestamp,
-                    )
-                    .await
-                {
-                    Ok(events) => {
-                        for event in events {
-                            self.handle_recovery_event(event, event_timestamp).await;
-                        }
-                    }
-                    Err(coordinator_error) => {
-                        warn!(
-                            turn_id = request.turn_id,
-                            recovery_job_id = request.job_id,
-                            recovery_attempt_id = request.recovery_attempt_id,
-                            error = %format!("{coordinator_error:#}"),
-                            "failed to record CLI runtime recovery start failure"
-                        );
-                    }
-                }
+                self.defer_cli_runtime_recovery_attempt(
+                    request.job_id.as_str(),
+                    request.recovery_attempt_id.as_str(),
+                    request.turn_id.as_str(),
+                    diagnostic,
+                    event_timestamp,
+                )
+                .await;
+            }
+            Err(CliRuntimeRecoveryStartFailure::InvalidBinding { diagnostic }) => {
+                self.block_cli_runtime_recovery_invalid_binding(
+                    &request.binding,
+                    request.job_id.as_str(),
+                    request.recovery_attempt_id.as_str(),
+                    diagnostic,
+                    event_timestamp,
+                )
+                .await;
             }
         }
     }
@@ -4482,25 +4476,6 @@ impl MessageProcessor {
         request: crate::resilience::CliRuntimeTerminalReconciliationRequest,
         event_timestamp: i64,
     ) {
-        if !self
-            .handle_retry_attempt_started_event(
-                request.job_id.clone(),
-                request.turn_id.clone(),
-                request.item_id.clone(),
-                request.item_type,
-                request.attempt_number,
-                event_timestamp,
-            )
-            .await
-        {
-            self.record_cli_terminal_reconciliation_failure(
-                &request,
-                "failed to persist terminal reconciliation attempt start".to_owned(),
-                event_timestamp,
-            )
-            .await;
-            return;
-        }
         let recovery = pioneer_protocol::RecoveryAttemptContext {
             job_id: request.job_id.clone(),
             attempt_id: request.recovery_attempt_id.clone(),
@@ -4509,19 +4484,52 @@ impl MessageProcessor {
             .reconcile_cli_runtime_observation_gap(&request.binding, recovery)
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
-                self.record_cli_terminal_reconciliation_failure(
-                    &request,
-                    "native runtime has no authoritative terminal snapshot yet".to_owned(),
+            CLIRuntimeObservationGapReconciliation::Active => {}
+            CLIRuntimeObservationGapReconciliation::Terminal {
+                status: crate::cli_runtime::manager::CLIAgentRuntimeObservedTurnStatus::Completed,
+                ..
+            } => {}
+            CLIRuntimeObservationGapReconciliation::Terminal {
+                status: crate::cli_runtime::manager::CLIAgentRuntimeObservedTurnStatus::Blocked,
+                diagnostic,
+            } => {
+                self.block_cli_runtime_recovery_invalid_binding(
+                    &request.binding,
+                    request.job_id.as_str(),
+                    request.recovery_attempt_id.as_str(),
+                    diagnostic
+                        .unwrap_or_else(|| "native runtime reported a blocked turn".to_owned()),
                     event_timestamp,
                 )
                 .await;
             }
-            Err(error) => {
-                self.record_cli_terminal_reconciliation_failure(
+            CLIRuntimeObservationGapReconciliation::Terminal { status, diagnostic } => {
+                self.complete_cli_observation_recovery_and_open_restart(
                     &request,
-                    format!("terminal snapshot reconciliation failed: {error:#}"),
+                    format!(
+                        "authoritative native runtime snapshot reported {status:?}: {}",
+                        diagnostic.unwrap_or_else(|| "no runtime diagnostic".to_owned())
+                    ),
+                    event_timestamp,
+                )
+                .await;
+            }
+            CLIRuntimeObservationGapReconciliation::Unavailable { diagnostic } => {
+                self.defer_cli_runtime_recovery_attempt(
+                    request.job_id.as_str(),
+                    request.recovery_attempt_id.as_str(),
+                    request.turn_id.as_str(),
+                    diagnostic,
+                    event_timestamp,
+                )
+                .await;
+            }
+            CLIRuntimeObservationGapReconciliation::InvalidBinding { diagnostic } => {
+                self.block_cli_runtime_recovery_invalid_binding(
+                    &request.binding,
+                    request.job_id.as_str(),
+                    request.recovery_attempt_id.as_str(),
+                    diagnostic,
                     event_timestamp,
                 )
                 .await;
@@ -4529,20 +4537,19 @@ impl MessageProcessor {
         }
     }
 
-    async fn record_cli_terminal_reconciliation_failure(
+    async fn complete_cli_observation_recovery_and_open_restart(
         &self,
         request: &crate::resilience::CliRuntimeTerminalReconciliationRequest,
-        failure: String,
+        reason: String,
         event_timestamp: i64,
     ) {
+        let recovery = pioneer_protocol::RecoveryAttemptContext {
+            job_id: request.job_id.clone(),
+            attempt_id: request.recovery_attempt_id.clone(),
+        };
         match self
             .recovery_coordinator
-            .record_cli_runtime_attempt_failure(
-                request.job_id.as_str(),
-                request.recovery_attempt_id.as_str(),
-                failure,
-                event_timestamp,
-            )
+            .succeed_active_recovery_attempt(request.turn_id.as_str(), &recovery, event_timestamp)
             .await
         {
             Ok(events) => {
@@ -4556,10 +4563,103 @@ impl MessageProcessor {
                     recovery_job_id = request.job_id,
                     recovery_attempt_id = request.recovery_attempt_id,
                     error = %format!("{error:#}"),
-                    "failed to record terminal reconciliation failure"
+                    "failed to complete authoritative CLI runtime observation recovery"
+                );
+                return;
+            }
+        }
+        if let Err(error) = self
+            .ensure_turn_observation_recovery(
+                request.turn_id.as_str(),
+                TurnFailureRecoveryKind::RuntimeFailure,
+                reason,
+                None,
+                None,
+            )
+            .await
+        {
+            warn!(
+                turn_id = request.turn_id,
+                recovery_job_id = request.job_id,
+                recovery_attempt_id = request.recovery_attempt_id,
+                error = %format!("{error:#}"),
+                "failed to open CLI runtime restart after authoritative terminal observation"
+            );
+        }
+    }
+
+    async fn defer_cli_runtime_recovery_attempt(
+        &self,
+        recovery_job_id: &str,
+        recovery_attempt_id: &str,
+        turn_id: &str,
+        diagnostic: String,
+        event_timestamp: i64,
+    ) {
+        match self
+            .recovery_coordinator
+            .defer_cli_runtime_attempt_unavailable(
+                recovery_job_id,
+                recovery_attempt_id,
+                diagnostic,
+                event_timestamp,
+            )
+            .await
+        {
+            Ok(events) => {
+                for event in events {
+                    self.handle_recovery_event(event, event_timestamp).await;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    turn_id,
+                    recovery_job_id,
+                    recovery_attempt_id,
+                    error = %format!("{error:#}"),
+                    "failed to defer unavailable CLI runtime recovery"
                 );
             }
         }
+    }
+
+    async fn block_cli_runtime_recovery_invalid_binding(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        recovery_job_id: &str,
+        recovery_attempt_id: &str,
+        diagnostic: String,
+        event_timestamp: i64,
+    ) {
+        let recovery = pioneer_protocol::RecoveryAttemptContext {
+            job_id: recovery_job_id.to_owned(),
+            attempt_id: recovery_attempt_id.to_owned(),
+        };
+        if let Err(error) = self
+            .recovery_coordinator
+            .block_active_recoveries_for_turn(
+                binding.turn_id.as_str(),
+                Some(&recovery),
+                diagnostic.as_str(),
+                event_timestamp,
+            )
+            .await
+        {
+            warn!(
+                turn_id = binding.turn_id,
+                recovery_job_id,
+                recovery_attempt_id,
+                error = %format!("{error:#}"),
+                "failed to persist invalid CLI runtime recovery binding"
+            );
+            return;
+        }
+        self.mark_turn_blocked(
+            binding.thread_id.clone(),
+            binding.turn_id.clone(),
+            format!("CLI runtime recovery is blocked: {diagnostic}"),
+        )
+        .await;
     }
 
     async fn handle_recovery_opened_event(

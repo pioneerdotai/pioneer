@@ -19327,6 +19327,29 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         .await
     }
 
+    pub async fn defer_active_recovery_job(
+        &self,
+        job_id: &str,
+        active_attempt_id: &str,
+        next_run_at_unix: i64,
+        last_error: Option<String>,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let last_error_value = last_error.clone();
+        self.run_serialized_write(|| async {
+            recovery_job::defer_active_job(
+                &self.connection,
+                job_id,
+                active_attempt_id,
+                unix_to_datetime(next_run_at_unix),
+                last_error_value.clone(),
+                unix_to_datetime(now_unix),
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn mark_claimed_recovery_job_retrying(
         &self,
         job_id: &str,

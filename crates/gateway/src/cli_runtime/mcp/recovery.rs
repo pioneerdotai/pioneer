@@ -4,17 +4,49 @@ use crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection;
 use crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection;
 use crate::cli_runtime::continuation::CliMcpSessionLaunch;
 use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
-use crate::turn_mcp::invoker::{TurnMcpRuntimeView, validate_frozen_identity};
+use crate::turn_mcp::invoker::{
+    TurnMcpInvocationErrorCode, TurnMcpRuntimeView, validate_frozen_identity,
+};
 use crate::turn_mcp::{
     MCP_TURN_PROJECTION_VERSION, McpProjectionLimits, McpSelectionReason,
     ResolvedMcpTurnProjection, ResolvedMcpTurnTool,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::{CliRuntimeTurnBindingRecord, CrudStore, TurnMcpBindingRecord};
 use pioneer_protocol::CLIAgentRuntimeKind;
 
 const CODEX_MCP_ADAPTER_KIND: &str = "codex_synthetic_mcp";
 const CLAUDE_MCP_ADAPTER_KIND: &str = "claude_strict_mcp";
+
+#[derive(Debug)]
+pub(crate) enum CliMcpSessionLaunchRestoreError {
+    Unavailable(anyhow::Error),
+    Invalid(anyhow::Error),
+}
+
+impl std::fmt::Display for CliMcpSessionLaunchRestoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) | Self::Invalid(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CliMcpSessionLaunchRestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unavailable(error) | Self::Invalid(error) => error.source(),
+        }
+    }
+}
+
+fn unavailable(error: anyhow::Error) -> CliMcpSessionLaunchRestoreError {
+    CliMcpSessionLaunchRestoreError::Unavailable(error)
+}
+
+fn invalid(error: anyhow::Error) -> CliMcpSessionLaunchRestoreError {
+    CliMcpSessionLaunchRestoreError::Invalid(error)
+}
 
 /// Restore the provider launch contract from the immutable turn projection.
 ///
@@ -27,15 +59,17 @@ pub(crate) async fn restore_cli_mcp_session_launch(
     turn_binding: &CliRuntimeTurnBindingRecord,
     runtime_kind: CLIAgentRuntimeKind,
     limits: McpProjectionLimits,
-) -> Result<CliMcpSessionLaunch> {
+) -> std::result::Result<CliMcpSessionLaunch, CliMcpSessionLaunchRestoreError> {
     let projection_record = crud_store
         .get_turn_mcp_projection(turn_binding.turn_id.as_str())
         .await
-        .context("failed to load frozen MCP projection for CLI recovery")?;
+        .context("failed to load frozen MCP projection for CLI recovery")
+        .map_err(unavailable)?;
     let bindings = crud_store
         .list_turn_mcp_bindings(turn_binding.turn_id.as_str())
         .await
-        .context("failed to load frozen MCP bindings for CLI recovery")?;
+        .context("failed to load frozen MCP bindings for CLI recovery")
+        .map_err(unavailable)?;
 
     let Some(metadata) = turn_binding.mcp.as_ref() else {
         if projection_record
@@ -43,12 +77,15 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             .is_some_and(|projection| projection.tool_count != 0)
             || !bindings.is_empty()
         {
-            bail!("CLI recovery has frozen MCP tools but no activated MCP session contract");
+            return Err(invalid(anyhow!(
+                "CLI recovery has frozen MCP tools but no activated MCP session contract"
+            )));
         }
         return Ok(CliMcpSessionLaunch::Disabled);
     };
     let projection_record = projection_record
-        .context("CLI recovery MCP session contract has no frozen turn projection")?;
+        .context("CLI recovery MCP session contract has no frozen turn projection")
+        .map_err(invalid)?;
     if projection_record.turn_id != turn_binding.turn_id
         || projection_record.workspace_id != turn_binding.workspace_id
         || projection_record.projection_version
@@ -60,7 +97,9 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             binding.projection_activation_generation != metadata.projection_activation_generation
         })
     {
-        bail!("CLI recovery MCP projection header does not match its immutable turn binding");
+        return Err(invalid(anyhow!(
+            "CLI recovery MCP projection header does not match its immutable turn binding"
+        )));
     }
 
     let mut projection = ResolvedMcpTurnProjection::empty(
@@ -71,21 +110,38 @@ pub(crate) async fn restore_cli_mcp_session_launch(
         let current = runtime_view
             .current_tool_identity(turn_binding.workspace_id.as_str(), binding)
             .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-            .with_context(|| {
-                format!(
+            .map_err(|error| {
+                let temporarily_unavailable = matches!(
+                    error.code,
+                    TurnMcpInvocationErrorCode::RuntimeNotLive
+                        | TurnMcpInvocationErrorCode::ResourceExhausted
+                        | TurnMcpInvocationErrorCode::Cancelled
+                        | TurnMcpInvocationErrorCode::TimedOut
+                        | TurnMcpInvocationErrorCode::ExecutionFailed
+                        | TurnMcpInvocationErrorCode::Internal
+                );
+                let error = anyhow!(error).context(format!(
                     "failed to restore frozen MCP tool `{}` for CLI recovery",
                     binding.canonical_callable_name
-                )
+                ));
+                if temporarily_unavailable {
+                    unavailable(error)
+                } else {
+                    invalid(error)
+                }
             })?;
-        validate_frozen_identity(binding, &current)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        validate_frozen_identity(binding, &current).map_err(|error| invalid(anyhow!(error)))?;
         let annotations = serde_json::from_str(binding.annotations_json.as_str())
-            .context("frozen MCP annotations are invalid during CLI recovery")?;
+            .context("frozen MCP annotations are invalid during CLI recovery")
+            .map_err(invalid)?;
         let selection_reason = match binding.selection_reason.as_str() {
             "implicit_policy" => McpSelectionReason::ImplicitPolicy,
             "explicit_composer_capability" => McpSelectionReason::ExplicitTool,
-            other => bail!("unsupported frozen MCP selection reason `{other}`"),
+            other => {
+                return Err(invalid(anyhow!(
+                    "unsupported frozen MCP selection reason `{other}`"
+                )));
+            }
         };
         projection.tools.push(ResolvedMcpTurnTool {
             canonical_callable_name: binding.canonical_callable_name.clone(),
@@ -107,33 +163,42 @@ pub(crate) async fn restore_cli_mcp_session_launch(
     }
     projection
         .finalize_identity(limits)
-        .context("failed to finalize frozen MCP projection for CLI recovery")?;
+        .context("failed to finalize frozen MCP projection for CLI recovery")
+        .map_err(invalid)?;
     if projection.manifest_hash != projection_record.manifest_hash {
-        bail!("reconstructed CLI recovery MCP manifest differs from the frozen projection");
+        return Err(invalid(anyhow!(
+            "reconstructed CLI recovery MCP manifest differs from the frozen projection"
+        )));
     }
-    validate_canonical_callable_names(projection.tools.as_slice(), bindings.as_slice())?;
+    validate_canonical_callable_names(projection.tools.as_slice(), bindings.as_slice())
+        .map_err(invalid)?;
 
     let facade_limits = CliMcpFacadeProjectionLimits::transport_bounded(limits.max_tools);
     match runtime_kind {
         CLIAgentRuntimeKind::Codex => {
             if metadata.adapter_kind != CODEX_MCP_ADAPTER_KIND {
-                bail!("frozen MCP adapter is not a Codex adapter");
+                return Err(invalid(anyhow!(
+                    "frozen MCP adapter is not a Codex adapter"
+                )));
             }
             let launch = build_codex_mcp_session_launch_projection(
                 projection,
                 metadata.provider_contract_fingerprint.clone(),
             )
-            .context("failed to rebuild frozen Codex MCP launch projection")?;
+            .context("failed to rebuild frozen Codex MCP launch projection")
+            .map_err(invalid)?;
+            let facade = launch
+                .facade_projection(facade_limits)
+                .map_err(|error| invalid(anyhow!(error)))?;
+            let facade_fingerprint = facade.fingerprint();
             validate_provider_projection(
                 launch.preflight.canonical_manifest_hash.as_str(),
                 launch.preflight.provider_contract_fingerprint.as_str(),
                 launch.semantic_restart_fingerprint(),
-                launch
-                    .facade_projection(facade_limits)?
-                    .fingerprint()
-                    .as_str(),
+                facade_fingerprint.as_str(),
                 metadata,
-            )?;
+            )
+            .map_err(invalid)?;
             validate_provider_bindings(
                 bindings.as_slice(),
                 launch.preflight.tools.iter().map(|tool| {
@@ -142,28 +207,34 @@ pub(crate) async fn restore_cli_mcp_session_launch(
                         tool.transformed_schema_fingerprint.as_str(),
                     )
                 }),
-            )?;
+            )
+            .map_err(invalid)?;
             Ok(CliMcpSessionLaunch::Codex(launch))
         }
         CLIAgentRuntimeKind::Claude => {
             if metadata.adapter_kind != CLAUDE_MCP_ADAPTER_KIND {
-                bail!("frozen MCP adapter is not a Claude adapter");
+                return Err(invalid(anyhow!(
+                    "frozen MCP adapter is not a Claude adapter"
+                )));
             }
             let launch = build_claude_mcp_session_launch_projection(
                 projection,
                 metadata.provider_contract_fingerprint.clone(),
             )
-            .context("failed to rebuild frozen Claude MCP launch projection")?;
+            .context("failed to rebuild frozen Claude MCP launch projection")
+            .map_err(invalid)?;
+            let facade = launch
+                .facade_projection(facade_limits)
+                .map_err(|error| invalid(anyhow!(error)))?;
+            let facade_fingerprint = facade.fingerprint();
             validate_provider_projection(
                 launch.preflight.canonical_manifest_hash.as_str(),
                 launch.preflight.provider_contract_fingerprint.as_str(),
                 launch.semantic_restart_fingerprint(),
-                launch
-                    .facade_projection(facade_limits)?
-                    .fingerprint()
-                    .as_str(),
+                facade_fingerprint.as_str(),
                 metadata,
-            )?;
+            )
+            .map_err(invalid)?;
             validate_provider_bindings(
                 bindings.as_slice(),
                 launch.preflight.tools.iter().map(|tool| {
@@ -172,7 +243,8 @@ pub(crate) async fn restore_cli_mcp_session_launch(
                         tool.transformed_schema_fingerprint.as_str(),
                     )
                 }),
-            )?;
+            )
+            .map_err(invalid)?;
             Ok(CliMcpSessionLaunch::Claude(launch))
         }
     }

@@ -653,25 +653,6 @@ impl ClaudeCLIAgentRuntimeSessionFactory {
 
 #[async_trait]
 impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
-    async fn start_session(
-        &self,
-        process_instance: &CliSessionInstanceId,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-        self.start_session_with_options(
-            process_instance,
-            &CLIAgentRuntimeSessionStartOptions::default(),
-        )
-        .await
-    }
-
-    async fn start_session_with_options(
-        &self,
-        _process_instance: &CliSessionInstanceId,
-        _options: &CLIAgentRuntimeSessionStartOptions,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-        bail!("Claude CLI session start requires a durable typed provider continuation")
-    }
-
     async fn start_session_with_launch_spec(
         &self,
         process_instance: &CliSessionInstanceId,

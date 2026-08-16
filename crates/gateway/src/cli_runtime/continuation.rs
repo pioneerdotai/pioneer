@@ -82,6 +82,7 @@ impl CliSessionLaunchSpec {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn unmanaged_codex(options: CLIAgentRuntimeSessionStartOptions) -> Self {
         Self::codex(options, CliMcpSessionLaunch::Disabled, None)
     }

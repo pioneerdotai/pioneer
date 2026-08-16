@@ -388,28 +388,11 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
 
 #[async_trait]
 pub(crate) trait CLIAgentRuntimeSessionFactory: Send + Sync {
-    async fn start_session(
-        &self,
-        instance: &CliSessionInstanceId,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>>;
-
-    async fn start_session_with_options(
-        &self,
-        instance: &CliSessionInstanceId,
-        options: &CLIAgentRuntimeSessionStartOptions,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-        let _ = options;
-        self.start_session(instance).await
-    }
-
     async fn start_session_with_launch_spec(
         &self,
         instance: &CliSessionInstanceId,
         launch_spec: &CliSessionLaunchSpec,
-    ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-        self.start_session_with_options(instance, &launch_spec.options)
-            .await
-    }
+    ) -> Result<Arc<dyn CLIAgentRuntimeSession>>;
 }
 
 /// Exact-generation lifecycle hooks for resources that surround a provider
@@ -576,6 +559,7 @@ impl CLIAgentRuntimeManager {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_or_start(
         &self,
         key: CLIAgentRuntimeSessionKey,
@@ -584,6 +568,7 @@ impl CLIAgentRuntimeManager {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_or_start_with_options(
         &self,
         key: CLIAgentRuntimeSessionKey,
@@ -1133,10 +1118,12 @@ mod tests {
 
     #[async_trait]
     impl CLIAgentRuntimeSessionFactory for FakeFactory {
-        async fn start_session(
+        async fn start_session_with_launch_spec(
             &self,
             _instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
+            launch_spec: &CliSessionLaunchSpec,
         ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+            self.launch_specs.lock().await.push(launch_spec.clone());
             let id = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             if let Some(release) = self.release.as_ref() {
                 release.notified().await;
@@ -1153,15 +1140,6 @@ mod tests {
                 replacement_events: self.replacement_events.clone(),
                 fail_replacement_prepare: self.fail_replacement_prepare,
             }))
-        }
-
-        async fn start_session_with_launch_spec(
-            &self,
-            instance: &crate::cli_runtime::session_instance::CliSessionInstanceId,
-            launch_spec: &CliSessionLaunchSpec,
-        ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
-            self.launch_specs.lock().await.push(launch_spec.clone());
-            self.start_session(instance).await
         }
     }
 
