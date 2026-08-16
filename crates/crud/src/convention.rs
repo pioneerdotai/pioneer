@@ -980,6 +980,7 @@ pub fn turn_origin_to_db(origin: pioneer_protocol::TurnOrigin) -> &'static str {
         pioneer_protocol::TurnOrigin::ScheduledTask => "scheduled_task",
         pioneer_protocol::TurnOrigin::DetachedTask => "detached_task",
         pioneer_protocol::TurnOrigin::AttachedTask => "attached_task",
+        pioneer_protocol::TurnOrigin::TaskDelivery => "task_delivery",
     }
 }
 
@@ -989,6 +990,7 @@ pub fn turn_origin_from_db(value: &str) -> Option<pioneer_protocol::TurnOrigin> 
         "scheduled_task" => Some(pioneer_protocol::TurnOrigin::ScheduledTask),
         "detached_task" => Some(pioneer_protocol::TurnOrigin::DetachedTask),
         "attached_task" => Some(pioneer_protocol::TurnOrigin::AttachedTask),
+        "task_delivery" => Some(pioneer_protocol::TurnOrigin::TaskDelivery),
         _ => None,
     }
 }

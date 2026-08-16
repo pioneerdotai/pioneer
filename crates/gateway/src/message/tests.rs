@@ -2851,6 +2851,36 @@ impl pioneer_tasks::TaskExecutor for CompletingSystemExecutor {
     }
 }
 
+struct FailingSystemExecutor;
+
+#[async_trait]
+impl pioneer_tasks::TaskExecutor for FailingSystemExecutor {
+    fn kind(&self) -> TaskExecutorKind {
+        TaskExecutorKind::System
+    }
+
+    async fn start_run(
+        &self,
+        _context: pioneer_tasks::TaskExecutionContext,
+        _run: TaskRun,
+        _handle: pioneer_tasks::TaskExecutionHandle,
+    ) -> pioneer_tasks::TaskRuntimeResult<pioneer_tasks::TaskExecutorStartOutcome> {
+        anyhow::bail!(
+            "Turn admission generation 44 is stale; current authorization generation is 60; internal path /srv/pioneer"
+        )
+    }
+
+    async fn cancel_run(
+        &self,
+        _context: pioneer_tasks::TaskExecutionContext,
+        _run_id: &str,
+        _reason: &str,
+        _handle: pioneer_tasks::TaskExecutionHandle,
+    ) -> pioneer_tasks::TaskRuntimeResult<()> {
+        Ok(())
+    }
+}
+
 fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
     Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -18518,6 +18548,26 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         .await
         .expect("scheduled task_create should succeed");
 
+    let admitted_generation =
+        pioneer_crud::current_policy_generation(&processor.crud_store.database_connection())
+            .await
+            .expect("admitted policy generation should load");
+    let unrelated_change = processor
+        .authorization_invalidation_hub
+        .publish_change(
+            pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
+            pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
+                workspace_id: "unrelated-workspace".to_owned(),
+                selector: "unrelated-mcp-runtime-state".to_owned(),
+            },
+        )
+        .await
+        .expect("unrelated authorization generation should advance");
+    assert!(
+        unrelated_change.policy_generation.get() > admitted_generation.get(),
+        "the scheduled Task must exercise a durable admission from an older generation"
+    );
+
     processor
         .task_runtime
         .process_due_once(due_at)
@@ -22793,6 +22843,199 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
         delivered_turn.send_mode.as_deref(),
         Some("chat"),
         "system delivery must remain an explicit Chat projection even when the target thread defaults to Message"
+    );
+    assert_eq!(delivered_turn.origin, "task_delivery");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_group() {
+    let connection = Database::connect("sqlite::memory:")
+        .await
+        .expect("must connect to sqlite memory");
+    Migrator::up(&connection, None)
+        .await
+        .expect("migrations must succeed");
+    bootstrap(&connection)
+        .await
+        .expect("gateway bootstrap should create default workspace");
+
+    let (tx, _rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let workspace_manager = Arc::new(WorkspaceManager::new(connection.clone()));
+    let workspace_id = workspace_manager
+        .list_workspaces()
+        .await
+        .expect("workspace/list should succeed")
+        .into_iter()
+        .find(|workspace| workspace.is_active && workspace.is_current)
+        .expect("default workspace should exist")
+        .id;
+    let crud_store = Arc::new(CrudStore::new(connection.clone()));
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager,
+        Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor
+        .task_runtime
+        .register_executor(Arc::new(FailingSystemExecutor))
+        .await;
+
+    let target_thread_id = "thr_failed_system_delivery";
+    processor
+        .thread_manager
+        .thread_start_seeded(
+            connection_id,
+            workspace_id.clone(),
+            ThreadStartParams {
+                thread_id: target_thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                name: Some("Failed system delivery".to_owned()),
+                model: Some("o4-mini".to_owned()),
+                model_provider: Some("openai".to_owned()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: None,
+                sidebar_visibility: None,
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("delivery target thread should load");
+
+    let response = processor
+        .task_runtime
+        .service()
+        .create_task(
+            pioneer_tasks::TaskCreateContext::default(),
+            TaskCreateParams {
+                workspace_id: workspace_id.clone(),
+                owner_kind: TaskOwnerKind::Thread,
+                owner_id: Some(target_thread_id.to_owned()),
+                created_by_thread_id: Some(target_thread_id.to_owned()),
+                created_by_turn_id: None,
+                parent_task_id: None,
+                executor_kind: TaskExecutorKind::System,
+                title: "Failed system delivery".to_owned(),
+                goal: "Fail before producing a result".to_owned(),
+                priority: 0,
+                trigger: TaskTriggerInput {
+                    spec: TaskTriggerSpec::ScheduledAt {
+                        scheduled_at: 4_200_000_000,
+                        timezone: Some("UTC".to_owned()),
+                        catch_up_policy: None,
+                    },
+                },
+                agent_spec: None,
+                lifecycle_policy: None,
+                delivery_policy: Some(TaskDeliveryPolicy {
+                    mode: TaskDeliveryMode::Thread,
+                    thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
+                    thread_id: Some(target_thread_id.to_owned()),
+                    webhook_url: None,
+                    include_result: true,
+                    format: TaskDeliveryFormat::Summary,
+                }),
+                retry_policy: None,
+                timeout_policy: None,
+                concurrency_policy: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("task should create");
+
+    processor
+        .task_runtime
+        .process_due_once(4_200_000_000)
+        .await
+        .expect("scheduled failure should be recorded");
+    processor
+        .process_due_task_deliveries(4_200_000_000, 10)
+        .await
+        .expect("failed thread delivery should run");
+
+    let deliveries = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id,
+            task_id: Some(response.task.id),
+            run_id: None,
+            statuses: vec![TaskDeliveryStatus::Delivered],
+            limit: Some(10),
+        })
+        .await
+        .expect("deliveries should read");
+    let delivery = deliveries
+        .deliveries
+        .first()
+        .expect("failed result should still have a delivered notification");
+    assert!(
+        delivery
+            .error_snapshot
+            .as_ref()
+            .is_some_and(|error| error.message.contains("internal path /srv/pioneer")),
+        "the durable Task diagnostic must retain the real internal cause"
+    );
+    let delivered_turn_id = delivery
+        .delivered_turn_id
+        .as_deref()
+        .expect("failed thread delivery should materialize a system Turn");
+    let delivered_turn = turn::Entity::find_by_id(delivered_turn_id)
+        .one(&connection)
+        .await
+        .expect("delivery turn query should succeed")
+        .expect("delivery turn should exist");
+    assert_eq!(delivered_turn.status, "failed");
+    assert_eq!(delivered_turn.origin, "task_delivery");
+    assert_eq!(
+        delivered_turn.initiated_by_actor_kind.as_deref(),
+        Some("system")
+    );
+    assert_eq!(
+        delivered_turn.error.as_deref(),
+        Some("Scheduled task could not start.")
+    );
+    assert!(
+        !delivered_turn
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("generation 44"),
+        "the chat projection must not disclose the internal diagnostic"
+    );
+    assert!(
+        crud_store
+            .get_turn_work_projection(delivered_turn_id)
+            .await
+            .expect("work projection should query")
+            .is_none(),
+        "a failed scheduled delivery is a system state, not an Agent Worked group"
+    );
+    let blocks = thread_timeline_block::Entity::find()
+        .filter(thread_timeline_block::Column::TurnId.eq(delivered_turn_id))
+        .all(&connection)
+        .await
+        .expect("delivery timeline blocks should query");
+    assert!(blocks.iter().any(|block| {
+        block.block_kind == pioneer_crud::BLOCK_KIND_SYSTEM
+            && block
+                .metadata_json
+                .contains("Scheduled task could not start.")
+    }));
+    assert!(
+        blocks
+            .iter()
+            .all(|block| block.block_kind != pioneer_crud::BLOCK_KIND_TURN_WORK)
     );
 }
 

@@ -572,13 +572,18 @@ impl MessageProcessor {
         {
             self.ensure_delivery_thread_loaded(thread_id, delivery.workspace_id.as_str())
                 .await?;
-            self.persist_delivery_item(
-                delivery.workspace_id.as_str(),
-                thread_id,
-                parent_turn_id.as_str(),
-                delivery_summary_item(delivery),
-            )
-            .await?;
+            // The task card on the occurrence Turn is already the canonical
+            // failed-state presentation. Do not duplicate its internal error
+            // as an agent work item beside the card.
+            if delivery.error_snapshot.is_none() {
+                self.persist_delivery_item(
+                    delivery.workspace_id.as_str(),
+                    thread_id,
+                    parent_turn_id.as_str(),
+                    delivery_result_item(delivery),
+                )
+                .await?;
+            }
             return Ok(parent_turn_id);
         }
 
@@ -622,7 +627,7 @@ impl MessageProcessor {
         let turn_id = pioneer_protocol::generate_id(DELIVERY_TURN_ID_LEN);
         let turn_outcome = self
             .thread_manager
-            .system_turn_start_with_permission_profile(
+            .system_turn_start_with_permission_profile_and_origin(
                 TurnStartParams {
                     thread_id: thread_id.to_owned(),
                     turn_id: turn_id.clone(),
@@ -645,6 +650,7 @@ impl MessageProcessor {
                 pioneer_protocol::system_turn_permission_profile_snapshot(
                     pioneer_protocol::TurnPermissionMode::FullAccess,
                 ),
+                pioneer_protocol::TurnOrigin::TaskDelivery,
             )
             .await?;
         let profile_selected_audit = match self.turn_profile_selected_audit_event(&turn_outcome) {
@@ -682,12 +688,23 @@ impl MessageProcessor {
         )
         .await;
 
+        if let Some(error) = delivery.error_snapshot.as_ref() {
+            let public_message = task_delivery_failure_message(error);
+            if !self
+                .mark_turn_failed_terminal(thread_id.to_owned(), turn_id.clone(), public_message)
+                .await
+            {
+                bail!("failed to durably publish failed task delivery");
+            }
+            return Ok(turn_id);
+        }
+
         if let Err(error) = self
             .persist_delivery_item(
                 delivery.workspace_id.as_str(),
                 thread_id,
                 turn_id.as_str(),
-                delivery_summary_item(delivery),
+                delivery_result_item(delivery),
             )
             .await
         {
@@ -950,20 +967,8 @@ fn task_user_notification_id(delivery_id: &str) -> String {
     format!("un_{}", hex::encode(&digest[..9]))
 }
 
-fn delivery_summary_item(delivery: &TaskDelivery) -> TurnItem {
-    if let Some(error) = delivery.error_snapshot.as_ref() {
-        return TurnItem::SystemEvent {
-            id: pioneer_protocol::task_delivery_result_item_id(delivery.id.as_str()),
-            level: SystemEventLevel::Error,
-            message: error.message.clone(),
-            code: Some(error.code.clone()),
-            details: Some(json!({
-                "taskId": delivery.task_id.clone(),
-                "runId": delivery.run_id.clone(),
-                "deliveryId": delivery.id.clone(),
-            })),
-        };
-    }
+fn delivery_result_item(delivery: &TaskDelivery) -> TurnItem {
+    debug_assert!(delivery.error_snapshot.is_none());
     let text = delivery
         .result_snapshot
         .as_ref()
@@ -976,6 +981,13 @@ fn delivery_summary_item(delivery: &TaskDelivery) -> TurnItem {
         markdown: Some(super::markdown::parse_markdown_document(text.as_str())),
         markdown_version: Some(MARKDOWN_AST_VERSION),
         text,
+    }
+}
+
+fn task_delivery_failure_message(error: &pioneer_protocol::TaskError) -> String {
+    match error.code.as_str() {
+        "task_executor_start_failed" => "Scheduled task could not start.".to_owned(),
+        _ => "Scheduled task failed.".to_owned(),
     }
 }
 

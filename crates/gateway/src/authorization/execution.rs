@@ -1787,23 +1787,44 @@ impl ExecutionAuthorizationContext {
         Ok((execution, tasks))
     }
 
-    /// Builds the mandatory durable admission record for a concrete Turn that
-    /// is derived from this execution authority. The initiating principal is
-    /// provenance only; quota ownership follows the immutable admitted role
-    /// and every concrete child Turn receives its own active reservation.
-    pub(crate) fn durable_turn_admission(
+    /// Builds a concrete Turn admission from an immutable execution context
+    /// after its current collaboration authority has been revalidated. The
+    /// context remains frozen at its original admission generation; only this
+    /// new Turn reservation is stamped with the generation that was actually
+    /// checked. The repository still compares that generation atomically at
+    /// insert time, so a concurrent authority change remains fail closed.
+    pub(crate) fn durable_turn_admission_after_revalidation(
         &self,
         actual_thread_id: &str,
         turn_id: &str,
         execution_backend: Option<&AgentExecutionBackend>,
+        revalidated: &RevalidatedExecutionAuthorization,
+    ) -> Result<pioneer_crud::NewTurnAdmission> {
+        revalidated.verify_context(self)?;
+        let current_policy_fingerprint =
+            crate::authorization::RoleDefinitionRegistry::new().policy_fingerprint();
+        if revalidated.validated_policy_fingerprint != current_policy_fingerprint {
+            bail!("revalidated Turn admission policy fingerprint is stale");
+        }
+        self.build_durable_turn_admission(
+            actual_thread_id,
+            turn_id,
+            execution_backend,
+            revalidated.validated_policy_generation,
+            revalidated.validated_policy_fingerprint.as_str(),
+        )
+    }
+
+    fn build_durable_turn_admission(
+        &self,
+        actual_thread_id: &str,
+        turn_id: &str,
+        execution_backend: Option<&AgentExecutionBackend>,
+        validated_policy_generation: u64,
+        validated_policy_fingerprint: &str,
     ) -> Result<pioneer_crud::NewTurnAdmission> {
         if actual_thread_id.trim().is_empty() || turn_id.trim().is_empty() {
             bail!("durable Turn admission requires exact thread and Turn ids");
-        }
-        let current_policy_fingerprint =
-            crate::authorization::RoleDefinitionRegistry::new().policy_fingerprint();
-        if self.policy_fingerprint != current_policy_fingerprint {
-            bail!("durable Turn admission policy fingerprint is stale");
         }
         let (principal_kind, scoped_role_key) = self.registered_role_identity()?;
         let policy = AuthorizationService::new()
@@ -1834,14 +1855,14 @@ impl ExecutionAuthorizationContext {
             thread_id: actual_thread_id.to_owned(),
             workspace_id: self.workspace_id.clone(),
             request_digest: hex::encode(digest.finalize()),
-            policy_generation: Some(self.policy_revision),
+            policy_generation: Some(validated_policy_generation),
             role_key: Some(self.role_key.clone()),
-            policy_fingerprint: Some(self.policy_fingerprint.clone()),
+            policy_fingerprint: Some(validated_policy_fingerprint.to_owned()),
             execution_lease: Some(super::ExecutionAdmissionGovernor::lease(
                 self.initiating_principal_id.as_str(),
                 self.role_key.as_str(),
                 self.workspace_id.as_str(),
-                self.policy_fingerprint.as_str(),
+                validated_policy_fingerprint,
                 policy,
                 operation_class,
                 "turn",
@@ -2247,6 +2268,15 @@ impl ExecutionAuthorizationContext {
             authorization,
             resource_boundary: self.resource_boundary,
             effective_permission_profile,
+            admitted_workspace_id: self.workspace_id.clone(),
+            admitted_root_thread_id: self.root_thread_id.clone(),
+            admitted_principal_id: self.initiating_principal_id.clone(),
+            admitted_session_id: self.initiating_session_id.clone(),
+            admitted_role_key: self.role_key.clone(),
+            admitted_policy_generation: self.policy_revision,
+            admitted_policy_fingerprint: self.policy_fingerprint.clone(),
+            validated_policy_generation: current_policy_revision,
+            validated_policy_fingerprint: current_policy_fingerprint,
         })
     }
 
@@ -2422,6 +2452,15 @@ pub(crate) struct RevalidatedExecutionAuthorization {
     authorization: AuthorizedThread,
     resource_boundary: ExecutionResourceBoundary,
     effective_permission_profile: TurnPermissionProfileSnapshot,
+    admitted_workspace_id: String,
+    admitted_root_thread_id: String,
+    admitted_principal_id: PrincipalId,
+    admitted_session_id: AuthSessionId,
+    admitted_role_key: String,
+    admitted_policy_generation: u64,
+    admitted_policy_fingerprint: String,
+    validated_policy_generation: u64,
+    validated_policy_fingerprint: String,
 }
 
 impl RevalidatedExecutionAuthorization {
@@ -2439,6 +2478,35 @@ impl RevalidatedExecutionAuthorization {
 
     pub(crate) fn effective_permission_profile(&self) -> &TurnPermissionProfileSnapshot {
         &self.effective_permission_profile
+    }
+
+    pub(crate) const fn validated_policy_generation(&self) -> u64 {
+        self.validated_policy_generation
+    }
+
+    fn verify_context(&self, context: &ExecutionAuthorizationContext) -> Result<()> {
+        if self.admitted_workspace_id != context.workspace_id
+            || self.admitted_root_thread_id != context.root_thread_id
+            || self.admitted_principal_id != context.initiating_principal_id
+            || self.admitted_session_id != context.initiating_session_id
+            || self.admitted_role_key != context.role_key
+            || self.admitted_policy_generation != context.policy_revision
+            || self.admitted_policy_fingerprint != context.policy_fingerprint
+            || self.resource_boundary != context.resource_boundary
+        {
+            bail!("current authorization proof belongs to a different execution authority");
+        }
+        let context_permission_profile =
+            pioneer_protocol::task_permission_cap_snapshot(&context.permission_profile_cap);
+        let effective = pioneer_protocol::intersect_turn_permission_profiles(
+            &context_permission_profile,
+            &self.effective_permission_profile,
+            pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
+        );
+        if effective != context_permission_profile {
+            bail!("execution continuation exceeds its revalidated permission profile");
+        }
+        Ok(())
     }
 }
 
@@ -3347,11 +3415,33 @@ mod tests {
                 &effective,
             )
             .expect("execution context");
+        let current_policy_fingerprint =
+            crate::authorization::RoleDefinitionRegistry::new().policy_fingerprint();
+        let revalidated = RevalidatedExecutionAuthorization {
+            principal: request.principal().clone(),
+            authorization: authorized_thread(&request),
+            resource_boundary: context.resource_boundary,
+            effective_permission_profile: effective.clone(),
+            admitted_workspace_id: context.workspace_id.clone(),
+            admitted_root_thread_id: context.root_thread_id.clone(),
+            admitted_principal_id: context.initiating_principal_id.clone(),
+            admitted_session_id: context.initiating_session_id.clone(),
+            admitted_role_key: context.role_key.clone(),
+            admitted_policy_generation: context.policy_revision,
+            admitted_policy_fingerprint: context.policy_fingerprint.clone(),
+            validated_policy_generation: 60,
+            validated_policy_fingerprint: current_policy_fingerprint,
+        };
 
         let child = context
-            .durable_turn_admission("thread-child", "turn-child", None)
+            .durable_turn_admission_after_revalidation(
+                "thread-child",
+                "turn-child",
+                None,
+                &revalidated,
+            )
             .expect("child admission");
-        assert_eq!(child.policy_generation, Some(7));
+        assert_eq!(child.policy_generation, Some(60));
         assert_eq!(child.role_key.as_deref(), Some("member"));
         assert_eq!(child.request_digest.len(), 64);
         let child_lease = child.execution_lease.expect("child quota lease");
@@ -3363,7 +3453,7 @@ mod tests {
         assert_eq!(child_lease.subject_id, "turn-child");
 
         let root = context
-            .durable_turn_admission("thread-a", "turn-root", None)
+            .durable_turn_admission_after_revalidation("thread-a", "turn-root", None, &revalidated)
             .expect("root continuation admission");
         assert_eq!(
             root.execution_lease
@@ -3377,7 +3467,12 @@ mod tests {
             runtime_kind: CLIAgentRuntimeKind::Codex,
         };
         let cli_child = context
-            .durable_turn_admission("thread-cli-child", "turn-cli-child", Some(&cli_backend))
+            .durable_turn_admission_after_revalidation(
+                "thread-cli-child",
+                "turn-cli-child",
+                Some(&cli_backend),
+                &revalidated,
+            )
             .expect("CLI child admission");
         assert_eq!(
             cli_child
@@ -3385,6 +3480,20 @@ mod tests {
                 .expect("CLI quota lease")
                 .operation_class,
             pioneer_crud::ExecutionAdmissionClass::CliProcess
+        );
+
+        let mut unrelated = context.clone();
+        unrelated.root_thread_id = "thread-unrelated".to_owned();
+        assert!(
+            unrelated
+                .durable_turn_admission_after_revalidation(
+                    "thread-child",
+                    "turn-unrelated",
+                    None,
+                    &revalidated,
+                )
+                .is_err(),
+            "a current proof must not authorize a different durable execution context"
         );
     }
 

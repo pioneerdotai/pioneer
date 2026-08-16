@@ -4,8 +4,8 @@ use pioneer_protocol::{
     AuthSessionId, PrincipalId, SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification,
     ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStartParams, ThreadStartResponse,
     ThreadStartedNotification, ThreadStatus, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
-    Turn, TurnKind, TurnStartParams, TurnStartResponse, TurnStartedNotification, TurnStatus,
-    UserInput,
+    Turn, TurnKind, TurnOrigin, TurnStartParams, TurnStartResponse, TurnStartedNotification,
+    TurnStatus, UserInput,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
@@ -841,6 +841,7 @@ impl ThreadManager {
             Some(permission_profile),
             author,
             mentions,
+            TurnOrigin::User,
         )
         .await
     }
@@ -850,12 +851,27 @@ impl ThreadManager {
         params: TurnStartParams,
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
     ) -> Result<TurnStartOutcome> {
+        self.system_turn_start_with_permission_profile_and_origin(
+            params,
+            permission_profile,
+            TurnOrigin::User,
+        )
+        .await
+    }
+
+    pub async fn system_turn_start_with_permission_profile_and_origin(
+        &self,
+        params: TurnStartParams,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        origin: TurnOrigin,
+    ) -> Result<TurnStartOutcome> {
         self.turn_start_for_actor_with_permission_profile(
             None,
             params,
             Some(permission_profile),
             None,
             Vec::new(),
+            origin,
         )
         .await
     }
@@ -873,6 +889,7 @@ impl ThreadManager {
             None,
             author,
             mentions,
+            TurnOrigin::User,
         )
         .await
     }
@@ -884,6 +901,7 @@ impl ThreadManager {
         resolved_permission_profile: Option<pioneer_protocol::TurnPermissionProfileSnapshot>,
         author: Option<pioneer_protocol::TurnAuthorSnapshot>,
         mentions: Vec<pioneer_protocol::TurnMention>,
+        origin: TurnOrigin,
     ) -> Result<TurnStartOutcome> {
         pioneer_protocol::validate_turn_execution_envelope(&params)
             .map_err(|message| anyhow!(message))?;
@@ -978,7 +996,7 @@ impl ThreadManager {
             id: turn_id,
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
-            origin: Default::default(),
+            origin,
             mode: effective_mode,
             author,
             reply_to_turn_id: params.reply_to_turn_id.clone(),

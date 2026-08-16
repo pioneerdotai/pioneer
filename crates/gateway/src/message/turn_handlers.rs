@@ -108,20 +108,32 @@ impl std::fmt::Display for TurnStartFailure {
 #[derive(Clone)]
 pub(super) enum TurnExecutionAuthority {
     Fresh(ExecutionAuthorizationAdmission),
-    Durable(crate::authorization::ExecutionAuthorizationContext),
+    Durable {
+        context: crate::authorization::ExecutionAuthorizationContext,
+        revalidation: std::sync::Arc<crate::authorization::RevalidatedExecutionAuthorization>,
+    },
 }
 
 #[derive(Clone, Copy)]
 enum ExecutionEnvelopeSource<'a> {
     Fresh(&'a ExecutionAuthorizationAdmission),
-    Durable(&'a crate::authorization::ExecutionAuthorizationContext),
+    Durable {
+        context: &'a crate::authorization::ExecutionAuthorizationContext,
+        revalidation: &'a crate::authorization::RevalidatedExecutionAuthorization,
+    },
 }
 
 impl TurnExecutionAuthority {
     fn source(&self) -> ExecutionEnvelopeSource<'_> {
         match self {
             Self::Fresh(admission) => ExecutionEnvelopeSource::Fresh(admission),
-            Self::Durable(context) => ExecutionEnvelopeSource::Durable(context),
+            Self::Durable {
+                context,
+                revalidation,
+            } => ExecutionEnvelopeSource::Durable {
+                context,
+                revalidation: revalidation.as_ref(),
+            },
         }
     }
 }
@@ -130,14 +142,14 @@ impl<'a> ExecutionEnvelopeSource<'a> {
     fn policy_revision(self) -> u64 {
         match self {
             Self::Fresh(admission) => admission.policy_provenance().1,
-            Self::Durable(context) => context.policy_revision(),
+            Self::Durable { revalidation, .. } => revalidation.validated_policy_generation(),
         }
     }
 
     fn runtime_draft(self) -> Option<&'a RuntimeDraftMaterialization> {
         match self {
             Self::Fresh(admission) => admission.runtime_draft(),
-            Self::Durable(_) => None,
+            Self::Durable { .. } => None,
         }
     }
 
@@ -146,7 +158,7 @@ impl<'a> ExecutionEnvelopeSource<'a> {
     ) -> anyhow::Result<pioneer_cli_agent_runtime::NativeEventBudget> {
         match self {
             Self::Fresh(admission) => Ok(admission.native_event_resource_budget()),
-            Self::Durable(context) => context.effective_native_event_resource_budget(),
+            Self::Durable { context, .. } => context.effective_native_event_resource_budget(),
         }
     }
 }
@@ -295,17 +307,21 @@ async fn persist_admitted_turn_start(
                 ),
             }
         }
-        ExecutionEnvelopeSource::Durable(context) => {
+        ExecutionEnvelopeSource::Durable {
+            context,
+            revalidation,
+        } => {
             context.verify_current_provider_authority(provider_registry)?;
-            context.durable_turn_admission(
+            context.durable_turn_admission_after_revalidation(
                 materialization.thread.id.as_str(),
                 materialization.turn.id.as_str(),
                 params.execution_backend.as_ref(),
+                revalidation,
             )?
         }
     };
     let authorization_context = match execution_authority {
-        ExecutionEnvelopeSource::Durable(context) => context.clone(),
+        ExecutionEnvelopeSource::Durable { context, .. } => context.clone(),
         ExecutionEnvelopeSource::Fresh(admission) => admission.finalize(
             materialization.thread.workspace_id.as_str(),
             materialization.thread.id.as_str(),
@@ -2616,6 +2632,7 @@ impl MessageProcessor {
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
         execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
         execution_authorization_context: crate::authorization::ExecutionAuthorizationContext,
+        execution_authorization_revalidation: crate::authorization::RevalidatedExecutionAuthorization,
         continuation_thread_id: String,
         context_thread_id: String,
         task_run_id: String,
@@ -2641,7 +2658,10 @@ impl MessageProcessor {
             params,
             runtime_id,
             runtime_kind,
-            TurnExecutionAuthority::Durable(execution_authorization_context),
+            TurnExecutionAuthority::Durable {
+                context: execution_authorization_context,
+                revalidation: std::sync::Arc::new(execution_authorization_revalidation),
+            },
             response,
         )
         .await;
@@ -3090,7 +3110,7 @@ impl MessageProcessor {
                 (&success_response, &execution_authority),
                 (
                     TurnStartSuccessResponse::Task { .. },
-                    TurnExecutionAuthority::Durable(_)
+                    TurnExecutionAuthority::Durable { .. }
                 ) | (
                     TurnStartSuccessResponse::TurnStart
                         | TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { .. },
@@ -3562,7 +3582,7 @@ impl MessageProcessor {
                     );
                     Some(admission.cap_permission_profile(&requested))
                 }
-                TurnExecutionAuthority::Fresh(_) | TurnExecutionAuthority::Durable(_) => None,
+                TurnExecutionAuthority::Fresh(_) | TurnExecutionAuthority::Durable { .. } => None,
             };
             if let Some(profile) = resolved_permission_profile.as_ref() {
                 params.permission_profile =
@@ -6026,7 +6046,7 @@ impl MessageProcessor {
             )));
         }
         let authorization_context = match execution_authority {
-            ExecutionEnvelopeSource::Durable(context) => {
+            ExecutionEnvelopeSource::Durable { context, .. } => {
                 if outcome.started_notification.workspace_id != context.workspace_id() {
                     return Err(TurnStartFailure::internal(
                         "failed to persist execution authorization context: durable context belongs to a different workspace",

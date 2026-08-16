@@ -622,7 +622,8 @@
         "user",
         "scheduled_task",
         "detached_task",
-        "attached_task"
+        "attached_task",
+        "task_delivery"
       ]
     },
     "TurnPermissionMode": {

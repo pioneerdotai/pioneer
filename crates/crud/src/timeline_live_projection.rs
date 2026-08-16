@@ -999,13 +999,19 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
     let has_detached_task_run = turn_has_detached_task_run_block(db, turn_model.id.as_str())
         .await?
         || detached_task_run_origin_hint(turn_model);
+    let terminal_system_task_delivery_without_work = work_count == 0
+        && turn_model.status != "in_progress"
+        && turn_model.turn_kind == "conversation"
+        && turn_model.origin == "task_delivery"
+        && turn_model.initiated_by_actor_kind.as_deref() == Some("system");
     // A detached Task card represents the wrapper lifecycle in the parent.
     // Its actual work belongs to the child thread, so wrapper diagnostics must
     // never create a second, misleading "Worked" group beside the card.
     // Successful message-only turns likewise do not need an empty work block.
     let completed_without_work = turn_model.status == "completed" && work_count == 0;
-    let needs_work_block =
-        !has_detached_task_run && (work_count > 0 || (!has_final && !completed_without_work));
+    let needs_work_block = !has_detached_task_run
+        && !terminal_system_task_delivery_without_work
+        && (work_count > 0 || (!has_final && !completed_without_work));
 
     if !needs_work_block {
         timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;

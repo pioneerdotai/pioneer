@@ -606,19 +606,20 @@ impl TaskAgentExecutor {
                     runtime_id: runtime_id.clone(),
                     runtime_kind,
                 };
-                let child_authorization_context =
-                    resolve_task_child_execution_authorization_context(
-                        processor,
-                        task,
-                        parent,
-                        effective_model_provider.as_str(),
-                        effective_model.model.as_str(),
-                        Some(&cli_execution_backend),
-                        turn_params.capabilities.as_slice(),
-                        &child_security_snapshot.permission_profile,
-                    )
-                    .await
-                    .context("failed to resolve hidden task CLI runtime authorization")?;
+                let child_authorization = resolve_task_child_execution_authorization_context(
+                    processor,
+                    task,
+                    parent,
+                    effective_model_provider.as_str(),
+                    effective_model.model.as_str(),
+                    Some(&cli_execution_backend),
+                    turn_params.capabilities.as_slice(),
+                    &child_security_snapshot.permission_profile,
+                )
+                .await
+                .context("failed to resolve hidden task CLI runtime authorization")?;
+                let child_authorization_context = child_authorization.context;
+                let child_authorization_revalidation = child_authorization.revalidation;
                 // Child-scoped authorization is revalidated while CLI MCP and skill
                 // projections are committed. Persist the durable lineage first so
                 // those checks can prove that the hidden thread belongs to the
@@ -655,6 +656,7 @@ impl TaskAgentExecutor {
                             child_permission_profile,
                             child_security_snapshot,
                             child_authorization_context,
+                            child_authorization_revalidation,
                             continuation_thread_id.clone(),
                             continuation_thread_id,
                             task_run_id,
@@ -856,7 +858,7 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve hidden task execution security");
             }
         };
-        let child_authorization_context = match resolve_task_child_execution_authorization_context(
+        let child_authorization = match resolve_task_child_execution_authorization_context(
             processor,
             task,
             parent,
@@ -877,6 +879,8 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve hidden task execution authorization");
             }
         };
+        let child_authorization_context = child_authorization.context;
+        let child_authorization_revalidation = child_authorization.revalidation;
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             context.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -886,11 +890,14 @@ impl TaskAgentExecutor {
         let child_authority_json = child_authorization_context
             .to_persisted_json()
             .context("failed to encode hidden task authority envelope")?;
-        let child_turn_admission = match child_authorization_context.durable_turn_admission(
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-            child_execution_backend.as_ref(),
-        ) {
+        let child_turn_admission = match child_authorization_context
+            .durable_turn_admission_after_revalidation(
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                child_execution_backend.as_ref(),
+                &child_authorization_revalidation,
+            )
+        {
             Ok(admission) => admission,
             Err(error) => {
                 processor
@@ -1623,7 +1630,7 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
         };
-        let child_authorization_context = match resolve_task_child_execution_authorization_context(
+        let child_authorization = match resolve_task_child_execution_authorization_context(
             processor,
             task,
             &parent,
@@ -1658,6 +1665,8 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
         };
+        let child_authorization_context = child_authorization.context;
+        let child_authorization_revalidation = child_authorization.revalidation;
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -1686,11 +1695,13 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
         };
-        let child_turn_admission = match child_authorization_context.durable_turn_admission(
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-            None,
-        ) {
+        let child_turn_admission = match child_authorization_context
+            .durable_turn_admission_after_revalidation(
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                None,
+                &child_authorization_revalidation,
+            ) {
             Ok(admission) => admission,
             Err(error) => {
                 processor
@@ -3404,7 +3415,7 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve hidden reviewer execution security");
             }
         };
-        let child_authorization_context = match resolve_task_child_execution_authorization_context(
+        let child_authorization = match resolve_task_child_execution_authorization_context(
             processor,
             task,
             &parent,
@@ -3426,6 +3437,8 @@ impl TaskAgentExecutor {
                     .context("failed to resolve hidden reviewer execution authorization");
             }
         };
+        let child_authorization_context = child_authorization.context;
+        let child_authorization_revalidation = child_authorization.revalidation;
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             task_run_turn.thread_id.as_str(),
@@ -3435,11 +3448,13 @@ impl TaskAgentExecutor {
         let child_authority_json = child_authorization_context
             .to_persisted_json()
             .context("failed to encode hidden reviewer authority envelope")?;
-        let child_turn_admission = match child_authorization_context.durable_turn_admission(
-            task_run_turn.thread_id.as_str(),
-            task_run_turn.turn_id.as_str(),
-            None,
-        ) {
+        let child_turn_admission = match child_authorization_context
+            .durable_turn_admission_after_revalidation(
+                task_run_turn.thread_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+                None,
+                &child_authorization_revalidation,
+            ) {
             Ok(admission) => admission,
             Err(error) => {
                 processor
@@ -4371,7 +4386,7 @@ async fn ensure_task_run_occurrence_context(
             run.id
         )
     })?;
-    let occurrence_authorization_context = resolve_task_parent_execution_authorization_context(
+    let occurrence_authorization = resolve_task_parent_execution_authorization_context(
         processor,
         &task_response.task,
         &parent,
@@ -4391,7 +4406,7 @@ async fn ensure_task_run_occurrence_context(
         origin,
         permission_profile,
         &occurrence_security_snapshot,
-        &occurrence_authorization_context,
+        &occurrence_authorization.context,
     )
     .await?;
     ensure_task_run_occurrence_anchor(
@@ -5608,11 +5623,16 @@ async fn persist_resolved_task_child_execution_envelope(
     Ok(())
 }
 
+struct RevalidatedTaskExecutionAuthorizationContext {
+    context: crate::authorization::ExecutionAuthorizationContext,
+    revalidation: crate::authorization::RevalidatedExecutionAuthorization,
+}
+
 async fn resolve_task_parent_execution_authorization_context(
     processor: &Arc<MessageProcessor>,
     task: &Task,
     parent: &TaskParentRuntimeContext,
-) -> Result<crate::authorization::ExecutionAuthorizationContext> {
+) -> Result<RevalidatedTaskExecutionAuthorizationContext> {
     let admission = processor
         .crud_store
         .get_task_execution_admission(task.id.as_str())
@@ -5643,7 +5663,7 @@ async fn resolve_task_parent_execution_authorization_context(
         .current_revision()
         .await
         .context("failed to load current authorization generation")?;
-    processor
+    let revalidation = processor
         .execution_leases
         .revalidate_context(
             processor.crud_store.as_ref(),
@@ -5656,7 +5676,10 @@ async fn resolve_task_parent_execution_authorization_context(
     context
         .verify_current_provider_authority(processor.provider_registry().as_ref())
         .context("Task provider authority changed after admission")?;
-    Ok(context)
+    Ok(RevalidatedTaskExecutionAuthorizationContext {
+        context,
+        revalidation,
+    })
 }
 
 async fn resolve_task_child_execution_authorization_context(
@@ -5668,7 +5691,7 @@ async fn resolve_task_child_execution_authorization_context(
     execution_backend: Option<&AgentExecutionBackend>,
     capabilities: &[pioneer_protocol::TurnCapability],
     permission_profile: &TurnPermissionProfileSnapshot,
-) -> Result<crate::authorization::ExecutionAuthorizationContext> {
+) -> Result<RevalidatedTaskExecutionAuthorizationContext> {
     let provider_authority_fingerprint = match execution_backend {
         Some(AgentExecutionBackend::CLIAgentRuntime { .. })
         | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => None,
@@ -5680,16 +5703,20 @@ async fn resolve_task_child_execution_authorization_context(
                 .to_owned(),
         ),
     };
-    resolve_task_parent_execution_authorization_context(processor, task, parent)
-        .await?
-        .derive_continuation(
-            provider,
-            model,
-            execution_backend,
-            capabilities,
-            permission_profile,
-            provider_authority_fingerprint.as_deref(),
-        )
+    let parent_authorization =
+        resolve_task_parent_execution_authorization_context(processor, task, parent).await?;
+    let context = parent_authorization.context.derive_continuation(
+        provider,
+        model,
+        execution_backend,
+        capabilities,
+        permission_profile,
+        provider_authority_fingerprint.as_deref(),
+    )?;
+    Ok(RevalidatedTaskExecutionAuthorizationContext {
+        context,
+        revalidation: parent_authorization.revalidation,
+    })
 }
 
 async fn revalidate_existing_task_child_execution_authorization(

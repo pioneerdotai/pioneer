@@ -2177,6 +2177,7 @@ pub enum TurnOrigin {
     ScheduledTask,
     DetachedTask,
     AttachedTask,
+    TaskDelivery,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
