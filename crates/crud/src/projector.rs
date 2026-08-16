@@ -86,6 +86,7 @@ impl TurnProjector {
                     payload.turn_id.as_str(),
                     payload.item.item_id(),
                     payload.item.item_type(),
+                    payload.item.execution_class(),
                     payload_json,
                     turn_item_attempt::AttemptDeadlines {
                         lease_expires_at: None,

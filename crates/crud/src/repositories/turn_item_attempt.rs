@@ -1,17 +1,19 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{turn_item, turn_item_attempt};
 use pioneer_protocol::{
-    TurnItem, TurnItemAttemptStatus, TurnItemTimeoutReason, TurnItemType, generate_id,
+    TurnItem, TurnItemAttemptStatus, TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType,
+    generate_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, Order, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, JoinType, Order,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 use crate::convention::{
     ATTEMPT_STATUS_TIMED_OUT, TURN_ITEM_STATUS_TIMED_OUT, turn_item_attempt_status_to_db,
+    turn_item_execution_class_from_db, turn_item_execution_class_to_db,
     turn_item_timeout_reason_from_db, turn_item_timeout_reason_to_db, turn_item_type_from_db,
     turn_item_type_to_db,
 };
@@ -32,6 +34,7 @@ pub struct RunningAttemptSnapshot {
     pub turn_id: String,
     pub item_id: String,
     pub item_type: TurnItemType,
+    pub execution_class: Option<TurnItemExecutionClass>,
     pub attempt_number: i64,
     pub started_at: DateTimeWithTimeZone,
     pub started_event_sequence: Option<i64>,
@@ -47,6 +50,7 @@ pub struct TimedOutAttemptSnapshot {
     pub turn_id: String,
     pub item_id: String,
     pub item_type: TurnItemType,
+    pub execution_class: TurnItemExecutionClass,
     pub attempt_number: i64,
     pub timeout_reason: TurnItemTimeoutReason,
     pub started_at: DateTimeWithTimeZone,
@@ -57,11 +61,22 @@ pub struct TimedOutAttemptSnapshot {
     pub hard_deadline_at: Option<DateTimeWithTimeZone>,
 }
 
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct UnclassifiedAttemptExecutionCandidate {
+    pub attempt_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: String,
+    pub item_payload: String,
+    pub started_at: DateTimeWithTimeZone,
+}
+
 pub async fn create_running_attempt<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     item_id: &str,
     item_type: TurnItemType,
+    execution_class: TurnItemExecutionClass,
     payload_json: String,
     deadlines: AttemptDeadlines,
     started_at: DateTimeWithTimeZone,
@@ -78,6 +93,9 @@ pub async fn create_running_attempt<C: ConnectionTrait>(
         turn_id: Set(turn_id.to_owned()),
         item_id: Set(item_id.to_owned()),
         item_type: Set(item_type_db),
+        execution_class: Set(Some(
+            turn_item_execution_class_to_db(execution_class).to_owned(),
+        )),
         attempt_number: Set(next_attempt_number),
         status: Set(status.clone()),
         timeout_reason: Set(None),
@@ -345,6 +363,9 @@ pub async fn list_expired_running_attempts<C: ConnectionTrait>(
     let running = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
     let rows = turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::Status.eq(running))
+        // Legacy attempts remain non-destructive until the background data
+        // migration has assigned their authoritative execution class.
+        .filter(turn_item_attempt::Column::ExecutionClass.is_not_null())
         .filter(
             Expr::col(turn_item_attempt::Column::HardDeadlineAt)
                 .lte(now)
@@ -357,23 +378,7 @@ pub async fn list_expired_running_attempts<C: ConnectionTrait>(
         .await
         .context("failed to query expired running attempts")?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| RunningAttemptSnapshot {
-            id: row.id,
-            turn_id: row.turn_id,
-            item_id: row.item_id,
-            item_type: turn_item_type_from_db(row.item_type.as_str())
-                .unwrap_or(TurnItemType::DynamicToolCall),
-            attempt_number: row.attempt_number,
-            started_at: row.started_at,
-            started_event_sequence: row.started_event_sequence,
-            last_heartbeat_at: row.last_heartbeat_at,
-            lease_expires_at: row.lease_expires_at,
-            idle_deadline_at: row.idle_deadline_at,
-            hard_deadline_at: row.hard_deadline_at,
-        })
-        .collect())
+    rows.into_iter().map(running_snapshot_from_model).collect()
 }
 
 pub async fn transition_running_attempt_to_timed_out<C: ConnectionTrait>(
@@ -466,23 +471,7 @@ pub async fn list_running_attempts_for_turn<C: ConnectionTrait>(
         .await
         .context("failed to list running attempts for turn")?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| RunningAttemptSnapshot {
-            id: row.id,
-            turn_id: row.turn_id,
-            item_id: row.item_id,
-            item_type: turn_item_type_from_db(row.item_type.as_str())
-                .unwrap_or(TurnItemType::DynamicToolCall),
-            attempt_number: row.attempt_number,
-            started_at: row.started_at,
-            started_event_sequence: row.started_event_sequence,
-            last_heartbeat_at: row.last_heartbeat_at,
-            lease_expires_at: row.lease_expires_at,
-            idle_deadline_at: row.idle_deadline_at,
-            hard_deadline_at: row.hard_deadline_at,
-        })
-        .collect())
+    rows.into_iter().map(running_snapshot_from_model).collect()
 }
 
 pub async fn list_running_attempts_by_item_type<C: ConnectionTrait>(
@@ -500,23 +489,18 @@ pub async fn list_running_attempts_by_item_type<C: ConnectionTrait>(
         .await
         .context("failed to list running attempts by item type")?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| RunningAttemptSnapshot {
-            id: row.id,
-            turn_id: row.turn_id,
-            item_id: row.item_id,
-            item_type: turn_item_type_from_db(row.item_type.as_str())
-                .unwrap_or(TurnItemType::DynamicToolCall),
-            attempt_number: row.attempt_number,
-            started_at: row.started_at,
-            started_event_sequence: row.started_event_sequence,
-            last_heartbeat_at: row.last_heartbeat_at,
-            lease_expires_at: row.lease_expires_at,
-            idle_deadline_at: row.idle_deadline_at,
-            hard_deadline_at: row.hard_deadline_at,
-        })
-        .collect())
+    rows.into_iter().map(running_snapshot_from_model).collect()
+}
+
+pub async fn find_latest_running_attempt<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<Option<RunningAttemptSnapshot>> {
+    latest_running_attempt(db, turn_id, item_id)
+        .await?
+        .map(running_snapshot_from_model)
+        .transpose()
 }
 
 pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
@@ -526,6 +510,7 @@ pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
     let timed_out_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::TimedOut);
     let rows = turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::Status.eq(timed_out_status))
+        .filter(turn_item_attempt::Column::ExecutionClass.is_not_null())
         .filter(turn_item_attempt::Column::RecoveryAction.is_null())
         .filter(turn_item_attempt::Column::RecoverySuppressedReason.is_null())
         .order_by_asc(turn_item_attempt::Column::UpdatedAt)
@@ -534,28 +519,153 @@ pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
         .await
         .context("failed to query timed_out attempts without recovery")?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| TimedOutAttemptSnapshot {
-            id: row.id,
-            turn_id: row.turn_id,
-            item_id: row.item_id,
-            item_type: turn_item_type_from_db(row.item_type.as_str())
-                .unwrap_or(TurnItemType::DynamicToolCall),
-            attempt_number: row.attempt_number,
-            timeout_reason: row
-                .timeout_reason
+    rows.into_iter()
+        .map(|row| -> Result<TimedOutAttemptSnapshot> {
+            let execution_class = row
+                .execution_class
                 .as_deref()
-                .and_then(turn_item_timeout_reason_from_db)
-                .unwrap_or(TurnItemTimeoutReason::HardDeadlineExceeded),
-            started_at: row.started_at,
-            started_event_sequence: row.started_event_sequence,
-            last_heartbeat_at: row.last_heartbeat_at,
-            lease_expires_at: row.lease_expires_at,
-            idle_deadline_at: row.idle_deadline_at,
-            hard_deadline_at: row.hard_deadline_at,
+                .and_then(turn_item_execution_class_from_db)
+                .with_context(|| format!("attempt `{}` has an invalid execution class", row.id))?;
+            Ok(TimedOutAttemptSnapshot {
+                id: row.id,
+                turn_id: row.turn_id,
+                item_id: row.item_id,
+                item_type: turn_item_type_from_db(row.item_type.as_str())
+                    .unwrap_or(TurnItemType::DynamicToolCall),
+                execution_class,
+                attempt_number: row.attempt_number,
+                timeout_reason: row
+                    .timeout_reason
+                    .as_deref()
+                    .and_then(turn_item_timeout_reason_from_db)
+                    .unwrap_or(TurnItemTimeoutReason::HardDeadlineExceeded),
+                started_at: row.started_at,
+                started_event_sequence: row.started_event_sequence,
+                last_heartbeat_at: row.last_heartbeat_at,
+                lease_expires_at: row.lease_expires_at,
+                idle_deadline_at: row.idle_deadline_at,
+                hard_deadline_at: row.hard_deadline_at,
+            })
         })
-        .collect())
+        .collect()
+}
+
+pub async fn list_unclassified_execution_attempts<C: ConnectionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<Vec<UnclassifiedAttemptExecutionCandidate>> {
+    turn_item_attempt::Entity::find()
+        .select_only()
+        .column_as(turn_item_attempt::Column::Id, "attempt_id")
+        .column(turn_item_attempt::Column::TurnId)
+        .column(turn_item_attempt::Column::ItemId)
+        .column(turn_item_attempt::Column::ItemType)
+        .column_as(turn_item::Column::Payload, "item_payload")
+        .column(turn_item_attempt::Column::StartedAt)
+        .join(
+            JoinType::InnerJoin,
+            turn_item_attempt::Entity::belongs_to(turn_item::Entity)
+                .from((
+                    turn_item_attempt::Column::TurnId,
+                    turn_item_attempt::Column::ItemId,
+                ))
+                .to((turn_item::Column::TurnId, turn_item::Column::ItemId))
+                .into(),
+        )
+        .filter(turn_item_attempt::Column::ExecutionClass.is_null())
+        .order_by_asc(turn_item_attempt::Column::Id)
+        .limit(std::cmp::max(limit, 1))
+        .into_model::<UnclassifiedAttemptExecutionCandidate>()
+        .all(db)
+        .await
+        .context("failed to list attempts missing an execution class")
+}
+
+pub async fn classify_execution_attempt<C: ConnectionTrait>(
+    db: &C,
+    candidate: &UnclassifiedAttemptExecutionCandidate,
+    execution_class: TurnItemExecutionClass,
+    context_compaction_deadlines: Option<AttemptDeadlines>,
+) -> Result<bool> {
+    let mut update = turn_item_attempt::Entity::update_many().col_expr(
+        turn_item_attempt::Column::ExecutionClass,
+        Expr::value(Some(
+            turn_item_execution_class_to_db(execution_class).to_owned(),
+        )),
+    );
+    if let Some(deadlines) = &context_compaction_deadlines {
+        update = update
+            .col_expr(
+                turn_item_attempt::Column::LeaseExpiresAt,
+                Expr::value(deadlines.lease_expires_at),
+            )
+            .col_expr(
+                turn_item_attempt::Column::IdleDeadlineAt,
+                Expr::value(deadlines.idle_deadline_at),
+            )
+            .col_expr(
+                turn_item_attempt::Column::HardDeadlineAt,
+                Expr::value(deadlines.hard_deadline_at),
+            );
+    }
+    let changed = update
+        .filter(turn_item_attempt::Column::Id.eq(candidate.attempt_id.clone()))
+        .filter(turn_item_attempt::Column::ExecutionClass.is_null())
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to classify execution for attempt `{}`",
+                candidate.attempt_id
+            )
+        })?
+        .rows_affected
+        > 0;
+
+    if changed && let Some(deadlines) = context_compaction_deadlines {
+        turn_item::Entity::update_many()
+            .col_expr(
+                turn_item::Column::LeaseExpiresAt,
+                Expr::value(deadlines.lease_expires_at),
+            )
+            .filter(turn_item::Column::TurnId.eq(candidate.turn_id.clone()))
+            .filter(turn_item::Column::ItemId.eq(candidate.item_id.clone()))
+            .filter(turn_item::Column::ActiveAttemptId.eq(candidate.attempt_id.clone()))
+            .exec(db)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to synchronize context compaction item `{}` deadline",
+                    candidate.item_id
+                )
+            })?;
+    }
+
+    Ok(changed)
+}
+
+fn running_snapshot_from_model(row: turn_item_attempt::Model) -> Result<RunningAttemptSnapshot> {
+    let execution_class = match row.execution_class.as_deref() {
+        Some(value) => Some(turn_item_execution_class_from_db(value).with_context(|| {
+            format!("attempt `{}` has unknown execution class `{value}`", row.id)
+        })?),
+        None => None,
+    };
+    Ok(RunningAttemptSnapshot {
+        id: row.id,
+        turn_id: row.turn_id,
+        item_id: row.item_id,
+        item_type: turn_item_type_from_db(row.item_type.as_str())
+            .unwrap_or(TurnItemType::DynamicToolCall),
+        execution_class,
+        attempt_number: row.attempt_number,
+        started_at: row.started_at,
+        started_event_sequence: row.started_event_sequence,
+        last_heartbeat_at: row.last_heartbeat_at,
+        lease_expires_at: row.lease_expires_at,
+        idle_deadline_at: row.idle_deadline_at,
+        hard_deadline_at: row.hard_deadline_at,
+    })
 }
 
 pub async fn suppress_timeout_recovery<C: ConnectionTrait>(

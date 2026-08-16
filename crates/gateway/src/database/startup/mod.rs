@@ -9,10 +9,13 @@ pub(crate) mod thread_episodic_workspace_capsule_refill;
 mod timeline_pagination_backfill;
 mod turn_event_projection_stream_state_backfill;
 mod turn_item_attempt_payload_compaction;
+mod turn_item_execution_class_backfill;
 mod turn_permission_profile_backfill;
 mod zstd_payload_compression;
 
-use pioneer_config::GatewayThreadEpisodicVectorSearchConfig;
+use pioneer_config::{
+    GatewayContextCompactionTimeoutConfig, GatewayThreadEpisodicVectorSearchConfig,
+};
 use pioneer_crud::CrudStore;
 use pioneer_provider::ProviderRegistry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -144,9 +147,15 @@ pub(crate) fn spawn(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
+    context_compaction_timeout_config: GatewayContextCompactionTimeoutConfig,
 ) {
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let _handle = tokio::spawn(async move {
+        turn_item_execution_class_backfill::run(
+            crud_store.as_ref(),
+            context_compaction_timeout_config,
+        )
+        .await;
         turn_event_projection_stream_state_backfill::run(crud_store.as_ref()).await;
         task_event_fanout_cursor_backfill::run(crud_store.as_ref()).await;
         authorization_legacy_backfill::run(crud_store.as_ref()).await;

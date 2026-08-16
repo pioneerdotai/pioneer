@@ -49,6 +49,7 @@ mod m20260810_000001_immutable_principal_avatar_revisions;
 mod m20260813_000001_authorization_governance;
 mod m20260815_000001_task_delivery_thread_targets;
 mod m20260815_000002_turn_event_projection_stream_state;
+mod m20260815_000003_turn_item_execution_class;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -99,6 +100,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000001_authorization_governance::Migration),
             Box::new(m20260815_000001_task_delivery_thread_targets::Migration),
             Box::new(m20260815_000002_turn_event_projection_stream_state::Migration),
+            Box::new(m20260815_000003_turn_item_execution_class::Migration),
         ]
     }
 }

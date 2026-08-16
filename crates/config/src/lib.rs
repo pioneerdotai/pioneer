@@ -332,6 +332,73 @@ pub struct GatewayResilienceConfig {
     pub command_execution: GatewayCommandExecutionTimeoutConfig,
     #[serde(default)]
     pub provider_stream_items: GatewayProviderStreamItemTimeoutConfig,
+    #[serde(default)]
+    pub context_compaction: GatewayContextCompactionTimeoutConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GatewayContextCompactionTimeoutConfig {
+    pub lease_secs: u64,
+    pub idle_secs: u64,
+    pub hard_secs: u64,
+    pub recovery_grace_secs: u64,
+}
+
+impl Default for GatewayContextCompactionTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            lease_secs: default_context_compaction_lease_timeout_secs(),
+            idle_secs: default_context_compaction_idle_timeout_secs(),
+            hard_secs: default_context_compaction_hard_timeout_secs(),
+            recovery_grace_secs: default_context_compaction_recovery_grace_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct GatewayContextCompactionTimeoutConfigWire {
+    #[serde(default = "default_context_compaction_lease_timeout_secs")]
+    lease_secs: u64,
+    #[serde(default = "default_context_compaction_idle_timeout_secs")]
+    idle_secs: u64,
+    #[serde(default = "default_context_compaction_hard_timeout_secs")]
+    hard_secs: u64,
+    #[serde(default = "default_context_compaction_recovery_grace_secs")]
+    recovery_grace_secs: u64,
+}
+
+impl<'de> Deserialize<'de> for GatewayContextCompactionTimeoutConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GatewayContextCompactionTimeoutConfigWire::deserialize(deserializer)?;
+        if wire.lease_secs == 0
+            || wire.idle_secs == 0
+            || wire.hard_secs == 0
+            || wire.recovery_grace_secs == 0
+        {
+            return Err(serde::de::Error::custom(
+                "context compaction timeout values must be greater than zero",
+            ));
+        }
+        if wire.lease_secs > wire.hard_secs || wire.idle_secs > wire.hard_secs {
+            return Err(serde::de::Error::custom(
+                "context compaction lease and idle deadlines must not exceed the hard deadline",
+            ));
+        }
+        if wire.recovery_grace_secs > wire.hard_secs {
+            return Err(serde::de::Error::custom(
+                "context compaction recovery grace must not exceed the hard deadline",
+            ));
+        }
+        Ok(Self {
+            lease_secs: wire.lease_secs,
+            idle_secs: wire.idle_secs,
+            hard_secs: wire.hard_secs,
+            recovery_grace_secs: wire.recovery_grace_secs,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2252,6 +2319,22 @@ const fn default_command_execution_recovery_max_wall_clock_secs() -> u64 {
     60 * 60
 }
 
+const fn default_context_compaction_lease_timeout_secs() -> u64 {
+    10 * 60
+}
+
+const fn default_context_compaction_idle_timeout_secs() -> u64 {
+    30 * 60
+}
+
+const fn default_context_compaction_hard_timeout_secs() -> u64 {
+    4 * 60 * 60
+}
+
+const fn default_context_compaction_recovery_grace_secs() -> u64 {
+    15 * 60
+}
+
 const fn default_provider_stream_item_lease_timeout_secs() -> u64 {
     16 * 60
 }
@@ -3781,6 +3864,57 @@ hard_secs = 0
         assert_eq!(config.provider_stream_items.lease_secs, 960);
         assert_eq!(config.provider_stream_items.idle_secs, 900);
         assert_eq!(config.provider_stream_items.hard_secs, 1_800);
+    }
+
+    #[test]
+    fn gateway_resilience_config_preserves_valid_context_compaction_policy() {
+        let config = toml::from_str::<GatewayResilienceConfig>(
+            r#"
+[context_compaction]
+lease_secs = 120
+idle_secs = 300
+hard_secs = 1800
+recovery_grace_secs = 600
+"#,
+        )
+        .expect("valid context compaction policy should deserialize");
+
+        assert_eq!(config.context_compaction.lease_secs, 120);
+        assert_eq!(config.context_compaction.idle_secs, 300);
+        assert_eq!(config.context_compaction.hard_secs, 1_800);
+        assert_eq!(config.context_compaction.recovery_grace_secs, 600);
+    }
+
+    #[test]
+    fn gateway_resilience_config_rejects_unbounded_context_compaction_policy() {
+        for invalid in [
+            r#"
+[context_compaction]
+lease_secs = 0
+idle_secs = 300
+hard_secs = 1800
+recovery_grace_secs = 600
+"#,
+            r#"
+[context_compaction]
+lease_secs = 120
+idle_secs = 300
+hard_secs = 100
+recovery_grace_secs = 60
+"#,
+            r#"
+[context_compaction]
+lease_secs = 120
+idle_secs = 300
+hard_secs = 1800
+recovery_grace_secs = 1801
+"#,
+        ] {
+            assert!(
+                toml::from_str::<GatewayResilienceConfig>(invalid).is_err(),
+                "invalid context compaction policy must fail closed: {invalid}"
+            );
+        }
     }
 
     #[test]

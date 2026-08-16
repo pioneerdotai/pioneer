@@ -1,15 +1,14 @@
 use anyhow::Result;
 use pioneer_config::{
-    GatewayCommandExecutionTimeoutConfig, GatewayProviderStreamItemTimeoutConfig,
+    GatewayCommandExecutionTimeoutConfig, GatewayContextCompactionTimeoutConfig,
+    GatewayProviderStreamItemTimeoutConfig,
 };
 use pioneer_crud::{CrudStore, TimeoutCandidate, TurnItemAttemptDeadlines, TurnLivenessRecord};
-use pioneer_protocol::{TurnItem, TurnItemTimeoutReason, TurnItemType};
+use pioneer_protocol::{TurnItem, TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType};
 use pioneer_provider::ProviderTimeoutPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const CLI_CONTEXT_COMPACTION_TIMEOUT_SECS: u64 = 5 * 60;
-const CLI_CONTEXT_COMPACTION_HARD_TIMEOUT_SECS: u64 = 10 * 60;
 pub const TIMEOUT_RECOVERY_SUPPRESSED_TURN_PROGRESS: &str = "turn_progressed_after_item_frontier";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +69,8 @@ impl From<GatewayProviderStreamItemTimeoutConfig> for TimeoutPolicy {
 #[derive(Debug, Clone)]
 pub struct TimeoutPolicyRegistry {
     by_item_type: HashMap<TurnItemType, TimeoutPolicy>,
+    context_compaction: TimeoutPolicy,
+    context_compaction_recovery_grace_secs: u64,
 }
 
 impl Default for TimeoutPolicyRegistry {
@@ -144,7 +145,16 @@ impl Default for TimeoutPolicyRegistry {
                 hard_secs: 5 * 60,
             },
         );
-        Self { by_item_type }
+        let context_compaction_config = GatewayContextCompactionTimeoutConfig::default();
+        Self {
+            by_item_type,
+            context_compaction: TimeoutPolicy {
+                lease_secs: context_compaction_config.lease_secs,
+                idle_secs: context_compaction_config.idle_secs,
+                hard_secs: context_compaction_config.hard_secs,
+            },
+            context_compaction_recovery_grace_secs: context_compaction_config.recovery_grace_secs,
+        }
     }
 }
 
@@ -158,10 +168,25 @@ impl TimeoutPolicyRegistry {
         )
     }
 
+    #[cfg(test)]
     pub fn with_provider_and_command_execution_timeout_policy(
         _provider_policy: ProviderTimeoutPolicy,
         command_execution_config: GatewayCommandExecutionTimeoutConfig,
         provider_stream_item_config: GatewayProviderStreamItemTimeoutConfig,
+    ) -> Self {
+        Self::with_configured_timeout_policies(
+            _provider_policy,
+            command_execution_config,
+            provider_stream_item_config,
+            GatewayContextCompactionTimeoutConfig::default(),
+        )
+    }
+
+    pub fn with_configured_timeout_policies(
+        _provider_policy: ProviderTimeoutPolicy,
+        command_execution_config: GatewayCommandExecutionTimeoutConfig,
+        provider_stream_item_config: GatewayProviderStreamItemTimeoutConfig,
+        context_compaction_config: GatewayContextCompactionTimeoutConfig,
     ) -> Self {
         use TurnItemType::{AgentMessage, Reasoning};
 
@@ -174,6 +199,13 @@ impl TimeoutPolicyRegistry {
 
         registry.by_item_type.insert(AgentMessage, timeout_policy);
         registry.by_item_type.insert(Reasoning, timeout_policy);
+        registry.context_compaction = TimeoutPolicy {
+            lease_secs: context_compaction_config.lease_secs,
+            idle_secs: context_compaction_config.idle_secs,
+            hard_secs: context_compaction_config.hard_secs,
+        };
+        registry.context_compaction_recovery_grace_secs =
+            context_compaction_config.recovery_grace_secs;
         registry
     }
 
@@ -189,15 +221,27 @@ impl TimeoutPolicyRegistry {
     }
 
     pub fn policy_for_item(&self, item: &TurnItem) -> TimeoutPolicy {
-        if is_cli_native_context_compaction_item(item) {
-            return TimeoutPolicy {
-                lease_secs: CLI_CONTEXT_COMPACTION_TIMEOUT_SECS,
-                idle_secs: CLI_CONTEXT_COMPACTION_TIMEOUT_SECS,
-                hard_secs: CLI_CONTEXT_COMPACTION_HARD_TIMEOUT_SECS,
-            };
-        }
+        self.policy_for_execution_class(item.execution_class(), item.item_type())
+    }
 
-        self.policy_for(item.item_type())
+    pub fn policy_for_execution_class(
+        &self,
+        execution_class: TurnItemExecutionClass,
+        item_type: TurnItemType,
+    ) -> TimeoutPolicy {
+        match execution_class {
+            TurnItemExecutionClass::Standard => self.policy_for(item_type),
+            TurnItemExecutionClass::ContextCompaction => self.context_compaction,
+        }
+    }
+
+    pub fn recovery_grace_secs(&self, execution_class: TurnItemExecutionClass) -> Option<u64> {
+        match execution_class {
+            TurnItemExecutionClass::Standard => None,
+            TurnItemExecutionClass::ContextCompaction => {
+                Some(self.context_compaction_recovery_grace_secs)
+            }
+        }
     }
 }
 
@@ -446,14 +490,15 @@ impl TimeoutSupervisor {
                 continue;
             }
 
-            let deadlines = self
-                .deadlines_for_stored_item(
-                    attempt.turn_id.as_str(),
-                    attempt.item_id.as_str(),
-                    attempt.item_type,
-                    now_unix,
-                )
-                .await?;
+            let policy = self
+                .policy_registry
+                .policy_for_execution_class(attempt.execution_class, attempt.item_type);
+            let (lease_expires_at, idle_deadline_at, _) = policy.deadlines(now_unix);
+            let deadlines = TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(lease_expires_at),
+                idle_deadline_at_unix: Some(idle_deadline_at),
+                hard_deadline_at_unix: None,
+            };
             // heartbeat_turn_item_attempt updates only lease/idle fields.  The
             // hard deadline remains the immutable deadline assigned at attempt
             // creation and therefore cannot be extended by a stuck actor.
@@ -482,8 +527,14 @@ impl TimeoutSupervisor {
         fallback_item_type: TurnItemType,
         started_at_unix: i64,
     ) -> Result<TurnItemAttemptDeadlines> {
-        let policy = match self.crud_store.get_turn_item(turn_id, item_id).await? {
-            Some(item) => self.policy_registry.policy_for_item(&item),
+        let policy = match self
+            .crud_store
+            .get_running_turn_item_attempt(turn_id, item_id)
+            .await?
+        {
+            Some(attempt) => self
+                .policy_registry
+                .policy_for_execution_class(attempt.execution_class, attempt.item_type),
             None => self.policy_registry.policy_for(fallback_item_type),
         };
         let (lease_expires_at, idle_deadline_at, hard_deadline_at) =
@@ -494,22 +545,11 @@ impl TimeoutSupervisor {
             hard_deadline_at_unix: Some(hard_deadline_at),
         })
     }
-}
 
-fn is_cli_native_context_compaction_item(item: &TurnItem) -> bool {
-    let TurnItem::SystemEvent { code, details, .. } = item else {
-        return false;
-    };
-
-    if code.as_deref() != Some("agent_context_compaction") {
-        return false;
+    pub fn recovery_grace_secs_for_candidate(&self, candidate: &TimeoutCandidate) -> Option<u64> {
+        self.policy_registry
+            .recovery_grace_secs(candidate.execution_class)
     }
-
-    details
-        .as_ref()
-        .and_then(|details| details.get("nativeItemKind"))
-        .and_then(|value| value.as_str())
-        == Some("contextCompaction")
 }
 
 fn saturating_add_secs(base: i64, seconds: u64) -> i64 {
@@ -527,6 +567,7 @@ mod tests {
             turn_id: "turn_1".to_owned(),
             item_id: "reasoning_1".to_owned(),
             item_type: TurnItemType::Reasoning,
+            execution_class: TurnItemExecutionClass::Standard,
             attempt_number: 1,
             timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
             started_at_unix: 1_000,
@@ -617,8 +658,18 @@ mod tests {
     }
 
     #[test]
-    fn cli_native_context_compaction_uses_extended_timeout() {
-        let registry = TimeoutPolicyRegistry::default();
+    fn context_compaction_uses_its_configured_finite_policy_and_recovery_grace() {
+        let registry = TimeoutPolicyRegistry::with_configured_timeout_policies(
+            ProviderTimeoutPolicy::from_secs(5, 30, 45, 120, Some(900)),
+            GatewayCommandExecutionTimeoutConfig::default(),
+            GatewayProviderStreamItemTimeoutConfig::default(),
+            GatewayContextCompactionTimeoutConfig {
+                lease_secs: 120,
+                idle_secs: 300,
+                hard_secs: 1_800,
+                recovery_grace_secs: 600,
+            },
+        );
         let item = TurnItem::SystemEvent {
             id: "context-compaction".to_owned(),
             level: SystemEventLevel::Info,
@@ -633,9 +684,17 @@ mod tests {
         let policy = registry.policy_for_item(&item);
         let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(1_000);
 
-        assert_eq!(lease_expires_at, 1_300);
+        assert_eq!(
+            item.execution_class(),
+            TurnItemExecutionClass::ContextCompaction
+        );
+        assert_eq!(lease_expires_at, 1_120);
         assert_eq!(idle_deadline_at, 1_300);
-        assert_eq!(hard_deadline_at, 1_600);
+        assert_eq!(hard_deadline_at, 2_800);
+        assert_eq!(
+            registry.recovery_grace_secs(item.execution_class()),
+            Some(600)
+        );
     }
 
     #[test]
@@ -655,6 +714,8 @@ mod tests {
         assert_eq!(lease_expires_at, 1_030);
         assert_eq!(idle_deadline_at, 1_030);
         assert_eq!(hard_deadline_at, 1_120);
+        assert_eq!(item.execution_class(), TurnItemExecutionClass::Standard);
+        assert_eq!(registry.recovery_grace_secs(item.execution_class()), None);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub struct Model {
     #[sea_orm(unique_key = "uq_turn_item_attempt_turn_item_attempt_number")]
     pub item_id: String,
     pub item_type: String,
+    pub execution_class: Option<String>,
     #[sea_orm(unique_key = "uq_turn_item_attempt_turn_item_attempt_number")]
     pub attempt_number: i64,
     pub status: String,

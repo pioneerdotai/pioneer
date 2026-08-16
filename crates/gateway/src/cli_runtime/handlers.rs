@@ -6142,6 +6142,7 @@ impl MessageProcessor {
                     TurnFailureRecoveryKind::ObservationGap,
                     reason,
                     None,
+                    None,
                 )
                 .await?;
                 return Ok(());

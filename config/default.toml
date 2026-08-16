@@ -68,6 +68,12 @@ lease_secs = 960
 idle_secs = 900
 hard_secs = 1800
 
+[gateway.resilience.context_compaction]
+lease_secs = 600
+idle_secs = 1800
+hard_secs = 14400
+recovery_grace_secs = 900
+
 [gateway.tasks.review]
 enabled = true
 allow_task_create_review_policy = false

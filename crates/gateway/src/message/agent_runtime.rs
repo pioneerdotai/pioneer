@@ -3253,6 +3253,24 @@ impl MessageProcessor {
         kind: TurnFailureRecoveryKind,
         error_message: String,
     ) -> bool {
+        self.report_turn_failure_with_max_wall_clock(
+            thread_id,
+            turn_id,
+            kind,
+            error_message,
+            crate::resilience::TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
+        )
+        .await
+    }
+
+    async fn report_turn_failure_with_max_wall_clock(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        kind: TurnFailureRecoveryKind,
+        error_message: String,
+        max_wall_clock_secs: u64,
+    ) -> bool {
         let turn_state = match self
             .crud_store
             .get_turn(thread_id.as_str(), turn_id.as_str())
@@ -3293,7 +3311,7 @@ impl MessageProcessor {
             reason: error_message.clone(),
             base_backoff_secs: 2,
             max_attempts: 3,
-            max_wall_clock_secs: crate::resilience::TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
+            max_wall_clock_secs,
             no_progress_limit: 3,
             metadata: pioneer_protocol::ToolMetadata::from_json(serde_json::json!({
                 "thread_id": thread_id,
@@ -3356,6 +3374,7 @@ impl MessageProcessor {
         kind: TurnFailureRecoveryKind,
         reason: String,
         source_attempt_id: Option<&str>,
+        recovery_grace_secs: Option<u64>,
     ) -> Result<()> {
         let mut open_jobs = self
             .crud_store
@@ -3368,7 +3387,14 @@ impl MessageProcessor {
                 bail!("Turn `{turn_id}` disappeared before observation recovery could be opened");
             };
             let _ = self
-                .report_turn_failure(thread_id, turn_id.to_owned(), kind, reason)
+                .report_turn_failure_with_max_wall_clock(
+                    thread_id,
+                    turn_id.to_owned(),
+                    kind,
+                    reason,
+                    recovery_grace_secs
+                        .unwrap_or(crate::resilience::TURN_RECOVERY_MAX_WALL_CLOCK_SECS),
+                )
                 .await;
             open_jobs = self
                 .crud_store
@@ -3893,6 +3919,8 @@ impl MessageProcessor {
                         recovery_kind,
                         reason,
                         Some(candidate.attempt_id.as_str()),
+                        self.timeout_supervisor
+                            .recovery_grace_secs_for_candidate(&candidate),
                     )
                     .await?;
                     continue;

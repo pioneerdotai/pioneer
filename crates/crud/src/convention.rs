@@ -13,7 +13,7 @@ use pioneer_protocol::{
     TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskTriggerKind,
     TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
     ThreadSidebarVisibility, ThreadStatus, TurnAuthorSnapshot, TurnItem, TurnItemAttemptStatus,
-    TurnItemTimeoutReason, TurnItemType, TurnMention, TurnPermissionMode,
+    TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType, TurnMention, TurnPermissionMode,
     TurnPermissionProfileSource, TurnStatus, UserInput,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -1064,6 +1064,21 @@ pub fn turn_item_type_from_db(value: &str) -> Option<TurnItemType> {
         "web_fetch" => Some(TurnItemType::WebFetch),
         "download" => Some(TurnItemType::Download),
         "dynamic_tool_call" => Some(TurnItemType::DynamicToolCall),
+        _ => None,
+    }
+}
+
+pub fn turn_item_execution_class_to_db(execution_class: TurnItemExecutionClass) -> &'static str {
+    match execution_class {
+        TurnItemExecutionClass::Standard => "standard",
+        TurnItemExecutionClass::ContextCompaction => "context_compaction",
+    }
+}
+
+pub fn turn_item_execution_class_from_db(value: &str) -> Option<TurnItemExecutionClass> {
+    match value {
+        "standard" => Some(TurnItemExecutionClass::Standard),
+        "context_compaction" => Some(TurnItemExecutionClass::ContextCompaction),
         _ => None,
     }
 }

@@ -3041,6 +3041,19 @@ pub enum TurnItemType {
     DynamicToolCall,
 }
 
+/// Operational execution semantics persisted with a turn-item attempt.
+///
+/// This is intentionally independent from [`TurnItemType`]: multiple runtime
+/// operations may project to the same presentation item while requiring
+/// different supervision policies.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnItemExecutionClass {
+    #[default]
+    Standard,
+    ContextCompaction,
+}
+
 impl TurnItemType {
     pub const fn is_tool_item(self) -> bool {
         matches!(
@@ -4173,6 +4186,25 @@ impl TurnItem {
             Self::WebFetch { .. } => TurnItemType::WebFetch,
             Self::Download { .. } => TurnItemType::Download,
             Self::DynamicToolCall { .. } => TurnItemType::DynamicToolCall,
+        }
+    }
+
+    /// Classifies execution once at the canonical item boundary. Supervisors
+    /// consume the class persisted on the attempt and never need to infer
+    /// operational semantics from presentation payloads.
+    pub fn execution_class(&self) -> TurnItemExecutionClass {
+        match self {
+            Self::SystemEvent { code, details, .. }
+                if code.as_deref() == Some("agent_context_compaction")
+                    && details
+                        .as_ref()
+                        .and_then(|details| details.get("nativeItemKind"))
+                        .and_then(JsonValue::as_str)
+                        == Some("contextCompaction") =>
+            {
+                TurnItemExecutionClass::ContextCompaction
+            }
+            _ => TurnItemExecutionClass::Standard,
         }
     }
 

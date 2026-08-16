@@ -4952,6 +4952,7 @@ mod tests {
             turn_id: turn_id.to_owned(),
             item_id: item_id.to_owned(),
             item_type,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             attempt_number: 1,
             timeout_reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
             started_at_unix: 1_700_000_000,

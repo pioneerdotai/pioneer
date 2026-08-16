@@ -67,7 +67,8 @@ use pioneer_crud::{
 };
 use pioneer_entity::{
     thread, thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state,
-    turn_input, turn_item, turn_status_history, turn_work_item_projection, turn_work_projection,
+    turn_input, turn_item, turn_item_attempt, turn_status_history, turn_work_item_projection,
+    turn_work_projection,
 };
 use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookDiagnosticCode,
@@ -7140,6 +7141,19 @@ fn command_execution_item(item_id: &str) -> TurnItem {
         success: None,
         outcome: None,
         observation: None,
+    }
+}
+
+fn context_compaction_item(item_id: &str) -> TurnItem {
+    TurnItem::SystemEvent {
+        id: item_id.to_owned(),
+        level: pioneer_protocol::SystemEventLevel::Info,
+        message: "Context compaction started".to_owned(),
+        code: Some("agent_context_compaction".to_owned()),
+        details: Some(json!({
+            "nativeItemKind": "contextCompaction",
+            "status": "started"
+        })),
     }
 }
 
@@ -37418,6 +37432,173 @@ async fn unavailable_cli_runtime_observation_defers_soft_timeout_into_recovery()
             .iter()
             .any(|candidate| candidate.item_id == "codex-item-soft-timeout-unavailable")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_context_compaction_uses_common_recovery_with_configured_grace() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::Unavailable);
+    let now = chrono::Utc::now().timestamp();
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id,
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item: context_compaction_item("codex-context-compaction-unavailable"),
+            },
+            now.saturating_sub(120),
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now.saturating_sub(10)),
+                idle_deadline_at_unix: Some(now.saturating_add(30 * 60)),
+                hard_deadline_at_unix: Some(now.saturating_add(4 * 60 * 60)),
+            },
+        )
+        .await
+        .expect("soft-expired context compaction should materialize");
+
+    let timed_out = processor
+        .poll_timeouts_respecting_human_wait(now, 64)
+        .await
+        .expect("timeout poll should survive unavailable compaction observation");
+    assert!(
+        timed_out.is_empty(),
+        "unavailable observation must enter recovery, not terminalize compaction"
+    );
+
+    let jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status("codex-turn-command", RecoveryJobStatus::Pending)
+        .await
+        .expect("observation recovery should load");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].action, RecoveryAction::RehydrateTurnState);
+    assert_eq!(
+        jobs[0].policy_json["max_wall_clock_secs"],
+        json!(15 * 60),
+        "context compaction recovery grace must come from its validated config"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_compaction_renews_soft_deadlines_only_after_confirmed_activity() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let now = chrono::Utc::now().timestamp();
+    let original_hard_deadline = now.saturating_add(4 * 60 * 60);
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id,
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item: context_compaction_item("codex-context-compaction-active"),
+            },
+            now.saturating_sub(120),
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now.saturating_sub(10)),
+                idle_deadline_at_unix: Some(now.saturating_sub(10)),
+                hard_deadline_at_unix: Some(original_hard_deadline),
+            },
+        )
+        .await
+        .expect("context compaction should materialize");
+
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::Unavailable);
+    assert_eq!(
+        processor
+            .renew_active_cli_runtime_turn_deadlines("codex-turn-command", now)
+            .await
+            .expect("unavailable observation should be represented"),
+        crate::resilience::RuntimeTimeoutObservation::Unavailable
+    );
+    let unavailable = turn_item_attempt::Entity::find()
+        .filter(turn_item_attempt::Column::TurnId.eq("codex-turn-command"))
+        .filter(turn_item_attempt::Column::ItemId.eq("codex-context-compaction-active"))
+        .one(&crud_store.database_connection())
+        .await
+        .expect("attempt should query")
+        .expect("attempt should exist");
+    assert_eq!(
+        unavailable.lease_expires_at.map(|value| value.timestamp()),
+        Some(now.saturating_sub(10))
+    );
+    assert_eq!(
+        unavailable.idle_deadline_at.map(|value| value.timestamp()),
+        Some(now.saturating_sub(10))
+    );
+
+    let confirmed_at = now.saturating_add(1);
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
+    assert_eq!(
+        processor
+            .renew_active_cli_runtime_turn_deadlines("codex-turn-command", confirmed_at)
+            .await
+            .expect("confirmed activity should renew context compaction"),
+        crate::resilience::RuntimeTimeoutObservation::Active
+    );
+    let renewed = turn_item_attempt::Entity::find()
+        .filter(turn_item_attempt::Column::TurnId.eq("codex-turn-command"))
+        .filter(turn_item_attempt::Column::ItemId.eq("codex-context-compaction-active"))
+        .one(&crud_store.database_connection())
+        .await
+        .expect("renewed attempt should query")
+        .expect("renewed attempt should exist");
+    assert_eq!(
+        renewed.execution_class.as_deref(),
+        Some("context_compaction")
+    );
+    assert_eq!(
+        renewed.lease_expires_at.map(|value| value.timestamp()),
+        Some(confirmed_at.saturating_add(10 * 60))
+    );
+    assert_eq!(
+        renewed.idle_deadline_at.map(|value| value.timestamp()),
+        Some(confirmed_at.saturating_add(30 * 60))
+    );
+    assert_eq!(
+        renewed.hard_deadline_at.map(|value| value.timestamp()),
+        Some(original_hard_deadline),
+        "confirmed activity must never move the hard deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_context_compaction_observation_does_not_disable_hard_deadline() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    *cli_session.turn_liveness_probe.lock().await =
+        Some(CLIAgentRuntimeTurnLivenessProbe::Unavailable);
+    let now = chrono::Utc::now().timestamp();
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id,
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item: context_compaction_item("codex-context-compaction-hard-timeout"),
+            },
+            now.saturating_sub(4 * 60 * 60),
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(now.saturating_add(30 * 60)),
+                idle_deadline_at_unix: Some(now.saturating_add(30 * 60)),
+                hard_deadline_at_unix: Some(now.saturating_sub(1)),
+            },
+        )
+        .await
+        .expect("hard-expired context compaction should materialize");
+
+    let timed_out = processor
+        .poll_timeouts_respecting_human_wait(now, 64)
+        .await
+        .expect("context compaction hard-deadline timeout poll should succeed");
+    assert!(timed_out.iter().any(|candidate| {
+        candidate.item_id == "codex-context-compaction-hard-timeout"
+            && candidate.timeout_reason == TurnItemTimeoutReason::HardDeadlineExceeded
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

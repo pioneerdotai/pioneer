@@ -71,8 +71,9 @@ use pioneer_artifacts::{
 };
 use pioneer_config::{
     GatewayArtifactsConfig, GatewayCliAgentRuntimeCommandHeartbeatConfig,
-    GatewayCommandExecutionTimeoutConfig, GatewayHookRecoveryConfig,
-    GatewayProviderStreamItemTimeoutConfig, GatewayThreadEpisodicVectorSearchConfig,
+    GatewayCommandExecutionTimeoutConfig, GatewayContextCompactionTimeoutConfig,
+    GatewayHookRecoveryConfig, GatewayProviderStreamItemTimeoutConfig,
+    GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_crud::{
     CliRuntimePendingRequestRecord,
@@ -317,6 +318,7 @@ const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
 pub(crate) struct MessageProcessorResilienceConfig {
     pub command_execution_timeout: GatewayCommandExecutionTimeoutConfig,
     pub provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig,
+    pub context_compaction_timeout: GatewayContextCompactionTimeoutConfig,
     pub cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig,
 }
 
@@ -325,6 +327,7 @@ impl Default for MessageProcessorResilienceConfig {
         Self {
             command_execution_timeout: GatewayCommandExecutionTimeoutConfig::default(),
             provider_stream_item_timeout: GatewayProviderStreamItemTimeoutConfig::default(),
+            context_compaction_timeout: GatewayContextCompactionTimeoutConfig::default(),
             cli_runtime_command_heartbeat: GatewayCliAgentRuntimeCommandHeartbeatConfig::default(),
         }
     }
@@ -671,10 +674,11 @@ impl MessageProcessor {
         ));
         let timeout_supervisor = Arc::new(TimeoutSupervisor::new(
             crud_store.clone(),
-            TimeoutPolicyRegistry::with_provider_and_command_execution_timeout_policy(
+            TimeoutPolicyRegistry::with_configured_timeout_policies(
                 normalized_tool_loop_config.provider,
                 resilience_config.command_execution_timeout,
                 resilience_config.provider_stream_item_timeout,
+                resilience_config.context_compaction_timeout,
             ),
         ));
         let recovery_coordinator = Arc::new(

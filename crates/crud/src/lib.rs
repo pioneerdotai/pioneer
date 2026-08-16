@@ -130,10 +130,10 @@ use pioneer_protocol::{
     Thread, ThreadFolder, ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode,
     ThreadPlacement, ThreadReadResponse, ThreadStatus, ThreadVisibility, TimelineOutputPolicy,
     ToolCallStatus, ToolDisplayPayload, ToolStoragePayload, Turn, TurnExecutionSecuritySnapshot,
-    TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType,
-    TurnItemsResponse, TurnKind, TurnMention, TurnMessageDeletedEvent, TurnMessageEditedEvent,
-    TurnMessageRevision, TurnMessageRevisionChangeKind, TurnPermissionProfileSnapshot,
-    TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
+    TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemExecutionClass, TurnItemTimeoutReason,
+    TurnItemType, TurnItemsResponse, TurnKind, TurnMention, TurnMessageDeletedEvent,
+    TurnMessageEditedEvent, TurnMessageRevision, TurnMessageRevisionChangeKind,
+    TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
@@ -177,9 +177,9 @@ use crate::convention::{
     task_trigger_status_from_db, task_write_lock_scope_kind_from_db,
     task_write_lock_status_from_db, task_write_lock_status_to_db, thread_mode_from_db,
     thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
-    turn_item_type_from_db, turn_item_type_to_db, turn_kind_from_db, turn_kind_to_db,
-    turn_origin_from_db, turn_permission_mode_from_db, turn_permission_profile_source_from_db,
-    turn_status_from_db, turn_status_to_db,
+    turn_item_execution_class_from_db, turn_item_type_from_db, turn_item_type_to_db,
+    turn_kind_from_db, turn_kind_to_db, turn_origin_from_db, turn_permission_mode_from_db,
+    turn_permission_profile_source_from_db, turn_status_from_db, turn_status_to_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -1312,6 +1312,7 @@ pub struct TimeoutCandidate {
     pub turn_id: String,
     pub item_id: String,
     pub item_type: TurnItemType,
+    pub execution_class: TurnItemExecutionClass,
     pub attempt_number: i64,
     pub timeout_reason: TurnItemTimeoutReason,
     pub started_at_unix: i64,
@@ -1427,6 +1428,7 @@ pub struct RunningAttemptDeadlineRepairCandidate {
     pub turn_id: String,
     pub item_id: String,
     pub item_type: TurnItemType,
+    pub execution_class: TurnItemExecutionClass,
     pub started_at_unix: i64,
 }
 
@@ -1435,8 +1437,22 @@ pub struct RunningTurnItemAttempt {
     pub turn_id: String,
     pub item_id: String,
     pub item_type: TurnItemType,
+    pub execution_class: TurnItemExecutionClass,
     pub started_at_unix: i64,
     pub last_heartbeat_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnItemAttemptTimeoutDurations {
+    pub lease_secs: u64,
+    pub idle_secs: u64,
+    pub hard_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnItemExecutionClassBackfillBatch {
+    pub attempts_classified: usize,
+    pub context_compactions_classified: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18518,28 +18534,33 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         )
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| TimeoutCandidate {
-                attempt_id: row.id,
-                turn_id: row.turn_id,
-                item_id: row.item_id,
-                item_type: row.item_type,
-                attempt_number: row.attempt_number,
-                timeout_reason: infer_timeout_reason(
-                    row.lease_expires_at,
-                    row.idle_deadline_at,
-                    row.hard_deadline_at,
-                    now_unix,
-                ),
-                started_at_unix: row.started_at.timestamp(),
-                started_event_sequence: row.started_event_sequence,
-                last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
-                lease_expires_at_unix: row.lease_expires_at.map(|value| value.timestamp()),
-                idle_deadline_at_unix: row.idle_deadline_at.map(|value| value.timestamp()),
-                hard_deadline_at_unix: row.hard_deadline_at.map(|value| value.timestamp()),
+        rows.into_iter()
+            .map(|row| {
+                let execution_class = row.execution_class.with_context(|| {
+                    format!("expired attempt `{}` has no execution class", row.id)
+                })?;
+                Ok(TimeoutCandidate {
+                    attempt_id: row.id,
+                    turn_id: row.turn_id,
+                    item_id: row.item_id,
+                    item_type: row.item_type,
+                    execution_class,
+                    attempt_number: row.attempt_number,
+                    timeout_reason: infer_timeout_reason(
+                        row.lease_expires_at,
+                        row.idle_deadline_at,
+                        row.hard_deadline_at,
+                        now_unix,
+                    ),
+                    started_at_unix: row.started_at.timestamp(),
+                    started_event_sequence: row.started_event_sequence,
+                    last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
+                    lease_expires_at_unix: row.lease_expires_at.map(|value| value.timestamp()),
+                    idle_deadline_at_unix: row.idle_deadline_at.map(|value| value.timestamp()),
+                    hard_deadline_at_unix: row.hard_deadline_at.map(|value| value.timestamp()),
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub async fn suppress_timeout_candidate_recovery(
@@ -18570,6 +18591,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     ) -> Result<Vec<RunningAttemptDeadlineRepairCandidate>> {
         let rows = pioneer_entity::turn_item_attempt::Entity::find()
             .filter(pioneer_entity::turn_item_attempt::Column::Status.eq(ATTEMPT_STATUS_RUNNING))
+            .filter(pioneer_entity::turn_item_attempt::Column::ExecutionClass.is_not_null())
             .filter(
                 Condition::any()
                     .add(pioneer_entity::turn_item_attempt::Column::LeaseExpiresAt.is_null())
@@ -18583,14 +18605,135 @@ WHERE id IN (SELECT attempt_id FROM candidates)
 
         Ok(rows
             .into_iter()
-            .map(|row| RunningAttemptDeadlineRepairCandidate {
-                turn_id: row.turn_id,
-                item_id: row.item_id,
-                item_type: turn_item_type_from_db(row.item_type.as_str())
-                    .unwrap_or(TurnItemType::DynamicToolCall),
-                started_at_unix: row.started_at.timestamp(),
+            .map(|row| {
+                let execution_class = row
+                    .execution_class
+                    .as_deref()
+                    .and_then(turn_item_execution_class_from_db)
+                    .with_context(|| {
+                        format!("attempt `{}` has an invalid execution class", row.id)
+                    })?;
+                Ok(RunningAttemptDeadlineRepairCandidate {
+                    turn_id: row.turn_id,
+                    item_id: row.item_id,
+                    item_type: turn_item_type_from_db(row.item_type.as_str())
+                        .unwrap_or(TurnItemType::DynamicToolCall),
+                    execution_class,
+                    started_at_unix: row.started_at.timestamp(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()?)
+    }
+
+    pub async fn backfill_turn_item_execution_classes_batch(
+        &self,
+        limit: u64,
+        context_compaction: TurnItemAttemptTimeoutDurations,
+    ) -> Result<TurnItemExecutionClassBackfillBatch> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin turn item execution-class backfill transaction")?;
+            let result = async {
+                let candidates =
+                    turn_item_attempt::list_unclassified_execution_attempts(&transaction, limit)
+                        .await?;
+                let mut summary = TurnItemExecutionClassBackfillBatch::default();
+                for candidate in candidates {
+                    let item = serde_json::from_str::<TurnItem>(candidate.item_payload.as_str())
+                        .with_context(|| {
+                            format!(
+                                "failed to decode item `{}` for attempt `{}` execution classification",
+                                candidate.item_id, candidate.attempt_id
+                            )
+                        })?;
+                    if item.item_id() != candidate.item_id {
+                        bail!(
+                            "attempt `{}` references item `{}`, but payload contains `{}`",
+                            candidate.attempt_id,
+                            candidate.item_id,
+                            item.item_id()
+                        );
+                    }
+                    let stored_item_type = turn_item_type_from_db(candidate.item_type.as_str())
+                        .with_context(|| {
+                            format!(
+                                "attempt `{}` has unknown item type `{}`",
+                                candidate.attempt_id, candidate.item_type
+                            )
+                        })?;
+                    if item.item_type() != stored_item_type {
+                        bail!(
+                            "attempt `{}` item type `{:?}` does not match payload type `{:?}`",
+                            candidate.attempt_id,
+                            stored_item_type,
+                            item.item_type()
+                        );
+                    }
+
+                    let execution_class = item.execution_class();
+                    let deadlines = if execution_class == TurnItemExecutionClass::ContextCompaction
+                    {
+                        Some(turn_item_attempt::AttemptDeadlines {
+                            lease_expires_at: Some(unix_to_datetime(
+                                candidate.started_at.timestamp().saturating_add(
+                                    i64::try_from(context_compaction.lease_secs)
+                                        .unwrap_or(i64::MAX),
+                                ),
+                            )),
+                            idle_deadline_at: Some(unix_to_datetime(
+                                candidate.started_at.timestamp().saturating_add(
+                                    i64::try_from(context_compaction.idle_secs)
+                                        .unwrap_or(i64::MAX),
+                                ),
+                            )),
+                            hard_deadline_at: Some(unix_to_datetime(
+                                candidate.started_at.timestamp().saturating_add(
+                                    i64::try_from(context_compaction.hard_secs)
+                                        .unwrap_or(i64::MAX),
+                                ),
+                            )),
+                        })
+                    } else {
+                        None
+                    };
+                    if turn_item_attempt::classify_execution_attempt(
+                        &transaction,
+                        &candidate,
+                        execution_class,
+                        deadlines,
+                    )
+                    .await?
+                    {
+                        summary.attempts_classified =
+                            summary.attempts_classified.saturating_add(1);
+                        if execution_class == TurnItemExecutionClass::ContextCompaction {
+                            summary.context_compactions_classified = summary
+                                .context_compactions_classified
+                                .saturating_add(1);
+                        }
+                    }
+                }
+                Ok(summary)
+            }
+            .await;
+
+            match result {
+                Ok(summary) => {
+                    transaction.commit().await.context(
+                        "failed to commit turn item execution-class backfill transaction",
+                    )?;
+                    Ok(summary)
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
+        })
+        .await
     }
 
     pub async fn list_running_turn_item_attempts_for_turn(
@@ -18601,14 +18744,44 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             turn_item_attempt::list_running_attempts_for_turn(&self.connection, turn_id).await?;
         Ok(rows
             .into_iter()
-            .map(|row| RunningTurnItemAttempt {
-                turn_id: row.turn_id,
-                item_id: row.item_id,
-                item_type: row.item_type,
-                started_at_unix: row.started_at.timestamp(),
-                last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
+            .filter_map(|row| {
+                row.execution_class
+                    .map(|execution_class| RunningTurnItemAttempt {
+                        turn_id: row.turn_id,
+                        item_id: row.item_id,
+                        item_type: row.item_type,
+                        execution_class,
+                        started_at_unix: row.started_at.timestamp(),
+                        last_heartbeat_at_unix: row
+                            .last_heartbeat_at
+                            .map(|value| value.timestamp()),
+                    })
             })
             .collect())
+    }
+
+    pub async fn get_running_turn_item_attempt(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<Option<RunningTurnItemAttempt>> {
+        Ok(
+            turn_item_attempt::find_latest_running_attempt(&self.connection, turn_id, item_id)
+                .await?
+                .and_then(|row| {
+                    row.execution_class
+                        .map(|execution_class| RunningTurnItemAttempt {
+                            turn_id: row.turn_id,
+                            item_id: row.item_id,
+                            item_type: row.item_type,
+                            execution_class,
+                            started_at_unix: row.started_at.timestamp(),
+                            last_heartbeat_at_unix: row
+                                .last_heartbeat_at
+                                .map(|value| value.timestamp()),
+                        })
+                }),
+        )
     }
 
     pub async fn list_running_turn_item_attempts_by_type(
@@ -18624,12 +18797,18 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|row| RunningTurnItemAttempt {
-                turn_id: row.turn_id,
-                item_id: row.item_id,
-                item_type: row.item_type,
-                started_at_unix: row.started_at.timestamp(),
-                last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
+            .filter_map(|row| {
+                row.execution_class
+                    .map(|execution_class| RunningTurnItemAttempt {
+                        turn_id: row.turn_id,
+                        item_id: row.item_id,
+                        item_type: row.item_type,
+                        execution_class,
+                        started_at_unix: row.started_at.timestamp(),
+                        last_heartbeat_at_unix: row
+                            .last_heartbeat_at
+                            .map(|value| value.timestamp()),
+                    })
             })
             .collect())
     }
@@ -18647,6 +18826,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 turn_id: row.turn_id,
                 item_id: row.item_id,
                 item_type: row.item_type,
+                execution_class: row.execution_class,
                 attempt_number: row.attempt_number,
                 timeout_reason: row.timeout_reason,
                 started_at_unix: row.started_at.timestamp(),
@@ -18961,6 +19141,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 turn_id: candidate.turn_id.clone(),
                 item_id: candidate.item_id.clone(),
                 item_type: candidate.item_type,
+                execution_class: Some(candidate.execution_class),
                 attempt_number: candidate.attempt_number,
                 started_at: unix_to_datetime(candidate.started_at_unix),
                 started_event_sequence: candidate.started_event_sequence,

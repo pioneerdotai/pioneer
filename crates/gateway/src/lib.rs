@@ -646,6 +646,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         config.gateway.listen_addr.as_str(),
     )
     .context("invalid Gateway listener address for invitation presentation")?;
+    let context_compaction_timeout_config = config.gateway.resilience.context_compaction;
     let mut message_processor = MessageProcessor::new_with_memory_runtime_and_task_config(
         thread_manager,
         provider_registry.clone(),
@@ -665,6 +666,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         MessageProcessorResilienceConfig {
             command_execution_timeout: config.gateway.resilience.command_execution,
             provider_stream_item_timeout: config.gateway.resilience.provider_stream_items,
+            context_compaction_timeout: context_compaction_timeout_config,
             cli_runtime_command_heartbeat: config.gateway.cli_agent_runtime.command_heartbeat,
         },
     )
@@ -737,6 +739,7 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             runtime_home.clone(),
             Some(message_processor.thread_episodic_vector_refill_status_sender()),
             message_processor.thread_episodic_workspace_refill_supervisor(),
+            context_compaction_timeout_config,
         );
         database::maintenance::spawn(message_processor.crud_store.clone());
         remote_access_supervisor
