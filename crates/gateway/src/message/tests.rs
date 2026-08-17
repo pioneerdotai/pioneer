@@ -36509,6 +36509,12 @@ async fn native_permission_request_replays_and_accepts_durable_response_after_re
         response.result["resolution"],
         serde_json::json!("allow_once")
     );
+    let resolved =
+        recv_notification_by_method(&mut replay_rx, events::TURN_PERMISSION_REQUEST_RESOLVED).await;
+    assert_eq!(
+        resolved.params.as_ref().expect("resolved params")["request_id"],
+        serde_json::json!("perm-approval-restart-1")
+    );
     let stored = processor
         .crud_store
         .get_cli_runtime_pending_request("perm-approval-restart-1")
@@ -36518,6 +36524,48 @@ async fn native_permission_request_replays_and_accepts_durable_response_after_re
     assert_eq!(
         stored.status,
         pioneer_crud::CliRuntimePendingRequestStatus::ResponseAccepted
+    );
+
+    // A recovered executor must be able to attach a fresh response lane to
+    // the already accepted durable request. Merely replaying and accepting
+    // the UI response is insufficient if reopening the request cannot consume
+    // it after restart.
+    let (recovered_respond_tx, recovered_respond_rx) = tokio::sync::oneshot::channel();
+    processor
+        .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
+            request_id: "perm-approval-restart-1".to_owned(),
+            workspace_id: Some(workspace_id.clone()),
+            thread_id: Some(thread_id.to_owned()),
+            turn_id: Some(turn_id.to_owned()),
+            tool_name: "exec_command".to_owned(),
+            key: pioneer_tools::PermissionRequestKey {
+                profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
+                tool_name: "exec_command".to_owned(),
+                action: pioneer_tools::PermissionActionKind::ShellCommand,
+                normalized_scope_hash: "scope-hash-restart".to_owned(),
+                turn_id: turn_id.to_owned(),
+            },
+            reason: pioneer_tools::PermissionDecisionReason::PolicyRequiresApproval,
+            summary: Some("run shell command after restart".to_owned()),
+            details: Vec::new(),
+            respond_to: recovered_respond_tx,
+        })
+        .await;
+    assert_eq!(
+        recovered_respond_rx
+            .await
+            .expect("recovered native response lane should receive durable decision"),
+        pioneer_tools::PermissionApprovalResolution::AllowOnce
+    );
+    let delivered = processor
+        .crud_store
+        .get_cli_runtime_pending_request("perm-approval-restart-1")
+        .await
+        .expect("delivered request lookup should succeed")
+        .expect("delivered request should remain durable");
+    assert_eq!(
+        delivered.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Resolved
     );
 }
 

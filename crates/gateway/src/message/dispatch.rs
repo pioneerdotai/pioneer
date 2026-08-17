@@ -1909,8 +1909,8 @@ impl MessageProcessor {
                                 AuthorizationExternalError::Unavailable.response(request.id.clone())
                             })?
                             .filter(|pending| {
-                                pending.runtime_id == "__native_permission__"
-                                    && pending.request_kind == "native_permission"
+                                pending.runtime_id == NATIVE_HUMAN_INTERACTION_RUNTIME_ID
+                                    && pending.request_kind == NATIVE_HUMAN_INTERACTION_REQUEST_KIND
                                     && pending.status.is_open()
                             })
                             .and_then(|pending| {

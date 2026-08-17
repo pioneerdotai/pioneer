@@ -173,7 +173,7 @@ fn deterministic_native_permission_request_id(
     digest.update([0]);
     digest.update(key.action.as_str().as_bytes());
     digest.update([0]);
-    digest.update(format!("{:?}", key.profile_mode).as_bytes());
+    digest.update(key.profile_mode.as_str().as_bytes());
     digest.update([0]);
     digest.update(key.normalized_scope_hash.as_bytes());
     format!("native-permission-{}", hex::encode(digest.finalize()))

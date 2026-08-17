@@ -4984,12 +4984,25 @@ impl CrudStore {
             .await?;
             let opened =
                 cli_runtime_binding::open_pending_request(&transaction, request.clone()).await?;
-            let record = cli_runtime_binding::bind_pending_request_authorization(
-                &transaction,
-                opened.request_id.as_str(),
-                &authorization,
-            )
-            .await?;
+            let record = if opened.status == CliRuntimePendingRequestStatus::Pending {
+                cli_runtime_binding::bind_pending_request_authorization(
+                    &transaction,
+                    opened.request_id.as_str(),
+                    &authorization,
+                )
+                .await?
+            } else {
+                // A recovered native executor reopens the same deterministic
+                // request after the response may already have been accepted.
+                // Preserve that durable delivery state, but only when it is
+                // still bound to the exact initiating authority.
+                if opened.authorization_binding.as_ref() != Some(&authorization) {
+                    return Err(anyhow::anyhow!(
+                        "native human interaction request is bound to different initiating authority"
+                    ));
+                }
+                opened
+            };
             transaction
                 .commit()
                 .await

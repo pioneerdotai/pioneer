@@ -1006,10 +1006,6 @@ fn native_api_provider_requires_artifacts(request: &ExecutionAdmissionRequest) -
             request.execution_backend,
             None | Some(AgentExecutionBackend::ApiProvider { .. })
         )
-        // Voice finalization materializes a server-owned recording after the
-        // authenticated upload path. Every other native API-provider ingress
-        // must use an exact-version artifact rather than a host path.
-        && request.entry_point != ExecutionAdmissionEntryPoint::VoiceTurn
 }
 
 /// Typed authority provenance. Missing provenance is never interpreted as an
@@ -3598,9 +3594,9 @@ mod tests {
         };
         assert!(native_api_provider_requires_artifacts(&request));
 
-        let mut trusted_voice = request.clone();
-        trusted_voice.entry_point = ExecutionAdmissionEntryPoint::VoiceTurn;
-        assert!(!native_api_provider_requires_artifacts(&trusted_voice));
+        let mut voice = request.clone();
+        voice.entry_point = ExecutionAdmissionEntryPoint::VoiceTurn;
+        assert!(native_api_provider_requires_artifacts(&voice));
 
         let mut recovery = request.clone();
         recovery.entry_point = ExecutionAdmissionEntryPoint::Recovery;

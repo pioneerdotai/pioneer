@@ -3983,7 +3983,7 @@ impl MessageProcessor {
         let native_permission_wait = self
             .crud_store
             .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
-                runtime_id: Some("__native_permission__".to_owned()),
+                runtime_id: Some(NATIVE_HUMAN_INTERACTION_RUNTIME_ID.to_owned()),
                 turn_id: Some(turn_id.to_owned()),
                 open_only: true,
                 limit: None,

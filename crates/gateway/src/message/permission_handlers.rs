@@ -1,10 +1,6 @@
 use super::*;
 use crate::authorization::{AuthorizationExternalError, AuthorizedTurn};
 
-const NATIVE_HUMAN_INTERACTION_RUNTIME_ID: &str = "__native_permission__";
-const NATIVE_HUMAN_INTERACTION_RUNTIME_KIND: &str = "native";
-const NATIVE_HUMAN_INTERACTION_REQUEST_KIND: &str = "native_permission";
-
 fn public_permission_error(
     request_id: Option<RequestId>,
     jsonrpc_code: i64,
@@ -214,6 +210,14 @@ impl MessageProcessor {
         // another approval notification.  This is the restart rendezvous for
         // the native tool call, not a new permission decision.
         if opened.status != StoredCliRuntimePendingRequestStatus::Pending {
+            if !durable_native_permission_request(&opened).is_some_and(|durable| {
+                same_native_permission_request_contract(&durable, &protocol_request)
+            }) {
+                let _ = request
+                    .respond_to
+                    .send(pioneer_tools::PermissionApprovalResolution::Expired);
+                return;
+            }
             if let Some(resolution) = durable_native_permission_resolution(&opened) {
                 if opened.status.is_terminal() {
                     let _ = request
@@ -724,10 +728,27 @@ impl MessageProcessor {
             // because no process-local tool lane exists to deliver to here.
             let response = TurnPermissionRequestRespondResponse {
                 request_id: params.request_id,
-                resolution: params.resolution,
+                resolution: params.resolution.clone(),
             };
             self.send_turn_permission_response(connection_id, request_id, &response)
                 .await;
+            if let Some(request) = durable_native_permission_request(&accepted) {
+                let notification_thread_id =
+                    native_permission_notification_thread_id(&request).to_owned();
+                self.send_execution_collaborator_notification(
+                    notification_thread_id.as_str(),
+                    crate::authorization::ResourceAction::AgentRequestObserve,
+                    events::TURN_PERMISSION_REQUEST_RESOLVED,
+                    &TurnPermissionRequestResolvedNotification {
+                        request_id: request.request_id,
+                        workspace_id: request.workspace_id,
+                        thread_id: request.thread_id,
+                        turn_id: request.turn_id,
+                        resolution: params.resolution,
+                    },
+                )
+                .await;
+            }
             return;
         };
 
@@ -1334,6 +1355,22 @@ fn durable_native_permission_request(
         && request.thread_id == record.thread_id
         && request.turn_id == record_turn_id)
         .then_some(request)
+}
+
+fn same_native_permission_request_contract(
+    left: &TurnPermissionApprovalRequest,
+    right: &TurnPermissionApprovalRequest,
+) -> bool {
+    left.request_id == right.request_id
+        && left.workspace_id == right.workspace_id
+        && left.thread_id == right.thread_id
+        && left.turn_id == right.turn_id
+        && left.tool_name == right.tool_name
+        && left.action == right.action
+        && left.scope_hash == right.scope_hash
+        && left.reason == right.reason
+        && left.summary == right.summary
+        && left.details == right.details
 }
 
 fn durable_native_permission_resolution(

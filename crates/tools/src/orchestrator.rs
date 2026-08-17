@@ -180,7 +180,7 @@ enum NetworkAccessGrant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FilesystemGrantCacheKey {
+struct SandboxCapabilityGrantCacheKey {
     workspace_id: String,
     turn_id: String,
     profile_mode: TurnPermissionMode,
@@ -215,8 +215,9 @@ pub struct ToolOrchestrator {
     approval_broker: Arc<dyn PermissionApprovalBroker>,
     effective_permission_profile: Arc<Mutex<Option<TurnPermissionProfileSnapshot>>>,
     approval_cache: Arc<Mutex<HashSet<crate::PermissionRequestKey>>>,
-    filesystem_grants: Arc<Mutex<HashMap<FilesystemGrantCacheKey, Vec<FilesystemAccessGrant>>>>,
-    network_grants: Arc<Mutex<HashMap<FilesystemGrantCacheKey, Vec<NetworkAccessGrant>>>>,
+    filesystem_grants:
+        Arc<Mutex<HashMap<SandboxCapabilityGrantCacheKey, Vec<FilesystemAccessGrant>>>>,
+    network_grants: Arc<Mutex<HashMap<SandboxCapabilityGrantCacheKey, Vec<NetworkAccessGrant>>>>,
     shell_session_permissions:
         Arc<Mutex<HashMap<ShellSessionPermissionKey, ShellSessionPermission>>>,
 }
@@ -289,6 +290,55 @@ impl ToolOrchestrator {
         }
     }
 
+    async fn revalidate_permission_context(
+        &self,
+        permission_context: &PermissionEvaluationContext,
+        invocation: &ToolInvocation,
+    ) -> Result<PermissionEvaluationContext, ToolError> {
+        let effective = tokio::select! {
+            biased;
+            _ = invocation.cancellation.cancelled() => {
+                return Err(ToolError::Cancelled("tool invocation cancelled".to_owned()));
+            }
+            result = self.approval_broker.revalidate_permission_context(
+                permission_context,
+                invocation,
+            ) => result.map_err(|_| {
+                ToolError::Rejected("tool permission authority is no longer available".to_owned())
+            })?,
+        };
+        if effective.workspace_id != permission_context.workspace_id
+            || effective.thread_id != permission_context.thread_id
+            || effective.turn_id != permission_context.turn_id
+        {
+            return Err(ToolError::Rejected(
+                "tool permission authority changed execution identity".to_owned(),
+            ));
+        }
+        Ok(effective)
+    }
+
+    async fn revalidate_immediately_before_side_effect(
+        &self,
+        admitted_context: &PermissionEvaluationContext,
+        expected_context: &PermissionEvaluationContext,
+        invocation: &ToolInvocation,
+    ) -> Result<(), ToolError> {
+        let current = self
+            .revalidate_permission_context(admitted_context, invocation)
+            .await?;
+        if current.permission_profile != expected_context.permission_profile {
+            // Clear grants derived from the superseded projection before
+            // rejecting this call. A later invocation can be evaluated from
+            // scratch under the new, equal-or-narrower authority.
+            self.apply_effective_permission_profile(&current.permission_profile)?;
+            return Err(ToolError::Rejected(
+                "tool permission authority changed before the side effect".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn with_permission_evaluator(
         policy: OrchestratorPolicy,
         post_policy: PostExecutionPolicy,
@@ -355,26 +405,9 @@ impl ToolOrchestrator {
         invocation.attempt_id = 1;
         enforce_non_escalatable_mcp_network_policy(&invocation)?;
 
-        let effective_permission_context = tokio::select! {
-            biased;
-            _ = invocation.cancellation.cancelled() => {
-                return Err(ToolError::Cancelled("tool invocation cancelled".to_owned()));
-            }
-            result = self.approval_broker.revalidate_permission_context(
-                permission_context,
-                &invocation,
-            ) => result.map_err(|_| {
-                ToolError::Rejected("tool permission authority is no longer available".to_owned())
-            })?,
-        };
-        if effective_permission_context.workspace_id != permission_context.workspace_id
-            || effective_permission_context.thread_id != permission_context.thread_id
-            || effective_permission_context.turn_id != permission_context.turn_id
-        {
-            return Err(ToolError::Rejected(
-                "tool permission authority changed execution identity".to_owned(),
-            ));
-        }
+        let effective_permission_context = self
+            .revalidate_permission_context(permission_context, &invocation)
+            .await?;
         self.apply_effective_permission_profile(&effective_permission_context.permission_profile)?;
 
         let permission_grant = self
@@ -392,6 +425,17 @@ impl ToolOrchestrator {
             &effective_permission_context,
             &permission_grant,
             trace,
+        )
+        .await?;
+
+        // Permission and sandbox approvals may wait for a person for hours.
+        // Revalidate again after every such wait, at the actual dispatch
+        // boundary, so a committed revoke cannot be bypassed by answering an
+        // approval that was opened under an older authority generation.
+        self.revalidate_immediately_before_side_effect(
+            permission_context,
+            &effective_permission_context,
+            &invocation,
         )
         .await?;
 
@@ -434,6 +478,12 @@ impl ToolOrchestrator {
                 trace.emit_stage(2, "retry.started", None, None);
                 let mut retry_invocation = invocation.clone();
                 retry_invocation.attempt_id = 2;
+                self.revalidate_immediately_before_side_effect(
+                    permission_context,
+                    &effective_permission_context,
+                    &retry_invocation,
+                )
+                .await?;
                 let mut result = self
                     .run_in_sandbox(
                         registry,
@@ -840,7 +890,7 @@ impl ToolOrchestrator {
             &permission_grant.intent,
             requested_grants.as_slice(),
         );
-        let cache_key = filesystem_grant_cache_key(
+        let cache_key = sandbox_capability_grant_cache_key(
             permission_context,
             invocation.execution_security_snapshot.as_ref(),
             invocation.tool_name.as_str(),
@@ -1029,7 +1079,7 @@ impl ToolOrchestrator {
         }
         let capability_intent =
             network_access_permission_intent(invocation, &permission_grant.intent, &pre_missing);
-        let cache_key = filesystem_grant_cache_key(
+        let cache_key = sandbox_capability_grant_cache_key(
             permission_context,
             invocation.execution_security_snapshot.as_ref(),
             invocation.tool_name.as_str(),
@@ -1191,7 +1241,7 @@ impl ToolOrchestrator {
     fn apply_cached_filesystem_grants(
         &self,
         invocation: &mut ToolInvocation,
-        cache_key: Option<&FilesystemGrantCacheKey>,
+        cache_key: Option<&SandboxCapabilityGrantCacheKey>,
     ) {
         let Some(cache_key) = cache_key else {
             return;
@@ -1218,7 +1268,7 @@ impl ToolOrchestrator {
         scope: PermissionApprovalGrantScope,
         trace: &ToolEventTrace,
         reason: &str,
-        cache_key: Option<&FilesystemGrantCacheKey>,
+        cache_key: Option<&SandboxCapabilityGrantCacheKey>,
     ) {
         apply_filesystem_grants_to_invocation(invocation, grants.as_slice());
         if scope == PermissionApprovalGrantScope::Turn
@@ -1247,7 +1297,7 @@ impl ToolOrchestrator {
     fn apply_cached_network_grants(
         &self,
         invocation: &mut ToolInvocation,
-        cache_key: Option<&FilesystemGrantCacheKey>,
+        cache_key: Option<&SandboxCapabilityGrantCacheKey>,
     ) {
         let Some(cache_key) = cache_key else {
             return;
@@ -1274,7 +1324,7 @@ impl ToolOrchestrator {
         scope: PermissionApprovalGrantScope,
         trace: &ToolEventTrace,
         reason: &str,
-        cache_key: Option<&FilesystemGrantCacheKey>,
+        cache_key: Option<&SandboxCapabilityGrantCacheKey>,
     ) {
         apply_network_grants_to_invocation(invocation, grants.as_slice());
         if scope == PermissionApprovalGrantScope::Turn
@@ -1514,14 +1564,14 @@ fn enforce_non_escalatable_mcp_network_policy(
     )
 }
 
-fn filesystem_grant_cache_key(
+fn sandbox_capability_grant_cache_key(
     permission_context: &PermissionEvaluationContext,
     snapshot: Option<&TurnExecutionSecuritySnapshot>,
     tool_name: &str,
     intent: &PermissionIntent,
-) -> Option<FilesystemGrantCacheKey> {
+) -> Option<SandboxCapabilityGrantCacheKey> {
     let authority_cap = &snapshot?.authority_cap;
-    Some(FilesystemGrantCacheKey {
+    Some(SandboxCapabilityGrantCacheKey {
         workspace_id: permission_context.workspace_id.clone()?,
         turn_id: permission_context.turn_id.clone()?,
         profile_mode: permission_context.permission_profile.mode,
@@ -2223,6 +2273,11 @@ mod tests {
         permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
     }
 
+    struct RevokingAfterApprovalBroker {
+        revalidations: Arc<AtomicUsize>,
+        approvals: Arc<AtomicUsize>,
+    }
+
     struct StaticJsonHandler {
         calls: Arc<AtomicUsize>,
         payload: serde_json::Value,
@@ -2304,6 +2359,9 @@ mod tests {
             if self.expect_enabled {
                 assert_eq!(snapshot.network.mode, TurnNetworkMode::Enabled);
                 assert_eq!(snapshot.sandbox.network.mode, TurnNetworkMode::Enabled);
+            } else {
+                assert_ne!(snapshot.network.mode, TurnNetworkMode::Enabled);
+                assert_ne!(snapshot.sandbox.network.mode, TurnNetworkMode::Enabled);
             }
             if let Some(url) = self.required_url {
                 match NetworkPolicyChecker::check_url(snapshot, url, "test") {
@@ -2343,6 +2401,34 @@ mod tests {
             let mut effective = context.clone();
             effective.permission_profile = self.permission_profile.clone();
             Ok(effective)
+        }
+
+        async fn request_approval(
+            &self,
+            _context: &PermissionEvaluationContext,
+            _invocation: &ToolInvocation,
+            _intent: &PermissionIntent,
+            _key: &PermissionRequestKey,
+            _reason: PermissionDecisionReason,
+        ) -> PermissionApprovalResolution {
+            self.approvals.fetch_add(1, Ordering::SeqCst);
+            PermissionApprovalResolution::AllowOnce
+        }
+    }
+
+    #[async_trait]
+    impl PermissionApprovalBroker for RevokingAfterApprovalBroker {
+        async fn revalidate_permission_context(
+            &self,
+            context: &PermissionEvaluationContext,
+            _invocation: &ToolInvocation,
+        ) -> Result<PermissionEvaluationContext, String> {
+            let call = self.revalidations.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Ok(context.clone())
+            } else {
+                Err("execution authority was revoked".to_owned())
+            }
         }
 
         async fn request_approval(
@@ -2499,6 +2585,46 @@ mod tests {
         assert!(matches!(error, ToolError::Rejected(_)));
         assert_eq!(revalidations.load(Ordering::SeqCst), 1);
         assert_eq!(approvals.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authority_revoked_during_approval_blocks_the_side_effect() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_handler(Arc::new(CountingHandler {
+            calls: handler_calls.clone(),
+            first_error: None,
+            success_text: "unexpected",
+        }));
+        let revalidations = Arc::new(AtomicUsize::new(0));
+        let approvals = Arc::new(AtomicUsize::new(0));
+        let orchestrator = ToolOrchestrator::with_approval_broker(
+            OrchestratorPolicy::default(),
+            Arc::new(RevokingAfterApprovalBroker {
+                revalidations: revalidations.clone(),
+                approvals: approvals.clone(),
+            }),
+        );
+        let context = PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            "turn",
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+        );
+        let trace = crate::events::ToolEventBus::default().start_trace("turn", "call_1", "tool");
+
+        let error = orchestrator
+            .run_with_context(&registry, invocation(), &trace, &context)
+            .await
+            .err()
+            .expect("revocation after approval must block dispatch");
+
+        assert!(matches!(error, ToolError::Rejected(_)));
+        assert_eq!(approvals.load(Ordering::SeqCst), 1);
+        assert_eq!(revalidations.load(Ordering::SeqCst), 2);
         assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
     }
 

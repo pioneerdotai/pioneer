@@ -37,6 +37,10 @@ mod timeline_handlers;
 mod timeline_notifications;
 mod turn_handlers;
 mod voice_handlers;
+
+const NATIVE_HUMAN_INTERACTION_RUNTIME_ID: &str = "__native_permission__";
+const NATIVE_HUMAN_INTERACTION_RUNTIME_KIND: &str = "native";
+const NATIVE_HUMAN_INTERACTION_REQUEST_KIND: &str = "native_permission";
 mod workspace_handlers;
 
 pub use summary::SummaryConfig;
