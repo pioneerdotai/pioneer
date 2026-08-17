@@ -4460,6 +4460,12 @@ impl CrudStore {
                 cli_runtime_binding::find_turn_binding(&transaction, binding.turn_id.as_str())
                     .await?
                     .context("initial CLI runtime turn binding is missing")?;
+            crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+                &transaction,
+                stored_binding.turn_id.as_str(),
+                stored_binding.updated_at,
+            )
+            .await?;
             transaction
                 .commit()
                 .await
@@ -4642,6 +4648,12 @@ impl CrudStore {
                 prepared_at,
             )
             .await?;
+            crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+                &transaction,
+                stored_binding.turn_id.as_str(),
+                prepared_at,
+            )
+            .await?;
             transaction
                 .commit()
                 .await
@@ -4707,6 +4719,12 @@ impl CrudStore {
                     && binding.native_turn_id.as_deref() == Some(native_turn_id.as_str())
                     && binding.status == "running"
                 {
+                    crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+                        &transaction,
+                        binding.turn_id.as_str(),
+                        binding.updated_at,
+                    )
+                    .await?;
                     transaction
                         .commit()
                         .await
@@ -4762,6 +4780,12 @@ impl CrudStore {
                 cli_runtime_binding::find_turn_attempt(&transaction, attempt_id.as_str())
                     .await?
                     .context("activated CLI runtime turn attempt is missing")?;
+            crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+                &transaction,
+                stored_binding.turn_id.as_str(),
+                started_at,
+            )
+            .await?;
             transaction
                 .commit()
                 .await
@@ -26653,6 +26677,73 @@ mod tests {
             .expect("active CLI runtime turn bindings should list");
         assert_eq!(active_turn_bindings.len(), 1);
         assert_eq!(active_turn_bindings[0].turn_id, "turn_cli_running");
+    }
+
+    #[tokio::test]
+    async fn cli_runtime_timeline_state_tracks_native_start_not_work_item_gaps() {
+        let workspace_id = "ws_cli_timeline_state";
+        let thread_id = "thread_cli_timeline_state";
+        let turn_id = "turn_cli_timeline_state";
+        let (store, _, _) = test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let queued_at = unix_to_datetime(1_700_000_010);
+        let running_at = unix_to_datetime(1_700_000_020);
+
+        let (_, attempt) = store
+            .prepare_cli_runtime_initial_turn_attempt(
+                NewCliRuntimeTurnBinding {
+                    turn_id: turn_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    continuation_thread_id: thread_id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                    runtime_id: "codex".to_owned(),
+                    runtime_kind: "codex".to_owned(),
+                    native_thread_id: "codex-thread-timeline-state".to_owned(),
+                    native_turn_id: None,
+                    request_id: None,
+                    status: "starting".to_owned(),
+                    model: Some("gpt-5.6".to_owned()),
+                    cwd: Some("/tmp/project".to_owned()),
+                    sandbox_json: None,
+                    approval_policy: Some("on-request".to_owned()),
+                    input_mapping_json: "{}".to_owned(),
+                    created_at: queued_at,
+                    updated_at: queued_at,
+                },
+                "attempt-cli-timeline-state".to_owned(),
+                1,
+            )
+            .await
+            .expect("queued CLI runtime attempt should prepare");
+        assert_eq!(
+            store
+                .get_turn_work_projection(turn_id)
+                .await
+                .expect("queued work projection should load")
+                .expect("queued work projection should exist")
+                .state,
+            "starting"
+        );
+
+        store
+            .activate_cli_runtime_turn_attempt(
+                turn_id,
+                attempt.id.as_str(),
+                "native-turn-timeline-state",
+                None,
+                running_at,
+            )
+            .await
+            .expect("CLI runtime attempt should activate");
+        assert_eq!(
+            store
+                .get_turn_work_projection(turn_id)
+                .await
+                .expect("running work projection should load")
+                .expect("running work projection should exist")
+                .state,
+            "running",
+            "a started CLI turn must stay running even when no work item is active"
+        );
     }
 
     #[tokio::test]

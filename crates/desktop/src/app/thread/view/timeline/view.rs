@@ -456,11 +456,11 @@ impl PioneerDesktop {
     ) -> AnyElement {
         let elapsed_label = group.elapsed_ms.map(format_elapsed_ms);
         let status_label = match group.state.as_ref() {
-            Some(&pioneer_protocol::TurnWorkState::Starting)
-            | Some(&pioneer_protocol::TurnWorkState::Stalled) => {
+            Some(&pioneer_protocol::TurnWorkState::Starting) => {
                 t!("timeline.task.status.queued").to_string()
             }
             Some(&pioneer_protocol::TurnWorkState::Running)
+            | Some(&pioneer_protocol::TurnWorkState::Stalled)
             | Some(&pioneer_protocol::TurnWorkState::WaitingForApproval) => {
                 t!("timeline.task.status.running").to_string()
             }

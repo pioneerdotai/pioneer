@@ -4755,6 +4755,12 @@ impl MessageProcessor {
                 return;
             }
         };
+        self.notify_semantic_timeline_turn_state_changed(
+            turn_binding.workspace_id.as_str(),
+            turn_binding.thread_id.as_str(),
+            turn_binding.turn_id.as_str(),
+        )
+        .await;
         let attempt = match self
             .crud_store
             .latest_cli_runtime_turn_attempt(outcome.started_notification.turn.id.as_str())

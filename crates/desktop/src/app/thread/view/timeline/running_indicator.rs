@@ -181,8 +181,7 @@ impl PioneerDesktop {
         let image_id = ElementId::from((ElementId::from("running-activity-image"), activity_id));
         let is_dark = cx.theme().mode.is_dark();
         let status_label = match state {
-            Some(pioneer_protocol::TurnWorkState::Starting)
-            | Some(pioneer_protocol::TurnWorkState::Stalled) => {
+            Some(pioneer_protocol::TurnWorkState::Starting) => {
                 t!("timeline.task.status.queued").to_string()
             }
             Some(pioneer_protocol::TurnWorkState::WaitingForApproval) => {

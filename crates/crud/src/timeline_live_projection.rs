@@ -11,7 +11,7 @@ use sea_orm::{
 use serde_json::json;
 
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
-use crate::repositories::cli_runtime_binding::CliRuntimePendingRequestRecord;
+use crate::repositories::cli_runtime_binding::{CliRuntimePendingRequestRecord, find_turn_binding};
 use crate::repositories::thread_timeline_projection as timeline_repository;
 use crate::repositories::{task, thread, turn};
 use crate::timeline_projection::{ProjectionPlacement, classify_turn_item_row_for_turn};
@@ -185,6 +185,21 @@ pub(crate) async fn project_cli_runtime_pending_request<C: ConnectionTrait>(
     .await?;
 
     refresh_turn_work_summary(db, &thread_model, &turn_model, 0, request.updated_at).await
+}
+
+pub(crate) async fn project_cli_runtime_turn_binding_state<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    refreshed_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    let Some(turn_model) = turn::find_turn_by_id(db, turn_id).await? else {
+        return Ok(());
+    };
+    let Some(thread_model) = thread::find_thread_by_id(db, turn_model.thread_id.as_str()).await?
+    else {
+        return Ok(());
+    };
+    refresh_turn_work_summary(db, &thread_model, &turn_model, 0, refreshed_at).await
 }
 
 fn approval_block_sort_key(
@@ -1043,9 +1058,13 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
     let running_item_state =
         find_running_item_state(db, turn_model.id.as_str(), summary_updated_at).await?;
     let has_running_item = running_item_state.item_id.is_some();
+    let cli_runtime_status = find_turn_binding(db, turn_model.id.as_str())
+        .await?
+        .map(|binding| binding.status);
     let presentation = turn_work_presentation(turn_model, has_final);
     let state = turn_work_state(
-        turn_model,
+        turn_model.status.as_str(),
+        cli_runtime_status.as_deref(),
         pending_request_count,
         has_running_item,
         running_item_state.stale,

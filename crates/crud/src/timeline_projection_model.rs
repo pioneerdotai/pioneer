@@ -114,12 +114,13 @@ pub(crate) fn turn_work_presentation(turn: &turn::Model, has_final: bool) -> &'s
 }
 
 pub(crate) fn turn_work_state(
-    turn: &turn::Model,
+    turn_status: &str,
+    cli_runtime_status: Option<&str>,
     pending_request_count: i64,
     has_running_item: bool,
     has_stale_running_item: bool,
 ) -> &'static str {
-    match turn.status.as_str() {
+    match turn_status {
         "completed" => return "completed",
         "failed" => return "failed",
         "interrupted" => return "interrupted",
@@ -135,12 +136,13 @@ pub(crate) fn turn_work_state(
         return "stalled";
     }
 
-    if turn.status == "in_progress" && has_running_item {
-        return "running";
-    }
-
-    if turn.status == "in_progress" {
-        return "starting";
+    if turn_status == "in_progress" {
+        return match cli_runtime_status {
+            Some("running") => "running",
+            Some("starting") => "starting",
+            _ if has_running_item => "running",
+            _ => "starting",
+        };
     }
 
     "running"
@@ -167,5 +169,46 @@ pub(crate) fn terminal_completed_at(turn: &turn::Model) -> Option<DateTimeWithTi
         Some(turn.updated_at)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_work_state;
+
+    #[test]
+    fn cli_runtime_state_does_not_follow_gaps_between_work_items() {
+        assert_eq!(
+            turn_work_state("in_progress", Some("running"), 0, false, false),
+            "running"
+        );
+        assert_eq!(
+            turn_work_state("in_progress", Some("running"), 0, true, false),
+            "running"
+        );
+    }
+
+    #[test]
+    fn cli_runtime_starting_is_the_authoritative_queue_state() {
+        assert_eq!(
+            turn_work_state("in_progress", Some("starting"), 0, false, false),
+            "starting"
+        );
+        assert_eq!(
+            turn_work_state("in_progress", Some("starting"), 0, true, false),
+            "starting"
+        );
+    }
+
+    #[test]
+    fn non_cli_turns_keep_the_work_item_fallback() {
+        assert_eq!(
+            turn_work_state("in_progress", None, 0, true, false),
+            "running"
+        );
+        assert_eq!(
+            turn_work_state("in_progress", None, 0, false, false),
+            "starting"
+        );
     }
 }
