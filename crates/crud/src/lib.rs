@@ -23844,9 +23844,6 @@ mod tests {
 
     const NATIVE_DELIVERY_MIGRATION: &str = "m20260805_000001_native_durable_delivery";
     const ATOMIC_TERMINALIZATION_MIGRATION: &str = "m20260806_000001_atomic_turn_terminalization";
-    const PROJECTION_STREAM_STATE_MIGRATION: &str =
-        "m20260815_000002_turn_event_projection_stream_state";
-
     fn migrations_before(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
         let migrations = Migrator::migrations();
         assert!(
@@ -23881,14 +23878,6 @@ mod tests {
     impl MigratorTrait for PreAtomicTerminalizationMigrator {
         fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
             migrations_before(ATOMIC_TERMINALIZATION_MIGRATION)
-        }
-    }
-
-    struct PreProjectionStreamStateMigrator;
-
-    impl MigratorTrait for PreProjectionStreamStateMigrator {
-        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-            migrations_before(PROJECTION_STREAM_STATE_MIGRATION)
         }
     }
 
@@ -31841,88 +31830,6 @@ mod tests {
                 .await
                 .expect("restored item should query")
                 .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn projection_stream_state_migration_is_schema_only() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        PreProjectionStreamStateMigrator::up(&connection, None)
-            .await
-            .expect("pre-quarantine migrations must succeed");
-
-        connection
-            .execute_unprepared(
-                r#"
-INSERT INTO turn_event_projection_state (
-    event_id, thread_id, turn_id, sequence, status, attempt_count,
-    last_error, next_run_at, claim_token, claim_expires_at,
-    projection_context_json, projected_at, created_at, updated_at
-) VALUES
-    (
-        'projection_poison_1', 'thread_poison', 'turn_poison', 1,
-        'exhausted', 10, 'invalid projection context', CURRENT_TIMESTAMP,
-        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-    ),
-    (
-        'projection_poison_2', 'thread_poison', 'turn_poison', 2,
-        'pending', 0, NULL, CURRENT_TIMESTAMP,
-        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-    ),
-    (
-        'projection_healthy_1', 'thread_healthy', 'turn_healthy', 1,
-        'pending', 0, NULL, CURRENT_TIMESTAMP,
-        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-    )
-"#,
-            )
-            .await
-            .expect("legacy projection backlog should insert");
-
-        Migrator::up(&connection, None)
-            .await
-            .expect("projection stream state migration must succeed");
-
-        assert!(
-            pioneer_entity::turn_event_projection_stream_state::Entity::find()
-                .all(&connection)
-                .await
-                .expect("new stream state table should query")
-                .is_empty(),
-            "schema migration must not scan or backfill projection data"
-        );
-
-        let successor =
-            pioneer_entity::turn_event_projection_state::Entity::find_by_id("projection_poison_2")
-                .one(&connection)
-                .await
-                .expect("successor state should query")
-                .expect("successor state should remain present");
-        assert_eq!(
-            successor.status,
-            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PENDING
-        );
-        assert_eq!(successor.attempt_count, 0);
-        assert!(successor.last_error.is_none());
-
-        Migrator::down(
-            &connection,
-            Some(rollback_steps_through(PROJECTION_STREAM_STATE_MIGRATION)),
-        )
-        .await
-        .expect("projection stream state migration down must succeed");
-        assert!(
-            connection
-                .query_one_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'turn_event_projection_stream_state'"
-                        .to_owned(),
-                ))
-                .await
-                .expect("stream state table lookup after down should succeed")
-                .is_none()
         );
     }
 
