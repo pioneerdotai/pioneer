@@ -10829,7 +10829,7 @@ async fn task_run_voice_composer_stays_foreground() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn voice_session_transcript_starts_turn_and_preserves_context_attachments() {
+async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_attachments() {
     let base_dir = unique_temp_dir("voice_turn_capability");
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
@@ -10895,7 +10895,6 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
         "thread_id": thread.thread.id,
         "turn_id": voice_turn_id,
         "prepared_input": [
-            { "type": "localFile", "path": "/tmp/voice-context.txt" },
             {
                 "type": "artifact",
                 "artifactId": artifact.artifact_id.clone(),
@@ -11050,14 +11049,6 @@ async fn voice_session_transcript_starts_turn_and_preserves_context_attachments(
     }
     let (text, attachments) = user_message.expect("voice turn must emit a user message");
     assert_eq!(text, "voice transcript with context");
-    assert!(
-        attachments.iter().any(|attachment| matches!(
-            attachment,
-            UserMessageAttachment::LocalFile { path }
-                if path == "/tmp/voice-context.txt"
-        )),
-        "voice turn must preserve prepared local-file attachment"
-    );
     assert!(
         attachments.iter().any(|attachment| matches!(
             attachment,
