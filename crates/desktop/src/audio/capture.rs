@@ -882,8 +882,7 @@ mod cpal_audio {
                     }
                 },
                 move |error| {
-                    *callback_error_for_errors.lock().expect("callback error") =
-                        Some(map_cpal_error(error));
+                    record_stream_error(error, &callback_error_for_errors);
                 },
                 None,
             )
@@ -898,7 +897,9 @@ mod cpal_audio {
 
     impl DesktopAudioInputStream for CpalDesktopAudioInputStream {
         fn stop(&mut self) -> Result<(), DesktopVoiceCaptureError> {
-            self.stopped.store(true, Ordering::Relaxed);
+            if self.stopped.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
             self.stream.pause().map_err(map_cpal_error)?;
 
             if let Ok(mut error) = self.callback_error.lock()
@@ -913,6 +914,26 @@ mod cpal_audio {
     impl Drop for CpalDesktopAudioInputStream {
         fn drop(&mut self) {
             let _ = self.stop();
+        }
+    }
+
+    /// CPAL reports these through the error callback even though the stream remains usable.
+    /// An xrun can drop a small slice of audio, but must not discard the complete recording.
+    fn is_recoverable_stream_event(kind: cpal::ErrorKind) -> bool {
+        matches!(
+            kind,
+            cpal::ErrorKind::Xrun
+                | cpal::ErrorKind::DeviceChanged
+                | cpal::ErrorKind::RealtimeDenied
+        )
+    }
+
+    pub(super) fn record_stream_error(
+        error: cpal::Error,
+        callback_error: &Mutex<Option<DesktopVoiceCaptureError>>,
+    ) {
+        if !is_recoverable_stream_event(error.kind()) {
+            *callback_error.lock().expect("callback error") = Some(map_cpal_error(error));
         }
     }
 
@@ -976,6 +997,40 @@ mod tests {
     use super::*;
     use pioneer_protocol::ThreadMode;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn recoverable_cpal_stream_events_do_not_fail_capture() {
+        let callback_error = Mutex::new(None);
+
+        for kind in [
+            cpal::ErrorKind::Xrun,
+            cpal::ErrorKind::DeviceChanged,
+            cpal::ErrorKind::RealtimeDenied,
+        ] {
+            cpal_audio::record_stream_error(cpal::Error::new(kind), &callback_error);
+        }
+
+        assert!(callback_error.lock().expect("callback error").is_none());
+    }
+
+    #[test]
+    fn terminal_cpal_stream_events_still_fail_capture() {
+        let callback_error = Mutex::new(None);
+
+        cpal_audio::record_stream_error(
+            cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+            &callback_error,
+        );
+
+        assert_eq!(
+            callback_error
+                .lock()
+                .expect("callback error")
+                .as_ref()
+                .map(|error| error.kind),
+            Some(DesktopVoiceCaptureErrorKind::NoInputDevice)
+        );
+    }
 
     #[derive(Default)]
     struct FakeStream {
