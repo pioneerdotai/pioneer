@@ -4,7 +4,7 @@ use pioneer_crud::{
     PROJECTION_META_STATUS_FAILED, ProjectionMetaRecord, find_projection_meta,
     upsert_projection_meta,
 };
-use pioneer_entity::{turn, turn_event};
+use pioneer_entity::{task_agent_spec, turn, turn_event};
 use pioneer_protocol::{
     TaskAgentSecurityCap, TurnExecutionSecuritySnapshot, TurnFilesystemSandboxEntry,
     TurnFilesystemSandboxPath, TurnNetworkPolicySnapshot, TurnPermissionMode,
@@ -21,7 +21,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const TURN_PERMISSION_PROFILE_BACKFILL_KEY: &str = "turn_permission_profile_payload_backfill";
-const TURN_PERMISSION_PROFILE_BACKFILL_VERSION: i64 = 2;
+const TURN_PERMISSION_PROFILE_BACKFILL_VERSION: i64 = 3;
 const TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE: u64 = 512;
 const TURN_PERMISSION_PROFILE_BACKFILL_YIELD_MS: u64 = 10;
 const DEFAULT_TURN_PERMISSION_PROFILE_MODE: &str = "full_access";
@@ -47,6 +47,13 @@ struct SyntheticWorkspaceTurnSecuritySnapshot {
     execution_security_snapshot_json: String,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct SyntheticWorkspaceTaskSecurityCap {
+    id: String,
+    workspace_id: String,
+    security_cap_json: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct TurnPermissionProfileBackfillSummary {
     pub(crate) skipped: bool,
@@ -56,6 +63,7 @@ pub(crate) struct TurnPermissionProfileBackfillSummary {
     pub(crate) task_agent_caps_updated: u64,
     pub(crate) security_snapshots_updated: u64,
     pub(crate) security_snapshots_repaired: u64,
+    pub(crate) cli_runtime_thread_bindings_removed: u64,
 }
 
 pub(super) async fn run(crud_store: &CrudStore, runtime_home: &Path) {
@@ -69,6 +77,7 @@ pub(super) async fn run(crud_store: &CrudStore, runtime_home: &Path) {
                 task_agent_caps_updated = summary.task_agent_caps_updated,
                 security_snapshots_updated = summary.security_snapshots_updated,
                 security_snapshots_repaired = summary.security_snapshots_repaired,
+                cli_runtime_thread_bindings_removed = summary.cli_runtime_thread_bindings_removed,
                 "turn permission profile and security snapshot backfill completed"
             );
         }
@@ -142,9 +151,15 @@ async fn backfill_all_batches(
         let turns_updated = backfill_turn_batch(db)
             .await
             .context("failed to backfill turn permission profile columns")?;
-        let task_agent_caps_updated = backfill_task_agent_cap_batch(db)
+        let task_agent_caps_backfilled = backfill_task_agent_cap_batch(db)
             .await
             .context("failed to backfill task agent permission and security caps")?;
+        let task_agent_caps_repaired =
+            repair_synthetic_workspace_task_security_cap_batch(db, runtime_home, cwd.as_str())
+                .await
+                .context("failed to repair synthetic workspace paths in task security caps")?;
+        let task_agent_caps_updated =
+            task_agent_caps_backfilled.saturating_add(task_agent_caps_repaired);
         let security_snapshots_updated =
             backfill_full_access_turn_security_snapshot_batch(db, cwd.as_str())
                 .await
@@ -153,12 +168,17 @@ async fn backfill_all_batches(
             repair_synthetic_workspace_security_snapshot_batch(db, runtime_home, cwd.as_str())
                 .await
                 .context("failed to repair synthetic workspace paths in turn security snapshots")?;
+        let cli_runtime_thread_bindings_removed =
+            remove_synthetic_workspace_cli_thread_binding_batch(db, runtime_home)
+                .await
+                .context("failed to remove synthetic workspace CLI thread bindings")?;
 
         if turn_events_updated == 0
             && turns_updated == 0
             && task_agent_caps_updated == 0
             && security_snapshots_updated == 0
             && security_snapshots_repaired == 0
+            && cli_runtime_thread_bindings_removed == 0
         {
             break;
         }
@@ -177,6 +197,9 @@ async fn backfill_all_batches(
         summary.security_snapshots_repaired = summary
             .security_snapshots_repaired
             .saturating_add(security_snapshots_repaired);
+        summary.cli_runtime_thread_bindings_removed = summary
+            .cli_runtime_thread_bindings_removed
+            .saturating_add(cli_runtime_thread_bindings_removed);
 
         tokio::time::sleep(Duration::from_millis(
             TURN_PERMISSION_PROFILE_BACKFILL_YIELD_MS,
@@ -231,11 +254,17 @@ async fn repair_synthetic_workspace_security_snapshot_batch(
     runtime_home: &Path,
     cwd: &str,
 ) -> Result<u64> {
-    let workspace_segment = format!(
+    let legacy_workspace_segment = format!(
         "{}workspaces{}",
         std::path::MAIN_SEPARATOR,
         std::path::MAIN_SEPARATOR
     );
+    let regressed_workspace_segment = format!(
+        "{}workspace_filesystems{}",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    );
+    let agent_segment = format!("{}agent", std::path::MAIN_SEPARATOR);
     let candidates =
         SyntheticWorkspaceTurnSecuritySnapshot::find_by_statement(Statement::from_sql_and_values(
             db.get_database_backend(),
@@ -244,13 +273,19 @@ async fn repair_synthetic_workspace_security_snapshot_batch(
                  FROM turn AS t \
                  JOIN thread AS th ON th.id = t.thread_id \
                  WHERE t.execution_security_snapshot_json IS NOT NULL \
-                   AND json_extract(t.execution_security_snapshot_json, '$.sandbox.cwd') = ? || ? || th.workspace_id \
+                   AND (\
+                        json_extract(t.execution_security_snapshot_json, '$.sandbox.cwd') = ? || ? || th.workspace_id \
+                        OR json_extract(t.execution_security_snapshot_json, '$.sandbox.cwd') = ? || ? || th.workspace_id || ?\
+                   ) \
                  ORDER BY t.created_at, t.id \
                  LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}",
             ),
             vec![
                 runtime_home.to_string_lossy().into_owned().into(),
-                workspace_segment.into(),
+                legacy_workspace_segment.into(),
+                runtime_home.to_string_lossy().into_owned().into(),
+                regressed_workspace_segment.into(),
+                agent_segment.into(),
             ],
         ))
         .all(db)
@@ -270,6 +305,9 @@ async fn repair_synthetic_workspace_security_snapshot_batch(
         let synthetic_cwd = snapshot.sandbox.cwd.clone();
         snapshot.sandbox.cwd = cwd.to_owned();
         for entry in &mut snapshot.sandbox.filesystem.entries {
+            repair_synthetic_workspace_entry(entry, synthetic_cwd.as_str(), cwd);
+        }
+        for entry in &mut snapshot.authority_cap.filesystem.entries {
             repair_synthetic_workspace_entry(entry, synthetic_cwd.as_str(), cwd);
         }
         if let Some(parent_cap) = snapshot.parent_cap.as_mut() {
@@ -298,6 +336,139 @@ async fn repair_synthetic_workspace_security_snapshot_batch(
     }
 
     Ok(updated)
+}
+
+async fn repair_synthetic_workspace_task_security_cap_batch(
+    db: &DatabaseConnection,
+    runtime_home: &Path,
+    cwd: &str,
+) -> Result<u64> {
+    let legacy_workspace_segment = format!(
+        "{}workspaces{}",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    );
+    let regressed_workspace_segment = format!(
+        "{}workspace_filesystems{}",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    );
+    let agent_segment = format!("{}agent", std::path::MAIN_SEPARATOR);
+    let candidates =
+        SyntheticWorkspaceTaskSecurityCap::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!(
+                "SELECT spec.id, task.workspace_id, spec.security_cap_json \
+                 FROM task_agent_spec AS spec \
+                 JOIN task ON task.id = spec.task_id \
+                 WHERE spec.security_cap_json IS NOT NULL \
+                   AND EXISTS (\
+                        SELECT 1 \
+                        FROM json_each(spec.security_cap_json, '$.maxFilesystemEntries') AS entry \
+                        WHERE json_extract(entry.value, '$.resolved_path') = ? || ? || task.workspace_id \
+                           OR json_extract(entry.value, '$.resolved_path') = ? || ? || task.workspace_id || ?\
+                   ) \
+                 ORDER BY spec.created_at, spec.id \
+                 LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}",
+            ),
+            vec![
+                runtime_home.to_string_lossy().into_owned().into(),
+                legacy_workspace_segment.into(),
+                runtime_home.to_string_lossy().into_owned().into(),
+                regressed_workspace_segment.into(),
+                agent_segment.into(),
+            ],
+        ))
+        .all(db)
+        .await
+        .context("failed to list task security caps with synthetic workspace paths")?;
+
+    let mut updated = 0_u64;
+    for candidate in candidates {
+        let mut cap: TaskAgentSecurityCap =
+            serde_json::from_str(candidate.security_cap_json.as_str()).with_context(|| {
+                format!(
+                    "failed to decode task security cap for agent spec `{}`",
+                    candidate.id
+                )
+            })?;
+        let legacy_cwd = runtime_home
+            .join("workspaces")
+            .join(candidate.workspace_id.as_str())
+            .to_string_lossy()
+            .into_owned();
+        let regressed_cwd = runtime_home
+            .join("workspace_filesystems")
+            .join(candidate.workspace_id.as_str())
+            .join("agent")
+            .to_string_lossy()
+            .into_owned();
+        for entry in &mut cap.max_filesystem_entries {
+            repair_synthetic_workspace_entry(entry, legacy_cwd.as_str(), cwd);
+            repair_synthetic_workspace_entry(entry, regressed_cwd.as_str(), cwd);
+        }
+        let security_cap_json = serde_json::to_string(&cap).with_context(|| {
+            format!(
+                "failed to serialize repaired task security cap for agent spec `{}`",
+                candidate.id
+            )
+        })?;
+        task_agent_spec::ActiveModel {
+            id: Set(candidate.id),
+            security_cap_json: Set(Some(security_cap_json)),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .context("failed to update task security cap with repaired cwd")?;
+        updated = updated.saturating_add(1);
+    }
+
+    Ok(updated)
+}
+
+async fn remove_synthetic_workspace_cli_thread_binding_batch(
+    db: &DatabaseConnection,
+    runtime_home: &Path,
+) -> Result<u64> {
+    let legacy_workspace_segment = format!(
+        "{}workspaces{}",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    );
+    let regressed_workspace_segment = format!(
+        "{}workspace_filesystems{}",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    );
+    let agent_segment = format!("{}agent", std::path::MAIN_SEPARATOR);
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!(
+                "DELETE FROM thread_cli_runtime_binding \
+                 WHERE thread_id IN (\
+                    SELECT thread_id FROM (\
+                        SELECT thread_id \
+                        FROM thread_cli_runtime_binding \
+                        WHERE native_cwd = ? || ? || workspace_id \
+                           OR native_cwd = ? || ? || workspace_id || ? \
+                        ORDER BY created_at, thread_id \
+                        LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}\
+                    )\
+                 )",
+            ),
+            vec![
+                runtime_home.to_string_lossy().into_owned().into(),
+                legacy_workspace_segment.into(),
+                runtime_home.to_string_lossy().into_owned().into(),
+                regressed_workspace_segment.into(),
+                agent_segment.into(),
+            ],
+        ))
+        .await
+        .context("failed to delete CLI thread bindings with synthetic workspace paths")?;
+    Ok(result.rows_affected())
 }
 
 fn repair_synthetic_workspace_entry(
@@ -599,8 +770,8 @@ mod tests {
     use anyhow::Context;
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
-        CrudStore, PROJECTION_META_STATUS_COMPLETE, ProjectionMetaRecord, find_projection_meta,
-        upsert_projection_meta,
+        CrudStore, NewCliRuntimeThreadBinding, PROJECTION_META_STATUS_COMPLETE,
+        ProjectionMetaRecord, find_projection_meta, upsert_projection_meta,
     };
     use pioneer_entity::{task, task_agent_spec, thread, turn, turn_event, workspace};
     use pioneer_protocol::{
@@ -740,6 +911,32 @@ mod tests {
         .await
         .expect("thread should insert");
 
+        let synthetic_cwd = runtime_home
+            .path()
+            .join("workspace_filesystems")
+            .join(workspace_id)
+            .join("agent")
+            .to_string_lossy()
+            .into_owned();
+        store
+            .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread-synthetic-cwd".to_owned(),
+                native_session_id: None,
+                native_root_thread_id: None,
+                native_cwd: Some(synthetic_cwd.clone()),
+                native_model: Some("o4-mini".to_owned()),
+                resume_cursor_json: "{}".to_owned(),
+                status: "active".to_owned(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("synthetic CLI thread binding should insert");
+
         turn::Entity::insert(turn::ActiveModel {
             id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
@@ -837,12 +1034,6 @@ mod tests {
         .await
         .expect("legacy task agent spec should insert");
 
-        let synthetic_cwd = runtime_home
-            .path()
-            .join("workspaces")
-            .join(workspace_id)
-            .to_string_lossy()
-            .into_owned();
         let synthetic_profile = TurnPermissionProfileSnapshot::from_mode(
             TurnPermissionMode::AutoAcceptEdits,
             TurnPermissionProfileSource::Composer,
@@ -852,10 +1043,45 @@ mod tests {
             synthetic_cwd.clone(),
             vec![TurnFilesystemSandboxEntry::workspace_root(
                 TurnFilesystemAccess::Write,
-                synthetic_cwd,
+                synthetic_cwd.clone(),
             )],
             now.timestamp_millis(),
         );
+        let synthetic_task_security_cap =
+            crate::turn_security::task_security_cap_from_snapshot(&synthetic_snapshot);
+        task_agent_spec::Entity::insert(task_agent_spec::ActiveModel {
+            id: Set("agent_spec_synthetic_workspace_caps".to_owned()),
+            task_id: Set(task_id.to_owned()),
+            run_id: Set(None),
+            agent_role: Set(None),
+            agent_nickname: Set(None),
+            model: Set(Some("o4-mini".to_owned())),
+            model_provider: Set(Some("openai".to_owned())),
+            prompt_json: Set(serde_json::json!({
+                "goal": "Verify synthetic task cap repair",
+                "instructions": []
+            })
+            .to_string()),
+            context_policy_json: Set(None),
+            tool_policy_json: Set(None),
+            result_contract_json: Set(None),
+            review_policy_json: Set(None),
+            depth: Set(0),
+            max_depth: Set(4),
+            created_at: Set(now),
+            updated_at: Set(now),
+            permission_cap_json: Set(Some(
+                serde_json::to_string(&synthetic_task_security_cap.max_permission_profile)
+                    .expect("synthetic permission cap should serialize"),
+            )),
+            security_cap_json: Set(Some(
+                serde_json::to_string(&synthetic_task_security_cap)
+                    .expect("synthetic security cap should serialize"),
+            )),
+        })
+        .exec(&connection)
+        .await
+        .expect("task agent spec with synthetic workspace cap should insert");
         turn::Entity::insert(turn::ActiveModel {
             id: Set(synthetic_turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
@@ -1027,9 +1253,10 @@ mod tests {
         assert!(!summary.skipped);
         assert_eq!(summary.turn_events_updated, 2);
         assert_eq!(summary.turns_updated, 1);
-        assert_eq!(summary.task_agent_caps_updated, 1);
+        assert_eq!(summary.task_agent_caps_updated, 2);
         assert_eq!(summary.security_snapshots_updated, 1);
         assert_eq!(summary.security_snapshots_repaired, 1);
+        assert_eq!(summary.cli_runtime_thread_bindings_removed, 1);
 
         assert_eq!(
             count_missing_turn_event_permission_profiles(&connection)
@@ -1057,7 +1284,8 @@ mod tests {
             .expect("legacy task should exist");
         let agent_spec = task
             .agent_specs
-            .first()
+            .iter()
+            .find(|spec| spec.id == "agent_spec_legacy_caps")
             .expect("legacy task agent spec should load");
         let permission_cap = agent_spec
             .permission_cap
@@ -1073,6 +1301,41 @@ mod tests {
             TurnPermissionMode::FullAccess
         );
         assert_eq!(security_cap.max_sandbox_mode, TurnSandboxMode::Unrestricted);
+
+        let repaired_agent_spec = task
+            .agent_specs
+            .iter()
+            .find(|spec| spec.id == "agent_spec_synthetic_workspace_caps")
+            .expect("repaired task agent spec should load");
+        let repaired_cap = repaired_agent_spec
+            .security_cap
+            .as_ref()
+            .expect("repaired security cap should remain present");
+        let repaired_cap_entry = repaired_cap
+            .max_filesystem_entries
+            .first()
+            .expect("repaired security cap should keep its cwd entry");
+        assert_eq!(
+            repaired_cap_entry.path,
+            TurnFilesystemSandboxPath::CurrentWorkingDirectory
+        );
+        let expected_cwd = std::env::current_dir()
+            .expect("test cwd should resolve")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            repaired_cap_entry.resolved_path.as_deref(),
+            Some(expected_cwd.as_str())
+        );
+
+        assert!(
+            store
+                .get_cli_runtime_thread_binding(thread_id)
+                .await
+                .expect("CLI thread binding should query")
+                .is_none(),
+            "synthetic CLI thread binding should be removed"
+        );
 
         let event = turn_event::Entity::find_by_id("evt_legacy_permission_profile".to_owned())
             .one(&connection)

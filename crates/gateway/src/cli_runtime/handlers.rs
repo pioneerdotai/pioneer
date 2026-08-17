@@ -1127,25 +1127,10 @@ impl MessageProcessor {
             let proxy_url = self
                 .cli_runtime_proxy_url(workspace_id.as_str(), params.runtime_id.as_str())
                 .await;
-            let workspace_cwd = match self
-                .turn_security_workspace_root(workspace_id.as_str())
-                .await
-            {
-                Ok(cwd) => cwd,
-                Err(error) => {
-                    self.send_error(
-                        connection_id,
-                        cli_runtime_public_error(Some(request_id), INVALID_REQUEST_CODE, error),
-                    )
-                    .await;
-                    return;
-                }
-            };
             let handle = match manager
                 .existing_or_start_management(
                     key,
                     crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
-                        cwd: Some(workspace_cwd),
                         env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                         ..Default::default()
                     },

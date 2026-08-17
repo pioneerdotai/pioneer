@@ -29276,10 +29276,8 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         persisted.snapshot.enforcement,
         pioneer_protocol::TurnSecurityEnforcementStatus::Active
     );
-    let expected_cwd = processor
-        .turn_security_workspace_root(workspace_id.as_str())
-        .await
-        .expect("managed workspace security root should resolve")
+    let expected_cwd = std::env::current_dir()
+        .expect("test cwd should resolve")
         .to_string_lossy()
         .into_owned();
     assert_eq!(persisted.snapshot.sandbox.cwd, expected_cwd);

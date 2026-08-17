@@ -5991,9 +5991,9 @@ impl MessageProcessor {
             snapshot
         } else {
             let workspace_id = outcome.started_notification.workspace_id.clone();
-            let cwd = self
-                .turn_security_workspace_root(workspace_id.as_str())
-                .await?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                TurnStartFailure::internal(format!("failed to resolve turn cwd: {error}"))
+            })?;
             let input_context = crate::turn_security::TurnSecurityResolverInputContext {
                 workspace_id: workspace_id.clone(),
                 cwd: Some(cwd),
@@ -6266,47 +6266,6 @@ impl MessageProcessor {
             reason: None,
             cached: false,
         }
-    }
-
-    pub(crate) async fn turn_security_workspace_root(
-        &self,
-        workspace_id: &str,
-    ) -> Result<std::path::PathBuf, String> {
-        let workspace_id = workspace_id.trim();
-        if workspace_id.is_empty() || workspace_id.contains(['/', '\\']) {
-            return Err(
-                "failed to resolve workspace filesystem binding: invalid workspace id".to_owned(),
-            );
-        }
-        let bindings_root = self.artifact_runtime_home.join("workspace_filesystems");
-        tokio::fs::create_dir_all(&bindings_root)
-            .await
-            .map_err(|error| {
-                format!("failed to create workspace filesystem bindings root: {error}")
-            })?;
-        let canonical_bindings_root =
-            tokio::fs::canonicalize(&bindings_root)
-                .await
-                .map_err(|error| {
-                    format!("failed to canonicalize workspace filesystem bindings root: {error}")
-                })?;
-        let workspace_root = bindings_root.join(workspace_id).join("agent");
-        tokio::fs::create_dir_all(&workspace_root)
-            .await
-            .map_err(|error| format!("failed to create workspace filesystem root: {error}"))?;
-        let canonical_workspace_root =
-            tokio::fs::canonicalize(&workspace_root)
-                .await
-                .map_err(|error| {
-                    format!("failed to canonicalize workspace filesystem root: {error}")
-                })?;
-        if !canonical_workspace_root.starts_with(&canonical_bindings_root) {
-            return Err(
-                "failed to resolve workspace filesystem binding: root escaped managed storage"
-                    .to_owned(),
-            );
-        }
-        Ok(canonical_workspace_root)
     }
 
     pub(super) fn turn_profile_selected_audit_event(
