@@ -89,6 +89,42 @@ async fn report_or_block_task_turn_failure(
     }
 }
 
+async fn commit_task_turn_execution_running(
+    processor: &Arc<MessageProcessor>,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<()> {
+    if processor
+        .crud_store
+        .get_turn_execution(turn_id)
+        .await?
+        .is_none()
+    {
+        // Legacy task Turns created before the control-plane migration remain
+        // resumable through their positive runtime snapshot evidence.
+        return Ok(());
+    }
+    let now = now_timestamp_secs();
+    if processor
+        .crud_store
+        .mark_turn_execution_running_owned(
+            turn_id,
+            processor.turn_execution_owner_id.as_ref(),
+            now,
+            now.saturating_add(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+        )
+        .await?
+    {
+        return Ok(());
+    }
+    let reason = "task Turn execution ownership changed before native dispatch completed";
+    let _ = processor
+        .agent_manager
+        .cancel_turn(thread_id, turn_id, reason)
+        .await;
+    bail!(reason)
+}
+
 async fn verify_durable_task_child_admission(
     processor: &Arc<MessageProcessor>,
     child_runtime: &TaskRunChildRuntime,
@@ -918,6 +954,11 @@ impl TaskAgentExecutor {
         let materialize_turn = turn_outcome.materialization.turn.clone();
         let materialize_input = turn_outcome.materialization.input.clone();
         let materialize_reasoning_effort = reasoning_effort.clone();
+        let materialize_execution = super::turn_handlers::new_turn_execution(
+            processor.turn_execution_owner_id.as_ref(),
+            child_execution_backend.as_ref(),
+            &turn_outcome.materialization,
+        )?;
         let materialize_result = message_fresh_task(async move {
             materialize_store
                 .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
@@ -931,6 +972,7 @@ impl TaskAgentExecutor {
                     child_authority_json.as_str(),
                     None,
                     Some(child_turn_admission),
+                    Some(materialize_execution),
                 )
                 .await
         })
@@ -1221,6 +1263,19 @@ impl TaskAgentExecutor {
                 child_turn_id,
                 TurnFailureRecoveryKind::TaskDispatch,
                 format!("failed to dispatch child task turn: {error}"),
+            )
+            .await;
+            return Ok(TaskExecutorStartOutcome::Started);
+        }
+        if let Err(error) =
+            commit_task_turn_execution_running(processor, child_thread_id.as_str(), child_turn_id.as_str()).await
+        {
+            report_or_block_task_turn_failure(
+                processor,
+                child_thread_id,
+                child_turn_id,
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to commit child task Turn execution ownership: {error:#}"),
             )
             .await;
             return Ok(TaskExecutorStartOutcome::Started);
@@ -1736,6 +1791,11 @@ impl TaskAgentExecutor {
                 child_authority_json.as_str(),
                 None,
                 Some(child_turn_admission),
+                Some(super::turn_handlers::new_turn_execution(
+                    processor.turn_execution_owner_id.as_ref(),
+                    None,
+                    &turn_outcome.materialization,
+                )?),
             )
             .await
         {
@@ -2020,6 +2080,35 @@ impl TaskAgentExecutor {
                 task_error(
                     "revision_dispatch_failed",
                     format!("failed to dispatch revision task turn: {error:#}"),
+                    TaskErrorClass::Internal,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Err(error) = commit_task_turn_execution_running(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+        )
+        .await
+        {
+            report_or_block_task_turn_failure(
+                processor,
+                child_thread_id.clone(),
+                child_turn_id.clone(),
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to commit revision task Turn execution ownership: {error:#}"),
+            )
+            .await;
+            self.block_revision_dispatch_turn(
+                processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "revision_dispatch_ownership_failed",
+                    format!("failed to commit revision task Turn execution ownership: {error:#}"),
                     TaskErrorClass::Internal,
                     Some(run.id.clone()),
                 ),
@@ -2451,6 +2540,9 @@ impl TaskAgentExecutor {
             )
             .await
             .map_err(|error| anyhow!("failed to redispatch child task turn: {error}"))?;
+        commit_task_turn_execution_running(processor, child_thread_id, child_turn_id)
+            .await
+            .context("failed to commit redispatched task Turn execution ownership")?;
         spawn_execution_heartbeat(
             processor,
             execution.id.clone(),
@@ -2581,7 +2673,14 @@ impl TaskAgentExecutor {
 
         let outcome = processor
             .crud_store
-            .resume_task_owned_turn(thread_id, turn_id, recovery_job_id, now_unix)
+            .resume_task_owned_turn(
+                thread_id,
+                turn_id,
+                recovery_job_id,
+                now_unix,
+                processor.turn_execution_owner_id.as_ref(),
+                now_unix.saturating_add(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+            )
             .await?;
         let Some(outcome) = outcome else {
             return Ok(Some(TaskChildResumeOutcome::Conflict {
@@ -3477,6 +3576,11 @@ impl TaskAgentExecutor {
                 child_authority_json.as_str(),
                 None,
                 Some(child_turn_admission),
+                Some(super::turn_handlers::new_turn_execution(
+                    processor.turn_execution_owner_id.as_ref(),
+                    None,
+                    &turn_outcome.materialization,
+                )?),
             )
             .await
         {
@@ -3690,6 +3794,23 @@ impl TaskAgentExecutor {
                 task_run_turn.turn_id,
                 TurnFailureRecoveryKind::TaskDispatch,
                 format!("failed to dispatch reviewer task turn: {error}"),
+            )
+            .await;
+            return Ok(());
+        }
+        if let Err(error) = commit_task_turn_execution_running(
+            processor,
+            task_run_turn.thread_id.as_str(),
+            task_run_turn.turn_id.as_str(),
+        )
+        .await
+        {
+            report_or_block_task_turn_failure(
+                processor,
+                task_run_turn.thread_id,
+                task_run_turn.turn_id,
+                TurnFailureRecoveryKind::TaskDispatch,
+                format!("failed to commit reviewer task Turn execution ownership: {error:#}"),
             )
             .await;
         }
@@ -4551,6 +4672,7 @@ async fn ensure_task_run_occurrence_turn(
             pioneer_protocol::PersistedActorRef::System,
             profile_selected_audit,
             occurrence_authority_json.as_str(),
+            None,
             None,
             None,
         )

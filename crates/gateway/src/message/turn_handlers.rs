@@ -276,6 +276,7 @@ fn native_turn_admission_digest(
 async fn persist_admitted_turn_start(
     crud_store: &pioneer_crud::CrudStore,
     provider_registry: &pioneer_provider::ProviderRegistry,
+    execution_owner_id: &str,
     params: &TurnStartParams,
     materialization: &crate::thread::TurnStartMaterialization,
     reasoning_effort: Option<&str>,
@@ -369,6 +370,11 @@ async fn persist_admitted_turn_start(
                 }
             }
         });
+    let execution = new_turn_execution(
+        execution_owner_id,
+        params.execution_backend.as_ref(),
+        materialization,
+    )?;
     crud_store
         .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
             &materialization.thread,
@@ -381,8 +387,47 @@ async fn persist_admitted_turn_start(
             authority_envelope_json.as_str(),
             runtime_draft,
             Some(admission),
+            Some(execution),
         )
         .await
+}
+
+pub(super) fn new_turn_execution(
+    execution_owner_id: &str,
+    backend: Option<&AgentExecutionBackend>,
+    materialization: &crate::thread::TurnStartMaterialization,
+) -> anyhow::Result<pioneer_crud::NewTurnExecution> {
+    let created_at = chrono::Utc::now().fixed_offset();
+    let (executor_kind, executor_key) = match backend {
+        None => (
+            pioneer_crud::TurnExecutorKind::NativeAgent,
+            Some(materialization.thread.model_provider.clone()),
+        ),
+        Some(AgentExecutionBackend::ApiProvider { provider }) => (
+            pioneer_crud::TurnExecutorKind::ApiProvider,
+            Some(provider.clone()),
+        ),
+        Some(AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) => (
+            pioneer_crud::TurnExecutorKind::CliRuntime,
+            Some(runtime_id.clone()),
+        ),
+        Some(AgentExecutionBackend::ACPAgentRuntime { runtime_id }) => (
+            pioneer_crud::TurnExecutorKind::AcpRuntime,
+            Some(runtime_id.clone()),
+        ),
+    };
+    Ok(pioneer_crud::NewTurnExecution {
+        turn_id: materialization.turn.id.clone(),
+        thread_id: materialization.thread.id.clone(),
+        workspace_id: materialization.thread.workspace_id.clone(),
+        executor_kind,
+        executor_key,
+        status: pioneer_crud::TurnExecutionStatus::Starting,
+        owner_id: execution_owner_id.to_owned(),
+        lease_until: created_at
+            + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+        created_at,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1630,6 +1675,7 @@ impl MessageProcessor {
                 if let Err(error) = persist_admitted_turn_start(
                     self.crud_store.as_ref(),
                     self.provider_registry.as_ref(),
+                    self.turn_execution_owner_id.as_ref(),
                     &launch,
                     &outcome.materialization,
                     requested_reasoning_effort(&launch).as_deref(),
@@ -2249,6 +2295,7 @@ impl MessageProcessor {
         if let Err(error) = message_future(persist_admitted_turn_start(
             self.crud_store.as_ref(),
             self.provider_registry.as_ref(),
+            self.turn_execution_owner_id.as_ref(),
             &security_params,
             &outcome.materialization,
             effective_reasoning_effort.as_deref(),
@@ -2518,7 +2565,7 @@ impl MessageProcessor {
         prepared: PreparedApiProviderTurnStart,
     ) {
         let outcome = prepared.outcome;
-        if let Err(error) = self
+        let start_result = self
             .agent_manager
             .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
                 outcome.started_notification.thread_id.as_str(),
@@ -2538,17 +2585,64 @@ impl MessageProcessor {
                 prepared.permission_profile,
                 prepared.execution_security_snapshot,
             )
-            .await
-        {
+            .await;
+        if let Err(error) = start_result {
             let reason = format!("failed to dispatch turn to agent runtime: {error}");
             if !self
                 .report_turn_failure(
-                outcome.started_notification.thread_id.clone(),
-                outcome.started_notification.turn.id.clone(),
-                TurnFailureRecoveryKind::TurnDispatch,
-                reason.clone(),
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    TurnFailureRecoveryKind::TurnDispatch,
+                    reason.clone(),
+                )
+                .await
+            {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    reason,
+                )
+                .await;
+            }
+            return;
+        }
+
+        let now = now_timestamp_secs();
+        let ownership_started = self
+            .crud_store
+            .mark_turn_execution_running_owned(
+                outcome.started_notification.turn.id.as_str(),
+                self.turn_execution_owner_id.as_ref(),
+                now,
+                now.saturating_add(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
             )
-            .await
+            .await;
+        if !matches!(ownership_started, Ok(true)) {
+            let reason = match ownership_started {
+                Ok(false) => {
+                    "Turn execution ownership changed before native dispatch completed".to_owned()
+                }
+                Err(error) => {
+                    format!("failed to persist native Turn execution ownership: {error:#}")
+                }
+                Ok(true) => unreachable!(),
+            };
+            let _ = self
+                .agent_manager
+                .cancel_turn(
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
+                    reason.as_str(),
+                )
+                .await;
+            if !self
+                .report_turn_failure(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    TurnFailureRecoveryKind::TurnDispatch,
+                    reason.clone(),
+                )
+                .await
             {
                 self.mark_turn_blocked(
                     outcome.started_notification.thread_id.clone(),
@@ -3774,12 +3868,14 @@ impl MessageProcessor {
             let materialization_result = {
                 let crud_store = self.crud_store.clone();
                 let provider_registry = self.provider_registry.clone();
+                let execution_owner_id = self.turn_execution_owner_id.clone();
                 let materialization = outcome.materialization.clone();
                 let effective_reasoning_effort = effective_cli_runtime_effort.clone();
                 let workflow = message_future(async move {
                     persist_admitted_turn_start(
                         crud_store.as_ref(),
                         provider_registry.as_ref(),
+                        execution_owner_id.as_ref(),
                         &materialization_params,
                         &materialization,
                         effective_reasoning_effort.as_deref(),
@@ -4722,7 +4818,7 @@ impl MessageProcessor {
         };
         let native_turn_id = native_turn.native_turn_id.clone();
         let turn_binding = match
-            crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start(
+            crate::cli_runtime::turn_binding::persist_cli_runtime_turn_binding_after_native_start_owned(
                 self.crud_store.as_ref(),
                 crate::cli_runtime::turn_binding::CLIAgentRuntimeNativeTurnStarted {
                     turn_id: outcome.started_notification.turn.id.clone(),
@@ -4730,6 +4826,7 @@ impl MessageProcessor {
                     request_id: None,
                     started_at: chrono::Utc::now().fixed_offset(),
                 },
+                self.turn_execution_owner_id.as_ref(),
             )
             .await
         {
@@ -5686,12 +5783,15 @@ impl MessageProcessor {
         let native_turn_id = native_turn.native_turn_id.clone();
         if let Err(error) = self
             .crud_store
-            .activate_cli_runtime_turn_attempt(
+            .activate_cli_runtime_turn_attempt_owned(
                 prepared_binding.turn_id.as_str(),
                 attempt.id.as_str(),
                 native_turn_id.as_str(),
                 None,
                 chrono::Utc::now().fixed_offset(),
+                self.turn_execution_owner_id.as_ref(),
+                chrono::Utc::now().fixed_offset()
+                    + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
             )
             .await
         {

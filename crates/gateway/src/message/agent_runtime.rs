@@ -1755,10 +1755,11 @@ impl MessageProcessor {
     ) -> Result<()> {
         let result = self
             .crud_store
-            .materialize_native_agent_turn_event(
+            .materialize_native_agent_turn_event_owned(
                 event,
                 event_timestamp_secs,
                 item_started_deadlines,
+                self.turn_execution_owner_id.as_ref(),
             )
             .await;
         match result {
@@ -1779,38 +1780,6 @@ impl MessageProcessor {
             }
             Err(error) => Err(error),
         }
-    }
-
-    pub(super) async fn reconcile_incomplete_native_turn_admissions(
-        &self,
-        limit: u64,
-    ) -> Result<u64> {
-        let candidates = self
-            .crud_store
-            .list_incomplete_native_turn_admissions(limit)
-            .await?;
-        let mut reconciled = 0_u64;
-        for candidate in candidates {
-            let reason = "native turn admission was interrupted before its durable runtime snapshot; resume or retry from the preserved user message"
-                .to_owned();
-            if self
-                .mark_turn_blocked(
-                    candidate.thread_id.clone(),
-                    candidate.turn_id.clone(),
-                    reason,
-                )
-                .await
-            {
-                reconciled = reconciled.saturating_add(1);
-            } else {
-                warn!(
-                    thread_id = candidate.thread_id,
-                    turn_id = candidate.turn_id,
-                    "incomplete native turn admission could not be reconciled"
-                );
-            }
-        }
-        Ok(reconciled)
     }
 
     async fn process_claimed_native_turn_event_delivery(

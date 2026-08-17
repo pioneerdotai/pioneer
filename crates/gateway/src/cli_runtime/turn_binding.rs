@@ -132,6 +132,27 @@ pub(crate) async fn persist_cli_runtime_turn_binding_after_native_start(
     store: &CrudStore,
     native_turn: CLIAgentRuntimeNativeTurnStarted,
 ) -> Result<CliRuntimeTurnBindingRecord> {
+    persist_cli_runtime_turn_binding_after_native_start_with_owner(store, native_turn, None).await
+}
+
+pub(crate) async fn persist_cli_runtime_turn_binding_after_native_start_owned(
+    store: &CrudStore,
+    native_turn: CLIAgentRuntimeNativeTurnStarted,
+    execution_owner_id: &str,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    persist_cli_runtime_turn_binding_after_native_start_with_owner(
+        store,
+        native_turn,
+        Some(execution_owner_id),
+    )
+    .await
+}
+
+async fn persist_cli_runtime_turn_binding_after_native_start_with_owner(
+    store: &CrudStore,
+    native_turn: CLIAgentRuntimeNativeTurnStarted,
+    execution_owner_id: Option<&str>,
+) -> Result<CliRuntimeTurnBindingRecord> {
     validate_native_turn_started(&native_turn)?;
     let Some(_existing) = store
         .get_cli_runtime_turn_binding(native_turn.turn_id.as_str())
@@ -165,15 +186,31 @@ pub(crate) async fn persist_cli_runtime_turn_binding_after_native_start(
             native_turn.turn_id
         );
     }
-    let (binding, _attempt) = store
-        .activate_cli_runtime_turn_attempt(
-            native_turn.turn_id.as_str(),
-            attempt.id.as_str(),
-            native_turn.native_turn_id.as_str(),
-            native_turn.request_id,
-            native_turn.started_at,
-        )
-        .await
+    let activation = if let Some(owner_id) = execution_owner_id {
+        store
+            .activate_cli_runtime_turn_attempt_owned(
+                native_turn.turn_id.as_str(),
+                attempt.id.as_str(),
+                native_turn.native_turn_id.as_str(),
+                native_turn.request_id,
+                native_turn.started_at,
+                owner_id,
+                native_turn.started_at
+                    + chrono::Duration::seconds(crate::message::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+            )
+            .await
+    } else {
+        store
+            .activate_cli_runtime_turn_attempt(
+                native_turn.turn_id.as_str(),
+                attempt.id.as_str(),
+                native_turn.native_turn_id.as_str(),
+                native_turn.request_id,
+                native_turn.started_at,
+            )
+            .await
+    };
+    let (binding, _attempt) = activation
         .context("failed to activate CLI runtime turn binding and attempt after native start")?;
     Ok(binding)
 }

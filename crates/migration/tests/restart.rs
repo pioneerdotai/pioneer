@@ -18,15 +18,12 @@ struct BeforeTaskDeliveryTargetsMigrator;
 #[async_trait::async_trait]
 impl MigratorTrait for BeforeTaskDeliveryTargetsMigrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        let mut migrations = Migrator::migrations();
-        // The task-delivery migration is followed by a later stream-state
-        // migration.  This fixture must stop before the former, rather than
-        // merely before the current latest migration.
-        migrations.pop().expect("migration registry is not empty");
-        migrations
-            .pop()
-            .expect("task-delivery migration is registered");
-        migrations
+        Migrator::migrations()
+            .into_iter()
+            .take_while(|migration| {
+                migration.name() != "m20260815_000001_task_delivery_thread_targets"
+            })
+            .collect()
     }
 }
 
@@ -111,6 +108,7 @@ async fn migration_fresh_schema_is_idempotent_across_database_restart() {
     assert!(table_exists(&restarted, "turn_execution_checkpoint").await);
     assert!(table_exists(&restarted, "turn_finalization").await);
     assert!(table_exists(&restarted, "turn_admission").await);
+    assert!(table_exists(&restarted, "turn_execution").await);
     assert!(table_exists(&restarted, "recovery_terminalization_outbox").await);
     restarted
         .close()
@@ -143,6 +141,7 @@ async fn migration_previous_release_upgrades_after_database_restart() {
     assert_eq!(applied_migration_count(&upgraded).await, expected_after);
     assert!(column_exists(&upgraded, "auth_refresh_credential", "exchange_request_id").await);
     assert!(table_exists(&upgraded, "turn_admission").await);
+    assert!(table_exists(&upgraded, "turn_execution").await);
     assert!(table_exists(&upgraded, "turn_finalization").await);
     assert!(table_exists(&upgraded, "recovery_terminalization_outbox").await);
     upgraded

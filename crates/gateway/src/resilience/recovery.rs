@@ -8,7 +8,7 @@ use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{
     BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore,
     NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, RecoveryJobRecord,
-    TimeoutCandidate, TurnExecutionCheckpointKind,
+    TimeoutCandidate, TurnExecutionCheckpointKind, TurnExecutionRecord, TurnExecutorKind,
 };
 use pioneer_protocol::{
     EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT, ExecutionCheckpointPayload,
@@ -498,6 +498,7 @@ pub struct RecoveryCoordinator {
     tool_loop_config: ToolLoopConfig,
     authorization_invalidation_hub: Arc<crate::authorization::AuthorizationInvalidationHub>,
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
+    turn_execution_owner_id: Arc<str>,
     listener_starter: Arc<RwLock<Option<RecoveryListenerStarter>>>,
 }
 
@@ -716,6 +717,11 @@ impl RecoveryCoordinator {
             tool_loop_config,
             authorization_invalidation_hub,
             execution_leases: Arc::new(crate::authorization::ExecutionLeaseRegistry::default()),
+            turn_execution_owner_id: format!(
+                "gateway-turn-owner-{}",
+                generate_id(RECOVERY_ATTEMPT_ID_LEN)
+            )
+            .into(),
             listener_starter: Arc::new(RwLock::new(None)),
         }
     }
@@ -748,6 +754,11 @@ impl RecoveryCoordinator {
         execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     ) -> Self {
         self.execution_leases = execution_leases;
+        self
+    }
+
+    pub(crate) fn with_turn_execution_owner_id(mut self, owner_id: Arc<str>) -> Self {
+        self.turn_execution_owner_id = owner_id;
         self
     }
 
@@ -1522,14 +1533,14 @@ impl RecoveryCoordinator {
         let mut events = Vec::new();
         let mut phase_errors = Vec::new();
 
-        match self.reconcile_orphan_native_turns(now_unix, limit).await {
+        match self.reconcile_orphan_turn_executions(now_unix, limit).await {
             Ok(()) => {}
             Err(error) => {
                 warn!(
                     error = %format!("{error:#}"),
-                    "recovery coordinator orphan-native-turn phase failed"
+                    "recovery coordinator orphan-turn-execution phase failed"
                 );
-                phase_errors.push(format!("orphan native turns: {error:#}"));
+                phase_errors.push(format!("orphan Turn executions: {error:#}"));
             }
         }
 
@@ -1607,12 +1618,51 @@ impl RecoveryCoordinator {
         Ok(events)
     }
 
-    /// Reconcile persisted native Turns that survived a process restart without
-    /// an item timeout or provider-failure job.  The local AgentManager map is
-    /// intentionally not consulted: it is process-local and cannot prove
-    /// ownership after restart.  A recent durable activity frontier is the
-    /// only reason to defer reconciliation.
-    async fn reconcile_orphan_native_turns(&self, now_unix: i64, limit: u64) -> Result<()> {
+    /// Reconcile executions whose durable process-owner lease proves that the
+    /// Gateway which admitted them is gone. Executor kind is persisted at the
+    /// same boundary as the Turn, so a missing provider binding is never used
+    /// to guess whether work is native or CLI-backed.
+    async fn reconcile_orphan_turn_executions(&self, now_unix: i64, limit: u64) -> Result<()> {
+        let expired = self
+            .crud_store
+            .list_expired_foreign_turn_executions(
+                self.turn_execution_owner_id.as_ref(),
+                now_unix,
+                limit,
+            )
+            .await?;
+        for execution in expired {
+            let Some(claimed) = self
+                .crud_store
+                .claim_expired_turn_execution(
+                    &execution,
+                    self.turn_execution_owner_id.as_ref(),
+                    now_unix,
+                    now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
+                )
+                .await?
+            else {
+                continue;
+            };
+            self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
+                .await?;
+        }
+
+        // A storage failure after the ownership CAS must remain retryable.
+        // Recovering rows owned by this process are therefore revisited until
+        // their idempotent recovery job exists or they become terminal.
+        for claimed in self
+            .crud_store
+            .list_owned_recovering_turn_executions(self.turn_execution_owner_id.as_ref(), limit)
+            .await?
+        {
+            self.enqueue_claimed_turn_execution_recovery(&claimed, now_unix)
+                .await?;
+        }
+
+        // Compatibility for pre-migration Turns is deliberately restricted to
+        // positive native evidence: the legacy query requires a durable native
+        // runtime snapshot and excludes every Turn with a control-plane row.
         for turn in self.crud_store.list_in_progress_native_turns(limit).await? {
             if self
                 .open_recovery_for_turn(turn.turn_id.as_str())
@@ -1678,6 +1728,75 @@ impl RecoveryCoordinator {
         Ok(())
     }
 
+    async fn enqueue_claimed_turn_execution_recovery(
+        &self,
+        execution: &TurnExecutionRecord,
+        now_unix: i64,
+    ) -> Result<()> {
+        if self
+            .open_recovery_for_turn(execution.turn_id.as_str())
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let has_runtime_snapshot = self
+            .crud_store
+            .get_turn_runtime_snapshot(execution.turn_id.as_str())
+            .await?
+            .is_some();
+        let has_cli_binding = self
+            .crud_store
+            .get_cli_runtime_turn_binding(execution.turn_id.as_str())
+            .await?
+            .is_some();
+        let recoverable = match execution.executor_kind {
+            TurnExecutorKind::NativeAgent | TurnExecutorKind::ApiProvider => has_runtime_snapshot,
+            TurnExecutorKind::CliRuntime => has_cli_binding,
+            TurnExecutorKind::AcpRuntime => false,
+        };
+        let (action, reason) = if recoverable {
+            (
+                RecoveryAction::RestartTurn,
+                format!(
+                    "{} Turn execution owner lease expired after Gateway replacement; resuming from durable provider state",
+                    execution.executor_kind.as_str()
+                ),
+            )
+        } else {
+            (
+                RecoveryAction::BlockResumable,
+                format!(
+                    "{} Turn execution owner lease expired before resumable provider state was committed; preserving it as explicitly resumable blocked work",
+                    execution.executor_kind.as_str()
+                ),
+            )
+        };
+        let policy = self
+            .policy_registry
+            .policy_for_item_type(TurnItemType::Reasoning);
+        let _ = self
+            .enqueue_runtime_failure_job(
+                &RuntimeFailureCandidate {
+                    turn_id: execution.turn_id.clone(),
+                    item_id: format!("orphan:{}", execution.turn_id),
+                    item_type: TurnItemType::Reasoning,
+                    trigger: RecoveryTrigger::RuntimeFailure,
+                    action,
+                    reason,
+                    base_backoff_secs: policy.base_backoff_secs,
+                    max_attempts: if recoverable { policy.max_attempts } else { 0 },
+                    max_wall_clock_secs: policy.max_wall_clock_secs,
+                    no_progress_limit: policy.no_progress_limit,
+                    metadata: ToolMetadata::empty(),
+                },
+                now_unix,
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn resume_blocked_turn(
         &self,
         thread_id: &str,
@@ -1687,7 +1806,14 @@ impl RecoveryCoordinator {
     ) -> Result<Option<RecoveryJobRecord>> {
         let outcome = self
             .crud_store
-            .resume_blocked_turn_recovery(thread_id, turn_id, recovery_job_id, now_unix)
+            .resume_blocked_turn_recovery(
+                thread_id,
+                turn_id,
+                recovery_job_id,
+                now_unix,
+                self.turn_execution_owner_id.as_ref(),
+                now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
+            )
             .await?;
 
         let job = match outcome {
@@ -2379,6 +2505,26 @@ impl RecoveryCoordinator {
             .await
         {
             Ok(()) => {
+                if let Err(error) = self
+                    .mark_recovered_execution_running(job.turn_id.as_str(), now_unix)
+                    .await
+                {
+                    let reason =
+                        format!("failed to commit recovered Turn execution ownership: {error:#}");
+                    let _ = self
+                        .agent_manager
+                        .cancel_turn(thread_id.as_str(), job.turn_id.as_str(), reason.as_str())
+                        .await;
+                    return self
+                        .record_active_recovery_failure(
+                            job,
+                            active_attempt_id.as_str(),
+                            Some(reason),
+                            None,
+                            now_unix,
+                        )
+                        .await;
+                }
                 events.push(RecoveryCoordinatorEvent::RetryAttemptStarted {
                     job_id: job.id.clone(),
                     turn_id: job.turn_id.clone(),
@@ -2450,6 +2596,34 @@ impl RecoveryCoordinator {
                                 .await
                             {
                                 Ok(()) => {
+                                    if let Err(error) = self
+                                        .mark_recovered_execution_running(
+                                            job.turn_id.as_str(),
+                                            now_unix,
+                                        )
+                                        .await
+                                    {
+                                        let reason = format!(
+                                            "failed to commit restored Turn execution ownership: {error:#}"
+                                        );
+                                        let _ = self
+                                            .agent_manager
+                                            .cancel_turn(
+                                                thread_id.as_str(),
+                                                job.turn_id.as_str(),
+                                                reason.as_str(),
+                                            )
+                                            .await;
+                                        return self
+                                            .record_active_recovery_failure(
+                                                job,
+                                                active_attempt_id.as_str(),
+                                                Some(reason),
+                                                None,
+                                                now_unix,
+                                            )
+                                            .await;
+                                    }
                                     events.push(RecoveryCoordinatorEvent::RetryAttemptStarted {
                                         job_id: job.id.clone(),
                                         turn_id: job.turn_id.clone(),
@@ -2497,6 +2671,25 @@ impl RecoveryCoordinator {
         }
 
         Ok(events)
+    }
+
+    async fn mark_recovered_execution_running(&self, turn_id: &str, now_unix: i64) -> Result<()> {
+        if self.crud_store.get_turn_execution(turn_id).await?.is_none() {
+            return Ok(());
+        }
+        if !self
+            .crud_store
+            .mark_turn_execution_running_owned(
+                turn_id,
+                self.turn_execution_owner_id.as_ref(),
+                now_unix,
+                now_unix.saturating_add(RECOVERY_JOB_CLAIM_LEASE_SECS as i64),
+            )
+            .await?
+        {
+            bail!("Turn execution ownership changed during recovery start");
+        }
+        Ok(())
     }
 
     async fn block_active_recovery(
@@ -4398,9 +4591,9 @@ mod tests {
         NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry,
         NewTurnRuntimeSnapshot, RecoveryJobRecord, SkillInstallationRecord,
         SkillPackInstallationRecord, TimeoutCandidate, TurnExecutionCheckpointKind,
-        TurnExecutionWindowStatsRecord,
+        TurnExecutionStatus, TurnExecutionWindowStatsRecord, TurnExecutorKind,
     };
-    use pioneer_entity::{turn, workspace};
+    use pioneer_entity::{turn, turn_execution, workspace};
     use pioneer_protocol::{
         AgentMessagePhase, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
         ItemCompletedNotification, ItemStartedNotification, ProviderFailureClass,
@@ -4961,6 +5154,227 @@ mod tests {
     async fn setup_coordinator() -> (Arc<CrudStore>, RecoveryCoordinator) {
         let (crud_store, _agent_manager, coordinator) = setup_coordinator_with_agent().await;
         (crud_store, coordinator)
+    }
+
+    async fn insert_test_turn_execution(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        owner_id: &str,
+        executor_kind: TurnExecutorKind,
+        lease_until_unix: i64,
+    ) {
+        let created_at = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("test execution timestamp should be valid")
+            .fixed_offset();
+        let lease_until = chrono::DateTime::from_timestamp(lease_until_unix, 0)
+            .expect("test execution lease should be valid")
+            .fixed_offset();
+        turn_execution::ActiveModel {
+            turn_id: Set(turn_id.to_owned()),
+            thread_id: Set(thread_id.to_owned()),
+            workspace_id: Set(workspace_id.to_owned()),
+            executor_kind: Set(executor_kind.as_str().to_owned()),
+            executor_key: Set(Some("test-executor".to_owned())),
+            status: Set(TurnExecutionStatus::Starting.as_str().to_owned()),
+            owner_id: Set(owner_id.to_owned()),
+            owner_generation: Set(1),
+            lease_until: Set(lease_until),
+            heartbeat_at: Set(created_at),
+            started_at: Set(None),
+            completed_at: Set(None),
+            created_at: Set(created_at),
+            updated_at: Set(created_at),
+        }
+        .insert(&crud_store.database_connection())
+        .await
+        .expect("test Turn execution should persist");
+    }
+
+    #[tokio::test]
+    async fn live_gateway_owner_never_recovers_its_normal_prebinding_turns() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let now_unix = 1_700_000_200;
+        for (suffix, executor_kind) in [
+            ("native", TurnExecutorKind::NativeAgent),
+            ("api", TurnExecutorKind::ApiProvider),
+            ("cli", TurnExecutorKind::CliRuntime),
+            ("acp", TurnExecutorKind::AcpRuntime),
+        ] {
+            let workspace_id = format!("ws_live_owner_{suffix}");
+            let thread_id = format!("thr_live_owner_{suffix}");
+            let turn_id = format!("turn_live_owner_{suffix}");
+            materialize_turn_with_tool_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                format!("item_live_owner_{suffix}").as_str(),
+                None,
+            )
+            .await;
+            insert_test_turn_execution(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                coordinator.turn_execution_owner_id.as_ref(),
+                executor_kind,
+                now_unix - 100,
+            )
+            .await;
+
+            coordinator
+                .reconcile_orphan_turn_executions(now_unix, 64)
+                .await
+                .expect("live owner reconciliation should succeed");
+            assert!(
+                coordinator
+                    .open_recovery_for_turn(turn_id.as_str())
+                    .await
+                    .expect("recovery lookup should succeed")
+                    .is_none(),
+                "a Turn owned by the running Gateway must never be declared orphaned"
+            );
+            let execution = crud_store
+                .get_turn_execution(turn_id.as_str())
+                .await
+                .expect("execution lookup should succeed")
+                .expect("execution should exist");
+            assert_eq!(execution.owner_generation, 1);
+            assert_eq!(execution.status, TurnExecutionStatus::Starting);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_foreign_prebinding_cli_turn_is_claimed_by_kind_not_binding_absence() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_expired_cli_owner";
+        let thread_id = "thr_expired_cli_owner";
+        let turn_id = "turn_expired_cli_owner";
+        let now_unix = 1_700_000_200;
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "item_expired_cli_owner",
+            None,
+        )
+        .await;
+        insert_test_turn_execution(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "gateway-turn-owner-replaced",
+            TurnExecutorKind::CliRuntime,
+            now_unix - 1,
+        )
+        .await;
+
+        coordinator
+            .reconcile_orphan_turn_executions(now_unix, 64)
+            .await
+            .expect("expired owner reconciliation should succeed");
+
+        let execution = crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .expect("execution lookup should succeed")
+            .expect("execution should exist");
+        assert_eq!(
+            execution.owner_id.as_str(),
+            coordinator.turn_execution_owner_id.as_ref()
+        );
+        assert_eq!(execution.owner_generation, 2);
+        assert_eq!(execution.status, TurnExecutionStatus::Recovering);
+        let recovery = coordinator
+            .open_recovery_for_turn(turn_id)
+            .await
+            .expect("recovery lookup should succeed")
+            .expect("expired foreign owner should open recovery");
+        assert_eq!(recovery.action, RecoveryAction::BlockResumable);
+        assert!(
+            recovery
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cli_runtime"))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_start_transition_fences_a_recovery_candidate_selected_before_cas() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_start_recovery_race";
+        let thread_id = "thr_start_recovery_race";
+        let turn_id = "turn_start_recovery_race";
+        let previous_owner = "gateway-turn-owner-still-starting";
+        let now_unix = 1_700_000_200;
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "item_start_recovery_race",
+            None,
+        )
+        .await;
+        insert_test_turn_execution(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            previous_owner,
+            TurnExecutorKind::CliRuntime,
+            now_unix - 1,
+        )
+        .await;
+
+        let selected = crud_store
+            .list_expired_foreign_turn_executions(
+                coordinator.turn_execution_owner_id.as_ref(),
+                now_unix,
+                1,
+            )
+            .await
+            .expect("expired candidate selection should succeed")
+            .pop()
+            .expect("expired candidate should be selected");
+        assert!(
+            crud_store
+                .mark_turn_execution_running_owned(
+                    turn_id,
+                    previous_owner,
+                    now_unix,
+                    now_unix + 45,
+                )
+                .await
+                .expect("provider start transition should commit")
+        );
+
+        assert!(
+            crud_store
+                .claim_expired_turn_execution(
+                    &selected,
+                    coordinator.turn_execution_owner_id.as_ref(),
+                    now_unix,
+                    now_unix + 45,
+                )
+                .await
+                .expect("stale recovery CAS should evaluate")
+                .is_none(),
+            "recovery must recheck status, owner generation, and lease atomically"
+        );
+        let execution = crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .expect("execution lookup should succeed")
+            .expect("execution should exist");
+        assert_eq!(execution.owner_id, previous_owner);
+        assert_eq!(execution.owner_generation, 1);
+        assert_eq!(execution.status, TurnExecutionStatus::Running);
     }
 
     fn provider_failure(class: ProviderFailureClass, message: &str) -> ProviderFailureDetails {

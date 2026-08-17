@@ -315,6 +315,7 @@ where
 }
 
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
+pub(super) const TURN_EXECUTION_OWNER_LEASE_SECONDS: i64 = 15;
 const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
 const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
 
@@ -421,6 +422,7 @@ pub struct MessageProcessor {
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     execution_leases: Arc<crate::authorization::ExecutionLeaseRegistry>,
     observation_governor: Arc<crate::authorization::ObservationAdmissionGovernor>,
+    turn_execution_owner_id: Arc<str>,
     artifact_stream_invalidation:
         Arc<StdRwLock<Option<Weak<dyn ArtifactStreamInvalidation>>>>,
     view_grant_service: Arc<StdRwLock<Option<Weak<crate::view_grants::ViewGrantService>>>>,
@@ -655,6 +657,8 @@ impl MessageProcessor {
         let execution_leases = Arc::new(crate::authorization::ExecutionLeaseRegistry::default());
         let observation_governor =
             Arc::new(crate::authorization::ObservationAdmissionGovernor::default());
+        let turn_execution_owner_id: Arc<str> =
+            format!("gateway-turn-owner-{}", generate_id(21)).into();
         let task_agent_executor = Arc::new(task_agent_executor::TaskAgentExecutor::new());
         let task_runtime = Arc::new(TaskRuntime::new_with_config(
             crud_store.clone(),
@@ -696,7 +700,8 @@ impl MessageProcessor {
                 normalized_tool_loop_config.clone(),
             )
             .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
-            .with_execution_leases(execution_leases.clone()),
+            .with_execution_leases(execution_leases.clone())
+            .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
         );
         let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
             resilience_config
@@ -764,6 +769,7 @@ impl MessageProcessor {
             authorization_invalidation_hub,
             execution_leases,
             observation_governor,
+            turn_execution_owner_id,
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
@@ -1699,17 +1705,6 @@ impl MessageProcessor {
                 );
             }
         }
-        match self.reconcile_incomplete_native_turn_admissions(1024).await {
-            Ok(reconciled) if reconciled > 0 => warn!(
-                reconciled,
-                "reconciled native turns interrupted during durable admission"
-            ),
-            Ok(_) => {}
-            Err(error) => warn!(
-                error = %format!("{error:#}"),
-                "failed to reconcile incomplete native turn admissions at startup"
-            ),
-        }
         match self.crud_store.reconcile_execution_admission_leases().await {
             Ok(reconciled) if reconciled > 0 => warn!(
                 reconciled,
@@ -1743,6 +1738,25 @@ impl MessageProcessor {
                 if now >= next_skill_upload_cleanup {
                     this.cleanup_stale_skill_uploads(now).await;
                     next_skill_upload_cleanup = now.saturating_add(60);
+                }
+
+                if let Err(error) = retry_transient_storage_access(|| {
+                    this.crud_store.heartbeat_turn_executions_owned_by(
+                        this.turn_execution_owner_id.as_ref(),
+                        now,
+                        now.saturating_add(TURN_EXECUTION_OWNER_LEASE_SECONDS),
+                    )
+                })
+                .await
+                {
+                    record_resilience_worker_poll_error(
+                        "Turn execution owner heartbeat",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    );
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
                 }
 
                 // Confirm live native command activity before timeout polling.
@@ -3290,6 +3304,8 @@ impl MessageProcessor {
         let execution_leases = Arc::new(crate::authorization::ExecutionLeaseRegistry::default());
         let observation_governor =
             Arc::new(crate::authorization::ObservationAdmissionGovernor::default());
+        let turn_execution_owner_id: Arc<str> =
+            format!("gateway-turn-owner-{}", generate_id(21)).into();
         let mcp_service = Arc::new(McpService::new(
             crud_store.clone(),
             session_manager.clone(),
@@ -3405,7 +3421,8 @@ impl MessageProcessor {
                 normalized_tool_loop_config.clone(),
             )
             .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
-            .with_execution_leases(execution_leases.clone()),
+            .with_execution_leases(execution_leases.clone())
+            .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
         );
         let memory_loop_config =
             Arc::new(StdRwLock::new(normalized_tool_loop_config.memory.clone()));
@@ -3453,6 +3470,7 @@ impl MessageProcessor {
             authorization_invalidation_hub,
             execution_leases,
             observation_governor,
+            turn_execution_owner_id,
             artifact_stream_invalidation: Arc::new(StdRwLock::new(None)),
             view_grant_service: Arc::new(StdRwLock::new(None)),
             auth_service: None,
