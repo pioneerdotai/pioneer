@@ -12,7 +12,7 @@ use sea_orm::{
 use std::collections::HashMap;
 
 pub const SEMANTIC_TIMELINE_PROJECTION_KEY: &str = "semantic_timeline";
-pub const SEMANTIC_TIMELINE_PROJECTION_VERSION: i64 = 8;
+pub const SEMANTIC_TIMELINE_PROJECTION_VERSION: i64 = 9;
 
 pub const PROJECTION_META_STATUS_PENDING: &str = "pending";
 pub const PROJECTION_META_STATUS_BACKFILLING: &str = "backfilling";

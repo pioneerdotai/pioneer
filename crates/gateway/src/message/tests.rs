@@ -43211,6 +43211,102 @@ async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_backfill_preserves_native_running_and_cli_queue_states() {
+    let (_workspace_manager, store, workspace_id) = setup_workspace_manager().await;
+    let base = super::now_timestamp_secs();
+    let native_thread_id = "thr_backfill_native_state";
+    let native_turn_id = "turn_backfill_native_state";
+    let cli_thread_id = "thr_backfill_cli_state";
+    let cli_turn_id = "turn_backfill_cli_state";
+
+    let native_thread = semantic_fixture_thread(
+        workspace_id.as_str(),
+        native_thread_id,
+        Some("Native backfill state"),
+        base,
+    );
+    store
+        .materialize_turn_start(
+            &native_thread,
+            SandboxMode::FullAccess,
+            &semantic_fixture_turn(native_turn_id, TurnStatus::InProgress),
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("native Turn should persist");
+
+    let cli_thread = semantic_fixture_thread(
+        workspace_id.as_str(),
+        cli_thread_id,
+        Some("CLI backfill state"),
+        base + 1,
+    );
+    store
+        .materialize_turn_start(
+            &cli_thread,
+            SandboxMode::FullAccess,
+            &semantic_fixture_turn(cli_turn_id, TurnStatus::InProgress),
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("CLI Turn should persist");
+    let prepared_at = chrono::Utc::now().fixed_offset();
+    store
+        .prepare_cli_runtime_initial_turn_attempt(
+            NewCliRuntimeTurnBinding {
+                turn_id: cli_turn_id.to_owned(),
+                thread_id: cli_thread_id.to_owned(),
+                continuation_thread_id: cli_thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread-backfill-cli-state".to_owned(),
+                native_turn_id: None,
+                request_id: None,
+                status: "starting".to_owned(),
+                model: Some("gpt-5.6".to_owned()),
+                cwd: None,
+                sandbox_json: None,
+                approval_policy: Some("on-request".to_owned()),
+                input_mapping_json: "{}".to_owned(),
+                created_at: prepared_at,
+                updated_at: prepared_at,
+            },
+            "attempt-backfill-cli-state".to_owned(),
+            1,
+        )
+        .await
+        .expect("queued CLI attempt should persist");
+
+    crate::database::startup::backfill_timeline_pagination_once(store.as_ref(), 16)
+        .await
+        .expect("semantic timeline v9 backfill should succeed");
+
+    assert_eq!(
+        store
+            .get_turn_work_projection(native_turn_id)
+            .await
+            .expect("native projection should load")
+            .expect("native projection should exist")
+            .state,
+        "running",
+        "backfill must not infer a native queue from a gap between work items"
+    );
+    assert_eq!(
+        store
+            .get_turn_work_projection(cli_turn_id)
+            .await
+            .expect("CLI projection should load")
+            .expect("CLI projection should exist")
+            .state,
+        "starting",
+        "backfill must preserve a CLI queue until the native provider starts"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_task_wrapper_diagnostics_do_not_persist_parent_work_group() {
     let (_workspace_manager, store, workspace_id) = setup_workspace_manager().await;
     let base = super::now_timestamp_secs();

@@ -1057,7 +1057,6 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
             .await?;
     let running_item_state =
         find_running_item_state(db, turn_model.id.as_str(), summary_updated_at).await?;
-    let has_running_item = running_item_state.item_id.is_some();
     let cli_runtime_status = find_turn_binding(db, turn_model.id.as_str())
         .await?
         .map(|binding| binding.status);
@@ -1066,7 +1065,6 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         turn_model.status.as_str(),
         cli_runtime_status.as_deref(),
         pending_request_count,
-        has_running_item,
         running_item_state.stale,
     );
 

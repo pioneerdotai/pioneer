@@ -26747,6 +26747,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_api_timeline_state_tracks_turn_lifecycle_not_work_item_gaps() {
+        let workspace_id = "ws_native_timeline_state";
+        let thread_id = "thread_native_timeline_state";
+        let turn_id = "turn_native_timeline_state";
+        let item_id = "item_native_timeline_state";
+        let (store, _, _) = test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+
+        let state = || async {
+            store
+                .get_turn_work_projection(turn_id)
+                .await
+                .expect("native work projection should load")
+                .expect("native work projection should exist")
+                .state
+        };
+        assert_eq!(
+            state().await,
+            "running",
+            "a confirmed native Turn start is already running before its first work item"
+        );
+
+        let running_item = safe_web_fetch_item(item_id);
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: running_item.clone(),
+                },
+                1_700_000_010,
+            )
+            .await
+            .expect("native work item should start");
+        assert_eq!(state().await, "running");
+
+        let mut completed_item = running_item;
+        if let TurnItem::WebFetch {
+            status, success, ..
+        } = &mut completed_item
+        {
+            *status = ToolCallStatus::Completed;
+            *success = Some(true);
+        }
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: completed_item,
+                },
+                1_700_000_020,
+            )
+            .await
+            .expect("native work item should complete");
+        assert_eq!(
+            state().await,
+            "running",
+            "a native Turn must remain running between completed and future work items"
+        );
+    }
+
+    #[tokio::test]
     async fn cli_runtime_execution_segments_enforce_attempt_ownership_and_sequence() {
         let store = test_store_with_workspace("ws_cli_segments").await;
         let now = unix_to_datetime(1_700_015_000);

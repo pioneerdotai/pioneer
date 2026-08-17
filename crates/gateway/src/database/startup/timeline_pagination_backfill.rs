@@ -9,7 +9,8 @@ use pioneer_crud::{
     user_block_id, work_block_id, work_item_projection_id,
 };
 use pioneer_entity::{
-    cli_runtime_pending_request, thread, turn, turn_event, turn_input, turn_item,
+    cli_runtime_pending_request, thread, turn, turn_cli_runtime_binding, turn_event, turn_input,
+    turn_item,
 };
 use pioneer_protocol::TurnItem;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -165,12 +166,12 @@ fn turn_work_presentation(turn: &turn::Model, has_final: bool) -> &'static str {
 }
 
 fn turn_work_state(
-    turn: &turn::Model,
+    turn_status: &str,
+    cli_runtime_status: Option<&str>,
     pending_request_count: i64,
-    has_running_item: bool,
     has_stale_running_item: bool,
 ) -> &'static str {
-    match turn.status.as_str() {
+    match turn_status {
         "completed" => return "completed",
         "failed" => return "failed",
         "interrupted" => return "interrupted",
@@ -186,12 +187,13 @@ fn turn_work_state(
         return "stalled";
     }
 
-    if turn.status == "in_progress" && has_running_item {
-        return "running";
-    }
-
-    if turn.status == "in_progress" {
-        return "starting";
+    if turn_status == "in_progress" {
+        // Native/API turns are already running once TurnStarted is durable.
+        // CLI runtimes alone persist an explicit pre-native-start state.
+        return match cli_runtime_status {
+            Some("starting") => "starting",
+            _ => "running",
+        };
     }
 
     "running"
@@ -582,7 +584,6 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
     let mut running_item_id: Option<String> = None;
     let mut assistant_blocks = Vec::new();
     let mut detached_task_run_blocks = Vec::new();
-    let mut has_running_item = false;
     let mut has_stale_running_item = false;
     let projection_now = now_datetime();
     let turn_completed_at = terminal_completed_at(turn_model);
@@ -644,7 +645,6 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
                         visible_work_count = visible_work_count.saturating_add(1);
                     }
                     if is_running_work_status(classification.status) {
-                        has_running_item = true;
                         if running_item_id.is_none() {
                             running_item_id = Some(item_model.item_id.clone());
                         }
@@ -740,11 +740,22 @@ async fn backfill_turn_in_connection<C: ConnectionTrait>(
             turn_model.id.as_str(),
         )
         .await?;
+        let cli_runtime_status =
+            turn_cli_runtime_binding::Entity::find_by_id(turn_model.id.clone())
+                .one(db)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to load CLI runtime binding for semantic timeline turn `{}`",
+                        turn_model.id
+                    )
+                })?
+                .map(|binding| binding.status);
         let presentation = turn_work_presentation(turn_model, has_final);
         let state = turn_work_state(
-            turn_model,
+            turn_model.status.as_str(),
+            cli_runtime_status.as_deref(),
             pending_request_count,
-            has_running_item,
             has_stale_running_item,
         );
         let elapsed_through = turn_completed_at.unwrap_or(turn_model.updated_at);
@@ -1229,4 +1240,26 @@ fn normalize_batch_size(batch_size: u64) -> u64 {
 
 fn now_datetime() -> DateTimeWithTimeZone {
     chrono::Utc::now().fixed_offset()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_work_state;
+
+    #[test]
+    fn backfill_keeps_native_turn_running_without_active_work_item() {
+        assert_eq!(turn_work_state("in_progress", None, 0, false), "running");
+    }
+
+    #[test]
+    fn backfill_preserves_cli_queue_until_native_start() {
+        assert_eq!(
+            turn_work_state("in_progress", Some("starting"), 0, false),
+            "starting"
+        );
+        assert_eq!(
+            turn_work_state("in_progress", Some("running"), 0, false),
+            "running"
+        );
+    }
 }

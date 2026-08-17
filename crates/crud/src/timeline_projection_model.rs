@@ -117,7 +117,6 @@ pub(crate) fn turn_work_state(
     turn_status: &str,
     cli_runtime_status: Option<&str>,
     pending_request_count: i64,
-    has_running_item: bool,
     has_stale_running_item: bool,
 ) -> &'static str {
     match turn_status {
@@ -137,11 +136,11 @@ pub(crate) fn turn_work_state(
     }
 
     if turn_status == "in_progress" {
+        // A durable native/API TurnStarted record means execution is already
+        // running. Only CLI runtimes have a persisted pre-native-start phase.
         return match cli_runtime_status {
-            Some("running") => "running",
             Some("starting") => "starting",
-            _ if has_running_item => "running",
-            _ => "starting",
+            _ => "running",
         };
     }
 
@@ -179,11 +178,7 @@ mod tests {
     #[test]
     fn cli_runtime_state_does_not_follow_gaps_between_work_items() {
         assert_eq!(
-            turn_work_state("in_progress", Some("running"), 0, false, false),
-            "running"
-        );
-        assert_eq!(
-            turn_work_state("in_progress", Some("running"), 0, true, false),
+            turn_work_state("in_progress", Some("running"), 0, false),
             "running"
         );
     }
@@ -191,24 +186,13 @@ mod tests {
     #[test]
     fn cli_runtime_starting_is_the_authoritative_queue_state() {
         assert_eq!(
-            turn_work_state("in_progress", Some("starting"), 0, false, false),
-            "starting"
-        );
-        assert_eq!(
-            turn_work_state("in_progress", Some("starting"), 0, true, false),
+            turn_work_state("in_progress", Some("starting"), 0, false),
             "starting"
         );
     }
 
     #[test]
-    fn non_cli_turns_keep_the_work_item_fallback() {
-        assert_eq!(
-            turn_work_state("in_progress", None, 0, true, false),
-            "running"
-        );
-        assert_eq!(
-            turn_work_state("in_progress", None, 0, false, false),
-            "starting"
-        );
+    fn native_turns_stay_running_between_work_items() {
+        assert_eq!(turn_work_state("in_progress", None, 0, false), "running");
     }
 }
