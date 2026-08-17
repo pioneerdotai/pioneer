@@ -268,6 +268,7 @@ fn push_work_header(
             anchor_entry_id: block.block_id.clone(),
             elapsed_ms: work.elapsed_ms,
             is_open: expanded,
+            state: Some(work.state.clone()),
         }),
     });
 }

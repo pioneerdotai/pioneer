@@ -178,6 +178,9 @@ pub struct TurnWorkGroupRow {
     pub anchor_entry_id: String,
     pub elapsed_ms: Option<u64>,
     pub is_open: bool,
+    /// Server-owned lifecycle state; clients must not infer it from row order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<pioneer_protocol::TurnWorkState>,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]

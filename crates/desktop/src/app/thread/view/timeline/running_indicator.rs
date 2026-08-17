@@ -137,6 +137,7 @@ impl PioneerDesktop {
         let content = self.render_running_activity_content(
             format!("turn:{}", running_turn.turn_id),
             running_turn.started_at_unix_ms,
+            running_turn.state.clone(),
             running_turn.security_summary.as_ref(),
             self.active_task_thread_navigation().is_none(),
             cx,
@@ -154,6 +155,7 @@ impl PioneerDesktop {
         &self,
         activity_id: String,
         started_at_unix_ms: Option<i64>,
+        state: Option<pioneer_protocol::TurnWorkState>,
         security_summary: Option<&ClientTurnSecuritySummary>,
         show_dino: bool,
         cx: &mut Context<Self>,
@@ -178,7 +180,16 @@ impl PioneerDesktop {
         ));
         let image_id = ElementId::from((ElementId::from("running-activity-image"), activity_id));
         let is_dark = cx.theme().mode.is_dark();
-        let status_label = t!("timeline.running.turn").to_string();
+        let status_label = match state {
+            Some(pioneer_protocol::TurnWorkState::Starting)
+            | Some(pioneer_protocol::TurnWorkState::Stalled) => {
+                t!("timeline.task.status.queued").to_string()
+            }
+            Some(pioneer_protocol::TurnWorkState::WaitingForApproval) => {
+                t!("timeline.task.status.waiting").to_string()
+            }
+            _ => t!("timeline.running.turn").to_string(),
+        };
 
         h_flex()
             .w_full()

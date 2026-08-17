@@ -455,6 +455,28 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let elapsed_label = group.elapsed_ms.map(format_elapsed_ms);
+        let status_label = match group.state.as_ref() {
+            Some(&pioneer_protocol::TurnWorkState::Starting)
+            | Some(&pioneer_protocol::TurnWorkState::Stalled) => {
+                t!("timeline.task.status.queued").to_string()
+            }
+            Some(&pioneer_protocol::TurnWorkState::Running)
+            | Some(&pioneer_protocol::TurnWorkState::WaitingForApproval) => {
+                t!("timeline.task.status.running").to_string()
+            }
+            Some(&pioneer_protocol::TurnWorkState::Failed) => {
+                t!("timeline.task.status.failed").to_string()
+            }
+            Some(&pioneer_protocol::TurnWorkState::Interrupted) => {
+                t!("timeline.task.status.cancelled").to_string()
+            }
+            Some(&pioneer_protocol::TurnWorkState::Blocked) => {
+                t!("timeline.task.status.blocked").to_string()
+            }
+            Some(&pioneer_protocol::TurnWorkState::Completed) | None => {
+                t!("timeline.work_group.completed").to_string()
+            }
+        };
 
         let mut toggle_hasher = std::collections::hash_map::DefaultHasher::new();
         toggle_hasher.write(group.toggle_key.as_bytes());
@@ -473,7 +495,7 @@ impl PioneerDesktop {
                     .items_center()
                     .justify_between()
                     .text_sm()
-                    .child(t!("timeline.work_group.completed").to_string())
+                    .child(status_label)
                     .child(
                         h_flex()
                             .items_center()
@@ -641,6 +663,7 @@ mod tests {
                 anchor_entry_id: "work-block".to_owned(),
                 elapsed_ms: Some(1_000),
                 is_open: false,
+                state: None,
             }),
         })];
         let expanded = HashSet::new();

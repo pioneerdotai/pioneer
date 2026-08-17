@@ -372,6 +372,7 @@ impl PioneerDesktop {
                     .map(|started_at| started_at.saturating_mul(1_000))
                     .or(item_view.started_at_unix_ms)
                     .or(Some(task_item.created_at.saturating_mul(1_000))),
+                Some(pioneer_protocol::TurnWorkState::Running),
                 None,
                 true,
                 cx,

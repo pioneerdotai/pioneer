@@ -657,6 +657,7 @@ mod tests {
                         anchor_entry_id: "work".to_owned(),
                         elapsed_ms: None,
                         is_open: false,
+                        state: None,
                     },
                 ),
             }),

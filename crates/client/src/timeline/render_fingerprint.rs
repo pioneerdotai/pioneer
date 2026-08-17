@@ -64,6 +64,7 @@ pub fn timeline_row_content_fingerprint(
             group.toggle_key.hash(&mut hasher);
             group.elapsed_ms.hash(&mut hasher);
             group.is_open.hash(&mut hasher);
+            group.state.hash(&mut hasher);
         }
         TimelineRowKind::CoalescedTools(group) => {
             2u8.hash(&mut hasher);
@@ -196,6 +197,18 @@ pub fn timeline_row_text_len(projection: &ConversationViewState, row: &TimelineR
             .unwrap_or_default(),
         TimelineRowKind::TurnWorkToggle(group) => {
             let mut len = TURN_WORK_GROUP_COMPLETED_TEXT_LEN_ESTIMATE;
+            if let Some(state) = group.state.as_ref() {
+                len = len.saturating_add(match state {
+                    pioneer_protocol::TurnWorkState::Starting
+                    | pioneer_protocol::TurnWorkState::Stalled => 6,
+                    pioneer_protocol::TurnWorkState::Running
+                    | pioneer_protocol::TurnWorkState::WaitingForApproval => 7,
+                    pioneer_protocol::TurnWorkState::Failed => 6,
+                    pioneer_protocol::TurnWorkState::Interrupted => 9,
+                    pioneer_protocol::TurnWorkState::Blocked => 7,
+                    pioneer_protocol::TurnWorkState::Completed => 9,
+                });
+            }
             if let Some(elapsed_ms) = group.elapsed_ms {
                 len = len.saturating_add(format_elapsed_ms(elapsed_ms).len());
             }
