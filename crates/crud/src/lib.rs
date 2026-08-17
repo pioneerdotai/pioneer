@@ -31907,9 +31907,12 @@ INSERT INTO turn_event_projection_state (
         assert_eq!(successor.attempt_count, 0);
         assert!(successor.last_error.is_none());
 
-        Migrator::down(&connection, Some(1))
-            .await
-            .expect("projection stream state migration down must succeed");
+        Migrator::down(
+            &connection,
+            Some(rollback_steps_through(PROJECTION_STREAM_STATE_MIGRATION)),
+        )
+        .await
+        .expect("projection stream state migration down must succeed");
         assert!(
             connection
                 .query_one_raw(Statement::from_string(
