@@ -8365,7 +8365,7 @@ impl MessageProcessor {
                 .map(|request| (request.created_at, request.request_id.clone()));
             for request in pending_requests {
                 if let Err(error) = self
-                    .expire_cli_runtime_pending_request_as_stale(&request)
+                    .expire_cli_runtime_pending_request_for_terminal_cleanup(&request)
                     .await
                 {
                     warn!(
@@ -8477,6 +8477,23 @@ impl MessageProcessor {
         &self,
         request: &CliRuntimePendingRequestRecord,
     ) -> anyhow::Result<Option<CliRuntimePendingRequestRecord>> {
+        self.expire_cli_runtime_pending_request_with_response_policy(request, true)
+            .await
+    }
+
+    async fn expire_cli_runtime_pending_request_for_terminal_cleanup(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+    ) -> anyhow::Result<Option<CliRuntimePendingRequestRecord>> {
+        self.expire_cli_runtime_pending_request_with_response_policy(request, false)
+            .await
+    }
+
+    async fn expire_cli_runtime_pending_request_with_response_policy(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+        return_control_to_native_runtime: bool,
+    ) -> anyhow::Result<Option<CliRuntimePendingRequestRecord>> {
         if let Some(current) = self
             .crud_store
             .get_cli_runtime_pending_request(request.request_id.as_str())
@@ -8509,7 +8526,9 @@ impl MessageProcessor {
             )),
         }?;
         if let Some(expired) = expired.as_ref() {
-            if cli_runtime_pending_request_is_human_wait(expired.request_kind.as_str()) {
+            if return_control_to_native_runtime
+                && cli_runtime_pending_request_is_human_wait(expired.request_kind.as_str())
+            {
                 match self
                     .cli_runtime_existing_session_for_pending_request(expired)
                     .await

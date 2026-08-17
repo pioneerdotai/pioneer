@@ -37361,7 +37361,7 @@ async fn cli_runtime_command_approval_cancel_sends_cancel_and_interrupts_turn() 
     let responses = cli_session.responses.lock().await;
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].0, json!("approval-native-cancel"));
-    assert_eq!(responses[0].1, json!({"decision": "decline"}));
+    assert_eq!(responses[0].1, json!({"decision": "cancel"}));
     drop(responses);
 
     let interrupts = cli_session.interrupts.lock().await;
