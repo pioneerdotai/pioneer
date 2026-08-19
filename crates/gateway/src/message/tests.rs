@@ -38298,7 +38298,7 @@ async fn unavailable_context_compaction_observation_does_not_disable_hard_deadli
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unavailable_cli_runtime_observation_does_not_disable_hard_deadline() {
+async fn unavailable_cli_runtime_observation_defers_rolling_hard_deadline() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
     *cli_session.turn_liveness_probe.lock().await =
@@ -38326,10 +38326,25 @@ async fn unavailable_cli_runtime_observation_does_not_disable_hard_deadline() {
         .poll_timeouts_respecting_human_wait(now, 64)
         .await
         .expect("hard-deadline timeout poll should succeed");
-    assert!(timed_out.iter().any(|candidate| {
-        candidate.item_id == "codex-item-hard-timeout-unavailable"
-            && candidate.timeout_reason == TurnItemTimeoutReason::HardDeadlineExceeded
-    }));
+    assert!(
+        timed_out.is_empty(),
+        "a rolling command deadline cannot terminalize while runtime state is unavailable"
+    );
+    let running = crud_store
+        .list_running_turn_item_attempts_for_turn("codex-turn-command")
+        .await
+        .expect("running command attempt should load");
+    assert!(
+        running
+            .iter()
+            .any(|attempt| attempt.item_id == "codex-item-hard-timeout-unavailable")
+    );
+    let pending_jobs = crud_store
+        .find_recovery_jobs_by_turn_and_status("codex-turn-command", RecoveryJobStatus::Pending)
+        .await
+        .expect("observation recovery should load");
+    assert_eq!(pending_jobs.len(), 1);
+    assert_eq!(pending_jobs[0].action, RecoveryAction::RehydrateTurnState);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -38343,21 +38358,6 @@ async fn cli_runtime_request_response_renews_running_attempt_deadlines() {
         before_wait,
     )
     .await;
-    // The request response may renew the attempt's lease and idle deadline,
-    // but the immutable hard cap must already be a future boundary.  Keeping
-    // that cap expired here would test the pre-T5 sliding-hard-deadline
-    // behavior rather than the human-response renewal contract.
-    crud_store
-        .configure_turn_item_attempt_deadlines(
-            "codex-turn-command",
-            "codex-item-command",
-            before_wait,
-            Some(before_wait.saturating_sub(10)),
-            Some(before_wait.saturating_sub(10)),
-            Some(before_wait.saturating_add(60 * 60)),
-        )
-        .await
-        .expect("hard deadline should be configured as a future immutable cap");
     let opened =
         open_test_codex_command_approval(&processor, &mut rx, workspace_id.as_str(), json!(712))
             .await;
@@ -38400,7 +38400,7 @@ async fn cli_runtime_request_response_renews_running_attempt_deadlines() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_active_command_heartbeat_renews_silent_command_deadlines() {
+async fn cli_runtime_active_command_heartbeat_renews_rolling_hard_deadline() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
     *cli_session.turn_liveness_probe.lock().await =
@@ -38418,7 +38418,7 @@ async fn cli_runtime_active_command_heartbeat_renews_silent_command_deadlines() 
             TurnItemAttemptDeadlines {
                 lease_expires_at_unix: Some(now.saturating_sub(10)),
                 idle_deadline_at_unix: Some(now.saturating_sub(10)),
-                hard_deadline_at_unix: Some(now.saturating_add(6 * 60 * 60)),
+                hard_deadline_at_unix: Some(now.saturating_sub(10)),
             },
         )
         .await
@@ -38433,6 +38433,18 @@ async fn cli_runtime_active_command_heartbeat_renews_silent_command_deadlines() 
             .await,
         1
     );
+    let renewed = turn_item_attempt::Entity::find()
+        .filter(turn_item_attempt::Column::TurnId.eq("codex-turn-command"))
+        .filter(turn_item_attempt::Column::ItemId.eq("codex-item-command"))
+        .one(&crud_store.database_connection())
+        .await
+        .expect("renewed attempt should query")
+        .expect("renewed attempt should exist");
+    assert_eq!(
+        renewed.hard_deadline_at.map(|value| value.timestamp()),
+        Some(heartbeat_now.saturating_add(60 * 60)),
+        "confirmed command activity must move the production one-hour hard horizon"
+    );
     let candidates = crud_store
         .list_timeout_candidates(heartbeat_now, 64)
         .await
@@ -38442,6 +38454,74 @@ async fn cli_runtime_active_command_heartbeat_renews_silent_command_deadlines() 
             .iter()
             .all(|candidate| candidate.item_id != "codex-item-command"),
         "active CLI command heartbeat should renew silent command idle deadlines"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_heartbeats_keep_default_policy_alive_for_four_hours() {
+    let (processor, _connection_id, _rx, workspace_id, crud_store, _cli_session) =
+        cli_runtime_approval_processor().await;
+    let started_at = chrono::Utc::now().timestamp();
+    let item = command_execution_item("codex-item-four-hour-command");
+    let policy = crate::resilience::TimeoutPolicyRegistry::default()
+        .policy_for(TurnItemType::CommandExecution);
+    let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(started_at);
+    crud_store
+        .materialize_item_started_with_attempt_deadlines(
+            ItemStartedNotification {
+                workspace_id,
+                thread_id: "thread_cli_command_approval".to_owned(),
+                turn_id: "codex-turn-command".to_owned(),
+                item,
+            },
+            started_at,
+            TurnItemAttemptDeadlines {
+                lease_expires_at_unix: Some(lease_expires_at),
+                idle_deadline_at_unix: Some(idle_deadline_at),
+                hard_deadline_at_unix: Some(hard_deadline_at),
+            },
+        )
+        .await
+        .expect("long-running command should materialize with production deadlines");
+
+    let mut heartbeat_at = started_at;
+    for hour in 1_i64..=4 {
+        heartbeat_at = started_at
+            .saturating_add(hour.saturating_mul(60 * 60))
+            .saturating_sub(hour);
+        processor
+            .timeout_supervisor
+            .heartbeat_item_attempt(
+                "codex-turn-command",
+                "codex-item-four-hour-command",
+                TurnItemType::CommandExecution,
+                heartbeat_at,
+            )
+            .await
+            .expect("confirmed command heartbeat should renew production deadlines");
+        let running = turn_item_attempt::Entity::find()
+            .filter(turn_item_attempt::Column::TurnId.eq("codex-turn-command"))
+            .filter(turn_item_attempt::Column::ItemId.eq("codex-item-four-hour-command"))
+            .one(&crud_store.database_connection())
+            .await
+            .expect("renewed attempt should load")
+            .expect("renewed attempt should remain running");
+        assert_eq!(
+            running.hard_deadline_at.map(|value| value.timestamp()),
+            Some(heartbeat_at.saturating_add(60 * 60)),
+            "hour {hour} must move the one-hour hard horizon from confirmed activity"
+        );
+    }
+
+    let candidates = crud_store
+        .list_timeout_candidates(heartbeat_at.saturating_add(1), 64)
+        .await
+        .expect("timeout candidates should query after four hours");
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.item_id != "codex-item-four-hour-command"),
+        "a command with confirmed hourly activity must remain running beyond four hours"
     );
 }
 

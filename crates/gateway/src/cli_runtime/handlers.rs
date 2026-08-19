@@ -5529,6 +5529,20 @@ impl MessageProcessor {
             let now_unix = now_timestamp_secs();
             if let Err(error) = self
                 .timeout_supervisor
+                .reactivate_timeout_source_attempt_after_runtime_activity(
+                    recovery.job_id.as_str(),
+                    now_unix,
+                )
+                .await
+            {
+                return CLIRuntimeObservationGapReconciliation::Unavailable {
+                    diagnostic: format!(
+                        "failed to restore the active native command attempt: {error:#}"
+                    ),
+                };
+            }
+            if let Err(error) = self
+                .timeout_supervisor
                 .renew_running_attempt_deadlines_after_runtime_activity(
                     binding.turn_id.as_str(),
                     now_unix,

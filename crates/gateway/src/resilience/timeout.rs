@@ -18,6 +18,15 @@ pub struct TimeoutPolicy {
     pub hard_secs: u64,
 }
 
+/// Defines whether confirmed runtime activity moves an attempt's hard
+/// deadline. Long-running commands use a rolling inactivity horizon; bounded
+/// internal operations such as context compaction retain an absolute cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardDeadlineMode {
+    Absolute,
+    RollingOnConfirmedActivity,
+}
+
 /// Authoritative runtime evidence available when a running item reaches a
 /// timeout boundary. `Unavailable` is deliberately distinct from terminal:
 /// absence of observation is not evidence that execution stopped.
@@ -29,11 +38,31 @@ pub enum RuntimeTimeoutObservation {
     Unavailable,
 }
 
-pub const fn timeout_requires_runtime_evidence(reason: TurnItemTimeoutReason) -> bool {
+pub const fn hard_deadline_mode(
+    execution_class: TurnItemExecutionClass,
+    item_type: TurnItemType,
+) -> HardDeadlineMode {
+    match (execution_class, item_type) {
+        (TurnItemExecutionClass::Standard, TurnItemType::CommandExecution) => {
+            HardDeadlineMode::RollingOnConfirmedActivity
+        }
+        _ => HardDeadlineMode::Absolute,
+    }
+}
+
+pub const fn timeout_requires_runtime_evidence(
+    reason: TurnItemTimeoutReason,
+    execution_class: TurnItemExecutionClass,
+    item_type: TurnItemType,
+) -> bool {
     matches!(
         reason,
         TurnItemTimeoutReason::LeaseExpired | TurnItemTimeoutReason::IdleDeadlineExceeded
-    )
+    ) || matches!(reason, TurnItemTimeoutReason::HardDeadlineExceeded)
+        && matches!(
+            hard_deadline_mode(execution_class, item_type),
+            HardDeadlineMode::RollingOnConfirmedActivity
+        )
 }
 
 impl TimeoutPolicy {
@@ -380,9 +409,29 @@ impl TimeoutSupervisor {
         item_type: TurnItemType,
         now_unix: i64,
     ) -> Result<()> {
-        let deadlines = self
-            .deadlines_for_stored_item(turn_id, item_id, item_type, now_unix)
+        let stored_attempt = self
+            .crud_store
+            .get_running_turn_item_attempt(turn_id, item_id)
             .await?;
+        let (policy, execution_class, stored_item_type) = match stored_attempt {
+            Some(attempt) => (
+                self.policy_registry
+                    .policy_for_execution_class(attempt.execution_class, attempt.item_type),
+                attempt.execution_class,
+                attempt.item_type,
+            ),
+            None => (
+                self.policy_registry.policy_for(item_type),
+                TurnItemExecutionClass::Standard,
+                item_type,
+            ),
+        };
+        let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(now_unix);
+        let next_hard_deadline_at = matches!(
+            hard_deadline_mode(execution_class, stored_item_type),
+            HardDeadlineMode::RollingOnConfirmedActivity
+        )
+        .then_some(hard_deadline_at);
         let _ = self
             .crud_store
             .heartbeat_turn_item_attempt(
@@ -390,8 +439,9 @@ impl TimeoutSupervisor {
                 item_id,
                 item_type,
                 now_unix,
-                deadlines.lease_expires_at_unix,
-                deadlines.idle_deadline_at_unix,
+                Some(lease_expires_at),
+                Some(idle_deadline_at),
+                next_hard_deadline_at,
             )
             .await?;
         Ok(())
@@ -414,6 +464,47 @@ impl TimeoutSupervisor {
     ) -> Result<bool> {
         self.crud_store
             .transition_timeout_candidate(candidate, now_unix)
+            .await
+    }
+
+    pub async fn reactivate_timeout_source_attempt_after_runtime_activity(
+        &self,
+        recovery_job_id: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
+        let Some(job) = self.crud_store.get_recovery_job(recovery_job_id).await? else {
+            return Ok(false);
+        };
+        let Some(source_attempt_id) = job.source_attempt_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(candidate) = self
+            .crud_store
+            .get_timed_out_attempt_candidate(source_attempt_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if !matches!(
+            hard_deadline_mode(candidate.execution_class, candidate.item_type),
+            HardDeadlineMode::RollingOnConfirmedActivity
+        ) {
+            return Ok(false);
+        }
+        let policy = self
+            .policy_registry
+            .policy_for_execution_class(candidate.execution_class, candidate.item_type);
+        let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(now_unix);
+        self.crud_store
+            .reactivate_timed_out_attempt(
+                source_attempt_id,
+                now_unix,
+                TurnItemAttemptDeadlines {
+                    lease_expires_at_unix: Some(lease_expires_at),
+                    idle_deadline_at_unix: Some(idle_deadline_at),
+                    hard_deadline_at_unix: Some(hard_deadline_at),
+                },
+            )
             .await
     }
 
@@ -445,8 +536,9 @@ impl TimeoutSupervisor {
     /// Process-local observation is deliberately not accepted by the normal
     /// renewal path.  A CLI runtime observation or a user response is a
     /// causal event received at the gateway boundary, so it is first recorded
-    /// durably and then may renew the lease/idle deadline.  The immutable hard
-    /// deadline is still never extended.
+    /// durably and then may renew the attempt's configured activity horizons.
+    /// Only command execution uses a rolling hard deadline; bounded internal
+    /// operations retain their immutable absolute cap.
     pub async fn renew_running_attempt_deadlines_after_runtime_activity(
         &self,
         turn_id: &str,
@@ -493,15 +585,17 @@ impl TimeoutSupervisor {
             let policy = self
                 .policy_registry
                 .policy_for_execution_class(attempt.execution_class, attempt.item_type);
-            let (lease_expires_at, idle_deadline_at, _) = policy.deadlines(now_unix);
+            let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(now_unix);
+            let next_hard_deadline_at = matches!(
+                hard_deadline_mode(attempt.execution_class, attempt.item_type),
+                HardDeadlineMode::RollingOnConfirmedActivity
+            )
+            .then_some(hard_deadline_at);
             let deadlines = TurnItemAttemptDeadlines {
                 lease_expires_at_unix: Some(lease_expires_at),
                 idle_deadline_at_unix: Some(idle_deadline_at),
-                hard_deadline_at_unix: None,
+                hard_deadline_at_unix: next_hard_deadline_at,
             };
-            // heartbeat_turn_item_attempt updates only lease/idle fields.  The
-            // hard deadline remains the immutable deadline assigned at attempt
-            // creation and therefore cannot be extended by a stuck actor.
             if self
                 .crud_store
                 .heartbeat_turn_item_attempt(
@@ -511,6 +605,7 @@ impl TimeoutSupervisor {
                     now_unix,
                     deadlines.lease_expires_at_unix,
                     deadlines.idle_deadline_at_unix,
+                    deadlines.hard_deadline_at_unix,
                 )
                 .await?
             {
@@ -577,6 +672,34 @@ mod tests {
             idle_deadline_at_unix: Some(1_900),
             hard_deadline_at_unix: Some(2_800),
         }
+    }
+
+    #[test]
+    fn command_hard_deadline_is_rolling_but_context_compaction_is_absolute() {
+        assert_eq!(
+            hard_deadline_mode(
+                TurnItemExecutionClass::Standard,
+                TurnItemType::CommandExecution,
+            ),
+            HardDeadlineMode::RollingOnConfirmedActivity
+        );
+        assert_eq!(
+            hard_deadline_mode(
+                TurnItemExecutionClass::ContextCompaction,
+                TurnItemType::SystemEvent,
+            ),
+            HardDeadlineMode::Absolute
+        );
+        assert!(timeout_requires_runtime_evidence(
+            TurnItemTimeoutReason::HardDeadlineExceeded,
+            TurnItemExecutionClass::Standard,
+            TurnItemType::CommandExecution,
+        ));
+        assert!(!timeout_requires_runtime_evidence(
+            TurnItemTimeoutReason::HardDeadlineExceeded,
+            TurnItemExecutionClass::ContextCompaction,
+            TurnItemType::SystemEvent,
+        ));
     }
 
     fn turn_liveness(at_unix: i64, sequence: i64) -> TurnLivenessRecord {

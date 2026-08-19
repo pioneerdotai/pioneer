@@ -86,6 +86,7 @@ struct RetainedProviderHistoryRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutRecoveryPolicySource {
+    CliRuntimeBinding,
     ItemTypeRegistry,
     ToolItemSnapshot,
     ToolItemMissingSnapshot,
@@ -94,6 +95,7 @@ enum TimeoutRecoveryPolicySource {
 impl TimeoutRecoveryPolicySource {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::CliRuntimeBinding => "cli_runtime_binding",
             Self::ItemTypeRegistry => "item_type_registry",
             Self::ToolItemSnapshot => "tool_item_snapshot",
             Self::ToolItemMissingSnapshot => "tool_item_missing_snapshot",
@@ -3659,6 +3661,39 @@ impl RecoveryCoordinator {
         &self,
         candidate: &TimeoutCandidate,
     ) -> Result<TimeoutRecoveryPolicyDecision> {
+        // Rehydrating an already-started native CLI turn is observation, not
+        // replay. Prefer its durable binding over the tool replay policy so a
+        // missing or non-idempotent tool snapshot cannot hide an execution
+        // that Codex/Claude may still be running.
+        if candidate.execution_class == pioneer_protocol::TurnItemExecutionClass::Standard
+            && candidate.item_type == TurnItemType::CommandExecution
+            && let Some(binding) = self
+                .crud_store
+                .get_cli_runtime_turn_binding(candidate.turn_id.as_str())
+                .await?
+            && matches!(
+                binding.status.as_str(),
+                crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING
+                    | crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+            )
+            && binding
+                .native_turn_id
+                .as_deref()
+                .is_some_and(|native_turn_id| !native_turn_id.trim().is_empty())
+        {
+            return Ok(TimeoutRecoveryPolicyDecision {
+                policy: RecoveryPolicy {
+                    action: RecoveryAction::RehydrateTurnState,
+                    max_attempts: 3,
+                    base_backoff_secs: 2,
+                    max_wall_clock_secs: TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
+                    no_progress_limit: 3,
+                },
+                policy_source: TimeoutRecoveryPolicySource::CliRuntimeBinding,
+                tool_snapshot: None,
+            });
+        }
+
         let base_policy = self
             .policy_registry
             .policy_for_item_type(candidate.item_type);
@@ -8078,6 +8113,101 @@ mod tests {
                 .and_then(|value| value.as_i64()),
             Some(0)
         );
+    }
+
+    #[tokio::test]
+    async fn cli_binding_rehydration_precedes_missing_tool_replay_snapshot() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let workspace_id = "ws_cli_timeout_rehydrate";
+        let thread_id = "thr_cli_timeout_rehydrate";
+        let turn_id = "turn_cli_timeout_rehydrate";
+        let item_id = "command_cli_timeout_rehydrate";
+        materialize_turn_with_tool_item(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            "setup_web_fetch_cli_timeout_rehydrate",
+            None,
+        )
+        .await;
+        crud_store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::CommandExecution {
+                        id: item_id.to_owned(),
+                        tool_name: "shell".to_owned(),
+                        arguments: serde_json::json!({"cmd": "cargo test"}),
+                        status: ToolCallStatus::InProgress,
+                        recovery_policy: None,
+                        output_policy: ToolOutputPolicySnapshot::for_tool_name("shell"),
+                        display: ToolDisplayPayload::Hidden,
+                        storage: ToolStoragePayload::Metadata {
+                            metadata: pioneer_protocol::ToolMetadata::empty(),
+                        },
+                        recovery: None,
+                        command: vec!["cargo".to_owned(), "test".to_owned()],
+                        cwd: Some("/tmp/project".to_owned()),
+                        success: None,
+                        outcome: None,
+                        observation: None,
+                    },
+                },
+                1_700_000_001,
+            )
+            .await
+            .expect("CLI command item should materialize");
+        let timestamp = chrono::Utc::now().fixed_offset();
+        crud_store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread-timeout-rehydrate".to_owned(),
+                native_turn_id: Some("native-turn-timeout-rehydrate".to_owned()),
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: Some("on-request".to_owned()),
+                input_mapping_json: "{}".to_owned(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .await
+            .expect("CLI runtime binding should persist");
+
+        let job = coordinator
+            .enqueue_timeout_job(
+                &timeout_candidate(
+                    "attempt_cli_timeout_rehydrate",
+                    turn_id,
+                    item_id,
+                    TurnItemType::CommandExecution,
+                ),
+                1_700_000_010,
+            )
+            .await
+            .expect("timeout should enqueue native state rehydration")
+            .into_job();
+
+        assert_eq!(job.action, RecoveryAction::RehydrateTurnState);
+        assert_eq!(job.max_attempts, 3);
+        assert_eq!(
+            job.policy_snapshot
+                .get("policy_source")
+                .and_then(|value| value.as_str()),
+            Some("cli_runtime_binding")
+        );
+        assert!(job.policy_snapshot.get("tool_recovery_policy").is_none());
     }
 
     #[tokio::test]

@@ -18681,6 +18681,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         heartbeat_at_unix: i64,
         lease_expires_at_unix: Option<i64>,
         idle_deadline_at_unix: Option<i64>,
+        hard_deadline_at_unix: Option<i64>,
     ) -> Result<bool> {
         self.run_serialized_write(|| async {
             let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
@@ -18691,6 +18692,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 heartbeat_at,
                 lease_expires_at_unix.map(unix_to_datetime),
                 idle_deadline_at_unix.map(unix_to_datetime),
+                hard_deadline_at_unix.map(unix_to_datetime),
             )
             .await?;
             if !updated {
@@ -19416,6 +19418,65 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 .context("failed to commit timeout transition transaction")?;
 
             Ok(true)
+        })
+        .await
+    }
+
+    pub async fn get_timed_out_attempt_candidate(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<TimeoutCandidate>> {
+        let Some(row) =
+            turn_item_attempt::find_timed_out_attempt_by_id(&self.connection, attempt_id).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(TimeoutCandidate {
+            attempt_id: row.id,
+            turn_id: row.turn_id,
+            item_id: row.item_id,
+            item_type: row.item_type,
+            execution_class: row.execution_class,
+            attempt_number: row.attempt_number,
+            timeout_reason: row.timeout_reason,
+            started_at_unix: row.started_at.timestamp(),
+            started_event_sequence: row.started_event_sequence,
+            last_heartbeat_at_unix: row.last_heartbeat_at.map(|value| value.timestamp()),
+            lease_expires_at_unix: row.lease_expires_at.map(|value| value.timestamp()),
+            idle_deadline_at_unix: row.idle_deadline_at.map(|value| value.timestamp()),
+            hard_deadline_at_unix: row.hard_deadline_at.map(|value| value.timestamp()),
+        }))
+    }
+
+    pub async fn reactivate_timed_out_attempt(
+        &self,
+        attempt_id: &str,
+        heartbeat_at_unix: i64,
+        deadlines: TurnItemAttemptDeadlines,
+    ) -> Result<bool> {
+        let attempt_id = attempt_id.to_owned();
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin timed_out attempt reactivation transaction")?;
+            let reactivated = turn_item_attempt::reactivate_timed_out_attempt(
+                &transaction,
+                attempt_id.as_str(),
+                unix_to_datetime(heartbeat_at_unix),
+                turn_item_attempt::AttemptDeadlines {
+                    lease_expires_at: deadlines.lease_expires_at_unix.map(unix_to_datetime),
+                    idle_deadline_at: deadlines.idle_deadline_at_unix.map(unix_to_datetime),
+                    hard_deadline_at: deadlines.hard_deadline_at_unix.map(unix_to_datetime),
+                },
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit timed_out attempt reactivation")?;
+            Ok(reactivated)
         })
         .await
     }
@@ -32670,7 +32731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_transition_terminalizes_payload_and_attempt_metadata() {
+    async fn timeout_transition_terminalizes_and_runtime_rehydration_restores_source_attempt() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -32746,6 +32807,134 @@ mod tests {
             panic!("expected web_fetch payload");
         };
         assert_eq!(status, ToolCallStatus::Failed);
+
+        assert!(
+            store
+                .reactivate_timed_out_attempt(
+                    candidates[0].attempt_id.as_str(),
+                    timestamp + 4,
+                    TurnItemAttemptDeadlines {
+                        lease_expires_at_unix: Some(timestamp + 104),
+                        idle_deadline_at_unix: Some(timestamp + 104),
+                        hard_deadline_at_unix: Some(timestamp + 104),
+                    },
+                )
+                .await
+                .expect("authoritative active runtime should reactivate its source attempt")
+        );
+        let restored =
+            crate::repositories::turn::find_turn_item(&store.connection, turn_id, item_id)
+                .await
+                .expect("restored turn_item lookup should succeed")
+                .expect("restored turn_item row should exist");
+        assert_eq!(restored.status.as_deref(), Some("in_progress"));
+        assert_eq!(restored.active_attempt_status.as_deref(), Some("running"));
+        let restored_payload: TurnItem = serde_json::from_str(restored.payload.as_str())
+            .expect("restored payload should decode");
+        assert!(matches!(
+            restored_payload,
+            TurnItem::WebFetch {
+                status: ToolCallStatus::InProgress,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn timeout_transition_rejects_candidate_stale_after_heartbeat() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let store = CrudStore::new(connection);
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_timeout_stale_candidate";
+        let thread_id = "thr_timeout_stale_candidate";
+        let turn_id = "turn_timeout_stale_candidate";
+        let item_id = "item_timeout_stale_candidate";
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("turn start should persist");
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: safe_web_fetch_item(item_id),
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("item start should persist");
+        store
+            .configure_turn_item_attempt_deadlines(
+                turn_id,
+                item_id,
+                timestamp + 1,
+                Some(timestamp + 2),
+                Some(timestamp + 2),
+                Some(timestamp + 2),
+            )
+            .await
+            .expect("expired deadlines should be configured");
+
+        let candidates = store
+            .list_timeout_candidates(timestamp + 3, 8)
+            .await
+            .expect("timeout candidate list should succeed");
+        assert_eq!(candidates.len(), 1);
+
+        assert!(
+            store
+                .heartbeat_turn_item_attempt(
+                    turn_id,
+                    item_id,
+                    TurnItemType::WebFetch,
+                    timestamp + 3,
+                    Some(timestamp + 103),
+                    Some(timestamp + 103),
+                    Some(timestamp + 103),
+                )
+                .await
+                .expect("heartbeat should move every deadline")
+        );
+        assert!(
+            !store
+                .transition_timeout_candidate(&candidates[0], timestamp + 3)
+                .await
+                .expect("stale timeout transition should be rejected"),
+            "a timeout candidate must not survive a newer heartbeat frontier"
+        );
+
+        let row = crate::repositories::turn::find_turn_item(&store.connection, turn_id, item_id)
+            .await
+            .expect("turn_item lookup should succeed")
+            .expect("turn_item row should exist");
+        assert_eq!(row.status.as_deref(), Some("in_progress"));
+        assert_eq!(row.active_attempt_status.as_deref(), Some("running"));
+        let payload: TurnItem =
+            serde_json::from_str(row.payload.as_str()).expect("payload should decode");
+        assert!(matches!(
+            payload,
+            TurnItem::WebFetch {
+                status: ToolCallStatus::InProgress,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -32920,6 +33109,7 @@ mod tests {
                     timestamp + 5,
                     Some(timestamp + 905),
                     Some(timestamp + 905),
+                    None,
                 )
                 .await
                 .expect("heartbeat should persist")

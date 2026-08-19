@@ -3901,6 +3901,8 @@ impl MessageProcessor {
                 crate::resilience::RuntimeTimeoutObservation::Active
                     if crate::resilience::timeout_requires_runtime_evidence(
                         candidate.timeout_reason,
+                        candidate.execution_class,
+                        candidate.item_type,
                     ) =>
                 {
                     continue;
@@ -3908,6 +3910,8 @@ impl MessageProcessor {
                 crate::resilience::RuntimeTimeoutObservation::Unavailable
                     if crate::resilience::timeout_requires_runtime_evidence(
                         candidate.timeout_reason,
+                        candidate.execution_class,
+                        candidate.item_type,
                     ) =>
                 {
                     let reason = format!(
