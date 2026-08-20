@@ -144,6 +144,7 @@ const MCP_TOOL_BUNDLE_PRIORITY: i32 = 300;
 const TURN_TOOL_BUNDLE_PRIORITY: i32 = 250;
 const TASK_TOOL_BUNDLE_PRIORITY: i32 = 200;
 const MAX_CONSECUTIVE_REJECTED_NO_TOOL_ROUNDS: usize = 3;
+const ATTACHED_TASK_FINALIZATION_WAIT_MS: u64 = 5_000;
 
 fn readable_agent_skill_overlay(
     agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
@@ -2718,29 +2719,17 @@ async fn materialize_turn_tooling(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
-) -> TurnToolMaterialization {
+) -> Result<TurnToolMaterialization, String> {
     let Some(provider) = provider else {
-        return TurnToolMaterialization::default();
+        return Ok(TurnToolMaterialization::default());
     };
-    match provider
+    provider
         .materialize_turn_tools(TurnToolContext {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
         })
         .await
-    {
-        Ok(materialization) => materialization,
-        Err(error) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = error.as_str(),
-                "failed to materialize turn tools"
-            );
-            TurnToolMaterialization::default()
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -2869,6 +2858,28 @@ async fn attached_task_finalization_snapshot(
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
         })
+        .await
+        .map(Some)
+}
+
+async fn wait_for_attached_task_finalization_snapshot(
+    provider: Option<&Arc<dyn TaskToolProvider>>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<TaskFinalizationSnapshot>, String> {
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+    provider
+        .wait_for_attached_task_finalization_snapshot(
+            TaskTurnContext {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+            },
+            ATTACHED_TASK_FINALIZATION_WAIT_MS,
+        )
         .await
         .map(Some)
 }
@@ -3510,17 +3521,23 @@ async fn execute_agent_provider_response(
     }
     let include_task_orchestration_policy = !task_materialization.bundles.is_empty();
 
-    let turn_tool_materialization = if provider_tool_calling {
-        materialize_turn_tooling(
-            turn_tool_provider.as_ref(),
-            workspace_id,
-            thread_id,
-            turn_id,
-        )
-        .await
-    } else {
-        TurnToolMaterialization::default()
-    };
+    // agent domain root execution admission is part of Agent response
+    // admission, not an optional consequence of native tool calling. The
+    // provider materializes the durable responding execution here even for a
+    // model/backend that cannot receive tools, and any admission failure must
+    // stop before the first external provider request.
+    let turn_tool_materialization = materialize_turn_tooling(
+        turn_tool_provider.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+    )
+    .await
+    .map_err(|error| {
+        ChatTurnError::Terminal(format!(
+            "failed to admit durable Agent execution before provider start: {error}"
+        ))
+    })?;
     for diagnostic in &turn_tool_materialization.diagnostics {
         warn!(
             thread_id,
@@ -4564,7 +4581,7 @@ async fn execute_agent_provider_response(
                 && let Some(final_text) =
                     task_mutation_finalization_guard.deterministic_failure_message()
             {
-                let final_task_gate_snapshot = match attached_task_finalization_snapshot(
+                let final_task_gate_snapshot = match wait_for_attached_task_finalization_snapshot(
                     task_tool_provider.as_ref(),
                     workspace_id,
                     thread_id,
@@ -4863,7 +4880,7 @@ async fn execute_agent_provider_response(
                 // text.  Take one fresh aggregate read immediately before
                 // evaluating review/pending/terminal state and committing
                 // the finalization snapshot event.
-                let final_task_gate_snapshot = match attached_task_finalization_snapshot(
+                let final_task_gate_snapshot = match wait_for_attached_task_finalization_snapshot(
                     task_tool_provider.as_ref(),
                     workspace_id,
                     thread_id,

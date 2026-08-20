@@ -557,6 +557,25 @@ pub trait TaskToolProvider: Send + Sync {
         })
     }
 
+    /// Wait for a bounded interval while attached work is still pending, then
+    /// return a fresh logical finalization snapshot. Runtime providers should
+    /// override this with their durable Task event wait; the default keeps
+    /// lightweight providers fair without requiring an event source.
+    async fn wait_for_attached_task_finalization_snapshot(
+        &self,
+        context: TaskTurnContext,
+        timeout_ms: u64,
+    ) -> Result<TaskFinalizationSnapshot, String> {
+        let snapshot = self
+            .attached_task_finalization_snapshot(context.clone())
+            .await?;
+        if snapshot.pending.is_empty() || timeout_ms == 0 {
+            return Ok(snapshot);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+        self.attached_task_finalization_snapshot(context).await
+    }
+
     async fn pending_attached_tasks(
         &self,
         context: TaskTurnContext,
@@ -1244,6 +1263,13 @@ impl AgentManager {
 
     pub async fn set_task_tool_provider(&self, provider: Option<Arc<dyn TaskToolProvider>>) {
         *self.task_tool_provider.write().await = provider;
+    }
+
+    /// Return the currently installed task-tool bridge for server-owned
+    /// execution adapters.  The provider remains behind the trait boundary;
+    /// callers cannot inspect or replace its internal authorization state.
+    pub async fn task_tool_provider(&self) -> Option<Arc<dyn TaskToolProvider>> {
+        self.task_tool_provider.read().await.clone()
     }
 
     pub async fn set_turn_tool_provider(&self, provider: Option<Arc<dyn TurnToolProvider>>) {
