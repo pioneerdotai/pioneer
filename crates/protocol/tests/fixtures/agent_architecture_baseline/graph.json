@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "network": "none",
+  "workspace": {
+    "id": "W",
+    "participants": ["Alice", "Bob", "Carol"]
+  },
+  "roots": [
+    {"id": "A", "visibility": "shared", "members": ["Alice", "Bob"], "execution": "A1"},
+    {"id": "B", "visibility": "private", "members": ["Alice", "Carol"]},
+    {"id": "C", "visibility": "private", "members": ["Carol"]},
+    {"id": "D", "visibility": "workspace", "members": ["Alice", "Bob", "Carol"]}
+  ],
+  "executions": [
+    {"id": "A1", "root": "A", "agent": "pioneer", "state": "running"}
+  ],
+  "agents": [
+    {"id": "pioneer", "source": "native", "display_name": "Pioneer", "nickname": "pioneer", "runtime_id": "native-runtime-1", "config_id": "pioneer-native"},
+    {"id": "reviewer-n1", "source": "native", "display_name": "Reviewer N1", "nickname": "reviewer-n1", "runtime_id": "native-runtime-1", "config_id": "reviewer-n1"},
+    {"id": "codex-c1", "source": "cli", "display_name": "Codex C1", "nickname": "codex-c1", "runtime_id": "codex-c1", "config_id": "codex-c1"},
+    {"id": "codex-c2", "source": "cli", "display_name": "Codex C2", "nickname": "codex-c2", "runtime_id": "codex-c2", "config_id": "codex-c2"},
+    {"id": "claude-h1", "source": "cli", "display_name": "Claude H1", "nickname": "claude-h1", "runtime_id": "claude-h1", "config_id": "claude-h1"},
+    {"id": "ephemeral-a3", "source": "ephemeral", "display_name": "Ephemeral A3", "nickname": "ephemeral-a3", "runtime_id": null, "config_id": null}
+  ],
+  "native_configs": [
+    {"id": "pioneer-native", "runtime_id": "native-runtime-1", "display_name": "Pioneer", "nickname": "pioneer"},
+    {"id": "reviewer-n1", "runtime_id": "native-runtime-1", "display_name": "Reviewer N1", "nickname": "reviewer-n1"}
+  ],
+  "cli_instances": [
+    {"id": "codex-c1", "kind": "codex", "binary": "/fixture/bin/codex-c1", "home": "/fixture/home/codex-c1", "display_name": "Codex C1", "nickname": "codex-c1"},
+    {"id": "codex-c2", "kind": "codex", "binary": "/fixture/bin/codex-c2", "home": "/fixture/home/codex-c2", "display_name": "Codex C2", "nickname": "codex-c2"},
+    {"id": "claude-h1", "kind": "claude", "binary": "/fixture/bin/claude-h1", "home": "/fixture/home/claude-h1", "display_name": "Claude H1", "nickname": "claude-h1"}
+  ],
+  "routes": [
+    {"id": "route-live", "source": "A", "target": "B", "status": "live", "actions": ["send_message"]},
+    {"id": "route-restart", "source": "A", "target": "D", "status": "restart_pending", "actions": ["send_message", "start_agent"]},
+    {"id": "route-revoked", "source": "A", "target": "C", "status": "revoked", "actions": ["send_message"]}
+  ],
+  "scenarios": [
+    {
+      "id": "sequential-chain-depth-boundary",
+      "kind": "sequential_chain",
+      "root": "A",
+      "steps": ["A1", "A2", "A3", "A4"],
+      "observed_baseline": {"boundary": "A4", "admission": "separate_child_quota_lease"},
+      "target_invariants": ["authorized_chain_reaches_boundary", "boundary_plus_one_rejects_only_new_child"]
+    },
+    {
+      "id": "parallel-fanout-permit-saturation",
+      "kind": "parallel_fanout",
+      "root": "A",
+      "children": ["reviewer-n1", "codex-c1", "codex-c2", "claude-h1", "ephemeral-a3"],
+      "permits": 2,
+      "observed_baseline": {"admission": "each_child_reserves_full_execution_slot", "saturation": "authorized_child_can_fail_at_admission"},
+      "target_invariants": ["queued_children_are_durable", "release_starts_next_child", "flat_turn_and_other_root_remain_alive"]
+    },
+    {
+      "id": "observation-loss-one-child",
+      "kind": "observation_loss",
+      "root": "A",
+      "lost_child": "codex-c1",
+      "siblings": ["codex-c2", "claude-h1"],
+      "observed_baseline": {"unknown_observation": "treated_as_terminal", "blast_radius": "parent_or_sibling_can_be_closed"},
+      "target_invariants": ["unknown_observation_is_not_terminal", "other_children_continue", "parent_stays_recoverable"]
+    },
+    {
+      "id": "local-payload-overflow-one-sibling",
+      "kind": "payload_overflow",
+      "root": "A",
+      "offending_child": "codex-c1",
+      "siblings": ["codex-c2", "claude-h1"],
+      "observed_baseline": {"limit": "single_frame_or_response", "blast_radius": "shared_transport_or_parent"},
+      "target_invariants": ["request_fails_exactly", "shared_transport_stays_usable", "siblings_continue"]
+    },
+    {
+      "id": "fair-runnable-branch",
+      "kind": "fairness",
+      "root": "A",
+      "busy_branch": "codex-c1",
+      "waiting_sibling": "codex-c2",
+      "observed_baseline": {"scheduler": "continuously_runnable_branch_can_reclaim_permit", "heartbeat": "aggregate_or_foreign_activity_can_mask_stall"},
+      "target_invariants": ["waiting_sibling_eventually_gets_permit", "heartbeat_renews_only_exact_execution", "hard_deadline_is_not_renewed_by_sibling"]
+    },
+    {
+      "id": "route-state-replay",
+      "kind": "route_lifecycle",
+      "routes": ["route-live", "route-restart", "route-revoked"],
+      "target_invariants": ["live_route_allows_declared_action", "restart_replays_state", "revoked_route_has_zero_target_writes"]
+    }
+  ]
+}
