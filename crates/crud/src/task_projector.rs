@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use pioneer_protocol::{
-    TaskError, TaskErrorClass, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind, TaskRunStatus,
-    TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
-    TaskValue, ThreadLineage,
+    PersistedActorRef, TaskDelivery, TaskDeliveryMode, TaskDeliveryStatus, TaskError,
+    TaskErrorClass, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
+    TaskResultReviewerRef, TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskValue, ThreadLineage,
 };
 use sea_orm::ConnectionTrait;
 use std::collections::BTreeMap;
@@ -13,8 +14,8 @@ use tracing::warn;
 
 use crate::convention::{is_terminal_task_status_db, task_run_status_from_db, task_status_from_db};
 use crate::repositories::{
-    ProjectionWriteOutcome, task, task_agent_spec, task_delivery, task_dependency,
-    task_result_candidate, task_result_review_event, task_run, task_run_execution,
+    ProjectionWriteOutcome, task, task_actor_contract, task_agent_spec, task_delivery,
+    task_dependency, task_result_candidate, task_result_review_event, task_run, task_run_execution,
     task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread_lineage,
 };
 use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
@@ -515,6 +516,7 @@ impl TaskProjector {
                             run_id: review_event.run_id.clone(),
                             task_run_turn_id: review_event.task_run_turn_id.clone(),
                             reviewer_kind: review_event.reviewer_kind,
+                            reviewer: review_event.reviewer.clone(),
                             reviewer_thread_id: review_event.reviewer_thread_id.clone(),
                             reviewer_turn_id: review_event.reviewer_turn_id.clone(),
                             reviewer_user_id: review_event.reviewer_user_id.clone(),
@@ -705,15 +707,23 @@ impl TaskProjector {
                 handle_projection_outcome("depth_limit_task_failed", task_id, &outcome)?;
                 Ok(())
             }),
-            TaskEventPayload::DeliveryQueued { delivery }
-            | TaskEventPayload::DeliveryCancelled { delivery, .. } => {
-                project_future(task_delivery::upsert_delivery(db, delivery))
+            TaskEventPayload::DeliveryQueued { delivery } => {
+                project_future(project_task_delivery(db, delivery))
             }
+            TaskEventPayload::DeliveryCancelled {
+                delivery, attempt, ..
+            } => project_future(async move {
+                project_task_delivery(db, delivery).await?;
+                if let Some(attempt) = attempt {
+                    task_delivery::upsert_attempt(db, attempt).await?;
+                }
+                Ok(())
+            }),
             TaskEventPayload::DeliveryStarted { delivery, attempt }
             | TaskEventPayload::DeliveryDelivered { delivery, attempt }
             | TaskEventPayload::DeliveryFailed { delivery, attempt } => {
                 project_future(async move {
-                    task_delivery::upsert_delivery(db, delivery).await?;
+                    project_task_delivery(db, delivery).await?;
                     task_delivery::upsert_attempt(db, attempt).await
                 })
             }
@@ -727,6 +737,109 @@ impl TaskProjector {
         };
         future.await
     }
+}
+
+async fn project_task_delivery<C: ConnectionTrait + Sync>(
+    db: &C,
+    delivery: &TaskDelivery,
+) -> Result<()> {
+    task_delivery::upsert_delivery(db, delivery).await?;
+    let contract = task_actor_contract::find_task_actor_contract(db, &delivery.task_id)
+        .await?
+        .context("Task delivery is missing its immutable actor contract")?;
+    contract
+        .delivery
+        .validate()
+        .map_err(|error| anyhow::anyhow!("Task delivery actor contract is invalid: {error:?}"))?;
+    if contract.workspace_id != delivery.workspace_id || !contract.delivery.enabled {
+        anyhow::bail!("Task delivery differs from its immutable actor contract");
+    }
+    let exact_destination = match delivery.mode {
+        TaskDeliveryMode::Thread => {
+            delivery.target_thread_id == contract.delivery.destination_thread_id
+        }
+        TaskDeliveryMode::UserNotification => {
+            delivery.target_user_id == contract.delivery.destination_user_id
+        }
+        TaskDeliveryMode::Webhook => {
+            delivery.webhook_url_fingerprint
+                == contract.delivery.destination_webhook_url_fingerprint
+        }
+        TaskDeliveryMode::None => false,
+    };
+    if !exact_destination {
+        anyhow::bail!("Task delivery rewrites its immutable destination");
+    }
+    let task = task::find_task_by_id(db, &delivery.task_id)
+        .await?
+        .context("Task delivery has no Task")?;
+    let author = if task.executor_kind == "agent" && delivery.error_snapshot.is_none() {
+        let occurrence = task_actor_contract::find_task_occurrence_by_run_id(db, &delivery.run_id)
+            .await?
+            .context("Agent Task delivery has no exact occurrence")?;
+        if occurrence.task_id != delivery.task_id {
+            anyhow::bail!("Agent Task delivery occurrence belongs to another Task");
+        }
+        let execution_id = occurrence
+            .agent_execution_id
+            .context("Agent Task result has no exact execution author")?;
+        PersistedActorRef::AgentExecution(
+            pioneer_protocol::AgentExecutionId::new(execution_id).map_err(|error| {
+                anyhow::anyhow!("Task delivery execution id is invalid: {error:?}")
+            })?,
+        )
+    } else {
+        PersistedActorRef::System
+    };
+    let reviewer = if delivery.error_snapshot.is_some() {
+        None
+    } else {
+        let candidate = task_result_candidate::find_candidate_by_run_and_status(
+            db,
+            &delivery.run_id,
+            TaskResultCandidateStatus::Accepted,
+        )
+        .await?;
+        let review_id = candidate
+            .and_then(|candidate| candidate.final_review_event_id)
+            .context("Task result delivery has no exact final review event")?;
+        let event = task_result_review_event::find_review_event_by_id(db, &review_id)
+            .await?
+            .context("Task delivery final review event disappeared")?;
+        if event.task_id != delivery.task_id
+            || event.run_id != delivery.run_id
+            || event.decision != "accept"
+        {
+            anyhow::bail!("Task delivery final reviewer has different immutable lineage");
+        }
+        Some(serde_json::from_str::<TaskResultReviewerRef>(
+            event.reviewer_ref_json.as_str(),
+        )?)
+    };
+    let status = match delivery.status {
+        TaskDeliveryStatus::Pending => "pending",
+        TaskDeliveryStatus::Delivering => "delivering",
+        TaskDeliveryStatus::Delivered => "delivered",
+        TaskDeliveryStatus::Failed => "failed",
+        TaskDeliveryStatus::Cancelled => "cancelled",
+    };
+    let author_json = serde_json::to_string(&author)?;
+    let reviewer_json = reviewer.as_ref().map(serde_json::to_string).transpose()?;
+    task_actor_contract::upsert_task_delivery_authority(
+        db,
+        &delivery.id,
+        &delivery.task_id,
+        &delivery.run_id,
+        &author_json,
+        reviewer_json.as_deref(),
+        contract.delivery.route_id.as_deref(),
+        contract.delivery.route_receipt_json.as_deref(),
+        contract.delivery.disclosure_generation,
+        &delivery.delivery_key,
+        status,
+        delivery.updated_at,
+    )
+    .await
 }
 
 async fn task_is_terminal_db<C: ConnectionTrait + Sync>(db: &C, task_id: &str) -> Result<bool> {
@@ -866,6 +979,7 @@ async fn project_legacy_auto_accepted_candidate<C: ConnectionTrait>(
             run_id: run_id.to_owned(),
             task_run_turn_id: task_run_turn.id,
             reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+            reviewer: pioneer_protocol::TaskResultReviewerRef::RuntimePolicy,
             reviewer_thread_id: None,
             reviewer_turn_id: None,
             reviewer_user_id: None,

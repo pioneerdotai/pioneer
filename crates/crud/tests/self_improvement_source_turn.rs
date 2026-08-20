@@ -51,6 +51,7 @@ fn thread(
         id: thread_id.to_owned(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "gpt-5.4".to_owned(),
         model_provider: "openai".to_owned(),
@@ -159,6 +160,7 @@ async fn seed_successful_collaborative_delivery(
         labels: vec!["composer".to_owned()],
         data: None,
         composer_work: Some(TaskComposerWork::v1(TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: parent_thread.id.clone(),
             turn_id: parent_turn.id.clone(),
             input: Vec::new(),
@@ -167,6 +169,7 @@ async fn seed_successful_collaborative_delivery(
             model_provider: Some("openai".to_owned()),
             sandbox_policy: None,
             mode: Some(ThreadMode::Agent),
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,

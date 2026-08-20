@@ -22,6 +22,7 @@ use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
 
 const DB_ID_LEN: usize = 21;
 const TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES: usize = 1_048_576;
+const TURN_AGENT_AUTHOR_SNAPSHOT_JSON_MAX_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedTurnCollaboration {
@@ -230,9 +231,6 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         turn::Column::Error,
         turn::Column::UpdatedAt,
         turn::Column::SendMode,
-        turn::Column::AuthorDisplayNameSnapshot,
-        turn::Column::AuthorNicknameSnapshot,
-        turn::Column::AuthorAvatarRevisionSnapshot,
         turn::Column::ReplyToTurnId,
         turn::Column::MentionsJson,
         turn::Column::MessageRevision,
@@ -269,19 +267,44 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
             anyhow::bail!("Turn author snapshot does not match its persisted initiator");
         }
     }
+    if let Some(existing) = existing_collaboration.as_ref()
+        && existing.send_mode.is_some()
+    {
+        let persisted = collaboration_from_model(existing).with_context(|| {
+            format!("turn `{turn_id}` has invalid immutable collaboration facts")
+        })?;
+        if turn_model.author.is_some() && persisted.author != turn_model.author {
+            anyhow::bail!("Turn author snapshot cannot change after initial persistence");
+        }
+    }
     let author = turn_model
         .author
         .as_ref()
         .map(|snapshot| {
             validate_turn_author_snapshot(snapshot)?;
+            let agent_json = snapshot
+                .agent
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("failed to encode Turn agent author snapshot")?;
+            if agent_json
+                .as_ref()
+                .is_some_and(|json| json.len() > TURN_AGENT_AUTHOR_SNAPSHOT_JSON_MAX_BYTES)
+            {
+                anyhow::bail!(
+                    "Turn agent author snapshot exceeds {TURN_AGENT_AUTHOR_SNAPSHOT_JSON_MAX_BYTES} bytes"
+                );
+            }
             Ok::<_, anyhow::Error>((
                 Some(snapshot.display_name.clone()),
                 Some(snapshot.nickname.clone()),
                 snapshot.avatar_revision.clone(),
+                agent_json,
             ))
         })
         .transpose()?
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, None, None));
     let mentions_json = canonical_turn_mentions_json(&turn_model.mentions)?;
     let message_revision = i64::try_from(turn_model.message_revision)
         .context("Turn message revision exceeds database integer range")?;
@@ -290,6 +313,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         author_display_name_snapshot,
         author_nickname_snapshot,
         author_avatar_revision_snapshot,
+        author_agent_snapshot_json,
         reply_to_turn_id,
         mentions_json,
         message_revision,
@@ -302,6 +326,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
             existing.author_display_name_snapshot.clone(),
             existing.author_nickname_snapshot.clone(),
             existing.author_avatar_revision_snapshot.clone(),
+            existing.author_agent_snapshot_json.clone(),
             existing.reply_to_turn_id.clone(),
             existing.mentions_json.clone(),
             existing.message_revision,
@@ -312,6 +337,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
             author.0,
             author.1,
             author.2,
+            author.3,
             turn_model.reply_to_turn_id.clone(),
             mentions_json,
             message_revision,
@@ -354,6 +380,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         author_display_name_snapshot: Set(author_display_name_snapshot),
         author_nickname_snapshot: Set(author_nickname_snapshot),
         author_avatar_revision_snapshot: Set(author_avatar_revision_snapshot),
+        author_agent_snapshot_json: Set(author_agent_snapshot_json),
         reply_to_turn_id: Set(reply_to_turn_id),
         mentions_json: Set(mentions_json),
         message_revision: Set(message_revision),
@@ -382,17 +409,38 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
         model.initiated_by_actor_id.as_deref(),
     )
     .context("Turn has an invalid persisted initiator pair")?;
+    if model.author_agent_snapshot_json.is_some()
+        && (!matches!(actor.as_ref(), Some(PersistedActorRef::AgentExecution(_)))
+            || model.author_display_name_snapshot.is_none()
+            || model.author_nickname_snapshot.is_none())
+    {
+        anyhow::bail!("Turn has an agent author snapshot outside a complete AgentExecution author");
+    }
     let author = match (
         actor,
         model.author_display_name_snapshot.as_ref(),
         model.author_nickname_snapshot.as_ref(),
     ) {
         (Some(actor), Some(display_name), Some(nickname)) => {
+            let agent = model
+                .author_agent_snapshot_json
+                .as_deref()
+                .map(|json| {
+                    if json.len() > TURN_AGENT_AUTHOR_SNAPSHOT_JSON_MAX_BYTES {
+                        anyhow::bail!(
+                            "persisted Turn agent author snapshot exceeds {TURN_AGENT_AUTHOR_SNAPSHOT_JSON_MAX_BYTES} bytes"
+                        );
+                    }
+                    serde_json::from_str(json)
+                        .context("failed to decode persisted Turn agent author snapshot")
+                })
+                .transpose()?;
             let snapshot = TurnAuthorSnapshot {
                 actor,
                 display_name: display_name.clone(),
                 nickname: nickname.clone(),
                 avatar_revision: model.author_avatar_revision_snapshot.clone(),
+                agent,
             };
             validate_turn_author_snapshot(&snapshot)?;
             Some(snapshot)
@@ -403,6 +451,9 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
                 PersistedActorRef::Principal(principal_id) => {
                     (principal_id.to_string(), principal_id.to_string())
                 }
+                PersistedActorRef::AgentExecution(execution_id) => {
+                    (execution_id.to_string(), format!("agent-{}", execution_id))
+                }
                 PersistedActorRef::System => ("System".to_owned(), "system".to_owned()),
             };
             Some(TurnAuthorSnapshot {
@@ -410,6 +461,7 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
                 display_name,
                 nickname,
                 avatar_revision: None,
+                agent: None,
             })
         }
         _ => anyhow::bail!("Turn has an incomplete persisted author snapshot"),
@@ -1367,6 +1419,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persisted_agent_collaboration_roundtrips_the_exact_immutable_snapshot() {
+        let mut model =
+            collaboration_test_turn(Some("message"), Some("Builder"), Some("builder"), "[]");
+        model.initiated_by_actor_kind = Some("agent_execution".to_owned());
+        model.initiated_by_actor_id = Some("E00000000000000000001".to_owned());
+        model.author_agent_snapshot_json = Some(
+            serde_json::to_string(&pioneer_protocol::AgentPresentationSnapshot {
+                agent_identity_id: pioneer_protocol::AgentIdentityId::new("I00000000000000000001")
+                    .unwrap(),
+                agent_execution_id: pioneer_protocol::AgentExecutionId::new(
+                    "E00000000000000000001",
+                )
+                .unwrap(),
+                identity_source_kind: pioneer_protocol::AgentIdentitySourceKind::NativeAgent,
+                identity_source_revision: 7,
+                display_name: "Builder".to_owned(),
+                nickname: "builder".to_owned(),
+                avatar_revision: Some("avatar-7".to_owned()),
+                role_label: Some("Reviewer".to_owned()),
+            })
+            .unwrap(),
+        );
+        model.author_avatar_revision_snapshot = Some("avatar-7".to_owned());
+
+        let author = collaboration_from_model(&model)
+            .expect("exact Agent author should decode")
+            .author
+            .expect("Agent author");
+        assert_eq!(author.display_name, "Builder");
+        assert_eq!(author.nickname, "builder");
+        assert_eq!(
+            author
+                .agent
+                .expect("rich Agent snapshot")
+                .role_label
+                .as_deref(),
+            Some("Reviewer")
+        );
+    }
+
+    #[test]
+    fn persisted_agent_snapshot_cannot_hide_under_an_incomplete_or_human_author() {
+        let mut model =
+            collaboration_test_turn(Some("message"), Some("Member A"), Some("member_a"), "[]");
+        model.author_agent_snapshot_json = Some("{}".to_owned());
+        assert!(collaboration_from_model(&model).is_err());
+
+        model.initiated_by_actor_kind = Some("agent_execution".to_owned());
+        model.initiated_by_actor_id = Some("E00000000000000000001".to_owned());
+        model.author_display_name_snapshot = None;
+        assert!(collaboration_from_model(&model).is_err());
+    }
+
     #[tokio::test]
     async fn upsert_turn_item_supports_sqlite_zstd_view() {
         pioneer_sqlite::zstd::register_auto_extension_once()
@@ -1460,6 +1566,7 @@ mod tests {
                 display_name: "System".to_owned(),
                 nickname: "system".to_owned(),
                 avatar_revision: None,
+                agent: None,
             }),
             reply_to_turn_id: None,
             mentions: Vec::new(),
@@ -1593,6 +1700,7 @@ mod tests {
             author_display_name_snapshot: display_name.map(str::to_owned),
             author_nickname_snapshot: nickname.map(str::to_owned),
             author_avatar_revision_snapshot: None,
+            author_agent_snapshot_json: None,
             reply_to_turn_id: send_mode.map(|_| "T00000000000000000000".to_owned()),
             mentions_json: mentions_json.to_owned(),
             message_revision: if send_mode.is_some() { 2 } else { 0 },

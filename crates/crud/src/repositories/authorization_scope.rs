@@ -747,7 +747,7 @@ async fn thread_scope_from_model<C: ConnectionTrait>(
         model.created_by_actor_id.as_deref(),
     ) {
         Ok(Some(PersistedActorRef::Principal(principal_id))) => Some(principal_id),
-        Ok(Some(PersistedActorRef::System) | None) => None,
+        Ok(Some(PersistedActorRef::System | PersistedActorRef::AgentExecution(_)) | None) => None,
         Err(_) => return Ok(None),
     };
     Ok(Some(ThreadAuthorizationScope {

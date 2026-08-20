@@ -1,4 +1,6 @@
 pub mod administrative_audit;
+pub mod agent_domain;
+pub mod agent_identity_catalog;
 pub mod agent_memory;
 pub mod agent_memory_candidate;
 pub mod agent_memory_capsule;
@@ -38,6 +40,7 @@ pub mod skill_pack_installation;
 pub mod skill_upload_session;
 pub mod skill_workspace_policy;
 pub mod task;
+pub mod task_actor_contract;
 pub mod task_agent_spec;
 pub mod task_delivery;
 pub mod task_dependency;

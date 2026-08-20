@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use pioneer_entity::{thread, thread_read_cursor};
 use pioneer_protocol::{
     PersistedActorRef, PrincipalId, Thread, ThreadOriginKind, ThreadReadCursor,
-    ThreadSidebarVisibility, ThreadStatus,
+    ThreadSidebarVisibility, ThreadStatus, TurnAuthorSnapshot,
 };
 use sea_orm::entity::ActiveModelTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -14,9 +14,38 @@ use sea_orm::{
 
 use crate::convention::{
     thread_mode_to_db, thread_origin_kind_to_db, thread_sidebar_visibility_to_db,
-    thread_status_to_db,
+    thread_status_to_db, validate_turn_author_snapshot,
 };
 use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
+
+const THREAD_PREVIEW_AUTHOR_JSON_MAX_BYTES: usize = 4_096;
+
+fn preview_author_json(author: Option<&TurnAuthorSnapshot>) -> Result<Option<String>> {
+    let Some(author) = author else {
+        return Ok(None);
+    };
+    validate_turn_author_snapshot(author)?;
+    let json = serde_json::to_string(author).context("failed to encode thread preview author")?;
+    if json.len() > THREAD_PREVIEW_AUTHOR_JSON_MAX_BYTES {
+        anyhow::bail!("thread preview author exceeds {THREAD_PREVIEW_AUTHOR_JSON_MAX_BYTES} bytes");
+    }
+    Ok(Some(json))
+}
+
+pub(crate) fn preview_author_from_json(json: Option<&str>) -> Result<Option<TurnAuthorSnapshot>> {
+    let Some(json) = json else {
+        return Ok(None);
+    };
+    if json.len() > THREAD_PREVIEW_AUTHOR_JSON_MAX_BYTES {
+        anyhow::bail!(
+            "persisted thread preview author exceeds {THREAD_PREVIEW_AUTHOR_JSON_MAX_BYTES} bytes"
+        );
+    }
+    let author = serde_json::from_str::<TurnAuthorSnapshot>(json)
+        .context("persisted thread preview author is invalid")?;
+    validate_turn_author_snapshot(&author)?;
+    Ok(Some(author))
+}
 
 pub async fn find_thread_read_cursor<C: ConnectionTrait>(
     db: &C,
@@ -70,13 +99,19 @@ pub async fn touch_thread_for_completed_message<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
     derived_preview: &str,
+    preview_author: Option<&TurnAuthorSnapshot>,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
     if !derived_preview.is_empty() {
+        let preview_author_json = preview_author_json(preview_author)?;
         thread::Entity::update_many()
             .col_expr(
                 thread::Column::Preview,
                 Expr::value(derived_preview.to_owned()),
+            )
+            .col_expr(
+                thread::Column::PreviewAuthorJson,
+                Expr::value(preview_author_json),
             )
             .filter(thread::Column::Id.eq(thread_id.to_owned()))
             .filter(thread::Column::Preview.eq(String::new()))
@@ -149,7 +184,8 @@ pub async fn upsert_thread<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    upsert_thread_with_actor_columns(db, thread_model, None, None, created_at, updated_at).await
+    upsert_thread_with_actor_columns(db, thread_model, None, None, None, created_at, updated_at)
+        .await
 }
 
 pub async fn upsert_thread_with_creator<C: ConnectionTrait>(
@@ -170,9 +206,15 @@ pub async fn upsert_thread_with_creator<C: ConnectionTrait>(
                 thread_model.id
             )
         })?;
-        if existing_creator.is_none() {
+        let Some(existing_creator) = existing_creator else {
             anyhow::bail!(
                 "thread `{}` is missing its persisted creator",
+                thread_model.id
+            );
+        };
+        if &existing_creator != creator {
+            anyhow::bail!(
+                "thread `{}` has a different persisted creator",
                 thread_model.id
             );
         }
@@ -183,6 +225,57 @@ pub async fn upsert_thread_with_creator<C: ConnectionTrait>(
         thread_model,
         actor_kind,
         actor_id,
+        None,
+        created_at,
+        updated_at,
+    )
+    .await
+}
+
+/// Persists a trusted internal or agent-created user-addressable Thread with
+/// an explicit immutable access class. Agent creation cannot infer the access
+/// class from origin because a delegated visible root is workspace
+/// scoped while its creator is an AgentExecution rather than a Principal.
+pub async fn upsert_agent_thread_with_creator<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &Thread,
+    creator: &PersistedActorRef,
+    access_class: super::membership::PersistedThreadAccessClass,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    match access_class {
+        super::membership::PersistedThreadAccessClass::Internal
+            if thread_model.sidebar_visibility == ThreadSidebarVisibility::Hidden
+                && thread_model.visibility.is_none() => {}
+        super::membership::PersistedThreadAccessClass::Workspace
+            if thread_model.sidebar_visibility == ThreadSidebarVisibility::Visible
+                && thread_model.visibility
+                    == Some(pioneer_protocol::ThreadVisibility::Workspace)
+                && !matches!(
+                    thread_model.origin_kind,
+                    ThreadOriginKind::TaskRun | ThreadOriginKind::System
+                ) => {}
+        _ => anyhow::bail!("agent-created thread has an inconsistent access projection"),
+    }
+    if let Some(existing) = find_thread_by_id(db, thread_model.id.as_str()).await? {
+        let existing_creator = actor_ref_from_db(
+            existing.created_by_actor_kind.as_deref(),
+            existing.created_by_actor_id.as_deref(),
+        )?;
+        let existing_access =
+            super::membership::persisted_thread_access_class_from_db(&existing.access_class)?;
+        if existing_creator.as_ref() != Some(creator) || existing_access != access_class {
+            anyhow::bail!("agent-created thread id was reused with different access facts");
+        }
+    }
+    let (actor_kind, actor_id) = actor_ref_to_db(creator);
+    upsert_thread_with_actor_columns(
+        db,
+        thread_model,
+        actor_kind,
+        actor_id,
+        Some(access_class),
         created_at,
         updated_at,
     )
@@ -214,11 +307,13 @@ pub async fn insert_user_thread_with_creator<C: ConnectionTrait>(
     }
 
     let (created_by_actor_kind, created_by_actor_id) = actor_ref_to_db(creator);
+    let preview_author_json = preview_author_json(thread_model.preview_author.as_ref())?;
     thread::Entity::insert(thread::ActiveModel {
         id: Set(thread_model.id.clone()),
         workspace_id: Set(thread_model.workspace_id.clone()),
         name: Set(thread_model.name.clone()),
         preview: Set(thread_model.preview.clone()),
+        preview_author_json: Set(preview_author_json),
         mode: Set(thread_mode_to_db(thread_model.mode).to_owned()),
         model: Set(thread_model.model.clone()),
         model_provider: Set(thread_model.model_provider.clone()),
@@ -251,14 +346,17 @@ async fn upsert_thread_with_actor_columns<C: ConnectionTrait>(
     thread_model: &Thread,
     created_by_actor_kind: Option<String>,
     created_by_actor_id: Option<String>,
+    access_class: Option<super::membership::PersistedThreadAccessClass>,
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    let preview_author_json = preview_author_json(thread_model.preview_author.as_ref())?;
     thread::Entity::insert(thread::ActiveModel {
         id: Set(thread_model.id.clone()),
         workspace_id: Set(thread_model.workspace_id.clone()),
         name: Set(thread_model.name.clone()),
         preview: Set(thread_model.preview.clone()),
+        preview_author_json: Set(preview_author_json),
         mode: Set(thread_mode_to_db(thread_model.mode).to_owned()),
         model: Set(thread_model.model.clone()),
         model_provider: Set(thread_model.model_provider.clone()),
@@ -267,22 +365,22 @@ async fn upsert_thread_with_actor_columns<C: ConnectionTrait>(
         sidebar_visibility: Set(
             thread_sidebar_visibility_to_db(thread_model.sidebar_visibility).to_owned(),
         ),
-        access_class: Set(if matches!(
-            thread_model.origin_kind,
-            pioneer_protocol::ThreadOriginKind::TaskRun
-                | pioneer_protocol::ThreadOriginKind::System
-        ) || matches!(
-            thread_model.sidebar_visibility,
-            pioneer_protocol::ThreadSidebarVisibility::Hidden
-        ) {
-            super::membership::persisted_thread_access_class_to_db(
-                super::membership::PersistedThreadAccessClass::Internal,
-            )
-        } else {
-            super::membership::persisted_thread_access_class_to_db(
-                super::membership::PersistedThreadAccessClass::Private,
-            )
-        }
+        access_class: Set(super::membership::persisted_thread_access_class_to_db(
+            access_class.unwrap_or_else(|| {
+                if matches!(
+                    thread_model.origin_kind,
+                    pioneer_protocol::ThreadOriginKind::TaskRun
+                        | pioneer_protocol::ThreadOriginKind::System
+                ) || matches!(
+                    thread_model.sidebar_visibility,
+                    pioneer_protocol::ThreadSidebarVisibility::Hidden
+                ) {
+                    super::membership::PersistedThreadAccessClass::Internal
+                } else {
+                    super::membership::PersistedThreadAccessClass::Private
+                }
+            }),
+        )
         .to_owned()),
         agent_nickname: Set(thread_model.agent_nickname.clone()),
         agent_role: Set(thread_model.agent_role.clone()),
@@ -299,6 +397,7 @@ async fn upsert_thread_with_actor_columns<C: ConnectionTrait>(
                 thread::Column::WorkspaceId,
                 thread::Column::Name,
                 thread::Column::Preview,
+                thread::Column::PreviewAuthorJson,
                 thread::Column::Mode,
                 thread::Column::Model,
                 thread::Column::ModelProvider,

@@ -1048,6 +1048,7 @@ mod tests {
                     id: "thread_message".to_owned(),
                     name: None,
                     preview: String::new(),
+                    preview_author: None,
                     mode: ThreadMode::Message,
                     model: "model".to_owned(),
                     model_provider: "provider".to_owned(),

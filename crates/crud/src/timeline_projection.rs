@@ -798,6 +798,7 @@ mod tests {
             author_display_name_snapshot: None,
             author_nickname_snapshot: None,
             author_avatar_revision_snapshot: None,
+            author_agent_snapshot_json: None,
             reply_to_turn_id: None,
             mentions_json: "[]".to_owned(),
             message_revision: 0,

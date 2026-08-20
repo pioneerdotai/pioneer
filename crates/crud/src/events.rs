@@ -232,6 +232,7 @@ mod tests {
                 id: "thread".to_owned(),
                 name: Some("Thread".to_owned()),
                 preview: String::new(),
+                preview_author: None,
                 mode: ThreadMode::Agent,
                 model: "model".to_owned(),
                 model_provider: "provider".to_owned(),

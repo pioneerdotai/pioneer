@@ -5,15 +5,16 @@ use pioneer_protocol::{
     MemoryCategory, MemoryEvidenceClass, MemoryFactClass, MemoryLifecycleActorKind,
     MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction,
     MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus, MemoryWriteRelation,
-    NewMemberProfile, PromptManifestProfile, ProviderFailureClass, ProviderFailureStage,
-    RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode, TaskConcurrencyConflictPolicy,
-    TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus, TaskDeliveryThreadTarget,
-    TaskExecutorKind, TaskOwnerKind, TaskResultCandidateStatus, TaskResultReviewDecision,
-    TaskResultReviewEventKind, TaskResultReviewerKind, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskTriggerKind,
-    TaskTriggerStatus, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadMode, ThreadOriginKind,
-    ThreadSidebarVisibility, ThreadStatus, TurnAuthorSnapshot, TurnItem, TurnItemAttemptStatus,
-    TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType, TurnMention, TurnPermissionMode,
+    NewMemberProfile, PersistedActorRef, PromptManifestProfile, ProviderFailureClass,
+    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
+    TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus,
+    TaskDeliveryThreadTarget, TaskExecutorKind, TaskOwnerKind, TaskResultCandidateStatus,
+    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind,
+    TaskRunTurnStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind,
+    TaskWriteLockStatus, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+    TurnAuthorSnapshot, TurnItem, TurnItemAttemptStatus, TurnItemExecutionClass,
+    TurnItemTimeoutReason, TurnItemType, TurnMention, TurnPermissionMode,
     TurnPermissionProfileSource, TurnStatus, UserInput,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -513,6 +514,33 @@ pub fn validate_turn_author_snapshot(snapshot: &TurnAuthorSnapshot) -> Result<()
             || revision.chars().any(char::is_control)
     }) {
         bail!("invalid Turn author avatar revision snapshot");
+    }
+    match (&snapshot.actor, snapshot.agent.as_ref()) {
+        (PersistedActorRef::AgentExecution(execution_id), Some(agent)) => {
+            if &agent.agent_execution_id != execution_id
+                || agent.display_name != snapshot.display_name
+                || agent.nickname != snapshot.nickname
+                || agent.avatar_revision != snapshot.avatar_revision
+            {
+                bail!("Turn agent author snapshot does not match its immutable author fields");
+            }
+            if agent.identity_source_revision == 0 {
+                bail!("Turn agent author snapshot has a zero source revision");
+            }
+            pioneer_protocol::AgentDisplayName::new(agent.display_name.clone())
+                .context("invalid Turn agent display-name snapshot")?;
+            pioneer_protocol::AgentNicknameKey::new(agent.nickname.clone())
+                .context("invalid Turn agent nickname snapshot")?;
+            if let Some(role_label) = agent.role_label.as_ref() {
+                pioneer_protocol::AgentRoleLabel::new(role_label.clone())
+                    .context("invalid Turn agent role-label snapshot")?;
+            }
+        }
+        (PersistedActorRef::AgentExecution(_), None) => {
+            bail!("AgentExecution Turn author has no immutable presentation snapshot")
+        }
+        (_, Some(_)) => bail!("non-agent Turn author carries an agent presentation snapshot"),
+        (_, None) => {}
     }
     Ok(())
 }

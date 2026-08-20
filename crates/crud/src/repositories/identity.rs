@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{gateway_identity, gateway_principal, thread, turn};
 use pioneer_protocol::{
-    GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
+    AgentExecutionId, GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus,
+    RoleKey,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
@@ -112,6 +113,9 @@ pub fn principal_status_from_db(value: &str) -> Result<PrincipalStatus> {
 pub fn actor_ref_to_db(actor: &PersistedActorRef) -> (Option<String>, Option<String>) {
     match actor {
         PersistedActorRef::Principal(id) => (Some("principal".to_owned()), Some(id.to_string())),
+        PersistedActorRef::AgentExecution(id) => {
+            (Some("agent_execution".to_owned()), Some(id.to_string()))
+        }
         PersistedActorRef::System => (Some("system".to_owned()), None),
     }
 }
@@ -126,9 +130,15 @@ pub fn actor_ref_from_db(
         (Some("principal"), Some(id)) => Ok(Some(PersistedActorRef::Principal(
             PrincipalId::new(id).context("invalid persisted principal actor id")?,
         ))),
+        (Some("agent_execution"), Some(id)) => Ok(Some(PersistedActorRef::AgentExecution(
+            AgentExecutionId::new(id).context("invalid persisted agent actor id")?,
+        ))),
         (None, Some(_)) => bail!("persisted actor has an id without a kind"),
         (Some("system"), Some(_)) => bail!("persisted System actor must not have an id"),
         (Some("principal"), None) => bail!("persisted principal actor is missing its id"),
+        (Some("agent_execution"), None) => {
+            bail!("persisted agent actor is missing its id")
+        }
         (Some(unknown), _) => bail!("unknown persisted actor kind `{unknown}`"),
     }
 }
@@ -600,6 +610,7 @@ mod tests {
     };
     use chrono::Utc;
     use migration::{Migrator, MigratorTrait};
+    use pioneer_protocol::AgentExecutionId;
     use pioneer_protocol::{
         GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus,
     };
@@ -643,6 +654,14 @@ mod tests {
         assert_eq!(
             actor_ref_from_db(Some("system"), None).unwrap(),
             Some(PersistedActorRef::System)
+        );
+        let execution = PersistedActorRef::AgentExecution(
+            AgentExecutionId::new("E00000000000000000001").unwrap(),
+        );
+        let execution_pair = actor_ref_to_db(&execution);
+        assert_eq!(
+            actor_ref_from_db(execution_pair.0.as_deref(), execution_pair.1.as_deref()).unwrap(),
+            Some(execution)
         );
         assert_eq!(actor_ref_from_db(None, None).unwrap(), None);
         assert!(actor_ref_from_db(None, Some(principal_id().as_str())).is_err());

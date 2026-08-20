@@ -17,6 +17,45 @@ pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
     insert_administrative_audit_event,
 };
+pub use repositories::agent_domain::{
+    ACTIVE_AGENT_IDENTITY_CATALOG_LIMIT, AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS,
+    AGENT_ACTION_OUTBOX_MAX_ATTEMPTS, AgentActionInput, AgentActionLedgerCompactionSummary,
+    AgentActionTimelineProjection, AgentCommitInput, AgentDelegationRouteInput,
+    AgentExecutionAuthorProjection, AgentExecutionGrantInput, AgentExecutionGraphCommitInput,
+    AgentExecutionGraphCommitResult, AgentExecutionInput, AgentIdentityInput, AgentQueueEntryInput,
+    AgentResourceCommitInput, AgentResourceStateInput, AgentThreadCreationCommitInput,
+    AgentTurnResponseInput, AgentWorkGraphCancellationTarget, AgentWorkGraphProjectionTarget,
+    NativeAgentConfigInput, PresentationSnapshotInput, PromotedAgentExecution,
+    SOURCE_CLI_RUNTIME_INSTANCE, SOURCE_EPHEMERAL, SOURCE_NATIVE_AGENT,
+    acquire_agent_running_permit, agent_delegation_route_projection,
+    agent_execution_grant_fingerprint, agent_presentation_snapshot_from_rows,
+    cancel_agent_work_graph, canonical_agent_id, claim_actor_nickname, claim_agent_action_outbox,
+    commit_agent_action, commit_agent_delivery_action, commit_agent_execution_graph,
+    commit_agent_thread_creation, commit_native_agent_config_mutation,
+    compact_terminal_agent_action_ledger, defer_agent_action_outbox_for_permit,
+    enqueue_agent_execution, ensure_agent_identity, ensure_native_agent_config,
+    ensure_root_resource_scope, expire_agent_delegation_routes, finalize_agent_execution,
+    heartbeat_agent_execution, insert_agent_action_idempotent, insert_agent_delegation_route,
+    insert_agent_execution, insert_agent_execution_grant, insert_agent_resource_state,
+    insert_agent_turn_response, insert_presentation_snapshot, list_active_agent_identities,
+    list_agent_delegation_routes, list_agent_delegation_routes_for_source,
+    load_active_agent_identity, load_active_agent_identity_by_source, load_agent_action,
+    load_agent_action_outbox, load_agent_action_receipt,
+    load_agent_action_timeline_projections_for_targets, load_agent_authors_for_executions,
+    load_agent_delegation_route, load_agent_execution, load_agent_execution_grant,
+    load_agent_execution_resource_state, load_agent_identity, load_agent_identity_by_source,
+    load_agent_presentation_snapshot, load_agent_turn_response,
+    load_agent_turn_responses_for_turns, load_agent_work_graph_projection_for_turn,
+    load_agent_work_graph_projection_target, load_current_agent_presentation_snapshot,
+    load_native_agent_config, load_native_agent_config_by_system_key,
+    mark_agent_action_outbox_delivered, mark_agent_action_outbox_failed,
+    promote_queued_agent_executions, record_agent_execution_progress,
+    revoke_agent_delegation_route, utc_now, wake_agent_action_outbox_for_execution,
+};
+pub use repositories::agent_identity_catalog::{
+    AgentIdentityCatalogSyncReport, CliRuntimeIdentitySeed, cli_runtime_identity_fingerprint,
+    ensure_pioneer_for_workspace, sync_cli_runtime_identity_catalog,
+};
 pub use repositories::auth_session::{
     AuthPersistenceInvariantReport, DeviceActivationFailureOutcome, NewActiveDeviceSessionRow,
     NewPendingDeviceSessionRow, NewRefreshCredentialRow, PendingSessionIssuer,
@@ -99,6 +138,10 @@ pub use repositories::principal_avatar::{
     load_principal_avatar_revision, replace_principal_avatar,
 };
 pub use repositories::task::TaskRootAccessFilter;
+pub use repositories::task_actor_contract::{
+    find_task_actor_contract, find_task_occurrence_by_run_id, find_task_occurrence_contract,
+    list_task_occurrences, upsert_task_actor_contract, upsert_task_occurrence_contract,
+};
 pub use repositories::thread::{
     advance_thread_read_cursor, find_thread_read_cursor, thread_read_cursor_from_model,
 };
@@ -881,15 +924,16 @@ use crate::repositories::{
     execution_admission_lease, hook_run, mcp_audit_event, mcp_server_catalog_snapshot,
     mcp_server_installation, policy, recovery_job, recovery_terminalization_outbox,
     skill_audit_event, skill_dependency_snapshot, skill_installation, skill_pack_installation,
-    skill_upload_session, skill_workspace_policy, task as task_repository, task_agent_spec,
-    task_delivery, task_dependency, task_event, task_execution_admission, task_result_candidate,
-    task_result_review_event, task_run, task_run_conversation_snapshot, task_run_execution,
-    task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread,
-    thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage, thread_tree,
-    turn, turn_admission, turn_cli_runtime_instruction, turn_event, turn_event_delivery,
-    turn_event_projection_state, turn_event_projection_stream_state, turn_execution,
-    turn_execution_window, turn_finalization, turn_item_attempt, turn_liveness, turn_llm_context,
-    turn_mcp_binding, turn_mcp_projection, turn_runtime_snapshot, turn_skill_binding,
+    skill_upload_session, skill_workspace_policy, task as task_repository, task_actor_contract,
+    task_agent_spec, task_delivery, task_dependency, task_event, task_execution_admission,
+    task_result_candidate, task_result_review_event, task_run, task_run_conversation_snapshot,
+    task_run_execution, task_run_thread_binding, task_run_turn, task_trigger, task_write_lock,
+    thread, thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage,
+    thread_tree, turn, turn_admission, turn_cli_runtime_instruction, turn_event,
+    turn_event_delivery, turn_event_projection_state, turn_event_projection_stream_state,
+    turn_execution, turn_execution_window, turn_finalization, turn_item_attempt, turn_liveness,
+    turn_llm_context, turn_mcp_binding, turn_mcp_projection, turn_runtime_snapshot,
+    turn_skill_binding, user_notification_outbox,
 };
 
 pub use crate::repositories::execution_admission_lease::{
@@ -2005,6 +2049,22 @@ pub struct CrudStore {
     write_coordinator: SqliteWriteCoordinator,
 }
 
+/// Complete durable write-set for one Task creation.  Task events, frozen
+/// conversation input, execution admission, agent domain actor contracts and
+/// an optional execution-bound AgentAction are deliberately committed by one
+/// owner.  Keeping this type in CRUD prevents Task Service and model-facing
+/// adapters from growing competing partial transaction paths.
+#[derive(Debug, Clone)]
+pub struct TaskCreationCommitInput {
+    pub events: Vec<TaskEventPayload>,
+    pub event_timestamp_secs: i64,
+    pub execution_admission: Option<NewTaskExecutionAdmission>,
+    pub conversation_snapshot: Option<NewTaskRunConversationSnapshot>,
+    pub actor_contract: pioneer_protocol::TaskActorContract,
+    pub occurrence_contract: Option<pioneer_protocol::TaskOccurrenceContract>,
+    pub agent_action: Option<AgentCommitInput>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DueTaskTriggerReconciliation {
     pub task_id: String,
@@ -2293,28 +2353,36 @@ async fn insert_new_user_thread_for_initial_turn(
     events: &[TurnEventPayload],
     creation: &NewUserThreadCreation,
 ) -> Result<()> {
-    let (started, audit) = match events {
-        [
-            TurnEventPayload::TurnStarted(started),
-            TurnEventPayload::TurnPermissionAudit(audit),
-        ] => (started, audit),
-        [
-            TurnEventPayload::TurnStarted(started),
-            TurnEventPayload::TurnCompleted(completed),
-            TurnEventPayload::TurnPermissionAudit(audit),
-        ] if completed.thread_id == started.thread.id
-            && completed.turn.id == started.turn.id
-            && completed.workspace_id == started.thread.workspace_id
-            && completed.turn.status == TurnStatus::Completed =>
-        {
-            (started, audit)
-        }
-        _ => {
-            bail!(
-                "new user thread materialization requires turn/started, optional immediate turn/completed, and one permission audit"
-            );
-        }
+    let Some((TurnEventPayload::TurnStarted(started), tail)) = events.split_first() else {
+        bail!(
+            "new user thread materialization requires turn/started, optional immediate turn/completed, and one or more permission audits"
+        );
     };
+    let audit_events = match tail.split_first() {
+        Some((TurnEventPayload::TurnCompleted(completed), remaining))
+            if completed.thread_id == started.thread.id
+                && completed.turn.id == started.turn.id
+                && completed.workspace_id == started.thread.workspace_id
+                && completed.turn.status == TurnStatus::Completed =>
+        {
+            remaining
+        }
+        Some((TurnEventPayload::TurnCompleted(_), _)) => {
+            bail!("new user thread immediate completion differs from its first Turn start");
+        }
+        _ => tail,
+    };
+    let Some(TurnEventPayload::TurnPermissionAudit(audit)) = audit_events.first() else {
+        bail!(
+            "new user thread materialization requires turn/started, optional immediate turn/completed, and one or more permission audits"
+        );
+    };
+    if audit_events
+        .iter()
+        .any(|event| !matches!(event, TurnEventPayload::TurnPermissionAudit(_)))
+    {
+        bail!("new user thread materialization contains a non-audit trailing event");
+    }
     if started.actor.as_ref() != Some(&creation.creator) {
         bail!("new user thread creator differs from first-turn actor");
     }
@@ -2325,6 +2393,16 @@ async fn insert_new_user_thread_for_initial_turn(
         || audit.thread_id != started.thread.id
         || audit.turn_id != started.turn.id
     {
+        bail!("first-turn permission audit scope differs from the new user thread");
+    }
+    if audit_events.iter().any(|event| {
+        let TurnEventPayload::TurnPermissionAudit(audit) = event else {
+            return true;
+        };
+        audit.workspace_id != started.thread.workspace_id
+            || audit.thread_id != started.thread.id
+            || audit.turn_id != started.turn.id
+    }) {
         bail!("first-turn permission audit scope differs from the new user thread");
     }
     if creation.access_class == PersistedThreadAccessClass::Internal {
@@ -2423,6 +2501,35 @@ pub struct CompletedMessageTurnWrite<'a> {
     pub actor: PersistedActorRef,
     pub completed: pioneer_protocol::TurnCompletedNotification,
     pub audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+}
+
+/// One immutable Task result projection.  Delivery owns a single transaction
+/// containing the conversation events and, for agent-produced results, the
+/// canonical DeliverResult action/receipt/outbox.  This prevents both a
+/// timeline ghost before the receipt and a receipt without destination data.
+pub struct CompletedTaskDeliveryTurnWrite<'a> {
+    pub thread: &'a Thread,
+    pub sandbox_mode: SandboxMode,
+    pub started_turn: &'a Turn,
+    pub actor: PersistedActorRef,
+    pub audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+    pub item_started: pioneer_protocol::ItemStartedNotification,
+    pub item_completed: pioneer_protocol::ItemCompletedNotification,
+    pub completed: pioneer_protocol::TurnCompletedNotification,
+    pub agent_action: Option<AgentCommitInput>,
+}
+
+/// One immutable failed Task delivery projection. The failed Turn and an
+/// optional routed DeliverResult receipt commit together, while the public
+/// terminal error remains System-authored and contains no work item.
+pub struct FailedTaskDeliveryTurnWrite<'a> {
+    pub thread: &'a Thread,
+    pub sandbox_mode: SandboxMode,
+    pub started_turn: &'a Turn,
+    pub actor: PersistedActorRef,
+    pub audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+    pub failed: pioneer_protocol::TurnFailedNotification,
+    pub agent_action: Option<AgentCommitInput>,
 }
 
 fn completed_message_turn_events(
@@ -3366,6 +3473,84 @@ impl CrudStore {
 
     pub fn database_connection(&self) -> DatabaseConnection {
         self.connection.clone()
+    }
+
+    pub async fn create_agent_delegation_route(
+        &self,
+        input: AgentDelegationRouteInput,
+    ) -> Result<pioneer_entity::agent_delegation_route::Model> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin Agent route creation transaction")?;
+            let route =
+                repositories::agent_domain::insert_agent_delegation_route(&transaction, &input)
+                    .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit Agent route creation")?;
+            Ok(route)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn revoke_agent_delegation_route(
+        &self,
+        route_id: &str,
+        expected_generation: i64,
+        expected_policy_generation: i64,
+        authority_actor_json: &str,
+        authority_fingerprint: &str,
+        now: DateTimeWithTimeZone,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin Agent route revocation transaction")?;
+            let revoked = repositories::agent_domain::revoke_agent_delegation_route(
+                &transaction,
+                route_id,
+                expected_generation,
+                expected_policy_generation,
+                authority_actor_json,
+                authority_fingerprint,
+                now.clone(),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit Agent route revocation")?;
+            Ok(revoked)
+        })
+        .await
+    }
+
+    pub async fn expire_agent_delegation_routes(&self, now: DateTimeWithTimeZone) -> Result<u64> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin Agent route expiry transaction")?;
+            let expired = repositories::agent_domain::expire_agent_delegation_routes(
+                &transaction,
+                now.clone(),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit Agent route expiry")?;
+            Ok(expired)
+        })
+        .await
     }
 
     pub async fn try_run_low_priority_write<T, F, Fut>(&self, operation: F) -> Result<Option<T>>
@@ -9784,19 +9969,49 @@ impl CrudStore {
         input: &[UserInput],
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     ) -> Result<()> {
+        self.materialize_non_executable_turn_start_with_permission_audit(
+            thread_model,
+            sandbox_mode,
+            turn_model,
+            input,
+            PersistedActorRef::System,
+            audit_event,
+        )
+        .await
+    }
+
+    /// Persists an execution-free projection Turn with the exact conversation
+    /// actor selected by the Gateway.  Delivery and other internal projections
+    /// may be non-executable without being System-authored: the actor is still
+    /// part of the durable conversation history and must match the prepared
+    /// Turn's immutable author snapshot.
+    pub async fn materialize_non_executable_turn_start_with_permission_audit(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+    ) -> Result<()> {
         if turn_model.mode != pioneer_protocol::ThreadMode::Chat
             || turn_model.turn_kind != pioneer_protocol::TurnKind::Conversation
             || !input.is_empty()
             || turn_model.prompt_manifest.is_some()
         {
-            bail!("non-executable System Turn violates the projection-only contract");
+            bail!("non-executable projection Turn violates the projection-only contract");
+        }
+        match (turn_model.author.as_ref(), &actor) {
+            (Some(author), actor) if &author.actor == actor => {}
+            (None, PersistedActorRef::System) => {}
+            _ => bail!("projection actor does not match Turn author snapshot"),
         }
         let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
             thread: thread_model.clone(),
             sandbox_mode,
             turn: turn_model.clone(),
             input: Vec::new(),
-            actor: Some(PersistedActorRef::System),
+            actor: Some(actor),
             reasoning_effort: None,
         });
         self.materialize_turn_events_atomically_with_optional_admission(
@@ -9809,8 +10024,13 @@ impl CrudStore {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     /// Persists an execution-capable Turn and its mandatory authority envelope
@@ -9830,7 +10050,11 @@ impl CrudStore {
         runtime_draft: Option<AuthorizedTurnRuntimeDraft>,
         admission: Option<NewTurnAdmission>,
         execution: Option<NewTurnExecution>,
-    ) -> Result<()> {
+        execution_security_snapshot: &TurnExecutionSecuritySnapshot,
+        security_audit_events: Vec<pioneer_protocol::TurnPermissionAuditEvent>,
+        execution_graph: Option<AgentExecutionGraphCommitInput>,
+        response: Option<AgentTurnResponseInput>,
+    ) -> Result<Option<AgentExecutionGraphCommitResult>> {
         let authority_envelope_json = authority_envelope_json.trim();
         if authority_envelope_json.is_empty() {
             bail!("execution authority envelope must not be empty");
@@ -9865,16 +10089,25 @@ impl CrudStore {
             actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
         });
+        let mut events = Vec::with_capacity(2usize.saturating_add(security_audit_events.len()));
+        events.push(started_event);
+        events.push(TurnEventPayload::TurnPermissionAudit(audit_event));
+        events.extend(
+            security_audit_events
+                .into_iter()
+                .map(TurnEventPayload::TurnPermissionAudit),
+        );
         self.materialize_turn_events_atomically_with_optional_admission(
-            vec![
-                started_event,
-                TurnEventPayload::TurnPermissionAudit(audit_event),
-            ],
+            events,
             thread_model.updated_at,
             creation,
             admission,
             Some((turn_model.id.clone(), authority_envelope_json.to_owned())),
             execution,
+            Some((turn_model.id.clone(), execution_security_snapshot.clone())),
+            None,
+            execution_graph,
+            response,
         )
         .await
     }
@@ -9889,6 +10122,283 @@ impl CrudStore {
         let events = completed_message_turn_events(write)?;
         self.materialize_turn_events_atomically(events, updated_at)
             .await
+    }
+
+    /// Commits an agent-authored executable Turn, its exact child execution
+    /// graph/resource placement and the originating action in one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn materialize_agent_turn_start_with_graph_and_action(
+        &self,
+        thread_model: &Thread,
+        sandbox_mode: SandboxMode,
+        turn_model: &Turn,
+        input: &[UserInput],
+        reasoning_effort: Option<&str>,
+        actor: PersistedActorRef,
+        audit_event: pioneer_protocol::TurnPermissionAuditEvent,
+        authority_envelope_json: &str,
+        admission: NewTurnAdmission,
+        execution: NewTurnExecution,
+        execution_security_snapshot: &TurnExecutionSecuritySnapshot,
+        security_audit_events: Vec<pioneer_protocol::TurnPermissionAuditEvent>,
+        execution_graph: AgentExecutionGraphCommitInput,
+        agent_action: AgentCommitInput,
+    ) -> Result<AgentExecutionGraphCommitResult> {
+        let input_execution_id = match &actor {
+            PersistedActorRef::AgentExecution(execution_id) => execution_id,
+            _ => bail!("agent Turn transaction requires an exact execution actor"),
+        };
+        let graph_response = execution_graph
+            .response
+            .as_ref()
+            .context("agent Turn transaction requires an exact response binding")?;
+        if execution_graph
+            .child_execution
+            .parent_execution_id
+            .as_deref()
+            != Some(input_execution_id.as_str())
+            || execution_graph.child_execution.parent_thread_id.as_deref()
+                != Some(thread_model.id.as_str())
+            || graph_response.turn_id != turn_model.id
+            || graph_response.execution_id != execution_graph.child_execution.id
+        {
+            bail!("agent Turn input/response actors differ from its execution graph");
+        }
+        let authority_envelope_json = authority_envelope_json.trim();
+        if authority_envelope_json.is_empty() {
+            bail!("agent Turn execution authority envelope must not be empty");
+        }
+        let started_event = TurnEventPayload::TurnStarted(TurnStartedEventPayload {
+            thread: thread_model.clone(),
+            sandbox_mode,
+            turn: turn_model.clone(),
+            input: input.to_vec(),
+            actor: Some(actor),
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+        });
+        let mut events = Vec::with_capacity(2usize.saturating_add(security_audit_events.len()));
+        events.push(started_event);
+        events.push(TurnEventPayload::TurnPermissionAudit(audit_event));
+        events.extend(
+            security_audit_events
+                .into_iter()
+                .map(TurnEventPayload::TurnPermissionAudit),
+        );
+        self.materialize_turn_events_atomically_with_optional_admission(
+            events,
+            thread_model.updated_at,
+            None,
+            Some(admission),
+            Some((turn_model.id.clone(), authority_envelope_json.to_owned())),
+            Some(execution),
+            Some((turn_model.id.clone(), execution_security_snapshot.clone())),
+            Some(agent_action),
+            Some(execution_graph),
+            None,
+        )
+        .await?
+        .context("agent Turn transaction did not commit its execution graph")
+    }
+
+    /// Agent-authored Message variant of the same canonical event batch. The
+    /// exact Turn actor and AgentAction receipt/outbox commit together; there
+    /// is no interval in which either side can exist as a ghost.
+    pub async fn materialize_completed_agent_message_turn_with_action(
+        &self,
+        write: CompletedMessageTurnWrite<'_>,
+        agent_action: AgentCommitInput,
+    ) -> Result<()> {
+        if !matches!(write.actor, PersistedActorRef::AgentExecution(_)) {
+            bail!("agent Message transaction requires an exact execution actor");
+        }
+        let updated_at = write.thread.updated_at;
+        let events = completed_message_turn_events(write)?;
+        self.materialize_turn_events_atomically_with_optional_admission(
+            events,
+            updated_at,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(agent_action),
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Commits a projection-only Task delivery Turn as one canonical event
+    /// batch. Agent output must bring its DeliverResult action. A routed
+    /// failure remains visibly System-authored but still carries the exact
+    /// source execution's route action so revocation cannot be bypassed by a
+    /// lifecycle diagnostic.
+    pub async fn materialize_completed_task_delivery_turn(
+        &self,
+        write: CompletedTaskDeliveryTurnWrite<'_>,
+    ) -> Result<()> {
+        let agent_authored = matches!(write.actor, PersistedActorRef::AgentExecution(_));
+        let routed_system_diagnostic = matches!(write.actor, PersistedActorRef::System)
+            && matches!(&write.item_completed.item, TurnItem::SystemEvent { .. })
+            && write.agent_action.as_ref().is_some_and(|action| {
+                action.mutation_kind == "deliver_result"
+                    && action.action.action_kind == "deliver_result"
+                    && action.route_receipt_json.is_some()
+            });
+        if (agent_authored && write.agent_action.is_none())
+            || (!agent_authored && write.agent_action.is_some() && !routed_system_diagnostic)
+        {
+            bail!("Task delivery actor and canonical agent action differ");
+        }
+        if write.started_turn.mode != pioneer_protocol::ThreadMode::Chat
+            || write.started_turn.status != TurnStatus::InProgress
+            || write.completed.turn.status != TurnStatus::Completed
+            || write.completed.turn.id != write.started_turn.id
+            || write.completed.thread_id != write.thread.id
+            || write.completed.workspace_id != write.thread.workspace_id
+            || write.completed.turn.author != write.started_turn.author
+            || write.audit_event.workspace_id != write.thread.workspace_id
+            || write.audit_event.thread_id != write.thread.id
+            || write.audit_event.turn_id != write.started_turn.id
+            || write.item_started.workspace_id != write.thread.workspace_id
+            || write.item_started.thread_id != write.thread.id
+            || write.item_started.turn_id != write.started_turn.id
+            || write.item_completed.workspace_id != write.thread.workspace_id
+            || write.item_completed.thread_id != write.thread.id
+            || write.item_completed.turn_id != write.started_turn.id
+            || write.item_started.item != write.item_completed.item
+        {
+            bail!("Task delivery Turn batch contains inconsistent immutable facts");
+        }
+        match (write.started_turn.author.as_ref(), &write.actor) {
+            (Some(author), actor) if &author.actor == actor => {}
+            (None, PersistedActorRef::System) => {}
+            _ => bail!("Task delivery Turn author differs from its event actor"),
+        }
+        let events = vec![
+            TurnEventPayload::TurnStarted(TurnStartedEventPayload {
+                thread: write.thread.clone(),
+                sandbox_mode: write.sandbox_mode,
+                turn: write.started_turn.clone(),
+                input: Vec::new(),
+                actor: Some(write.actor),
+                reasoning_effort: None,
+            }),
+            TurnEventPayload::TurnPermissionAudit(write.audit_event),
+            TurnEventPayload::ItemStarted(write.item_started),
+            TurnEventPayload::ItemCompleted(write.item_completed),
+            TurnEventPayload::TurnCompleted(write.completed),
+        ];
+        self.materialize_turn_events_atomically_with_optional_admission(
+            events,
+            write.thread.updated_at,
+            None,
+            None,
+            None,
+            None,
+            None,
+            write.agent_action,
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Commits a failed projection-only Task delivery Turn as one canonical
+    /// event batch. A routed failure may carry the source Agent's exact route
+    /// receipt, but the visible Turn remains System-authored and contains no
+    /// Agent work item or internal diagnostic text.
+    pub async fn materialize_failed_task_delivery_turn(
+        &self,
+        write: FailedTaskDeliveryTurnWrite<'_>,
+    ) -> Result<()> {
+        if !matches!(write.actor, PersistedActorRef::System) {
+            bail!("failed Task delivery Turn must be System-authored");
+        }
+        if write.agent_action.as_ref().is_some_and(|action| {
+            action.mutation_kind != "deliver_result"
+                || action.action.action_kind != "deliver_result"
+                || action.route_receipt_json.is_none()
+        }) {
+            bail!("failed Task delivery action must be an exact routed DeliverResult receipt");
+        }
+        if write.started_turn.mode != pioneer_protocol::ThreadMode::Chat
+            || write.started_turn.status != TurnStatus::InProgress
+            || write.started_turn.author.is_some()
+            || write.failed.turn.status != TurnStatus::Failed
+            || write.failed.turn.id != write.started_turn.id
+            || write.failed.turn.author != write.started_turn.author
+            || write.failed.thread_id != write.thread.id
+            || write.failed.workspace_id != write.thread.workspace_id
+            || write.audit_event.workspace_id != write.thread.workspace_id
+            || write.audit_event.thread_id != write.thread.id
+            || write.audit_event.turn_id != write.started_turn.id
+        {
+            bail!("failed Task delivery Turn batch contains inconsistent immutable facts");
+        }
+        let events = vec![
+            TurnEventPayload::TurnStarted(TurnStartedEventPayload {
+                thread: write.thread.clone(),
+                sandbox_mode: write.sandbox_mode,
+                turn: write.started_turn.clone(),
+                input: Vec::new(),
+                actor: Some(write.actor),
+                reasoning_effort: None,
+            }),
+            TurnEventPayload::TurnPermissionAudit(write.audit_event),
+            TurnEventPayload::TurnFailed(write.failed),
+        ];
+        self.materialize_turn_events_atomically_with_optional_admission(
+            events,
+            write.thread.updated_at,
+            None,
+            None,
+            None,
+            None,
+            None,
+            write.agent_action,
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Projects a Task result into an existing origin Turn. The two item
+    /// lifecycle events and optional DeliverResult receipt are inseparable.
+    pub async fn materialize_task_delivery_item(
+        &self,
+        started: pioneer_protocol::ItemStartedNotification,
+        completed: pioneer_protocol::ItemCompletedNotification,
+        event_timestamp_secs: i64,
+        agent_action: Option<AgentCommitInput>,
+    ) -> Result<()> {
+        if started.workspace_id != completed.workspace_id
+            || started.thread_id != completed.thread_id
+            || started.turn_id != completed.turn_id
+            || started.item != completed.item
+        {
+            bail!("Task delivery item lifecycle contains inconsistent immutable facts");
+        }
+        self.materialize_turn_events_atomically_with_optional_admission(
+            vec![
+                TurnEventPayload::ItemStarted(started),
+                TurnEventPayload::ItemCompleted(completed),
+            ],
+            event_timestamp_secs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            agent_action,
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Atomically creates a Member runtime draft and its immediately
@@ -10101,8 +10611,13 @@ impl CrudStore {
             admission,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn get_turn_admission(
@@ -10994,6 +11509,22 @@ impl CrudStore {
         .await
     }
 
+    pub async fn append_task_events_with_agent_action(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        agent_action: AgentCommitInput,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.run_serialized_write(|| {
+            self.append_task_events_with_agent_action_once(
+                events.clone(),
+                event_timestamp_secs,
+                agent_action.clone(),
+            )
+        })
+        .await
+    }
+
     pub async fn append_task_events_with_execution_admission(
         &self,
         events: Vec<TaskEventPayload>,
@@ -11026,12 +11557,70 @@ impl CrudStore {
         .await
     }
 
+    pub async fn append_task_events_with_execution_readmission_and_agent_action(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        admission: NewTaskExecutionAdmission,
+        agent_action: AgentCommitInput,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.run_serialized_write(|| {
+            self.append_task_events_with_execution_readmission_and_agent_action_once(
+                events.clone(),
+                event_timestamp_secs,
+                admission.clone(),
+                agent_action.clone(),
+            )
+        })
+        .await
+    }
+
+    /// Commits every row that makes a newly created Task runnable and
+    /// attributable.  In particular, an agent-authored Task cannot become
+    /// visible without its exact actor/occurrence contract or its canonical
+    /// action receipt, and a failed receipt/outbox write cannot leave a ghost
+    /// Task behind.
+    pub async fn commit_task_creation(
+        &self,
+        input: TaskCreationCommitInput,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        self.run_serialized_write(|| self.commit_task_creation_once(input.clone()))
+            .await
+    }
+
+    /// Creates an agent-owned Thread, its execution-scoped continuation route
+    /// and the originating action receipt/outbox as one durable mutation.
+    pub async fn commit_agent_thread_creation_with_action(
+        &self,
+        thread: Thread,
+        execution_id: pioneer_protocol::AgentExecutionId,
+        route: Option<AgentDelegationRouteInput>,
+        lineage: Option<TaskThreadLineage>,
+        created_at: DateTimeWithTimeZone,
+        updated_at: DateTimeWithTimeZone,
+        agent_action: AgentCommitInput,
+    ) -> Result<()> {
+        self.run_serialized_write(|| {
+            self.commit_agent_thread_creation_with_action_once(
+                thread.clone(),
+                execution_id.clone(),
+                route.clone(),
+                lineage.clone(),
+                created_at.clone(),
+                updated_at.clone(),
+                agent_action.clone(),
+            )
+        })
+        .await
+    }
+
     pub async fn append_due_trigger_task_events(
         &self,
         trigger_id: &str,
         expected_next_fire_at: i64,
         now: i64,
         events: Vec<TaskEventPayload>,
+        occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
         reserve_executions: Vec<(String, TaskExecutorKind)>,
     ) -> Result<Vec<AppendedTaskEvent>> {
         self.run_serialized_write(|| {
@@ -11040,6 +11629,7 @@ impl CrudStore {
                 expected_next_fire_at,
                 now,
                 events.clone(),
+                occurrence_contracts.clone(),
                 reserve_executions.clone(),
             )
         })
@@ -11138,6 +11728,158 @@ impl CrudStore {
             result_candidates,
             result_review_events,
         }))
+    }
+
+    /// Load only the canonical Task row when authorization needs immutable
+    /// task facts rather than the full aggregate. The aggregate reader below
+    /// intentionally expands runs, bindings, review state, and lineage; using
+    /// it in a hot execution revalidation path creates avoidable N+1 reads.
+    pub async fn get_task_record(&self, task_id: &str) -> Result<Option<Task>> {
+        task_repository::find_task_by_id(&self.connection, task_id)
+            .await?
+            .map(task_from_db_model)
+            .transpose()
+    }
+
+    pub async fn upsert_task_actor_contract(
+        &self,
+        contract: &pioneer_protocol::TaskActorContract,
+        now: i64,
+    ) -> Result<()> {
+        repositories::task_actor_contract::upsert_task_actor_contract(
+            &self.connection,
+            contract,
+            now,
+        )
+        .await
+    }
+
+    pub async fn get_task_actor_contract(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<pioneer_protocol::TaskActorContract>> {
+        repositories::task_actor_contract::find_task_actor_contract(&self.connection, task_id).await
+    }
+
+    pub async fn upsert_task_delivery_authority(
+        &self,
+        delivery_id: &str,
+        task_id: &str,
+        run_id: &str,
+        author_json: &str,
+        reviewer_json: Option<&str>,
+        destination_route_id: Option<&str>,
+        route_receipt_json: Option<&str>,
+        disclosure_generation: u64,
+        idempotency_key: &str,
+        status: &str,
+        now: i64,
+    ) -> Result<()> {
+        repositories::task_actor_contract::upsert_task_delivery_authority(
+            &self.connection,
+            delivery_id,
+            task_id,
+            run_id,
+            author_json,
+            reviewer_json,
+            destination_route_id,
+            route_receipt_json,
+            disclosure_generation,
+            idempotency_key,
+            status,
+            now,
+        )
+        .await
+    }
+
+    pub async fn upsert_task_occurrence_contract(
+        &self,
+        contract: &pioneer_protocol::TaskOccurrenceContract,
+        now: i64,
+    ) -> Result<()> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin Task occurrence contract transition")?;
+            repositories::task_actor_contract::upsert_task_occurrence_contract(
+                &transaction,
+                contract,
+                now,
+            )
+            .await?;
+            if matches!(
+                contract.status,
+                pioneer_protocol::TaskOccurrenceStatus::Delivered
+                    | pioneer_protocol::TaskOccurrenceStatus::Failed
+                    | pioneer_protocol::TaskOccurrenceStatus::Cancelled
+            ) && let Some(root_id) = contract.work_graph_root_execution_id.as_deref()
+            {
+                repositories::agent_domain::close_agent_root_scope_if_drained(
+                    &transaction,
+                    root_id,
+                    unix_to_datetime(now),
+                )
+                .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit Task occurrence contract transition")
+        })
+        .await
+    }
+
+    pub async fn get_task_occurrence_contract(
+        &self,
+        occurrence_id: &str,
+    ) -> Result<Option<pioneer_protocol::TaskOccurrenceContract>> {
+        repositories::task_actor_contract::find_task_occurrence_contract(
+            &self.connection,
+            occurrence_id,
+        )
+        .await
+    }
+
+    pub async fn get_task_occurrence_contract_by_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<pioneer_protocol::TaskOccurrenceContract>> {
+        repositories::task_actor_contract::find_task_occurrence_by_run_id(&self.connection, run_id)
+            .await
+    }
+
+    pub async fn list_task_occurrence_contracts(
+        &self,
+        task_id: &str,
+        limit: u64,
+    ) -> Result<Vec<pioneer_protocol::TaskOccurrenceContract>> {
+        repositories::task_actor_contract::list_task_occurrences(&self.connection, task_id, limit)
+            .await
+    }
+
+    pub async fn next_task_occurrence_execution_generation(&self, task_id: &str) -> Result<u64> {
+        repositories::task_actor_contract::next_task_occurrence_execution_generation(
+            &self.connection,
+            task_id,
+        )
+        .await
+    }
+
+    pub async fn task_occurrence_matches_execution_or_graph(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+        work_graph_root_execution_id: &str,
+    ) -> Result<bool> {
+        repositories::task_actor_contract::task_occurrence_matches_execution_or_graph(
+            &self.connection,
+            task_id,
+            execution_id,
+            work_graph_root_execution_id,
+        )
+        .await
     }
 
     /// Return a canonical revision of every durable row that contributes to
@@ -11763,6 +12505,157 @@ impl CrudStore {
         }
     }
 
+    /// Persist the exact agent domain identity/execution graph for an agent
+    /// Task occurrence before its runtime is started. The transaction owns
+    /// immutable identity/lineage, root scope, independent liveness state and
+    /// permit/queue placement together.
+    pub async fn commit_agent_execution_graph(
+        &self,
+        input: AgentExecutionGraphCommitInput,
+    ) -> Result<AgentExecutionGraphCommitResult> {
+        self.run_serialized_write(|| {
+            let input = input.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin agent execution graph transaction")?;
+                match crate::repositories::agent_domain::commit_agent_execution_graph(
+                    &transaction,
+                    &input,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit agent execution graph transaction")?;
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    pub async fn promote_queued_agent_executions(
+        &self,
+        now: sea_orm::prelude::DateTimeWithTimeZone,
+        limit: u64,
+        idle_timeout_secs: i64,
+        hard_timeout_secs: i64,
+    ) -> Result<Vec<PromotedAgentExecution>> {
+        self.run_serialized_write(|| {
+            let now = now.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin queued AgentExecution promotion transaction")?;
+                match crate::repositories::agent_domain::promote_queued_agent_executions(
+                    &transaction,
+                    now,
+                    limit,
+                    idle_timeout_secs,
+                    hard_timeout_secs,
+                )
+                .await
+                {
+                    Ok(promoted) => {
+                        transaction.commit().await.context(
+                            "failed to commit queued AgentExecution promotion transaction",
+                        )?;
+                        Ok(promoted)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Atomically finalize one agent domain execution attempt, release only
+    /// its permit/queue ownership and close the root scope when the graph is
+    /// actually drained.
+    pub async fn finalize_agent_execution(
+        &self,
+        execution_id: &str,
+        terminal_status: &str,
+        finished_at: sea_orm::prelude::DateTimeWithTimeZone,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| {
+            let finished_at = finished_at.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin AgentExecution finalization transaction")?;
+                let finalized = crate::repositories::agent_domain::finalize_agent_execution(
+                    &transaction,
+                    execution_id,
+                    terminal_status,
+                    finished_at,
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit AgentExecution finalization transaction")?;
+                Ok(finalized)
+            }
+        })
+        .await
+    }
+
+    pub async fn cancel_agent_work_graph(
+        &self,
+        root_execution_id: &str,
+        terminal_reason: &str,
+        finished_at: sea_orm::prelude::DateTimeWithTimeZone,
+    ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
+        self.run_serialized_write(|| {
+            let finished_at = finished_at.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin Agent work-graph cancellation transaction")?;
+                match crate::repositories::agent_domain::cancel_agent_work_graph(
+                    &transaction,
+                    root_execution_id,
+                    terminal_reason,
+                    finished_at,
+                )
+                .await
+                {
+                    Ok(targets) => {
+                        transaction.commit().await.context(
+                            "failed to commit Agent work-graph cancellation transaction",
+                        )?;
+                        Ok(targets)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn load_execution_for_run(&self, run_id: &str) -> Result<Option<TaskRunExecution>> {
         task_run_execution::find_execution_by_run(&self.connection, run_id)
             .await?
@@ -11831,17 +12724,90 @@ impl CrudStore {
         error: Option<&TaskError>,
     ) -> Result<Option<TaskRunExecution>> {
         self.run_serialized_write(|| async {
-            task_run_execution::mark_execution_terminal(
-                &self.connection,
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin terminal execution transition")?;
+            let completed_at = unix_to_datetime(completed_at);
+            let task_execution = task_run_execution::mark_execution_terminal(
+                &transaction,
                 execution_id,
                 status,
-                unix_to_datetime(completed_at),
+                completed_at,
                 result,
                 error,
             )
-            .await?
-            .map(task_run_execution_from_db_model)
-            .transpose()
+            .await?;
+            if let Some(task_execution) = task_execution.as_ref() {
+                let mut occurrence =
+                    repositories::task_actor_contract::find_task_occurrence_by_run_id(
+                        &transaction,
+                        task_execution.task_run_id.as_str(),
+                    )
+                    .await?
+                    .with_context(|| {
+                        format!(
+                            "Task execution `{}` has no durable occurrence contract",
+                            task_execution.id
+                        )
+                    })?;
+                occurrence.status = match status {
+                    TaskRunExecutionStatus::Succeeded => {
+                        pioneer_protocol::TaskOccurrenceStatus::Delivered
+                    }
+                    TaskRunExecutionStatus::Cancelled => {
+                        pioneer_protocol::TaskOccurrenceStatus::Cancelled
+                    }
+                    TaskRunExecutionStatus::Failed
+                    | TaskRunExecutionStatus::Blocked
+                    | TaskRunExecutionStatus::TimedOut => {
+                        pioneer_protocol::TaskOccurrenceStatus::Failed
+                    }
+                    TaskRunExecutionStatus::Reserved
+                    | TaskRunExecutionStatus::Starting
+                    | TaskRunExecutionStatus::Running
+                    | TaskRunExecutionStatus::WaitingReview => {
+                        bail!("non-terminal task execution status cannot finalize an occurrence")
+                    }
+                };
+                occurrence.terminal_reason = error.map(|error| error.message.clone());
+                repositories::task_actor_contract::upsert_task_occurrence_contract(
+                    &transaction,
+                    &occurrence,
+                    completed_at.timestamp(),
+                )
+                .await?;
+                if task_execution.executor_kind == "agent" {
+                    let agent_status = match status {
+                        TaskRunExecutionStatus::Succeeded => "succeeded",
+                        TaskRunExecutionStatus::Failed => "failed",
+                        TaskRunExecutionStatus::Blocked => "blocked",
+                        TaskRunExecutionStatus::Cancelled => "cancelled",
+                        TaskRunExecutionStatus::TimedOut => "timed_out",
+                        TaskRunExecutionStatus::Reserved
+                        | TaskRunExecutionStatus::Starting
+                        | TaskRunExecutionStatus::Running
+                        | TaskRunExecutionStatus::WaitingReview => bail!(
+                            "non-terminal task execution status cannot finalize an agent execution"
+                        ),
+                    };
+                    crate::repositories::agent_domain::finalize_agent_execution(
+                        &transaction,
+                        execution_id,
+                        agent_status,
+                        completed_at,
+                    )
+                    .await?;
+                }
+            }
+            transaction
+                .commit()
+                .await
+                .context("failed to commit terminal execution transition")?;
+            task_execution
+                .map(task_run_execution_from_db_model)
+                .transpose()
         })
         .await
     }
@@ -11852,16 +12818,92 @@ impl CrudStore {
         heartbeat_at: i64,
         lease_until: Option<i64>,
     ) -> Result<Option<TaskRunExecution>> {
+        self.heartbeat_execution_with_agent_attempt(execution_id, None, heartbeat_at, lease_until)
+            .await
+    }
+
+    pub async fn heartbeat_execution_for_agent_attempt(
+        &self,
+        execution_id: &str,
+        expected_attempt_generation: i64,
+        heartbeat_at: i64,
+        lease_until: Option<i64>,
+    ) -> Result<Option<TaskRunExecution>> {
+        self.heartbeat_execution_with_agent_attempt(
+            execution_id,
+            Some(expected_attempt_generation),
+            heartbeat_at,
+            lease_until,
+        )
+        .await
+    }
+
+    async fn heartbeat_execution_with_agent_attempt(
+        &self,
+        execution_id: &str,
+        expected_attempt_generation: Option<i64>,
+        heartbeat_at: i64,
+        lease_until: Option<i64>,
+    ) -> Result<Option<TaskRunExecution>> {
         self.run_serialized_write(|| async {
-            task_run_execution::heartbeat_execution(
-                &self.connection,
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin execution heartbeat transition")?;
+            if let Some(expected_attempt_generation) = expected_attempt_generation {
+                let current = crate::repositories::agent_domain::heartbeat_agent_execution(
+                    &transaction,
+                    execution_id,
+                    expected_attempt_generation,
+                    unix_to_datetime(heartbeat_at),
+                    lease_until.map(unix_to_datetime),
+                )
+                .await?;
+                if !current {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back stale agent heartbeat")?;
+                    return Ok(None);
+                }
+            }
+            let task_execution = task_run_execution::heartbeat_execution(
+                &transaction,
                 execution_id,
                 unix_to_datetime(heartbeat_at),
                 lease_until.map(unix_to_datetime),
             )
-            .await?
-            .map(task_run_execution_from_db_model)
-            .transpose()
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit execution heartbeat transition")?;
+            task_execution
+                .map(task_run_execution_from_db_model)
+                .transpose()
+        })
+        .await
+    }
+
+    pub async fn record_agent_execution_progress(
+        &self,
+        execution_id: &str,
+        expected_attempt_generation: i64,
+        progress_frontier_json: &str,
+        progress_at: i64,
+        idle_deadline_at: Option<i64>,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            crate::repositories::agent_domain::record_agent_execution_progress(
+                &self.connection,
+                execution_id,
+                expected_attempt_generation,
+                progress_frontier_json,
+                unix_to_datetime(progress_at),
+                idle_deadline_at.map(unix_to_datetime),
+            )
+            .await
         })
         .await
     }
@@ -12146,6 +13188,7 @@ impl CrudStore {
                     run_id: review_event.run_id.clone(),
                     task_run_turn_id: review_event.task_run_turn_id.clone(),
                     reviewer_kind: review_event.reviewer_kind,
+                    reviewer: review_event.reviewer.clone(),
                     reviewer_thread_id: review_event.reviewer_thread_id.clone(),
                     reviewer_turn_id: review_event.reviewer_turn_id.clone(),
                     reviewer_user_id: review_event.reviewer_user_id.clone(),
@@ -12532,14 +13575,38 @@ impl CrudStore {
         run_id: String,
         claimed_at: i64,
     ) -> Result<Option<TaskRun>> {
-        task_run::claim_run_for_dispatch(
-            &self.connection,
-            run_id.as_str(),
-            unix_to_datetime(claimed_at),
-        )
-        .await?
-        .map(task_run_from_db_model)
-        .transpose()
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin Task dispatch claim transaction")?;
+        let result = async {
+            let Some(_) = task_run::find_run_by_id(&transaction, run_id.as_str()).await? else {
+                return Ok(None);
+            };
+            task_run::claim_run_for_dispatch(
+                &transaction,
+                run_id.as_str(),
+                unix_to_datetime(claimed_at),
+            )
+            .await?
+            .map(task_run_from_db_model)
+            .transpose()
+        }
+        .await;
+        match result {
+            Ok(run) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit Task dispatch claim transaction")?;
+                Ok(run)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn append_task_run_started_once(
@@ -12728,6 +13795,20 @@ impl CrudStore {
             .await?
             .map(task_delivery_from_db_model)
             .transpose()
+    }
+
+    /// The exact-recipient inbox row is the notification delivery receipt.
+    /// For an agent-produced result its canonical DeliverResult receipt is
+    /// committed in the same transaction.
+    pub async fn materialize_task_notification(
+        &self,
+        notification: NewUserNotificationOutbox,
+        agent_action: Option<AgentCommitInput>,
+    ) -> Result<pioneer_entity::user_notification_outbox::Model> {
+        self.run_serialized_write(|| {
+            self.materialize_task_notification_once(notification.clone(), agent_action.clone())
+        })
+        .await
     }
 
     pub async fn list_due_task_deliveries(
@@ -12939,6 +14020,23 @@ impl CrudStore {
     ) -> Result<Vec<TaskThreadLineage>> {
         let rows =
             thread_lineage::list_lineage_by_root_thread(&self.connection, root_thread_id).await?;
+        Ok(rows
+            .into_iter()
+            .map(task_thread_lineage_from_db_model)
+            .collect())
+    }
+
+    pub async fn list_task_thread_lineage_by_root_thread_bounded(
+        &self,
+        root_thread_id: &str,
+        limit: u64,
+    ) -> Result<Vec<TaskThreadLineage>> {
+        let rows = thread_lineage::list_lineage_by_root_thread_bounded(
+            &self.connection,
+            root_thread_id,
+            limit,
+        )
+        .await?;
         Ok(rows
             .into_iter()
             .map(task_thread_lineage_from_db_model)
@@ -14694,6 +15792,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             &self.connection,
             task_ids.as_slice(),
             thread_id,
+            entry_turn_ids.as_slice(),
         )
         .await?;
         let entries_by_turn_id = entries
@@ -17314,6 +18413,20 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         find_turn_work_projection(&self.connection, turn_id).await
     }
 
+    pub async fn get_agent_work_graph_projection_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::AgentWorkGraphProjection>> {
+        load_agent_work_graph_projection_for_turn(&self.connection, turn_id).await
+    }
+
+    pub async fn get_agent_work_graph_projection_target(
+        &self,
+        root_execution_id: &str,
+    ) -> Result<Option<AgentWorkGraphProjectionTarget>> {
+        load_agent_work_graph_projection_target(&self.connection, root_execution_id).await
+    }
+
     pub async fn get_turn_work_item_projection(
         &self,
         work_item_id: &str,
@@ -17364,7 +18477,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         let Some(model) = thread::find_thread_by_id(&self.connection, thread_id).await? else {
             return Ok(None);
         };
-        let Some(mut thread) = thread_from_db_model(model) else {
+        let Some(mut thread) = thread_from_db_model(model)? else {
             return Ok(None);
         };
 
@@ -17801,7 +18914,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         .await?;
         let mut threads = Vec::with_capacity(models.len());
         for model in models {
-            let Some(mut thread) = thread_from_db_model(model) else {
+            let Some(mut thread) = thread_from_db_model(model)? else {
                 continue;
             };
             self.attach_latest_thread_turn_snapshot(&mut thread).await?;
@@ -17820,7 +18933,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         let mut threads = Vec::with_capacity(models.len());
 
         for model in models {
-            let Some(mut thread) = thread_from_db_model(model) else {
+            let Some(mut thread) = thread_from_db_model(model)? else {
                 continue;
             };
 
@@ -20817,6 +21930,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
 
             let task_update = pioneer_entity::task::Entity::update_many()
                 .filter(pioneer_entity::task::Column::Id.eq(run.task_id.clone()))
+                .filter(pioneer_entity::task::Column::Revision.lt(i64::MAX))
                 .filter(pioneer_entity::task::Column::Status.is_in(vec![
                     task_status_to_db(TaskStatus::Blocked),
                     task_status_to_db(TaskStatus::Scheduled),
@@ -21251,8 +22365,13 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     async fn materialize_turn_events_atomically_with_optional_admission(
@@ -21263,7 +22382,11 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         admission: Option<NewTurnAdmission>,
         authority_envelope: Option<(String, String)>,
         execution: Option<NewTurnExecution>,
-    ) -> Result<()> {
+        execution_security_snapshot: Option<(String, TurnExecutionSecuritySnapshot)>,
+        agent_action: Option<AgentCommitInput>,
+        execution_graph: Option<AgentExecutionGraphCommitInput>,
+        agent_turn_response: Option<AgentTurnResponseInput>,
+    ) -> Result<Option<AgentExecutionGraphCommitResult>> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let claim_expires_at =
             unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
@@ -21277,6 +22400,10 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 admission.clone(),
                 authority_envelope.clone(),
                 execution.clone(),
+                execution_security_snapshot.clone(),
+                agent_action.clone(),
+                execution_graph.clone(),
+                agent_turn_response.clone(),
             )
         })
         .await
@@ -21295,8 +22422,13 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
+        .map(|_| ())
     }
 
     async fn materialize_turn_events_atomically_once(
@@ -21308,12 +22440,101 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         admission: Option<NewTurnAdmission>,
         authority_envelope: Option<(String, String)>,
         execution: Option<NewTurnExecution>,
-    ) -> Result<()> {
+        execution_security_snapshot: Option<(String, TurnExecutionSecuritySnapshot)>,
+        agent_action: Option<AgentCommitInput>,
+        execution_graph: Option<AgentExecutionGraphCommitInput>,
+        agent_turn_response: Option<AgentTurnResponseInput>,
+    ) -> Result<Option<AgentExecutionGraphCommitResult>> {
+        let agent_action_timeline_target = if let Some(action) = agent_action.as_ref() {
+            let matching_turns = events
+                .iter()
+                .filter_map(|event| match event {
+                    TurnEventPayload::TurnStarted(started)
+                        if matches!(
+                            started.actor.as_ref(),
+                            Some(PersistedActorRef::AgentExecution(execution_id))
+                                if execution_id.as_str() == action.action.execution_id
+                        ) =>
+                    {
+                        Some(started.turn.id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if matching_turns.len() > 1 {
+                bail!("canonical agent action batch contains multiple authored Turn starts");
+            }
+            let item_targets = events
+                .iter()
+                .filter_map(|event| match event {
+                    TurnEventPayload::ItemCompleted(completed) => match &completed.item {
+                        TurnItem::AgentMessage { id, .. } => {
+                            Some((completed.turn_id.clone(), id.clone()))
+                        }
+                        TurnItem::SystemEvent { id, .. }
+                            if action.action.action_kind == "deliver_result"
+                                && action.route_receipt_json.is_some() =>
+                        {
+                            Some((completed.turn_id.clone(), id.clone()))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            if item_targets.len() > 1 {
+                bail!("canonical agent action batch contains multiple Agent message targets");
+            }
+            match action.action.action_kind.as_str() {
+                "deliver_result" => {
+                    let (turn_id, item_id) = item_targets.into_iter().next().context(
+                        "canonical delivery action batch has no exact result item target",
+                    )?;
+                    let result_reference =
+                        repositories::agent_domain::agent_delivery_result_reference(action)?;
+                    if item_id != result_reference {
+                        bail!(
+                            "canonical delivery action target differs from its immutable result reference"
+                        );
+                    }
+                    if matching_turns
+                        .first()
+                        .is_some_and(|started_turn_id| started_turn_id != &turn_id)
+                    {
+                        bail!("agent action item target differs from its exact delivery mutation");
+                    }
+                    Some((turn_id, Some(item_id)))
+                }
+                "send_message" | "start_agent" if matching_turns.len() == 1 => {
+                    Some((matching_turns[0].clone(), None))
+                }
+                _ => {
+                    bail!("canonical agent action batch has no exact authored timeline target");
+                }
+            }
+        } else {
+            None
+        };
         let transaction = self
             .connection
             .begin()
             .await
             .context("failed to begin turn event batch materialization transaction")?;
+
+        if let Some(response) = agent_turn_response.as_ref() {
+            let matching_start = events.iter().any(|event| {
+                matches!(
+                    event,
+                    TurnEventPayload::TurnStarted(started)
+                        if started.turn.id == response.turn_id
+                            && started.turn.mode == pioneer_protocol::ThreadMode::Agent
+                )
+            });
+            if !matching_start {
+                let _ = transaction.rollback().await;
+                bail!("responding AgentExecution is not bound to this Agent Turn batch");
+            }
+        }
 
         if let Some(creation) = creation
             && let Err(error) =
@@ -21365,12 +22586,72 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             bail!("execution Turn disappeared while persisting its authority envelope");
         }
 
+        if let Some((turn_id, snapshot)) = execution_security_snapshot
+            && !turn::set_turn_execution_security_snapshot(
+                &transaction,
+                turn_id.as_str(),
+                &snapshot,
+            )
+            .await?
+        {
+            let _ = transaction.rollback().await;
+            bail!("execution Turn disappeared while persisting its security snapshot");
+        }
+
+        let execution_graph_result = if let Some(execution_graph) = execution_graph {
+            match repositories::agent_domain::commit_agent_execution_graph(
+                &transaction,
+                &execution_graph,
+            )
+            .await
+            {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(response) = agent_turn_response
+            && let Err(error) =
+                repositories::agent_domain::insert_agent_turn_response(&transaction, &response)
+                    .await
+        {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+
+        if let Some(agent_action) = agent_action.as_ref() {
+            if let Err(error) =
+                repositories::agent_domain::commit_agent_action(&transaction, agent_action).await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            if let Some((turn_id, item_id)) = agent_action_timeline_target.as_ref()
+                && let Err(error) = repositories::agent_domain::bind_agent_action_timeline_target(
+                    &transaction,
+                    turn_id,
+                    item_id.as_deref(),
+                    agent_action.action.id.as_str(),
+                    created_at,
+                )
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+
         transaction
             .commit()
             .await
             .context("failed to commit turn event batch materialization transaction")?;
 
-        Ok(())
+        Ok(execution_graph_result)
     }
 
     async fn append_and_project_turn_event_in_transaction(
@@ -22437,6 +23718,128 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         Ok(appended_events)
     }
 
+    async fn append_task_events_with_agent_action_once(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        agent_action: AgentCommitInput,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin Task action materialization transaction")?;
+        let result = async {
+            let appended = self
+                .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
+                .await?;
+            repositories::agent_domain::commit_agent_action(&transaction, &agent_action).await?;
+            Ok(appended)
+        }
+        .await;
+        match result {
+            Ok(appended) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit Task action materialization transaction")?;
+                Ok(appended)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn materialize_task_notification_once(
+        &self,
+        notification: NewUserNotificationOutbox,
+        agent_action: Option<AgentCommitInput>,
+    ) -> Result<pioneer_entity::user_notification_outbox::Model> {
+        let payload: pioneer_protocol::TaskUserNotificationDeliveredNotification =
+            serde_json::from_str(notification.payload_json.as_str())
+                .context("durable Task notification payload is invalid")?;
+        if payload.notification_id != notification.id
+            || payload.workspace_id != notification.workspace_id
+            || payload.recipient_principal_id != notification.recipient_principal_id
+            || payload.task_id != notification.task_id
+            || payload.run_id != notification.run_id
+            || payload.delivery_id != notification.task_delivery_id
+        {
+            bail!("durable Task notification payload differs from its exact recipient envelope");
+        }
+        match agent_action.as_ref() {
+            Some(action) => {
+                let result_reference =
+                    repositories::agent_domain::agent_delivery_result_reference(action)?;
+                let delivery_id = pioneer_protocol::task_delivery_id_from_result_item_id(
+                    result_reference.as_str(),
+                )
+                .context("Task notification action has an invalid delivery reference")?;
+                if delivery_id != notification.task_delivery_id
+                    || payload.delivery_action_receipt_id.as_deref()
+                        != Some(action.receipt_id.as_str())
+                    || payload.author.as_ref().is_none_or(|author| {
+                        author.agent_identity_id.as_str() != action.actor_identity_id
+                            || author.agent_execution_id.as_str() != action.action.execution_id
+                    })
+                {
+                    bail!(
+                        "Agent Task notification differs from its exact delivery action and author"
+                    );
+                }
+            }
+            None => {
+                if payload.author.is_some() || payload.delivery_action_receipt_id.is_some() {
+                    bail!("System Task notification cannot claim an Agent delivery action");
+                }
+            }
+        }
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin Task notification transaction")?;
+        let result = async {
+            if let (Some(action), Some(author)) = (agent_action.as_ref(), payload.author.as_ref()) {
+                repositories::agent_domain::revalidate_agent_presentation_for_execution(
+                    &transaction,
+                    action.action.execution_id.as_str(),
+                    author,
+                )
+                .await?;
+            }
+            let persisted = user_notification_outbox::insert_task_notification_idempotent(
+                &transaction,
+                notification,
+            )
+            .await?;
+            if let Some(agent_action) = agent_action {
+                repositories::agent_domain::commit_agent_delivery_action(
+                    &transaction,
+                    &agent_action,
+                )
+                .await?;
+            }
+            Ok(persisted)
+        }
+        .await;
+        match result {
+            Ok(persisted) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit Task notification transaction")?;
+                Ok(persisted)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     async fn append_task_events_with_execution_admission_once(
         &self,
         events: Vec<TaskEventPayload>,
@@ -22500,6 +23903,162 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     .context("failed to commit blocked Task readmission transaction")?;
                 Ok(appended_events)
             }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn append_task_events_with_execution_readmission_and_agent_action_once(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        admission: NewTaskExecutionAdmission,
+        agent_action: AgentCommitInput,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin Task action readmission transaction")?;
+        let result = async {
+            let appended = self
+                .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
+                .await?;
+            task_execution_admission::readmit_immutable(&transaction, admission).await?;
+            repositories::agent_domain::commit_agent_action(&transaction, &agent_action).await?;
+            Ok(appended)
+        }
+        .await;
+        match result {
+            Ok(appended) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit Task action readmission transaction")?;
+                Ok(appended)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn commit_task_creation_once(
+        &self,
+        input: TaskCreationCommitInput,
+    ) -> Result<Vec<AppendedTaskEvent>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin atomic Task creation transaction")?;
+        let result = async {
+            let appended_events = self
+                .append_task_events_in_connection(
+                    &transaction,
+                    input.events,
+                    input.event_timestamp_secs,
+                )
+                .await?;
+
+            if let Some(snapshot) = input.conversation_snapshot {
+                let expected = snapshot.clone();
+                let persisted =
+                    task_run_conversation_snapshot::insert_if_absent(&transaction, snapshot)
+                        .await?;
+                if persisted.run_id != expected.run_id
+                    || persisted.task_id != expected.task_id
+                    || persisted.workspace_id != expected.workspace_id
+                    || persisted.conversation_thread_id != expected.conversation_thread_id
+                    || persisted.source_turn_id != expected.source_turn_id
+                    || persisted.history_json != expected.history_json
+                {
+                    bail!(
+                        "task run `{}` conversation snapshot conflicts with Task creation",
+                        expected.run_id
+                    );
+                }
+            }
+            if let Some(admission) = input.execution_admission {
+                task_execution_admission::insert_immutable(&transaction, admission).await?;
+            }
+            task_actor_contract::upsert_task_actor_contract(
+                &transaction,
+                &input.actor_contract,
+                input.event_timestamp_secs,
+            )
+            .await?;
+            if let Some(occurrence) = input.occurrence_contract {
+                task_actor_contract::upsert_task_occurrence_contract(
+                    &transaction,
+                    &occurrence,
+                    input.event_timestamp_secs,
+                )
+                .await?;
+            }
+            if let Some(agent_action) = input.agent_action {
+                repositories::agent_domain::commit_agent_action(&transaction, &agent_action)
+                    .await?;
+            }
+            Ok(appended_events)
+        }
+        .await;
+
+        match result {
+            Ok(appended_events) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit atomic Task creation transaction")?;
+                Ok(appended_events)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn commit_agent_thread_creation_with_action_once(
+        &self,
+        thread: Thread,
+        execution_id: pioneer_protocol::AgentExecutionId,
+        route: Option<AgentDelegationRouteInput>,
+        lineage: Option<TaskThreadLineage>,
+        created_at: DateTimeWithTimeZone,
+        updated_at: DateTimeWithTimeZone,
+        agent_action: AgentCommitInput,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin agent Thread creation transaction")?;
+        let result = async {
+            repositories::agent_domain::commit_agent_thread_creation(
+                &transaction,
+                &AgentThreadCreationCommitInput {
+                    thread: &thread,
+                    execution_id,
+                    route,
+                    lineage,
+                    created_at,
+                    updated_at,
+                },
+            )
+            .await?;
+            repositories::agent_domain::commit_agent_action(&transaction, &agent_action).await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => transaction
+                .commit()
+                .await
+                .context("failed to commit agent Thread creation transaction"),
             Err(error) => {
                 let _ = transaction.rollback().await;
                 Err(error)
@@ -22617,6 +24176,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         expected_next_fire_at: i64,
         now: i64,
         events: Vec<TaskEventPayload>,
+        occurrence_contracts: Vec<pioneer_protocol::TaskOccurrenceContract>,
         reserve_executions: Vec<(String, TaskExecutorKind)>,
     ) -> Result<Vec<AppendedTaskEvent>> {
         let transaction = self
@@ -22642,6 +24202,14 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             let appended_events = self
                 .append_task_events_in_connection(&transaction, events, now)
                 .await?;
+            for occurrence in occurrence_contracts {
+                task_actor_contract::upsert_task_occurrence_contract(
+                    &transaction,
+                    &occurrence,
+                    now,
+                )
+                .await?;
+            }
             for (run_id, executor_kind) in reserve_executions {
                 let _ = reserve_execution_for_run_in_connection(
                     &transaction,
@@ -23237,6 +24805,8 @@ fn task_result_review_event_from_db_model(
         run_id: model.run_id,
         task_run_turn_id: model.task_run_turn_id,
         reviewer_kind: task_result_reviewer_kind_from_db(model.reviewer_kind.as_str())?,
+        reviewer: serde_json::from_str(model.reviewer_ref_json.as_str())
+            .context("task result review event has an invalid exact reviewer")?,
         reviewer_thread_id: model.reviewer_thread_id,
         reviewer_turn_id: model.reviewer_turn_id,
         reviewer_user_id: model.reviewer_user_id,
@@ -23922,23 +25492,35 @@ fn contains_any_key(value: &serde_json::Value, keys: &[&str]) -> Option<String> 
     }
 }
 
-fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Option<Thread> {
-    let mode = thread_mode_from_db(model.mode.as_str())?;
-    let status = thread_status_from_db(model.status.as_str())?;
-    let origin_kind = thread_origin_kind_from_db(model.origin_kind.as_str())?;
-    let sidebar_visibility = thread_sidebar_visibility_from_db(model.sidebar_visibility.as_str())?;
-    let visibility =
-        match persisted_thread_access_class_from_db(model.access_class.as_str()).ok()? {
-            PersistedThreadAccessClass::Private => Some(ThreadVisibility::Private),
-            PersistedThreadAccessClass::Workspace => Some(ThreadVisibility::Workspace),
-            PersistedThreadAccessClass::Internal => None,
-        };
+fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Result<Option<Thread>> {
+    let Some(mode) = thread_mode_from_db(model.mode.as_str()) else {
+        return Ok(None);
+    };
+    let Some(status) = thread_status_from_db(model.status.as_str()) else {
+        return Ok(None);
+    };
+    let Some(origin_kind) = thread_origin_kind_from_db(model.origin_kind.as_str()) else {
+        return Ok(None);
+    };
+    let Some(sidebar_visibility) =
+        thread_sidebar_visibility_from_db(model.sidebar_visibility.as_str())
+    else {
+        return Ok(None);
+    };
+    let visibility = match persisted_thread_access_class_from_db(model.access_class.as_str())? {
+        PersistedThreadAccessClass::Private => Some(ThreadVisibility::Private),
+        PersistedThreadAccessClass::Workspace => Some(ThreadVisibility::Workspace),
+        PersistedThreadAccessClass::Internal => None,
+    };
+    let preview_author =
+        repositories::thread::preview_author_from_json(model.preview_author_json.as_deref())?;
 
-    Some(Thread {
+    Ok(Some(Thread {
         workspace_id: model.workspace_id,
         id: model.id,
         name: model.name,
         preview: model.preview,
+        preview_author,
         mode,
         model: model.model,
         model_provider: model.model_provider,
@@ -23952,7 +25534,7 @@ fn thread_from_db_model(model: pioneer_entity::thread::Model) -> Option<Thread> 
         agent_role: model.agent_role,
         visibility,
         turns: Vec::new(),
-    })
+    }))
 }
 
 fn thread_snapshot_turn_from_db_model(model: pioneer_entity::turn::Model) -> Result<Option<Turn>> {
@@ -24222,7 +25804,7 @@ mod tests {
         TurnMcpProjectionRecord, TurnMcpProjectionReplacement, TurnMessageMutationFailure,
         TurnProjectionStreamHealth, TurnSkillBindingRecord, WorkspaceSkillPolicyRecord,
         create_gateway_singleton, create_member_principal, create_superuser,
-        delete_workspace_membership, insert_workspace_membership,
+        delete_workspace_membership, ensure_pioneer_for_workspace, insert_workspace_membership,
         list_abandoned_runtime_draft_artifact_ids,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
@@ -24350,6 +25932,13 @@ mod tests {
         CrudStore::new(connection)
     }
 
+    async fn ensure_test_agent_identity(store: &CrudStore, workspace_id: &str, timestamp: i64) {
+        let now = unix_to_datetime(timestamp);
+        ensure_pioneer_for_workspace(&store.connection, workspace_id, now.clone())
+            .await
+            .expect("agent domain workspace identity should seed");
+    }
+
     async fn test_store_with_started_turn(
         workspace_id: &str,
         thread_id: &str,
@@ -24362,6 +25951,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -25992,6 +27582,7 @@ mod tests {
             author_display_name_snapshot: Set(Some("Author".to_owned())),
             author_nickname_snapshot: Set(Some("author".to_owned())),
             author_avatar_revision_snapshot: Set(None),
+            author_agent_snapshot_json: Set(None),
             reply_to_turn_id: Set(None),
             mentions_json: Set("[]".to_owned()),
             message_revision: Set(0),
@@ -26693,6 +28284,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -28110,6 +29702,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -28393,6 +29986,7 @@ mod tests {
     async fn task_owned_blocked_turn_resume_reopens_the_full_aggregate() {
         let store = test_store_with_workspace("ws_task_owned_resume").await;
         let timestamp = 1_700_010_000;
+        ensure_test_agent_identity(&store, "ws_task_owned_resume", timestamp).await;
         let thread_id = "thread_task_owned_resume";
         let turn_id = "turn_task_owned_resume";
 
@@ -28556,6 +30150,7 @@ mod tests {
     ) -> (CrudStore, Task, TaskRun, RecoveryJobRecord, String, String) {
         let store = test_store_with_workspace(workspace_id).await;
         let timestamp = 1_700_011_000;
+        ensure_test_agent_identity(&store, workspace_id, timestamp).await;
         let thread_id = format!("thread_task_owned_{suffix}");
         let turn_id = format!("turn_task_owned_{suffix}");
 
@@ -28953,6 +30548,7 @@ mod tests {
             run_id: "run_round_trip".to_owned(),
             task_run_turn_id: turn.id.clone(),
             reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+            reviewer: pioneer_protocol::TaskResultReviewerRef::RuntimePolicy,
             reviewer_thread_id: None,
             reviewer_turn_id: None,
             reviewer_user_id: None,
@@ -29262,6 +30858,10 @@ mod tests {
                     run_id: "run_helpers".to_owned(),
                     task_run_turn_id: "task_run_turn_helpers_1".to_owned(),
                     reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                    reviewer: pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+                        pioneer_protocol::AgentExecutionId::new("R".repeat(21))
+                            .expect("parent reviewer execution id"),
+                    ),
                     reviewer_thread_id: Some("parent_thread_helpers".to_owned()),
                     reviewer_turn_id: Some("parent_turn_helpers".to_owned()),
                     reviewer_user_id: None,
@@ -29390,6 +30990,7 @@ mod tests {
     async fn task_review_projector_replays_new_runtime_events_idempotently() {
         let store = test_store_with_workspace("ws_task_review_projector").await;
         let timestamp = 1_700_002_000;
+        ensure_test_agent_identity(&store, "ws_task_review_projector", timestamp).await;
         let mut task = sample_task(timestamp);
         task.id = "task_projector".to_owned();
         task.workspace_id = "ws_task_review_projector".to_owned();
@@ -29474,6 +31075,7 @@ mod tests {
             run_id: run.id.clone(),
             task_run_turn_id: turn.id.clone(),
             reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+            reviewer: pioneer_protocol::TaskResultReviewerRef::RuntimePolicy,
             reviewer_thread_id: None,
             reviewer_turn_id: None,
             reviewer_user_id: None,
@@ -29759,6 +31361,10 @@ mod tests {
             run_id: run.id.clone(),
             task_run_turn_id: initial_turn.id.clone(),
             reviewer_kind: TaskResultReviewerKind::ParentAgent,
+            reviewer: pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+                pioneer_protocol::AgentExecutionId::new("R".repeat(21))
+                    .expect("parent reviewer execution id"),
+            ),
             reviewer_thread_id: Some("parent_thread_revision_projector".to_owned()),
             reviewer_turn_id: Some("parent_turn_revision_projector".to_owned()),
             reviewer_user_id: None,
@@ -30249,6 +31855,7 @@ mod tests {
             id: "thr_task".to_owned(),
             name: Some("TaskRun occurrence reconciliation".to_owned()),
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -30929,6 +32536,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -31111,6 +32719,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -31236,6 +32845,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -31594,6 +33204,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -34298,6 +35909,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -34518,6 +36130,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -34778,6 +36391,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -36834,6 +38448,7 @@ mod tests {
             id: "thr_000000000000000001".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -37034,6 +38649,7 @@ mod tests {
             id: "thr_legacy_actor".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -37415,6 +39031,7 @@ mod tests {
             id: "thr_permission_profile".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -37606,6 +39223,7 @@ mod tests {
             id: "thr_atomic_profile".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -37759,6 +39377,7 @@ mod tests {
             id: "thr_atomic_admission_fault".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -37808,6 +39427,10 @@ mod tests {
             reason: None,
             cached: false,
         };
+        let security_snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            "/workspace/atomic-admission",
+            timestamp.saturating_mul(1000),
+        );
 
         store
             .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
@@ -37841,6 +39464,10 @@ mod tests {
                     lease_until: unix_to_datetime(timestamp + 45),
                     created_at: unix_to_datetime(timestamp),
                 }),
+                &security_snapshot,
+                Vec::new(),
+                None,
+                None,
             )
             .await
             .expect_err("stale policy admission must abort the whole batch");
@@ -37896,6 +39523,7 @@ mod tests {
             id: "thr_atomic_message".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -38558,6 +40186,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Message,
             model: String::new(),
             model_provider: String::new(),
@@ -38671,6 +40300,7 @@ mod tests {
             id: "thr_old_permission_profile".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -38733,6 +40363,7 @@ mod tests {
             id: "thr_unknown_permission_profile".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -39056,6 +40687,7 @@ mod tests {
             id: "thr_reasoning_effort".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -39115,6 +40747,7 @@ mod tests {
             id: "thr_000000000000000001".to_owned(),
             name: None,
             preview: "human conversation".to_owned(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -39355,6 +40988,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -39578,6 +41212,7 @@ mod tests {
             id: "thr_000000000000000002".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -39701,6 +41336,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Message,
             model: String::new(),
             model_provider: String::new(),

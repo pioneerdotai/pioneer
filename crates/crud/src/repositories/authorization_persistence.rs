@@ -651,6 +651,7 @@ mod tests {
             workspace_id: Set(WORKSPACE_ID.to_owned()),
             name: Set(Some("Private legacy thread".to_owned())),
             preview: Set(String::new()),
+            preview_author_json: Set(None),
             mode: Set("chat".to_owned()),
             model: Set("test".to_owned()),
             model_provider: Set("test".to_owned()),

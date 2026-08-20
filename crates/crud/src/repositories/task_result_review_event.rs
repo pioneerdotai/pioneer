@@ -1,7 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use pioneer_entity::task_result_review_event;
 use pioneer_protocol::{
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind, TaskValue,
+    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
+    TaskResultReviewerRef, TaskValue,
 };
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
@@ -12,6 +13,7 @@ use crate::convention::{
 };
 use crate::util::{optional_typed_json_to_db, unix_to_datetime};
 
+#[derive(Clone)]
 pub struct NewTaskResultReviewEvent {
     pub id: String,
     pub candidate_id: String,
@@ -19,6 +21,7 @@ pub struct NewTaskResultReviewEvent {
     pub run_id: String,
     pub task_run_turn_id: String,
     pub reviewer_kind: TaskResultReviewerKind,
+    pub reviewer: TaskResultReviewerRef,
     pub reviewer_thread_id: Option<String>,
     pub reviewer_turn_id: Option<String>,
     pub reviewer_user_id: Option<String>,
@@ -37,32 +40,50 @@ pub async fn upsert_review_event<C: ConnectionTrait>(
     db: &C,
     event: NewTaskResultReviewEvent,
 ) -> Result<()> {
-    task_result_review_event::Entity::insert(active_model_from_new_review_event(event)?)
+    task_result_review_event::Entity::insert(active_model_from_new_review_event(event.clone())?)
         .on_conflict(
             OnConflict::column(task_result_review_event::Column::Id)
-                .update_columns([
-                    task_result_review_event::Column::CandidateId,
-                    task_result_review_event::Column::TaskId,
-                    task_result_review_event::Column::RunId,
-                    task_result_review_event::Column::TaskRunTurnId,
-                    task_result_review_event::Column::ReviewerKind,
-                    task_result_review_event::Column::ReviewerThreadId,
-                    task_result_review_event::Column::ReviewerTurnId,
-                    task_result_review_event::Column::ReviewerUserId,
-                    task_result_review_event::Column::ReviewerAgentSpecId,
-                    task_result_review_event::Column::EventKind,
-                    task_result_review_event::Column::Decision,
-                    task_result_review_event::Column::FeedbackText,
-                    task_result_review_event::Column::FeedbackJson,
-                    task_result_review_event::Column::Confidence,
-                    task_result_review_event::Column::SupersedesReviewEventId,
-                    task_result_review_event::Column::NextTaskRunTurnId,
-                ])
+                .do_nothing()
                 .to_owned(),
         )
-        .exec(db)
+        .exec_without_returning(db)
         .await
         .context("failed to upsert task result review event")?;
+    let persisted = find_review_event_by_id(db, event.id.as_str())
+        .await?
+        .context("task result review event missing after insert")?;
+    ensure_review_event_is_exact(&persisted, &event)?;
+    Ok(())
+}
+
+fn ensure_review_event_is_exact(
+    persisted: &task_result_review_event::Model,
+    expected: &NewTaskResultReviewEvent,
+) -> Result<()> {
+    let reviewer_ref_json = serde_json::to_string(&expected.reviewer)?;
+    let feedback_json = optional_typed_json_to_db(&expected.feedback)?;
+    ensure!(
+        persisted.candidate_id == expected.candidate_id
+            && persisted.task_id == expected.task_id
+            && persisted.run_id == expected.run_id
+            && persisted.task_run_turn_id == expected.task_run_turn_id
+            && persisted.reviewer_kind == task_result_reviewer_kind_to_db(expected.reviewer_kind)
+            && persisted.reviewer_ref_json == reviewer_ref_json
+            && persisted.reviewer_thread_id == expected.reviewer_thread_id
+            && persisted.reviewer_turn_id == expected.reviewer_turn_id
+            && persisted.reviewer_user_id == expected.reviewer_user_id
+            && persisted.reviewer_agent_spec_id == expected.reviewer_agent_spec_id
+            && persisted.event_kind == task_result_review_event_kind_to_db(expected.event_kind)
+            && persisted.decision == task_result_review_decision_to_db(expected.decision)
+            && persisted.feedback_text == expected.feedback_text
+            && persisted.feedback_json == feedback_json
+            && persisted.confidence == expected.confidence
+            && persisted.supersedes_review_event_id == expected.supersedes_review_event_id
+            && persisted.next_task_run_turn_id == expected.next_task_run_turn_id
+            && persisted.created_at.timestamp() == expected.created_at,
+        "task result review event {} already exists with different immutable facts",
+        expected.id
+    );
     Ok(())
 }
 
@@ -112,6 +133,7 @@ fn active_model_from_new_review_event(
         run_id: Set(event.run_id),
         task_run_turn_id: Set(event.task_run_turn_id),
         reviewer_kind: Set(task_result_reviewer_kind_to_db(event.reviewer_kind)),
+        reviewer_ref_json: Set(serde_json::to_string(&event.reviewer)?),
         reviewer_thread_id: Set(event.reviewer_thread_id),
         reviewer_turn_id: Set(event.reviewer_turn_id),
         reviewer_user_id: Set(event.reviewer_user_id),

@@ -331,6 +331,7 @@ pub async fn update_task_result<C: ConnectionTrait>(
 
     let result = task::Entity::update_many()
         .filter(task::Column::Id.eq(task_id.to_owned()))
+        .filter(task::Column::Revision.lt(i64::MAX))
         .col_expr(task::Column::Status, Expr::value(task_status_to_db(status)))
         .col_expr(task::Column::ResultJson, Expr::value(result_json))
         .col_expr(task::Column::UpdatedAt, Expr::value(updated_at))
@@ -370,6 +371,7 @@ pub async fn update_task_error<C: ConnectionTrait>(
 
     let result = task::Entity::update_many()
         .filter(task::Column::Id.eq(task_id.to_owned()))
+        .filter(task::Column::Revision.lt(i64::MAX))
         .col_expr(task::Column::Status, Expr::value(task_status_to_db(status)))
         .col_expr(task::Column::ErrorJson, Expr::value(error_json))
         .col_expr(task::Column::UpdatedAt, Expr::value(updated_at))

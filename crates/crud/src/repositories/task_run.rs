@@ -179,7 +179,9 @@ pub async fn next_run_number<C: ConnectionTrait>(db: &C, task_id: &str) -> Resul
         })
         .unwrap_or(0);
 
-    Ok(max_run_number + 1)
+    max_run_number
+        .checked_add(1)
+        .context("task run number is exhausted")
 }
 
 pub async fn update_run_status<C: ConnectionTrait>(

@@ -29,7 +29,7 @@ where
     Box::pin(future)
 }
 
-fn message_thread_preview(input: &[UserInput]) -> String {
+pub(crate) fn message_thread_preview(input: &[UserInput]) -> String {
     input
         .iter()
         .find_map(|input| match input {
@@ -558,6 +558,7 @@ impl TurnProjector {
                     db,
                     payload.thread.id.as_str(),
                     derived_preview.as_str(),
+                    payload.turn.author.as_ref(),
                     thread_updated_at,
                 )
                 .await?;
@@ -578,8 +579,11 @@ impl TurnProjector {
                     .await?;
                 }
             } else {
-                match actor {
-                    Some(actor) => {
+                let existing_thread = thread::find_thread_by_id(db, payload.thread.id.as_str())
+                    .await?
+                    .is_some();
+                match (existing_thread, actor) {
+                    (false, Some(actor)) => {
                         thread::upsert_thread_with_creator(
                             db,
                             &payload.thread,
@@ -589,7 +593,7 @@ impl TurnProjector {
                         )
                         .await?;
                     }
-                    None => {
+                    (true, _) | (false, None) => {
                         thread::upsert_thread(
                             db,
                             &payload.thread,
@@ -980,6 +984,7 @@ mod epic6_tests {
                 id: "thread-message".to_owned(),
                 name: None,
                 preview: "hello".to_owned(),
+                preview_author: None,
                 mode: ThreadMode::Message,
                 model: "unused".to_owned(),
                 model_provider: "unused".to_owned(),

@@ -1,8 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use pioneer_entity::thread_lineage;
 use pioneer_protocol::TaskThreadLineage;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 
 use crate::util::unix_to_datetime;
 
@@ -68,4 +70,24 @@ pub async fn list_lineage_by_root_thread<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list thread lineage subtree")
+}
+
+pub async fn list_lineage_by_root_thread_bounded<C: ConnectionTrait>(
+    db: &C,
+    root_thread_id: &str,
+    limit: u64,
+) -> Result<Vec<thread_lineage::Model>> {
+    if limit == 0 || limit > 128 {
+        bail!("thread lineage projection exceeds its bounded limit");
+    }
+    let rows = thread_lineage::Entity::find()
+        .filter(thread_lineage::Column::RootThreadId.eq(root_thread_id.to_owned()))
+        .order_by_asc(thread_lineage::Column::Depth)
+        .order_by_asc(thread_lineage::Column::CreatedAt)
+        .order_by_asc(thread_lineage::Column::ChildThreadId)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to list bounded thread lineage subtree")?;
+    Ok(rows)
 }
