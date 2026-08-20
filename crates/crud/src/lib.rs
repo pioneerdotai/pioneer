@@ -10059,6 +10059,11 @@ impl CrudStore {
         if authority_envelope_json.is_empty() {
             bail!("execution authority envelope must not be empty");
         }
+        match (turn_model.author.as_ref(), &actor) {
+            (Some(author), actor) if &author.actor == actor => {}
+            (None, PersistedActorRef::System) => {}
+            _ => bail!("executable Turn actor does not match its immutable author snapshot"),
+        }
         let creation = match runtime_draft {
             Some(AuthorizedTurnRuntimeDraft::ScopedPrincipal {
                 gateway_id,

@@ -1,5 +1,6 @@
 mod admission;
 mod agent_action_service;
+#[cfg(test)]
 mod agent_authored_operations;
 mod agent_execution;
 mod agent_facts;
@@ -34,7 +35,6 @@ pub(crate) use agent_action_service::{
     AgentActionCommitPlan, AgentActionCommitProjection, AgentActionKindName,
     AgentActionServiceError, CanonicalAgentActionService, PreparedAgentAction,
 };
-pub(crate) use agent_authored_operations::exact_agent_actor;
 pub(crate) use agent_execution::{
     ChildAgentLaunchGrant, ExecutionAttemptState, ExecutionMaterializationError,
     MaterializedChildAgentStart, RootExecutionBinding, RunningPermit,

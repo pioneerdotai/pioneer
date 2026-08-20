@@ -55,13 +55,38 @@ fn task_agent_liveness_timeouts(task: &Task) -> (i64, i64) {
     (idle, hard.max(idle))
 }
 
-/// Every executable task/reviewer turn has a stable server-generated
-/// execution-shaped id. Persist that id as the visible actor; System is
-/// reserved for genuine runtime lifecycle events only.
-fn exact_task_execution_actor(execution_id: &str) -> Result<pioneer_protocol::PersistedActorRef> {
-    let execution_id = AgentExecutionId::new(execution_id.to_owned())
-        .map_err(|error| anyhow!("invalid task execution actor id `{execution_id}`: {error:?}"))?;
-    Ok(crate::authorization::exact_agent_actor(execution_id))
+fn task_occurrence_turn_author(
+    actor_contract: &pioneer_protocol::TaskActorContract,
+    execution_id: &str,
+) -> Result<pioneer_protocol::TurnAuthorSnapshot> {
+    actor_contract
+        .validate()
+        .map_err(|error| anyhow!("Task actor contract is invalid: {error:?}"))?;
+    let grant_json = actor_contract
+        .derived_child_launch_grant_json
+        .as_deref()
+        .context("Agent Task has no immutable resolved launch grant")?;
+    let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch { identity, .. } =
+        serde_json::from_str(grant_json).context("Task resolved launch grant is invalid")?;
+    if actor_contract.resolved_identity_id.as_deref() != Some(identity.id.as_str())
+        || actor_contract.source_config_fingerprint.as_deref()
+            != Some(identity.source_fingerprint.as_str())
+    {
+        bail!("Task occurrence identity differs from its immutable actor contract");
+    }
+    let agent_execution_id = AgentExecutionId::new(execution_id.to_owned())
+        .map_err(|error| anyhow!("invalid task execution id `{execution_id}`: {error:?}"))?;
+    Ok(pioneer_protocol::AgentPresentationSnapshot {
+        agent_identity_id: identity.id,
+        agent_execution_id,
+        identity_source_kind: identity.source_kind,
+        identity_source_revision: identity.source_revision,
+        display_name: identity.display_name,
+        nickname: identity.nickname,
+        avatar_revision: identity.avatar_revision,
+        role_label: identity.role_label,
+    }
+    .to_turn_author_snapshot())
 }
 
 fn task_occurrence_execution_lineage(
@@ -6522,13 +6547,20 @@ async fn ensure_task_run_occurrence_turn(
     let now = now_timestamp_secs();
     parent_thread.updated_at = now;
     parent_thread.turns.clear();
+    let actor_contract = processor
+        .crud_store
+        .get_task_actor_contract(task.id.as_str())
+        .await?
+        .context("agent Task is missing its durable actor contract")?;
+    let occurrence_author = task_occurrence_turn_author(&actor_contract, execution.id.as_str())?;
+    let occurrence_actor = occurrence_author.actor.clone();
     let occurrence_turn = Turn {
         id: run.id.clone(),
         status: TurnStatus::InProgress,
         turn_kind: TurnKind::TaskRun,
         origin,
         mode: Default::default(),
-        author: None,
+        author: Some(occurrence_author),
         reply_to_turn_id: None,
         mentions: Vec::new(),
         message_revision: 0,
@@ -6565,7 +6597,7 @@ async fn ensure_task_run_occurrence_turn(
             &occurrence_turn,
             &[],
             None,
-            exact_task_execution_actor(execution.id.as_str())?,
+            occurrence_actor,
             profile_selected_audit,
             occurrence_authority_json.as_str(),
             None,
@@ -9368,6 +9400,17 @@ mod tests {
         ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
     };
     use sea_orm::{ConnectionTrait, Database};
+
+    fn exact_task_execution_actor(
+        execution_id: &str,
+    ) -> Result<pioneer_protocol::PersistedActorRef> {
+        let execution_id = AgentExecutionId::new(execution_id.to_owned()).map_err(|error| {
+            anyhow!("invalid task execution actor id `{execution_id}`: {error:?}")
+        })?;
+        Ok(pioneer_protocol::PersistedActorRef::AgentExecution(
+            execution_id,
+        ))
+    }
 
     fn test_task_run_turn() -> TaskRunTurn {
         TaskRunTurn {
