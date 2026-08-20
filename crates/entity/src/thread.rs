@@ -27,8 +27,10 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub created_by_actor_id: Option<String>,
-    pub created_by_actor_kind: Option<String>,
     pub access_class: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub preview_author_json: Option<String>,
+    pub created_by_actor_kind: Option<String>,
     #[sea_orm(has_many)]
     pub thread_read_cursors: HasMany<super::thread_read_cursor::Entity>,
     #[sea_orm(has_many, via = "thread_membership")]

@@ -34,7 +34,6 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_security_snapshot_json: Option<String>,
     pub initiated_by_actor_id: Option<String>,
-    pub initiated_by_actor_kind: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_authorization_context_json: Option<String>,
     pub send_mode: Option<String>,
@@ -49,6 +48,13 @@ pub struct Model {
     pub message_deleted_at: Option<DateTimeWithTimeZone>,
     pub message_deleted_by_actor_id: Option<String>,
     pub message_deleted_by_actor_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub author_agent_snapshot_json: Option<String>,
+    pub initiated_by_actor_kind: Option<String>,
+    #[sea_orm(has_many)]
+    pub agent_action_timeline_targets: HasMany<super::agent_action_timeline_target::Entity>,
+    #[sea_orm(has_one)]
+    pub agent_turn_response_execution: HasOne<super::agent_turn_response_execution::Entity>,
     #[sea_orm(has_many)]
     pub thread_read_cursors: HasMany<super::thread_read_cursor::Entity>,
     #[sea_orm(
@@ -64,6 +70,8 @@ pub struct Model {
     pub turn_admission: HasOne<super::turn_admission::Entity>,
     #[sea_orm(has_one)]
     pub turn_cli_runtime_instruction: HasOne<super::turn_cli_runtime_instruction::Entity>,
+    #[sea_orm(has_one)]
+    pub turn_execution: HasOne<super::turn_execution::Entity>,
     #[sea_orm(has_one)]
     pub turn_finalization: HasOne<super::turn_finalization::Entity>,
     #[sea_orm(has_one)]

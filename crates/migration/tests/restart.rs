@@ -2,14 +2,15 @@ use migration::{MigrationTrait, Migrator, MigratorTrait};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement, TryGetable};
 use tempfile::TempDir;
 
-struct BeforeLatestMigrator;
+struct BeforeAgentArchitectureMigrator;
 
 #[async_trait::async_trait]
-impl MigratorTrait for BeforeLatestMigrator {
+impl MigratorTrait for BeforeAgentArchitectureMigrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        let mut migrations = Migrator::migrations();
-        migrations.pop().expect("migration registry is not empty");
-        migrations
+        Migrator::migrations()
+            .into_iter()
+            .take_while(|migration| migration.name() != "m20260820_000001_agent_domain_foundation")
+            .collect()
     }
 }
 
@@ -121,11 +122,11 @@ async fn migration_previous_release_upgrades_after_database_restart() {
     let directory = tempfile::tempdir().expect("create migration test directory");
     let url = sqlite_url(&directory);
     let all_migrations = Migrator::migrations();
-    let expected_before = all_migrations.len() as i64 - 1;
+    let expected_before = BeforeAgentArchitectureMigrator::migrations().len() as i64;
     let expected_after = all_migrations.len() as i64;
 
     let previous = connect(&url).await;
-    BeforeLatestMigrator::up(&previous, None)
+    BeforeAgentArchitectureMigrator::up(&previous, None)
         .await
         .expect("apply previous release schema");
     assert_eq!(applied_migration_count(&previous).await, expected_before);
@@ -144,6 +145,11 @@ async fn migration_previous_release_upgrades_after_database_restart() {
     assert!(table_exists(&upgraded, "turn_execution").await);
     assert!(table_exists(&upgraded, "turn_finalization").await);
     assert!(table_exists(&upgraded, "recovery_terminalization_outbox").await);
+    assert!(table_exists(&upgraded, "agent_identity").await);
+    assert!(table_exists(&upgraded, "agent_execution").await);
+    assert!(table_exists(&upgraded, "task_actor_contract").await);
+    assert!(table_exists(&upgraded, "agent_action_timeline_target").await);
+    assert!(column_exists(&upgraded, "turn", "author_agent_snapshot_json").await);
     upgraded
         .close()
         .await
@@ -157,12 +163,12 @@ async fn migration_upgrades_legacy_task_delivery_contract_without_runtime_fallba
     let previous = connect(&url).await;
     BeforeTaskDeliveryTargetsMigrator::up(&previous, None)
         .await
-        .expect("apply previous release schema");
+        .expect("apply schema before task delivery migration");
     previous
         .execute_unprepared(
             r#"
             INSERT INTO workspace (id, name, is_active, is_current)
-            VALUES ('workspace_migration', 'Migration test', 1, 1);
+            VALUES ('WworkspaceMigration01', 'Migration test', 1, 1);
 
             INSERT INTO task (
                 id, workspace_id, owner_kind, owner_id, created_by_thread_id,

@@ -24,6 +24,8 @@ pub struct Model {
     pub lease_expires_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(has_one)]
+    pub agent_action_timeline_target: HasOne<super::agent_action_timeline_target::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

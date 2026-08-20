@@ -29,6 +29,8 @@ pub struct Model {
     pub supersedes_review_event_id: Option<String>,
     pub next_task_run_turn_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub reviewer_ref_json: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

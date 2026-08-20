@@ -15,6 +15,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 sea-orm-migration = { workspace = true, features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 pioneer-entity.workspace = true
 serde_json.workspace = true
+hex.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

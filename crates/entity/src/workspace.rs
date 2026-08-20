@@ -16,7 +16,15 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(has_many)]
+    pub actor_nickname_indices: HasMany<super::actor_nickname_index::Entity>,
+    #[sea_orm(has_many)]
+    pub agent_executions: HasMany<super::agent_execution::Entity>,
+    #[sea_orm(has_many)]
+    pub agent_identities: HasMany<super::agent_identity::Entity>,
+    #[sea_orm(has_many)]
     pub agent_skills: HasMany<super::agent_skill::Entity>,
+    #[sea_orm(has_many)]
+    pub native_agent_configs: HasMany<super::native_agent_config::Entity>,
     #[sea_orm(has_many)]
     pub self_improvement_runs: HasMany<super::self_improvement_run::Entity>,
     #[sea_orm(has_many)]

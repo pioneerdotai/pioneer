@@ -14,7 +14,6 @@ pub struct Model {
     #[sea_orm(unique_key = "uq_turn_item_attempt_turn_item_attempt_number")]
     pub item_id: String,
     pub item_type: String,
-    pub execution_class: Option<String>,
     #[sea_orm(unique_key = "uq_turn_item_attempt_turn_item_attempt_number")]
     pub attempt_number: i64,
     pub status: String,
@@ -37,6 +36,7 @@ pub struct Model {
     pub recovery_suppressed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]
     pub recovery_suppression_context_json: Option<String>,
+    pub execution_class: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
