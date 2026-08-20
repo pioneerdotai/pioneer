@@ -4512,6 +4512,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "test-model".to_owned(),
             model_provider: "test-provider".to_owned(),

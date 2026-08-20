@@ -19,7 +19,6 @@ struct GatewayDatabaseRuntimeConfig {
     acquire_timeout: Duration,
     idle_timeout: Duration,
     sqlx_logging: bool,
-    run_migrations_on_startup: bool,
 }
 
 impl GatewayDatabaseRuntimeConfig {
@@ -51,7 +50,6 @@ impl GatewayDatabaseRuntimeConfig {
             acquire_timeout: Duration::from_millis(database.acquire_timeout_ms),
             idle_timeout: Duration::from_millis(database.idle_timeout_ms),
             sqlx_logging: database.sqlx_logging,
-            run_migrations_on_startup: database.run_migrations_on_startup,
         })
     }
 }
@@ -88,23 +86,20 @@ pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<D
     )
     .await?;
 
-    if config.run_migrations_on_startup {
-        retry_with_backoff(
-            || async {
-                Migrator::up(&connection, None)
-                    .await
-                    .context("failed to apply gateway database migrations")
-            },
-            is_anyhow_sqlite_lock,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-        .await?;
-    }
+    retry_with_backoff(
+        || async {
+            Migrator::up(&connection, None)
+                .await
+                .context("failed to apply gateway database migrations")
+        },
+        is_anyhow_sqlite_lock,
+        DEFAULT_LOCK_RETRY_ATTEMPTS,
+        Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+    )
+    .await?;
 
     info!(
         database_path = %database_path.display(),
-        run_migrations_on_startup = config.run_migrations_on_startup,
         "gateway database is ready"
     );
 

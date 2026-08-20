@@ -1,4 +1,5 @@
 mod agent_diff_event_compaction;
+mod agent_domain_upgrade;
 mod authorization_legacy_backfill;
 mod cli_runtime_native_event_compaction;
 mod execution_authority_integrity;
@@ -49,6 +50,15 @@ pub(crate) async fn enforce_execution_authority_integrity(
     crud_store: &CrudStore,
 ) -> anyhow::Result<()> {
     execution_authority_integrity::run(crud_store).await
+}
+
+/// Converts all pre-Agent-domain Task data before the Gateway listener or any
+/// task worker can observe the database. The runtime only supports the final
+/// representation produced by this upgrade.
+pub(crate) async fn upgrade_agent_domain_data(
+    message_processor: &crate::message::MessageProcessor,
+) -> anyhow::Result<()> {
+    agent_domain_upgrade::apply(message_processor).await
 }
 
 impl ThreadEpisodicWorkspaceRefillSupervisor {

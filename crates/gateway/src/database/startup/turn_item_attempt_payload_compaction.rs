@@ -237,6 +237,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
