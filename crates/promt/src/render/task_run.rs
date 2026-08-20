@@ -609,6 +609,10 @@ mod tests {
             run_id: "run_weather_000000001".to_owned(),
             task_run_turn_id: "trt_initial000000001".to_owned(),
             reviewer_kind: TaskResultReviewerKind::ParentAgent,
+            reviewer: pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+                pioneer_protocol::AgentExecutionId::new("R".repeat(21))
+                    .expect("parent reviewer execution id"),
+            ),
             reviewer_thread_id: Some("thread_parent000001".to_owned()),
             reviewer_turn_id: Some("turn_create00000001".to_owned()),
             reviewer_user_id: None,
