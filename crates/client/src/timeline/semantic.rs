@@ -1956,7 +1956,11 @@ pub fn apply_work_range_page(
     range.thread_id = page.thread_id;
     range.turn_id = page.turn_id;
     if page_can_advance_newest_boundary {
-        range.work = Some(page.work);
+        let mut incoming_work = page.work;
+        if let Some(existing_work) = range.work.as_ref() {
+            preserve_newer_agent_work_graph(existing_work, &mut incoming_work);
+        }
+        range.work = Some(incoming_work);
         range.source_high_watermark = page.source_high_watermark;
         range.projection_updated_at_unix_micros = page.projection_updated_at_unix_micros;
     }
@@ -2137,7 +2141,7 @@ pub fn apply_turn_work_state_changed(
     let thread = state.thread_mut(notification.thread_id);
     let before = thread.clone();
     let turn_id = notification.turn_id;
-    let work = notification.work;
+    let mut work = notification.work;
     let incoming_revision = (
         notification.source_high_watermark,
         notification.projection_updated_at_unix_micros,
@@ -2151,6 +2155,9 @@ pub fn apply_turn_work_state_changed(
         )
     {
         return false;
+    }
+    if let Some(existing_work) = range.work.as_ref() {
+        preserve_newer_agent_work_graph(existing_work, &mut work);
     }
     range.work = Some(work.clone());
     range.source_high_watermark = notification.source_high_watermark;
@@ -2484,11 +2491,23 @@ fn upsert_top_level_block(thread: &mut ThreadSemanticTimelineState, block: Timel
 
 fn newest_top_level_block(
     existing: Option<&TimelineBlock>,
-    incoming: TimelineBlock,
+    mut incoming: TimelineBlock,
 ) -> TimelineBlock {
     let Some(existing) = existing else {
         return incoming;
     };
+    if let (
+        TimelineBlockKind::TurnWork {
+            work: existing_work,
+        },
+        TimelineBlockKind::TurnWork {
+            work: incoming_work,
+        },
+    ) = (&existing.kind, &mut incoming.kind)
+    {
+        preserve_newer_agent_work_graph(existing_work, incoming_work);
+        return incoming;
+    }
     let (
         TimelineBlockKind::DetachedTaskRun {
             task: existing_task,
@@ -2533,6 +2552,21 @@ fn newest_top_level_block(
     }
 }
 
+fn preserve_newer_agent_work_graph(existing: &TurnWorkBlock, incoming: &mut TurnWorkBlock) {
+    let Some(existing_graph) = existing.agent_work_graph.as_ref() else {
+        return;
+    };
+    if incoming
+        .agent_work_graph
+        .as_ref()
+        .is_none_or(|incoming_graph| {
+            incoming_graph.updated_at_unix_micros < existing_graph.updated_at_unix_micros
+        })
+    {
+        incoming.agent_work_graph = Some(existing_graph.clone());
+    }
+}
+
 const fn detached_task_status_rank(status: TaskStatus) -> u8 {
     match status {
         TaskStatus::Draft => 0,
@@ -2561,6 +2595,14 @@ fn upsert_user_message_block(
 ) {
     let block_id = user_block_id(turn_id);
     let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let (author, route) = existing
+        .and_then(|block| match &block.kind {
+            TimelineBlockKind::UserMessage { author, route, .. } => {
+                Some((author.clone(), route.clone()))
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
     let block = TimelineBlock {
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
@@ -2579,7 +2621,8 @@ fn upsert_user_message_block(
             text,
             attachments,
             mode,
-            author: None,
+            author,
+            route,
             reply: None,
             mentions: Vec::new(),
             revision: 0,
@@ -2607,6 +2650,14 @@ fn upsert_assistant_message_block(
     };
     let block_id = assistant_block_id(turn_id, id);
     let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let (author, route) = existing
+        .and_then(|block| match &block.kind {
+            TimelineBlockKind::AssistantMessage { author, route, .. } => {
+                Some((author.clone(), route.clone()))
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
     let block = TimelineBlock {
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
@@ -2631,6 +2682,8 @@ fn upsert_assistant_message_block(
             text: text.clone(),
             status,
             markdown: markdown.clone(),
+            author,
+            route,
         },
     };
     upsert_top_level_block(thread, block);
@@ -2756,7 +2809,12 @@ fn upsert_terminal_state_block(
             .and_then(|block| block.started_at_unix_ms)
             .or(Some(now_unix_ms)),
         updated_at_unix_ms: Some(now_unix_ms),
-        kind: TimelineBlockKind::TurnState { state, message },
+        kind: TimelineBlockKind::TurnState {
+            state,
+            message,
+            author: None,
+            route: None,
+        },
     };
     upsert_top_level_block(thread, block);
 }
@@ -2891,6 +2949,9 @@ fn upsert_turn_work_summary(
         turn_id: turn_id.to_owned(),
         presentation,
         state,
+        agent_work_graph: existing
+            .as_ref()
+            .and_then(|work| work.agent_work_graph.clone()),
         started_at_unix_ms: existing
             .as_ref()
             .and_then(|work| work.started_at_unix_ms)
@@ -3461,6 +3522,7 @@ mod tests {
             display_name: "Alice".to_owned(),
             nickname: "alice".to_owned(),
             avatar_revision: Some("avatar-r3".to_owned()),
+            agent: None,
         };
         let mention = TurnMention {
             principal_id,
@@ -3494,6 +3556,7 @@ mod tests {
                 }],
                 mode: ThreadMode::Message,
                 author: Some(author.clone()),
+                route: None,
                 reply: Some(TimelineReplySummary {
                     turn_id: "turn_parent".to_owned(),
                     author: Some(author.clone()),
@@ -3565,6 +3628,7 @@ mod tests {
             attachments: Vec::new(),
             mode: ThreadMode::Message,
             author: Some(author),
+            route: None,
             reply: None,
             mentions: vec![mention],
             revision: 2,
@@ -5086,6 +5150,68 @@ mod tests {
     }
 
     #[test]
+    fn stale_pages_cannot_regress_live_agent_work_graph_state() {
+        let mut state = SemanticTimelineState::default();
+        assert!(apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![turn_work_block("thread_a", "block_work", "002")]),
+            TopLevelPageMergeMode::Reset
+        ));
+        assert!(apply_turn_work_page(
+            &mut state,
+            work_page(Vec::new()),
+            WorkPageMergeMode::Reset
+        ));
+
+        let mut live_work = work_block("turn_a");
+        live_work.agent_work_graph = Some(agent_graph(10, 0, 2));
+        assert!(apply_turn_work_state_changed(
+            &mut state,
+            TurnWorkStateChangedNotification {
+                workspace_id: "workspace_a".to_owned(),
+                thread_id: "thread_a".to_owned(),
+                turn_id: "turn_a".to_owned(),
+                source_high_watermark: 2,
+                projection_updated_at_unix_micros: 2,
+                work: live_work,
+                reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
+            }
+        ));
+
+        let mut stale_work = work_block("turn_a");
+        stale_work.agent_work_graph = Some(agent_graph(5, 1, 1));
+        let mut stale_work_page = work_page_with_work(stale_work.clone(), Vec::new());
+        stale_work_page.source_high_watermark = 2;
+        stale_work_page.projection_updated_at_unix_micros = 2;
+        apply_turn_work_page(&mut state, stale_work_page, WorkPageMergeMode::Reset);
+
+        let mut stale_block = turn_work_block("thread_a", "block_work", "002");
+        stale_block.kind = TimelineBlockKind::TurnWork { work: stale_work };
+        apply_thread_timeline_page(
+            &mut state,
+            thread_page(vec![stale_block]),
+            TopLevelPageMergeMode::Reset,
+        );
+
+        let thread = state.thread("thread_a").unwrap();
+        assert_eq!(
+            thread
+                .work_range("turn_a")
+                .and_then(|range| range.work.as_ref())
+                .and_then(|work| work.agent_work_graph.as_ref())
+                .map(|graph| (graph.updated_at_unix_micros, graph.queued_count)),
+            Some((10, 0))
+        );
+        assert!(matches!(
+            &thread.top_level.block("block_work").unwrap().kind,
+            TimelineBlockKind::TurnWork { work }
+                if work.agent_work_graph.as_ref().is_some_and(|graph| {
+                    graph.updated_at_unix_micros == 10 && graph.queued_count == 0
+                })
+        ));
+    }
+
+    #[test]
     fn flatten_expanded_work_shows_loaded_rows_and_request_hints() {
         let mut state = SemanticTimelineState::default();
         assert!(apply_thread_timeline_page(
@@ -5275,6 +5401,7 @@ mod tests {
                     TimelineBlockKind::TurnState {
                         state: TurnWorkState::Failed,
                         message: Some(message),
+                        ..
                     } if message == "provider disconnected"
                 )
         ));
@@ -5753,6 +5880,8 @@ mod tests {
             kind: TimelineBlockKind::TurnState {
                 state: TurnWorkState::Running,
                 message: None,
+                author: None,
+                route: None,
             },
         }
     }
@@ -5805,6 +5934,7 @@ mod tests {
                 attachments: Vec::new(),
                 mode: Default::default(),
                 author: None,
+                route: None,
                 reply: None,
                 mentions: Vec::new(),
                 revision: 0,
@@ -5849,6 +5979,8 @@ mod tests {
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,
                 markdown,
+                author: None,
+                route: None,
             },
         }
     }
@@ -5912,6 +6044,23 @@ mod tests {
         work_page_with_work(work_block("turn_a"), items)
     }
 
+    fn agent_graph(
+        updated_at_unix_micros: i64,
+        queued_count: u64,
+        running_count: u64,
+    ) -> pioneer_protocol::AgentWorkGraphProjection {
+        pioneer_protocol::AgentWorkGraphProjection {
+            root_execution_id: pioneer_protocol::AgentExecutionId::new("Egraphroot12345678901")
+                .unwrap(),
+            updated_at_unix_micros,
+            queued_count,
+            running_count,
+            terminal_count: 0,
+            saturated: queued_count > 0,
+            nodes: Vec::new(),
+        }
+    }
+
     fn work_page_with_work(work: TurnWorkBlock, items: Vec<TurnWorkItem>) -> TurnWorkPageResponse {
         TurnWorkPageResponse {
             workspace_id: "workspace_a".to_owned(),
@@ -5958,6 +6107,7 @@ mod tests {
             turn_id: turn_id.to_owned(),
             presentation: TurnWorkPresentation::ExpandedLive,
             state: TurnWorkState::Running,
+            agent_work_graph: None,
             started_at_unix_ms: None,
             completed_at_unix_ms: None,
             elapsed_ms: None,

@@ -35,6 +35,7 @@ fn thread_snapshot_with_turn(turn: Turn) -> Thread {
         id: THREAD_ID.to_owned(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: ThreadMode::Chat,
         model: "gpt-5".to_owned(),
         model_provider: "openai".to_owned(),

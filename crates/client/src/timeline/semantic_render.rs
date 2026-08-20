@@ -50,13 +50,17 @@ pub fn render_semantic_timeline_rows(
         push_semantic_row(&mut projection, &mut rows, row);
         for render_row in &rows[rows_before..] {
             semantic_row_ids.insert(render_row.key.clone(), row.id.clone());
+            if let TimelineRowKind::RunningTurn(display) = &render_row.kind {
+                inserted_running_rows.insert(display.turn_id.clone());
+            }
         }
 
         let current_turn_id = semantic_row_turn_id(row);
         let next_turn_id = semantic_rows.get(index + 1).and_then(semantic_row_turn_id);
         if let Some(turn_id) = current_turn_id
             && next_turn_id != Some(turn_id)
-            && let Some((started_at_unix_ms, state)) = live_work.get(turn_id).copied()
+            && let Some((started_at_unix_ms, state, agent_work_graph)) =
+                live_work.get(turn_id).cloned()
             && inserted_running_rows.insert(turn_id.to_owned())
         {
             let running_key = format!("semantic-running-turn::{turn_id}");
@@ -68,9 +72,23 @@ pub fn render_semantic_timeline_rows(
                     started_at_unix_ms,
                     Some(state),
                     None,
+                    None,
+                    None,
+                    agent_work_graph,
                 )),
             });
             semantic_row_ids.insert(running_key, row.id.clone());
+        }
+    }
+
+    for row in &mut rows {
+        let TimelineRowKind::RunningTurn(display) = &mut row.kind else {
+            continue;
+        };
+        if display.agent_work_graph.is_none() {
+            display.agent_work_graph = live_work
+                .get(display.turn_id.as_str())
+                .and_then(|(_, _, graph)| graph.clone());
         }
     }
 
@@ -128,6 +146,7 @@ fn push_user_block(
         attachments,
         mode,
         author,
+        route,
         reply,
         mentions,
         revision,
@@ -164,6 +183,8 @@ fn push_user_block(
             partial_markdown: None,
             final_markdown: None,
             item,
+            author: author.clone(),
+            route: route.clone(),
             opaque_meta: None,
         },
     );
@@ -177,6 +198,7 @@ fn push_user_block(
             item_id: item_id.to_owned(),
             mode: *mode,
             author: author.clone(),
+            route: route.clone(),
             reply: reply.clone().map(bound_reply_summary),
             reply_state: reply.as_ref().map(timeline_reply_state),
             mentions: (!*deleted).then(|| mentions.clone()).unwrap_or_default(),
@@ -211,6 +233,8 @@ fn push_assistant_block(
         text,
         status,
         markdown,
+        author,
+        route,
     } = &block.kind
     else {
         return;
@@ -246,6 +270,8 @@ fn push_assistant_block(
                 .then(|| markdown.clone())
                 .flatten(),
             item,
+            author: author.clone(),
+            route: route.clone(),
             opaque_meta: None,
         },
     );
@@ -298,6 +324,8 @@ fn push_work_item(
                 .then(|| markdown.clone())
                 .flatten(),
             item: item.item.clone(),
+            author: None,
+            route: None,
             opaque_meta: item.metadata.clone(),
         },
     );
@@ -337,6 +365,8 @@ fn push_detached_task_run(
             partial_markdown: None,
             final_markdown: None,
             item: TurnItem::Task { item: task.clone() },
+            author: None,
+            route: None,
             opaque_meta: Some(serde_json::json!({
                 "attachment": "detached",
                 "taskId": task.task_id,
@@ -351,7 +381,13 @@ fn push_turn_state(
     rows: &mut Vec<TimelineRow>,
     block: &TimelineBlock,
 ) {
-    let TimelineBlockKind::TurnState { state, message } = &block.kind else {
+    let TimelineBlockKind::TurnState {
+        state,
+        message,
+        author,
+        route,
+    } = &block.kind
+    else {
         return;
     };
     let Some(turn_id) = block.turn_id.as_deref() else {
@@ -369,6 +405,9 @@ fn push_turn_state(
                 block.started_at_unix_ms.or(block.updated_at_unix_ms),
                 Some(*state),
                 message.clone(),
+                author.clone(),
+                route.clone(),
+                None,
             )),
         });
         return;
@@ -408,6 +447,8 @@ fn push_turn_state(
             partial_markdown: None,
             final_markdown: None,
             item,
+            author: None,
+            route: None,
             opaque_meta: details,
         },
     );
@@ -434,12 +475,18 @@ fn running_turn_display_for_projection(
     started_at_unix_ms: Option<i64>,
     state: Option<TurnWorkState>,
     message: Option<String>,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+    route: Option<pioneer_protocol::SafeRouteProvenance>,
+    agent_work_graph: Option<pioneer_protocol::AgentWorkGraphProjection>,
 ) -> RunningTurnDisplay {
     RunningTurnDisplay {
         turn_id: turn_id.to_owned(),
         started_at_unix_ms,
         state,
         message,
+        author,
+        route,
+        agent_work_graph,
         permission_profile: projection.turn_permission_profile(turn_id).cloned(),
         security_summary: projection.turn_security_summary(turn_id).cloned(),
     }
@@ -459,6 +506,8 @@ struct ItemRowInput {
     partial_markdown: Option<pioneer_protocol::MarkdownDocument>,
     final_markdown: Option<pioneer_protocol::MarkdownDocument>,
     item: TurnItem,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+    route: Option<pioneer_protocol::SafeRouteProvenance>,
     opaque_meta: Option<serde_json::Value>,
 }
 
@@ -482,6 +531,8 @@ fn push_item_row(
         partial_markdown: input.partial_markdown,
         final_markdown: input.final_markdown,
         item: input.item,
+        author: input.author,
+        route: input.route,
         timeline_origin: None,
         opaque_meta: input.opaque_meta,
     });
@@ -500,7 +551,14 @@ fn push_item_row(
 
 fn live_work_by_turn(
     rows: &[SemanticTimelineRow],
-) -> HashMap<String, (Option<i64>, TurnWorkState)> {
+) -> HashMap<
+    String,
+    (
+        Option<i64>,
+        TurnWorkState,
+        Option<pioneer_protocol::AgentWorkGraphProjection>,
+    ),
+> {
     rows.iter()
         .filter_map(|row| {
             let SemanticTimelineRowKind::WorkHeader { work, .. } = &row.kind else {
@@ -515,7 +573,14 @@ fn live_work_by_turn(
             ) {
                 return None;
             }
-            Some((work.turn_id.clone(), (work.started_at_unix_ms, work.state)))
+            Some((
+                work.turn_id.clone(),
+                (
+                    work.started_at_unix_ms,
+                    work.state,
+                    work.agent_work_graph.clone(),
+                ),
+            ))
         })
         .collect()
 }
@@ -795,6 +860,58 @@ mod tests {
     }
 
     #[test]
+    fn live_root_projects_queue_and_keeps_a_blocked_branch_local() {
+        let root_id = pioneer_protocol::AgentExecutionId::new("Egraphroot12345678901").unwrap();
+        let blocked_id = pioneer_protocol::AgentExecutionId::new("Egraphblock1234567890").unwrap();
+        let graph = pioneer_protocol::AgentWorkGraphProjection {
+            root_execution_id: root_id.clone(),
+            updated_at_unix_micros: 5,
+            queued_count: 1,
+            running_count: 1,
+            terminal_count: 1,
+            saturated: true,
+            nodes: vec![
+                pioneer_protocol::AgentWorkNodeProjection {
+                    execution_id: root_id,
+                    state: pioneer_protocol::AgentWorkNodeState::Running,
+                    progress_revision: 4,
+                    progress_label: None,
+                },
+                pioneer_protocol::AgentWorkNodeProjection {
+                    execution_id: blocked_id,
+                    state: pioneer_protocol::AgentWorkNodeState::Blocked,
+                    progress_revision: 2,
+                    progress_label: None,
+                },
+            ],
+        };
+        let mut work = work_payload(TurnWorkPresentation::ExpandedLive, 0);
+        work.state = TurnWorkState::Running;
+        work.agent_work_graph = Some(graph.clone());
+        let mut block = work_block(TurnWorkPresentation::ExpandedLive, 0);
+        block.kind = TimelineBlockKind::TurnWork { work: work.clone() };
+
+        let model = render_semantic_timeline_rows(
+            &[semantic_row(SemanticTimelineRowKind::WorkHeader {
+                block,
+                work,
+                expanded: true,
+                loaded_range: None,
+            })],
+            ConversationViewState::default(),
+        );
+
+        assert!(matches!(
+            model.rows.as_slice(),
+            [TimelineRow {
+                kind: TimelineRowKind::RunningTurn(display),
+                ..
+            }] if display.state == Some(TurnWorkState::Running)
+                && display.agent_work_graph.as_ref() == Some(&graph)
+        ));
+    }
+
+    #[test]
     fn every_unsuccessful_terminal_state_has_a_system_event() {
         for (state, expected_level, expected_code, expected_message) in [
             (
@@ -963,6 +1080,64 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn running_turn_uses_exact_responding_agent_instead_of_input_author() {
+        let responding_execution =
+            pioneer_protocol::AgentExecutionId::new("ERESPONDING1234567890").unwrap();
+        let responding_author = TurnAuthorSnapshot {
+            actor: PersistedActorRef::AgentExecution(responding_execution.clone()),
+            display_name: "Child Agent".to_owned(),
+            nickname: "child-agent".to_owned(),
+            avatar_revision: Some("avatar-child".to_owned()),
+            agent: None,
+        };
+        let mut block = turn_state_block(TurnWorkState::Running);
+        let TimelineBlockKind::TurnState { author, .. } = &mut block.kind else {
+            unreachable!();
+        };
+        *author = Some(responding_author.clone());
+        let mut projection = ConversationViewState::default();
+        projection.upsert_turn_snapshot_metadata(&Turn {
+            id: "turn_a".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            mode: Default::default(),
+            author: Some(TurnAuthorSnapshot {
+                actor: PersistedActorRef::Principal(
+                    PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                ),
+                display_name: "Alice".to_owned(),
+                nickname: "alice".to_owned(),
+                avatar_revision: None,
+                agent: None,
+            }),
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::compile_turn_permission_profile(
+                TurnPermissionMode::FullAccess,
+                TurnPermissionProfileSource::Composer,
+            ),
+        });
+
+        let model = render_semantic_timeline_rows(
+            &[semantic_row(SemanticTimelineRowKind::TurnState { block })],
+            projection,
+        );
+        let TimelineRowKind::RunningTurn(display) = &model.rows[0].kind else {
+            panic!("expected running turn row");
+        };
+        assert_eq!(display.author, Some(responding_author));
+        assert_eq!(
+            display.author.as_ref().map(|author| &author.actor),
+            Some(&PersistedActorRef::AgentExecution(responding_execution))
+        );
+    }
+
     fn semantic_row(kind: SemanticTimelineRowKind) -> SemanticTimelineRow {
         SemanticTimelineRow {
             id: SemanticTimelineRowId::TopLevelBlock {
@@ -994,7 +1169,9 @@ mod tests {
                     display_name: "Alice".to_owned(),
                     nickname: "alice".to_owned(),
                     avatar_revision: Some("avatar-4".to_owned()),
+                    agent: None,
                 }),
+                route: None,
                 reply: Some(TimelineReplySummary {
                     turn_id: "turn_parent".to_owned(),
                     author: None,
@@ -1026,6 +1203,8 @@ mod tests {
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,
                 markdown,
+                author: None,
+                route: None,
             },
         }
     }
@@ -1093,6 +1272,7 @@ mod tests {
             turn_id: "turn_a".to_owned(),
             presentation,
             state: TurnWorkState::Completed,
+            agent_work_graph: None,
             started_at_unix_ms: Some(1),
             completed_at_unix_ms: Some(2),
             elapsed_ms: Some(1),
@@ -1122,6 +1302,8 @@ mod tests {
             kind: TimelineBlockKind::TurnState {
                 state,
                 message: None,
+                author: None,
+                route: None,
             },
         }
     }

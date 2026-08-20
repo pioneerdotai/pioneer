@@ -1857,6 +1857,7 @@ mod tests {
                 id: "codex".to_owned(),
                 kind: CLIAgentRuntimeKind::Codex,
                 display_name: "Codex CLI".to_owned(),
+                nickname: "codex".to_owned(),
                 enabled: true,
                 binary_path: "codex".to_owned(),
                 home_path: "~/.codex".to_owned(),

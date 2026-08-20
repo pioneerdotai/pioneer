@@ -3535,6 +3535,7 @@ mod tests {
                 turn_start(
                     &PanicTransport,
                     TurnStartParams {
+                        agent_delegation_routes: Vec::new(),
                         thread_id: " ".to_owned(),
                         turn_id: "turn_1".to_owned(),
                         input: Vec::new(),
@@ -3543,6 +3544,7 @@ mod tests {
                         model_provider: None,
                         sandbox_policy: None,
                         mode: None,
+                        agent_launch: None,
                         reply_to_turn_id: None,
                         mentioned_principal_ids: Vec::new(),
                         execution_backend: None,
@@ -3561,6 +3563,7 @@ mod tests {
                 turn_start(
                     &PanicTransport,
                     TurnStartParams {
+                        agent_delegation_routes: Vec::new(),
                         thread_id: "thread_1".to_owned(),
                         turn_id: " ".to_owned(),
                         input: Vec::new(),
@@ -3569,6 +3572,7 @@ mod tests {
                         model_provider: None,
                         sandbox_policy: None,
                         mode: None,
+                        agent_launch: None,
                         reply_to_turn_id: None,
                         mentioned_principal_ids: Vec::new(),
                         execution_backend: None,
@@ -3586,6 +3590,7 @@ mod tests {
         let error = turn_start(
             &ExactSkillTurnTransport,
             TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 input: Vec::new(),
@@ -3601,6 +3606,7 @@ mod tests {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: None,

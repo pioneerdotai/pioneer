@@ -33,6 +33,12 @@
     "revisions"
   ],
   "$defs": {
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "MessageRevisionPresentation": {
       "type": "object",
       "properties": {
@@ -87,6 +93,22 @@
             "kind": {
               "type": "string",
               "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/AgentExecutionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent_execution"
             }
           },
           "required": [

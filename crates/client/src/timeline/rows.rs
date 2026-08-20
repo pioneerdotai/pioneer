@@ -159,6 +159,8 @@ pub struct UserMessagePresentation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<TurnAuthorSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<pioneer_protocol::SafeRouteProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<TimelineReplySummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_state: Option<TimelineReplyState>,
@@ -241,6 +243,7 @@ mod tests {
             item_id: "item".to_owned(),
             mode: ThreadMode::Message,
             author,
+            route: None,
             reply: None,
             reply_state: None,
             mentions: Vec::new(),
@@ -259,6 +262,7 @@ mod tests {
             display_name: "Current".to_owned(),
             nickname: "current".to_owned(),
             avatar_revision: None,
+            agent: None,
         };
         let mut message = presentation(Some(author));
 
@@ -283,6 +287,7 @@ mod tests {
             display_name: "Other".to_owned(),
             nickname: "other".to_owned(),
             avatar_revision: None,
+            agent: None,
         });
         assert!(!user_message_mutation_availability(&message, &current).can_delete);
     }
@@ -296,6 +301,7 @@ mod tests {
             display_name: "Removed Alice".to_owned(),
             nickname: "alice-old".to_owned(),
             avatar_revision: Some("old-avatar".to_owned()),
+            agent: None,
         };
         let row = presentation(Some(historical.clone()));
 

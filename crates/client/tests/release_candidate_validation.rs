@@ -197,6 +197,7 @@ fn user_message_block(sort_key: &str) -> TimelineBlock {
             attachments: Vec::new(),
             mode: Default::default(),
             author: None,
+            route: None,
             reply: None,
             mentions: Vec::new(),
             revision: 0,
@@ -226,6 +227,7 @@ fn turn_work(presentation: TurnWorkPresentation, work_count: u64) -> TurnWorkBlo
         turn_id: TURN_ID.to_owned(),
         presentation,
         state: TurnWorkState::Completed,
+        agent_work_graph: None,
         started_at_unix_ms: Some(1_001),
         completed_at_unix_ms: Some(1_500),
         elapsed_ms: Some(499),
@@ -257,6 +259,8 @@ fn assistant_message_block(sort_key: &str) -> TimelineBlock {
             text: "Done".to_owned(),
             status: TurnWorkItemStatus::Completed,
             markdown: Some(pioneer_protocol::MarkdownDocument::from_plain_text("Done")),
+            author: None,
+            route: None,
         },
     }
 }

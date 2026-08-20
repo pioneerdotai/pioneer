@@ -1412,6 +1412,8 @@ mod tests {
             task_id: "task-a".to_owned(),
             run_id: "run-a".to_owned(),
             delivery_id: "delivery-a".to_owned(),
+            author: None,
+            delivery_action_receipt_id: None,
             result: None,
             error: None,
             created_at: 1_700_000_000,

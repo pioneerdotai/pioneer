@@ -59,6 +59,12 @@ pub struct RunningTurnDisplay {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<pioneer_protocol::SafeRouteProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_work_graph: Option<pioneer_protocol::AgentWorkGraphProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<TurnPermissionProfileSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_summary: Option<ClientTurnSecuritySummary>,
@@ -99,6 +105,9 @@ pub fn running_turn_display(projection: &ConversationViewState) -> Option<Runnin
             .or_else(|| first_turn_item_started_at(projection, active_turn.id.as_str())),
         state: Some(TurnWorkState::Running),
         message: None,
+        author: None,
+        route: None,
+        agent_work_graph: None,
         permission_profile: active_turn.permission_profile.clone(),
         security_summary: active_turn.security_summary.clone(),
     })
@@ -1675,6 +1684,8 @@ mod tests {
                 markdown: None,
                 markdown_version: None,
             },
+            author: None,
+            route: None,
             timeline_origin,
             opaque_meta: None,
         }
@@ -2250,6 +2261,7 @@ mod tests {
                 started_at_unix_ms: Some(42),
                 completed_at_unix_ms: None,
                 error: None,
+                author: None,
                 permission_profile: None,
                 security_summary: None,
                 resume: None,
@@ -2265,6 +2277,9 @@ mod tests {
                 started_at_unix_ms: Some(42),
                 state: Some(TurnWorkState::Running),
                 message: None,
+                author: None,
+                route: None,
+                agent_work_graph: None,
                 permission_profile: None,
                 security_summary: None,
             })
@@ -2280,6 +2295,7 @@ mod tests {
                 started_at_unix_ms: Some(42),
                 completed_at_unix_ms: None,
                 error: None,
+                author: None,
                 permission_profile: None,
                 security_summary: None,
                 resume: None,
@@ -2303,6 +2319,8 @@ mod tests {
                     markdown: None,
                     markdown_version: None,
                 },
+                author: None,
+                route: None,
                 timeline_origin: None,
                 opaque_meta: None,
             }],

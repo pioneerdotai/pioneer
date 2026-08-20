@@ -32,6 +32,10 @@ pub struct CLIRuntimeProviderDraft {
     pub kind: CLIAgentRuntimeKind,
     pub id: String,
     pub display_name: String,
+    /// Stable agent presentation nickname.  The UI does not expose this
+    /// field yet, but edits must preserve the gateway-owned value.
+    #[serde(default)]
+    pub nickname: String,
     pub enabled: bool,
     pub binary_path: String,
     pub home_path: String,
@@ -71,6 +75,7 @@ impl CLIRuntimeProviderDraft {
             mode: CLIRuntimeProviderDraftMode::Create,
             kind,
             display_name: next_available_cli_runtime_display_name(current, defaults.display_name),
+            nickname: id.clone(),
             id,
             enabled: true,
             binary_path: defaults.binary_path.to_owned(),
@@ -87,6 +92,11 @@ impl CLIRuntimeProviderDraft {
             kind: instance.kind,
             id: instance.id.clone(),
             display_name: instance.display_name.clone(),
+            nickname: if instance.nickname.trim().is_empty() {
+                instance.id.clone()
+            } else {
+                instance.nickname.clone()
+            },
             enabled: instance.enabled,
             binary_path: instance.binary_path.clone(),
             home_path: instance.home_path.clone(),
@@ -99,6 +109,11 @@ impl CLIRuntimeProviderDraft {
         instance: &GatewayCliRuntimeInstanceSettings,
     ) -> Self {
         let id = next_available_cli_runtime_id(current, format!("{}_copy", instance.id).as_str());
+        let source_nickname = if instance.nickname.trim().is_empty() {
+            instance.id.as_str()
+        } else {
+            instance.nickname.as_str()
+        };
         Self {
             mode: CLIRuntimeProviderDraftMode::Duplicate {
                 source_id: instance.id.clone(),
@@ -109,6 +124,7 @@ impl CLIRuntimeProviderDraft {
                 current,
                 format!("{} Copy", instance.display_name).as_str(),
             ),
+            nickname: format!("{source_nickname}_copy"),
             enabled: instance.enabled,
             binary_path: instance.binary_path.clone(),
             home_path: instance.home_path.clone(),
@@ -291,11 +307,17 @@ fn cli_runtime_provider_instance_from_draft(
     if shadow_home_path.as_deref() == Some(home_path.as_str()) {
         return Err(CLIRuntimeProviderSettingsRejection::ShadowHomeMatchesHome);
     }
+    let nickname = if draft.nickname.trim().is_empty() {
+        id.clone()
+    } else {
+        draft.nickname.trim().to_owned()
+    };
 
     Ok(GatewayCliRuntimeInstanceSettings {
         id,
         kind: draft.kind,
         display_name,
+        nickname,
         enabled: draft.enabled,
         binary_path,
         home_path,
@@ -599,6 +621,7 @@ mod tests {
             id: id.to_owned(),
             kind: CLIAgentRuntimeKind::Codex,
             display_name: display_name.to_owned(),
+            nickname: id.to_owned(),
             enabled: true,
             binary_path: "codex".to_owned(),
             home_path: "~/.codex".to_owned(),

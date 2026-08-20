@@ -622,6 +622,11 @@
           "format": "uint",
           "minimum": 0
         },
+        "max_queue_wait_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "max_queued_calls": {
           "type": "integer",
           "format": "uint",
@@ -637,6 +642,7 @@
       "required": [
         "profile_version",
         "max_arguments_bytes",
+        "max_queue_wait_ms",
         "max_concurrent_calls",
         "max_queued_calls"
       ]

@@ -703,6 +703,7 @@ pub fn reduce_prepared_composer_turn_submit_success(
             model: context.selected_model,
             model_provider: context.turn_model_provider,
             mode: Some(selected_mode),
+            agent_launch: None,
             reply_to_turn_id: context.reply_to_turn_id,
             mentioned_principal_ids: context.mentioned_principal_ids,
             execution_backend: context.execution_backend,

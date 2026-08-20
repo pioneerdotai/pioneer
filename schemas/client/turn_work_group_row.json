@@ -17,6 +17,17 @@
     "is_open": {
       "type": "boolean"
     },
+    "state": {
+      "description": "Server-owned lifecycle state; clients must not infer it from row order.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnWorkState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "toggle_key": {
       "type": "string"
     }
@@ -25,5 +36,20 @@
     "toggle_key",
     "anchor_entry_id",
     "is_open"
-  ]
+  ],
+  "$defs": {
+    "TurnWorkState": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "waiting_for_approval",
+        "stalled",
+        "completed",
+        "blocked",
+        "failed",
+        "interrupted"
+      ]
+    }
+  }
 }

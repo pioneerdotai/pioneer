@@ -24,6 +24,11 @@
     "mode": {
       "$ref": "#/$defs/CLIRuntimeProviderDraftMode"
     },
+    "nickname": {
+      "description": "Stable agent presentation nickname.  The UI does not expose this\nfield yet, but edits must preserve the gateway-owned value.",
+      "type": "string",
+      "default": ""
+    },
     "shadow_home_path": {
       "type": "string"
     }

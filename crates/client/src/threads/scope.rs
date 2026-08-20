@@ -278,6 +278,7 @@ mod tests {
             id: "thread_1".into(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::default(),
             model: String::new(),
             model_provider: String::new(),
