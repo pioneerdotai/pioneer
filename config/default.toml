@@ -269,7 +269,6 @@ connect_timeout_ms = 5000
 acquire_timeout_ms = 30000
 idle_timeout_ms = 30000
 sqlx_logging = false
-run_migrations_on_startup = true
 
 [gateway.memory]
 enabled = true

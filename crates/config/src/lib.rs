@@ -2843,7 +2843,6 @@ pub struct GatewayDatabaseConfig {
     pub acquire_timeout_ms: u64,
     pub idle_timeout_ms: u64,
     pub sqlx_logging: bool,
-    pub run_migrations_on_startup: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
