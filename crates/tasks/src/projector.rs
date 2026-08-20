@@ -85,6 +85,21 @@ impl TaskProjector {
         .await
     }
 
+    pub async fn append_events_with_agent_action(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        agent_action: pioneer_crud::AgentCommitInput,
+    ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
+        let store = self.store.clone();
+        task_projector_fresh_task(async move {
+            Ok(store
+                .append_task_events_with_agent_action(events, event_timestamp_secs, agent_action)
+                .await?)
+        })
+        .await
+    }
+
     pub async fn append_events_with_execution_admission(
         &self,
         events: Vec<TaskEventPayload>,
@@ -121,5 +136,34 @@ impl TaskProjector {
                 .await?)
         })
         .await
+    }
+
+    pub async fn append_events_with_execution_readmission_and_agent_action(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        admission: pioneer_crud::NewTaskExecutionAdmission,
+        agent_action: pioneer_crud::AgentCommitInput,
+    ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
+        let store = self.store.clone();
+        task_projector_fresh_task(async move {
+            Ok(store
+                .append_task_events_with_execution_readmission_and_agent_action(
+                    events,
+                    event_timestamp_secs,
+                    admission,
+                    agent_action,
+                )
+                .await?)
+        })
+        .await
+    }
+
+    pub async fn commit_task_creation(
+        &self,
+        input: pioneer_crud::TaskCreationCommitInput,
+    ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
+        let store = self.store.clone();
+        task_projector_fresh_task(async move { Ok(store.commit_task_creation(input).await?) }).await
     }
 }

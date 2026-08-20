@@ -1,7 +1,8 @@
 use pioneer_protocol::{
     TaskAgentReviewMode, TaskAgentReviewPolicy, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
-    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResultReviewerSpec, TaskValue,
+    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResultReviewerRef,
+    TaskResultReviewerSpec, TaskValue,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskResultReviewActor {
     pub reviewer_kind: TaskResultReviewerKind,
+    pub reviewer: TaskResultReviewerRef,
     pub reviewer_thread_id: Option<String>,
     pub reviewer_turn_id: Option<String>,
     pub reviewer_user_id: Option<String>,
@@ -19,6 +21,7 @@ impl TaskResultReviewActor {
     pub fn runtime_auto() -> Self {
         Self {
             reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+            reviewer: TaskResultReviewerRef::RuntimePolicy,
             reviewer_thread_id: None,
             reviewer_turn_id: None,
             reviewer_user_id: None,
@@ -29,6 +32,7 @@ impl TaskResultReviewActor {
     pub fn system() -> Self {
         Self {
             reviewer_kind: TaskResultReviewerKind::System,
+            reviewer: TaskResultReviewerRef::RuntimePolicy,
             reviewer_thread_id: None,
             reviewer_turn_id: None,
             reviewer_user_id: None,
@@ -209,6 +213,7 @@ pub fn build_task_result_review_event(
         run_id: candidate.run_id.clone(),
         task_run_turn_id: candidate.task_run_turn_id.clone(),
         reviewer_kind: params.actor.reviewer_kind,
+        reviewer: params.actor.reviewer,
         reviewer_thread_id: params.actor.reviewer_thread_id,
         reviewer_turn_id: params.actor.reviewer_turn_id,
         reviewer_user_id: params.actor.reviewer_user_id,
@@ -587,6 +592,10 @@ mod tests {
             run_id: "run".to_owned(),
             task_run_turn_id: "turn".to_owned(),
             reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+            reviewer: TaskResultReviewerRef::AgentExecution(
+                pioneer_protocol::AgentExecutionId::new("R".repeat(21))
+                    .expect("reviewer execution id"),
+            ),
             reviewer_thread_id: Some(format!("thread_{index}")),
             reviewer_turn_id: Some(format!("turn_{index}")),
             reviewer_user_id: None,

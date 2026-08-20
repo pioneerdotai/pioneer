@@ -1,7 +1,8 @@
 use crate::TaskRuntimeResult;
 use crate::event_bus::TaskEventBus;
 use crate::projector::TaskProjector;
-use anyhow::bail;
+use crate::scheduler::TASK_EXECUTION_LEASE_SECONDS;
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
@@ -11,9 +12,9 @@ use pioneer_protocol::{
     TaskRunExecution, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunTurn,
     TaskThreadLineage, TaskWriteLockStatus, generate_id,
 };
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use tokio::sync::RwLock;
 
 const ID_LEN: usize = 21;
@@ -33,6 +34,7 @@ pub struct TaskExecutionHandle {
     event_bus: Arc<TaskEventBus>,
     task_id: String,
     run_id: String,
+    agent_attempt_generation: Arc<OnceCell<Option<i64>>>,
 }
 
 impl TaskExecutionHandle {
@@ -49,6 +51,7 @@ impl TaskExecutionHandle {
             event_bus,
             task_id,
             run_id,
+            agent_attempt_generation: Arc::new(OnceCell::new()),
         }
     }
 
@@ -173,7 +176,14 @@ impl TaskExecutionHandle {
         ];
         self.push_waiting_review_write_lock_extensions(&mut events, event_timestamp_secs)
             .await?;
-        self.append_and_publish(events, event_timestamp_secs).await
+        self.append_and_publish(events, event_timestamp_secs)
+            .await?;
+        self.update_occurrence_status(
+            pioneer_protocol::TaskOccurrenceStatus::WaitingReview,
+            None,
+            event_timestamp_secs,
+        )
+        .await
     }
 
     pub async fn mark_started(&self, started_at: i64) -> TaskRuntimeResult<()> {
@@ -184,6 +194,12 @@ impl TaskExecutionHandle {
         {
             self.event_bus.publish(appended).await;
         }
+        self.update_occurrence_status(
+            pioneer_protocol::TaskOccurrenceStatus::Running,
+            None,
+            started_at,
+        )
+        .await?;
         Ok(())
     }
 
@@ -193,16 +209,49 @@ impl TaskExecutionHandle {
         details: Option<TaskProgressDetails>,
         event_timestamp_secs: i64,
     ) -> TaskRuntimeResult<()> {
+        let message = message.into();
+        let frontier_message = message.chars().take(2_048).collect::<String>();
+        let frontier = serde_json::json!({
+            "message": frontier_message,
+            "has_details": details.is_some(),
+        })
+        .to_string();
         self.append_and_publish(
             vec![TaskEventPayload::Progress {
                 task_id: self.task_id.clone(),
                 run_id: Some(self.run_id.clone()),
-                message: message.into(),
+                message,
                 details,
             }],
             event_timestamp_secs,
         )
-        .await
+        .await?;
+        // TaskExecutionHandle is keyed by the stable TaskRun id for the task
+        // event stream, while agent domain liveness is keyed by the separately
+        // generated TaskRunExecution id. Resolve that exact row instead of
+        // accidentally writing progress under the run id (which silently
+        // becomes a no-op for durable agent executions).
+        if let Some(execution) = self
+            .store
+            .load_execution_for_run(self.run_id.as_str())
+            .await?
+        {
+            if let Some(attempt_generation) = self
+                .pinned_agent_attempt_generation(execution.id.as_str())
+                .await?
+            {
+                self.store
+                    .record_agent_execution_progress(
+                        execution.id.as_str(),
+                        attempt_generation,
+                        frontier.as_str(),
+                        event_timestamp_secs,
+                        Some(event_timestamp_secs.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn complete_run(
@@ -254,6 +303,12 @@ impl TaskExecutionHandle {
             completed_at,
             result.as_ref(),
             None,
+        )
+        .await?;
+        self.update_occurrence_status(
+            pioneer_protocol::TaskOccurrenceStatus::Delivered,
+            None,
+            completed_at,
         )
         .await
     }
@@ -322,6 +377,12 @@ impl TaskExecutionHandle {
             None,
             error.as_ref(),
         )
+        .await?;
+        self.update_occurrence_status(
+            pioneer_protocol::TaskOccurrenceStatus::Failed,
+            error.as_ref().map(|value| value.message.clone()),
+            completed_at,
+        )
         .await
     }
 
@@ -374,6 +435,12 @@ impl TaskExecutionHandle {
             blocked_at,
             None,
             error.as_ref(),
+        )
+        .await?;
+        self.update_occurrence_status(
+            pioneer_protocol::TaskOccurrenceStatus::Failed,
+            error.as_ref().map(|value| value.message.clone()),
+            blocked_at,
         )
         .await
     }
@@ -438,7 +505,37 @@ impl TaskExecutionHandle {
             None,
             terminal_error.as_ref(),
         )
+        .await?;
+        self.update_occurrence_status(
+            pioneer_protocol::TaskOccurrenceStatus::Cancelled,
+            reason,
+            cancelled_at,
+        )
         .await
+    }
+
+    async fn update_occurrence_status(
+        &self,
+        status: pioneer_protocol::TaskOccurrenceStatus,
+        terminal_reason: Option<String>,
+        now: i64,
+    ) -> TaskRuntimeResult<()> {
+        let mut occurrence = self
+            .store
+            .get_task_occurrence_contract_by_run(self.run_id.as_str())
+            .await?
+            .with_context(|| {
+                format!(
+                    "Task run `{}` has no durable occurrence contract",
+                    self.run_id
+                )
+            })?;
+        occurrence.status = status;
+        occurrence.terminal_reason = terminal_reason;
+        self.store
+            .upsert_task_occurrence_contract(&occurrence, now)
+            .await?;
+        Ok(())
     }
 
     pub async fn heartbeat_execution(
@@ -452,12 +549,47 @@ impl TaskExecutionHandle {
             .await?
             && !execution.status.is_terminal()
         {
-            let _ = self
-                .store
-                .heartbeat_execution(execution.id.as_str(), heartbeat_at, lease_until)
-                .await?;
+            if let Some(attempt_generation) = self
+                .pinned_agent_attempt_generation(execution.id.as_str())
+                .await?
+            {
+                let _ = self
+                    .store
+                    .heartbeat_execution_for_agent_attempt(
+                        execution.id.as_str(),
+                        attempt_generation,
+                        heartbeat_at,
+                        lease_until,
+                    )
+                    .await?;
+            } else {
+                let _ = self
+                    .store
+                    .heartbeat_execution(execution.id.as_str(), heartbeat_at, lease_until)
+                    .await?;
+            }
         }
         Ok(())
+    }
+
+    async fn pinned_agent_attempt_generation(
+        &self,
+        execution_id: &str,
+    ) -> TaskRuntimeResult<Option<i64>> {
+        let attempt = self
+            .agent_attempt_generation
+            .get_or_try_init(|| async {
+                Ok::<_, anyhow::Error>(
+                    pioneer_crud::load_agent_execution_resource_state(
+                        &self.store.database_connection(),
+                        execution_id,
+                    )
+                    .await?
+                    .map(|state| state.attempt_generation),
+                )
+            })
+            .await?;
+        Ok(*attempt)
     }
 
     pub async fn load_execution(&self) -> TaskRuntimeResult<Option<TaskRunExecution>> {
@@ -585,12 +717,23 @@ impl TaskExecutionHandle {
         let Some(task_response) = self.store.get_task(self.task_id.as_str()).await? else {
             return Ok(());
         };
+        let actor_contract = self
+            .store
+            .get_task_actor_contract(task_response.task.id.as_str())
+            .await?
+            .with_context(|| {
+                format!(
+                    "Task `{}` has no durable actor contract",
+                    task_response.task.id
+                )
+            })?;
         let Some(delivery) = delivery_for_terminal_run(
             &task_response,
             self.run_id.as_str(),
             event_timestamp_secs,
             result_snapshot,
             error_snapshot,
+            actor_contract.delivery.destination_user_id.as_deref(),
         ) else {
             return Ok(());
         };
@@ -611,6 +754,10 @@ impl TaskExecutionHandle {
         {
             return Ok(());
         }
+        actor_contract
+            .delivery
+            .validate()
+            .map_err(|error| anyhow!("task delivery authority is invalid: {error:?}"))?;
         events.push(TaskEventPayload::DeliveryQueued { delivery });
         Ok(())
     }
@@ -823,6 +970,7 @@ fn delivery_for_terminal_run(
     event_timestamp_secs: i64,
     result_snapshot: Option<TaskResult>,
     error_snapshot: Option<TaskError>,
+    exact_notification_recipient: Option<&str>,
 ) -> Option<pioneer_protocol::TaskDelivery> {
     let policy = task_response.task.delivery_policy.as_ref()?;
     if policy.mode == TaskDeliveryMode::None {
@@ -839,12 +987,21 @@ fn delivery_for_terminal_run(
         _ => None,
     };
     let target_user_id = (policy.mode == TaskDeliveryMode::UserNotification)
-        .then(|| task_response.task.owner_id.clone())
+        .then(|| {
+            exact_notification_recipient.map(str::to_owned).or_else(|| {
+                (task_response.task.owner_kind == pioneer_protocol::TaskOwnerKind::User)
+                    .then(|| task_response.task.owner_id.clone())
+                    .flatten()
+            })
+        })
         .flatten();
     let webhook_url = (policy.mode == TaskDeliveryMode::Webhook)
         .then(|| policy.webhook_url.clone())
         .flatten();
     if policy.mode == TaskDeliveryMode::Thread && target_thread_id.is_none() {
+        return None;
+    }
+    if policy.mode == TaskDeliveryMode::UserNotification && target_user_id.is_none() {
         return None;
     }
     if policy.mode == TaskDeliveryMode::Webhook && webhook_url.is_none() {
@@ -855,6 +1012,7 @@ fn delivery_for_terminal_run(
         result_snapshot
             .or_else(|| run.and_then(|run| run.result.clone()))
             .or_else(|| task_response.task.result.clone())
+            .map(|result| task_delivery_result_snapshot(result, policy.format))
     } else {
         None
     };
@@ -895,15 +1053,16 @@ fn delivery_for_terminal_run(
         target_thread_id,
         target_user_id,
         webhook_url: webhook_url.clone(),
-        webhook_url_fingerprint: webhook_url.map(|url| sha256_hex(url.as_bytes())),
+        webhook_url_fingerprint: webhook_url
+            .as_deref()
+            .map(crate::actor_contract::delivery_target_fingerprint),
         status: TaskDeliveryStatus::Pending,
         next_attempt_at: Some(event_timestamp_secs),
         attempt_count: 0,
-        max_attempts: if policy.mode == TaskDeliveryMode::Webhook {
-            3
-        } else {
-            1
-        },
+        // Every surface is an idempotent outbox delivery. A crash after the
+        // destination commit but before acknowledgement must retry the same
+        // deterministic receipt instead of stranding it after one attempt.
+        max_attempts: 3,
         result_snapshot,
         error_snapshot,
         delivered_turn_id: None,
@@ -913,6 +1072,21 @@ fn delivery_for_terminal_run(
         created_at: event_timestamp_secs,
         updated_at: event_timestamp_secs,
     })
+}
+
+fn task_delivery_result_snapshot(
+    result: TaskResult,
+    format: pioneer_protocol::TaskDeliveryFormat,
+) -> TaskResult {
+    match format {
+        pioneer_protocol::TaskDeliveryFormat::FullResult => result,
+        pioneer_protocol::TaskDeliveryFormat::Summary => TaskResult {
+            summary: result.summary,
+            data: None,
+            artifacts: Vec::new(),
+            completed_by_run_id: result.completed_by_run_id,
+        },
+    }
 }
 
 fn delivery_mode_key(mode: TaskDeliveryMode) -> &'static str {
@@ -931,12 +1105,6 @@ fn delivery_thread_target_key(target: pioneer_protocol::TaskDeliveryThreadTarget
         pioneer_protocol::TaskDeliveryThreadTarget::CollaborationRoot => "collaboration_root",
         pioneer_protocol::TaskDeliveryThreadTarget::ExactThread => "exact_thread",
     }
-}
-
-fn sha256_hex(input: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    hex::encode(hasher.finalize())
 }
 
 fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {
@@ -1032,5 +1200,38 @@ fn executor_key(kind: TaskExecutorKind) -> &'static str {
         TaskExecutorKind::Workflow => "workflow",
         TaskExecutorKind::Webhook => "webhook",
         TaskExecutorKind::System => "system",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::{TaskArtifact, TaskDeliveryFormat, TaskValue};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn summary_delivery_snapshot_drops_full_data_and_artifacts() {
+        let result = TaskResult {
+            summary: Some("safe summary".to_owned()),
+            data: Some(TaskValue::Object(BTreeMap::from([(
+                "secret".to_owned(),
+                TaskValue::String("must-not-cross".to_owned()),
+            )]))),
+            artifacts: vec![TaskArtifact {
+                artifact_id: Some("artifact-1".to_owned()),
+                version_id: Some("version-1".to_owned()),
+                path: None,
+                url: None,
+                mime_type: None,
+                metadata: None,
+            }],
+            completed_by_run_id: Some("run-1".to_owned()),
+        };
+
+        let projected = task_delivery_result_snapshot(result, TaskDeliveryFormat::Summary);
+        assert_eq!(projected.summary.as_deref(), Some("safe summary"));
+        assert!(projected.data.is_none());
+        assert!(projected.artifacts.is_empty());
+        assert_eq!(projected.completed_by_run_id.as_deref(), Some("run-1"));
     }
 }

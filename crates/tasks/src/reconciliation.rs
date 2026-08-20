@@ -3,8 +3,11 @@ use crate::event_bus::TaskEventBus;
 use crate::executor::{TaskExecutionContext, TaskExecutionHandle, TaskExecutorRegistry};
 use crate::projector::TaskProjector;
 use crate::scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskSchedulerHandle};
+use anyhow::Context;
 use pioneer_crud::CrudStore;
-use pioneer_protocol::{TaskEventPayload, TaskRun, TaskRunStatus, TaskTriggerStatus, generate_id};
+use pioneer_protocol::{
+    TaskEventPayload, TaskOccurrenceStatus, TaskRun, TaskRunStatus, TaskTriggerStatus, generate_id,
+};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -129,6 +132,25 @@ impl TaskStartupReconciler {
         let Some(task_response) = self.store.get_task(run.task_id.as_str()).await? else {
             return Ok(false);
         };
+        let mut occurrence = self
+            .store
+            .get_task_occurrence_contract_by_run(run.id.as_str())
+            .await?
+            .with_context(|| {
+                format!(
+                    "recoverable Task run `{}` has no durable occurrence contract",
+                    run.id
+                )
+            })?;
+        occurrence.status = match run.status {
+            TaskRunStatus::Queued => TaskOccurrenceStatus::Queued,
+            TaskRunStatus::Starting | TaskRunStatus::Running => TaskOccurrenceStatus::Recovering,
+            TaskRunStatus::WaitingReview => TaskOccurrenceStatus::WaitingReview,
+            _ => occurrence.status.clone(),
+        };
+        self.store
+            .upsert_task_occurrence_contract(&occurrence, now)
+            .await?;
         let recovery_message = match run.status {
             TaskRunStatus::Queued => DISPATCHABLE_RUN_RECOVERY_MESSAGE,
             TaskRunStatus::Starting | TaskRunStatus::Running => {
@@ -152,7 +174,7 @@ impl TaskStartupReconciler {
                 run.task_id.clone(),
                 run.id.clone(),
             );
-            if let Err(error) = executor
+            if let Err(_error) = executor
                 .recover_run(
                     TaskExecutionContext {
                         workspace_id: task_response.task.workspace_id,
@@ -168,7 +190,7 @@ impl TaskStartupReconciler {
                 warn!(
                     task_id = %run.task_id,
                     run_id = %run.id,
-                    error = %format!("{error:#}"),
+                    failure_class = "task_waiting_review_recovery_failed",
                     "task executor waiting-review recovery failed"
                 );
             }
@@ -216,7 +238,8 @@ impl TaskStartupReconciler {
             warn!(
                 task_id = %run.task_id,
                 run_id = %run.id,
-                error = %format!("{error:#}"),
+                error = %error,
+                failure_class = "task_execution_recovery_failed",
                 "task executor run recovery failed"
             );
         }

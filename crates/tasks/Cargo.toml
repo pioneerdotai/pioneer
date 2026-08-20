@@ -23,4 +23,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 pioneer-migration.workspace = true
+pioneer-entity.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }

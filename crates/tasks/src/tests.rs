@@ -19,19 +19,20 @@ use pioneer_protocol::{
     TaskConcurrencyConflictPolicy, TaskConcurrencyPolicy, TaskCreateParams, TaskDeliveriesParams,
     TaskDeliveryMode, TaskDeliveryPolicy, TaskDeliveryStatus, TaskDetachParams, TaskError,
     TaskErrorClass, TaskEventPayload, TaskEventsParams, TaskExecutorKind, TaskLifecyclePolicy,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams,
-    TaskRescheduleReason, TaskResourceBudget, TaskResult, TaskResultCandidate,
-    TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEventKind,
-    TaskResultReviewResolutionStrategy, TaskResultReviewerKind, TaskResultReviewerSpec,
-    TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskRun,
-    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
-    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerSpec, TaskTriggerStatus,
-    TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams, TaskWaitReviewAction,
-    TaskWaitRevisionBlockedReason, ThreadLineage, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
-    TurnNetworkPolicySnapshot, TurnPermissionMode, TurnProcessPolicySnapshot, TurnSandboxMode,
+    TaskOccurrenceContract, TaskOccurrenceStatus, TaskOwnerKind, TaskParentTerminalAction,
+    TaskPauseParams, TaskRescheduleParams, TaskRescheduleReason, TaskResourceBudget, TaskResult,
+    TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
+    TaskResultReviewEventKind, TaskResultReviewResolutionStrategy, TaskResultReviewerKind,
+    TaskResultReviewerSpec, TaskResumeParams, TaskRetryBackoffKind, TaskRetryPolicy,
+    TaskReviseParams, TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding,
+    TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus,
+    TaskThreadLineage, TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerSpec,
+    TaskTriggerStatus, TaskUpdateParams, TaskValue, TaskWaitMode, TaskWaitParams,
+    TaskWaitReviewAction, TaskWaitRevisionBlockedReason, ThreadLineage, TurnFilesystemAccess,
+    TurnFilesystemSandboxEntry, TurnNetworkPolicySnapshot, TurnPermissionMode,
+    TurnProcessPolicySnapshot, TurnSandboxMode,
 };
-use sea_orm::Database;
+use sea_orm::{ActiveValue::Set, Database, EntityTrait};
 use std::collections::BTreeMap;
 use std::sync::{
     Arc,
@@ -39,6 +40,15 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
+
+const TEST_WORKSPACE_ID: &str = "ws_tasks";
+const TEST_PRINCIPAL_ID: &str = "P00000000000000000001";
+const TEST_PARENT_EXECUTION_ID: &str = "E12345678901234567890";
+const TEST_PARENT_THREAD_ID: &str = "H12345678901234567890";
+const TEST_PARENT_TURN_ID: &str = "T12345678901234567890";
+const TEST_REVIEWER_EXECUTION_ID: &str = "E22345678901234567890";
+const TEST_REVIEWER_THREAD_ID: &str = "H22345678901234567890";
+const TEST_PRESENTATION_SNAPSHOT_ID: &str = "S12345678901234567890";
 
 #[derive(Default)]
 struct CompletingSystemExecutor;
@@ -340,7 +350,9 @@ async fn runtime() -> TaskRuntime {
     Migrator::up(&connection, None)
         .await
         .expect("migration should apply");
-    TaskRuntime::new(Arc::new(CrudStore::new(connection)))
+    seed_task_test_workspace(&connection).await;
+    let store = Arc::new(CrudStore::new(connection));
+    TaskRuntime::new(store)
 }
 
 async fn runtime_with_review_config() -> TaskRuntime {
@@ -350,8 +362,10 @@ async fn runtime_with_review_config() -> TaskRuntime {
     Migrator::up(&connection, None)
         .await
         .expect("migration should apply");
+    seed_task_test_workspace(&connection).await;
+    let store = Arc::new(CrudStore::new(connection));
     TaskRuntime::new_with_config(
-        Arc::new(CrudStore::new(connection)),
+        store,
         TaskRuntimeConfig {
             review: TaskReviewRuntimeConfig {
                 enabled: true,
@@ -362,6 +376,24 @@ async fn runtime_with_review_config() -> TaskRuntime {
             },
         },
     )
+}
+
+async fn seed_task_test_workspace(connection: &sea_orm::DatabaseConnection) {
+    let now = pioneer_crud::utc_now();
+    pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+        id: Set(TEST_WORKSPACE_ID.to_owned()),
+        name: Set("Tasks Test Workspace".to_owned()),
+        is_active: Set(true),
+        is_current: Set(true),
+        created_at: Set(now.clone()),
+        updated_at: Set(now),
+    })
+    .exec(connection)
+    .await
+    .expect("Tasks test workspace should seed");
+    pioneer_crud::ensure_pioneer_for_workspace(connection, TEST_WORKSPACE_ID, now)
+        .await
+        .expect("Tasks test workspace should seed its reserved Pioneer identity");
 }
 
 #[tokio::test]
@@ -442,9 +474,9 @@ fn idempotency_test_run(status: TaskRunStatus, run_number: i64) -> TaskRun {
 
 fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
     TaskCreateParams {
-        workspace_id: "ws_tasks".to_owned(),
+        workspace_id: TEST_WORKSPACE_ID.to_owned(),
         owner_kind: TaskOwnerKind::Workspace,
-        owner_id: Some("ws_tasks".to_owned()),
+        owner_id: Some(TEST_WORKSPACE_ID.to_owned()),
         created_by_thread_id: None,
         created_by_turn_id: None,
         parent_task_id: None,
@@ -453,6 +485,7 @@ fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
         goal: "Do the task".to_owned(),
         priority: 0,
         trigger: TaskTriggerInput { spec },
+        launch: None,
         agent_spec: None,
         lifecycle_policy: None,
         delivery_policy: None,
@@ -461,6 +494,229 @@ fn create_params(spec: TaskTriggerSpec) -> TaskCreateParams {
         concurrency_policy: None,
         metadata: None,
     }
+}
+
+fn test_agent_launch_facts() -> (
+    pioneer_protocol::AgentLaunchSelection,
+    pioneer_protocol::AgentIdentityProjection,
+    pioneer_protocol::AgentExecutionProfileProjection,
+    crate::TaskAgentAuthorizationGrantSeed,
+) {
+    let identity = pioneer_protocol::AgentIdentityProjection::new(
+        pioneer_protocol::AgentIdentityId::new("A12345678901234567890".to_owned())
+            .expect("valid test Agent identity id"),
+        pioneer_protocol::AgentIdentitySourceKind::NativeAgent,
+        "Tasks Test Agent",
+        "tasks-test-agent",
+        None,
+        None,
+        1,
+        "tasks-test-agent-v1",
+    )
+    .expect("valid test Agent identity");
+    let profile = pioneer_protocol::AgentExecutionProfileProjection {
+        id: pioneer_protocol::AgentExecutionProfileId::new("P12345678901234567890".to_owned())
+            .expect("valid test Agent execution profile id"),
+        compatible_agent_identity_ids: vec![identity.id.clone()],
+        backend: pioneer_protocol::AgentExecutionProfileBackend::ApiProvider,
+        provider_id: "openai".to_owned(),
+        model_id: "test-model".to_owned(),
+        provider_display_name: "OpenAI".to_owned(),
+        model_display_name: "Test Model".to_owned(),
+        allowed_reasoning: Vec::new(),
+        allowed_permission_profiles: vec![TurnPermissionMode::AutoAcceptEdits],
+        catalog_generation: 1,
+        policy_generation: 1,
+        fingerprint: "tasks-test-profile-v1".to_owned(),
+    };
+    let launch = pioneer_protocol::AgentLaunchSelection {
+        agent: pioneer_protocol::AgentIdentitySelection::Exact {
+            agent_identity_id: identity.id.clone(),
+        },
+        execution: pioneer_protocol::AgentExecutionSelection {
+            profile: pioneer_protocol::AgentExecutionProfileSelection::Exact {
+                profile_id: profile.id.clone(),
+            },
+            reasoning: None,
+            permission_profile: None,
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+        },
+    };
+    let child_launch_grant = pioneer_protocol::ChildAgentLaunchGrantSet::new(
+        vec![identity.clone()],
+        vec![profile.clone()],
+    )
+    .expect("valid test child launch grant");
+    let authorization = crate::TaskAgentAuthorizationGrantSeed {
+        role_key: "tasks_test_role".to_owned(),
+        policy_generation: 1,
+        allowed_actions: vec!["task.execute".to_owned()],
+        fingerprint: "a".repeat(64),
+        child_launch_grant,
+    };
+    (launch, identity, profile, authorization)
+}
+
+fn configure_agent_task(params: &mut TaskCreateParams) {
+    params.executor_kind = TaskExecutorKind::Agent;
+    params.launch = Some(test_agent_launch_facts().0);
+}
+
+fn test_agent_presentation_snapshot(
+    execution_id: &str,
+) -> pioneer_protocol::AgentPresentationSnapshot {
+    let (_, identity, _, _) = test_agent_launch_facts();
+    pioneer_protocol::AgentPresentationSnapshot {
+        agent_identity_id: identity.id,
+        agent_execution_id: pioneer_protocol::AgentExecutionId::new(execution_id.to_owned())
+            .expect("valid test Agent execution id"),
+        identity_source_kind: identity.source_kind,
+        identity_source_revision: identity.source_revision,
+        display_name: identity.display_name,
+        nickname: identity.nickname,
+        avatar_revision: identity.avatar_revision,
+        role_label: identity.role_label,
+    }
+}
+
+async fn persist_test_agent_turn(
+    runtime: &TaskRuntime,
+    execution_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    parent_execution_id: Option<&str>,
+) {
+    let store = runtime.service().store();
+    let database = store.database_connection();
+    let now = pioneer_crud::utc_now();
+    let (launch, identity, profile, _) = test_agent_launch_facts();
+    let snapshot = test_agent_presentation_snapshot(execution_id);
+
+    pioneer_crud::ensure_agent_identity(
+        &database,
+        &pioneer_crud::AgentIdentityInput {
+            id: identity.id.as_str().to_owned(),
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            source_kind: pioneer_crud::SOURCE_NATIVE_AGENT.to_owned(),
+            source_id: "tasks-test-agent".to_owned(),
+            source_revision: i64::try_from(identity.source_revision)
+                .expect("test identity revision should fit i64"),
+            source_fingerprint: identity.source_fingerprint.clone(),
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("test Agent identity should persist");
+    pioneer_crud::insert_presentation_snapshot(
+        &database,
+        &pioneer_crud::PresentationSnapshotInput {
+            id: TEST_PRESENTATION_SNAPSHOT_ID.to_owned(),
+            agent_identity_id: identity.id.as_str().to_owned(),
+            source_revision: i64::try_from(identity.source_revision)
+                .expect("test identity revision should fit i64"),
+            source_fingerprint: identity.source_fingerprint.clone(),
+            display_name: snapshot.display_name.clone(),
+            nickname: snapshot.nickname.clone(),
+            avatar_revision: snapshot.avatar_revision.clone(),
+            role_label: snapshot.role_label.clone(),
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("test Agent presentation should persist");
+    pioneer_crud::insert_agent_execution(
+        &database,
+        &pioneer_crud::AgentExecutionInput {
+            id: execution_id.to_owned(),
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            agent_identity_id: identity.id.as_str().to_owned(),
+            identity_source_revision: i64::try_from(identity.source_revision)
+                .expect("test identity revision should fit i64"),
+            identity_source_fingerprint: identity.source_fingerprint,
+            parent_execution_id: parent_execution_id.map(str::to_owned),
+            parent_task_id: None,
+            parent_thread_id: parent_execution_id.map(|_| TEST_PARENT_THREAD_ID.to_owned()),
+            home_root_thread_id: TEST_PARENT_THREAD_ID.to_owned(),
+            work_graph_root_execution_id: parent_execution_id.unwrap_or(execution_id).to_owned(),
+            requested_identity_selection_json: serde_json::to_string(&launch.agent)
+                .expect("test identity selection should serialize"),
+            requested_profile_selection_json: serde_json::to_string(&launch.execution.profile)
+                .expect("test profile selection should serialize"),
+            resolved_profile_id: Some(profile.id.as_str().to_owned()),
+            resolved_profile_fingerprint: Some(profile.fingerprint),
+            presentation_snapshot_id: Some(TEST_PRESENTATION_SNAPSHOT_ID.to_owned()),
+            authorization_context_fingerprint: "b".repeat(64),
+            execution_generation: 1,
+            status: "running".to_owned(),
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("test Agent execution should persist");
+
+    let actor =
+        pioneer_protocol::PersistedActorRef::AgentExecution(snapshot.agent_execution_id.clone());
+    let thread = pioneer_protocol::Thread {
+        workspace_id: TEST_WORKSPACE_ID.to_owned(),
+        id: thread_id.to_owned(),
+        name: None,
+        preview: String::new(),
+        preview_author: None,
+        mode: pioneer_protocol::ThreadMode::Agent,
+        model: profile.model_id,
+        model_provider: profile.provider_id,
+        reasoning_effort: None,
+        created_at: 1_700_000_000,
+        updated_at: 1_700_000_000,
+        status: pioneer_protocol::ThreadStatus::Active,
+        origin_kind: pioneer_protocol::ThreadOriginKind::User,
+        sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        visibility: None,
+        turns: Vec::new(),
+    };
+    let turn = pioneer_protocol::Turn {
+        id: turn_id.to_owned(),
+        status: pioneer_protocol::TurnStatus::InProgress,
+        turn_kind: pioneer_protocol::TurnKind::Conversation,
+        origin: pioneer_protocol::TurnOrigin::User,
+        mode: pioneer_protocol::ThreadMode::Agent,
+        author: Some(snapshot.to_turn_author_snapshot()),
+        reply_to_turn_id: None,
+        mentions: Vec::new(),
+        message_revision: 0,
+        message_deleted: false,
+        error: None,
+        prompt_manifest: None,
+        permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+    };
+    store
+        .upsert_thread_model(&thread, actor.clone())
+        .await
+        .expect("test Agent thread should persist");
+    store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &turn,
+            &[],
+            actor,
+        )
+        .await
+        .expect("test Agent turn should persist");
+    pioneer_crud::insert_agent_turn_response(
+        &database,
+        &pioneer_crud::AgentTurnResponseInput {
+            turn_id: turn_id.to_owned(),
+            execution_id: execution_id.to_owned(),
+            presentation_snapshot_id: TEST_PRESENTATION_SNAPSHOT_ID.to_owned(),
+            now,
+        },
+    )
+    .await
+    .expect("test Agent turn response should persist");
 }
 
 /// Produces the explicit positive authority seed required by Agent Tasks in
@@ -480,8 +736,24 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
         per_workspace: 1_024,
         gateway: 1_024,
     };
+    let (launch, identity, profile, authorization) = test_agent_launch_facts();
+    assert_eq!(params.launch.as_ref(), Some(&launch));
     TaskCreateContext {
-        actor_id: Some("P00000000000000000001".to_owned()),
+        actor_id: Some(TEST_PRINCIPAL_ID.to_owned()),
+        creator_presentation_snapshot: None,
+        execution_destination_thread_id: None,
+        execution_route_id: None,
+        execution_route_receipt_json: None,
+        execution_route_expires_at_millis: None,
+        delivery_route_id: None,
+        delivery_route_receipt_json: None,
+        delivery_route_expires_at_millis: None,
+        creator_work_graph_root_execution_id: None,
+        work_graph_root_execution_id: None,
+        launch_selection: Some(launch),
+        resolved_launch_identity: Some(identity),
+        resolved_launch_profile: Some(profile),
+        agent_authorization_grant: Some(authorization),
         conversation_snapshot: None,
         execution_admission: Some(crate::TaskExecutionAdmissionSeed {
             workspace_id: params.workspace_id.clone(),
@@ -490,7 +762,7 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
                 .clone()
                 .or_else(|| params.owner_id.clone())
                 .unwrap_or_else(|| "thr_tasks_test_root".to_owned()),
-            initiating_principal_id: "P00000000000000000001".to_owned(),
+            initiating_principal_id: TEST_PRINCIPAL_ID.to_owned(),
             authorization_context_json: r#"{"test_authority":"tasks_unit"}"#.to_owned(),
             role_key: "tasks_test_role".to_owned(),
             policy_fingerprint: "0".repeat(64),
@@ -501,7 +773,18 @@ fn task_create_context_for(params: &TaskCreateParams) -> TaskCreateContext {
             },
             task_resources: TaskResourceBudget::default(),
         }),
+        agent_action_commit: None,
     }
+}
+
+fn task_create_context_for_parent_agent(params: &TaskCreateParams) -> TaskCreateContext {
+    let mut context = task_create_context_for(params);
+    let snapshot = test_agent_presentation_snapshot(TEST_PARENT_EXECUTION_ID);
+    context.actor_id = Some(TEST_PARENT_EXECUTION_ID.to_owned());
+    context.creator_presentation_snapshot = Some(snapshot);
+    context.creator_work_graph_root_execution_id = Some(TEST_PARENT_EXECUTION_ID.to_owned());
+    context.work_graph_root_execution_id = Some(TEST_PARENT_EXECUTION_ID.to_owned());
+    context
 }
 
 async fn record_active_task_execution_turn(
@@ -607,15 +890,25 @@ async fn create_waiting_review_agent_task_with_policy(
     candidate_round: u32,
     candidate_status: TaskResultCandidateStatus,
 ) -> (String, String, String) {
+    persist_test_agent_turn(
+        runtime,
+        TEST_PARENT_EXECUTION_ID,
+        TEST_PARENT_THREAD_ID,
+        TEST_PARENT_TURN_ID,
+        None,
+    )
+    .await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
+    params.created_by_thread_id = Some(TEST_PARENT_THREAD_ID.to_owned());
+    params.created_by_turn_id = Some(TEST_PARENT_TURN_ID.to_owned());
     let mut spec = agent_spec(3);
     spec.review_policy = Some(review_policy);
     params.agent_spec = Some(spec);
 
     let response = runtime
         .service()
-        .create_task(task_create_context_for(&params), params)
+        .create_task(task_create_context_for_parent_agent(&params), params)
         .await
         .expect("review task should create");
     let run = response.run.expect("review task should have run");
@@ -631,8 +924,8 @@ async fn create_waiting_review_agent_task_with_policy(
         run.task_id.clone(),
         run.id.clone(),
     );
-    let parent_thread_id = pioneer_protocol::generate_id(21);
-    let parent_turn_id = pioneer_protocol::generate_id(21);
+    let parent_thread_id = TEST_PARENT_THREAD_ID.to_owned();
+    let parent_turn_id = TEST_PARENT_TURN_ID.to_owned();
     let child_thread_id = pioneer_protocol::generate_id(21);
     let child_turn_id = pioneer_protocol::generate_id(21);
     let turn_id = format!("review_turn_{}", run.id);
@@ -767,7 +1060,7 @@ async fn parent_accept_context_for_candidate(
         .iter()
         .find(|lineage| lineage.child_thread_id == candidate.thread_id)
         .expect("candidate source lineage should exist");
-    TaskMutationContext::parent_agent(
+    let mut context = TaskMutationContext::parent_agent(
         lineage
             .created_by_thread_id
             .clone()
@@ -776,7 +1069,28 @@ async fn parent_accept_context_for_candidate(
             .created_by_turn_id
             .clone()
             .expect("parent turn id should exist"),
-    )
+    );
+    context.actor_id = Some(TEST_PARENT_EXECUTION_ID.to_owned());
+    context
+}
+
+async fn parent_review_actor_for_candidate(
+    runtime: &TaskRuntime,
+    task_id: &str,
+    candidate_id: &str,
+) -> TaskResultReviewActor {
+    let context = parent_accept_context_for_candidate(runtime, task_id, candidate_id).await;
+    TaskResultReviewActor {
+        reviewer_kind: TaskResultReviewerKind::ParentAgent,
+        reviewer: pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+            pioneer_protocol::AgentExecutionId::new(TEST_PARENT_EXECUTION_ID.to_owned())
+                .expect("valid test parent Agent execution id"),
+        ),
+        reviewer_thread_id: context.thread_id,
+        reviewer_turn_id: context.turn_id,
+        reviewer_user_id: None,
+        reviewer_agent_spec_id: None,
+    }
 }
 
 fn composer_work_create_params(
@@ -789,7 +1103,7 @@ fn composer_work_create_params(
     params.owner_id = Some(parent_thread_id.to_owned());
     params.created_by_thread_id = Some(parent_thread_id.to_owned());
     params.created_by_turn_id = Some(format!("turn_{parent_thread_id}"));
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     params.agent_spec = Some(agent_spec(3));
     params.lifecycle_policy = Some(TaskLifecyclePolicy {
         attachment: TaskAttachmentMode::Detached,
@@ -803,6 +1117,7 @@ fn composer_work_create_params(
         composer_work: Some(pioneer_protocol::TaskComposerWork {
             version: payload_version,
             launch: pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: parent_thread_id.to_owned(),
                 turn_id: format!("planned_{parent_thread_id}"),
                 input: vec![pioneer_protocol::UserInput::Text {
@@ -814,6 +1129,7 @@ fn composer_work_create_params(
                 model_provider: Some("openai".to_owned()),
                 sandbox_policy: None,
                 mode: Some(pioneer_protocol::ThreadMode::Agent),
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: Some(pioneer_protocol::AgentExecutionBackend::ApiProvider {
@@ -952,9 +1268,48 @@ async fn composer_work_rejects_attached_subagent_lifecycle() {
 #[tokio::test]
 async fn review_event_advisory_keeps_candidate_pending() {
     let runtime = runtime_with_review_config().await;
-    let (_task_id, run_id, candidate_id) =
-        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
-            .await;
+    let reviewer_spec = TaskResultReviewerSpec {
+        reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+        agent_nickname: Some("reviewer".to_owned()),
+        agent_role: Some("review".to_owned()),
+        required: true,
+        weight: None,
+    };
+    let policy = TaskAgentReviewPolicy {
+        mode: TaskAgentReviewMode::ParentAgentWithReviewers,
+        max_revision_rounds: 2,
+        require_explicit_acceptance: true,
+        reviewers: vec![reviewer_spec.clone()],
+        resolution_strategy:
+            TaskResultReviewResolutionStrategy::RequireAllRequiredReviewersThenParent,
+    };
+    let (_task_id, run_id, candidate_id) = create_waiting_review_agent_task_with_policy(
+        &runtime,
+        policy,
+        0,
+        TaskResultCandidateStatus::PendingReview,
+    )
+    .await;
+    let reviewer_context = runtime
+        .service()
+        .create_task_result_reviewer_context(CreateTaskResultReviewerContextParams {
+            candidate_id: candidate_id.clone(),
+            reviewer_index: 0,
+            reviewer_spec: reviewer_spec.clone(),
+            reviewer_thread_id: TEST_REVIEWER_THREAD_ID.to_owned(),
+            reviewer_turn_id: TEST_REVIEWER_EXECUTION_ID.to_owned(),
+            created_at: Some(10_000),
+        })
+        .await
+        .expect("reviewer context should create");
+    persist_test_agent_turn(
+        &runtime,
+        TEST_REVIEWER_EXECUTION_ID,
+        TEST_REVIEWER_THREAD_ID,
+        TEST_REVIEWER_EXECUTION_ID,
+        Some(TEST_PARENT_EXECUTION_ID),
+    )
+    .await;
 
     let recorded = runtime
         .service()
@@ -963,10 +1318,17 @@ async fn review_event_advisory_keeps_candidate_pending() {
             review_event_id: Some("review_advisory_pending".to_owned()),
             actor: TaskResultReviewActor {
                 reviewer_kind: TaskResultReviewerKind::ReviewAgent,
-                reviewer_thread_id: Some("reviewer_thread_pending".to_owned()),
-                reviewer_turn_id: Some("reviewer_turn_pending".to_owned()),
+                reviewer: pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+                    pioneer_protocol::AgentExecutionId::new(TEST_REVIEWER_EXECUTION_ID.to_owned())
+                        .unwrap(),
+                ),
+                reviewer_thread_id: Some(reviewer_context.task_run_turn.thread_id),
+                reviewer_turn_id: Some(reviewer_context.task_run_turn.turn_id),
                 reviewer_user_id: None,
-                reviewer_agent_spec_id: Some("reviewer_spec_pending".to_owned()),
+                reviewer_agent_spec_id: Some(crate::task_result_reviewer_spec_key(
+                    0,
+                    &reviewer_spec,
+                )),
             },
             event_kind: TaskResultReviewEventKind::Advisory,
             decision: TaskResultReviewDecision::RequestChanges,
@@ -1008,22 +1370,18 @@ async fn review_event_advisory_keeps_candidate_pending() {
 #[tokio::test]
 async fn review_event_decision_accept_resolves_candidate() {
     let runtime = runtime_with_review_config().await;
-    let (_task_id, _run_id, candidate_id) =
+    let (task_id, _run_id, candidate_id) =
         create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
             .await;
+    let actor =
+        parent_review_actor_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str()).await;
 
     let recorded = runtime
         .service()
         .record_task_result_review_event(RecordTaskResultReviewEventParams {
             candidate_id: candidate_id.clone(),
             review_event_id: Some("review_parent_accept".to_owned()),
-            actor: TaskResultReviewActor {
-                reviewer_kind: TaskResultReviewerKind::ParentAgent,
-                reviewer_thread_id: Some("parent_thread_accept".to_owned()),
-                reviewer_turn_id: Some("parent_turn_accept".to_owned()),
-                reviewer_user_id: None,
-                reviewer_agent_spec_id: None,
-            },
+            actor,
             event_kind: TaskResultReviewEventKind::Decision,
             decision: TaskResultReviewDecision::Accept,
             feedback_text: None,
@@ -1050,22 +1408,18 @@ async fn review_event_decision_accept_resolves_candidate() {
 #[tokio::test]
 async fn review_event_decision_request_changes_rejects_candidate() {
     let runtime = runtime_with_review_config().await;
-    let (_task_id, _run_id, candidate_id) =
+    let (task_id, _run_id, candidate_id) =
         create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
             .await;
+    let actor =
+        parent_review_actor_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str()).await;
 
     let recorded = runtime
         .service()
         .record_task_result_review_event(RecordTaskResultReviewEventParams {
             candidate_id,
             review_event_id: Some("review_parent_request_changes".to_owned()),
-            actor: TaskResultReviewActor {
-                reviewer_kind: TaskResultReviewerKind::ParentAgent,
-                reviewer_thread_id: Some("parent_thread_request".to_owned()),
-                reviewer_turn_id: Some("parent_turn_request".to_owned()),
-                reviewer_user_id: None,
-                reviewer_agent_spec_id: None,
-            },
+            actor,
             event_kind: TaskResultReviewEventKind::Decision,
             decision: TaskResultReviewDecision::RequestChanges,
             feedback_text: Some("redo this".to_owned()),
@@ -1126,22 +1480,18 @@ async fn review_event_cancel_resolves_candidate_cancelled() {
 #[tokio::test]
 async fn review_event_override_updates_final_pointer_without_losing_history() {
     let runtime = runtime_with_review_config().await;
-    let (_task_id, _run_id, candidate_id) =
+    let (task_id, _run_id, candidate_id) =
         create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
             .await;
+    let actor =
+        parent_review_actor_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str()).await;
 
     runtime
         .service()
         .record_task_result_review_event(RecordTaskResultReviewEventParams {
             candidate_id: candidate_id.clone(),
             review_event_id: Some("review_parent_reject_before_override".to_owned()),
-            actor: TaskResultReviewActor {
-                reviewer_kind: TaskResultReviewerKind::ParentAgent,
-                reviewer_thread_id: Some("parent_thread_override".to_owned()),
-                reviewer_turn_id: Some("parent_turn_override_1".to_owned()),
-                reviewer_user_id: None,
-                reviewer_agent_spec_id: None,
-            },
+            actor: actor.clone(),
             event_kind: TaskResultReviewEventKind::Decision,
             decision: TaskResultReviewDecision::Reject,
             feedback_text: Some("reject first".to_owned()),
@@ -1159,13 +1509,7 @@ async fn review_event_override_updates_final_pointer_without_losing_history() {
         .record_task_result_review_event(RecordTaskResultReviewEventParams {
             candidate_id: candidate_id.clone(),
             review_event_id: Some("review_parent_override_accept".to_owned()),
-            actor: TaskResultReviewActor {
-                reviewer_kind: TaskResultReviewerKind::ParentAgent,
-                reviewer_thread_id: Some("parent_thread_override".to_owned()),
-                reviewer_turn_id: Some("parent_turn_override_2".to_owned()),
-                reviewer_user_id: None,
-                reviewer_agent_spec_id: None,
-            },
+            actor,
             event_kind: TaskResultReviewEventKind::Override,
             decision: TaskResultReviewDecision::Accept,
             feedback_text: Some("accept after dispute".to_owned()),
@@ -1329,7 +1673,7 @@ async fn user_review_event_resolves_when_policy_is_user_final() {
     let recorded = runtime
         .service()
         .record_user_task_result_review_event(
-            TaskMutationContext::user("user_1"),
+            TaskMutationContext::user(TEST_PRINCIPAL_ID),
             RecordUserTaskResultReviewEventParams {
                 candidate_id,
                 review_event_id: Some("review_user_accept".to_owned()),
@@ -1350,7 +1694,7 @@ async fn user_review_event_resolves_when_policy_is_user_final() {
     );
     assert_eq!(
         recorded.review_event.reviewer_user_id.as_deref(),
-        Some("user_1")
+        Some(TEST_PRINCIPAL_ID)
     );
     assert_eq!(
         recorded.candidate.status,
@@ -1372,7 +1716,7 @@ async fn user_review_event_is_blocked_when_policy_is_parent_final() {
     let error = runtime
         .service()
         .record_user_task_result_review_event(
-            TaskMutationContext::user("user_1"),
+            TaskMutationContext::user(TEST_PRINCIPAL_ID),
             RecordUserTaskResultReviewEventParams {
                 candidate_id,
                 review_event_id: Some("review_user_blocked".to_owned()),
@@ -1387,7 +1731,7 @@ async fn user_review_event_is_blocked_when_policy_is_parent_final() {
         .await
         .expect_err("user final review should be blocked by parent-final policy");
     assert!(
-        format!("{error:#}").contains("user final review is not allowed"),
+        format!("{error:#}").contains("immutable reviewer intent"),
         "unexpected error: {error:#}"
     );
 }
@@ -2423,7 +2767,7 @@ async fn accept_task_result_candidate_user_records_user_review_when_policy_allow
     let accepted = runtime
         .service()
         .accept_task_result_candidate(
-            TaskMutationContext::user("user_1"),
+            TaskMutationContext::user(TEST_PRINCIPAL_ID),
             accept_params(task_id, run_id, candidate_id),
         )
         .await
@@ -2435,7 +2779,7 @@ async fn accept_task_result_candidate_user_records_user_review_when_policy_allow
     );
     assert_eq!(
         accepted.review_event.reviewer_user_id.as_deref(),
-        Some("user_1")
+        Some(TEST_PRINCIPAL_ID)
     );
     assert_eq!(
         accepted.candidate.status,
@@ -2516,7 +2860,7 @@ async fn agent_run_is_atomically_claimed_before_spawn() {
         timezone: Some("UTC".to_owned()),
         catch_up_policy: None,
     });
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     let mut spec = agent_spec(2);
     spec.prompt.instructions = vec!["Execute the scheduled test run once.".to_owned()];
     spec.prompt.output_instructions = Some("Return a concise test result.".to_owned());
@@ -2599,7 +2943,7 @@ async fn running_agent_recovery_reuses_one_execution_and_one_child_lineage() {
         .await;
 
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     params.agent_spec = Some(agent_spec(2));
     let response = runtime
         .service()
@@ -2710,7 +3054,7 @@ async fn starting_agent_recovery_reuses_reserved_execution_identity() {
     let recoveries = Arc::new(AtomicUsize::new(0));
 
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     params.agent_spec = Some(agent_spec(2));
     let response = runtime
         .service()
@@ -2817,7 +3161,7 @@ async fn mark_started_is_idempotent_and_emits_one_started_event() {
 async fn concurrent_execution_reservations_reuse_one_child_identity() {
     let runtime = runtime().await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     params.agent_spec = Some(agent_spec(2));
     let response = runtime
         .service()
@@ -2935,7 +3279,7 @@ async fn execution_repository_tracks_claim_running_heartbeat_and_terminal_state(
 async fn one_task_run_can_link_only_one_child_thread() {
     let runtime = runtime().await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     params.agent_spec = Some(agent_spec(2));
     let response = runtime
         .service()
@@ -3113,6 +3457,98 @@ async fn scheduled_trigger_fires_when_due() {
         .await
         .expect("task should read");
     assert_eq!(task.runs.len(), 1);
+}
+
+#[tokio::test]
+async fn due_trigger_materialization_rolls_back_run_when_occurrence_contract_is_invalid() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 10,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("scheduled task should create");
+    let task_id = response.task.id.clone();
+    let trigger = response.trigger;
+    let run = TaskRun {
+        id: pioneer_protocol::generate_id(21),
+        task_id: task_id.clone(),
+        trigger_id: Some(trigger.id.clone()),
+        parent_run_id: None,
+        run_group_id: pioneer_protocol::generate_id(21),
+        attempt_number: 1,
+        retry_of_run_id: None,
+        ready_at: Some(10),
+        run_number: 1,
+        status: TaskRunStatus::Queued,
+        executor_kind: response.task.executor_kind,
+        started_at: None,
+        completed_at: None,
+        heartbeat_at: None,
+        locked_by: None,
+        lock_expires_at: None,
+        result: None,
+        error: None,
+        created_at: 10,
+        updated_at: 10,
+    };
+    let invalid_occurrence = TaskOccurrenceContract {
+        occurrence_id: String::new(),
+        task_id: task_id.clone(),
+        run_id: run.id.clone(),
+        trigger_id: Some(trigger.id.clone()),
+        occurrence_key: format!("{}:1", trigger.id),
+        execution_generation: 1,
+        agent_execution_id: None,
+        work_graph_root_execution_id: None,
+        root_resource_scope_id: None,
+        status: TaskOccurrenceStatus::Queued,
+        queue_position: None,
+        retry_attempt: 0,
+        action_idempotency_key: format!("task:{task_id}:{}", run.id),
+        route_id: None,
+        result_return_route_id: None,
+        terminal_reason: None,
+    };
+
+    let error = runtime
+        .service()
+        .store()
+        .append_due_trigger_task_events(
+            trigger.id.as_str(),
+            10,
+            10,
+            vec![
+                TaskEventPayload::TaskQueued {
+                    task_id: task_id.clone(),
+                    run_id: Some(run.id.clone()),
+                },
+                TaskEventPayload::RunCreated {
+                    run: run.clone(),
+                    agent_spec: None,
+                },
+            ],
+            vec![invalid_occurrence],
+            vec![(run.id, run.executor_kind)],
+        )
+        .await
+        .expect_err("invalid occurrence must abort the due-trigger transaction");
+    assert!(format!("{error:#}").contains("invalid task occurrence contract"));
+
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams { task_id })
+        .await
+        .expect("task should remain readable after rollback");
+    assert!(task.runs.is_empty());
+    assert_eq!(task.triggers[0].next_fire_at, Some(10));
+    assert_eq!(task.triggers[0].status, TaskTriggerStatus::Active);
 }
 
 #[tokio::test]
@@ -3625,7 +4061,7 @@ async fn write_locks_block_conflicting_agent_runs_and_recover_release_terminal_l
     let runtime = runtime().await;
 
     let mut first = create_params(TaskTriggerSpec::Immediate);
-    first.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut first);
     let mut first_spec = agent_spec(3);
     first_spec.tool_policy = Some(TaskAgentToolPolicy {
         allowed_tools: Vec::new(),
@@ -3648,7 +4084,7 @@ async fn write_locks_block_conflicting_agent_runs_and_recover_release_terminal_l
     let first_run_id = first.run.expect("first run should exist").id;
 
     let mut second = create_params(TaskTriggerSpec::Immediate);
-    second.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut second);
     let mut second_spec = agent_spec(3);
     second_spec.tool_policy = Some(TaskAgentToolPolicy {
         allowed_tools: Vec::new(),
@@ -3733,7 +4169,7 @@ async fn waiting_review_recovery_preserves_stale_write_lock() {
     let runtime = runtime().await;
 
     let mut first = create_params(TaskTriggerSpec::Immediate);
-    first.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut first);
     let mut first_spec = agent_spec(3);
     first_spec.tool_policy = Some(TaskAgentToolPolicy {
         allowed_tools: Vec::new(),
@@ -3756,7 +4192,7 @@ async fn waiting_review_recovery_preserves_stale_write_lock() {
     let first_run_id = first.run.expect("first run should exist").id;
 
     let mut second = create_params(TaskTriggerSpec::Immediate);
-    second.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut second);
     let mut second_spec = agent_spec(3);
     second_spec.tool_policy = Some(TaskAgentToolPolicy {
         allowed_tools: Vec::new(),
@@ -4091,7 +4527,7 @@ async fn blocked_agent_task_requires_readmission_and_resumes_atomically() {
         timezone: "Europe/Moscow".to_owned(),
         catch_up_policy: None,
     });
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     let mut spec = agent_spec(3);
     spec.prompt.instructions = vec![
         "Use currently available runtime capabilities by capability.".to_owned(),
@@ -4549,7 +4985,7 @@ async fn cron_trigger_computes_moscow_morning_fire_in_utc() {
 async fn agent_task_create_requires_permission_cap() {
     let runtime = runtime().await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     let mut spec = agent_spec(3);
     spec.permission_cap = None;
     params.agent_spec = Some(spec);
@@ -4567,7 +5003,7 @@ async fn agent_task_create_requires_permission_cap() {
 async fn agent_task_create_requires_explicit_execution_admission() {
     let runtime = runtime().await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     params.agent_spec = Some(agent_spec(3));
 
     let error = runtime
@@ -4586,7 +5022,7 @@ async fn agent_task_create_requires_explicit_execution_admission() {
 async fn task_security_cap_persists_on_agent_spec() {
     let runtime = runtime().await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     let mut spec = agent_spec(3);
     let security_cap = test_security_cap();
     spec.security_cap = Some(security_cap.clone());
@@ -4625,7 +5061,7 @@ async fn task_security_cap_persists_on_agent_spec() {
 async fn security_intersection_missing_security_cap_is_rejected_for_agent_task() {
     let runtime = runtime().await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     let mut spec = agent_spec(3);
     spec.security_cap = None;
     params.agent_spec = Some(spec);
@@ -4645,7 +5081,7 @@ async fn security_intersection_missing_security_cap_is_rejected_for_agent_task()
 async fn recovery_security_missing_security_cap_is_not_defaulted() {
     let runtime = runtime().await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     let mut spec = agent_spec(3);
     spec.security_cap = None;
     params.agent_spec = Some(spec);
@@ -4670,7 +5106,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
         timezone: "Europe/Moscow".to_owned(),
         catch_up_policy: None,
     });
-    missing_prompt.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut missing_prompt);
     missing_prompt.agent_spec = Some(agent_spec(3));
     let error = runtime
         .service()
@@ -4684,7 +5120,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
         timezone: "Europe/Moscow".to_owned(),
         catch_up_policy: None,
     });
-    missing_output.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut missing_output);
     let mut spec = agent_spec(3);
     spec.prompt.instructions = vec![
         "Use currently available runtime capabilities by capability, not stale tool names."
@@ -4704,7 +5140,7 @@ async fn scheduled_agent_task_requires_self_contained_prompt_contract() {
         timezone: "Europe/Moscow".to_owned(),
         catch_up_policy: None,
     });
-    valid.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut valid);
     let mut spec = agent_spec(3);
     spec.prompt.instructions = vec![
         "Use currently available runtime capabilities by capability, not stale tool names."
@@ -4729,7 +5165,7 @@ async fn update_task_patches_task_trigger_and_base_agent_spec_atomically() {
         timezone: "Europe/Moscow".to_owned(),
         catch_up_policy: None,
     });
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     let mut spec = agent_spec(3);
     spec.prompt.instructions = vec![
         "Use currently available runtime capabilities by capability.".to_owned(),
@@ -4848,7 +5284,7 @@ async fn update_task_patches_task_trigger_and_base_agent_spec_atomically() {
 async fn update_task_rejects_scheduled_agent_without_prompt_contract() {
     let runtime = runtime().await;
     let mut params = create_params(TaskTriggerSpec::Immediate);
-    params.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut params);
     params.agent_spec = Some(agent_spec(3));
     let created = runtime
         .service()
@@ -4921,7 +5357,7 @@ async fn max_depth_is_enforced_before_child_events_are_appended() {
         allowed_actor: None,
     });
     root.created_by_thread_id = Some("thread_depth_root".to_owned());
-    root.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut root);
     root.agent_spec = Some(agent_spec(1));
     let root = runtime
         .service()
@@ -4932,7 +5368,7 @@ async fn max_depth_is_enforced_before_child_events_are_appended() {
     let mut child = create_params(TaskTriggerSpec::Manual {
         allowed_actor: None,
     });
-    child.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut child);
     child.created_by_thread_id = Some("thread_depth_root".to_owned());
     child.parent_task_id = Some(root.task.id.clone());
     child.agent_spec = Some(agent_spec(1));
@@ -4969,7 +5405,7 @@ async fn scheduled_parent_task_can_create_child_when_depth_allows() {
         catch_up_policy: None,
     });
     root.created_by_thread_id = Some("thread_scheduled_parent".to_owned());
-    root.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut root);
     let mut root_spec = agent_spec(3);
     root_spec.prompt.instructions = vec!["Run the scheduled parent task.".to_owned()];
     root_spec.prompt.output_instructions = Some("Return the scheduled result.".to_owned());
@@ -4981,7 +5417,7 @@ async fn scheduled_parent_task_can_create_child_when_depth_allows() {
         .expect("scheduled root task should create");
 
     let mut child = create_params(TaskTriggerSpec::Immediate);
-    child.executor_kind = TaskExecutorKind::Agent;
+    configure_agent_task(&mut child);
     child.created_by_thread_id = Some("thread_scheduled_parent".to_owned());
     child.parent_task_id = Some(root.task.id.clone());
     child.agent_spec = Some(agent_spec(3));

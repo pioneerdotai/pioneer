@@ -1,4 +1,5 @@
 use crate::TaskRuntimeResult;
+use crate::actor_contract::{build_occurrence_contract, build_task_actor_contract};
 use crate::admission::TaskAdmissionNormalizer;
 use crate::event_bus::{TaskEventBus, TaskEventFilter, TaskEventWakeDelivery};
 use crate::executor::{
@@ -16,10 +17,11 @@ use crate::review::{
     TaskResultReviewCandidateResolution, TaskResultReviewRecordResponse, TaskResultReviewerContext,
     build_task_result_review_event, evaluate_task_result_review_resolution, final_actor_allowed,
     final_actor_for_reviewer_kind, review_event_candidate_resolution,
+    task_result_reviewer_spec_key,
 };
 use crate::scheduler::TaskScheduler;
 use crate::trigger::TaskTriggerCalculator;
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use pioneer_crud::{
     AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore, NewTaskRunConversationSnapshot,
     TaskRootAccessFilter,
@@ -37,15 +39,15 @@ use pioneer_protocol::{
     TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse, TaskRescheduleParams,
     TaskRescheduleResponse, TaskResourceBudget, TaskResult, TaskResultCandidate,
     TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
-    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResumeParams, TaskResumeResponse,
-    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTree, TaskTreeParams, TaskTreeResponse,
-    TaskTrigger, TaskTriggerKind, TaskTriggerStatus, TaskUpdateParams, TaskUpdateResponse,
-    TaskValue, TaskWaitItem, TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason,
-    TaskWaitParams, TaskWaitResponse, TaskWaitReviewAction, TaskWaitReviewItem,
-    TaskWaitRevisionBlockedReason, TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind,
-    TaskWriteLockStatus, generate_id,
+    TaskResultReviewEventKind, TaskResultReviewerKind, TaskResultReviewerRef, TaskResumeParams,
+    TaskResumeResponse, TaskReviewerIntent, TaskReviseParams, TaskReviseResponse, TaskRun,
+    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskTree,
+    TaskTreeParams, TaskTreeResponse, TaskTrigger, TaskTriggerKind, TaskTriggerStatus,
+    TaskUpdateParams, TaskUpdateResponse, TaskValue, TaskWaitItem, TaskWaitMode,
+    TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse,
+    TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock,
+    TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, generate_id,
 };
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -65,6 +67,7 @@ const WAIT_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
 const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
+const DELIVERY_RECOVERY_BATCH_LIMIT: u64 = 1_000;
 const MAX_REVISION_FEEDBACK_CHARS: usize = 16_000;
 const MAX_WAIT_GOVERNOR_SCOPES: usize = 1_024;
 
@@ -225,7 +228,9 @@ impl TaskRuntime {
         let now = now_timestamp_secs();
         self.reconciler.reconcile(now).await?;
         self.service.recover_retry_and_lock_state(now).await?;
-        self.service.recover_stuck_deliveries(now, 1024).await?;
+        self.service
+            .recover_stuck_deliveries(now, DELIVERY_RECOVERY_BATCH_LIMIT)
+            .await?;
         self.service
             .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
             .await?;
@@ -246,9 +251,9 @@ impl TaskRuntime {
                 ticks.tick().await;
                 loop {
                     ticks.tick().await;
-                    if let Err(error) = reconciler.reconcile(now_timestamp_secs()).await {
+                    if let Err(_error) = reconciler.reconcile(now_timestamp_secs()).await {
                         warn!(
-                            error = %format!("{error:#}"),
+                            failure_class = "task_live_reconciliation_failed",
                             "live task terminal reconciliation pass failed"
                         );
                     }
@@ -267,12 +272,12 @@ impl TaskRuntime {
                 loop {
                     interval.tick().await;
                     let now = now_timestamp_secs();
-                    if let Err(error) = service
+                    if let Err(_error) = service
                         .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
                         .await
                     {
                         warn!(
-                            error = %format!("{error:#}"),
+                            failure_class = "task_review_auto_accept_scan_failed",
                             "task review timeout auto-accept scan failed"
                         );
                     }
@@ -344,6 +349,15 @@ impl TaskService {
         &self,
         params: RecordTaskResultReviewEventParams,
     ) -> TaskRuntimeResult<TaskResultReviewRecordResponse> {
+        self.record_task_result_review_event_with_agent_action(params, None)
+            .await
+    }
+
+    pub async fn record_task_result_review_event_with_agent_action(
+        &self,
+        params: RecordTaskResultReviewEventParams,
+        agent_action: Option<pioneer_crud::AgentCommitInput>,
+    ) -> TaskRuntimeResult<TaskResultReviewRecordResponse> {
         let created_at = params.created_at.unwrap_or_else(now_timestamp_secs);
         let candidate = self
             .store
@@ -363,6 +377,8 @@ impl TaskService {
                 .find(|run| run.id == candidate.run_id)
                 .ok_or_else(|| anyhow!("task run `{}` not found", candidate.run_id))?,
         );
+        self.validate_review_actor_contract(&response, &candidate, &params.actor)
+            .await?;
         let mut review_event = build_task_result_review_event(&candidate, params, created_at);
         validate_review_event_for_candidate(&candidate, &review_event)?;
 
@@ -402,7 +418,9 @@ impl TaskService {
             ));
         }
 
-        let appended = self.projector.append_events(events, created_at).await?;
+        let appended = self
+            .append_events_with_optional_agent_action(events, created_at, agent_action)
+            .await?;
         self.event_bus.publish_many(appended).await;
         let candidate = self
             .store
@@ -515,6 +533,10 @@ impl TaskService {
             review_event_id: params.review_event_id,
             actor: TaskResultReviewActor {
                 reviewer_kind: TaskResultReviewerKind::User,
+                reviewer: TaskResultReviewerRef::Principal(
+                    pioneer_protocol::PrincipalId::new(user_id.clone())
+                        .map_err(|_| anyhow!("user reviewer identity is invalid"))?,
+                ),
                 reviewer_thread_id: None,
                 reviewer_turn_id: None,
                 reviewer_user_id: Some(user_id),
@@ -554,10 +576,10 @@ impl TaskService {
             {
                 Ok(true) => accepted += 1,
                 Ok(false) => {}
-                Err(error) => {
+                Err(_error) => {
                     warn!(
                         run_id = %run_id,
-                        error = %format!("{error:#}"),
+                        failure_class = "task_review_auto_accept_failed",
                         "failed to auto-accept timed-out task review candidate"
                     );
                 }
@@ -721,6 +743,8 @@ impl TaskService {
 
         validate_no_active_candidate_child_turn(&response, &run, "accept")?;
         let actor = resolve_parent_or_user_review_actor(&context, &response, &candidate, "accept")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor)
+            .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
         {
@@ -758,28 +782,41 @@ impl TaskService {
             .already_accepted_task_result_candidate_response(&context, &params)
             .await?
         {
+            if context.agent_action_commit.is_some() {
+                let _ = self
+                    .append_events_with_optional_agent_action(
+                        Vec::new(),
+                        now_timestamp_secs(),
+                        context.agent_action_commit,
+                    )
+                    .await?;
+            }
             return self
                 .finalize_accepted_task_result_candidate_response(response)
                 .await;
         }
 
+        let agent_action = context.agent_action_commit.clone();
         let validated = self
             .validate_task_result_candidate_accept(context, &params)
             .await?;
         let recorded = self
-            .record_task_result_review_event(RecordTaskResultReviewEventParams {
-                candidate_id: validated.candidate.id.clone(),
-                review_event_id: None,
-                actor: validated.actor,
-                event_kind: TaskResultReviewEventKind::Decision,
-                decision: TaskResultReviewDecision::Accept,
-                feedback_text: params.reason.clone(),
-                feedback: None,
-                confidence: None,
-                supersedes_review_event_id: None,
-                next_task_run_turn_id: None,
-                created_at: Some(now_timestamp_secs()),
-            })
+            .record_task_result_review_event_with_agent_action(
+                RecordTaskResultReviewEventParams {
+                    candidate_id: validated.candidate.id.clone(),
+                    review_event_id: None,
+                    actor: validated.actor,
+                    event_kind: TaskResultReviewEventKind::Decision,
+                    decision: TaskResultReviewDecision::Accept,
+                    feedback_text: params.reason.clone(),
+                    feedback: None,
+                    confidence: None,
+                    supersedes_review_event_id: None,
+                    next_task_run_turn_id: None,
+                    created_at: Some(now_timestamp_secs()),
+                },
+                agent_action,
+            )
             .await?;
 
         let response = self
@@ -883,6 +920,8 @@ impl TaskService {
 
         validate_no_active_candidate_child_turn(&response, &run, "revise")?;
         let actor = resolve_parent_or_user_review_actor(&context, &response, &candidate, "revise")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor)
+            .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
         {
@@ -921,9 +960,19 @@ impl TaskService {
             .already_requested_task_revision_response(&context, &params)
             .await?
         {
+            if context.agent_action_commit.is_some() {
+                let _ = self
+                    .append_events_with_optional_agent_action(
+                        Vec::new(),
+                        now_timestamp_secs(),
+                        context.agent_action_commit,
+                    )
+                    .await?;
+            }
             return Ok(response);
         }
 
+        let agent_action = context.agent_action_commit.clone();
         let validated = self
             .validate_task_result_candidate_revise(context, &params)
             .await?;
@@ -1040,7 +1089,9 @@ impl TaskService {
                 task_run_turn: task_run_turn.clone(),
             },
         ];
-        let appended = self.append_events(events, now).await?;
+        let appended = self
+            .append_events_with_optional_agent_action(events, now, agent_action)
+            .await?;
         self.publish_and_wake(appended).await;
 
         let response = self
@@ -1126,6 +1177,8 @@ impl TaskService {
                 )
             })?;
         let actor = resolve_parent_or_user_review_actor(context, &response, &candidate, "revise")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor)
+            .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
         {
@@ -1209,6 +1262,8 @@ impl TaskService {
                 )
             })?;
         let actor = resolve_parent_or_user_review_actor(context, &response, &candidate, "accept")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor)
+            .await?;
         if actor.reviewer_kind == TaskResultReviewerKind::User
             && let Some(user_id) = actor.reviewer_user_id.as_deref()
         {
@@ -1343,7 +1398,12 @@ impl TaskService {
             .iter()
             .find(|lineage| lineage.child_thread_id == candidate.thread_id)
             .cloned()
-            .unwrap_or_else(|| fallback_candidate_lineage(&response.task, candidate));
+            .with_context(|| {
+                format!(
+                    "accepted candidate `{}` has no durable thread lineage",
+                    candidate.id
+                )
+            })?;
 
         for (index, artifact) in result.artifacts.iter().enumerate() {
             let Some(artifact_id) = artifact
@@ -1418,6 +1478,165 @@ impl TaskService {
         );
     }
 
+    async fn validate_review_actor_contract(
+        &self,
+        response: &TaskGetResponse,
+        candidate: &TaskResultCandidate,
+        actor: &TaskResultReviewActor,
+    ) -> TaskRuntimeResult<()> {
+        let contract = self
+            .store
+            .get_task_actor_contract(response.task.id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` has no durable actor contract", response.task.id))?;
+        contract
+            .validate()
+            .map_err(|error| anyhow!("task actor contract is invalid: {error:?}"))?;
+
+        match (actor.reviewer_kind, &actor.reviewer) {
+            (
+                TaskResultReviewerKind::ParentAgent,
+                TaskResultReviewerRef::AgentExecution(reviewer_execution_id),
+            ) => {
+                let intended_execution_id = match &contract.reviewer {
+                    TaskReviewerIntent::Parent => match &contract.creator {
+                        pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
+                            execution_id.as_str()
+                        }
+                        _ => bail!(
+                            "task `{}` has parent review intent without an exact agent creator",
+                            response.task.id
+                        ),
+                    },
+                    TaskReviewerIntent::Agent { execution_id } => execution_id.as_str(),
+                    _ => bail!(
+                        "task `{}` does not admit a parent-agent reviewer",
+                        response.task.id
+                    ),
+                };
+                if reviewer_execution_id.as_str() != intended_execution_id {
+                    bail!(
+                        "parent reviewer execution does not match task `{}` immutable reviewer intent",
+                        response.task.id
+                    );
+                }
+                let turn_id = actor
+                    .reviewer_turn_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("parent-agent review has no exact reviewer turn"))?;
+                if actor.reviewer_thread_id.is_none()
+                    || actor.reviewer_user_id.is_some()
+                    || actor.reviewer_agent_spec_id.is_some()
+                {
+                    bail!("parent-agent review has inconsistent exact actor fields");
+                }
+                let turn_response = pioneer_crud::load_agent_turn_response(
+                    &self.store.database_connection(),
+                    turn_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow!("parent reviewer turn has no exact AgentExecution"))?;
+                if turn_response.execution_id != reviewer_execution_id.as_str() {
+                    bail!("parent reviewer turn belongs to a different AgentExecution");
+                }
+            }
+            (
+                TaskResultReviewerKind::ReviewAgent,
+                TaskResultReviewerRef::AgentExecution(reviewer_execution_id),
+            ) => {
+                let reviewer_thread_id = actor
+                    .reviewer_thread_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("review-agent event has no exact reviewer thread"))?;
+                let reviewer_turn_id = actor
+                    .reviewer_turn_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("review-agent event has no exact reviewer turn"))?;
+                let reviewer_key = actor
+                    .reviewer_agent_spec_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("review-agent event has no exact reviewer spec"))?;
+                if actor.reviewer_user_id.is_some() {
+                    bail!("review-agent event cannot carry a user reviewer");
+                }
+                let configured = response.agent_specs.iter().any(|agent_spec| {
+                    agent_spec.review_policy.as_ref().is_some_and(|policy| {
+                        policy
+                            .reviewers
+                            .iter()
+                            .enumerate()
+                            .any(|(index, reviewer)| {
+                                reviewer.reviewer_kind == TaskResultReviewerKind::ReviewAgent
+                                    && task_result_reviewer_spec_key(index, reviewer)
+                                        == reviewer_key
+                            })
+                    })
+                });
+                if !configured {
+                    bail!(
+                        "review-agent event references a reviewer outside task `{}` immutable policy",
+                        response.task.id
+                    );
+                }
+                let reviewer_turn = self
+                    .store
+                    .get_task_run_turn_by_turn(reviewer_thread_id, reviewer_turn_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("review-agent event references a missing review turn")
+                    })?;
+                if reviewer_turn.kind != TaskRunTurnKind::Review
+                    || reviewer_turn.reviews_candidate_id.as_deref() != Some(candidate.id.as_str())
+                    || reviewer_turn.execution_id.as_deref() != Some(reviewer_execution_id.as_str())
+                {
+                    bail!("review-agent event does not match its durable review turn");
+                }
+                let turn_response = pioneer_crud::load_agent_turn_response(
+                    &self.store.database_connection(),
+                    reviewer_turn_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow!("review-agent turn has no exact AgentExecution"))?;
+                if turn_response.execution_id != reviewer_execution_id.as_str() {
+                    bail!("review-agent turn belongs to a different AgentExecution");
+                }
+            }
+            (TaskResultReviewerKind::User, TaskResultReviewerRef::Principal(principal_id)) => {
+                if contract.reviewer
+                    != (TaskReviewerIntent::Human {
+                        principal_id: principal_id.as_str().to_owned(),
+                    })
+                    || actor.reviewer_user_id.as_deref() != Some(principal_id.as_str())
+                    || actor.reviewer_thread_id.is_some()
+                    || actor.reviewer_turn_id.is_some()
+                    || actor.reviewer_agent_spec_id.is_some()
+                {
+                    bail!(
+                        "user reviewer does not match task `{}` immutable reviewer intent",
+                        response.task.id
+                    );
+                }
+            }
+            (
+                TaskResultReviewerKind::RuntimeAuto | TaskResultReviewerKind::System,
+                TaskResultReviewerRef::RuntimePolicy,
+            ) => {
+                if actor.reviewer_thread_id.is_some()
+                    || actor.reviewer_turn_id.is_some()
+                    || actor.reviewer_user_id.is_some()
+                    || actor.reviewer_agent_spec_id.is_some()
+                {
+                    bail!("runtime review event has inconsistent exact actor fields");
+                }
+            }
+            _ => bail!(
+                "review actor does not match its exact reviewer classification for task `{}`",
+                response.task.id
+            ),
+        }
+        Ok(())
+    }
+
     pub async fn create_task_result_reviewer_context(
         &self,
         params: CreateTaskResultReviewerContextParams,
@@ -1449,12 +1668,22 @@ impl TaskService {
                 .store
                 .get_task_thread_lineage(params.reviewer_thread_id.as_str())
                 .await?
-                .unwrap_or_else(|| reviewer_fallback_lineage(&existing_turn));
+                .with_context(|| {
+                    format!(
+                        "reviewer thread `{}` has no durable lineage",
+                        params.reviewer_thread_id
+                    )
+                })?;
             let binding = self
                 .store
                 .get_task_run_thread_binding_by_thread(params.reviewer_thread_id.as_str())
                 .await?
-                .unwrap_or_else(|| reviewer_binding_for_turn(&existing_turn, created_at));
+                .with_context(|| {
+                    format!(
+                        "reviewer thread `{}` has no durable Task binding",
+                        params.reviewer_thread_id
+                    )
+                })?;
             return Ok(TaskResultReviewerContext {
                 lineage,
                 binding,
@@ -1467,16 +1696,12 @@ impl TaskService {
             .store
             .get_task_thread_lineage(candidate.thread_id.as_str())
             .await?
-            .unwrap_or_else(|| TaskThreadLineage {
-                child_thread_id: candidate.thread_id.clone(),
-                parent_thread_id: candidate.thread_id.clone(),
-                root_thread_id: candidate.thread_id.clone(),
-                depth: 0,
-                origin_kind: Some("task_run".to_owned()),
-                created_by_thread_id: None,
-                created_by_turn_id: None,
-                created_at: candidate.created_at,
-            });
+            .with_context(|| {
+                format!(
+                    "candidate thread `{}` has no durable lineage",
+                    candidate.thread_id
+                )
+            })?;
         let lineage = TaskThreadLineage {
             child_thread_id: params.reviewer_thread_id.clone(),
             parent_thread_id: source_lineage.parent_thread_id.clone(),
@@ -1491,7 +1716,11 @@ impl TaskService {
             id: format!("trb_reviewer_{}", params.reviewer_thread_id),
             task_id: candidate.task_id.clone(),
             run_id: candidate.run_id.clone(),
-            execution_id: None,
+            // A reviewer is an execution of its own, even though it is
+            // created from the parent task run. Keep the stable reviewer turn
+            // id as its durable execution identity so authored review content
+            // never falls back to System.
+            execution_id: Some(params.reviewer_turn_id.clone()),
             thread_id: params.reviewer_thread_id.clone(),
             binding_kind: TaskRunThreadBindingKind::Reviewer,
             created_at,
@@ -1503,7 +1732,7 @@ impl TaskService {
             id: format!("trt_{}", params.reviewer_turn_id),
             task_id: candidate.task_id.clone(),
             run_id: candidate.run_id.clone(),
-            execution_id: None,
+            execution_id: Some(params.reviewer_turn_id.clone()),
             thread_id: params.reviewer_thread_id.clone(),
             turn_id: params.reviewer_turn_id.clone(),
             kind: TaskRunTurnKind::Review,
@@ -1574,6 +1803,38 @@ impl TaskService {
                 bail!("non-agent Task cannot carry an agent execution authorization admission")
             }
             (true, true) | (false, false) => {}
+        }
+        match params.executor_kind {
+            TaskExecutorKind::Agent => {
+                let launch = params
+                    .launch
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("agent Task requires AgentLaunchSelection"))?;
+                if context.launch_selection.as_ref() != Some(launch) {
+                    bail!("agent Task launch differs from its server admission context");
+                }
+                if context.resolved_launch_identity.is_none()
+                    || context.resolved_launch_profile.is_none()
+                    || context.agent_authorization_grant.is_none()
+                {
+                    bail!(
+                        "agent Task requires an exact resolved identity/profile/authorization grant"
+                    );
+                }
+            }
+            TaskExecutorKind::Tool
+            | TaskExecutorKind::Workflow
+            | TaskExecutorKind::Webhook
+            | TaskExecutorKind::System => {
+                if params.launch.is_some()
+                    || context.launch_selection.is_some()
+                    || context.resolved_launch_identity.is_some()
+                    || context.resolved_launch_profile.is_some()
+                    || context.agent_authorization_grant.is_some()
+                {
+                    bail!("non-agent Task cannot carry an Agent launch selection");
+                }
+            }
         }
         let now = now_timestamp_secs();
         let parent = self
@@ -1743,65 +2004,66 @@ impl TaskService {
                 reason: pioneer_protocol::TaskRescheduleReason::TriggerFired,
             });
         }
-        let inserted_conversation_snapshot_run_id =
-            match (context.conversation_snapshot, immediate_run.as_ref()) {
-                (Some(seed), Some(run)) => {
-                    let persisted = self
-                        .store
-                        .insert_task_run_conversation_snapshot_if_absent(
-                            NewTaskRunConversationSnapshot {
-                                run_id: run.id.clone(),
-                                task_id: task.id.clone(),
-                                workspace_id: task.workspace_id.clone(),
-                                conversation_thread_id: seed.conversation_thread_id.clone(),
-                                source_turn_id: seed.source_turn_id.clone(),
-                                history_json: seed.history_json.clone(),
-                                created_at: chrono::Utc::now().fixed_offset(),
-                            },
-                        )
-                        .await?;
-                    if persisted.task_id != task.id
-                        || persisted.workspace_id != task.workspace_id
-                        || persisted.conversation_thread_id != seed.conversation_thread_id
-                        || persisted.source_turn_id != seed.source_turn_id
-                        || persisted.history_json != seed.history_json
-                    {
-                        bail!(
-                            "task run `{}` conversation snapshot conflicts with task creation",
-                            run.id
-                        );
-                    }
-                    Some(run.id.clone())
-                }
-                (Some(_), None) => {
-                    bail!("conversation snapshots can only seed an immediate task run")
-                }
-                (None, _) => None,
-            };
+        let conversation_snapshot = match (
+            context.conversation_snapshot.clone(),
+            immediate_run.as_ref(),
+        ) {
+            (Some(seed), Some(run)) => Some(NewTaskRunConversationSnapshot {
+                run_id: run.id.clone(),
+                task_id: task.id.clone(),
+                workspace_id: task.workspace_id.clone(),
+                conversation_thread_id: seed.conversation_thread_id,
+                source_turn_id: seed.source_turn_id,
+                history_json: seed.history_json,
+                created_at: chrono::Utc::now().fixed_offset(),
+            }),
+            (Some(_), None) => {
+                bail!("conversation snapshots can only seed an immediate task run")
+            }
+            (None, _) => None,
+        };
         let execution_admission = context
             .execution_admission
+            .clone()
             .map(|seed| new_task_execution_admission(&task, std::slice::from_ref(&trigger), seed))
             .transpose()?;
-        let append_result = match execution_admission {
-            Some(admission) => {
-                self.projector
-                    .append_events_with_execution_admission(events, now, admission)
-                    .await
-            }
-            None => self.append_events(events, now).await,
-        };
-        let appended = match append_result {
-            Ok(appended) => appended,
-            Err(error) => {
-                if let Some(run_id) = inserted_conversation_snapshot_run_id.as_deref() {
-                    let _ = self
-                        .store
-                        .delete_task_run_conversation_snapshot(run_id)
-                        .await;
-                }
-                return Err(error);
-            }
-        };
+        let actor_contract = build_task_actor_contract(&task, agent_spec.as_ref(), &context, now)?;
+        let immediate_occurrence = immediate_run
+            .as_ref()
+            .map(|run| {
+                build_occurrence_contract(
+                    &task,
+                    &actor_contract,
+                    run.id.as_str(),
+                    run.trigger_id.as_deref(),
+                    format!("immediate:{}", run.id),
+                    1,
+                    now,
+                )
+            })
+            .transpose()?;
+        let immediate_occurrence = immediate_occurrence.map(|mut occurrence| {
+            // Every immediate Task created by an Agent belongs to the
+            // creator's graph, including detached work. Attachment controls
+            // cancellation, not resource-scope lineage. Persist the root at
+            // Task creation so a fast-finishing parent cannot close the scope
+            // before the asynchronous child materializes its execution.
+            occurrence.work_graph_root_execution_id = context.work_graph_root_execution_id.clone();
+            occurrence.root_resource_scope_id = context.work_graph_root_execution_id.clone();
+            occurrence
+        });
+        let appended = self
+            .projector
+            .commit_task_creation(pioneer_crud::TaskCreationCommitInput {
+                events,
+                event_timestamp_secs: now,
+                execution_admission,
+                conversation_snapshot,
+                actor_contract,
+                occurrence_contract: immediate_occurrence,
+                agent_action: context.agent_action_commit,
+            })
+            .await?;
         self.publish_and_wake(appended).await;
         if trigger_kind == TaskTriggerKind::Immediate {
             self.process_due_once(now).await?;
@@ -1969,6 +2231,7 @@ impl TaskService {
         context: TaskMutationContext,
         params: TaskCancelParams,
     ) -> TaskRuntimeResult<TaskCancelResponse> {
+        let agent_action = context.agent_action_commit.clone();
         let Some(root_response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
@@ -1977,6 +2240,15 @@ impl TaskService {
         if is_terminal_task(root_response.task.status)
             && root_response.task.status != TaskStatus::Blocked
         {
+            if agent_action.is_some() {
+                let _ = self
+                    .append_events_with_optional_agent_action(
+                        Vec::new(),
+                        now_timestamp_secs(),
+                        agent_action,
+                    )
+                    .await?;
+            }
             return Ok(TaskCancelResponse {
                 task: root_response.task,
                 cancelled_tasks: Vec::new(),
@@ -2042,7 +2314,43 @@ impl TaskService {
             });
         }
 
-        let appended = self.append_events(events, now).await?;
+        let appended = self
+            .append_events_with_optional_agent_action(events, now, agent_action)
+            .await?;
+        for run in &cancelled_runs {
+            let mut occurrence = self
+                .store
+                .get_task_occurrence_contract_by_run(run.id.as_str())
+                .await?
+                .with_context(|| {
+                    format!(
+                        "cancelled Task run `{}` has no durable occurrence contract",
+                        run.id
+                    )
+                })?;
+            occurrence.status = pioneer_protocol::TaskOccurrenceStatus::Cancelled;
+            occurrence.terminal_reason = Some(reason.clone());
+            self.store
+                .upsert_task_occurrence_contract(&occurrence, now)
+                .await?;
+            if let Some(execution) = self.store.load_execution_for_run(run.id.as_str()).await?
+                && !execution.status.is_terminal()
+                && !cancelled_executions
+                    .iter()
+                    .any(|(execution_id, _)| execution_id == &execution.id)
+            {
+                cancelled_executions.push((
+                    execution.id,
+                    Some(TaskError {
+                        code: "task_run_cancelled".to_owned(),
+                        message: reason.clone(),
+                        class: TaskErrorClass::Cancelled,
+                        details: None,
+                        failed_run_id: Some(run.id.clone()),
+                    }),
+                ));
+            }
+        }
         for (execution_id, error) in cancelled_executions {
             let _ = self
                 .store
@@ -2136,7 +2444,7 @@ impl TaskService {
 
     pub async fn detach_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskDetachParams,
     ) -> TaskRuntimeResult<TaskDetachResponse> {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
@@ -2144,6 +2452,15 @@ impl TaskService {
         };
         let mut task = response.task;
         if is_terminal_task(task.status) {
+            if context.agent_action_commit.is_some() {
+                let _ = self
+                    .append_events_with_optional_agent_action(
+                        Vec::new(),
+                        now_timestamp_secs(),
+                        context.agent_action_commit,
+                    )
+                    .await?;
+            }
             return Ok(TaskDetachResponse { task });
         }
         if task.status == TaskStatus::WaitingReview
@@ -2172,15 +2489,16 @@ impl TaskService {
         task.revision = task.revision.saturating_add(1);
         task.updated_at = now_timestamp_secs();
         let appended = self
-            .append_event(
-                TaskEventPayload::TaskDetached {
+            .append_events_with_optional_agent_action(
+                vec![TaskEventPayload::TaskDetached {
                     task: task.clone(),
                     detached_at: task.updated_at,
-                },
+                }],
                 task.updated_at,
+                context.agent_action_commit,
             )
             .await?;
-        self.publish_and_wake(vec![appended]).await;
+        self.publish_and_wake(appended).await;
         Ok(TaskDetachResponse { task })
     }
 
@@ -2654,6 +2972,7 @@ impl TaskService {
         context: TaskMutationContext,
         params: TaskResumeParams,
     ) -> TaskRuntimeResult<TaskResumeResponse> {
+        let agent_action = context.agent_action_commit.clone();
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
@@ -2696,6 +3015,11 @@ impl TaskService {
             triggers.push(trigger);
         }
         if !resumed_any && !was_blocked {
+            if agent_action.is_some() {
+                let _ = self
+                    .append_events_with_optional_agent_action(Vec::new(), now, agent_action)
+                    .await?;
+            }
             return Ok(TaskResumeResponse { task, triggers });
         }
         task.status = if triggers
@@ -2716,8 +3040,20 @@ impl TaskService {
             reason: params.reason,
             resumed_at: now,
         };
-        let appended = match readmission {
-            Some(admission) => {
+        let appended = match (readmission, agent_action) {
+            (Some(admission), Some(agent_action)) => {
+                task_service_future(
+                    self.projector
+                        .append_events_with_execution_readmission_and_agent_action(
+                            vec![event],
+                            now,
+                            admission,
+                            agent_action,
+                        ),
+                )
+                .await?
+            }
+            (Some(admission), None) => {
                 task_service_future(self.projector.append_events_with_execution_readmission(
                     vec![event],
                     now,
@@ -2725,7 +3061,10 @@ impl TaskService {
                 ))
                 .await?
             }
-            None => vec![task_service_future(self.append_event(event, now)).await?],
+            (None, agent_action) => {
+                self.append_events_with_optional_agent_action(vec![event], now, agent_action)
+                    .await?
+            }
         };
         self.publish_and_wake(appended).await;
         self.process_due_once(now).await?;
@@ -2854,6 +3193,7 @@ impl TaskService {
         {
             return Ok(None);
         }
+        self.validate_delivery_boundary(&delivery).await?;
         let attempt_number = delivery.attempt_count.saturating_add(1);
         delivery.status = TaskDeliveryStatus::Delivering;
         delivery.attempt_count = attempt_number;
@@ -2893,6 +3233,7 @@ impl TaskService {
         response_fingerprint: Option<String>,
         delivered_at: i64,
     ) -> TaskRuntimeResult<TaskDelivery> {
+        self.validate_delivery_boundary(&delivery).await?;
         delivery.status = TaskDeliveryStatus::Delivered;
         delivery.delivered_turn_id = delivered_turn_id;
         delivery.delivered_notification_id = delivered_notification_id;
@@ -2921,11 +3262,12 @@ impl TaskService {
         &self,
         mut delivery: TaskDelivery,
         mut attempt: TaskDeliveryAttempt,
-        error: String,
+        failure_class: String,
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
         failed_at: i64,
     ) -> TaskRuntimeResult<TaskDelivery> {
+        self.validate_delivery_boundary(&delivery).await?;
         let retryable = delivery.attempt_count < delivery.max_attempts;
         delivery.status = if retryable {
             TaskDeliveryStatus::Pending
@@ -2933,12 +3275,13 @@ impl TaskService {
             TaskDeliveryStatus::Failed
         };
         delivery.next_attempt_at = retryable.then_some(failed_at.saturating_add(60));
-        delivery.last_error = Some(error.clone());
+        let failure_class = normalize_delivery_failure_class(failure_class.as_str());
+        delivery.last_error = Some(failure_class.clone());
         delivery.updated_at = failed_at;
         attempt.status = TaskDeliveryAttemptStatus::Failed;
         attempt.completed_at = Some(failed_at);
         attempt.http_status = http_status;
-        attempt.error = Some(error);
+        attempt.error = Some(failure_class);
         attempt.response_fingerprint = response_fingerprint;
         let appended = self
             .append_event(
@@ -2953,17 +3296,87 @@ impl TaskService {
         Ok(delivery)
     }
 
+    async fn validate_delivery_boundary(&self, delivery: &TaskDelivery) -> TaskRuntimeResult<()> {
+        let contract = self
+            .store
+            .get_task_actor_contract(delivery.task_id.as_str())
+            .await?
+            .with_context(|| {
+                format!(
+                    "Task delivery `{}` has no durable actor contract",
+                    delivery.id
+                )
+            })?;
+        contract
+            .delivery
+            .validate()
+            .map_err(|error| anyhow!("task delivery authority is invalid: {error:?}"))?;
+        if !contract.delivery.enabled {
+            bail!("task delivery is disabled by its durable actor contract");
+        }
+        let destination_matches = match delivery.mode {
+            TaskDeliveryMode::Thread => {
+                delivery.target_thread_id == contract.delivery.destination_thread_id
+            }
+            TaskDeliveryMode::UserNotification => {
+                delivery.target_user_id == contract.delivery.destination_user_id
+            }
+            TaskDeliveryMode::Webhook => {
+                delivery.webhook_url_fingerprint
+                    == contract.delivery.destination_webhook_url_fingerprint
+            }
+            TaskDeliveryMode::None => false,
+        };
+        if !destination_matches {
+            bail!("task delivery destination no longer matches its durable route");
+        }
+        Ok(())
+    }
+
     pub async fn recover_stuck_deliveries(&self, now: i64, limit: u64) -> TaskRuntimeResult<usize> {
         let cutoff = now.saturating_sub(300);
         let deliveries = self.store.list_stuck_task_deliveries(cutoff, limit).await?;
         let mut recovered = 0usize;
         for mut delivery in deliveries {
-            delivery.status = TaskDeliveryStatus::Pending;
-            delivery.next_attempt_at = Some(now);
-            delivery.last_error = Some("delivery recovered after gateway restart".to_owned());
+            let attempts = self
+                .store
+                .list_task_deliveries(TaskDeliveriesParams {
+                    workspace_id: delivery.workspace_id.clone(),
+                    task_id: Some(delivery.task_id.clone()),
+                    run_id: Some(delivery.run_id.clone()),
+                    statuses: Vec::new(),
+                    limit: Some(100),
+                })
+                .await?
+                .attempts;
+            let mut attempt = attempts
+                .into_iter()
+                .find(|attempt| {
+                    attempt.delivery_id == delivery.id
+                        && attempt.attempt_number == delivery.attempt_count
+                        && attempt.status == TaskDeliveryAttemptStatus::Started
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "stuck Task delivery `{}` has no exact active attempt",
+                        delivery.id
+                    )
+                })?;
+            let retryable = delivery.attempt_count < delivery.max_attempts;
+            delivery.status = if retryable {
+                TaskDeliveryStatus::Pending
+            } else {
+                TaskDeliveryStatus::Failed
+            };
+            delivery.next_attempt_at = retryable.then_some(now);
+            let recovery_error = "task_delivery_recovered".to_owned();
+            delivery.last_error = Some(recovery_error.clone());
             delivery.updated_at = now;
+            attempt.status = TaskDeliveryAttemptStatus::Failed;
+            attempt.completed_at = Some(now);
+            attempt.error = Some(recovery_error);
             let appended = self
-                .append_event(TaskEventPayload::DeliveryQueued { delivery }, now)
+                .append_event(TaskEventPayload::DeliveryFailed { delivery, attempt }, now)
                 .await?;
             self.event_bus.publish(appended).await;
             recovered = recovered.saturating_add(1);
@@ -3385,6 +3798,26 @@ impl TaskService {
         self.projector
             .append_events(events, event_timestamp_secs)
             .await
+    }
+
+    async fn append_events_with_optional_agent_action(
+        &self,
+        events: Vec<TaskEventPayload>,
+        event_timestamp_secs: i64,
+        agent_action: Option<pioneer_crud::AgentCommitInput>,
+    ) -> TaskRuntimeResult<Vec<AppendedTaskEvent>> {
+        match agent_action {
+            Some(agent_action) => {
+                self.projector
+                    .append_events_with_agent_action(events, event_timestamp_secs, agent_action)
+                    .await
+            }
+            None => {
+                self.projector
+                    .append_events(events, event_timestamp_secs)
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn publish_and_wake(&self, events: Vec<AppendedTaskEvent>) {
@@ -3822,12 +4255,45 @@ impl TaskService {
             .await?
             .deliveries
         {
+            let attempt = if delivery.status == TaskDeliveryStatus::Delivering {
+                let attempts = self
+                    .store
+                    .list_task_deliveries(TaskDeliveriesParams {
+                        workspace_id: delivery.workspace_id.clone(),
+                        task_id: Some(delivery.task_id.clone()),
+                        run_id: Some(delivery.run_id.clone()),
+                        statuses: Vec::new(),
+                        limit: Some(100),
+                    })
+                    .await?
+                    .attempts;
+                let mut attempt = attempts
+                    .into_iter()
+                    .find(|attempt| {
+                        attempt.delivery_id == delivery.id
+                            && attempt.attempt_number == delivery.attempt_count
+                            && attempt.status == TaskDeliveryAttemptStatus::Started
+                    })
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cancelling Task delivery `{}` has no exact active attempt",
+                            delivery.id
+                        )
+                    })?;
+                attempt.status = TaskDeliveryAttemptStatus::Failed;
+                attempt.completed_at = Some(now);
+                attempt.error = Some(reason.to_owned());
+                Some(attempt)
+            } else {
+                None
+            };
             delivery.status = TaskDeliveryStatus::Cancelled;
             delivery.next_attempt_at = None;
             delivery.last_error = Some(reason.to_owned());
             delivery.updated_at = now;
             events.push(TaskEventPayload::DeliveryCancelled {
                 delivery: delivery.clone(),
+                attempt,
                 reason: Some(reason.to_owned()),
             });
             cancelled_deliveries.push(delivery);
@@ -4001,6 +4467,19 @@ impl TaskService {
             .await?;
         self.publish_and_wake(vec![appended]).await;
         Ok(())
+    }
+}
+
+fn normalize_delivery_failure_class(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if safe {
+        value.to_owned()
+    } else {
+        "task_delivery_failed".to_owned()
     }
 }
 
@@ -4573,6 +5052,7 @@ fn cancel_review_event_for_candidate(
         run_id: candidate.run_id.clone(),
         task_run_turn_id: candidate.task_run_turn_id.clone(),
         reviewer_kind: TaskResultReviewerKind::System,
+        reviewer: TaskResultReviewerRef::RuntimePolicy,
         reviewer_thread_id: None,
         reviewer_turn_id: None,
         reviewer_user_id: None,
@@ -4633,6 +5113,22 @@ fn validate_review_event_for_candidate(
             "candidate source thread `{}` cannot review its own result",
             candidate.thread_id
         );
+    }
+    match (review_event.reviewer_kind, &review_event.reviewer) {
+        (
+            TaskResultReviewerKind::ParentAgent | TaskResultReviewerKind::ReviewAgent,
+            TaskResultReviewerRef::AgentExecution(_),
+        ) => {}
+        (TaskResultReviewerKind::User, TaskResultReviewerRef::Principal(principal))
+            if review_event.reviewer_user_id.as_deref() == Some(principal.as_str()) => {}
+        (
+            TaskResultReviewerKind::RuntimeAuto | TaskResultReviewerKind::System,
+            TaskResultReviewerRef::RuntimePolicy,
+        ) => {}
+        _ => bail!(
+            "review event `{}` has no exact reviewer matching its reviewer kind",
+            review_event.id
+        ),
     }
     Ok(())
 }
@@ -4773,6 +5269,15 @@ fn resolve_parent_or_user_review_actor(
         }
         return Ok(TaskResultReviewActor {
             reviewer_kind: TaskResultReviewerKind::ParentAgent,
+            reviewer: TaskResultReviewerRef::AgentExecution(
+                pioneer_protocol::AgentExecutionId::new(
+                    context
+                        .actor_id
+                        .clone()
+                        .ok_or_else(|| anyhow!("parent-agent review has no exact execution"))?,
+                )
+                .map_err(|_| anyhow!("parent-agent reviewer execution is invalid"))?,
+            ),
             reviewer_thread_id: Some(thread_id.to_owned()),
             reviewer_turn_id: Some(turn_id.to_owned()),
             reviewer_user_id: None,
@@ -4794,6 +5299,10 @@ fn resolve_parent_or_user_review_actor(
         })?;
     Ok(TaskResultReviewActor {
         reviewer_kind: TaskResultReviewerKind::User,
+        reviewer: TaskResultReviewerRef::Principal(
+            pioneer_protocol::PrincipalId::new(user_id.to_owned())
+                .map_err(|_| anyhow!("user reviewer identity is invalid"))?,
+        ),
         reviewer_thread_id: None,
         reviewer_turn_id: None,
         reviewer_user_id: Some(user_id.to_owned()),
@@ -4922,28 +5431,6 @@ fn revision_additional_instructions_from_feedback(feedback: Option<&TaskValue>) 
         .collect()
 }
 
-fn fallback_candidate_lineage(task: &Task, candidate: &TaskResultCandidate) -> TaskThreadLineage {
-    let parent_thread_id = task
-        .created_by_thread_id
-        .clone()
-        .or_else(|| {
-            (task.owner_kind == TaskOwnerKind::Thread)
-                .then(|| task.owner_id.clone())
-                .flatten()
-        })
-        .unwrap_or_else(|| candidate.thread_id.clone());
-    TaskThreadLineage {
-        child_thread_id: candidate.thread_id.clone(),
-        parent_thread_id: parent_thread_id.clone(),
-        root_thread_id: parent_thread_id,
-        depth: 0,
-        origin_kind: Some("task_run".to_owned()),
-        created_by_thread_id: task.created_by_thread_id.clone(),
-        created_by_turn_id: task.created_by_turn_id.clone(),
-        created_at: candidate.created_at,
-    }
-}
-
 fn accepted_result_artifact_binding_target(
     task: &Task,
     task_run_turn: &TaskRunTurn,
@@ -5005,31 +5492,6 @@ fn accepted_candidate_artifact_metadata(
         );
     }
     metadata
-}
-
-fn reviewer_fallback_lineage(task_run_turn: &TaskRunTurn) -> TaskThreadLineage {
-    TaskThreadLineage {
-        child_thread_id: task_run_turn.thread_id.clone(),
-        parent_thread_id: task_run_turn.thread_id.clone(),
-        root_thread_id: task_run_turn.thread_id.clone(),
-        depth: 0,
-        origin_kind: Some("task_review".to_owned()),
-        created_by_thread_id: None,
-        created_by_turn_id: None,
-        created_at: task_run_turn.created_at,
-    }
-}
-
-fn reviewer_binding_for_turn(task_run_turn: &TaskRunTurn, created_at: i64) -> TaskRunThreadBinding {
-    TaskRunThreadBinding {
-        id: format!("trb_reviewer_{}", task_run_turn.thread_id),
-        task_id: task_run_turn.task_id.clone(),
-        run_id: task_run_turn.run_id.clone(),
-        execution_id: None,
-        thread_id: task_run_turn.thread_id.clone(),
-        binding_kind: TaskRunThreadBindingKind::Reviewer,
-        created_at,
-    }
 }
 
 pub(crate) fn now_timestamp_secs() -> i64 {

@@ -1,3 +1,4 @@
+mod actor_contract;
 mod admission;
 mod error;
 mod event_bus;
@@ -17,6 +18,7 @@ mod wait;
 #[cfg(test)]
 mod tests;
 
+pub use actor_contract::{build_occurrence_contract, build_task_actor_contract};
 pub use error::{TaskRuntimeError, TaskRuntimeResult};
 pub use event_bus::{
     TaskEventBus, TaskEventFilter, TaskEventSubscription, TaskEventWake, TaskEventWakeDelivery,
@@ -31,8 +33,8 @@ pub use invariant::{
 };
 pub use notifications::TaskNotificationMapper;
 pub use policy::{
-    TaskCreateContext, TaskExecutionAdmissionSeed, TaskMutationContext,
-    TaskRunConversationSnapshotSeed, TaskWaitContext, default_delivery_policy,
+    TaskAgentAuthorizationGrantSeed, TaskCreateContext, TaskExecutionAdmissionSeed,
+    TaskMutationContext, TaskRunConversationSnapshotSeed, TaskWaitContext, default_delivery_policy,
     default_lifecycle_policy,
 };
 pub use projector::TaskProjector;
