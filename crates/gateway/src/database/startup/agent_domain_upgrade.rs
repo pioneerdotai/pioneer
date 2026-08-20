@@ -338,7 +338,30 @@ async fn build_actor_contract(
         .iter()
         .find(|spec| spec.run_id.is_none())
         .or_else(|| response.agent_specs.first());
-    let creator_id = exact_task_creator(processor, task).await?;
+    let persisted_admission = if task.executor_kind == TaskExecutorKind::Agent {
+        processor
+            .crud_store
+            .get_task_execution_admission(task.id.as_str())
+            .await?
+    } else {
+        None
+    };
+    let exact_creator_id = exact_task_creator(processor, task).await?;
+    let creator_id = match persisted_admission.as_ref() {
+        Some(admission) => {
+            if let Some(exact_creator_id) = exact_creator_id.as_deref()
+                && exact_creator_id != admission.initiating_principal_id
+            {
+                bail!(
+                    "Agent Task `{}` creator `{exact_creator_id}` differs from its persisted admission principal `{}`",
+                    task.id,
+                    admission.initiating_principal_id
+                );
+            }
+            Some(admission.initiating_principal_id.clone())
+        }
+        None => exact_creator_id,
+    };
     let mut context = pioneer_tasks::TaskCreateContext {
         actor_id: creator_id.clone(),
         ..Default::default()
@@ -351,10 +374,6 @@ async fn build_actor_contract(
                 task.id
             )
         })?;
-        let persisted_admission = processor
-            .crud_store
-            .get_task_execution_admission(task.id.as_str())
-            .await?;
         let (admitted, execution_admission) = match persisted_admission {
             Some(admission) => {
                 let admitted =
