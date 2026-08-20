@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ChildAgentLaunchGrantSetError",
+  "type": "string",
+  "enum": [
+    "unsupported_version",
+    "empty_identity_set",
+    "capacity_exceeded",
+    "duplicate_identity",
+    "duplicate_profile",
+    "invalid_identity",
+    "invalid_profile",
+    "profile_outside_identity_set",
+    "duplicate_capability",
+    "invalid_capability",
+    "serialization",
+    "fingerprint_mismatch"
+  ]
+}

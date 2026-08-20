@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentAuthoredProjectionError",
+  "type": "string",
+  "enum": [
+    "missing_execution",
+    "missing_task",
+    "wrong_actor_kind",
+    "unsafe_visible_input"
+  ]
+}

@@ -7,10 +7,11 @@ use crate::thread_agents_doc::ThreadAgentsDocSummary;
 use crate::turn::{
     ItemDeltaStream, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, ToolLoopBudgetAction,
     ToolLoopBudgetLimitKind, ToolRetryBudgetUsage, ToolRetryErrorClass, ToolRetryExhaustionKind,
-    ToolRetryResolution, Turn, TurnBlockedResumeMetadata, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemTimeoutReason, TurnItemType, UserInput,
+    ToolRetryResolution, Turn, TurnAuthorSnapshot, TurnBlockedResumeMetadata,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnItem, TurnItemTimeoutReason, TurnItemType,
+    UserInput,
 };
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,6 +563,11 @@ pub struct Thread {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub preview: String,
+    /// Immutable author of the Turn that owns `preview`. Thread trees and
+    /// notifications must not pair preview text with the latest responding
+    /// execution or reconstruct this value from mutable agent settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_author: Option<TurnAuthorSnapshot>,
     pub mode: ThreadMode,
     pub model: String,
     pub model_provider: String,

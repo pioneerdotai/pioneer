@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskDeliveryActorContract",
+  "type": "object",
+  "properties": {
+    "authorSnapshot": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentPresentationSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "destinationThreadId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destinationUserId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destinationWebhookUrlFingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "disclosureGeneration": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "returnRouteId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "routeExpiresAtMillis": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "routeId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "routeReceiptJson": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "enabled",
+    "disclosureGeneration"
+  ],
+  "$defs": {
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentPresentationSnapshot": {
+      "type": "object",
+      "properties": {
+        "agent_execution_id": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "agent_identity_id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "identity_source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "identity_source_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_identity_id",
+        "agent_execution_id",
+        "identity_source_kind",
+        "identity_source_revision",
+        "display_name",
+        "nickname"
+      ]
+    }
+  }
+}

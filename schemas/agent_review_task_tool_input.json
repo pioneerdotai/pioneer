@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentReviewTaskToolInput",
+  "type": "object",
+  "properties": {
+    "decision": {
+      "$ref": "#/$defs/AgentReviewDecision"
+    },
+    "taskId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "taskId",
+    "decision"
+  ],
+  "$defs": {
+    "AgentReviewDecision": {
+      "type": "string",
+      "enum": [
+        "accept",
+        "reject",
+        "request_changes",
+        "abstain"
+      ]
+    }
+  }
+}

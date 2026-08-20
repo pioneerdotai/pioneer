@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentPublicOutcome",
+  "description": "Stable, non-disclosing public outcomes for agent domain operations.\nInternal diagnostics may be more precise, but public adapters use only\nthese bounded codes and never turn target failures into an existence oracle.",
+  "type": "string",
+  "enum": [
+    "agent_actor_unavailable",
+    "agent_identity_unavailable",
+    "agent_identity_revision_stale",
+    "agent_execution_stale",
+    "agent_execution_profile_unavailable",
+    "agent_execution_selection_not_allowed",
+    "agent_nickname_unavailable",
+    "agent_action_not_allowed",
+    "agent_route_required",
+    "agent_route_revoked",
+    "agent_route_expired",
+    "agent_destination_unavailable",
+    "agent_context_export_denied",
+    "agent_action_conflict",
+    "agent_action_already_committed",
+    "agent_recovery_quarantined",
+    "agent_work_queued",
+    "agent_work_queue_full",
+    "agent_work_graph_limit_exceeded",
+    "agent_action_payload_limit_exceeded",
+    "agent_runtime_integrity_lost"
+  ]
+}

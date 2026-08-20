@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentToolBackendKind",
+  "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
+  "type": "string",
+  "enum": [
+    "api",
+    "cli",
+    "acp"
+  ]
+}

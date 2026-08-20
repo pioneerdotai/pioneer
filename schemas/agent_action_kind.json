@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentActionKind",
+  "type": "string",
+  "enum": [
+    "send_message",
+    "create_thread",
+    "start_agent",
+    "create_task",
+    "schedule_task",
+    "review_task_result",
+    "control_task",
+    "deliver_result"
+  ]
+}

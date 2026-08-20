@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentModelToolName",
+  "description": "Names exposed to a model.  These are intentionally distinct from internal\nservice methods and contain no provider-specific tool names.",
+  "type": "string",
+  "enum": [
+    "agent_start_options",
+    "send_message",
+    "create_thread",
+    "start_agent",
+    "create_task",
+    "schedule_task",
+    "review_task",
+    "control_task",
+    "wait",
+    "result"
+  ]
+}

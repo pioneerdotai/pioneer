@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentToolCapability",
+  "description": "Capability gates are evaluated by the server before a tool is projected.",
+  "type": "string",
+  "enum": [
+    "message_create",
+    "thread_create",
+    "child_start",
+    "task_create",
+    "task_schedule",
+    "task_review",
+    "task_control",
+    "task_observe",
+    "result_read"
+  ]
+}

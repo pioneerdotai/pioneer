@@ -447,6 +447,7 @@ impl VoiceTurnContext {
         input.extend(self.prepared_input);
 
         TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: self.thread_id,
             turn_id: self.turn_id,
             input,
@@ -455,6 +456,7 @@ impl VoiceTurnContext {
             model_provider: self.model_provider,
             sandbox_policy: self.sandbox_policy,
             mode: self.mode,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: self.execution_backend,

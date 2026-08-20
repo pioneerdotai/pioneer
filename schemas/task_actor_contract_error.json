@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskActorContractError",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "missing_delivery_destination",
+        "conflicting_delivery_destinations",
+        "invalid_delivery_destination",
+        "unexpected_delivery_authority",
+        "missing_delivery_route_receipt",
+        "invalid_route_receipt",
+        "route_facts_without_route",
+        "missing_execution_route_destination",
+        "missing_execution_route_receipt",
+        "return_route_without_route",
+        "invalid_revision",
+        "retry_must_advance",
+        "generation_overflow",
+        "disclosure_generation_changed",
+        "route_expired",
+        "missing_agent_creator_snapshot",
+        "agent_creator_snapshot_mismatch",
+        "unexpected_agent_creator_snapshot",
+        "graph_resource_root_mismatch",
+        "missing_agent_creator_graph_root",
+        "unexpected_creator_graph_root",
+        "creator_graph_root_mismatch",
+        "unexpected_occurrence_graph_root",
+        "missing_occurrence_graph_root",
+        "incomplete_requested_launch",
+        "invalid_requested_identity",
+        "requested_identity_mismatch",
+        "incomplete_resolved_launch",
+        "invalid_resolved_launch_grant",
+        "resolved_launch_grant_mismatch"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "missing_field": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "missing_field"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "oversized_field": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "oversized_field"
+      ]
+    }
+  ]
+}

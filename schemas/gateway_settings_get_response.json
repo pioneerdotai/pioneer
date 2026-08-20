@@ -39,6 +39,11 @@
         "kind": {
           "$ref": "#/$defs/CLIAgentRuntimeKind"
         },
+        "nickname": {
+          "description": "Stable workspace nickname used by the direct AgentIdentity projection.\nThe default keeps old settings files readable; gateway validation owns\nuniqueness and rejects an empty/duplicate value before activation.",
+          "type": "string",
+          "default": ""
+        },
         "shadow_home_path": {
           "type": [
             "string",
@@ -318,7 +323,8 @@
                 "enabled": true,
                 "home_path": "~/.codex",
                 "id": "codex",
-                "kind": "codex"
+                "kind": "codex",
+                "nickname": "codex"
               },
               {
                 "binary_path": "claude",
@@ -326,7 +332,8 @@
                 "enabled": true,
                 "home_path": "~/.claude",
                 "id": "claude",
-                "kind": "claude"
+                "kind": "claude",
+                "nickname": "claude"
               }
             ]
           }

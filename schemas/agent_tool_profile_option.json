@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentToolProfileOption",
+  "type": "object",
+  "properties": {
+    "allowedPermissionProfiles": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TurnPermissionMode"
+      }
+    },
+    "allowedReasoning": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TurnReasoningSelection"
+      }
+    },
+    "backend": {
+      "$ref": "#/$defs/AgentToolBackendKind"
+    },
+    "compatibleIdentityIds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentIdentityId"
+      }
+    },
+    "id": {
+      "$ref": "#/$defs/AgentExecutionProfileId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "compatibleIdentityIds",
+    "backend"
+  ],
+  "$defs": {
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentToolBackendKind": {
+      "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
+      "type": "string",
+      "enum": [
+        "api",
+        "cli",
+        "acp"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    }
+  }
+}

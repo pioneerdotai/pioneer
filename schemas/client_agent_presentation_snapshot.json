@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientAgentPresentationSnapshot",
+  "type": "object",
+  "properties": {
+    "agentExecutionId": {
+      "$ref": "#/$defs/AgentExecutionId"
+    },
+    "agentIdentityId": {
+      "$ref": "#/$defs/AgentIdentityId"
+    },
+    "avatarRevision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "displayName": {
+      "type": "string"
+    },
+    "nickname": {
+      "type": "string"
+    },
+    "roleLabel": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sourceKind": {
+      "$ref": "#/$defs/AgentIdentitySourceKind"
+    },
+    "sourceRevision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "status": {
+      "$ref": "#/$defs/AgentIdentityStatus"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "agentIdentityId",
+    "agentExecutionId",
+    "sourceKind",
+    "sourceRevision",
+    "displayName",
+    "nickname",
+    "status"
+  ],
+  "$defs": {
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentIdentityStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "retired"
+      ]
+    }
+  }
+}

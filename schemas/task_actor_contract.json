@@ -1,0 +1,585 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskActorContract",
+  "type": "object",
+  "properties": {
+    "accountingAttribution": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PersistedActorRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "controllerPrincipalId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "creator": {
+      "$ref": "#/$defs/PersistedActorRef"
+    },
+    "creatorPresentationSnapshot": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentPresentationSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "creatorWorkGraphRootExecutionId": {
+      "description": "Immutable graph lineage of an Agent creator. This remains distinct\nfrom the occurrence root: scheduled occurrences create a fresh root\nwhen admitted, while immediate Agent Tasks inherit the creator root.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delivery": {
+      "$ref": "#/$defs/TaskDeliveryActorContract"
+    },
+    "derivedChildLaunchGrantJson": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "executionDestinationThreadId": {
+      "description": "Exact capsule/thread in which an occurrence executes. For ordinary\nTasks this is absent and the admitted collaboration root is used.\nRouted Tasks pin both fields at create/schedule time so the scheduler\nnever infers a destination from current membership or prompt text.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "executionRouteExpiresAtMillis": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "executionRouteId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "executionRouteReceiptJson": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "launch": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentLaunchSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "requestedIdentityJson": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resolvedIdentityId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resolvedProfileId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reviewer": {
+      "$ref": "#/$defs/TaskReviewerIntent"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "rootResourceScopeId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sourceConfigFingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "workGraphRootExecutionId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspaceId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "taskId",
+    "workspaceId",
+    "creator",
+    "reviewer",
+    "delivery",
+    "revision"
+  ],
+  "$defs": {
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentExecutionProfileSelection": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "inherit_parent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "object",
+              "properties": {
+                "profile_id": {
+                  "$ref": "#/$defs/AgentExecutionProfileId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "profile_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        }
+      ]
+    },
+    "AgentExecutionSelection": {
+      "type": "object",
+      "properties": {
+        "mcpServerIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "permissionProfile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnPermissionProfileSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "profile": {
+          "$ref": "#/$defs/AgentExecutionProfileSelection"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnReasoningSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skillIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillId"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile"
+      ]
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySelection": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "inherit_parent",
+            "default_pioneer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "object",
+              "properties": {
+                "agent_identity_id": {
+                  "$ref": "#/$defs/AgentIdentityId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "agent_identity_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "server_derived_ephemeral": {
+              "type": "object",
+              "properties": {
+                "display_name_hint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "role_label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "server_derived_ephemeral"
+          ]
+        }
+      ]
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentLaunchSelection": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentIdentitySelection"
+        },
+        "execution": {
+          "$ref": "#/$defs/AgentExecutionSelection"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "execution"
+      ]
+    },
+    "AgentPresentationSnapshot": {
+      "type": "object",
+      "properties": {
+        "agent_execution_id": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "agent_identity_id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "identity_source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "identity_source_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_identity_id",
+        "agent_execution_id",
+        "identity_source_kind",
+        "identity_source_revision",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "PersistedActorRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/AgentExecutionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent_execution"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TaskDeliveryActorContract": {
+      "type": "object",
+      "properties": {
+        "authorSnapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentPresentationSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destinationThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "destinationUserId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "destinationWebhookUrlFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "disclosureGeneration": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "returnRouteId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "routeExpiresAtMillis": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "routeId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "routeReceiptJson": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "disclosureGeneration"
+      ]
+    },
+    "TaskReviewerIntent": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "parent",
+            "runtime_auto"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "human": {
+              "type": "object",
+              "properties": {
+                "principal_id": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "principal_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "human"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent": {
+              "type": "object",
+              "properties": {
+                "execution_id": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "execution_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "agent"
+          ]
+        }
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileSelection": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    }
+  }
+}

@@ -428,6 +428,11 @@ pub struct GatewayCliRuntimeInstanceSettings {
     pub id: String,
     pub kind: CLIAgentRuntimeKind,
     pub display_name: String,
+    /// Stable workspace nickname used by the direct AgentIdentity projection.
+    /// The default keeps old settings files readable; gateway validation owns
+    /// uniqueness and rejects an empty/duplicate value before activation.
+    #[serde(default)]
+    pub nickname: String,
     pub enabled: bool,
     pub binary_path: String,
     pub home_path: String,
@@ -441,6 +446,7 @@ impl GatewayCliRuntimeInstanceSettings {
             id: "codex".to_owned(),
             kind: CLIAgentRuntimeKind::Codex,
             display_name: "Codex CLI".to_owned(),
+            nickname: "codex".to_owned(),
             enabled: true,
             binary_path: "codex".to_owned(),
             home_path: "~/.codex".to_owned(),
@@ -453,12 +459,32 @@ impl GatewayCliRuntimeInstanceSettings {
             id: "claude".to_owned(),
             kind: CLIAgentRuntimeKind::Claude,
             display_name: "Claude CLI".to_owned(),
+            nickname: "claude".to_owned(),
             enabled: true,
             binary_path: "claude".to_owned(),
             home_path: "~/.claude".to_owned(),
             shadow_home_path: None,
         }
     }
+}
+
+/// Identity presentation and lifecycle state for one Pioneer-native agent.
+///
+/// Execution choices (provider/model, reasoning, permissions, Skills, MCP and
+/// runtime session state) intentionally do not belong here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayNativeAgentConfig {
+    pub id: String,
+    /// Server-owned key; ordinary native agents leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_key: Option<String>,
+    pub display_name: String,
+    pub nickname: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_revision: Option<String>,
+    pub config_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -750,6 +776,7 @@ mod tests {
         assert_eq!(settings.instances[0].id, "codex");
         assert_eq!(settings.instances[0].kind, CLIAgentRuntimeKind::Codex);
         assert_eq!(settings.instances[0].display_name, "Codex CLI");
+        assert_eq!(settings.instances[0].nickname, "codex");
         assert!(settings.instances[0].enabled);
         assert_eq!(settings.instances[0].binary_path, "codex");
         assert_eq!(settings.instances[0].home_path, "~/.codex");
@@ -757,10 +784,79 @@ mod tests {
         assert_eq!(settings.instances[1].id, "claude");
         assert_eq!(settings.instances[1].kind, CLIAgentRuntimeKind::Claude);
         assert_eq!(settings.instances[1].display_name, "Claude CLI");
+        assert_eq!(settings.instances[1].nickname, "claude");
         assert!(settings.instances[1].enabled);
         assert_eq!(settings.instances[1].binary_path, "claude");
         assert_eq!(settings.instances[1].home_path, "~/.claude");
         assert!(settings.instances[1].shadow_home_path.is_none());
+    }
+
+    #[test]
+    fn native_agent_config_is_exactly_identity_and_lifecycle_data() {
+        let config = super::GatewayNativeAgentConfig {
+            id: "reviewer".to_owned(),
+            system_key: Some("server-reviewer".to_owned()),
+            display_name: "Reviewer".to_owned(),
+            nickname: "reviewer".to_owned(),
+            enabled: true,
+            avatar_revision: Some("avatar-1".to_owned()),
+            config_revision: 3,
+        };
+        let encoded = serde_json::to_value(&config).expect("native config should encode");
+        assert_eq!(encoded.as_object().expect("config object").len(), 7);
+        for forbidden in [
+            "prompt",
+            "provider",
+            "model",
+            "reasoning",
+            "permissions",
+            "skills",
+            "mcp",
+        ] {
+            assert!(!encoded.as_object().unwrap().contains_key(forbidden));
+        }
+        let decoded: super::GatewayNativeAgentConfig =
+            serde_json::from_value(encoded).expect("native config should decode");
+        assert_eq!(decoded, config);
+        assert!(
+            serde_json::from_value::<super::GatewayNativeAgentConfig>(serde_json::json!({
+                "id": "reviewer",
+                "display_name": "Reviewer",
+                "nickname": "reviewer",
+                "enabled": true,
+                "config_revision": 3,
+                "provider": "untrusted-provider"
+            }))
+            .is_err()
+        );
+
+        let second = super::GatewayNativeAgentConfig {
+            id: "reviewer-two".to_owned(),
+            system_key: None,
+            display_name: "Reviewer Two".to_owned(),
+            nickname: "reviewer-two".to_owned(),
+            enabled: true,
+            avatar_revision: None,
+            config_revision: 1,
+        };
+        assert_ne!(config.id, second.id);
+        assert!(config.system_key.is_some());
+        assert_eq!(second.system_key, None);
+    }
+
+    #[test]
+    fn old_cli_runtime_settings_without_nickname_remain_readable() {
+        let decoded: GatewayCliRuntimeInstanceSettings =
+            serde_json::from_value(serde_json::json!({
+                "id": "codex-old",
+                "kind": "codex",
+                "display_name": "Old Codex",
+                "enabled": true,
+                "binary_path": "codex",
+                "home_path": "~/.codex"
+            }))
+            .expect("legacy runtime settings should decode");
+        assert!(decoded.nickname.is_empty());
     }
 
     #[test]
@@ -839,6 +935,7 @@ mod tests {
                     id: "codex_work".to_owned(),
                     kind: CLIAgentRuntimeKind::Codex,
                     display_name: "Codex Work".to_owned(),
+                    nickname: "codex-work".to_owned(),
                     enabled: true,
                     binary_path: "codex".to_owned(),
                     home_path: "~/.codex".to_owned(),
@@ -873,6 +970,7 @@ mod tests {
                     id: "codex_personal".to_owned(),
                     kind: CLIAgentRuntimeKind::Codex,
                     display_name: "Codex Personal".to_owned(),
+                    nickname: "codex-personal".to_owned(),
                     enabled: false,
                     binary_path: "/opt/homebrew/bin/codex".to_owned(),
                     home_path: "~/.codex-personal".to_owned(),

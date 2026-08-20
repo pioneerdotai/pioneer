@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentIdentity",
+  "type": "object",
+  "properties": {
+    "created_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "id": {
+      "$ref": "#/$defs/AgentIdentityId"
+    },
+    "retired_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "source": {
+      "$ref": "#/$defs/AgentIdentitySource"
+    },
+    "source_fingerprint": {
+      "type": "string"
+    },
+    "source_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "status": {
+      "$ref": "#/$defs/AgentIdentityStatus"
+    },
+    "updated_at": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "workspace_id": {
+      "$ref": "#/$defs/WorkspaceId"
+    }
+  },
+  "required": [
+    "id",
+    "workspace_id",
+    "source",
+    "source_revision",
+    "source_fingerprint",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "$defs": {
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "native_agent"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "native_agent_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "native_agent_id"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cli_runtime_instance"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "$ref": "#/$defs/CLIAgentRuntimeKind"
+                },
+                "runtime_instance_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "runtime_instance_id",
+                "kind"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ephemeral"
+            },
+            "value": {
+              "type": "object",
+              "properties": {
+                "allocation_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "allocation_id"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "AgentIdentityStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "retired"
+      ]
+    },
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "WorkspaceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

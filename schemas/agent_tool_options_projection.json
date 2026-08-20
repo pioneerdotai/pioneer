@@ -1,0 +1,327 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentToolOptionsProjection",
+  "type": "object",
+  "properties": {
+    "allowedMcpServerIds": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowedSkillIds": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SkillId"
+      }
+    },
+    "defaultPioneerIdentityAvailable": {
+      "type": "boolean"
+    },
+    "derivedEphemeralIdentityAvailable": {
+      "type": "boolean"
+    },
+    "generationFingerprint": {
+      "type": "string"
+    },
+    "identities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentToolIdentityOption"
+      }
+    },
+    "inheritParentIdentityAvailable": {
+      "type": "boolean"
+    },
+    "inheritParentProfileAvailable": {
+      "type": "boolean"
+    },
+    "maxPermissionProfile": {
+      "$ref": "#/$defs/TurnPermissionProfileCap"
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentToolProfileOption"
+      }
+    },
+    "targetOptions": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AgentToolTargetOption"
+      }
+    },
+    "threadCreationOptions": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AgentToolThreadCreationOption"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "identities",
+    "profiles",
+    "inheritParentIdentityAvailable",
+    "defaultPioneerIdentityAvailable",
+    "derivedEphemeralIdentityAvailable",
+    "inheritParentProfileAvailable",
+    "maxPermissionProfile",
+    "generationFingerprint"
+  ],
+  "$defs": {
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentToolBackendKind": {
+      "description": "Deliberately contains only a backend class.  Runtime instance IDs and\nprovider/model configuration remain server-side implementation details.",
+      "type": "string",
+      "enum": [
+        "api",
+        "cli",
+        "acp"
+      ]
+    },
+    "AgentToolIdentityOption": {
+      "type": "object",
+      "properties": {
+        "avatarRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "roleLabel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceKind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "displayName",
+        "nickname",
+        "sourceKind"
+      ]
+    },
+    "AgentToolProfileOption": {
+      "type": "object",
+      "properties": {
+        "allowedPermissionProfiles": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TurnPermissionMode"
+          }
+        },
+        "allowedReasoning": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TurnReasoningSelection"
+          }
+        },
+        "backend": {
+          "$ref": "#/$defs/AgentToolBackendKind"
+        },
+        "compatibleIdentityIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentIdentityId"
+          }
+        },
+        "id": {
+          "$ref": "#/$defs/AgentExecutionProfileId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "compatibleIdentityIds",
+        "backend"
+      ]
+    },
+    "AgentToolTargetOption": {
+      "description": "Opaque action target projected by the server. The model never receives a\nthread, route, workspace, capsule or Gateway identifier and therefore\ncannot turn guessed infrastructure IDs into an existence oracle.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "AgentToolThreadCreationOption": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileCap": {
+      "type": "object",
+      "properties": {
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode",
+        "effective_policy"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    }
+  }
+}

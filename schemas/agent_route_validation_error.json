@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentRouteValidationError",
+  "type": "string",
+  "enum": [
+    "empty_identifier",
+    "no_actions",
+    "duplicate_action",
+    "invalid_generation",
+    "invalid_hop_boundary",
+    "cross_workspace",
+    "cross_gateway",
+    "disclosure_required",
+    "invalid_result_return_policy",
+    "invalid_expiry"
+  ]
+}

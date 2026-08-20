@@ -120,6 +120,9 @@ pub mod methods {
     pub const TASK_DELIVERIES: &str = "task/deliveries";
     pub const TASK_USER_NOTIFICATION_LIST: &str = "task/user_notification/list";
     pub const TASK_USER_NOTIFICATION_ACKNOWLEDGE: &str = "task/user_notification/acknowledge";
+    pub const AGENT_ROUTE_CREATE: &str = "agent/route/create";
+    pub const AGENT_ROUTE_LIST: &str = "agent/route/list";
+    pub const AGENT_ROUTE_REVOKE: &str = "agent/route/revoke";
     pub const MEMORY_SEARCH: &str = "memory/search";
     pub const MEMORY_GET: &str = "memory/get";
     pub const MEMORY_LIST: &str = "memory/list";
@@ -267,6 +270,9 @@ pub mod methods {
         TASK_DELIVERIES,
         TASK_USER_NOTIFICATION_LIST,
         TASK_USER_NOTIFICATION_ACKNOWLEDGE,
+        AGENT_ROUTE_CREATE,
+        AGENT_ROUTE_LIST,
+        AGENT_ROUTE_REVOKE,
         MEMORY_SEARCH,
         MEMORY_GET,
         MEMORY_LIST,

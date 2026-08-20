@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentControlTaskToolInput",
+  "type": "object",
+  "properties": {
+    "control": {
+      "$ref": "#/$defs/AgentTaskControl"
+    },
+    "taskId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "taskId",
+    "control"
+  ],
+  "$defs": {
+    "AgentTaskControl": {
+      "type": "string",
+      "enum": [
+        "cancel",
+        "resume",
+        "detach"
+      ]
+    }
+  }
+}

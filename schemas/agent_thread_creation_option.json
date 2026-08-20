@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentThreadCreationOption",
+  "type": "object",
+  "properties": {
+    "audience": {
+      "$ref": "#/$defs/AgentThreadAudienceTemplate"
+    },
+    "optionId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "optionId",
+    "audience"
+  ],
+  "$defs": {
+    "AgentThreadAudienceTemplate": {
+      "type": "string",
+      "enum": [
+        "home_capsule",
+        "root_delegation"
+      ]
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentIdentitySourceKind",
+  "type": "string",
+  "enum": [
+    "native_agent",
+    "cli_runtime_instance",
+    "ephemeral"
+  ]
+}

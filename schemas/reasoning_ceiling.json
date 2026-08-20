@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReasoningCeiling",
+  "description": "Canonical exact reasoning selections that remain delegable by an admitted\nexecution. Effort labels are backend-owned opaque values, so ordering them\nby presumed strength would be unsafe; the ceiling is an allow-set.",
+  "type": "object",
+  "properties": {
+    "allowed": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TurnReasoningSelection"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "allowed"
+  ],
+  "$defs": {
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    }
+  }
+}

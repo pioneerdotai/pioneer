@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentWaitToolInput",
+  "type": "object",
+  "properties": {
+    "taskIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64,
+      "minItems": 1
+    },
+    "timeoutMs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "maximum": 30000,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "taskIds"
+  ]
+}

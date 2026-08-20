@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentExecutionSelection",
+  "type": "object",
+  "properties": {
+    "mcpServerIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "permissionProfile": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnPermissionProfileSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "profile": {
+      "$ref": "#/$defs/AgentExecutionProfileSelection"
+    },
+    "reasoning": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnReasoningSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "skillIds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SkillId"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "profile"
+  ],
+  "$defs": {
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentExecutionProfileSelection": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "inherit_parent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "object",
+              "properties": {
+                "profile_id": {
+                  "$ref": "#/$defs/AgentExecutionProfileId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "profile_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        }
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileSelection": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    }
+  }
+}

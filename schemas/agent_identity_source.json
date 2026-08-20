@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentIdentitySource",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "native_agent"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "native_agent_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "native_agent_id"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "cli_runtime_instance"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            "runtime_instance_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "runtime_instance_id",
+            "kind"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "ephemeral"
+        },
+        "value": {
+          "type": "object",
+          "properties": {
+            "allocation_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "allocation_id"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ]
+    }
+  ],
+  "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    }
+  }
+}

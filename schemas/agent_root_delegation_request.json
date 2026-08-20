@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentRootDelegationRequest",
+  "description": "Optional typed extension accepted by `turn/start` for automatic,\nshort-lived root-execution delegation. It is deliberately separate from\nthe prompt and has no participant/role/ACL fields.",
+  "type": "object",
+  "properties": {
+    "allowedActions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentRouteAction"
+      }
+    },
+    "destinationAgentIdentityId": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "destinationProfileId": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentExecutionProfileId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "destinationThreadId": {
+      "type": "string"
+    },
+    "disclosure": {
+      "$ref": "#/$defs/AgentRouteDisclosurePolicy"
+    },
+    "expiresAt": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "idempotencyKey": {
+      "type": "string"
+    },
+    "returnRouteId": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentDelegationRouteId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "destinationThreadId",
+    "allowedActions",
+    "disclosure",
+    "expiresAt",
+    "idempotencyKey"
+  ],
+  "$defs": {
+    "AgentDelegationRouteId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentResultReturnPolicy": {
+      "type": "string",
+      "enum": [
+        "none",
+        "summary_only",
+        "full_result"
+      ]
+    },
+    "AgentRouteAction": {
+      "type": "string",
+      "enum": [
+        "send_message",
+        "start_agent",
+        "create_task",
+        "schedule_task",
+        "review_task_result",
+        "deliver_result"
+      ]
+    },
+    "AgentRouteDisclosurePolicy": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "description": "Exact, already-authorized artifact handles. Raw files and paths are\nnever represented by this flag.",
+          "type": "boolean",
+          "default": false
+        },
+        "context": {
+          "description": "Bounded conversation excerpts or summaries selected by server policy.",
+          "type": "boolean",
+          "default": false
+        },
+        "resultReturn": {
+          "description": "Result return is a separate disclosure class: allowing ordinary text\nmust never imply that a full Task result can cross a capsule boundary.",
+          "$ref": "#/$defs/AgentResultReturnPolicy",
+          "default": "none"
+        },
+        "text": {
+          "description": "Explicit text authored for the routed operation.",
+          "type": "boolean",
+          "default": false
+        },
+        "userInput": {
+          "description": "Explicit user-provided Task inputs. This is deliberately independent\nfrom Agent-authored text and inherited conversation context.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

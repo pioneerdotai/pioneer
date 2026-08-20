@@ -5,6 +5,7 @@ use pioneer_protocol::{
 
 fn turn_start(mode: ThreadMode) -> TurnStartParams {
     TurnStartParams {
+        agent_delegation_routes: Vec::new(),
         thread_id: "thread-baseline".to_owned(),
         turn_id: "turn-baseline".to_owned(),
         input: vec![UserInput::Text {
@@ -16,6 +17,7 @@ fn turn_start(mode: ThreadMode) -> TurnStartParams {
         model_provider: None,
         sandbox_policy: None,
         mode: Some(mode),
+        agent_launch: None,
         reply_to_turn_id: None,
         mentioned_principal_ids: Vec::new(),
         execution_backend: None,
@@ -54,6 +56,7 @@ fn epic6_turn_collaboration_fields_round_trip_on_the_canonical_turn() {
             display_name: "Member".to_owned(),
             nickname: "member".to_owned(),
             avatar_revision: Some("avatar-revision".to_owned()),
+            agent: None,
         }),
         reply_to_turn_id: Some("turn-parent".to_owned()),
         mentions: vec![TurnMention {

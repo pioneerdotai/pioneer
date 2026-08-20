@@ -1,13 +1,19 @@
 pub mod constants;
 
 mod access;
+mod agent_action;
+mod agent_authorship;
 mod agent_event;
+mod agent_launch;
+mod agent_route;
+mod agent_tools;
 mod app_url;
 mod artifact;
 mod audit;
 mod auth;
 mod authorization;
 mod cli_runtime;
+mod client_projection;
 mod gateway_endpoint;
 mod id;
 mod identity;
@@ -25,6 +31,7 @@ mod settings;
 mod skills;
 mod system_assets;
 mod task;
+mod task_actor;
 mod thread;
 mod thread_agents_doc;
 mod thread_episodic;
@@ -39,12 +46,45 @@ pub use access::{
     AccessChangeKind, AccessChangeOutcome, AccessChangedNotification, AuthorizationChangeKind,
     AuthorizationChangeScope, AuthorizationProjectionChangedNotification, PolicyGeneration,
 };
+pub use agent_action::{
+    AgentActionIntent, AgentActionKind, AgentActionNormalizationError, AgentBoundRuntimeSelection,
+    AgentReviewDecision, AgentTaskActionSelection, AgentTaskControl, AgentThreadAudienceTemplate,
+    AgentThreadCreationOption, NormalizedAgentAction,
+};
+pub use agent_authorship::{
+    AgentAuthoredProjectionError, AgentAuthoredTaskProjection, AgentAuthoredTurnProjection,
+    AgentTaskReviewProjection,
+};
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ProgressCoalescingKey,
     ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
     TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
     TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
     TurnPermissionAuditRequestKey, TurnRejectedCapability, TurnSkillBinding,
+};
+pub use agent_launch::{
+    AgentAuthoredInput, AgentAuthoredInputError, AgentExecutionProfileBackend,
+    AgentExecutionProfileProjection, AgentExecutionProfileSelection, AgentExecutionSelection,
+    AgentIdentitySelection, AgentLaunchSelection, AgentLaunchSelectionError,
+    AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantSet,
+    ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
+};
+pub use agent_route::{
+    AgentDelegationRouteCreateParams, AgentDelegationRouteListParams,
+    AgentDelegationRouteListResponse, AgentDelegationRouteProjection,
+    AgentDelegationRouteRevokeParams, AgentResultReturnPolicy, AgentRootDelegationRequest,
+    AgentRouteAction, AgentRouteDisclosurePolicy, AgentRouteGraphValidationError, AgentRouteKind,
+    AgentRouteStatus, AgentRouteValidationError, validate_agent_route_graph,
+};
+pub use agent_tools::{
+    AgentControlTaskToolInput, AgentCreateThreadToolInput, AgentModelToolCatalogEntry,
+    AgentModelToolName, AgentPublicOutcome, AgentResultToolInput, AgentReviewTaskToolInput,
+    AgentScheduleTaskToolInput, AgentSendMessageToolInput, AgentStartOptionsToolInput,
+    AgentStartToolInput, AgentTaskToolInput, AgentToolBackendKind, AgentToolCapability,
+    AgentToolIdentityChoice, AgentToolIdentityOption, AgentToolLaunchSelection,
+    AgentToolOptionsProjection, AgentToolProfileChoice, AgentToolProfileOption,
+    AgentToolResultStatus, AgentToolSafeResult, AgentToolTargetOption,
+    AgentToolThreadCreationOption, AgentWaitToolInput, project_agent_model_tool_catalog,
 };
 pub use app_url::{
     PIONEER_DEVELOPMENT_URL_SCHEME, PIONEER_PRODUCTION_URL_SCHEME, PioneerAppUrlScheme,
@@ -120,6 +160,13 @@ pub use cli_runtime::{
     RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
     sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };
+pub use client_projection::{
+    AgentAuthoredMessage, AgentAuthoredMessageState, AgentWorkGraphProjection,
+    AgentWorkNodeProjection, AgentWorkNodeState, ClientAgentPresentationSnapshot,
+    ClientAuthorProjectionError, ConversationAuthorPresentation, CrossThreadSourceVisibility,
+    PrincipalAuthorSnapshot, SafeExecutionProfileMetadata, SafeRouteProvenance,
+    project_agent_authored_message, project_conversation_author,
+};
 pub use gateway_endpoint::{
     DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError, GatewayTransportSecurity,
     PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER, PIONEER_PROTOCOL_VERSION_NUMBER,
@@ -133,8 +180,16 @@ pub use id::{
     TokenFamilyId, WorkspaceId, generate_id,
 };
 pub use identity::{
-    MEMBER_ROLE_KEY, PersistedActorRef, PrincipalKind, PrincipalStatus, ROLE_KEY_MAX_LEN, RoleKey,
-    RoleKeyError, SUPERUSER_CAPABILITY_ROLE_KEY,
+    AGENT_DISPLAY_NAME_MAX_SCALARS, AGENT_DISPLAY_NAME_MAX_UTF8_BYTES, AGENT_NICKNAME_MAX_LEN,
+    AGENT_NICKNAME_MIN_LEN, AGENT_OPAQUE_ID_LEN, AGENT_ROLE_LABEL_MAX_SCALARS,
+    AdministrativeActorRef, AgentActionId, AgentDelegationRouteId, AgentDisplayName,
+    AgentExecutionId, AgentExecutionProfileId, AgentIdentity, AgentIdentityId,
+    AgentIdentityProjection, AgentIdentitySource, AgentIdentitySourceKind, AgentIdentityStatus,
+    AgentIdentityValidationError, AgentNicknameKey, AgentPresentationSnapshot, AgentRoleLabel,
+    AgentRouteGrantId, AuthorizationSubjectRef, ConversationActorRef, MEMBER_ROLE_KEY,
+    PIONEER_AGENT_DISPLAY_NAME, PIONEER_AGENT_NICKNAME, PIONEER_NATIVE_AGENT_KEY,
+    PersistedActorRef, PrincipalKind, PrincipalStatus, ROLE_KEY_MAX_LEN, RoleKey, RoleKeyError,
+    SUPERUSER_CAPABILITY_ROLE_KEY, ServiceId, SystemIssuer,
 };
 pub use invitation::{
     INVITATION_CREDENTIAL_BODY_LEN, INVITATION_CREDENTIAL_ENTROPY_BYTES,
@@ -222,8 +277,8 @@ pub use public_error::{PUBLIC_ERROR_VERSION, PublicError, PublicErrorCode, Publi
 pub use settings::{
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
-    GatewayMemorySettings, GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings,
-    GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
+    GatewayMemorySettings, GatewayNativeAgentConfig, GatewayRemoteAccessErrorKind,
+    GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
     GatewayRemoteAccessTransport, GatewaySelfImprovementModelSelection,
     GatewaySelfImprovementSettings, GatewaySettingsGetParams, GatewaySettingsGetResponse,
@@ -290,23 +345,27 @@ pub use task::{
     TaskRescheduledNotification, TaskResourceBudget, TaskResult, TaskResultCandidate,
     TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
     TaskResultReviewEventKind, TaskResultReviewResolutionStrategy, TaskResultReviewerKind,
-    TaskResultReviewerSpec, TaskResumeParams, TaskResumeResponse, TaskResumedNotification,
-    TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
-    TaskRunCompletedNotification, TaskRunCreatedNotification, TaskRunExecution,
-    TaskRunExecutionStatus, TaskRunFailedNotification, TaskRunStartedNotification, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskScheduledNotification, TaskSchema, TaskStatus, TaskThreadLineage,
-    TaskTimeoutPolicy, TaskTree, TaskTreeChangedNotification, TaskTreeParams, TaskTreeResponse,
-    TaskTrigger, TaskTriggerCatchUpMode, TaskTriggerCatchUpPolicy, TaskTriggerInput,
-    TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskUpdateParams,
-    TaskUpdateResponse, TaskUpdatedNotification, TaskUserNotification,
-    TaskUserNotificationAcknowledgeParams, TaskUserNotificationAcknowledgeResponse,
-    TaskUserNotificationDeliveredNotification, TaskUserNotificationListParams,
-    TaskUserNotificationListResponse, TaskValue, TaskWaitItem, TaskWaitMode,
-    TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams, TaskWaitResponse,
-    TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock,
-    TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus, ThreadLineage,
-    task_delivery_id_from_result_item_id, task_delivery_result_item_id,
+    TaskResultReviewerRef, TaskResultReviewerSpec, TaskResumeParams, TaskResumeResponse,
+    TaskResumedNotification, TaskRetryBackoffKind, TaskRetryPolicy, TaskReviseParams,
+    TaskReviseResponse, TaskRun, TaskRunCompletedNotification, TaskRunCreatedNotification,
+    TaskRunExecution, TaskRunExecutionStatus, TaskRunFailedNotification,
+    TaskRunStartedNotification, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskScheduledNotification, TaskSchema,
+    TaskStatus, TaskThreadLineage, TaskTimeoutPolicy, TaskTree, TaskTreeChangedNotification,
+    TaskTreeParams, TaskTreeResponse, TaskTrigger, TaskTriggerCatchUpMode,
+    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
+    TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskUpdatedNotification,
+    TaskUserNotification, TaskUserNotificationAcknowledgeParams,
+    TaskUserNotificationAcknowledgeResponse, TaskUserNotificationDeliveredNotification,
+    TaskUserNotificationListParams, TaskUserNotificationListResponse, TaskValue, TaskWaitItem,
+    TaskWaitMode, TaskWaitNonWaitableItem, TaskWaitNonWaitableReason, TaskWaitParams,
+    TaskWaitResponse, TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason,
+    TaskWriteLock, TaskWriteLockConflict, TaskWriteLockScopeKind, TaskWriteLockStatus,
+    ThreadLineage, task_delivery_id_from_result_item_id, task_delivery_result_item_id,
+};
+pub use task_actor::{
+    TaskActorContract, TaskActorContractError, TaskDeliveryActorContract,
+    TaskDerivedChildLaunchGrant, TaskOccurrenceContract, TaskOccurrenceStatus, TaskReviewerIntent,
 };
 pub use thread::{
     SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadComposerExecutionMode,

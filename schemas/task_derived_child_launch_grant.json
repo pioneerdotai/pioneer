@@ -1,0 +1,434 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskDerivedChildLaunchGrant",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "agent_authorization_fingerprint": {
+          "type": "string"
+        },
+        "agent_policy_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "allowed_actions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "child_launch_grant": {
+          "$ref": "#/$defs/ChildAgentLaunchGrantSet"
+        },
+        "identity": {
+          "$ref": "#/$defs/AgentIdentityProjection"
+        },
+        "kind": {
+          "type": "string",
+          "const": "resolved_task_launch"
+        },
+        "profile": {
+          "$ref": "#/$defs/AgentExecutionProfileProjection"
+        },
+        "role_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "identity",
+        "profile",
+        "role_key",
+        "agent_policy_generation",
+        "allowed_actions",
+        "agent_authorization_fingerprint",
+        "child_launch_grant"
+      ]
+    }
+  ],
+  "$defs": {
+    "AgentExecutionProfileBackend": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "api_provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cli_runtime": {
+              "type": "object",
+              "properties": {
+                "runtime_instance_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "runtime_instance_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "cli_runtime"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "acp_agent_runtime": {
+              "type": "object",
+              "properties": {
+                "runtime_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "runtime_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "acp_agent_runtime"
+          ]
+        }
+      ]
+    },
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentExecutionProfileProjection": {
+      "type": "object",
+      "properties": {
+        "allowedPermissionProfiles": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TurnPermissionMode"
+          }
+        },
+        "allowedReasoning": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TurnReasoningSelection"
+          }
+        },
+        "backend": {
+          "$ref": "#/$defs/AgentExecutionProfileBackend"
+        },
+        "catalogGeneration": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "compatibleAgentIdentityIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentIdentityId"
+          }
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/AgentExecutionProfileId"
+        },
+        "modelDisplayName": {
+          "type": "string"
+        },
+        "modelId": {
+          "type": "string"
+        },
+        "policyGeneration": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "providerDisplayName": {
+          "type": "string"
+        },
+        "providerId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "compatibleAgentIdentityIds",
+        "backend",
+        "providerId",
+        "modelId",
+        "providerDisplayName",
+        "modelDisplayName",
+        "catalogGeneration",
+        "policyGeneration",
+        "fingerprint"
+      ]
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityProjection": {
+      "type": "object",
+      "properties": {
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_fingerprint": {
+          "type": "string"
+        },
+        "source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "source_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "source_kind",
+        "display_name",
+        "nickname",
+        "source_revision",
+        "source_fingerprint"
+      ]
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "ChildAgentLaunchGrantSet": {
+      "description": "Immutable upper bound for identities and execution profiles that an\nadmitted AgentExecution may delegate to. Current source/policy state may\nnarrow this set, but a later workspace catalog addition can never widen it.",
+      "type": "object",
+      "properties": {
+        "allowInheritParentIdentity": {
+          "type": "boolean"
+        },
+        "allowInheritParentProfile": {
+          "type": "boolean"
+        },
+        "allowServerDerivedEphemeral": {
+          "type": "boolean"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "identities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentIdentityProjection"
+          }
+        },
+        "maxPermissionProfile": {
+          "$ref": "#/$defs/TurnPermissionProfileCap"
+        },
+        "maxReasoning": {
+          "$ref": "#/$defs/ReasoningCeiling"
+        },
+        "mcpServerIds": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentExecutionProfileProjection"
+          }
+        },
+        "skillIds": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillId"
+          }
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "identities",
+        "allowInheritParentIdentity",
+        "allowServerDerivedEphemeral",
+        "profiles",
+        "allowInheritParentProfile",
+        "maxPermissionProfile",
+        "maxReasoning",
+        "fingerprint"
+      ]
+    },
+    "PermissionBehavior": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "ReasoningCeiling": {
+      "description": "Canonical exact reasoning selections that remain delegable by an admitted\nexecution. Effort labels are backend-owned opaque values, so ordering them\nby presumed strength would be unsafe; the ceiling is an allow-set.",
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnReasoningSelection"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "allowed"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ToolPermissionPolicySnapshot": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "computer_use": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "default_behavior": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dynamic_skill_tool": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "file_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_read": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "mcp_write_or_unknown": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "network": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "shell_command": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
+        "task_subagent": {
+          "$ref": "#/$defs/PermissionBehavior"
+        }
+      },
+      "required": [
+        "default_behavior",
+        "file_read",
+        "file_write",
+        "shell_command",
+        "network",
+        "mcp_read",
+        "mcp_write_or_unknown",
+        "dynamic_skill_tool",
+        "computer_use",
+        "task_subagent"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileCap": {
+      "type": "object",
+      "properties": {
+        "effective_policy": {
+          "$ref": "#/$defs/ToolPermissionPolicySnapshot"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode",
+        "effective_policy"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    }
+  }
+}

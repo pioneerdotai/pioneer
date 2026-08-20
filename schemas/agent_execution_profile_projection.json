@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentExecutionProfileProjection",
+  "type": "object",
+  "properties": {
+    "allowedPermissionProfiles": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TurnPermissionMode"
+      }
+    },
+    "allowedReasoning": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/TurnReasoningSelection"
+      }
+    },
+    "backend": {
+      "$ref": "#/$defs/AgentExecutionProfileBackend"
+    },
+    "catalogGeneration": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "compatibleAgentIdentityIds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentIdentityId"
+      }
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "id": {
+      "$ref": "#/$defs/AgentExecutionProfileId"
+    },
+    "modelDisplayName": {
+      "type": "string"
+    },
+    "modelId": {
+      "type": "string"
+    },
+    "policyGeneration": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "providerDisplayName": {
+      "type": "string"
+    },
+    "providerId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "compatibleAgentIdentityIds",
+    "backend",
+    "providerId",
+    "modelId",
+    "providerDisplayName",
+    "modelDisplayName",
+    "catalogGeneration",
+    "policyGeneration",
+    "fingerprint"
+  ],
+  "$defs": {
+    "AgentExecutionProfileBackend": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "api_provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cli_runtime": {
+              "type": "object",
+              "properties": {
+                "runtime_instance_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "runtime_instance_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "cli_runtime"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "acp_agent_runtime": {
+              "type": "object",
+              "properties": {
+                "runtime_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "runtime_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "acp_agent_runtime"
+          ]
+        }
+      ]
+    },
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    }
+  }
+}

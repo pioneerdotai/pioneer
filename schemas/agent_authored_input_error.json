@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentAuthoredInputError",
+  "type": "string",
+  "enum": [
+    "artifact_version_required",
+    "runtime_or_unresolved_input",
+    "payload_limit_exceeded"
+  ]
+}

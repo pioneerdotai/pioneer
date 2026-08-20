@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentActionNormalizationError",
+  "type": "string",
+  "enum": [
+    "empty_idempotency_key",
+    "empty_opaque_selection",
+    "invalid_target",
+    "unsafe_visible_input",
+    "payload_limit_exceeded"
+  ]
+}

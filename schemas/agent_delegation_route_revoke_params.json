@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentDelegationRouteRevokeParams",
+  "type": "object",
+  "properties": {
+    "expectedGeneration": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "idempotencyKey": {
+      "type": "string"
+    },
+    "routeId": {
+      "$ref": "#/$defs/AgentDelegationRouteId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "routeId",
+    "expectedGeneration",
+    "idempotencyKey"
+  ],
+  "$defs": {
+    "AgentDelegationRouteId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

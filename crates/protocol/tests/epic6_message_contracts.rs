@@ -118,6 +118,7 @@ fn epic6_user_timeline_block_and_read_invalidation_use_existing_contracts() {
         attachments: Vec::new(),
         mode: ThreadMode::Message,
         author: None,
+        route: None,
         reply: None,
         mentions: Vec::new(),
         revision: 1,

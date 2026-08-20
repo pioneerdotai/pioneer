@@ -68,6 +68,10 @@ pub struct TurnWorkBlock {
     pub turn_id: String,
     pub presentation: TurnWorkPresentation,
     pub state: TurnWorkState,
+    /// Server-owned aggregate state for the root Agent work graph bound to
+    /// this Turn. Descendant Turns do not repeat the graph projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_work_graph: Option<crate::AgentWorkGraphProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +111,8 @@ pub enum TimelineBlockKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         author: Option<TurnAuthorSnapshot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<crate::SafeRouteProvenance>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<TimelineReplySummary>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mentions: Vec<TurnMention>,
@@ -129,12 +135,22 @@ pub enum TimelineBlockKind {
         status: TurnWorkItemStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         markdown: Option<MarkdownDocument>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<TurnAuthorSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<crate::SafeRouteProvenance>,
     },
     #[serde(rename_all = "camelCase")]
     TurnState {
         state: TurnWorkState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Exact responding execution for live Agent work. Terminal lifecycle
+        /// rows remain System-classified and therefore leave this absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<TurnAuthorSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<crate::SafeRouteProvenance>,
     },
     #[serde(rename_all = "camelCase")]
     PendingRequest {

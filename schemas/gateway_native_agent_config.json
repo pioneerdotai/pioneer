@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayNativeAgentConfig",
+  "description": "Identity presentation and lifecycle state for one Pioneer-native agent.\n\nExecution choices (provider/model, reasoning, permissions, Skills, MCP and\nruntime session state) intentionally do not belong here.",
+  "type": "object",
+  "properties": {
+    "avatar_revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "config_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "id": {
+      "type": "string"
+    },
+    "nickname": {
+      "type": "string"
+    },
+    "system_key": {
+      "description": "Server-owned key; ordinary native agents leave it absent.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "display_name",
+    "nickname",
+    "enabled",
+    "config_revision"
+  ]
+}

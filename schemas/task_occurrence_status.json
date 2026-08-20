@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskOccurrenceStatus",
+  "type": "string",
+  "enum": [
+    "dormant",
+    "queued",
+    "recovering",
+    "running",
+    "waiting_review",
+    "delivered",
+    "failed",
+    "cancelled"
+  ]
+}

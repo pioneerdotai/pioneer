@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentToolIdentityOption",
+  "type": "object",
+  "properties": {
+    "avatarRevision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "displayName": {
+      "type": "string"
+    },
+    "id": {
+      "$ref": "#/$defs/AgentIdentityId"
+    },
+    "nickname": {
+      "type": "string"
+    },
+    "roleLabel": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sourceKind": {
+      "$ref": "#/$defs/AgentIdentitySourceKind"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "displayName",
+    "nickname",
+    "sourceKind"
+  ],
+  "$defs": {
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    }
+  }
+}

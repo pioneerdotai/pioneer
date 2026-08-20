@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentExecutionProfileBackend",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "api_provider"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cli_runtime": {
+          "type": "object",
+          "properties": {
+            "runtime_instance_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "runtime_instance_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cli_runtime"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "acp_agent_runtime": {
+          "type": "object",
+          "properties": {
+            "runtime_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "runtime_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "acp_agent_runtime"
+      ]
+    }
+  ]
+}

@@ -17,6 +17,71 @@
     "thread"
   ],
   "$defs": {
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentPresentationSnapshot": {
+      "type": "object",
+      "properties": {
+        "agent_execution_id": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "agent_identity_id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "identity_source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "identity_source_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_identity_id",
+        "agent_execution_id",
+        "identity_source_kind",
+        "identity_source_revision",
+        "display_name",
+        "nickname"
+      ]
+    },
     "PermissionBehavior": {
       "type": "string",
       "enum": [
@@ -36,6 +101,22 @@
             "kind": {
               "type": "string",
               "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/AgentExecutionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent_execution"
             }
           },
           "required": [
@@ -316,6 +397,17 @@
         "preview": {
           "type": "string"
         },
+        "preview_author": {
+          "description": "Immutable author of the Turn that owns `preview`. Thread trees and\nnotifications must not pair preview text with the latest responding\nexecution or reconstruct this value from mutable agent settings.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnAuthorSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "reasoning_effort": {
           "type": [
             "string",
@@ -583,6 +675,17 @@
       "properties": {
         "actor": {
           "$ref": "#/$defs/PersistedActorRef"
+        },
+        "agent": {
+          "description": "Full immutable identity presentation for an agent-authored Turn.  This\nis carried with the Turn instead of being reconstructed from mutable\nidentity/runtime state. Non-agent actors leave it absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentPresentationSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "avatar_revision": {
           "type": [

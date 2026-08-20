@@ -31,6 +31,209 @@
     "page"
   ],
   "$defs": {
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentPresentationSnapshot": {
+      "type": "object",
+      "properties": {
+        "agent_execution_id": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "agent_identity_id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "identity_source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "identity_source_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_identity_id",
+        "agent_execution_id",
+        "identity_source_kind",
+        "identity_source_revision",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "AgentResultReturnPolicy": {
+      "type": "string",
+      "enum": [
+        "none",
+        "summary_only",
+        "full_result"
+      ]
+    },
+    "AgentRouteAction": {
+      "type": "string",
+      "enum": [
+        "send_message",
+        "start_agent",
+        "create_task",
+        "schedule_task",
+        "review_task_result",
+        "deliver_result"
+      ]
+    },
+    "AgentRouteDisclosurePolicy": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "description": "Exact, already-authorized artifact handles. Raw files and paths are\nnever represented by this flag.",
+          "type": "boolean",
+          "default": false
+        },
+        "context": {
+          "description": "Bounded conversation excerpts or summaries selected by server policy.",
+          "type": "boolean",
+          "default": false
+        },
+        "resultReturn": {
+          "description": "Result return is a separate disclosure class: allowing ordinary text\nmust never imply that a full Task result can cross a capsule boundary.",
+          "$ref": "#/$defs/AgentResultReturnPolicy",
+          "default": "none"
+        },
+        "text": {
+          "description": "Explicit text authored for the routed operation.",
+          "type": "boolean",
+          "default": false
+        },
+        "userInput": {
+          "description": "Explicit user-provided Task inputs. This is deliberately independent\nfrom Agent-authored text and inherited conversation context.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "AgentWorkGraphProjection": {
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "description": "Stable, bounded nodes in the exact root graph. No prompt, provider,\nmodel, thread title, runtime path, or other private payload is exposed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentWorkNodeProjection"
+          }
+        },
+        "queuedCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "rootExecutionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "runningCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "saturated": {
+          "description": "True while one or more authorized nodes are durably queued for\nserver-owned capacity. This is resource state, not an authorization\nfailure and never implies that the whole graph is blocked.",
+          "type": "boolean"
+        },
+        "terminalCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "updatedAtUnixMicros": {
+          "description": "Monotonic persisted resource-state timestamp used only to reject stale\ngraph projections racing with live queue/promotion/finalization events.",
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rootExecutionId",
+        "updatedAtUnixMicros",
+        "queuedCount",
+        "runningCount",
+        "terminalCount",
+        "saturated",
+        "nodes"
+      ]
+    },
+    "AgentWorkNodeProjection": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "progressLabel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progressRevision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/AgentWorkNodeState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "executionId",
+        "state",
+        "progressRevision"
+      ]
+    },
+    "AgentWorkNodeState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "blocked"
+      ]
+    },
     "ArtifactKind": {
       "type": "string",
       "enum": [
@@ -256,6 +459,13 @@
         "file_change_approval",
         "user_input",
         "other"
+      ]
+    },
+    "CrossThreadSourceVisibility": {
+      "type": "string",
+      "enum": [
+        "accessible",
+        "inaccessible"
       ]
     },
     "MarkdownBlock": {
@@ -555,6 +765,22 @@
         {
           "type": "object",
           "properties": {
+            "id": {
+              "$ref": "#/$defs/AgentExecutionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent_execution"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "kind": {
               "type": "string",
               "const": "system"
@@ -571,6 +797,33 @@
       "maxLength": 21,
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SafeRouteProvenance": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/AgentRouteAction"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/AgentRouteDisclosurePolicy"
+        },
+        "sourceThreadLabel": {
+          "description": "Present only when the viewer has source read authority.  Source title,\nparticipants, prompts, and raw identifiers are never sent otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "visibility": {
+          "$ref": "#/$defs/CrossThreadSourceVisibility"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "visibility",
+        "disclosure"
+      ]
     },
     "SkillId": {
       "type": "string",
@@ -909,6 +1162,16 @@
               "default": 0,
               "minimum": 0
             },
+            "route": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SafeRouteProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "text": {
               "type": "string",
               "default": ""
@@ -953,6 +1216,16 @@
         {
           "type": "object",
           "properties": {
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TurnAuthorSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "itemId": {
               "type": "string"
             },
@@ -964,6 +1237,16 @@
               "anyOf": [
                 {
                   "$ref": "#/$defs/MarkdownDocument"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "route": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SafeRouteProvenance"
                 },
                 {
                   "type": "null"
@@ -987,6 +1270,17 @@
         {
           "type": "object",
           "properties": {
+            "author": {
+              "description": "Exact responding execution for live Agent work. Terminal lifecycle\nrows remain System-classified and therefore leave this absent.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TurnAuthorSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "kind": {
               "type": "string",
               "const": "turn_state"
@@ -995,6 +1289,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "route": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SafeRouteProvenance"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "state": {
@@ -1124,6 +1428,17 @@
       "properties": {
         "actor": {
           "$ref": "#/$defs/PersistedActorRef"
+        },
+        "agent": {
+          "description": "Full immutable identity presentation for an agent-authored Turn.  This\nis carried with the Turn instead of being reconstructed from mutable\nidentity/runtime state. Non-agent actors leave it absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentPresentationSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "avatar_revision": {
           "type": [
@@ -1293,6 +1608,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agentWorkGraph": {
+          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentWorkGraphProjection"
             },
             {
               "type": "null"

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentExecutionProfileSelection",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "inherit_parent"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "exact": {
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "$ref": "#/$defs/AgentExecutionProfileId"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "profile_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "exact"
+      ]
+    }
+  ],
+  "$defs": {
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

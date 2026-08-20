@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentRouteAction",
+  "type": "string",
+  "enum": [
+    "send_message",
+    "start_agent",
+    "create_task",
+    "schedule_task",
+    "review_task_result",
+    "deliver_result"
+  ]
+}

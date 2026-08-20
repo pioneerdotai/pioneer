@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentStartTarget",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "current_thread"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "same_capsule_thread": {
+          "type": "object",
+          "properties": {
+            "thread_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "thread_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "same_capsule_thread"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "routed_thread": {
+          "type": "object",
+          "properties": {
+            "route_id": {
+              "$ref": "#/$defs/AgentDelegationRouteId"
+            },
+            "thread_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "route_id",
+            "thread_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "routed_thread"
+      ]
+    }
+  ],
+  "$defs": {
+    "AgentDelegationRouteId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

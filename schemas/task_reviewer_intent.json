@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskReviewerIntent",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "parent",
+        "runtime_auto"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "human": {
+          "type": "object",
+          "properties": {
+            "principal_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "principal_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "human"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "object",
+          "properties": {
+            "execution_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "execution_id"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent"
+      ]
+    }
+  ]
+}

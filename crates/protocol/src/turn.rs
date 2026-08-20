@@ -319,6 +319,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct TurnStartParams {
+    /// Explicit, bounded cross-capsule delegations requested for this root
+    /// Agent execution. These are authorization inputs, never prompt content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_delegation_routes: Vec<crate::AgentRootDelegationRequest>,
     pub thread_id: String,
     pub turn_id: String,
     #[serde(default)]
@@ -333,6 +337,11 @@ pub struct TurnStartParams {
     pub sandbox_policy: Option<SandboxPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ThreadMode>,
+    /// Typed identity/profile intent for a root Agent Turn. When omitted, the
+    /// protected Pioneer identity is selected, or the exact CLI identity named
+    /// by `execution_backend` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_launch: Option<crate::AgentLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2149,6 +2158,11 @@ pub struct TurnAuthorSnapshot {
     pub nickname: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_revision: Option<String>,
+    /// Full immutable identity presentation for an agent-authored Turn.  This
+    /// is carried with the Turn instead of being reconstructed from mutable
+    /// identity/runtime state. Non-agent actors leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::AgentPresentationSnapshot>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -5741,6 +5755,7 @@ mod tests {
     #[test]
     fn turn_start_params_encode_user_input_tagged_enum() {
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thr_123".to_owned(),
             turn_id: "turn_123".to_owned(),
             input: vec![UserInput::Image {
@@ -5751,6 +5766,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,
@@ -5806,6 +5822,7 @@ mod tests {
     #[test]
     fn turn_start_params_encode_extended_attachment_input_variants() {
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thr_123".to_owned(),
             turn_id: "turn_123".to_owned(),
             input: vec![
@@ -5837,6 +5854,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,

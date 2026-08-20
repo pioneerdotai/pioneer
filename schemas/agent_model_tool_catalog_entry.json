@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentModelToolCatalogEntry",
+  "type": "object",
+  "properties": {
+    "capability": {
+      "$ref": "#/$defs/AgentToolCapability"
+    },
+    "description": {
+      "type": "string"
+    },
+    "name": {
+      "$ref": "#/$defs/AgentModelToolName"
+    },
+    "parameters": true
+  },
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "description",
+    "parameters",
+    "capability"
+  ],
+  "$defs": {
+    "AgentModelToolName": {
+      "description": "Names exposed to a model.  These are intentionally distinct from internal\nservice methods and contain no provider-specific tool names.",
+      "type": "string",
+      "enum": [
+        "agent_start_options",
+        "send_message",
+        "create_thread",
+        "start_agent",
+        "create_task",
+        "schedule_task",
+        "review_task",
+        "control_task",
+        "wait",
+        "result"
+      ]
+    },
+    "AgentToolCapability": {
+      "description": "Capability gates are evaluated by the server before a tool is projected.",
+      "type": "string",
+      "enum": [
+        "message_create",
+        "thread_create",
+        "child_start",
+        "task_create",
+        "task_schedule",
+        "task_review",
+        "task_control",
+        "task_observe",
+        "result_read"
+      ]
+    }
+  }
+}

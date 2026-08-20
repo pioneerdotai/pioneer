@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentDelegationRouteListResponse",
+  "type": "object",
+  "properties": {
+    "nextCursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentDelegationRouteProjection"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "routes"
+  ],
+  "$defs": {
+    "AgentDelegationRouteId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentDelegationRouteProjection": {
+      "description": "Safe route projection returned to an authorized caller. It intentionally\ncontains no participant list, prompt, credential, provider session or raw\nACL data.",
+      "type": "object",
+      "properties": {
+        "allowedActions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentRouteAction"
+          }
+        },
+        "destinationAgentIdentityId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentIdentityId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destinationCapsuleId": {
+          "type": "string"
+        },
+        "destinationGatewayId": {
+          "type": "string"
+        },
+        "destinationPolicyGeneration": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "destinationProfileId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "destinationThreadId": {
+          "type": "string"
+        },
+        "destinationWorkspaceId": {
+          "type": "string"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/AgentRouteDisclosurePolicy"
+        },
+        "expiresAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "grantFingerprint": {
+          "type": "string"
+        },
+        "hopCount": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "id": {
+          "$ref": "#/$defs/AgentDelegationRouteId"
+        },
+        "kind": {
+          "$ref": "#/$defs/AgentRouteKind"
+        },
+        "maxHops": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "returnRouteId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentDelegationRouteId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sourceAgentIdentityId": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "sourceCapsuleId": {
+          "type": "string",
+          "default": ""
+        },
+        "sourceExecutionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "sourceGatewayId": {
+          "type": "string"
+        },
+        "sourcePolicyGeneration": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sourceWorkspaceId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/AgentRouteStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "sourceExecutionId",
+        "destinationThreadId",
+        "destinationCapsuleId",
+        "kind",
+        "status",
+        "allowedActions",
+        "disclosure",
+        "sourceAgentIdentityId",
+        "sourceWorkspaceId",
+        "destinationWorkspaceId",
+        "sourceGatewayId",
+        "destinationGatewayId",
+        "generation",
+        "sourcePolicyGeneration",
+        "destinationPolicyGeneration",
+        "hopCount",
+        "maxHops",
+        "grantFingerprint"
+      ]
+    },
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentResultReturnPolicy": {
+      "type": "string",
+      "enum": [
+        "none",
+        "summary_only",
+        "full_result"
+      ]
+    },
+    "AgentRouteAction": {
+      "type": "string",
+      "enum": [
+        "send_message",
+        "start_agent",
+        "create_task",
+        "schedule_task",
+        "review_task_result",
+        "deliver_result"
+      ]
+    },
+    "AgentRouteDisclosurePolicy": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "description": "Exact, already-authorized artifact handles. Raw files and paths are\nnever represented by this flag.",
+          "type": "boolean",
+          "default": false
+        },
+        "context": {
+          "description": "Bounded conversation excerpts or summaries selected by server policy.",
+          "type": "boolean",
+          "default": false
+        },
+        "resultReturn": {
+          "description": "Result return is a separate disclosure class: allowing ordinary text\nmust never imply that a full Task result can cross a capsule boundary.",
+          "$ref": "#/$defs/AgentResultReturnPolicy",
+          "default": "none"
+        },
+        "text": {
+          "description": "Explicit text authored for the routed operation.",
+          "type": "boolean",
+          "default": false
+        },
+        "userInput": {
+          "description": "Explicit user-provided Task inputs. This is deliberately independent\nfrom Agent-authored text and inherited conversation context.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "AgentRouteKind": {
+      "type": "string",
+      "enum": [
+        "execution_bound",
+        "identity_bound"
+      ]
+    },
+    "AgentRouteStatus": {
+      "type": "string",
+      "enum": [
+        "prepared",
+        "active",
+        "expired",
+        "revoked"
+      ]
+    }
+  }
+}

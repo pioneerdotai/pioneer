@@ -375,6 +375,17 @@ pub enum TaskResultReviewerKind {
     System,
 }
 
+/// Exact actor recorded on a review event. The reviewer kind remains the
+/// coarse presentation/classification value; this reference is the durable
+/// identity used for authorization and audit.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "id")]
+pub enum TaskResultReviewerRef {
+    Principal(crate::PrincipalId),
+    AgentExecution(crate::AgentExecutionId),
+    RuntimePolicy,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskResultReviewEventKind {
@@ -1234,6 +1245,8 @@ pub struct TaskResultReviewEvent {
     pub run_id: String,
     pub task_run_turn_id: String,
     pub reviewer_kind: TaskResultReviewerKind,
+    /// Exact durable reviewer used for authorization and audit.
+    pub reviewer: TaskResultReviewerRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1589,6 +1602,8 @@ pub enum TaskEventPayload {
     },
     DeliveryCancelled {
         delivery: TaskDelivery,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<TaskDeliveryAttempt>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
@@ -2100,6 +2115,8 @@ pub struct TaskCreateParams {
     #[serde(default)]
     pub priority: i64,
     pub trigger: TaskTriggerInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<crate::AgentLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_spec: Option<TaskAgentSpecInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3340,6 +3357,14 @@ pub struct TaskUserNotificationDeliveredNotification {
     pub task_id: String,
     pub run_id: String,
     pub delivery_id: String,
+    /// Exact immutable author of an agent-produced result. Scheduler/system
+    /// diagnostics leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<crate::AgentPresentationSnapshot>,
+    /// Canonical delivery receipt committed with the exact-recipient inbox
+    /// row. It is opaque to clients but preserves reconnect-safe provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_action_receipt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<PublicTaskResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3360,6 +3385,10 @@ pub struct TaskUserNotification {
     pub task_id: String,
     pub run_id: String,
     pub delivery_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<crate::AgentPresentationSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_action_receipt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<PublicTaskResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3459,9 +3488,10 @@ pub struct TaskTurnItem {
 mod tests {
     use super::{
         TaskAgentSpec, TaskEventPayload, TaskExecutorKind, TaskGetResponse, TaskOwnerKind,
-        TaskRescheduleReason, TaskResultReviewerKind, TaskRunExecutionStatus, TaskRunStatus,
-        TaskStatus, TaskTriggerKind, TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem,
-        TaskWaitMode, TaskWaitResponse, TaskWaitReviewAction, TaskWaitRevisionBlockedReason,
+        TaskRescheduleReason, TaskResultReviewerKind, TaskResultReviewerRef,
+        TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerKind, TaskTriggerSpec,
+        TaskTriggerStatus, TaskTurnItem, TaskWaitMode, TaskWaitResponse, TaskWaitReviewAction,
+        TaskWaitRevisionBlockedReason,
     };
     use serde_json::json;
 
@@ -3499,6 +3529,7 @@ mod tests {
     #[test]
     fn composer_work_round_trips_exact_launch_and_rebinds_only_execution_ids() {
         let launch = crate::TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thr_parent".to_owned(),
             turn_id: "turn_planned".to_owned(),
             input: vec![
@@ -3522,6 +3553,7 @@ mod tests {
             model_provider: Some("openai".to_owned()),
             sandbox_policy: None,
             mode: Some(crate::ThreadMode::Agent),
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: Some(crate::AgentExecutionBackend::ApiProvider {
@@ -3908,6 +3940,28 @@ mod tests {
             serde_json::to_value(TaskWaitRevisionBlockedReason::MaxRevisionRoundsReached)
                 .expect("blocked reason should encode"),
             json!("max_revision_rounds_reached")
+        );
+    }
+
+    #[test]
+    fn task_result_reviewer_ref_keeps_exact_agent_identity() {
+        let reviewer = TaskResultReviewerRef::AgentExecution(
+            crate::AgentExecutionId::new("R00000000000000000001")
+                .expect("valid reviewer execution id"),
+        );
+        assert_eq!(
+            serde_json::to_value(&reviewer).expect("reviewer ref should encode"),
+            json!({
+                "kind": "agent_execution",
+                "id": "R00000000000000000001"
+            })
+        );
+        assert!(
+            serde_json::from_value::<TaskResultReviewerRef>(json!({
+                "kind": "principal",
+                "id": "alice"
+            }))
+            .is_err()
         );
     }
 

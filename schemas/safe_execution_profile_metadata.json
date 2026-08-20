@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SafeExecutionProfileMetadata",
+  "description": "The profile data a product surface may explain without exposing provider,\nmodel, credentials, runtime IDs, or local paths.",
+  "type": "object",
+  "properties": {
+    "backend": {
+      "type": "string"
+    },
+    "modelLabel": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "profileId": {
+      "type": "string"
+    },
+    "providerLabel": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "profileId",
+    "backend"
+  ]
+}

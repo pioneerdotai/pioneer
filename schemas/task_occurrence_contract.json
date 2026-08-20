@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskOccurrenceContract",
+  "type": "object",
+  "properties": {
+    "actionIdempotencyKey": {
+      "type": "string"
+    },
+    "agentExecutionId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "executionGeneration": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "occurrenceId": {
+      "type": "string"
+    },
+    "occurrenceKey": {
+      "type": "string"
+    },
+    "queuePosition": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "resultReturnRouteId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "retryAttempt": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "rootResourceScopeId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "routeId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runId": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskOccurrenceStatus"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "terminalReason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "triggerId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workGraphRootExecutionId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "occurrenceId",
+    "taskId",
+    "runId",
+    "occurrenceKey",
+    "executionGeneration",
+    "status",
+    "retryAttempt",
+    "actionIdempotencyKey"
+  ],
+  "$defs": {
+    "TaskOccurrenceStatus": {
+      "type": "string",
+      "enum": [
+        "dormant",
+        "queued",
+        "recovering",
+        "running",
+        "waiting_review",
+        "delivered",
+        "failed",
+        "cancelled"
+      ]
+    }
+  }
+}

@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentTaskActionSelection",
+  "type": "object",
+  "properties": {
+    "launch": {
+      "$ref": "#/$defs/AgentLaunchSelection"
+    },
+    "taskTemplateId": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "taskTemplateId",
+    "launch"
+  ],
+  "$defs": {
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentExecutionProfileSelection": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "inherit_parent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "object",
+              "properties": {
+                "profile_id": {
+                  "$ref": "#/$defs/AgentExecutionProfileId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "profile_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        }
+      ]
+    },
+    "AgentExecutionSelection": {
+      "type": "object",
+      "properties": {
+        "mcpServerIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "permissionProfile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnPermissionProfileSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "profile": {
+          "$ref": "#/$defs/AgentExecutionProfileSelection"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnReasoningSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skillIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillId"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile"
+      ]
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySelection": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "inherit_parent",
+            "default_pioneer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "object",
+              "properties": {
+                "agent_identity_id": {
+                  "$ref": "#/$defs/AgentIdentityId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "agent_identity_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "server_derived_ephemeral": {
+              "type": "object",
+              "properties": {
+                "display_name_hint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "role_label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "server_derived_ephemeral"
+          ]
+        }
+      ]
+    },
+    "AgentLaunchSelection": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentIdentitySelection"
+        },
+        "execution": {
+          "$ref": "#/$defs/AgentExecutionSelection"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "execution"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileSelection": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    }
+  }
+}

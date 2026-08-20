@@ -60,6 +60,12 @@
     "task"
   ],
   "$defs": {
+    "AgentDelegationRouteId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
     "AgentExecutionBackend": {
       "oneOf": [
         {
@@ -115,6 +121,287 @@
           ]
         }
       ]
+    },
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentExecutionProfileId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentExecutionProfileSelection": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "inherit_parent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "object",
+              "properties": {
+                "profile_id": {
+                  "$ref": "#/$defs/AgentExecutionProfileId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "profile_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        }
+      ]
+    },
+    "AgentExecutionSelection": {
+      "type": "object",
+      "properties": {
+        "mcpServerIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "permissionProfile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnPermissionProfileSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "profile": {
+          "$ref": "#/$defs/AgentExecutionProfileSelection"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnReasoningSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skillIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillId"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile"
+      ]
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySelection": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "inherit_parent",
+            "default_pioneer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "exact": {
+              "type": "object",
+              "properties": {
+                "agent_identity_id": {
+                  "$ref": "#/$defs/AgentIdentityId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "agent_identity_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "exact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "server_derived_ephemeral": {
+              "type": "object",
+              "properties": {
+                "display_name_hint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "role_label": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "server_derived_ephemeral"
+          ]
+        }
+      ]
+    },
+    "AgentLaunchSelection": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentIdentitySelection"
+        },
+        "execution": {
+          "$ref": "#/$defs/AgentExecutionSelection"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "execution"
+      ]
+    },
+    "AgentResultReturnPolicy": {
+      "type": "string",
+      "enum": [
+        "none",
+        "summary_only",
+        "full_result"
+      ]
+    },
+    "AgentRootDelegationRequest": {
+      "description": "Optional typed extension accepted by `turn/start` for automatic,\nshort-lived root-execution delegation. It is deliberately separate from\nthe prompt and has no participant/role/ACL fields.",
+      "type": "object",
+      "properties": {
+        "allowedActions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentRouteAction"
+          }
+        },
+        "destinationAgentIdentityId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentIdentityId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destinationProfileId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentExecutionProfileId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destinationThreadId": {
+          "type": "string"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/AgentRouteDisclosurePolicy"
+        },
+        "expiresAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "idempotencyKey": {
+          "type": "string"
+        },
+        "returnRouteId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentDelegationRouteId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "destinationThreadId",
+        "allowedActions",
+        "disclosure",
+        "expiresAt",
+        "idempotencyKey"
+      ]
+    },
+    "AgentRouteAction": {
+      "type": "string",
+      "enum": [
+        "send_message",
+        "start_agent",
+        "create_task",
+        "schedule_task",
+        "review_task_result",
+        "deliver_result"
+      ]
+    },
+    "AgentRouteDisclosurePolicy": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "description": "Exact, already-authorized artifact handles. Raw files and paths are\nnever represented by this flag.",
+          "type": "boolean",
+          "default": false
+        },
+        "context": {
+          "description": "Bounded conversation excerpts or summaries selected by server policy.",
+          "type": "boolean",
+          "default": false
+        },
+        "resultReturn": {
+          "description": "Result return is a separate disclosure class: allowing ordinary text\nmust never imply that a full Task result can cross a capsule boundary.",
+          "$ref": "#/$defs/AgentResultReturnPolicy",
+          "default": "none"
+        },
+        "text": {
+          "description": "Explicit text authored for the routed operation.",
+          "type": "boolean",
+          "default": false
+        },
+        "userInput": {
+          "description": "Explicit user-provided Task inputs. This is deliberately independent\nfrom Agent-authored text and inherited conversation context.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
     },
     "ByteRange": {
       "type": "object",
@@ -1403,6 +1690,10 @@
             "null"
           ]
         },
+        "reviewer": {
+          "description": "Exact durable reviewer used for authorization and audit.",
+          "$ref": "#/$defs/TaskResultReviewerRef"
+        },
         "reviewerAgentSpecId": {
           "type": [
             "string",
@@ -1453,6 +1744,7 @@
         "runId",
         "taskRunTurnId",
         "reviewerKind",
+        "reviewer",
         "eventKind",
         "decision",
         "createdAt"
@@ -1485,6 +1777,55 @@
         "review_agent",
         "user",
         "system"
+      ]
+    },
+    "TaskResultReviewerRef": {
+      "description": "Exact actor recorded on a review event. The reviewer kind remains the\ncoarse presentation/classification value; this reference is the durable\nidentity used for authorization and audit.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/AgentExecutionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent_execution"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "runtime_policy"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
       ]
     },
     "TaskResultReviewerSpec": {
@@ -2635,6 +2976,24 @@
     "TurnStartParams": {
       "type": "object",
       "properties": {
+        "agent_delegation_routes": {
+          "description": "Explicit, bounded cross-capsule delegations requested for this root\nAgent execution. These are authorization inputs, never prompt content.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentRootDelegationRequest"
+          }
+        },
+        "agent_launch": {
+          "description": "Typed identity/profile intent for a root Agent Turn. When omitted, the\nprotected Pioneer identity is selected, or the exact CLI identity named\nby `execution_backend` is used.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentLaunchSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "capabilities": {
           "type": "array",
           "items": {
