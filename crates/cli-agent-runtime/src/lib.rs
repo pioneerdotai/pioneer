@@ -16,6 +16,7 @@ pub mod codex_attestation;
 pub mod config;
 pub mod driver;
 pub mod event;
+pub mod identity;
 pub mod input;
 pub mod instructions;
 pub mod mcp;
@@ -25,6 +26,11 @@ pub mod reserved_args;
 pub mod session;
 
 pub const CLI_AGENT_RUNTIME_BOUNDARY: &str = "cli-agent-runtime";
+
+pub use identity::{
+    AgentExecutionProfileIdError, CliRuntimeAgentBinding, CliRuntimeExecutionBinding,
+    CliRuntimeIdentityBindingError, CliRuntimeReconnectDecision,
+};
 
 #[cfg(test)]
 mod tests {
