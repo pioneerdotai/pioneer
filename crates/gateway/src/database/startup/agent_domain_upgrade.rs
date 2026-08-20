@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_protocol::{
-    SkillId, Task, TaskExecutorKind, TaskOccurrenceContract, TaskOccurrenceStatus, TaskOwnerKind,
-    TaskRun, TaskRunStatus,
+    AuthSessionId, DeviceId, GatewayId, PrincipalId, RoleKey, SkillId, Task, TaskExecutorKind,
+    TaskOccurrenceContract, TaskOccurrenceStatus, TaskOwnerKind, TaskRun, TaskRunStatus,
 };
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use tracing::info;
@@ -14,6 +14,7 @@ use crate::message::MessageProcessor;
 /// listener starts. The final runtime assumes these rows exist and contains
 /// no alternate path for an older Task representation.
 pub(crate) async fn apply(processor: &MessageProcessor) -> Result<()> {
+    normalize_execution_authorization_contexts(processor).await?;
     let task_ids = tasks_requiring_conversion(processor).await?;
     let mut converted_tasks = 0_usize;
     let mut converted_occurrences = 0_usize;
@@ -58,6 +59,70 @@ pub(crate) async fn apply(processor: &MessageProcessor) -> Result<()> {
         converted_tasks,
         converted_occurrences, converted_deliveries, "Agent domain data upgrade is complete"
     );
+    Ok(())
+}
+
+async fn normalize_execution_authorization_contexts(processor: &MessageProcessor) -> Result<()> {
+    let database = processor.crud_store.database_connection();
+    for (table, column) in [
+        ("task_execution_admission", "authorization_context_json"),
+        ("turn", "execution_authorization_context_json"),
+    ] {
+        let current = format!("{table}.{column}");
+        let sql = format!(
+            "UPDATE {table} SET {column} = json_set(\
+                {current}, \
+                '$.human_interaction_budget', json_object(\
+                    'max_pending_requests_per_execution', \
+                    COALESCE(json_extract({current}, '$.human_interaction_budget.max_pending_requests_per_execution'), 8)\
+                ), \
+                '$.mcp_invocation_limits', json_object(\
+                    'profile_version', 5, \
+                    'max_arguments_bytes', \
+                    COALESCE(json_extract({current}, '$.mcp_invocation_limits.max_arguments_bytes'), 131072), \
+                    'max_queue_wait_ms', \
+                    COALESCE(\
+                        json_extract({current}, '$.mcp_invocation_limits.max_queue_wait_ms'), \
+                        json_extract({current}, '$.mcp_invocation_limits.max_timeout_ms'), \
+                        120000\
+                    ), \
+                    'max_concurrent_calls', \
+                    COALESCE(json_extract({current}, '$.mcp_invocation_limits.max_concurrent_calls'), 8), \
+                    'max_queued_calls', \
+                    COALESCE(json_extract({current}, '$.mcp_invocation_limits.max_queued_calls'), 16)\
+                ), \
+                '$.native_event_budget', json_object(\
+                    'profile_version', 2, \
+                    'max_frame_bytes', \
+                    COALESCE(json_extract({current}, '$.native_event_budget.max_frame_bytes'), 1048576), \
+                    'max_recovery_frame_bytes', MAX(\
+                        COALESCE(\
+                            json_extract({current}, '$.native_event_budget.max_recovery_frame_bytes'), \
+                            67108864\
+                        ), \
+                        COALESCE(json_extract({current}, '$.native_event_budget.max_frame_bytes'), 1048576)\
+                    )\
+                )\
+             ) \
+             WHERE {column} IS NOT NULL AND (\
+                 json_type({current}, '$.human_interaction_budget') IS NULL OR \
+                 json_type({current}, '$.human_interaction_budget.max_questions_per_request') IS NOT NULL OR \
+                 json_type({current}, '$.human_interaction_budget.max_pending_requests_per_execution') IS NULL OR \
+                 COALESCE(json_extract({current}, '$.mcp_invocation_limits.profile_version'), 0) <> 5 OR \
+                 json_type({current}, '$.mcp_invocation_limits.max_arguments_depth') IS NOT NULL OR \
+                 json_type({current}, '$.mcp_invocation_limits.max_queue_wait_ms') IS NULL OR \
+                 COALESCE(json_extract({current}, '$.native_event_budget.profile_version'), 0) <> 2 OR \
+                 json_type({current}, '$.native_event_budget.max_json_depth') IS NOT NULL OR \
+                 json_type({current}, '$.native_event_budget.max_recovery_frame_bytes') IS NULL\
+             )"
+        );
+        database
+            .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+            .await
+            .with_context(|| {
+                format!("failed to normalize final execution authorization data in `{table}`")
+            })?;
+    }
     Ok(())
 }
 
@@ -273,8 +338,9 @@ async fn build_actor_contract(
         .iter()
         .find(|spec| spec.run_id.is_none())
         .or_else(|| response.agent_specs.first());
+    let creator_id = exact_task_creator(processor, task).await?;
     let mut context = pioneer_tasks::TaskCreateContext {
-        actor_id: exact_task_creator(processor, task).await?,
+        actor_id: creator_id.clone(),
         ..Default::default()
     };
 
@@ -285,30 +351,72 @@ async fn build_actor_contract(
                 task.id
             )
         })?;
-        let admission = processor
+        let persisted_admission = processor
             .crud_store
             .get_task_execution_admission(task.id.as_str())
-            .await?
-            .with_context(|| {
-                format!(
-                    "Agent Task `{}` has no execution admission to convert",
-                    task.id
-                )
-            })?;
-        let admitted =
-            crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
-                processor.crud_store.as_ref(),
-                &admission,
-            )
             .await?;
+        let (admitted, execution_admission) = match persisted_admission {
+            Some(admission) => {
+                let admitted =
+                    crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+                        processor.crud_store.as_ref(),
+                        &admission,
+                    )
+                    .await?;
+                let (execution_resources, task_resources) = admitted.admitted_resource_budgets()?;
+                let seed = pioneer_tasks::TaskExecutionAdmissionSeed {
+                    workspace_id: admission.workspace_id,
+                    root_thread_id: admission.root_thread_id,
+                    initiating_principal_id: admission.initiating_principal_id,
+                    authorization_context_json: admission.authorization_context_json,
+                    role_key: admitted.role_key().to_owned(),
+                    policy_fingerprint: admitted.policy_fingerprint().to_owned(),
+                    execution_resources,
+                    task_resources,
+                };
+                (admitted, Some(seed))
+            }
+            None => {
+                let creator_id = creator_id.as_deref().with_context(|| {
+                    format!(
+                        "historical Agent Task `{}` has no exact principal creator",
+                        task.id
+                    )
+                })?;
+                let principal = data_upgrade_principal(processor, creator_id).await?;
+                let seed = processor
+                    .task_execution_admission_seed_for_existing_task(
+                        &principal,
+                        task.created_by_thread_id.as_deref(),
+                        response,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to authorize historical Agent Task `{}` during conversion",
+                            task.id
+                        )
+                    })?;
+                let admitted =
+                    crate::authorization::ExecutionAuthorizationContext::from_persisted_json(
+                        seed.authorization_context_json.as_str(),
+                    )?;
+                // The temporary admission is used only to evaluate the current,
+                // final authorization policy. Historical terminal Tasks did not
+                // persist an execution admission, so no invented session
+                // provenance is written to the database.
+                (admitted, None)
+            }
+        };
         let root_thread = processor
             .crud_store
-            .get_thread_by_id(admission.root_thread_id.as_str())
+            .get_thread_by_id(admitted.root_thread_id())
             .await?
             .with_context(|| {
                 format!(
                     "Agent Task `{}` execution root `{}` is missing",
-                    task.id, admission.root_thread_id
+                    task.id,
+                    admitted.root_thread_id()
                 )
             })?;
         let source_provider = agent_spec
@@ -365,27 +473,61 @@ async fn build_actor_contract(
             child_launch_grant,
         )
         .map_err(|error| anyhow!("failed to freeze Agent Task authorization: {error:?}"))?;
-        let (execution_resources, task_resources) = admitted.admitted_resource_budgets()?;
 
-        context.actor_id = Some(admission.initiating_principal_id.clone());
         context.launch_selection = Some(canonical_launch);
         context.resolved_launch_identity = Some(identity);
         context.resolved_launch_profile = Some(profile);
         context.agent_authorization_grant = Some(authorization_grant);
-        context.execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
-            workspace_id: admission.workspace_id,
-            root_thread_id: admission.root_thread_id,
-            initiating_principal_id: admission.initiating_principal_id,
-            authorization_context_json: admission.authorization_context_json,
-            role_key: admitted.role_key().to_owned(),
-            policy_fingerprint: admitted.policy_fingerprint().to_owned(),
-            execution_resources,
-            task_resources,
-        });
+        context.execution_admission = execution_admission;
     }
 
     pioneer_tasks::build_task_actor_contract(task, task_agent_spec, &context, task.created_at)
         .with_context(|| format!("failed to convert Task `{}` actor contract", task.id))
+}
+
+async fn data_upgrade_principal(
+    processor: &MessageProcessor,
+    principal_id: &str,
+) -> Result<crate::auth::AuthenticatedSessionPrincipal> {
+    let row = processor
+        .crud_store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT principal.gateway_id, principal.kind AS principal_kind, principal.role_key, \
+                    session.device_id, session.id AS session_id \
+             FROM gateway_principal principal \
+             JOIN auth_session session ON session.principal_id = principal.id \
+             JOIN device ON device.id = session.device_id \
+             WHERE principal.id = ? \
+               AND principal.status = 'active' \
+               AND session.status = 'active' \
+               AND device.status = 'active' \
+             ORDER BY session.last_seen_at DESC, session.id DESC \
+             LIMIT 1",
+            [principal_id.into()],
+        ))
+        .await?
+        .with_context(|| {
+            format!(
+                "historical Agent Task principal `{principal_id}` has no active local session for one-time authorization conversion"
+            )
+        })?;
+    let gateway_id: String = row.try_get("", "gateway_id")?;
+    let principal_kind: String = row.try_get("", "principal_kind")?;
+    let role_key: Option<String> = row.try_get("", "role_key")?;
+    let device_id: String = row.try_get("", "device_id")?;
+    let session_id: String = row.try_get("", "session_id")?;
+    Ok(crate::auth::AuthenticatedSessionPrincipal {
+        gateway_id: GatewayId::new(gateway_id)?,
+        principal_id: PrincipalId::new(principal_id.to_owned())?,
+        kind: pioneer_crud::principal_kind_from_db(principal_kind.as_str())?,
+        role_key: role_key.map(RoleKey::new).transpose()?,
+        device_id: DeviceId::new(device_id)?,
+        session_id: AuthSessionId::new(session_id)?,
+        access_jti: "agent-domain-data-upgrade".to_owned(),
+        access_expires_at_unix: u64::MAX,
+    })
 }
 
 async fn exact_task_creator(processor: &MessageProcessor, task: &Task) -> Result<Option<String>> {
@@ -539,6 +681,9 @@ async fn verify_conversion(processor: &MessageProcessor) -> Result<()> {
         (
             "Task turns without execution ownership",
             "SELECT COUNT(*) AS row_count FROM task_run_turn task_turn \
+             JOIN turn materialized_turn \
+               ON materialized_turn.id = task_turn.turn_id \
+              AND materialized_turn.thread_id = task_turn.thread_id \
              WHERE NOT EXISTS (SELECT 1 FROM turn_execution execution WHERE execution.turn_id = task_turn.turn_id)",
         ),
         (

@@ -52,8 +52,19 @@ async fn add_turn_agent_author_snapshot(manager: &SchemaManager<'_>) -> Result<(
 // --- action timeline target ---
 
 const ACTION_TIMELINE_TARGET_TABLE: &str = "agent_action_timeline_target";
+const TURN_ITEM_BACKING_TABLE: &str = "_turn_item_zstd";
 
 async fn create_action_timeline_target_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    // sqlite-zstd exposes `turn_item` as a writable view after moving the
+    // durable rows into `_turn_item_zstd`. SQLite foreign keys cannot target a
+    // view, so upgrades of an already-compressed database must reference the
+    // backing table. On a fresh database the ordinary table is still present;
+    // sqlite-zstd's later rename rewrites this reference to the backing name.
+    let turn_item_table = if manager.has_table(TURN_ITEM_BACKING_TABLE).await? {
+        TURN_ITEM_BACKING_TABLE
+    } else {
+        "turn_item"
+    };
     manager
         .create_table(
             Table::create()
@@ -92,7 +103,7 @@ async fn create_action_timeline_target_schema(manager: &SchemaManager<'_>) -> Re
                             Alias::new(ACTION_TIMELINE_TARGET_TABLE),
                             Alias::new("turn_item_id"),
                         )
-                        .to(Alias::new("turn_item"), Alias::new("id"))
+                        .to(Alias::new(turn_item_table), Alias::new("id"))
                         .on_delete(ForeignKeyAction::Restrict),
                 )
                 .check((
@@ -225,9 +236,12 @@ async fn migrate_conversation_actor_constraints(manager: &SchemaManager<'_>) -> 
     Ok(())
 }
 
-/// Existing Task turns predate the mandatory execution-owner row. Convert
-/// every one while the application is stopped so runtime and recovery have a
-/// single invariant: a Task turn always owns a `turn_execution` record.
+/// Existing materialized Task turns predate the mandatory execution-owner
+/// row. Convert every one while the application is stopped so runtime and
+/// recovery have a single invariant: a durable Turn always owns a
+/// `turn_execution` record. Historical failed Task attempts that never
+/// materialized their preallocated Turn id remain ordinary terminal attempt
+/// records and must not gain an orphan execution row.
 async fn migrate_task_turn_execution_ownership(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     if manager.get_database_backend() != DatabaseBackend::Sqlite {
         return Err(DbErr::Migration(
@@ -266,6 +280,9 @@ async fn migrate_task_turn_execution_ownership(manager: &SchemaManager<'_>) -> R
             task_turn.created_at, CURRENT_TIMESTAMP \
          FROM task_run_turn task_turn \
          JOIN task ON task.id = task_turn.task_id \
+         JOIN turn materialized_turn \
+           ON materialized_turn.id = task_turn.turn_id \
+          AND materialized_turn.thread_id = task_turn.thread_id \
          LEFT JOIN turn_execution execution ON execution.turn_id = task_turn.turn_id \
          WHERE execution.turn_id IS NULL"
             .to_owned(),
@@ -277,6 +294,9 @@ async fn migrate_task_turn_execution_ownership(manager: &SchemaManager<'_>) -> R
         .query_one_raw(Statement::from_string(
             DatabaseBackend::Sqlite,
             "SELECT COUNT(*) AS row_count FROM task_run_turn task_turn \
+             JOIN turn materialized_turn \
+               ON materialized_turn.id = task_turn.turn_id \
+              AND materialized_turn.thread_id = task_turn.thread_id \
              LEFT JOIN turn_execution execution ON execution.turn_id = task_turn.turn_id \
              WHERE execution.turn_id IS NULL"
                 .to_owned(),
