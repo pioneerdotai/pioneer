@@ -1,4 +1,5 @@
 mod bootstrap;
+pub(crate) mod catalog;
 mod invariants;
 
 #[cfg(test)]

@@ -369,6 +369,8 @@ struct GatewayCliRuntimeInstanceSettingsOverride {
     id: String,
     kind: GatewayCliAgentRuntimeKindConfig,
     display_name: String,
+    #[serde(default)]
+    nickname: String,
     enabled: bool,
     binary_path: String,
     home_path: String,
@@ -577,7 +579,10 @@ impl GatewaySettings {
         &self,
         config: &GatewayConfig,
     ) -> pioneer_protocol::GatewayCliRuntimeSettings {
-        cli_runtime_settings_from_gateway_config(&self.apply_to_gateway_config(config.clone()))
+        cli_runtime_settings_from_gateway_config(
+            &self.apply_to_gateway_config(config.clone()),
+            self.cli_runtimes.as_ref(),
+        )
     }
 
     pub fn remote_access_secret_ref(&self) -> Option<&str> {
@@ -980,6 +985,7 @@ impl GatewaySettings {
                 id: "claude".to_owned(),
                 kind: GatewayCliAgentRuntimeKindConfig::Claude,
                 display_name: "Claude CLI".to_owned(),
+                nickname: "claude".to_owned(),
                 enabled: true,
                 binary_path: "claude".to_owned(),
                 home_path: "~/.claude".to_owned(),
@@ -1855,6 +1861,7 @@ impl GatewayCliRuntimeSettingsOverride {
         let mut normalized_instances = Vec::with_capacity(settings.instances.len());
         let mut ids = HashSet::new();
         let mut display_names = HashSet::new();
+        let mut nicknames = HashSet::new();
 
         for instance in settings.instances {
             let id = normalize_cli_runtime_instance_id(instance.id.as_str())?;
@@ -1867,6 +1874,11 @@ impl GatewayCliRuntimeSettingsOverride {
             let display_name_key = display_name.to_ascii_lowercase();
             if !display_names.insert(display_name_key) {
                 bail!("duplicate CLI runtime display name `{display_name}`");
+            }
+
+            let nickname = normalize_cli_runtime_nickname(instance.nickname.as_str(), id.as_str())?;
+            if !nicknames.insert(nickname.clone()) {
+                bail!("duplicate CLI runtime nickname `{nickname}`");
             }
 
             let binary_path =
@@ -1885,6 +1897,7 @@ impl GatewayCliRuntimeSettingsOverride {
                 id,
                 kind: cli_runtime_kind_from_protocol(instance.kind)?,
                 display_name,
+                nickname,
                 enabled: instance.enabled,
                 binary_path,
                 home_path,
@@ -1932,22 +1945,34 @@ impl GatewayCliRuntimeSettingsOverride {
 
 fn cli_runtime_settings_from_gateway_config(
     config: &GatewayConfig,
+    overrides: Option<&GatewayCliRuntimeSettingsOverride>,
 ) -> pioneer_protocol::GatewayCliRuntimeSettings {
     pioneer_protocol::GatewayCliRuntimeSettings {
         instances: config
             .effective_cli_agent_runtime_instances()
             .into_iter()
-            .map(
-                |instance| pioneer_protocol::GatewayCliRuntimeInstanceSettings {
-                    id: instance.id,
+            .map(|instance| {
+                let instance_id = instance.id.clone();
+                pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                    id: instance_id.clone(),
                     kind: cli_runtime_kind_to_protocol(instance.kind),
                     display_name: instance.display_name,
+                    nickname: overrides
+                        .and_then(|settings| {
+                            settings
+                                .instances
+                                .iter()
+                                .find(|configured| configured.id == instance_id)
+                        })
+                        .map(|configured| configured.nickname.clone())
+                        .filter(|nickname| !nickname.is_empty())
+                        .unwrap_or_else(|| instance.id.clone()),
                     enabled: instance.enabled,
                     binary_path: instance.binary_path,
                     home_path: instance.home_path,
                     shadow_home_path: instance.shadow_home_path,
-                },
-            )
+                }
+            })
             .collect(),
     }
 }
@@ -2113,6 +2138,17 @@ fn normalize_cli_runtime_display_name(raw: &str, id: &str) -> Result<String> {
         bail!("CLI runtime display name `{display_name}` contains unsupported control characters");
     }
     Ok(display_name)
+}
+
+fn normalize_cli_runtime_nickname(raw: &str, id: &str) -> Result<String> {
+    let candidate = if raw.trim().is_empty() {
+        id
+    } else {
+        raw.trim()
+    };
+    pioneer_protocol::AgentNicknameKey::new(candidate.to_owned())
+        .map(|nickname| nickname.to_string())
+        .map_err(|error| anyhow::anyhow!("invalid CLI runtime nickname `{candidate}`: {error}"))
 }
 
 fn normalize_cli_runtime_required_path(field: &str, raw: &str) -> Result<String> {
@@ -4004,6 +4040,7 @@ backend = "keystore"
                             id: "Codex Personal".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "Codex Personal".to_owned(),
+                            nickname: "codex-personal".to_owned(),
                             enabled: true,
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex".to_owned(),
@@ -4013,6 +4050,7 @@ backend = "keystore"
                             id: "codex_work".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "Codex Work".to_owned(),
+                            nickname: "codex-work".to_owned(),
                             enabled: false,
                             binary_path: "/opt/homebrew/bin/codex".to_owned(),
                             home_path: "~/.codex-work".to_owned(),
@@ -4290,6 +4328,7 @@ backend = "keystore"
                             id: "codex_one".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "Codex CLI".to_owned(),
+                            nickname: "codex-one".to_owned(),
                             enabled: true,
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex".to_owned(),
@@ -4299,6 +4338,7 @@ backend = "keystore"
                             id: "codex_two".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "codex cli".to_owned(),
+                            nickname: "codex-two".to_owned(),
                             enabled: true,
                             binary_path: "codex".to_owned(),
                             home_path: "~/.codex-two".to_owned(),
@@ -4311,6 +4351,37 @@ backend = "keystore"
             .expect_err("duplicate display names should be rejected");
         assert!(format!("{duplicate:#}").contains("duplicate CLI runtime display name"));
 
+        let duplicate_nickname = settings
+            .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
+                cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
+                    instances: vec![
+                        pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            id: "codex_one".to_owned(),
+                            kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                            display_name: "Codex One".to_owned(),
+                            nickname: "reviewer".to_owned(),
+                            enabled: true,
+                            binary_path: "codex".to_owned(),
+                            home_path: "~/.codex".to_owned(),
+                            shadow_home_path: None,
+                        },
+                        pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            id: "codex_two".to_owned(),
+                            kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                            display_name: "Codex Two".to_owned(),
+                            nickname: "REVIEWER".to_owned(),
+                            enabled: true,
+                            binary_path: "codex".to_owned(),
+                            home_path: "~/.codex-two".to_owned(),
+                            shadow_home_path: None,
+                        },
+                    ],
+                }),
+                ..pioneer_protocol::GatewaySettingsUpdate::default()
+            })
+            .expect_err("duplicate nicknames should be rejected");
+        assert!(format!("{duplicate_nickname:#}").contains("duplicate CLI runtime nickname"));
+
         let invalid_path = settings
             .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
                 cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
@@ -4318,6 +4389,7 @@ backend = "keystore"
                         id: "codex_bad".to_owned(),
                         kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                         display_name: "Codex Bad".to_owned(),
+                        nickname: "codex-bad".to_owned(),
                         enabled: true,
                         binary_path: "codex\nbad".to_owned(),
                         home_path: "~/.codex".to_owned(),
@@ -4665,7 +4737,6 @@ model = "legacy-model"
                 acquire_timeout_ms: 5_000,
                 idle_timeout_ms: 30_000,
                 sqlx_logging: false,
-                run_migrations_on_startup: true,
             },
             memory: GatewayMemoryConfig::default(),
             thread_episodic: GatewayThreadEpisodicConfig::default(),

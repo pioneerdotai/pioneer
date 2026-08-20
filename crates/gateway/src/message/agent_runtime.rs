@@ -5337,9 +5337,9 @@ impl MessageProcessor {
                 let notification = TurnCompletedNotification {
                     workspace_id,
                     thread_id: thread_id.clone(),
-                    turn: current_turn,
+                    turn: current_turn.clone(),
                 };
-                return self
+                let committed = self
                     .materialize_native_agent_turn_event(
                         pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(notification),
                         now_timestamp_secs(),
@@ -5356,6 +5356,11 @@ impl MessageProcessor {
                         );
                         false
                     });
+                if committed {
+                    self.finalize_agent_execution_for_turn(&current_turn, "completed")
+                        .await;
+                }
+                return committed;
             }
             if current_turn.status != TurnStatus::InProgress {
                 return false;
@@ -5447,6 +5452,8 @@ impl MessageProcessor {
                 return false;
             }
         }
+        self.finalize_agent_execution_for_turn(&turn_completed.turn, "completed")
+            .await;
 
         if let Err(error) = self
             .close_latest_active_execution_window_for_terminal_turn(
@@ -5538,6 +5545,168 @@ impl MessageProcessor {
                 .await;
         }
         true
+    }
+
+    async fn finalize_agent_execution_for_turn(
+        &self,
+        turn: &pioneer_protocol::Turn,
+        terminal_status: &str,
+    ) {
+        let database = self.crud_store.database_connection();
+        let responding_execution_id =
+            match pioneer_crud::load_agent_turn_response(&database, turn.id.as_str()).await {
+                Ok(response) => response.map(|response| response.execution_id),
+                Err(_error) => {
+                    warn!(
+                        turn_id = turn.id.as_str(),
+                        failure_class = "agent_execution_response_lookup_failed",
+                        "failed to resolve agent domain responding AgentExecution"
+                    );
+                    return;
+                }
+            };
+        let authored_execution_id = turn.author.as_ref().and_then(|author| match &author.actor {
+            pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
+                Some(execution_id.as_str().to_owned())
+            }
+            pioneer_protocol::PersistedActorRef::Principal(_)
+            | pioneer_protocol::PersistedActorRef::System => None,
+        });
+        let execution_id = responding_execution_id
+            .or(authored_execution_id)
+            .unwrap_or_else(|| {
+                super::agent_action_tools::root_agent_execution_id_for_turn(turn.id.as_str())
+            });
+        match pioneer_crud::load_agent_execution(&database, execution_id.as_str()).await {
+            Ok(Some(execution)) if execution.parent_task_id.is_some() => {
+                // Task candidate/reviewer lifecycles own their terminal point;
+                // a candidate Turn may still be waiting for review.
+                return;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(_error) => {
+                warn!(
+                    execution_id = execution_id.as_str(),
+                    failure_class = "agent_execution_terminal_inspection_failed",
+                    "failed to inspect agent domain execution before terminal release"
+                );
+                return;
+            }
+        }
+        if let Err(_error) = self
+            .finalize_agent_execution_and_notify(execution_id.as_str(), terminal_status)
+            .await
+        {
+            warn!(
+                execution_id = execution_id.as_str(),
+                terminal_status,
+                failure_class = "agent_execution_terminal_release_failed",
+                "failed to release agent domain execution resources after terminal Turn"
+            );
+        }
+    }
+
+    pub(super) async fn cancel_root_agent_work_graph_for_turn(
+        &self,
+        turn: &pioneer_protocol::Turn,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let database = self.crud_store.database_connection();
+        let responding_execution_id =
+            pioneer_crud::load_agent_turn_response(&database, turn.id.as_str())
+                .await?
+                .map(|response| response.execution_id);
+        let authored_execution_id = turn.author.as_ref().and_then(|author| match &author.actor {
+            pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
+                Some(execution_id.as_str().to_owned())
+            }
+            pioneer_protocol::PersistedActorRef::Principal(_)
+            | pioneer_protocol::PersistedActorRef::System => None,
+        });
+        let execution_id = responding_execution_id
+            .or(authored_execution_id)
+            .unwrap_or_else(|| {
+                super::agent_action_tools::root_agent_execution_id_for_turn(turn.id.as_str())
+            });
+        let Some(execution) =
+            pioneer_crud::load_agent_execution(&database, execution_id.as_str()).await?
+        else {
+            return Ok(false);
+        };
+        if execution.id != execution.work_graph_root_execution_id
+            || execution.parent_execution_id.is_some()
+        {
+            return Ok(false);
+        }
+
+        // Fence every queued/running descendant before asking provider
+        // runtimes to stop. Any concurrent action commit then observes the
+        // terminal execution/resource state and fails closed.
+        let targets = self
+            .crud_store
+            .cancel_agent_work_graph(execution.id.as_str(), reason, pioneer_crud::utc_now())
+            .await?;
+
+        let task_ids = targets
+            .iter()
+            .filter_map(|target| target.parent_task_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for task_id in task_ids {
+            if let Err(error) = self
+                .task_runtime
+                .service()
+                .cancel_task(
+                    pioneer_tasks::TaskMutationContext::default(),
+                    pioneer_protocol::TaskCancelParams {
+                        task_id: task_id.clone(),
+                        reason: Some(reason.to_owned()),
+                        scope: pioneer_protocol::TaskCancelScope::FullSubtree,
+                    },
+                )
+                .await
+            {
+                warn!(
+                    root_execution_id = execution.id,
+                    task_id,
+                    error = %format!("{error:#}"),
+                    failure_class = "agent_graph_task_cancellation_cleanup_failed",
+                    "durable Agent work-graph fence committed but Task cancellation cleanup failed"
+                );
+            }
+        }
+
+        for target in targets {
+            if target.execution_id == execution.id {
+                continue;
+            }
+            let (Some(thread_id), Some(turn_id)) =
+                (target.thread_id.as_deref(), target.turn_id.as_deref())
+            else {
+                continue;
+            };
+            self.mcp_service.cancel_turn_mcp_invocations(turn_id);
+            let stopped_cli = self
+                .cancel_task_cli_runtime_turn(thread_id, turn_id, reason)
+                .await
+                .unwrap_or(false);
+            if !stopped_cli {
+                let _ = self
+                    .agent_manager
+                    .cancel_turn(thread_id, turn_id, reason)
+                    .await;
+            }
+            self.unregister_agent_action_binding(turn_id).await;
+            if target.parent_task_id.is_none() {
+                self.mark_turn_interrupted(
+                    thread_id.to_owned(),
+                    turn_id.to_owned(),
+                    reason.to_owned(),
+                )
+                .await;
+            }
+        }
+        Ok(true)
     }
 
     /// Native provider success with a final response is acknowledged only after
@@ -5637,6 +5806,23 @@ impl MessageProcessor {
         turn_id: String,
         reason: String,
     ) -> bool {
+        if let Some(user_cancellation_reason) = self
+            .user_turn_cancel_intents
+            .lock()
+            .await
+            .get(&(thread_id.clone(), turn_id.clone()))
+            .cloned()
+        {
+            return self
+                .mark_turn_interrupted_with_recovery_disposition(
+                    thread_id,
+                    turn_id,
+                    user_cancellation_reason,
+                    None,
+                    true,
+                )
+                .await;
+        }
         self.mark_turn_blocked_with_resume_metadata(thread_id, turn_id, reason, None, None)
             .await
     }
@@ -6422,6 +6608,8 @@ impl MessageProcessor {
                 return false;
             }
         }
+        self.finalize_agent_execution_for_turn(&turn_failed.turn, "cancelled")
+            .await;
 
         if let Err(error) = self
             .close_latest_active_execution_window_for_terminal_turn(
@@ -6666,6 +6854,8 @@ impl MessageProcessor {
                 return false;
             }
         }
+        self.finalize_agent_execution_for_turn(&turn_failed.turn, "failed")
+            .await;
 
         if let Err(error) = self
             .close_latest_active_execution_window_for_terminal_turn(

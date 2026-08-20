@@ -1,4 +1,6 @@
 mod access_invalidation;
+pub(crate) mod agent_action_tools;
+mod agent_route_handlers;
 mod agent_runtime;
 mod artifact_finalization_diagnostics;
 mod artifact_registration;
@@ -318,6 +320,9 @@ const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
 pub(super) const TURN_EXECUTION_OWNER_LEASE_SECONDS: i64 = 15;
 const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
 const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
+const AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
+const AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS: i64 = 60 * 60;
+const AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE: u64 = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MessageProcessorResilienceConfig {
@@ -441,6 +446,8 @@ pub struct MessageProcessor {
     context_budget: ContextBudget,
     agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     agent_message_buffers: Arc<Mutex<HashMap<String, String>>>,
+    agent_action_bindings:
+        Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
     user_turn_cancel_intents: Arc<Mutex<HashMap<(String, String), String>>>,
     cli_runtime_pending_turn_events:
@@ -789,6 +796,7 @@ impl MessageProcessor {
             context_budget,
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             user_turn_cancel_intents: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),
@@ -1342,6 +1350,44 @@ impl MessageProcessor {
         self.bind_artifact_tool_bridge().await;
     }
 
+    pub(crate) async fn register_agent_action_binding(
+        &self,
+        turn_id: impl Into<String>,
+        mut binding: agent_action_tools::AgentActionRuntimeBinding,
+    ) -> anyhow::Result<()> {
+        let turn_id = turn_id.into();
+        binding
+            .refresh_start_options_catalog(self, turn_id.as_str())
+            .await?;
+        self.agent_action_bindings
+            .lock()
+            .await
+            .insert(turn_id, binding);
+        Ok(())
+    }
+
+    pub(crate) async fn unregister_agent_action_binding(&self, turn_id: &str) {
+        self.agent_action_bindings.lock().await.remove(turn_id);
+    }
+
+    pub(crate) async fn agent_action_binding(
+        &self,
+        turn_id: &str,
+    ) -> Option<agent_action_tools::AgentActionRuntimeBinding> {
+        self.agent_action_bindings
+            .lock()
+            .await
+            .get(turn_id)
+            .cloned()
+    }
+
+    pub(crate) async fn materialize_agent_action_tools(
+        self: &Arc<Self>,
+        context: pioneer_agent::TurnToolContext,
+    ) -> Result<pioneer_agent::TurnToolMaterialization, String> {
+        agent_action_tools::materialize(self.clone(), context).await
+    }
+
     async fn bind_permission_approval_bridge(self: &Arc<Self>) {
         let mut worker = self.native_permission_approval_worker.lock().await;
         if worker.is_some() {
@@ -1729,6 +1775,7 @@ impl MessageProcessor {
         let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
             let mut next_skill_upload_cleanup = 0;
+            let mut next_agent_action_ledger_compaction = 0;
             loop {
                 let Some(this) = processor.upgrade() else {
                     break;
@@ -1763,6 +1810,115 @@ impl MessageProcessor {
                 // A command whose lease is near its boundary must get the
                 // authoritative liveness check before any destructive claim.
                 this.heartbeat_due_cli_runtime_command_items(now).await;
+
+                let agent_resource_policy =
+                    crate::authorization::AgentWorkResourcePolicy::default();
+                match retry_transient_storage_access(|| {
+                    this.crud_store.promote_queued_agent_executions(
+                        pioneer_crud::utc_now(),
+                        64,
+                        i64::try_from(agent_resource_policy.idle_timeout_secs).unwrap_or(i64::MAX),
+                        i64::try_from(agent_resource_policy.hard_timeout_secs).unwrap_or(i64::MAX),
+                    )
+                })
+                .await
+                {
+                    Ok(promoted) => {
+                        let database = this.crud_store.database_connection();
+                        for execution in &promoted {
+                            if let Err(error) =
+                                pioneer_crud::wake_agent_action_outbox_for_execution(
+                                    &database,
+                                    execution.execution_id.as_str(),
+                                    pioneer_crud::utc_now(),
+                                )
+                                .await
+                            {
+                                record_resilience_worker_poll_error(
+                                    "agent domain promoted agent outbox wake",
+                                    &error,
+                                    &mut transient_storage_poll_failed,
+                                );
+                            }
+                        }
+                        let roots = promoted
+                            .into_iter()
+                            .map(|execution| execution.root_execution_id)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        for root_execution_id in roots {
+                            this.notify_agent_work_graph_state_changed(root_execution_id.as_str())
+                                .await;
+                        }
+                    }
+                    Err(error) => {
+                        record_resilience_worker_poll_error(
+                            "agent domain durable agent queue",
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
+                    }
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                if now >= next_agent_action_ledger_compaction {
+                    next_agent_action_ledger_compaction =
+                        now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
+                    match retry_transient_storage_access(|| {
+                        let database = this.crud_store.database_connection();
+                        async move {
+                            pioneer_crud::compact_terminal_agent_action_ledger(
+                                &database,
+                                pioneer_crud::utc_now(),
+                                AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE,
+                            )
+                            .await
+                        }
+                    })
+                    .await
+                    {
+                        Ok(summary) => {
+                            if summary.compacted_rows > 0 {
+                                info!(
+                                    compacted_rows = summary.compacted_rows,
+                                    payload_bytes_released = summary.payload_bytes_released,
+                                    "compacted terminal agent domain action ledger payloads"
+                                );
+                            }
+                            if summary.candidate_rows >= AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE {
+                                next_agent_action_ledger_compaction = now;
+                            }
+                        }
+                        Err(error) => {
+                            next_agent_action_ledger_compaction =
+                                now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS);
+                            record_resilience_worker_poll_error(
+                                "agent domain action ledger compaction",
+                                &error,
+                                &mut transient_storage_poll_failed,
+                            );
+                        }
+                    }
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                if let Err(error) = retry_transient_storage_access(|| {
+                    agent_action_tools::process_due_agent_action_outbox(&this, 64)
+                })
+                .await
+                {
+                    record_resilience_worker_poll_error(
+                        "agent domain agent action outbox",
+                        &error,
+                        &mut transient_storage_poll_failed,
+                    );
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
 
                 match retry_transient_storage_access(|| {
                     this.poll_timeouts_respecting_human_wait(now, 64)
@@ -3498,6 +3654,7 @@ impl MessageProcessor {
             },
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             user_turn_cancel_intents: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_pending_turn_events: Arc::new(Mutex::new(HashMap::new())),

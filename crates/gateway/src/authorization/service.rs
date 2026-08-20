@@ -128,6 +128,14 @@ impl AuthorizationService {
         }
     }
 
+    /// Authorize an agent action through the same server-owned role registry
+    /// used by the rest of Gateway. Agent envelopes still carry the narrowed
+    /// parent intersection; this check prevents a forged role/action pair from
+    /// bypassing the registry before that envelope is evaluated.
+    pub(crate) fn agent_action_allowed(&self, role_key: &str, action: ResourceAction) -> bool {
+        self.roles.agent_policy_allows(role_key, action)
+    }
+
     pub(crate) fn authorize_action(
         &self,
         principal_kind: PrincipalKind,
@@ -1080,7 +1088,7 @@ mod tests {
         WorkspaceAccessFacts,
     };
 
-    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 62] = [
+    const MEMBER_RESOURCE_ACTIONS: [ResourceAction; 65] = [
         ResourceAction::WorkspaceList,
         ResourceAction::WorkspaceRead,
         ResourceAction::ThreadCreatePrivate,
@@ -1104,6 +1112,9 @@ mod tests {
         ResourceAction::ChildTaskCreate,
         ResourceAction::ChildArtifactRead,
         ResourceAction::ChildArtifactWrite,
+        ResourceAction::AgentSourceExport,
+        ResourceAction::AgentRouteCreate,
+        ResourceAction::AgentRouteRevoke,
         ResourceAction::AgentsDocumentRead,
         ResourceAction::ThreadManage,
         ResourceAction::ThreadParticipantsManage,

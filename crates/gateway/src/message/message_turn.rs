@@ -278,7 +278,21 @@ pub(super) async fn resolve_turn_author_snapshot(
         display_name: principal.display_name,
         nickname: principal.nickname,
         avatar_revision,
+        agent: None,
     }))
+}
+
+/// Canonical presentation for genuine Gateway-owned lifecycle or runtime
+/// policy events. Agent-authored paths must resolve an execution snapshot
+/// instead of calling this helper.
+pub(super) fn system_turn_author_snapshot() -> pioneer_protocol::TurnAuthorSnapshot {
+    pioneer_protocol::TurnAuthorSnapshot {
+        actor: pioneer_protocol::PersistedActorRef::System,
+        display_name: "System".to_owned(),
+        nickname: "system".to_owned(),
+        avatar_revision: None,
+        agent: None,
+    }
 }
 
 /// Resolves reply/mention metadata inside the already-authorized Turn scope.
@@ -557,6 +571,7 @@ mod tests {
 
     fn message_params() -> TurnStartParams {
         TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             input: vec![UserInput::Text {
@@ -568,6 +583,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: Some(ThreadMode::Message),
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,

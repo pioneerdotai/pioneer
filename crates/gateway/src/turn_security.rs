@@ -1005,6 +1005,7 @@ mod tests {
     #[test]
     fn security_resolver_input_builds_from_api_provider_turn_start_params() {
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             input: Vec::new(),
@@ -1013,6 +1014,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,
@@ -1055,6 +1057,7 @@ mod tests {
     #[test]
     fn security_resolver_input_rejects_missing_cwd() {
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             input: Vec::new(),
@@ -1063,6 +1066,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,
@@ -1084,6 +1088,7 @@ mod tests {
     #[test]
     fn security_resolver_input_maps_cli_backend_without_provider_knobs() {
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             input: Vec::new(),
@@ -1092,6 +1097,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -1149,6 +1155,7 @@ mod tests {
             ),
         ] {
             let params = TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: "thread_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 input: Vec::new(),
@@ -1157,6 +1164,7 @@ mod tests {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
@@ -1507,6 +1515,7 @@ mod tests {
         execution_backend: Option<AgentExecutionBackend>,
     ) -> TurnSecurityResolverInput {
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             input: Vec::new(),
@@ -1515,6 +1524,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend,
@@ -2053,6 +2063,7 @@ mod tests {
             TurnPermissionProfileSource::Composer,
         );
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             input: Vec::new(),
@@ -2061,6 +2072,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,

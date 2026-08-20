@@ -567,7 +567,8 @@ mod tests {
                 "partial_actor" => {
                     database
                         .execute_unprepared(
-                            "PRAGMA ignore_check_constraints = ON; \
+                            "DROP TRIGGER conversation_actor_kind_pair_insert; \
+                             PRAGMA ignore_check_constraints = ON; \
                              INSERT INTO workspace (id, name, is_active, is_current) \
                              VALUES ('corrupt-workspace-001', 'Corrupt fixture', 1, 1); \
                              INSERT INTO thread \

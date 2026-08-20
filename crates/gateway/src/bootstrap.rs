@@ -398,6 +398,7 @@ mod tests {
             workspace_id: Set(DEFAULT_WORKSPACE_ID.to_owned()),
             name: Set(Some("final message repair".to_owned())),
             preview: Set("final message repair".to_owned()),
+            preview_author_json: Set(None),
             mode: Set("agent".to_owned()),
             model: Set("model-a".to_owned()),
             model_provider: Set("provider-a".to_owned()),

@@ -140,11 +140,11 @@ impl MessageProcessor {
                         "workspace",
                         "task_user_notification",
                     );
+                    let _ = error;
                     warn!(
-                        connection_id,
+                        failure_class = "task_user_notification_authorization_unavailable",
                         authorization_action = action.safe_name(),
                         authorization_resource_kind = "workspace",
-                        error = %format!("{error:#}"),
                         "task user notification authorization unavailable"
                     );
                 }

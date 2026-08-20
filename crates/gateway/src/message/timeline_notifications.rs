@@ -336,7 +336,54 @@ impl MessageProcessor {
         .await;
     }
 
-    async fn notify_semantic_turn_work_state_changed(
+    pub(super) async fn notify_agent_work_graph_state_changed(&self, root_execution_id: &str) {
+        let target = match self
+            .crud_store
+            .get_agent_work_graph_projection_target(root_execution_id)
+            .await
+        {
+            Ok(Some(target)) => target,
+            Ok(None) => return,
+            Err(_error) => {
+                warn!(
+                    root_execution_id,
+                    failure_class = "agent_work_graph_notification_target_failed",
+                    "failed to resolve Agent work-graph notification target"
+                );
+                return;
+            }
+        };
+        self.notify_semantic_turn_work_state_changed(
+            target.workspace_id.as_str(),
+            target.thread_id.as_str(),
+            target.turn_id.as_str(),
+        )
+        .await;
+    }
+
+    pub(super) async fn finalize_agent_execution_and_notify(
+        &self,
+        execution_id: &str,
+        terminal_status: &str,
+    ) -> anyhow::Result<bool> {
+        let database = self.crud_store.database_connection();
+        let Some(execution) = pioneer_crud::load_agent_execution(&database, execution_id).await?
+        else {
+            return Ok(false);
+        };
+        let root_execution_id = execution.work_graph_root_execution_id;
+        let finalized = self
+            .crud_store
+            .finalize_agent_execution(execution_id, terminal_status, pioneer_crud::utc_now())
+            .await?;
+        if finalized {
+            self.notify_agent_work_graph_state_changed(root_execution_id.as_str())
+                .await;
+        }
+        Ok(finalized)
+    }
+
+    pub(super) async fn notify_semantic_turn_work_state_changed(
         &self,
         workspace_id: &str,
         thread_id: &str,

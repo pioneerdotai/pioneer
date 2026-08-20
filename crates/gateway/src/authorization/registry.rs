@@ -125,10 +125,10 @@ use AuthorizationAuditClass::{Authentication, Execution, Management, Mutation, R
 use DisclosurePolicy::{Forbidden, NotFound};
 use ResourceAction::{
     AgentExecutionCancel, AgentExecutionObserve, AgentExecutionResume, AgentExecutionSteer,
-    AgentRequestRespond, AgentTurnStart, AgentsDocumentManage, AgentsDocumentRead,
-    ArtifactBindThread, ArtifactCreateThread, ArtifactDeleteThread, ArtifactRead,
-    CliRuntimeDiscover, CliRuntimeManage, CliThreadFork, GatewayManage, InvitationCreate,
-    InvitationList, InvitationRevoke, McpDiscover, McpManage, MemberDeviceCreate,
+    AgentRequestRespond, AgentRouteCreate, AgentRouteRevoke, AgentTurnStart, AgentsDocumentManage,
+    AgentsDocumentRead, ArtifactBindThread, ArtifactCreateThread, ArtifactDeleteThread,
+    ArtifactRead, CliRuntimeDiscover, CliRuntimeManage, CliThreadFork, GatewayManage,
+    InvitationCreate, InvitationList, InvitationRevoke, McpDiscover, McpManage, MemberDeviceCreate,
     MemberDirectoryList, MemberRemove, MemberRestore, MemberSuspend, MemoryCreateThread,
     MemoryForgetThread, MemoryModerateWorkspace, MemoryRead, MessageCreate, MessageDeleteOwn,
     MessageEditOwn, NotificationAcknowledgeOwn, NotificationReadOwn, ProfileUpdateOwn,
@@ -145,6 +145,21 @@ use ResourceResolverKind::{
 };
 
 pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
+    method_entry(
+        AGENT_ROUTE_CREATE,
+        AgentRouteCreate,
+        Gateway,
+        NotFound,
+        Management,
+    ),
+    method_entry(AGENT_ROUTE_LIST, AgentRouteCreate, Gateway, NotFound, Read),
+    method_entry(
+        AGENT_ROUTE_REVOKE,
+        AgentRouteRevoke,
+        Gateway,
+        NotFound,
+        Management,
+    ),
     method_entry(
         INVITE_CREATE,
         InvitationCreate,
@@ -1041,7 +1056,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 142);
+        assert_eq!(registry.len(), 145);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());

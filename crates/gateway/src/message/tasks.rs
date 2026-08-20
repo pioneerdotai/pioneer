@@ -661,7 +661,9 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            TaskEventPayload::DeliveryCancelled { delivery, reason } => {
+            TaskEventPayload::DeliveryCancelled {
+                delivery, reason, ..
+            } => {
                 self.mark_task_run_occurrence_turn_terminal(delivery.run_id.as_str())
                     .await?;
                 self.send_notification_to_task_workspace_connections(

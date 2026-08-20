@@ -37,6 +37,27 @@ pub(crate) fn load_effective_cli_runtime_instances(
     Ok(instances)
 }
 
+/// Load the server-owned identity presentation for the same effective CLI
+/// catalog used to launch runtimes.  Runtime launch configuration deliberately
+/// remains in `EffectiveGatewayCliAgentRuntimeInstanceConfig`; this helper
+/// exposes only the protocol projection needed by identity migration and
+/// authorship binding, including the validated nickname override.
+pub(crate) fn load_effective_cli_runtime_identity_settings(
+    runtime_home: &Path,
+) -> Result<pioneer_protocol::GatewayCliRuntimeSettings> {
+    let config =
+        AppConfig::load().context("failed to load app config for CLI identity settings")?;
+    let settings_file_name =
+        crate::settings::normalize_settings_file_name(config.gateway.settings_file_name.as_str())?;
+    let settings_path = runtime_home.join(settings_file_name.as_str());
+    let settings = crate::settings::load_or_create_gateway_settings(
+        settings_path.as_path(),
+        config.gateway.settings_version,
+        settings_file_name.as_str(),
+    )?;
+    Ok(settings.effective_cli_runtime_settings(&config.gateway))
+}
+
 pub(crate) fn validate_instance_launch_args(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
 ) -> Result<()> {

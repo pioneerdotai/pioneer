@@ -51,6 +51,28 @@ impl MessageProcessor {
         {
             return Ok(None);
         }
+        self.task_execution_admission_seed_for_existing_task(
+            principal,
+            preferred_root_thread_id,
+            &response,
+        )
+        .await
+        .map(Some)
+    }
+
+    pub(crate) async fn task_execution_admission_seed_for_existing_task(
+        &self,
+        principal: &crate::auth::AuthenticatedSessionPrincipal,
+        preferred_root_thread_id: Option<&str>,
+        response: &pioneer_protocol::TaskGetResponse,
+    ) -> anyhow::Result<pioneer_tasks::TaskExecutionAdmissionSeed> {
+        if response.task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent {
+            anyhow::bail!(
+                "Task `{}` is not an Agent Task and cannot carry an execution admission",
+                response.task.id
+            );
+        }
+        let task_id = response.task.id.as_str();
         let authorization_policy = crate::authorization::AuthorizationService::new();
         let execution_resources = authorization_policy
             .execution_resource_policy(principal.kind, principal.role_key.as_ref())
@@ -77,7 +99,7 @@ impl MessageProcessor {
                 task_resources,
             };
             self.validate_task_execution_admission_seed(&seed).await?;
-            return Ok(Some(seed));
+            return Ok(seed);
         }
         let root_thread_id = preferred_root_thread_id
             .map(str::to_owned)
@@ -105,6 +127,14 @@ impl MessageProcessor {
             root_thread.model.as_str(),
             None,
         )?;
+        request.capabilities = self
+            .normalize_turn_skill_capabilities(
+                response.task.workspace_id.as_str(),
+                request.capabilities.as_slice(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?
+            .execution;
         if !matches!(
             request.execution_backend,
             Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
@@ -142,7 +172,7 @@ impl MessageProcessor {
             task_resources,
         };
         self.validate_task_execution_admission_seed(&seed).await?;
-        Ok(Some(seed))
+        Ok(seed)
     }
 
     async fn acquire_task_observation_page(
@@ -721,6 +751,8 @@ impl MessageProcessor {
             return;
         }
         let mut task_execution_admission = None;
+        let mut resolved_task_launch = None;
+        let mut task_agent_authorization_grant = None;
         if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent {
             let Some(root_thread_id) = authorized_thread
                 .map(|proof| proof.collaboration_root_thread_id())
@@ -764,6 +796,36 @@ impl MessageProcessor {
                     return;
                 }
             };
+            let (canonical_launch, resolved_launch) =
+                match super::agent_action_tools::resolve_workspace_task_launch(
+                    self,
+                    params.workspace_id.as_str(),
+                    root_thread.model_provider.as_str(),
+                    root_thread.model.as_str(),
+                    params.launch.as_ref(),
+                    None,
+                    request_id.as_str(),
+                )
+                .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            crate::public_error::agent_rpc_error(
+                                Some(request_id),
+                                INVALID_PARAMS_CODE,
+                                pioneer_protocol::PublicErrorCode::InvalidInput,
+                                pioneer_protocol::PublicErrorStage::Admission,
+                                format!("invalid Task agent launch: {error:#}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            params.launch = Some(canonical_launch);
+            resolved_task_launch = resolved_launch;
             let mut execution_request =
                 match crate::authorization::ExecutionAdmissionRequest::for_task(
                     &params,
@@ -862,6 +924,85 @@ impl MessageProcessor {
                     return;
                 }
             };
+            if let Some((identity, profile)) = resolved_task_launch.as_ref() {
+                let child_skill_ids = match admitted_context
+                    .granted_skill_ids()
+                    .iter()
+                    .map(|id| pioneer_protocol::SkillId::new(id.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        self.send_error(
+                            connection_id,
+                            task_authorization_unavailable(
+                                request_id,
+                                ResourceAction::TaskCreate,
+                                "agent_authorization",
+                                "child_launch_skill_grant",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let child_launch_grant =
+                    match super::agent_action_tools::current_workspace_child_launch_ceiling(
+                        self,
+                        params.workspace_id.as_str(),
+                        identity,
+                        profile,
+                        root_thread.model_provider.as_str(),
+                        root_thread.model.as_str(),
+                        true,
+                        child_skill_ids,
+                        admitted_context
+                            .granted_mcp_server_capability_ids()
+                            .to_vec(),
+                        admitted_context.permission_profile_cap().clone(),
+                    )
+                    .await
+                    {
+                        Ok(grant) => grant,
+                        Err(_) => {
+                            self.send_error(
+                                connection_id,
+                                task_authorization_unavailable(
+                                    request_id,
+                                    ResourceAction::TaskCreate,
+                                    "agent_authorization",
+                                    "child_launch_grant",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                task_agent_authorization_grant = Some(
+                    match crate::authorization::derive_task_agent_authorization_grant_seed(
+                        identity.id.clone(),
+                        admitted_context.root_thread_id(),
+                        "thread_agent",
+                        policy_revision,
+                        child_launch_grant,
+                    ) {
+                        Ok(grant) => grant,
+                        Err(_) => {
+                            self.send_error(
+                                connection_id,
+                                task_authorization_unavailable(
+                                    request_id,
+                                    ResourceAction::TaskCreate,
+                                    "agent_authorization",
+                                    "launch_grant",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    },
+                );
+            }
             task_execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
                 workspace_id: admitted_context.workspace_id().to_owned(),
                 root_thread_id: admitted_context.root_thread_id().to_owned(),
@@ -899,6 +1040,12 @@ impl MessageProcessor {
             }
         };
         context.actor_id = Some(request_context.principal().principal_id.to_string());
+        context.launch_selection = params.launch.clone();
+        if let Some((identity, profile)) = resolved_task_launch {
+            context.resolved_launch_identity = Some(identity);
+            context.resolved_launch_profile = Some(profile);
+        }
+        context.agent_authorization_grant = task_agent_authorization_grant;
         context.execution_admission = task_execution_admission;
         if let Some(seed) = context.execution_admission.as_ref()
             && self

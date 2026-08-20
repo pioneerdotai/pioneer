@@ -367,6 +367,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: Some("MCP recovery".to_owned()),
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "gpt-5".to_owned(),
             model_provider: "cli_runtime:codex".to_owned(),

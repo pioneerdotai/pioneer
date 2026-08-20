@@ -6,7 +6,12 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-const DELIVERY_TURN_ID_LEN: usize = 21;
+struct PreparedTaskDeliveryAgentAction {
+    presentation: pioneer_protocol::AgentPresentationSnapshot,
+    author: pioneer_protocol::TurnAuthorSnapshot,
+    actor: pioneer_protocol::PersistedActorRef,
+    plan: crate::authorization::AgentActionCommitPlan,
+}
 
 impl MessageProcessor {
     pub(super) async fn task_user_notification_list(
@@ -70,7 +75,11 @@ impl MessageProcessor {
                     return;
                 }
                 Err(error) => {
-                    tracing::warn!(error = %format!("{error:#}"), "failed to resolve task notification cursor");
+                    tracing::warn!(
+                        failure_class = "task_notification_cursor_resolution_failed",
+                        "failed to resolve task notification cursor"
+                    );
+                    let _ = error;
                     self.send_error(
                         connection_id,
                         AuthorizationExternalError::Unavailable.response(request_id),
@@ -94,7 +103,11 @@ impl MessageProcessor {
         {
             Ok(rows) => rows,
             Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "failed to list task notifications");
+                tracing::warn!(
+                    failure_class = "task_notification_list_failed",
+                    "failed to list task notifications"
+                );
+                let _ = error;
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::Unavailable.response(request_id),
@@ -109,7 +122,11 @@ impl MessageProcessor {
             match task_user_notification_from_row(row) {
                 Ok(notification) => notifications.push(notification),
                 Err(error) => {
-                    tracing::warn!(error = %format!("{error:#}"), "durable task notification is invalid");
+                    tracing::warn!(
+                        failure_class = "task_notification_projection_invalid",
+                        "durable task notification is invalid"
+                    );
+                    let _ = error;
                     self.send_error(
                         connection_id,
                         AuthorizationExternalError::Unavailable.response(request_id),
@@ -133,11 +150,19 @@ impl MessageProcessor {
         match JsonRpcResponse::from_result(request_id.clone(), &response) {
             Ok(response) => {
                 if let Err(error) = self.send_json(connection_id, &response).await {
-                    tracing::warn!(error = %format!("{error:#}"), "failed to send task notification inbox");
+                    tracing::warn!(
+                        failure_class = "task_notification_response_delivery_failed",
+                        "failed to send task notification inbox"
+                    );
+                    let _ = error;
                 }
             }
             Err(error) => {
-                tracing::warn!(error = %error, "failed to encode task notification inbox");
+                tracing::warn!(
+                    failure_class = "task_notification_response_encoding_failed",
+                    "failed to encode task notification inbox"
+                );
+                let _ = error;
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::Unavailable.response(request_id),
@@ -189,7 +214,11 @@ impl MessageProcessor {
                 return;
             }
             Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "failed to acknowledge task notification");
+                tracing::warn!(
+                    failure_class = "task_notification_acknowledgement_failed",
+                    "failed to acknowledge task notification"
+                );
+                let _ = error;
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::Unavailable.response(request_id),
@@ -201,7 +230,11 @@ impl MessageProcessor {
         let notification = match task_user_notification_from_row(row) {
             Ok(notification) => notification,
             Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "acknowledged task notification is invalid");
+                tracing::warn!(
+                    failure_class = "task_notification_projection_invalid",
+                    "acknowledged task notification is invalid"
+                );
+                let _ = error;
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::Unavailable.response(request_id),
@@ -214,11 +247,19 @@ impl MessageProcessor {
         match JsonRpcResponse::from_result(request_id.clone(), &response) {
             Ok(response) => {
                 if let Err(error) = self.send_json(connection_id, &response).await {
-                    tracing::warn!(error = %format!("{error:#}"), "failed to send task notification acknowledgement");
+                    tracing::warn!(
+                        failure_class = "task_notification_response_delivery_failed",
+                        "failed to send task notification acknowledgement"
+                    );
+                    let _ = error;
                 }
             }
             Err(error) => {
-                tracing::warn!(error = %error, "failed to encode task notification acknowledgement");
+                tracing::warn!(
+                    failure_class = "task_notification_response_encoding_failed",
+                    "failed to encode task notification acknowledgement"
+                );
+                let _ = error;
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::Unavailable.response(request_id),
@@ -299,12 +340,13 @@ impl MessageProcessor {
             };
             if let Err(error) = execution_result {
                 let failed_at = now_timestamp_secs();
+                let _ = error;
                 self.task_runtime
                     .service()
                     .fail_delivery(
                         delivery,
                         attempt,
-                        format!("{error:#}"),
+                        "task_delivery_execution_failed".to_owned(),
                         None,
                         None,
                         failed_at,
@@ -409,6 +451,14 @@ impl MessageProcessor {
             )
             .await
             .context("task delivery has no current collaboration authority")?;
+        let actor_contract = self
+            .crud_store
+            .get_task_actor_contract(task.id.as_str())
+            .await?
+            .context("Agent Task delivery has no actor contract")?;
+        actor_contract
+            .validate()
+            .map_err(|error| anyhow!("Agent Task delivery actor contract is invalid: {error:?}"))?;
 
         match delivery.mode {
             TaskDeliveryMode::None => {}
@@ -436,6 +486,16 @@ impl MessageProcessor {
                     .target_thread_id
                     .as_deref()
                     .ok_or_else(|| anyhow!("task delivery has no target thread"))?;
+                // A durable cross-capsule route is the destination authority.
+                // Do not accidentally add the personal target access of one
+                // currently selected source collaborator as a second gate:
+                // the canonical DeliverResult plan below validates the exact
+                // route/target/disclosure and the commit transaction repeats
+                // its generation, expiry and destination checks.  Unrouted
+                // same-capsule delivery still needs a current direct proof.
+                if actor_contract.delivery.route_id.is_some() {
+                    return Ok(());
+                }
                 let action = crate::authorization::ResourceAction::MessageCreate;
                 let gate = crate::authorization::AuthorizationService::new().authorize_action(
                     current.principal().kind,
@@ -510,6 +570,173 @@ impl MessageProcessor {
         Ok(())
     }
 
+    async fn prepare_task_delivery_agent_action(
+        &self,
+        delivery: &TaskDelivery,
+        target_thread_id: Option<&str>,
+    ) -> Result<Option<PreparedTaskDeliveryAgentAction>> {
+        let task_response = self
+            .crud_store
+            .get_task(delivery.task_id.as_str())
+            .await?
+            .context("Task delivery root is unavailable")?;
+        if task_response.task.executor_kind == pioneer_protocol::TaskExecutorKind::System {
+            return Ok(None);
+        }
+        let actor_contract = self
+            .crud_store
+            .get_task_actor_contract(delivery.task_id.as_str())
+            .await?
+            .context("Agent Task delivery has no actor contract")?;
+        // Failed/cancelled/blocked runs remain visibly System-authored.  A
+        // routed diagnostic nevertheless needs the same exact route action
+        // and transactional receipt as successful cross-capsule delivery;
+        // otherwise a revoke between execution and delivery could be
+        // bypassed by the lifecycle path.
+        if delivery.error_snapshot.is_some() && actor_contract.delivery.route_id.is_none() {
+            return Ok(None);
+        }
+        let occurrence = self
+            .crud_store
+            .get_task_occurrence_contract_by_run(delivery.run_id.as_str())
+            .await?
+            .context("Agent Task delivery has no durable occurrence")?;
+        let execution_id = occurrence
+            .agent_execution_id
+            .as_deref()
+            .context("Agent Task result has no exact source execution")?;
+        let database = self.crud_store.database_connection();
+        let execution = pioneer_crud::load_agent_execution(&database, execution_id)
+            .await?
+            .context("Agent Task delivery source execution is unavailable")?;
+        if execution.workspace_id != delivery.workspace_id
+            || execution.parent_task_id.as_deref() != Some(delivery.task_id.as_str())
+            || execution.work_graph_root_execution_id
+                != occurrence
+                    .work_graph_root_execution_id
+                    .as_deref()
+                    .context("Agent Task occurrence has no work-graph root")?
+        {
+            bail!("Agent Task delivery source differs from its occurrence boundary");
+        }
+        let source_fence =
+            super::agent_action_tools::current_agent_identity_source_fence(self, execution_id)
+                .await?;
+        let agent_spec =
+            super::task_agent_executor::select_agent_spec(&task_response, delivery.run_id.as_str())
+                .context("Agent Task delivery has no execution specification")?;
+        let policy_generation = self.current_authorization_revision().await?;
+        let (mut adapter, _, _) =
+            super::task_agent_executor::materialize_task_agent_action_binding_for_execution(
+                self,
+                &task_response.task,
+                &agent_spec,
+                execution_id,
+                delivery.run_id.as_str(),
+                execution.home_root_thread_id.as_str(),
+                policy_generation,
+                true,
+            )
+            .await
+            .context("failed to restore exact Task delivery actor")?;
+
+        let route_id = actor_contract.delivery.route_id.as_deref();
+        let target = if let Some(route_id) = route_id {
+            let route = pioneer_crud::load_agent_delegation_route(&database, route_id)
+                .await?
+                .context("Task delivery route is unavailable")?;
+            let projection = pioneer_crud::agent_delegation_route_projection(&route)?;
+            let route_facts = crate::authorization::AgentRouteFacts::from_projection(&projection)
+                .map_err(|message| anyhow!(message))?;
+            let exact_surface_target = match delivery.mode {
+                TaskDeliveryMode::Thread => {
+                    target_thread_id == Some(projection.destination_thread_id.as_str())
+                }
+                TaskDeliveryMode::UserNotification => target_thread_id.is_none(),
+                TaskDeliveryMode::None | TaskDeliveryMode::Webhook => false,
+            };
+            if !exact_surface_target {
+                bail!("Task delivery route target differs from the immutable destination");
+            }
+            adapter
+                .bind_persisted_route(route_facts)
+                .map_err(|error| anyhow!("Task delivery route is invalid: {error:?}"))?;
+            pioneer_protocol::AgentStartTarget::RoutedThread {
+                route_id: projection.id,
+                thread_id: projection.destination_thread_id,
+            }
+        } else {
+            let target_thread_id =
+                target_thread_id.unwrap_or(execution.home_root_thread_id.as_str());
+            if target_thread_id == execution.home_root_thread_id {
+                pioneer_protocol::AgentStartTarget::SameCapsuleThread {
+                    thread_id: target_thread_id.to_owned(),
+                }
+            } else if execution.parent_thread_id.as_deref() == Some(target_thread_id) {
+                pioneer_protocol::AgentStartTarget::CurrentThread
+            } else {
+                bail!("Task result delivery outside its source capsule requires a durable route");
+            }
+        };
+        let action_id = pioneer_protocol::AgentActionId::new(pioneer_crud::canonical_agent_id(
+            'A',
+            &format!("task-delivery-action\0{}", delivery.id),
+        ))
+        .map_err(|error| anyhow!("Task delivery action id is invalid: {error:?}"))?;
+        let intent = pioneer_protocol::AgentActionIntent::DeliverResult {
+            action_id,
+            execution_id: pioneer_protocol::AgentExecutionId::new(execution_id.to_owned())
+                .map_err(|error| anyhow!("Task delivery execution id is invalid: {error:?}"))?,
+            route_id: route_id
+                .map(|route_id| pioneer_protocol::AgentDelegationRouteId::new(route_id.to_owned()))
+                .transpose()
+                .map_err(|error| anyhow!("Task delivery route id is invalid: {error:?}"))?,
+            target,
+            result_reference: pioneer_protocol::task_delivery_result_item_id(delivery.id.as_str()),
+            idempotency_key: delivery.delivery_key.clone(),
+        };
+        let prepared = adapter
+            .prepare(&intent)
+            .map_err(|error| anyhow!("Task delivery action was denied: {error:?}"))?;
+        let mut plan = adapter
+            .prepare_commit(
+                &prepared,
+                Some(
+                    json!({
+                        "deliveryId": delivery.id,
+                        "taskId": delivery.task_id,
+                        "runId": delivery.run_id,
+                    })
+                    .to_string(),
+                ),
+                adapter.policy_fingerprint(),
+                policy_generation,
+            )
+            .map_err(|error| anyhow!("Task delivery action commit was denied: {error:?}"))?;
+        if route_id.is_some()
+            && task_response
+                .task
+                .delivery_policy
+                .as_ref()
+                .is_some_and(|policy| {
+                    !policy.include_result
+                        || policy.format == pioneer_protocol::TaskDeliveryFormat::Summary
+                })
+        {
+            plan.input.disclosure_class = "routed_result_summary".to_owned();
+        }
+        super::agent_action_tools::apply_current_identity_source_fence(&mut plan, &source_fence);
+        let presentation = adapter.presentation_snapshot();
+        let author = presentation.to_turn_author_snapshot();
+        let actor = author.actor.clone();
+        Ok(Some(PreparedTaskDeliveryAgentAction {
+            presentation,
+            author,
+            actor,
+            plan,
+        }))
+    }
+
     async fn deliver_user_notification(
         &self,
         delivery: &TaskDelivery,
@@ -518,6 +745,9 @@ impl MessageProcessor {
             .target_user_id
             .as_deref()
             .context("user notification delivery has no recipient")?;
+        let agent_action = self
+            .prepare_task_delivery_agent_action(delivery, None)
+            .await?;
         let notification_id = task_user_notification_id(delivery.id.as_str());
         let notification = pioneer_protocol::TaskUserNotificationDeliveredNotification {
             notification_id: notification_id.clone(),
@@ -526,6 +756,13 @@ impl MessageProcessor {
             task_id: delivery.task_id.clone(),
             run_id: delivery.run_id.clone(),
             delivery_id: delivery.id.clone(),
+            author: agent_action
+                .as_ref()
+                .filter(|_| delivery.error_snapshot.is_none())
+                .map(|prepared| prepared.presentation.clone()),
+            delivery_action_receipt_id: agent_action
+                .as_ref()
+                .map(|prepared| prepared.plan.projection.receipt_id.clone()),
             result: delivery
                 .result_snapshot
                 .as_ref()
@@ -538,20 +775,22 @@ impl MessageProcessor {
         };
         let payload_json = serde_json::to_string(&notification)
             .context("failed to encode durable user notification")?;
-        let persisted = pioneer_crud::insert_task_notification_idempotent(
-            &self.crud_store.database_connection(),
-            pioneer_crud::NewUserNotificationOutbox {
-                id: notification_id,
-                task_delivery_id: delivery.id.clone(),
-                workspace_id: delivery.workspace_id.clone(),
-                recipient_principal_id: recipient_principal_id.to_owned(),
-                task_id: delivery.task_id.clone(),
-                run_id: delivery.run_id.clone(),
-                payload_json,
-                created_at_unix: now_timestamp_secs(),
-            },
-        )
-        .await?;
+        let persisted = self
+            .crud_store
+            .materialize_task_notification(
+                pioneer_crud::NewUserNotificationOutbox {
+                    id: notification_id,
+                    task_delivery_id: delivery.id.clone(),
+                    workspace_id: delivery.workspace_id.clone(),
+                    recipient_principal_id: recipient_principal_id.to_owned(),
+                    task_id: delivery.task_id.clone(),
+                    run_id: delivery.run_id.clone(),
+                    payload_json,
+                    created_at_unix: now_timestamp_secs(),
+                },
+                agent_action.map(|prepared| prepared.plan.input),
+            )
+            .await?;
         let notification = serde_json::from_str(persisted.payload_json.as_str())
             .context("durable user notification payload is invalid")?;
         if persisted.status != "delivered" {
@@ -570,7 +809,10 @@ impl MessageProcessor {
             .lineage_parent_turn_for_origin_delivery(delivery, thread_id)
             .await?
         {
-            self.ensure_delivery_thread_loaded(thread_id, delivery.workspace_id.as_str())
+            let agent_action = self
+                .prepare_task_delivery_agent_action(delivery, Some(thread_id))
+                .await?;
+            self.ensure_thread_loaded(thread_id, delivery.workspace_id.as_str())
                 .await?;
             // The task card on the occurrence Turn is already the canonical
             // failed-state presentation. Do not duplicate its internal error
@@ -581,6 +823,7 @@ impl MessageProcessor {
                     thread_id,
                     parent_turn_id.as_str(),
                     delivery_result_item(delivery),
+                    agent_action.map(|prepared| prepared.plan.input),
                 )
                 .await?;
             }
@@ -621,38 +864,115 @@ impl MessageProcessor {
             .target_thread_id
             .as_deref()
             .ok_or_else(|| anyhow!("thread delivery has no target_thread_id"))?;
-        self.ensure_delivery_thread_loaded(thread_id, delivery.workspace_id.as_str())
+        let agent_action = self
+            .prepare_task_delivery_agent_action(delivery, Some(thread_id))
             .await?;
-
-        let turn_id = pioneer_protocol::generate_id(DELIVERY_TURN_ID_LEN);
-        let turn_outcome = self
-            .thread_manager
-            .system_turn_start_with_permission_profile_and_origin(
-                TurnStartParams {
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.clone(),
-                    input: Vec::new(),
-                    capabilities: Vec::new(),
-                    model: None,
-                    model_provider: None,
-                    sandbox_policy: None,
-                    // Delivery is an internal system projection, not a user-authored ordinary
-                    // Message. Keep the pre-Epic-6 execution-free Chat semantics explicit so a
-                    // target thread whose composer default is Message cannot reclassify it.
-                    mode: Some(ThreadMode::Chat),
-                    reply_to_turn_id: None,
-                    mentioned_principal_ids: Vec::new(),
-                    execution_backend: None,
-                    reasoning: None,
-                    permission_profile: None,
-                    cli_runtime_options: None,
-                },
-                pioneer_protocol::system_turn_permission_profile_snapshot(
-                    pioneer_protocol::TurnPermissionMode::FullAccess,
-                ),
-                pioneer_protocol::TurnOrigin::TaskDelivery,
-            )
+        self.ensure_thread_loaded(thread_id, delivery.workspace_id.as_str())
             .await?;
+        let turn_id =
+            pioneer_crud::canonical_agent_id('T', &format!("task-delivery-turn\0{}", delivery.id));
+        let public_failure = delivery
+            .error_snapshot
+            .as_ref()
+            .map(task_delivery_failure_message);
+        let item = delivery
+            .error_snapshot
+            .is_none()
+            .then(|| delivery_result_item(delivery));
+        // A crash after the atomic destination commit but before Task delivery
+        // acknowledgement must reuse the same Turn and unread projection.
+        if let Some((workspace_id, existing_turn)) = self
+            .crud_store
+            .get_turn(thread_id, turn_id.as_str())
+            .await?
+        {
+            let existing_item = self
+                .crud_store
+                .get_turn_item(
+                    turn_id.as_str(),
+                    pioneer_protocol::task_delivery_result_item_id(delivery.id.as_str()).as_str(),
+                )
+                .await?;
+            if workspace_id != delivery.workspace_id
+                || match (&public_failure, &item) {
+                    (Some(error), None) => {
+                        existing_turn.status != pioneer_protocol::TurnStatus::Failed
+                            || existing_turn.error.as_deref() != Some(error.as_str())
+                            || existing_item.is_some()
+                    }
+                    (None, Some(item)) => {
+                        existing_turn.status != pioneer_protocol::TurnStatus::Completed
+                            || existing_turn.error.is_some()
+                            || existing_item.as_ref() != Some(item)
+                    }
+                    _ => true,
+                }
+            {
+                bail!("deterministic Task delivery Turn conflicts with its immutable result");
+            }
+            if let Some(prepared) = agent_action.as_ref() {
+                let action = pioneer_crud::load_agent_action(
+                    &self.crud_store.database_connection(),
+                    prepared.plan.projection.action_id.as_str(),
+                )
+                .await?;
+                if action.as_ref().is_none_or(|action| {
+                    action.status != "committed"
+                        || action.action_kind != "deliver_result"
+                        || action.execution_id != prepared.plan.input.action.execution_id
+                        || action.idempotency_key != delivery.delivery_key
+                }) {
+                    bail!("agent-authored Task delivery Turn has no canonical action receipt");
+                }
+            }
+            return Ok(turn_id);
+        }
+        let turn_params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.clone(),
+            input: Vec::new(),
+            capabilities: Vec::new(),
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            // Delivery is an internal system projection, not a user-authored ordinary
+            // Message. Keep the pre-Epic-6 execution-free Chat semantics explicit so a
+            // target thread whose composer default is Message cannot reclassify it.
+            mode: Some(ThreadMode::Chat),
+            agent_launch: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
+            execution_backend: None,
+            reasoning: None,
+            permission_profile: None,
+            cli_runtime_options: None,
+        };
+        let permission_profile = pioneer_protocol::system_turn_permission_profile_snapshot(
+            pioneer_protocol::TurnPermissionMode::FullAccess,
+        );
+        let visibly_agent_authored = agent_action.is_some() && delivery.error_snapshot.is_none();
+        let turn_outcome = match agent_action.as_ref().filter(|_| visibly_agent_authored) {
+            Some(prepared) => {
+                self.thread_manager
+                    .agent_turn_start_with_permission_profile_and_origin(
+                        turn_params,
+                        permission_profile,
+                        prepared.author.clone(),
+                        pioneer_protocol::TurnOrigin::TaskDelivery,
+                    )
+                    .await?
+            }
+            None => {
+                self.thread_manager
+                    .system_turn_start_with_permission_profile_and_origin(
+                        turn_params,
+                        permission_profile,
+                        pioneer_protocol::TurnOrigin::TaskDelivery,
+                    )
+                    .await?
+            }
+        };
         let profile_selected_audit = match self.turn_profile_selected_audit_event(&turn_outcome) {
             Ok(event) => event,
             Err(error) => {
@@ -664,78 +984,191 @@ impl MessageProcessor {
                 ));
             }
         };
-        if let Err(error) = self
-            .crud_store
-            .materialize_non_executable_system_turn_start_with_permission_audit(
-                &turn_outcome.materialization.thread,
-                turn_outcome.materialization.sandbox_mode,
-                &turn_outcome.materialization.turn,
-                &turn_outcome.materialization.input,
-                profile_selected_audit,
-            )
-            .await
+        let projection_actor = match turn_outcome.materialization.turn.author.as_ref() {
+            Some(author) => author.actor.clone(),
+            None if visibly_agent_authored => {
+                self.thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                bail!("Agent Task delivery Turn has no exact author snapshot");
+            }
+            None => pioneer_protocol::PersistedActorRef::System,
+        };
+        if visibly_agent_authored
+            && agent_action
+                .as_ref()
+                .is_some_and(|prepared| prepared.actor != projection_actor)
         {
             self.thread_manager
                 .rollback_turn_start(turn_outcome.rollback_context)
                 .await;
-            return Err(error).map_err(|error| anyhow!("{error:#}"));
+            bail!("Task delivery projection actor differs from its canonical action");
         }
-        self.send_notification_to_authorized_thread_connections(
-            thread_id,
-            events::TURN_STARTED,
-            &turn_outcome.started_notification,
-            turn_outcome.started_notification_connection_ids.clone(),
-        )
-        .await;
-
-        if let Some(error) = delivery.error_snapshot.as_ref() {
-            let public_message = task_delivery_failure_message(error);
-            if !self
-                .mark_turn_failed_terminal(thread_id.to_owned(), turn_id.clone(), public_message)
-                .await
-            {
-                bail!("failed to durably publish failed task delivery");
-            }
-            return Ok(turn_id);
-        }
-
-        if let Err(error) = self
-            .persist_delivery_item(
-                delivery.workspace_id.as_str(),
+        let finish = match self
+            .thread_manager
+            .turn_finish(
                 thread_id,
                 turn_id.as_str(),
-                delivery_result_item(delivery),
+                if public_failure.is_some() {
+                    pioneer_protocol::TurnStatus::Failed
+                } else {
+                    pioneer_protocol::TurnStatus::Completed
+                },
+                public_failure.clone(),
             )
             .await
         {
-            let reason = format!("failed to persist task delivery item: {error:#}");
-            if !self
-                .mark_turn_blocked(thread_id.to_owned(), turn_id.clone(), reason.clone())
-                .await
-            {
-                warn!(
-                    thread_id,
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "failed to durably close task delivery turn after item persistence failure"
-                );
+            Ok(finish) => finish,
+            Err(error) => {
+                self.thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error);
             }
-            return Err(error);
-        }
-        if !self
-            .complete_turn(thread_id.to_owned(), turn_id.clone(), None)
-            .await
-        {
-            let reason = "failed to durably complete task delivery turn".to_owned();
-            let _ = self
-                .mark_turn_blocked(thread_id.to_owned(), turn_id.clone(), reason.clone())
+        };
+        match item {
+            Some(item) => {
+                let item_started = pioneer_protocol::ItemStartedNotification {
+                    workspace_id: delivery.workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.clone(),
+                    item: item.clone(),
+                };
+                let item_completed = pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: delivery.workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.clone(),
+                    item,
+                };
+                let completed = pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: finish.workspace_id.clone(),
+                    thread_id: finish.thread_id.clone(),
+                    turn: finish.turn.clone(),
+                };
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_completed_task_delivery_turn(
+                        pioneer_crud::CompletedTaskDeliveryTurnWrite {
+                            thread: &turn_outcome.materialization.thread,
+                            sandbox_mode: turn_outcome.materialization.sandbox_mode,
+                            started_turn: &turn_outcome.materialization.turn,
+                            actor: projection_actor,
+                            audit_event: profile_selected_audit,
+                            item_started: item_started.clone(),
+                            item_completed: item_completed.clone(),
+                            completed: completed.clone(),
+                            agent_action: agent_action.map(|prepared| prepared.plan.input),
+                        },
+                    )
+                    .await
+                {
+                    self.thread_manager
+                        .rollback_turn_finish(finish.rollback_context)
+                        .await;
+                    self.thread_manager
+                        .rollback_turn_start(turn_outcome.rollback_context)
+                        .await;
+                    return Err(error);
+                }
+                self.send_notification_to_authorized_thread_connections(
+                    thread_id,
+                    events::TURN_STARTED,
+                    &turn_outcome.started_notification,
+                    turn_outcome.started_notification_connection_ids.clone(),
+                )
                 .await;
-            bail!(reason);
+                self.send_notification_to_thread_subscribers(
+                    thread_id,
+                    events::ITEM_STARTED,
+                    &item_started,
+                )
+                .await;
+                self.notify_semantic_timeline_item_changed(
+                    item_started.workspace_id.as_str(),
+                    item_started.thread_id.as_str(),
+                    item_started.turn_id.as_str(),
+                    &item_started.item,
+                    Some("in_progress"),
+                )
+                .await;
+                self.ingest_committed_thread_item(&item_completed).await;
+                self.send_notification_to_thread_subscribers(
+                    thread_id,
+                    events::ITEM_COMPLETED,
+                    &item_completed,
+                )
+                .await;
+                self.notify_semantic_timeline_item_changed(
+                    item_completed.workspace_id.as_str(),
+                    item_completed.thread_id.as_str(),
+                    item_completed.turn_id.as_str(),
+                    &item_completed.item,
+                    None,
+                )
+                .await;
+                self.send_notification_to_thread_subscribers(
+                    thread_id,
+                    events::TURN_COMPLETED,
+                    &completed,
+                )
+                .await;
+            }
+            None => {
+                let failed = pioneer_protocol::TurnFailedNotification {
+                    workspace_id: finish.workspace_id.clone(),
+                    thread_id: finish.thread_id.clone(),
+                    turn: finish.turn.clone(),
+                };
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_failed_task_delivery_turn(
+                        pioneer_crud::FailedTaskDeliveryTurnWrite {
+                            thread: &turn_outcome.materialization.thread,
+                            sandbox_mode: turn_outcome.materialization.sandbox_mode,
+                            started_turn: &turn_outcome.materialization.turn,
+                            actor: projection_actor,
+                            audit_event: profile_selected_audit,
+                            failed: failed.clone(),
+                            agent_action: agent_action.map(|prepared| prepared.plan.input),
+                        },
+                    )
+                    .await
+                {
+                    self.thread_manager
+                        .rollback_turn_finish(finish.rollback_context)
+                        .await;
+                    self.thread_manager
+                        .rollback_turn_start(turn_outcome.rollback_context)
+                        .await;
+                    return Err(error);
+                }
+                self.send_notification_to_authorized_thread_connections(
+                    thread_id,
+                    events::TURN_STARTED,
+                    &turn_outcome.started_notification,
+                    turn_outcome.started_notification_connection_ids.clone(),
+                )
+                .await;
+                self.send_notification_to_thread_subscribers(
+                    thread_id,
+                    events::TURN_FAILED,
+                    &failed,
+                )
+                .await;
+                self.notify_semantic_timeline_turn_state_changed(
+                    failed.workspace_id.as_str(),
+                    failed.thread_id.as_str(),
+                    failed.turn.id.as_str(),
+                )
+                .await;
+            }
         }
+        self.notify_thread_tree_changed(delivery.workspace_id.clone())
+            .await;
         Ok(turn_id)
     }
 
-    async fn ensure_delivery_thread_loaded(
+    pub(super) async fn ensure_thread_loaded(
         &self,
         thread_id: &str,
         workspace_id: &str,
@@ -779,6 +1212,7 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
         item: TurnItem,
+        agent_action: Option<pioneer_crud::AgentCommitInput>,
     ) -> Result<()> {
         let started = pioneer_protocol::ItemStartedNotification {
             workspace_id: workspace_id.to_owned(),
@@ -794,7 +1228,7 @@ impl MessageProcessor {
         };
         let now = now_timestamp_secs();
         self.crud_store
-            .materialize_item_started(started.clone(), now)
+            .materialize_task_delivery_item(started.clone(), completed.clone(), now, agent_action)
             .await?;
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_STARTED, &started)
             .await;
@@ -807,9 +1241,6 @@ impl MessageProcessor {
         )
         .await;
 
-        self.crud_store
-            .materialize_item_completed(completed.clone(), now)
-            .await?;
         // Delivery projects an already-produced result into the target conversation. Index the
         // committed projection directly; do not run another turn or post-turn memory extractor.
         self.ingest_committed_thread_item(&completed).await;
@@ -857,7 +1288,7 @@ impl MessageProcessor {
                 .fail_delivery(
                     delivery,
                     attempt,
-                    format!("webhook returned HTTP {}", status.as_u16()),
+                    "task_webhook_delivery_rejected".to_owned(),
                     Some(status.as_u16()),
                     None,
                     now_timestamp_secs(),
@@ -909,6 +1340,8 @@ fn task_user_notification_from_row(
         task_id: payload.task_id,
         run_id: payload.run_id,
         delivery_id: payload.delivery_id,
+        author: payload.author,
+        delivery_action_receipt_id: payload.delivery_action_receipt_id,
         result: payload.result,
         error: payload.error,
         created_at: payload.created_at,

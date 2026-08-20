@@ -1,16 +1,23 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
 use super::*;
+use crate::authorization::AgentExecutionPersistenceFacts;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use pioneer_agent::{AgentTurnHookRuntimeContext, ExecutionCheckpointContext};
+use pioneer_crud::{
+    AgentExecutionGrantInput, AgentExecutionGraphCommitInput, AgentExecutionInput,
+    AgentIdentityInput, AgentResourceStateInput, PresentationSnapshotInput, canonical_agent_id,
+    utc_now,
+};
 use pioneer_promt::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput};
 use pioneer_protocol::{
-    AgentExecutionBackend, CLIAgentRuntimeKind, ExecutionCheckpointPayload,
-    ItemCompletedNotification, ItemStartedNotification, PermissionBehavior,
-    TASK_COMPOSER_WORK_VERSION, Task, TaskAgentContext, TaskAgentContextMode, TaskAgentInput,
-    TaskAgentResultContract, TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec,
-    TaskAgentToolPolicy, TaskAgentWriteMode, TaskAttachmentMode, TaskError, TaskErrorClass,
-    TaskExecutorKind, TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    AgentExecutionBackend, AgentExecutionId, AgentExecutionProfileBackend, AgentIdentitySourceKind,
+    CLIAgentRuntimeKind, ExecutionCheckpointPayload, ItemCompletedNotification,
+    ItemStartedNotification, PermissionBehavior, TASK_COMPOSER_WORK_VERSION, Task,
+    TaskAgentContext, TaskAgentContextMode, TaskAgentInput, TaskAgentResultContract,
+    TaskAgentResultFormat, TaskAgentReviewPolicy, TaskAgentSpec, TaskAgentToolPolicy,
+    TaskAgentWriteMode, TaskAttachmentMode, TaskError, TaskErrorClass, TaskExecutorKind,
+    TaskGetResponse, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
     TaskResultReviewerKind, TaskResultReviewerSpec, TaskReviseResponse, TaskRun, TaskRunExecution,
     TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
@@ -34,6 +41,953 @@ use tokio::time::{Duration, sleep};
 
 const TASK_EXECUTION_HEARTBEAT_SECONDS: u64 = 30;
 
+fn task_agent_liveness_timeouts(task: &Task) -> (i64, i64) {
+    let defaults = pioneer_config::GatewayProviderStreamItemTimeoutConfig::default();
+    let configured = task.timeout_policy.as_ref();
+    let idle = configured
+        .and_then(|policy| policy.heartbeat_timeout_seconds)
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(defaults.idle_secs as i64);
+    let hard = configured
+        .and_then(|policy| policy.run_timeout_seconds)
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(defaults.hard_secs as i64);
+    (idle, hard.max(idle))
+}
+
+/// Every executable task/reviewer turn has a stable server-generated
+/// execution-shaped id. Persist that id as the visible actor; System is
+/// reserved for genuine runtime lifecycle events only.
+fn exact_task_execution_actor(execution_id: &str) -> Result<pioneer_protocol::PersistedActorRef> {
+    let execution_id = AgentExecutionId::new(execution_id.to_owned())
+        .map_err(|error| anyhow!("invalid task execution actor id `{execution_id}`: {error:?}"))?;
+    Ok(crate::authorization::exact_agent_actor(execution_id))
+}
+
+fn task_occurrence_execution_lineage(
+    execution_id: &str,
+    occurrence_root_execution_id: Option<&str>,
+    occurrence_execution_id: Option<&str>,
+    task_root_execution_id: Option<&str>,
+    task_creator_execution_id: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let root_execution_id = occurrence_root_execution_id
+        .or(task_root_execution_id)
+        .unwrap_or(execution_id)
+        .to_owned();
+    if root_execution_id == execution_id {
+        return Ok((root_execution_id, None));
+    }
+    let parent_execution_id = occurrence_execution_id
+        .filter(|candidate| *candidate != execution_id)
+        .or(task_creator_execution_id)
+        .filter(|candidate| *candidate != execution_id)
+        .map(str::to_owned)
+        .context("inherited Task work graph has no exact parent execution actor")?;
+    Ok((root_execution_id, Some(parent_execution_id)))
+}
+
+async fn exact_agent_execution_author(
+    processor: &Arc<MessageProcessor>,
+    execution_id: &str,
+) -> Result<pioneer_protocol::TurnAuthorSnapshot> {
+    let database = processor.crud_store.database_connection();
+    let execution = pioneer_crud::load_agent_execution(&database, execution_id)
+        .await?
+        .with_context(|| format!("AgentExecution `{execution_id}` is missing"))?;
+    let snapshot_id = execution
+        .presentation_snapshot_id
+        .as_deref()
+        .context("AgentExecution has no immutable presentation snapshot")?;
+    let snapshot = pioneer_crud::load_agent_presentation_snapshot(&database, snapshot_id)
+        .await?
+        .context("AgentExecution presentation snapshot is missing")?;
+    let identity =
+        pioneer_crud::load_agent_identity(&database, execution.agent_identity_id.as_str())
+            .await?
+            .context("AgentExecution identity is missing")?;
+    let presentation =
+        pioneer_crud::agent_presentation_snapshot_from_rows(&identity, &execution, &snapshot)?;
+    Ok(presentation.to_turn_author_snapshot())
+}
+
+async fn agent_turn_response_input(
+    processor: &Arc<MessageProcessor>,
+    turn_id: &str,
+    execution_id: &str,
+) -> Result<pioneer_crud::AgentTurnResponseInput> {
+    let database = processor.crud_store.database_connection();
+    let execution = pioneer_crud::load_agent_execution(&database, execution_id)
+        .await?
+        .with_context(|| format!("responding AgentExecution `{execution_id}` is missing"))?;
+    let presentation_snapshot_id = execution
+        .presentation_snapshot_id
+        .context("responding AgentExecution has no presentation snapshot")?;
+    Ok(pioneer_crud::AgentTurnResponseInput {
+        turn_id: turn_id.to_owned(),
+        execution_id: execution_id.to_owned(),
+        presentation_snapshot_id,
+        now: utc_now().into(),
+    })
+}
+
+async fn task_actor_turn_author(
+    processor: &Arc<MessageProcessor>,
+    actor_contract: &pioneer_protocol::TaskActorContract,
+) -> Result<pioneer_protocol::TurnAuthorSnapshot> {
+    match &actor_contract.creator {
+        pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
+            let snapshot = actor_contract
+                .creator_presentation_snapshot
+                .as_ref()
+                .context("agent Task creator has no immutable presentation snapshot")?;
+            if &snapshot.agent_execution_id != execution_id {
+                bail!("Task creator snapshot differs from its exact AgentExecution");
+            }
+            Ok(snapshot.to_turn_author_snapshot())
+        }
+        pioneer_protocol::PersistedActorRef::Principal(_) => {
+            super::message_turn::resolve_turn_author_snapshot(
+                processor.crud_store.as_ref(),
+                &actor_contract.creator,
+            )
+            .await?
+            .context("Task creator principal has no presentation snapshot")
+        }
+        _ => bail!("Agent Task creator must be a Principal or exact AgentExecution"),
+    }
+}
+
+async fn revision_turn_author(
+    processor: &Arc<MessageProcessor>,
+    task_run_turn: &TaskRunTurn,
+) -> Result<pioneer_protocol::TurnAuthorSnapshot> {
+    let review_event_id = task_run_turn
+        .requested_by_review_event_id
+        .as_deref()
+        .context("revision Turn has no requesting review event")?;
+    let review_event = processor
+        .crud_store
+        .get_task_result_review_event(review_event_id)
+        .await?
+        .with_context(|| format!("revision review event `{review_event_id}` is missing"))?;
+    match review_event.reviewer {
+        pioneer_protocol::TaskResultReviewerRef::AgentExecution(execution_id) => {
+            exact_agent_execution_author(processor, execution_id.as_str()).await
+        }
+        pioneer_protocol::TaskResultReviewerRef::Principal(principal_id) => {
+            super::message_turn::resolve_turn_author_snapshot(
+                processor.crud_store.as_ref(),
+                &pioneer_protocol::PersistedActorRef::Principal(principal_id),
+            )
+            .await?
+            .context("revision reviewer principal has no presentation snapshot")
+        }
+        pioneer_protocol::TaskResultReviewerRef::RuntimePolicy => {
+            Ok(super::message_turn::system_turn_author_snapshot())
+        }
+    }
+}
+
+fn task_child_launch_grant(
+    actor_contract: &pioneer_protocol::TaskActorContract,
+) -> Result<pioneer_protocol::ChildAgentLaunchGrantSet> {
+    let grant_json = actor_contract
+        .derived_child_launch_grant_json
+        .as_deref()
+        .context("Agent Task has no immutable child launch ceiling")?;
+    let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+        child_launch_grant,
+        ..
+    } = serde_json::from_str(grant_json).context("Task resolved child launch grant is invalid")?;
+    child_launch_grant
+        .validate()
+        .map_err(|error| anyhow!("Task child launch ceiling failed validation: {error:?}"))?;
+    Ok(child_launch_grant)
+}
+
+async fn exact_task_agent_source_id(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    task_id: &str,
+    facts: &AgentExecutionPersistenceFacts,
+) -> Result<String> {
+    let expected_source_kind = match facts.identity.source_kind {
+        AgentIdentitySourceKind::NativeAgent => pioneer_crud::SOURCE_NATIVE_AGENT,
+        AgentIdentitySourceKind::CliRuntimeInstance => pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE,
+        AgentIdentitySourceKind::Ephemeral => {
+            return Ok(format!("task-agent:{task_id}:{}", facts.identity.id));
+        }
+    };
+    let identity = pioneer_crud::load_agent_identity(
+        &processor.crud_store.database_connection(),
+        facts.identity.id.as_str(),
+    )
+    .await?
+    .context("Task Agent identity source is missing")?;
+    if identity.workspace_id != workspace_id
+        || identity.source_kind != expected_source_kind
+        || identity.status != "active"
+        || identity.retired_at.is_some()
+        || identity.source_revision != i64::try_from(facts.identity_source_revision).unwrap_or(-1)
+        || identity.source_fingerprint != facts.identity_source_fingerprint
+    {
+        bail!("Task Agent identity source differs from its immutable execution facts");
+    }
+    if let AgentExecutionProfileBackend::CliRuntime {
+        runtime_instance_id,
+    } = &facts.profile.backend
+        && runtime_instance_id != &identity.source_id
+    {
+        bail!("Task CLI identity and execution profile use different runtime instances");
+    }
+    Ok(identity.source_id)
+}
+
+async fn exact_task_agent_presentation_snapshot_id(
+    processor: &MessageProcessor,
+    facts: &AgentExecutionPersistenceFacts,
+    ephemeral_snapshot_seed: &str,
+) -> Result<String> {
+    if facts.identity.source_kind == AgentIdentitySourceKind::Ephemeral {
+        return Ok(canonical_agent_id('S', ephemeral_snapshot_seed));
+    }
+
+    let source_revision = i64::try_from(facts.identity_source_revision)
+        .context("Task Agent identity source revision exceeds database range")?;
+    let snapshot = pioneer_crud::load_current_agent_presentation_snapshot(
+        &processor.crud_store.database_connection(),
+        facts.identity.id.as_str(),
+        source_revision,
+        facts.identity_source_fingerprint.as_str(),
+    )
+    .await?
+    .context("Task Agent identity has no authoritative presentation snapshot")?;
+    if snapshot.display_name != facts.identity.display_name
+        || snapshot.nickname != facts.identity.nickname
+        || snapshot.avatar_revision != facts.identity.avatar_revision
+        || snapshot.role_label != facts.identity.role_label
+    {
+        bail!("Task Agent presentation differs from its immutable identity snapshot");
+    }
+    Ok(snapshot.id)
+}
+
+/// Persist the server-derived agent domain graph before a Task runtime starts.
+/// The task execution row remains the visible actor; the deterministic root
+/// scope is only the graph/resource owner and never a human/session identity.
+async fn persist_task_agent_execution_graph(
+    processor: &Arc<MessageProcessor>,
+    task_response: &TaskGetResponse,
+    run: &TaskRun,
+    agent_spec: &TaskAgentSpec,
+    parent: &TaskParentRuntimeContext,
+    facts: &AgentExecutionPersistenceFacts,
+    authorization_context_fingerprint: &str,
+) -> Result<pioneer_crud::AgentExecutionGraphCommitResult> {
+    let task = &task_response.task;
+    let now = utc_now();
+    let (idle_timeout_secs, hard_timeout_secs) = task_agent_liveness_timeouts(task);
+    let source_kind = match facts.identity.source_kind {
+        AgentIdentitySourceKind::NativeAgent => pioneer_crud::SOURCE_NATIVE_AGENT,
+        AgentIdentitySourceKind::CliRuntimeInstance => pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE,
+        AgentIdentitySourceKind::Ephemeral => pioneer_crud::SOURCE_EPHEMERAL,
+    };
+    // Registered Native/CLI identities must reuse their exact durable source
+    // key. Only an execution-local ephemeral identity receives a derived key.
+    let source_id = exact_task_agent_source_id(
+        processor,
+        task.workspace_id.as_str(),
+        task.id.as_str(),
+        facts,
+    )
+    .await?;
+    let source_revision = i64::try_from(facts.identity_source_revision)
+        .context("task agent identity source revision exceeds database range")?;
+    let execution_id = facts.execution_id.as_str().to_owned();
+    let snapshot_id = exact_task_agent_presentation_snapshot_id(
+        processor,
+        facts,
+        &format!(
+            "task-agent-snapshot\0{}\0{}",
+            facts.identity.id, execution_id
+        ),
+    )
+    .await?;
+    let actor_contract = processor
+        .crud_store
+        .get_task_actor_contract(task.id.as_str())
+        .await?
+        .context("agent Task is missing its durable actor contract")?;
+    let child_launch_grant = task_child_launch_grant(&actor_contract)?;
+    let launch = actor_contract
+        .launch
+        .as_ref()
+        .context("Agent Task has no immutable launch selection")?;
+    let requested_identity_json = serde_json::to_string(&launch.agent)
+        .context("failed to serialize requested Task agent identity selection")?;
+    let requested_profile_json = serde_json::to_string(&launch.execution)
+        .context("failed to serialize requested Task execution selection")?;
+    let occurrence_contract = processor
+        .crud_store
+        .get_task_occurrence_contract_by_run(run.id.as_str())
+        .await?
+        .context("agent Task run is missing its durable occurrence contract")?;
+    if occurrence_contract.route_id != actor_contract.execution_route_id
+        || occurrence_contract.result_return_route_id != actor_contract.delivery.route_id
+    {
+        bail!("Task occurrence route facts differ from its immutable actor contract");
+    }
+    let execution_generation = i64::try_from(occurrence_contract.execution_generation)
+        .context("task occurrence execution generation exceeds database range")?;
+    let attempt_generation = i64::from(occurrence_contract.retry_attempt).saturating_add(1);
+    let creator_execution_id = match &actor_contract.creator {
+        pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
+            Some(execution_id.as_str().to_owned())
+        }
+        _ => None,
+    };
+    let (root_execution_id, parent_execution_id) = task_occurrence_execution_lineage(
+        execution_id.as_str(),
+        occurrence_contract.work_graph_root_execution_id.as_deref(),
+        occurrence_contract.agent_execution_id.as_deref(),
+        actor_contract.work_graph_root_execution_id.as_deref(),
+        creator_execution_id.as_deref(),
+    )?;
+    if facts.root_execution_id.as_str() != root_execution_id.as_str() {
+        bail!("Task action binding and occurrence resolve different work-graph roots");
+    }
+    let root_home_thread_id = facts.home_root_thread_id.clone();
+    let branch_key = if let Some(parent_execution_id) = parent_execution_id.as_deref()
+        && parent_execution_id != root_execution_id
+    {
+        let parent_resource = pioneer_crud::load_agent_execution_resource_state(
+            &processor.crud_store.database_connection(),
+            parent_execution_id,
+        )
+        .await?
+        .context("nested Task parent has no durable branch resource state")?;
+        parent_resource.branch_key
+    } else {
+        format!("task:{}:{}", task.id, run.id)
+    };
+    let grant_id = canonical_agent_id('G', &format!("grant\0{execution_id}"));
+    let child_resource_state_id = canonical_agent_id(
+        'R',
+        &format!("resource\0{execution_id}\0{attempt_generation}"),
+    );
+    let grant_json = serde_json::json!({
+        "kind": "task_child",
+        "parent_execution_id": parent_execution_id,
+        "execution_id": execution_id,
+        "identity_id": facts.identity.id,
+        "profile_id": facts.profile.id,
+        "identity": facts.identity.clone(),
+        "profile": facts.profile.clone(),
+        "launch": actor_contract.launch.clone(),
+        "execution_route_id": actor_contract.execution_route_id.clone(),
+        "result_return_route_id": actor_contract.delivery.route_id.clone(),
+        "depth": agent_spec.depth,
+        "max_depth": agent_spec.max_depth,
+        "root_thread_id": facts.home_root_thread_id,
+        "role_key": facts.agent_authorization_role_key,
+        "agent_policy_generation": facts.agent_authorization_policy_generation,
+        "allowed_actions": facts.agent_authorization_allowed_actions,
+        "agent_authorization_fingerprint": facts.agent_authorization_fingerprint,
+        "child_launch_grant": child_launch_grant,
+    })
+    .to_string();
+    let grant_fingerprint = pioneer_crud::agent_execution_grant_fingerprint(&grant_json)?;
+
+    let result = processor
+        .crud_store
+        .commit_agent_execution_graph(AgentExecutionGraphCommitInput {
+            identity: AgentIdentityInput {
+                id: facts.identity.id.as_str().to_owned(),
+                workspace_id: task.workspace_id.clone(),
+                source_kind: source_kind.to_owned(),
+                source_id,
+                source_revision,
+                source_fingerprint: facts.identity_source_fingerprint.clone(),
+                now: now.clone().into(),
+            },
+            presentation: PresentationSnapshotInput {
+                id: snapshot_id.clone(),
+                agent_identity_id: facts.identity.id.as_str().to_owned(),
+                source_revision,
+                source_fingerprint: facts.identity_source_fingerprint.clone(),
+                display_name: facts.identity.display_name.clone(),
+                nickname: facts.identity.nickname.clone(),
+                avatar_revision: facts.identity.avatar_revision.clone(),
+                role_label: facts.identity.role_label.clone(),
+                now: now.clone().into(),
+            },
+            root_execution_id: root_execution_id.clone(),
+            root_execution: (root_execution_id == execution_id).then(|| AgentExecutionInput {
+                id: root_execution_id.clone(),
+                workspace_id: task.workspace_id.clone(),
+                agent_identity_id: facts.identity.id.as_str().to_owned(),
+                identity_source_revision: source_revision,
+                identity_source_fingerprint: facts.identity_source_fingerprint.clone(),
+                parent_execution_id: None,
+                parent_task_id: Some(task.id.clone()),
+                parent_thread_id: Some(parent.parent_thread_id.clone()),
+                home_root_thread_id: root_home_thread_id.clone(),
+                work_graph_root_execution_id: root_execution_id.clone(),
+                requested_identity_selection_json: requested_identity_json.clone(),
+                requested_profile_selection_json: requested_profile_json.clone(),
+                resolved_profile_id: Some(facts.profile.id.as_str().to_owned()),
+                resolved_profile_fingerprint: Some(facts.profile.fingerprint.clone()),
+                presentation_snapshot_id: Some(snapshot_id.clone()),
+                authorization_context_fingerprint: authorization_context_fingerprint.to_owned(),
+                execution_generation,
+                status: "created".to_owned(),
+                now: now.clone().into(),
+            }),
+            child_execution: AgentExecutionInput {
+                id: execution_id.clone(),
+                workspace_id: task.workspace_id.clone(),
+                agent_identity_id: facts.identity.id.as_str().to_owned(),
+                identity_source_revision: source_revision,
+                identity_source_fingerprint: facts.identity_source_fingerprint.clone(),
+                parent_execution_id: parent_execution_id.clone(),
+                parent_task_id: Some(task.id.clone()),
+                parent_thread_id: Some(parent.parent_thread_id.clone()),
+                home_root_thread_id: root_home_thread_id,
+                work_graph_root_execution_id: root_execution_id.clone(),
+                requested_identity_selection_json: requested_identity_json,
+                requested_profile_selection_json: requested_profile_json,
+                resolved_profile_id: Some(facts.profile.id.as_str().to_owned()),
+                resolved_profile_fingerprint: Some(facts.profile.fingerprint.clone()),
+                presentation_snapshot_id: Some(snapshot_id.clone()),
+                authorization_context_fingerprint: authorization_context_fingerprint.to_owned(),
+                execution_generation,
+                status: "created".to_owned(),
+                now: now.clone().into(),
+            },
+            root_resource_state: None,
+            child_resource_state: AgentResourceStateInput {
+                id: child_resource_state_id,
+                execution_id: execution_id.clone(),
+                attempt_generation,
+                branch_key,
+                fair_order: 1,
+                now: now.clone().into(),
+            },
+            grant: AgentExecutionGrantInput {
+                id: grant_id,
+                execution_id: execution_id.clone(),
+                parent_execution_id: parent_execution_id.clone(),
+                child_identity_id: facts.identity.id.as_str().to_owned(),
+                grant_fingerprint,
+                grant_json,
+                now: now.clone().into(),
+            },
+            response: None,
+            root_routes: Vec::new(),
+            max_concurrency: crate::authorization::AgentWorkResourcePolicy::default()
+                .max_concurrency as i32,
+            max_queue_depth: crate::authorization::AgentWorkResourcePolicy::default()
+                .max_queue_depth as i32,
+            max_depth: i32::from(
+                crate::authorization::AgentWorkResourcePolicy::default().max_depth,
+            ),
+            max_fan_out: crate::authorization::AgentWorkResourcePolicy::default().max_fan_out
+                as i32,
+            max_total_nodes: crate::authorization::AgentWorkResourcePolicy::default()
+                .max_total_nodes as i32,
+            idle_timeout_secs,
+            hard_timeout_secs,
+            child_permit_id: canonical_agent_id(
+                'P',
+                &format!("permit\0{root_execution_id}\0{execution_id}\0{attempt_generation}"),
+            ),
+            child_queue_id: canonical_agent_id(
+                'Q',
+                &format!("queue\0{root_execution_id}\0{execution_id}\0{attempt_generation}"),
+            ),
+            // Task-level creator, launch selection and creating graph facts
+            // were frozen atomically with Task creation. Occurrence-specific
+            // execution/grant facts belong to the execution graph rows above
+            // and must never rewrite that immutable actor contract.
+            task_actor_contract: None,
+            task_occurrence_contract: Some(occurrence_contract),
+            contract_now: now_timestamp_secs(),
+        })
+        .await
+        .context("failed to persist agent domain task execution graph")?;
+    processor
+        .notify_agent_work_graph_state_changed(result.root_execution_id.as_str())
+        .await;
+    Ok(result)
+}
+
+/// Reviewer turns are independent AgentExecutions in the existing Task work
+/// graph. They must acquire their own permit and grant, but must not overwrite
+/// the occurrence's candidate execution actor in `task_occurrence_contract`.
+async fn persist_task_reviewer_execution_graph(
+    processor: &Arc<MessageProcessor>,
+    task_response: &TaskGetResponse,
+    run: &TaskRun,
+    reviewer_key: &str,
+    parent: &TaskParentRuntimeContext,
+    facts: &AgentExecutionPersistenceFacts,
+    authorization_context_fingerprint: &str,
+) -> Result<pioneer_crud::AgentExecutionGraphCommitResult> {
+    let task = &task_response.task;
+    let occurrence = processor
+        .crud_store
+        .get_task_occurrence_contract_by_run(run.id.as_str())
+        .await?
+        .context("reviewer run is missing its durable occurrence contract")?;
+    let parent_execution_id = occurrence
+        .agent_execution_id
+        .clone()
+        .context("reviewer run has no exact candidate execution")?;
+    let root_execution_id = occurrence
+        .work_graph_root_execution_id
+        .clone()
+        .context("reviewer run has no durable work-graph root")?;
+    if occurrence.root_resource_scope_id.as_deref() != Some(root_execution_id.as_str()) {
+        bail!("reviewer run has inconsistent root resource scope");
+    }
+    let now = utc_now();
+    let (idle_timeout_secs, hard_timeout_secs) = task_agent_liveness_timeouts(task);
+    let source_kind = match facts.identity.source_kind {
+        AgentIdentitySourceKind::NativeAgent => pioneer_crud::SOURCE_NATIVE_AGENT,
+        AgentIdentitySourceKind::CliRuntimeInstance => pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE,
+        AgentIdentitySourceKind::Ephemeral => pioneer_crud::SOURCE_EPHEMERAL,
+    };
+    let source_id = exact_task_agent_source_id(
+        processor,
+        task.workspace_id.as_str(),
+        task.id.as_str(),
+        facts,
+    )
+    .await?;
+    let source_revision = i64::try_from(facts.identity_source_revision)
+        .context("reviewer identity source revision exceeds database range")?;
+    let execution_generation = i64::try_from(occurrence.execution_generation)
+        .context("reviewer execution generation exceeds database range")?;
+    let attempt_generation = i64::from(occurrence.retry_attempt).saturating_add(1);
+    let execution_id = facts.execution_id.as_str().to_owned();
+    let snapshot_id = exact_task_agent_presentation_snapshot_id(
+        processor,
+        facts,
+        &format!(
+            "task-reviewer-snapshot\0{}\0{}",
+            facts.identity.id, execution_id
+        ),
+    )
+    .await?;
+    let actor_contract = processor
+        .crud_store
+        .get_task_actor_contract(task.id.as_str())
+        .await?
+        .context("reviewer Task is missing its durable actor contract")?;
+    let child_launch_grant = task_child_launch_grant(&actor_contract)?;
+    let grant_json = serde_json::json!({
+        "kind": "task_reviewer",
+        "parent_execution_id": parent_execution_id.clone(),
+        "execution_id": execution_id.clone(),
+        "root_execution_id": root_execution_id.clone(),
+        "reviewer_key": reviewer_key,
+        "identity": facts.identity.clone(),
+        "profile": facts.profile.clone(),
+        "role_key": facts.agent_authorization_role_key,
+        "agent_policy_generation": facts.agent_authorization_policy_generation,
+        "allowed_actions": facts.agent_authorization_allowed_actions,
+        "agent_authorization_fingerprint": facts.agent_authorization_fingerprint,
+        "child_launch_grant": child_launch_grant,
+    })
+    .to_string();
+    let grant_fingerprint = pioneer_crud::agent_execution_grant_fingerprint(&grant_json)?;
+    let requested_identity = pioneer_protocol::AgentIdentitySelection::Exact {
+        agent_identity_id: facts.identity.id.clone(),
+    };
+    let requested_execution = pioneer_protocol::AgentExecutionSelection {
+        profile: pioneer_protocol::AgentExecutionProfileSelection::Exact {
+            profile_id: facts.profile.id.clone(),
+        },
+        reasoning: None,
+        permission_profile: None,
+        skill_ids: Vec::new(),
+        mcp_server_ids: Vec::new(),
+    };
+    let policy = crate::authorization::AgentWorkResourcePolicy::default();
+    let result = processor
+        .crud_store
+        .commit_agent_execution_graph(AgentExecutionGraphCommitInput {
+            identity: AgentIdentityInput {
+                id: facts.identity.id.as_str().to_owned(),
+                workspace_id: task.workspace_id.clone(),
+                source_kind: source_kind.to_owned(),
+                source_id,
+                source_revision,
+                source_fingerprint: facts.identity_source_fingerprint.clone(),
+                now: now.clone().into(),
+            },
+            presentation: PresentationSnapshotInput {
+                id: snapshot_id.clone(),
+                agent_identity_id: facts.identity.id.as_str().to_owned(),
+                source_revision,
+                source_fingerprint: facts.identity_source_fingerprint.clone(),
+                display_name: facts.identity.display_name.clone(),
+                nickname: facts.identity.nickname.clone(),
+                avatar_revision: facts.identity.avatar_revision.clone(),
+                role_label: facts.identity.role_label.clone(),
+                now: now.clone().into(),
+            },
+            root_execution_id: root_execution_id.clone(),
+            root_execution: None,
+            child_execution: AgentExecutionInput {
+                id: execution_id.clone(),
+                workspace_id: task.workspace_id.clone(),
+                agent_identity_id: facts.identity.id.as_str().to_owned(),
+                identity_source_revision: source_revision,
+                identity_source_fingerprint: facts.identity_source_fingerprint.clone(),
+                parent_execution_id: Some(parent_execution_id.clone()),
+                parent_task_id: Some(task.id.clone()),
+                parent_thread_id: Some(parent.parent_thread_id.clone()),
+                home_root_thread_id: facts.home_root_thread_id.clone(),
+                work_graph_root_execution_id: root_execution_id.clone(),
+                requested_identity_selection_json: serde_json::to_string(&requested_identity)
+                    .context("failed to encode reviewer identity selection")?,
+                requested_profile_selection_json: serde_json::to_string(&requested_execution)
+                    .context("failed to encode reviewer execution selection")?,
+                resolved_profile_id: Some(facts.profile.id.as_str().to_owned()),
+                resolved_profile_fingerprint: Some(facts.profile.fingerprint.clone()),
+                presentation_snapshot_id: Some(snapshot_id.clone()),
+                authorization_context_fingerprint: authorization_context_fingerprint.to_owned(),
+                execution_generation,
+                status: "created".to_owned(),
+                now: now.clone().into(),
+            },
+            root_resource_state: None,
+            child_resource_state: AgentResourceStateInput {
+                id: canonical_agent_id(
+                    'R',
+                    &format!("reviewer-resource\0{execution_id}\0{attempt_generation}"),
+                ),
+                execution_id: execution_id.clone(),
+                attempt_generation,
+                branch_key: format!("task-reviewer:{}:{reviewer_key}", task.id),
+                fair_order: 1,
+                now: now.clone().into(),
+            },
+            grant: AgentExecutionGrantInput {
+                id: canonical_agent_id('G', &format!("reviewer-grant\0{execution_id}")),
+                execution_id: execution_id.clone(),
+                parent_execution_id: Some(parent_execution_id),
+                child_identity_id: facts.identity.id.as_str().to_owned(),
+                grant_fingerprint,
+                grant_json,
+                now: now.clone().into(),
+            },
+            response: None,
+            root_routes: Vec::new(),
+            max_concurrency: i32::try_from(policy.max_concurrency).unwrap_or(i32::MAX),
+            max_queue_depth: i32::try_from(policy.max_queue_depth).unwrap_or(i32::MAX),
+            max_depth: i32::from(policy.max_depth),
+            max_fan_out: i32::from(policy.max_fan_out),
+            max_total_nodes: i32::try_from(policy.max_total_nodes).unwrap_or(i32::MAX),
+            idle_timeout_secs,
+            hard_timeout_secs,
+            child_permit_id: canonical_agent_id(
+                'P',
+                &format!("reviewer-permit\0{execution_id}\0{attempt_generation}"),
+            ),
+            child_queue_id: canonical_agent_id(
+                'Q',
+                &format!("reviewer-queue\0{execution_id}\0{attempt_generation}"),
+            ),
+            task_actor_contract: None,
+            task_occurrence_contract: None,
+            contract_now: now_timestamp_secs(),
+        })
+        .await
+        .context("failed to persist reviewer execution graph")?;
+    processor
+        .notify_agent_work_graph_state_changed(result.root_execution_id.as_str())
+        .await;
+    Ok(result)
+}
+
+async fn bind_existing_task_agent_graph(
+    processor: &Arc<MessageProcessor>,
+    run_id: &str,
+    execution_id: &str,
+    adapter: &mut crate::authorization::BoundAgentActionAdapter,
+) -> Result<()> {
+    let occurrence = processor
+        .crud_store
+        .get_task_occurrence_contract_by_run(run_id)
+        .await?
+        .context("task continuation is missing its durable occurrence contract")?;
+    if occurrence.agent_execution_id.as_deref() != Some(execution_id) {
+        bail!("task continuation execution differs from the persisted occurrence actor");
+    }
+    let root_execution_id = occurrence
+        .work_graph_root_execution_id
+        .as_deref()
+        .context("task continuation occurrence has no persisted work-graph root")?;
+    if occurrence.root_resource_scope_id.as_deref() != Some(root_execution_id) {
+        bail!("task continuation occurrence has inconsistent root resource scope");
+    }
+    adapter
+        .bind_persisted_work_graph_root(root_execution_id)
+        .map_err(|error| anyhow!("failed to bind persisted task work graph: {error:?}"))
+}
+
+pub(super) type TaskAgentActionBinding = (
+    crate::authorization::BoundAgentActionAdapter,
+    pioneer_protocol::AgentToolOptionsProjection,
+    std::collections::BTreeSet<pioneer_protocol::AgentToolCapability>,
+);
+
+/// Restore the exact identity/profile snapshot stored with an admitted Task
+/// execution, or materialize the exact launch frozen in the Task actor
+/// contract. Current Task, workspace, and runtime defaults are never used to
+/// widen or rewrite that admitted launch.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn materialize_task_agent_action_binding_for_execution(
+    processor: &MessageProcessor,
+    task: &Task,
+    agent_spec: &TaskAgentSpec,
+    execution_id: &str,
+    run_id: &str,
+    root_capsule_id: &str,
+    policy_generation: u64,
+    allow_terminal_execution: bool,
+) -> Result<TaskAgentActionBinding> {
+    let database = processor.crud_store.database_connection();
+    let actor_contract = processor
+        .crud_store
+        .get_task_actor_contract(task.id.as_str())
+        .await?
+        .context("agent Task is missing its durable actor contract")?;
+    let effective_home_root_thread_id =
+        if let Some(route_id) = actor_contract.execution_route_id.as_deref() {
+            let route = pioneer_crud::load_agent_delegation_route(&database, route_id)
+                .await?
+                .context("Task execution route is unavailable")?;
+            pioneer_crud::agent_delegation_route_projection(&route)?.destination_capsule_id
+        } else {
+            root_capsule_id.to_owned()
+        };
+    if let Some(execution) = pioneer_crud::load_agent_execution(&database, execution_id).await? {
+        if execution.workspace_id != task.workspace_id
+            || execution.parent_task_id.as_deref() != Some(task.id.as_str())
+            || (!allow_terminal_execution
+                && (execution.finished_at.is_some()
+                    || matches!(
+                        execution.status.as_str(),
+                        "completed" | "failed" | "cancelled"
+                    )))
+        {
+            bail!("persisted Task execution binding is stale or belongs to another Task");
+        }
+        if execution.home_root_thread_id != effective_home_root_thread_id {
+            bail!("persisted Task execution left its admitted destination capsule");
+        }
+        let identity =
+            pioneer_crud::load_agent_identity(&database, execution.agent_identity_id.as_str())
+                .await?
+                .context("persisted Task execution identity is missing")?;
+        if identity.workspace_id != task.workspace_id || identity.status != "active" {
+            bail!("persisted Task execution identity is unavailable");
+        }
+        super::agent_action_tools::current_agent_identity_source_fence(
+            processor,
+            execution.id.as_str(),
+        )
+        .await?;
+        let snapshot_id = execution
+            .presentation_snapshot_id
+            .as_deref()
+            .context("persisted Task execution has no presentation snapshot")?;
+        let snapshot = pioneer_crud::load_agent_presentation_snapshot(&database, snapshot_id)
+            .await?
+            .context("persisted Task execution presentation snapshot is missing")?;
+        if snapshot.agent_identity_id != identity.id
+            || snapshot.source_revision != execution.identity_source_revision
+            || snapshot.source_fingerprint != execution.identity_source_fingerprint
+        {
+            bail!("persisted Task presentation snapshot does not match its identity revision");
+        }
+        let source_kind = match identity.source_kind.as_str() {
+            pioneer_crud::SOURCE_NATIVE_AGENT => AgentIdentitySourceKind::NativeAgent,
+            pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE => {
+                AgentIdentitySourceKind::CliRuntimeInstance
+            }
+            pioneer_crud::SOURCE_EPHEMERAL => AgentIdentitySourceKind::Ephemeral,
+            _ => bail!("persisted Task identity has an unsupported source kind"),
+        };
+        let source_revision = u64::try_from(execution.identity_source_revision)
+            .context("persisted Task identity revision is invalid")?;
+        let identity_projection = pioneer_protocol::AgentIdentityProjection::new(
+            pioneer_protocol::AgentIdentityId::new(identity.id.clone())
+                .map_err(|error| anyhow!("persisted Task identity id is invalid: {error:?}"))?,
+            source_kind,
+            snapshot.display_name,
+            snapshot.nickname,
+            snapshot.avatar_revision,
+            snapshot.role_label,
+            source_revision,
+            execution.identity_source_fingerprint.clone(),
+        )
+        .map_err(|error| anyhow!("persisted Task identity projection is invalid: {error:?}"))?;
+        let execution_grant =
+            pioneer_crud::load_agent_execution_grant(&database, execution.id.as_str())
+                .await?
+                .context("persisted Task execution grant is missing")?;
+        let grant: serde_json::Value = serde_json::from_str(execution_grant.grant_json.as_str())
+            .context("persisted Task execution grant is invalid")?;
+        let grant_kind = grant.get("kind").and_then(serde_json::Value::as_str);
+        let profile: pioneer_protocol::AgentExecutionProfileProjection = serde_json::from_value(
+            grant
+                .get("profile")
+                .cloned()
+                .context("persisted Task execution grant has no resolved profile")?,
+        )
+        .context("persisted Task resolved execution profile is invalid")?;
+        if execution.resolved_profile_id.as_deref() != Some(profile.id.as_str())
+            || execution.resolved_profile_fingerprint.as_deref()
+                != Some(profile.fingerprint.as_str())
+        {
+            bail!("persisted Task execution profile differs from its resolved snapshot");
+        }
+        if grant_kind != Some("task_reviewer")
+            && let Some(selection) = actor_contract.launch.as_ref()
+        {
+            if execution.requested_identity_selection_json
+                != serde_json::to_string(&selection.agent)?
+                || execution.requested_profile_selection_json
+                    != serde_json::to_string(&selection.execution)?
+            {
+                bail!(
+                    "persisted Task execution requested selection differs from its actor contract"
+                );
+            }
+        }
+        let execution_id = AgentExecutionId::new(execution.id.clone())
+            .map_err(|error| anyhow!("persisted Task execution id is invalid: {error:?}"))?;
+        let root_execution_id =
+            AgentExecutionId::new(execution.work_graph_root_execution_id.clone())
+                .map_err(|error| anyhow!("persisted Task graph root is invalid: {error:?}"))?;
+        let execution_generation = u64::try_from(execution.execution_generation)
+            .context("persisted Task execution generation is invalid")?;
+        let resource_state =
+            pioneer_crud::load_agent_execution_resource_state(&database, execution.id.as_str())
+                .await?
+                .context("persisted Task execution resource attempt is missing")?;
+        let attempt_generation = u64::try_from(resource_state.attempt_generation)
+            .context("persisted Task execution attempt generation is invalid")?;
+        let depth =
+            u16::try_from(agent_spec.depth).context("persisted Task execution depth is invalid")?;
+        let role_key = grant
+            .get("role_key")
+            .and_then(serde_json::Value::as_str)
+            .context("persisted Task execution grant has no subject role")?;
+        let persisted_policy_generation = grant
+            .get("agent_policy_generation")
+            .and_then(serde_json::Value::as_u64)
+            .context("persisted Task execution grant has no policy generation")?;
+        let agent_authorization_fingerprint = grant
+            .get("agent_authorization_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .context("persisted Task execution grant has no authorization fingerprint")?;
+        let allowed_action_names: Vec<String> = serde_json::from_value(
+            grant
+                .get("allowed_actions")
+                .cloned()
+                .context("persisted Task execution grant has no action ceiling")?,
+        )
+        .context("persisted Task execution action ceiling is invalid")?;
+        return crate::authorization::materialize_persisted_task_agent_action_binding(
+            execution_id,
+            effective_home_root_thread_id.as_str(),
+            root_execution_id,
+            identity_projection,
+            profile,
+            execution_generation,
+            attempt_generation,
+            depth,
+            &format!("task:{}", task.id),
+            role_key,
+            persisted_policy_generation,
+            policy_generation,
+            agent_authorization_fingerprint,
+            allowed_action_names.as_slice(),
+        )
+        .map_err(|error| anyhow!("failed to restore exact Task agent binding: {error:?}"));
+    }
+
+    if let Some(grant_json) = actor_contract.derived_child_launch_grant_json.as_deref() {
+        let pioneer_protocol::TaskDerivedChildLaunchGrant::ResolvedTaskLaunch {
+            identity,
+            profile,
+            role_key,
+            agent_policy_generation: persisted_policy_generation,
+            allowed_actions: allowed_action_names,
+            agent_authorization_fingerprint: authorization_fingerprint,
+            child_launch_grant: _,
+        } = serde_json::from_str(grant_json).context("Task resolved launch grant is invalid")?;
+        let identity_row = pioneer_crud::load_agent_identity(&database, identity.id.as_str())
+            .await?
+            .context("Task resolved launch identity is no longer available")?;
+        if identity_row.workspace_id != task.workspace_id
+            || identity_row.status != "active"
+            || identity_row.source_revision != i64::try_from(identity.source_revision).unwrap_or(-1)
+            || identity_row.source_fingerprint != identity.source_fingerprint
+        {
+            bail!("Task resolved launch identity changed before occurrence admission");
+        }
+        let occurrence = processor
+            .crud_store
+            .get_task_occurrence_contract_by_run(run_id)
+            .await?
+            .context("Task run is missing its occurrence contract")?;
+        let execution_generation = occurrence.execution_generation;
+        let depth = u16::try_from(agent_spec.depth).context("Task execution depth is invalid")?;
+        let execution_id = AgentExecutionId::new(execution_id.to_owned())
+            .map_err(|error| anyhow!("Task execution id is invalid: {error:?}"))?;
+        let task_creator_execution_id = match &actor_contract.creator {
+            pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
+                Some(execution_id.as_str())
+            }
+            _ => None,
+        };
+        let (work_graph_root_execution_id, _) = task_occurrence_execution_lineage(
+            execution_id.as_str(),
+            occurrence.work_graph_root_execution_id.as_deref(),
+            occurrence.agent_execution_id.as_deref(),
+            actor_contract.work_graph_root_execution_id.as_deref(),
+            task_creator_execution_id,
+        )?;
+        let work_graph_root_execution_id = AgentExecutionId::new(work_graph_root_execution_id)
+            .map_err(|error| anyhow!("Task work graph root is invalid: {error:?}"))?;
+        return crate::authorization::materialize_persisted_selected_task_agent_action_binding(
+            execution_id,
+            effective_home_root_thread_id.as_str(),
+            work_graph_root_execution_id,
+            agent_spec.id.as_str(),
+            identity,
+            profile,
+            execution_generation,
+            u64::from(occurrence.retry_attempt).saturating_add(1),
+            depth,
+            role_key.as_str(),
+            persisted_policy_generation,
+            policy_generation,
+            authorization_fingerprint.as_str(),
+            allowed_action_names.as_slice(),
+        )
+        .map_err(|error| anyhow!("failed to bind resolved Task launch: {error:?}"));
+    }
+    bail!("Task launch selection was not resolved at create/schedule commit")
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum TaskChildResumeOutcome {
     Resumed { recovery_job_id: String },
@@ -51,7 +1005,7 @@ async fn close_admitted_task_turn_on_error<T>(
     let Err(error) = result else {
         return result;
     };
-    let reason = format!("task turn admission failed after durable start: {error:#}");
+    let reason = "task_turn_admission_failed".to_owned();
     if !processor
         .mark_turn_blocked(thread_id.to_owned(), turn_id.to_owned(), reason.clone())
         .await
@@ -59,7 +1013,7 @@ async fn close_admitted_task_turn_on_error<T>(
         warn!(
             thread_id,
             turn_id,
-            error = %format!("{error:#}"),
+            failure_class = "task_turn_admission_close_failed",
             "failed to durably close task turn after admission failure"
         );
     }
@@ -71,8 +1025,9 @@ async fn report_or_block_task_turn_failure(
     thread_id: String,
     turn_id: String,
     kind: TurnFailureRecoveryKind,
-    reason: String,
+    _reason_detail: String,
 ) {
+    let reason = "task_runtime_failure".to_owned();
     if !processor
         .report_turn_failure(thread_id.clone(), turn_id.clone(), kind, reason.clone())
         .await
@@ -83,7 +1038,7 @@ async fn report_or_block_task_turn_failure(
         warn!(
             thread_id,
             turn_id,
-            error = %reason,
+            failure_class = "task_runtime_failure_persistence_failed",
             "failed to report or durably block task turn after runtime failure"
         );
     }
@@ -100,9 +1055,7 @@ async fn commit_task_turn_execution_running(
         .await?
         .is_none()
     {
-        // Legacy task Turns created before the control-plane migration remain
-        // resumable through their positive runtime snapshot evidence.
-        return Ok(());
+        bail!("Task Turn `{turn_id}` has no durable execution-owner record");
     }
     let now = now_timestamp_secs();
     if processor
@@ -123,6 +1076,37 @@ async fn commit_task_turn_execution_running(
         .cancel_turn(thread_id, turn_id, reason)
         .await;
     bail!(reason)
+}
+
+async fn claim_task_turn_execution_for_recovery(
+    processor: &Arc<MessageProcessor>,
+    turn_id: &str,
+) -> Result<()> {
+    let execution = processor
+        .crud_store
+        .get_turn_execution(turn_id)
+        .await?
+        .with_context(|| format!("Task Turn `{turn_id}` has no durable execution-owner record"))?;
+    if execution.owner_id == processor.turn_execution_owner_id.as_ref() {
+        return Ok(());
+    }
+
+    let now = now_timestamp_secs();
+    if processor
+        .crud_store
+        .claim_expired_turn_execution(
+            &execution,
+            processor.turn_execution_owner_id.as_ref(),
+            now,
+            now.saturating_add(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+        )
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    bail!("task Turn execution is still owned by another live Gateway")
 }
 
 async fn verify_durable_task_child_admission(
@@ -323,6 +1307,14 @@ impl TaskAgentExecutor {
                 .recover_waiting_review_run(&processor, &task_response, &run, &agent_spec)
                 .await;
         }
+        // A disabled native runtime must not consume a new task execution
+        // reservation.  Keep the run queued so enabling the same configured
+        // runtime can resume it without rewriting its history.  The session
+        // factory repeats this check at process start to cover a config change
+        // racing this preflight.
+        if !cli_runtime_backend_enabled(&processor, &task_response.task)? {
+            return Ok(TaskExecutorStartOutcome::Queued);
+        }
         let Some(execution) = self
             .load_or_reserve_execution(&processor, &context, &run)
             .await?
@@ -362,6 +1354,7 @@ impl TaskAgentExecutor {
             &processor,
             &task_response,
             &run,
+            &execution,
             &agent_spec,
             parent,
             &occurrence_permission_profile,
@@ -487,7 +1480,89 @@ impl TaskAgentExecutor {
         if let Some(launch) = composer_launch.as_ref() {
             validate_composer_launch_backend(launch)?;
         }
-        let cli_runtime_backend = task_cli_runtime_backend(task)?;
+        // Resolve the immutable Task launch before creating any hidden
+        // conversation state. The selected profile, not Task metadata or the
+        // current parent thread, is authoritative for backend/provider/model.
+        let action_policy_generation = processor.current_authorization_revision().await?;
+        let (mut action_adapter, action_options, action_capabilities) =
+            materialize_task_agent_action_binding_for_execution(
+                processor,
+                &task_response.task,
+                agent_spec,
+                execution.id.as_str(),
+                run.id.as_str(),
+                parent.root_thread_id.as_str(),
+                action_policy_generation,
+                false,
+            )
+            .await
+            .context("failed to bind child agent action service")?;
+        let action_facts = action_adapter.persistence_facts();
+        let launch_selection = processor
+            .crud_store
+            .get_task_actor_contract(task.id.as_str())
+            .await?
+            .context("agent Task is missing its durable actor contract")?
+            .launch;
+        let effective_model = EffectiveAgentModel {
+            model: action_facts.profile.model_id.clone(),
+            model_provider: action_facts.profile.provider_id.clone(),
+        };
+        let (cli_runtime_backend, selected_execution_backend) = match &action_facts.profile.backend
+        {
+            AgentExecutionProfileBackend::ApiProvider => (
+                None,
+                Some(AgentExecutionBackend::ApiProvider {
+                    provider: action_facts.profile.provider_id.clone(),
+                }),
+            ),
+            AgentExecutionProfileBackend::CliRuntime {
+                runtime_instance_id,
+            } => {
+                let runtime = processor
+                    .load_cli_runtime_instances()?
+                    .into_iter()
+                    .find(|runtime| runtime.id == *runtime_instance_id && runtime.enabled)
+                    .context("selected Task CLI runtime is unavailable")?;
+                let runtime_kind = match runtime.kind {
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
+                        CLIAgentRuntimeKind::Codex
+                    }
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
+                        CLIAgentRuntimeKind::Claude
+                    }
+                };
+                (
+                    Some((runtime_instance_id.clone(), runtime_kind)),
+                    Some(AgentExecutionBackend::CLIAgentRuntime {
+                        runtime_id: runtime_instance_id.clone(),
+                        runtime_kind,
+                    }),
+                )
+            }
+            AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id } => (
+                None,
+                Some(AgentExecutionBackend::ACPAgentRuntime {
+                    runtime_id: runtime_id.clone(),
+                }),
+            ),
+        };
+        if let Some(launch) = composer_launch.as_mut() {
+            if launch
+                .execution_backend
+                .as_ref()
+                .is_some_and(|backend| Some(backend) != selected_execution_backend.as_ref())
+            {
+                bail!(
+                    "Composer Task backend {:?} differs from its resolved launch profile {:?}",
+                    launch.execution_backend,
+                    selected_execution_backend
+                );
+            }
+            launch.execution_backend = selected_execution_backend.clone();
+            launch.model = Some(effective_model.model.clone());
+            launch.model_provider = Some(effective_model.model_provider.clone());
+        }
         let normalized_composer_capabilities = if cli_runtime_backend.is_none()
             && let Some(launch) = composer_launch.as_mut()
         {
@@ -504,26 +1579,83 @@ impl TaskAgentExecutor {
         } else {
             None
         };
-        let effective_model = effective_task_child_model(task, agent_spec)?;
-        // A CLI backend owns provider identity. In particular, Composer sends
-        // no `model_provider` for native runtimes, and the parent thread may
-        // still carry the last API-provider key. Never project that key into
-        // the hidden child.
-        let effective_model_provider = cli_runtime_backend
-            .as_ref()
-            .map(|(runtime_id, _)| format!("cli_runtime:{}", runtime_id.trim()))
-            .unwrap_or_else(|| effective_model.model_provider.clone());
+        let normalized_selected_capabilities = if let Some(selection) = launch_selection.as_ref() {
+            let requested =
+                super::agent_action_tools::launch_selection_capabilities(&selection.execution)
+                    .context("persisted Task launch capabilities are invalid")?;
+            Some(
+                processor
+                    .normalize_turn_skill_capabilities(
+                        context.workspace_id.as_str(),
+                        requested.as_slice(),
+                    )
+                    .await
+                    .map_err(|message| anyhow!(message))
+                    .context("persisted Task launch capabilities are unavailable")?,
+            )
+        } else {
+            None
+        };
+        if let (Some(composer), Some(selection), Some(launch)) = (
+            normalized_composer_capabilities.as_ref(),
+            launch_selection.as_ref(),
+            composer_launch.as_ref(),
+        ) {
+            let mut validation_launch = launch.clone();
+            validation_launch.capabilities = composer.execution.clone();
+            validation_launch.agent_launch = Some(selection.clone());
+            super::turn_handlers::validate_root_agent_launch_capabilities(&validation_launch)
+                .map_err(|_| {
+                    anyhow!("Composer Task capabilities differ from its persisted launch selection")
+                })?;
+        }
+        let effective_model_provider = effective_model.model_provider.clone();
         let child_mode = composer_launch
             .as_ref()
             .and_then(|launch| launch.mode)
             .unwrap_or(ThreadMode::Agent);
-        let launch_permission_profile =
+        let selected_permission_profile = launch_selection.as_ref().map(|selection| {
+            pioneer_protocol::resolve_turn_permission_profile(
+                selection.execution.permission_profile.as_ref(),
+            )
+        });
+        let composer_permission_profile =
             composer_launch_permission_profile(composer_launch.as_ref());
+        if let (Some(selected), Some(composer)) = (
+            selected_permission_profile.as_ref(),
+            composer_permission_profile.as_ref(),
+        ) && selected.mode != composer.mode
+        {
+            bail!("Composer Task permission profile differs from its persisted launch selection");
+        }
+        let launch_permission_profile = selected_permission_profile.or(composer_permission_profile);
         let child_permission_profile = effective_task_child_permission_profile(
             agent_spec,
             launch_permission_profile.as_ref(),
         )?;
-        let reasoning_effort = composer_launch_reasoning_effort(composer_launch.as_ref());
+        let selected_reasoning = launch_selection
+            .as_ref()
+            .and_then(|selection| selection.execution.reasoning.clone());
+        let composer_reasoning_effort = composer_launch_reasoning_effort(composer_launch.as_ref());
+        if let (Some(selected), Some(composer)) = (
+            selected_reasoning.as_ref(),
+            composer_reasoning_effort.as_ref(),
+        ) && selected.effort.trim() != composer
+        {
+            bail!("Composer Task reasoning differs from its persisted launch selection");
+        }
+        let reasoning_effort = selected_reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort.trim())
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_owned)
+            .or(composer_reasoning_effort);
+        if let Some(launch) = composer_launch.as_mut()
+            && let Some(selection) = launch_selection.as_ref()
+        {
+            launch.reasoning = selection.execution.reasoning.clone();
+            launch.permission_profile = selection.execution.permission_profile.clone();
+        }
         let sandbox_mode = match composer_launch
             .as_ref()
             .and_then(|launch| launch.sandbox_policy.as_ref())
@@ -602,60 +1734,110 @@ impl TaskAgentExecutor {
             .await?;
             materialize_child_task_input(prompt, agent_spec)
         };
+        let selected_capabilities = normalized_selected_capabilities
+            .as_ref()
+            .map(|normalized| normalized.execution.clone())
+            .unwrap_or_default();
         let turn_params = composer_launch.unwrap_or_else(|| TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: child_thread_id.clone(),
             turn_id: child_turn_id.clone(),
             input: child_input.clone(),
-            capabilities: Vec::new(),
+            capabilities: selected_capabilities,
             model: Some(effective_model.model.clone()),
             model_provider: Some(effective_model_provider.clone()),
             sandbox_policy: None,
             mode: Some(child_mode),
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
-            execution_backend: None,
-            reasoning: None,
-            permission_profile: None,
+            execution_backend: selected_execution_backend,
+            reasoning: selected_reasoning,
+            permission_profile: launch_selection
+                .as_ref()
+                .and_then(|selection| selection.execution.permission_profile.clone()),
             cli_runtime_options: None,
         });
         let child_execution_backend = turn_params.execution_backend.clone();
+        let child_security_snapshot = match cli_runtime_backend.as_ref() {
+            Some((runtime_id, runtime_kind)) => resolve_task_child_cli_execution_security_snapshot(
+                processor,
+                context.workspace_id.as_str(),
+                parent,
+                agent_spec,
+                child_permission_profile.clone(),
+                runtime_id.as_str(),
+                *runtime_kind,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+            )
+            .await
+            .context("failed to resolve hidden task CLI runtime execution security")?,
+            None => resolve_task_child_execution_security_snapshot(
+                processor,
+                context.workspace_id.as_str(),
+                parent,
+                agent_spec,
+                child_permission_profile.clone(),
+                effective_model_provider.as_str(),
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+            )
+            .await
+            .context("failed to resolve hidden task execution security")?,
+        };
+        let (child_authorization, mut agent_skill_overlay) =
+            resolve_task_child_execution_authorization_context(
+                processor,
+                task,
+                parent,
+                effective_model_provider.as_str(),
+                effective_model.model.as_str(),
+                child_execution_backend.as_ref(),
+                turn_params.capabilities.as_slice(),
+                &child_security_snapshot.permission_profile,
+                child_turn_id.as_str(),
+            )
+            .await
+            .context("failed to resolve hidden task execution authorization")?;
+        let child_authorization_context = child_authorization.context;
+        let child_authorization_revalidation = child_authorization.revalidation;
+        let child_authorization_fingerprint = child_authorization_context
+            .authorization_fingerprint()
+            .context("failed to fingerprint hidden task execution authorization")?;
+        let actor_contract = processor
+            .crud_store
+            .get_task_actor_contract(task.id.as_str())
+            .await?
+            .context("agent Task is missing its durable actor contract")?;
+        let input_author = task_actor_turn_author(processor, &actor_contract).await?;
+        let non_cli_action_author = input_author.clone();
+        let graph = persist_task_agent_execution_graph(
+            processor,
+            task_response,
+            run,
+            agent_spec,
+            parent,
+            &action_facts,
+            child_authorization_fingerprint.as_str(),
+        )
+        .await?;
+        action_adapter
+            .bind_persisted_work_graph_root(graph.root_execution_id.as_str())
+            .map_err(|error| anyhow!("failed to bind persisted task work graph: {error:?}"))?;
+        if graph.queued {
+            return Ok(TaskExecutorStartOutcome::Queued);
+        }
+        let turn_response =
+            agent_turn_response_input(processor, child_turn_id.as_str(), execution.id.as_str())
+                .await?;
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
+            let action_author = input_author;
             return message_future(async move {
                 let conversation_history = frozen_conversation_scope
                     .as_ref()
                     .map(|(_, history)| history.clone())
                     .unwrap_or_default();
-                let child_security_snapshot = resolve_task_child_cli_execution_security_snapshot(
-                    processor,
-                    context.workspace_id.as_str(),
-                    parent,
-                    agent_spec,
-                    child_permission_profile.clone(),
-                    runtime_id.as_str(),
-                    runtime_kind,
-                    child_thread_id.as_str(),
-                    child_turn_id.as_str(),
-                )
-                .await
-                .context("failed to resolve hidden task CLI runtime execution security")?;
-                let cli_execution_backend = AgentExecutionBackend::CLIAgentRuntime {
-                    runtime_id: runtime_id.clone(),
-                    runtime_kind,
-                };
-                let child_authorization = resolve_task_child_execution_authorization_context(
-                    processor,
-                    task,
-                    parent,
-                    effective_model_provider.as_str(),
-                    effective_model.model.as_str(),
-                    Some(&cli_execution_backend),
-                    turn_params.capabilities.as_slice(),
-                    &child_security_snapshot.permission_profile,
-                )
-                .await
-                .context("failed to resolve hidden task CLI runtime authorization")?;
-                let child_authorization_context = child_authorization.context;
-                let child_authorization_revalidation = child_authorization.revalidation;
                 // Child-scoped authorization is revalidated while CLI MCP and skill
                 // projections are committed. Persist the durable lineage first so
                 // those checks can prove that the hidden thread belongs to the
@@ -698,6 +1880,8 @@ impl TaskAgentExecutor {
                             task_run_id,
                             execution_id,
                             conversation_history,
+                            action_author,
+                            turn_response,
                         )
                         .await
                 })
@@ -767,9 +1951,7 @@ impl TaskAgentExecutor {
                 if let Err(error) =
                     verify_durable_task_child_admission(processor, &child_runtime, &execution).await
                 {
-                    let abort_reason = format!(
-                        "task CLI runtime child admission could not be verified: {error:#}"
-                    );
+                    let abort_reason = "task_cli_runtime_child_admission_invalid".to_owned();
                     processor
                         .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
                         .await;
@@ -778,8 +1960,7 @@ impl TaskAgentExecutor {
 
                 let started_at = now_timestamp_secs();
                 if let Err(error) = handle.mark_started(started_at).await {
-                    let abort_reason =
-                        format!("failed to mark task CLI runtime run started: {error:#}");
+                    let abort_reason = "task_cli_runtime_run_start_failed".to_owned();
                     processor
                         .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
                         .await;
@@ -794,8 +1975,7 @@ impl TaskAgentExecutor {
                     )
                     .await
                 {
-                    let abort_reason =
-                        format!("failed to mark task CLI runtime execution running: {error:#}");
+                    let abort_reason = "task_cli_runtime_execution_start_failed".to_owned();
                     processor
                         .abort_prepared_task_cli_runtime_turn(prepared, abort_reason)
                         .await;
@@ -814,30 +1994,43 @@ impl TaskAgentExecutor {
                 })
                 .await;
                 if matches!(activation_result, Ok(Ok(()))) {
+                    processor
+                        .register_agent_action_binding(
+                            child_turn_id.clone(),
+                            crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                                action_adapter,
+                                action_options,
+                                action_capabilities,
+                            ),
+                        )
+                        .await?;
                     spawn_execution_heartbeat(
                         processor,
                         execution.id,
                         child_thread_id,
                         child_turn_id,
                         run.id.clone(),
+                        task_agent_liveness_timeouts(task),
                     );
                 }
                 return Ok(TaskExecutorStartOutcome::Started);
             })
             .await;
         }
+        let materialize_actor = non_cli_action_author.actor.clone();
         message_future(async move {
             let turn_outcome = processor
                 .thread_manager
-                .system_turn_start_with_permission_profile(
+                .agent_turn_start_with_permission_profile(
                     TurnStartParams {
                         input: child_input,
-                        model: Some(effective_model.model),
-                        model_provider: Some(effective_model.model_provider),
+                        model: Some(effective_model.model.clone()),
+                        model_provider: Some(effective_model.model_provider.clone()),
                         mode: Some(child_mode),
                         ..turn_params
                     },
                     child_permission_profile,
+                    non_cli_action_author,
                 )
                 .await
                 .context("failed to create hidden task turn")?;
@@ -869,54 +2062,6 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve hidden task permission profile");
             }
         };
-        let child_security_snapshot = match resolve_task_child_execution_security_snapshot(
-            processor,
-            context.workspace_id.as_str(),
-            parent,
-            agent_spec,
-            turn_permission_profile.clone(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-        )
-        .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                processor
-                    .thread_manager
-                    .rollback_turn_start(turn_outcome.rollback_context)
-                    .await;
-                return Err(error).context("failed to resolve hidden task execution security");
-            }
-        };
-        let child_authorization = match resolve_task_child_execution_authorization_context(
-            processor,
-            task,
-            parent,
-            turn_outcome.materialization.thread.model_provider.as_str(),
-            turn_outcome.materialization.thread.model.as_str(),
-            child_execution_backend.as_ref(),
-            turn_outcome.materialization.capabilities.as_slice(),
-            &child_security_snapshot.permission_profile,
-        )
-        .await
-        {
-            Ok(context) => context,
-            Err(error) => {
-                processor
-                    .thread_manager
-                    .rollback_turn_start(turn_outcome.rollback_context)
-                    .await;
-                return Err(error).context("failed to resolve hidden task execution authorization");
-            }
-        };
-        let child_authorization_context = child_authorization.context;
-        let child_authorization_revalidation = child_authorization.revalidation;
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             context.workspace_id.as_str(),
             child_thread_id.as_str(),
@@ -959,6 +2104,14 @@ impl TaskAgentExecutor {
             child_execution_backend.as_ref(),
             &turn_outcome.materialization,
         )?;
+        let materialize_response = turn_response;
+        let materialize_security_snapshot = child_security_snapshot.clone();
+        let materialize_security_audits = processor.turn_security_audit_events_for_turn(
+            context.workspace_id.as_str(),
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            &child_security_snapshot,
+        );
         let materialize_result = message_fresh_task(async move {
             materialize_store
                 .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
@@ -967,12 +2120,16 @@ impl TaskAgentExecutor {
                     &materialize_turn,
                     &materialize_input,
                     materialize_reasoning_effort.as_deref(),
-                    pioneer_protocol::PersistedActorRef::System,
+                    materialize_actor,
                     profile_selected_audit,
                     child_authority_json.as_str(),
                     None,
                     Some(child_turn_admission),
                     Some(materialize_execution),
+                    &materialize_security_snapshot,
+                    materialize_security_audits,
+                    None,
+                    Some(materialize_response),
                 )
                 .await
         })
@@ -986,9 +2143,8 @@ impl TaskAgentExecutor {
             return Err(error).context("failed to persist hidden task turn");
         }
         // The execution lease revalidator proves the child against durable
-        // lineage. Persist that typed derivation before any security/lease side
-        // effect, matching the CLI path and preventing a transient authority
-        // gap between Turn admission and child registration.
+        // lineage. Turn, authority, security snapshot and response are already
+        // one atomic write; link the runtime before registering its live lease.
         close_admitted_task_turn_on_error(
             processor,
             child_thread_id.as_str(),
@@ -1008,14 +2164,9 @@ impl TaskAgentExecutor {
             processor,
             child_thread_id.as_str(),
             child_turn_id.as_str(),
-            persist_resolved_task_child_execution_envelope(
-                processor,
-                child_turn_id.as_str(),
-                &child_security_snapshot,
-                &child_authorization_context,
-            )
+            register_resolved_task_child_execution_lease(processor, child_turn_id.as_str())
             .await
-            .context("failed to persist hidden task execution security"),
+            .context("failed to register hidden task execution lease"),
         )
         .await?;
         close_admitted_task_turn_on_error(
@@ -1049,6 +2200,17 @@ impl TaskAgentExecutor {
                 .await,
         )
         .await?;
+
+        processor
+            .register_agent_action_binding(
+                child_turn_id.clone(),
+                crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                    action_adapter,
+                    action_options,
+                    action_capabilities,
+                ),
+            )
+            .await?;
 
         let started_at = now_timestamp_secs();
         close_admitted_task_turn_on_error(
@@ -1180,29 +2342,6 @@ impl TaskAgentExecutor {
             .await,
         )
         .await?;
-        let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
-            task.workspace_id.as_str(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
-        ) {
-            close_admitted_task_turn_on_error(
-                processor,
-                child_thread_id.as_str(),
-                child_turn_id.as_str(),
-                load_task_agent_skill_overlay(
-                    processor,
-                    &child_authorization_context,
-                    child_turn_id.as_str(),
-                )
-                .await,
-            )
-            .await?
-        } else {
-            Vec::new()
-        };
         if let Err(error) = processor
             .persist_turn_runtime_snapshot_with_optional_agent_overlay(
                 child_thread_id.as_str(),
@@ -1286,6 +2425,7 @@ impl TaskAgentExecutor {
             child_thread_id,
             child_turn_id,
             run.id.clone(),
+            task_agent_liveness_timeouts(task),
         );
 
             Ok(TaskExecutorStartOutcome::Started)
@@ -1442,6 +2582,7 @@ impl TaskAgentExecutor {
                         child_runtime.task_run_turn.thread_id.clone(),
                         child_runtime.task_run_turn.turn_id.clone(),
                         run.id.clone(),
+                        task_agent_liveness_timeouts(task),
                     );
                 }
             }
@@ -1472,7 +2613,47 @@ impl TaskAgentExecutor {
             .get_thread_sandbox_mode(child_thread_id.as_str())
             .await?;
         let parent = resolve_parent_context(processor, task).await?;
-        let effective_model = effective_agent_model(agent_spec)?;
+        let action_policy_generation = processor.current_authorization_revision().await?;
+        let (mut action_adapter, action_options, action_capabilities) =
+            materialize_task_agent_action_binding_for_execution(
+                processor,
+                task,
+                agent_spec,
+                execution.id.as_str(),
+                run.id.as_str(),
+                parent.root_thread_id.as_str(),
+                action_policy_generation,
+                false,
+            )
+            .await
+            .context("failed to bind revision agent action service")?;
+        bind_existing_task_agent_graph(
+            processor,
+            run.id.as_str(),
+            execution.id.as_str(),
+            &mut action_adapter,
+        )
+        .await?;
+        let action_facts = action_adapter.persistence_facts();
+        let actor_contract = processor
+            .crud_store
+            .get_task_actor_contract(task.id.as_str())
+            .await?
+            .context("revision Task has no durable actor contract")?;
+        let turn_settings = resolved_task_execution_turn_settings(
+            processor,
+            task,
+            agent_spec,
+            &action_facts,
+            actor_contract.launch.as_ref(),
+        )
+        .await?;
+        let effective_model = turn_settings.model.clone();
+        let action_author = revision_turn_author(processor, &child_runtime.task_run_turn).await?;
+        let action_actor = action_author.actor.clone();
+        let turn_response =
+            agent_turn_response_input(processor, child_turn_id.as_str(), execution.id.as_str())
+                .await?;
         let thread_outcome = processor
             .thread_manager
             .system_thread_start_seeded(
@@ -1496,7 +2677,7 @@ impl TaskAgentExecutor {
             )
             .await
             .context("failed to restore revision task thread")?;
-        let child_permission_profile = effective_task_child_permission_profile(agent_spec, None)?;
+        let child_permission_profile = turn_settings.permission_profile.clone();
         let frozen_conversation_scope = if task_attachment(task) == TaskAttachmentMode::Detached {
             Some(
                 load_task_execution_conversation_scope(
@@ -1535,26 +2716,137 @@ impl TaskAgentExecutor {
             .await?,
             agent_spec,
         );
+        if let Some((runtime_id, runtime_kind)) = turn_settings.cli_runtime.clone() {
+            let child_security_snapshot = resolve_task_child_cli_execution_security_snapshot(
+                processor,
+                task.workspace_id.as_str(),
+                &parent,
+                agent_spec,
+                child_permission_profile.clone(),
+                runtime_id.as_str(),
+                runtime_kind,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+            )
+            .await
+            .context("failed to resolve revision CLI execution security")?;
+            let (child_authorization, _) = resolve_task_child_execution_authorization_context(
+                processor,
+                task,
+                &parent,
+                effective_model.model_provider.as_str(),
+                effective_model.model.as_str(),
+                Some(&turn_settings.execution_backend),
+                turn_settings.capabilities.as_slice(),
+                &child_security_snapshot.permission_profile,
+                child_turn_id.as_str(),
+            )
+            .await
+            .context("failed to resolve revision CLI execution authorization")?;
+            let child_authorization_context = child_authorization.context;
+            let child_authorization_revalidation = child_authorization.revalidation;
+            let prepared = processor
+                .prepare_task_cli_runtime_turn(
+                    TurnStartParams {
+                        agent_delegation_routes: Vec::new(),
+                        thread_id: child_thread_id.clone(),
+                        turn_id: child_turn_id.clone(),
+                        input,
+                        capabilities: turn_settings.capabilities.clone(),
+                        model: Some(effective_model.model.clone()),
+                        model_provider: Some(effective_model.model_provider.clone()),
+                        sandbox_policy: None,
+                        mode: Some(ThreadMode::Agent),
+                        agent_launch: None,
+                        reply_to_turn_id: None,
+                        mentioned_principal_ids: Vec::new(),
+                        execution_backend: Some(turn_settings.execution_backend.clone()),
+                        reasoning: turn_settings.reasoning.clone(),
+                        permission_profile: turn_settings.permission_selection.clone(),
+                        cli_runtime_options: None,
+                    },
+                    runtime_id,
+                    runtime_kind,
+                    child_permission_profile,
+                    child_security_snapshot,
+                    child_authorization_context,
+                    child_authorization_revalidation,
+                    parent.parent_thread_id.clone(),
+                    parent.parent_thread_id.clone(),
+                    run.id.clone(),
+                    execution.id.clone(),
+                    frozen_conversation_scope
+                        .as_ref()
+                        .map(|(_, history)| history.clone())
+                        .unwrap_or_default(),
+                    action_author,
+                    turn_response.clone(),
+                )
+                .await
+                .context("failed to prepare revision CLI runtime turn")?;
+            processor
+                .activate_prepared_task_cli_runtime_turn(prepared)
+                .await
+                .context("failed to activate revision CLI runtime turn")?;
+            processor
+                .register_agent_action_binding(
+                    child_turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await?;
+            let started_at = now_timestamp_secs();
+            processor
+                .crud_store
+                .mark_execution_running(
+                    execution.id.as_str(),
+                    started_at,
+                    Some(started_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                )
+                .await
+                .context("failed to mark revision CLI execution running")?;
+            spawn_execution_heartbeat(
+                processor,
+                execution.id.clone(),
+                child_runtime.task_run_turn.thread_id,
+                child_runtime.task_run_turn.turn_id,
+                run.id.clone(),
+                task_agent_liveness_timeouts(task),
+            );
+            return Ok(());
+        }
+        if !matches!(
+            turn_settings.execution_backend,
+            AgentExecutionBackend::ApiProvider { .. }
+        ) {
+            bail!("revision Task backend has no installed runtime adapter");
+        }
         let turn_outcome = match processor
             .thread_manager
-            .system_turn_start_with_permission_profile(
+            .agent_turn_start_with_permission_profile(
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: child_runtime.task_run_turn.thread_id.clone(),
                     turn_id: child_runtime.task_run_turn.turn_id.clone(),
                     input,
-                    capabilities: Vec::new(),
+                    capabilities: turn_settings.capabilities.clone(),
                     model: Some(effective_model.model),
                     model_provider: Some(effective_model.model_provider),
                     sandbox_policy: None,
                     mode: Some(ThreadMode::Agent),
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
-                    execution_backend: None,
-                    reasoning: None,
-                    permission_profile: None,
+                    execution_backend: Some(turn_settings.execution_backend.clone()),
+                    reasoning: turn_settings.reasoning.clone(),
+                    permission_profile: turn_settings.permission_selection.clone(),
                     cli_runtime_options: None,
                 },
                 child_permission_profile,
+                action_author,
             )
             .await
         {
@@ -1579,6 +2871,7 @@ impl TaskAgentExecutor {
                     child_runtime.task_run_turn.thread_id,
                     child_runtime.task_run_turn.turn_id,
                     run.id.clone(),
+                    task_agent_liveness_timeouts(task),
                 );
                 return Ok(());
             }
@@ -1685,41 +2978,43 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
         };
-        let child_authorization = match resolve_task_child_execution_authorization_context(
-            processor,
-            task,
-            &parent,
-            turn_outcome.materialization.thread.model_provider.as_str(),
-            turn_outcome.materialization.thread.model.as_str(),
-            None,
-            turn_outcome.materialization.capabilities.as_slice(),
-            &child_security_snapshot.permission_profile,
-        )
-        .await
-        {
-            Ok(context) => context,
-            Err(error) => {
-                processor
-                    .thread_manager
-                    .rollback_turn_start(turn_outcome.rollback_context)
-                    .await;
-                self.block_revision_dispatch_turn(
-                    processor,
-                    child_runtime,
-                    handle,
-                    task_error(
-                        "revision_execution_authorization_unavailable",
-                        format!(
-                            "failed to resolve revision task execution authorization: {error:#}"
+        let (child_authorization, mut agent_skill_overlay) =
+            match resolve_task_child_execution_authorization_context(
+                processor,
+                task,
+                &parent,
+                turn_outcome.materialization.thread.model_provider.as_str(),
+                turn_outcome.materialization.thread.model.as_str(),
+                Some(&turn_settings.execution_backend),
+                turn_outcome.materialization.capabilities.as_slice(),
+                &child_security_snapshot.permission_profile,
+                child_turn_id.as_str(),
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    processor
+                        .thread_manager
+                        .rollback_turn_start(turn_outcome.rollback_context)
+                        .await;
+                    self.block_revision_dispatch_turn(
+                        processor,
+                        child_runtime,
+                        handle,
+                        task_error(
+                            "revision_execution_authorization_unavailable",
+                            format!(
+                                "failed to resolve revision task execution authorization: {error:#}"
+                            ),
+                            TaskErrorClass::Policy,
+                            Some(run.id.clone()),
                         ),
-                        TaskErrorClass::Policy,
-                        Some(run.id.clone()),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
         let child_authorization_context = child_authorization.context;
         let child_authorization_revalidation = child_authorization.revalidation;
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
@@ -1754,7 +3049,7 @@ impl TaskAgentExecutor {
             .durable_turn_admission_after_revalidation(
                 child_thread_id.as_str(),
                 child_turn_id.as_str(),
-                None,
+                Some(&turn_settings.execution_backend),
                 &child_authorization_revalidation,
             ) {
             Ok(admission) => admission,
@@ -1785,17 +3080,29 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
-                None,
-                pioneer_protocol::PersistedActorRef::System,
+                turn_settings
+                    .reasoning
+                    .as_ref()
+                    .map(|reasoning| reasoning.effort.as_str()),
+                action_actor,
                 profile_selected_audit,
                 child_authority_json.as_str(),
                 None,
                 Some(child_turn_admission),
                 Some(super::turn_handlers::new_turn_execution(
                     processor.turn_execution_owner_id.as_ref(),
-                    None,
+                    Some(&turn_settings.execution_backend),
                     &turn_outcome.materialization,
                 )?),
+                &child_security_snapshot,
+                processor.turn_security_audit_events_for_turn(
+                    task.workspace_id.as_str(),
+                    child_thread_id.as_str(),
+                    child_turn_id.as_str(),
+                    &child_security_snapshot,
+                ),
+                None,
+                Some(turn_response),
             )
             .await
         {
@@ -1817,15 +3124,17 @@ impl TaskAgentExecutor {
             .await?;
             return Ok(());
         }
-        if let Err(error) = persist_resolved_task_child_execution_envelope(
-            processor,
-            child_turn_id.as_str(),
-            &child_security_snapshot,
-            &child_authorization_context,
-        )
-        .await
+        if let Err(error) =
+            register_resolved_task_child_execution_lease(processor, child_turn_id.as_str()).await
         {
-            let reason = format!("failed to persist revision task execution security: {error:#}");
+            warn!(
+                thread_id = child_thread_id,
+                turn_id = child_turn_id,
+                error = %format!("{error:#}"),
+                failure_class = "revision_execution_security_persist_failed",
+                "failed to persist revision task execution security"
+            );
+            let reason = "revision_execution_security_persist_failed".to_owned();
             if !processor
                 .mark_turn_blocked(
                     child_thread_id.clone(),
@@ -1837,7 +3146,7 @@ impl TaskAgentExecutor {
                 warn!(
                     thread_id = child_thread_id,
                     turn_id = child_turn_id,
-                    error = %format!("{error:#}"),
+                    failure_class = "revision_execution_security_close_failed",
                     "failed to durably close revision task turn after admission failure"
                 );
             }
@@ -1878,6 +3187,16 @@ impl TaskAgentExecutor {
                 .await,
         )
         .await?;
+        processor
+            .register_agent_action_binding(
+                child_turn_id.to_owned(),
+                crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                    action_adapter,
+                    action_options,
+                    action_capabilities,
+                ),
+            )
+            .await?;
 
         let started_at = now_timestamp_secs();
         close_admitted_task_turn_on_error(
@@ -1976,29 +3295,6 @@ impl TaskAgentExecutor {
             .await,
         )
         .await?;
-        let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
-            task.workspace_id.as_str(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
-        ) {
-            close_admitted_task_turn_on_error(
-                processor,
-                child_thread_id.as_str(),
-                child_turn_id.as_str(),
-                load_task_agent_skill_overlay(
-                    processor,
-                    &child_authorization_context,
-                    child_turn_id.as_str(),
-                )
-                .await,
-            )
-            .await?
-        } else {
-            Vec::new()
-        };
         if let Err(error) = processor
             .persist_turn_runtime_snapshot_with_optional_agent_overlay(
                 child_thread_id.as_str(),
@@ -2122,6 +3418,7 @@ impl TaskAgentExecutor {
             child_runtime.task_run_turn.thread_id,
             child_runtime.task_run_turn.turn_id,
             run.id.clone(),
+            task_agent_liveness_timeouts(task),
         );
         Ok(())
     }
@@ -2183,39 +3480,30 @@ impl TaskAgentExecutor {
                 Ok(TaskExecutorStartOutcome::Started)
             }
             TurnStatus::InProgress => {
-                revalidate_existing_task_child_execution_authorization(
+                claim_task_turn_execution_for_recovery(
                     processor,
-                    &task_response.task,
-                    child_runtime.task_run_turn.thread_id.as_str(),
                     child_runtime.task_run_turn.turn_id.as_str(),
                 )
                 .await
-                .context("task child continuation authorization is no longer active")?;
-                if task_cli_runtime_backend(&task_response.task)?.is_some() {
-                    let child_turn_id = child_runtime.task_run_turn.turn_id.as_str();
-                    let Some(binding) = processor
-                        .crud_store
-                        .get_cli_runtime_turn_binding(child_turn_id)
-                        .await?
-                    else {
-                        let message = "native CLI runtime binding is missing during task recovery";
-                        report_or_block_task_turn_failure(
-                            processor,
-                            child_runtime.task_run_turn.thread_id.clone(),
-                            child_runtime.task_run_turn.turn_id.clone(),
-                            TurnFailureRecoveryKind::TaskDispatch,
-                            message.to_owned(),
-                        )
-                        .await;
-                        self.fail_child_turn(
-                            child_runtime,
-                            message,
-                            TaskRunTurnStatus::Failed,
-                            handle,
-                        )
-                        .await?;
-                        return Ok(TaskExecutorStartOutcome::Started);
-                    };
+                .context("failed to claim restored task Turn execution ownership")?;
+                let child_authorization_context =
+                    revalidate_existing_task_child_execution_authorization(
+                        processor,
+                        &task_response.task,
+                        child_runtime.task_run_turn.thread_id.as_str(),
+                        child_runtime.task_run_turn.turn_id.as_str(),
+                    )
+                    .await
+                    .context("task child continuation authorization is no longer active")?;
+                let child_authorization_fingerprint = child_authorization_context
+                    .authorization_fingerprint()
+                    .context("failed to fingerprint restored task child authorization")?;
+                let child_turn_id = child_runtime.task_run_turn.turn_id.as_str();
+                if let Some(binding) = processor
+                    .crud_store
+                    .get_cli_runtime_turn_binding(child_turn_id)
+                    .await?
+                {
                     let parent = resolve_parent_context(processor, &task_response.task).await?;
                     if binding.thread_id != child_runtime.task_run_turn.thread_id
                         || binding.continuation_thread_id != parent.parent_thread_id
@@ -2239,15 +3527,134 @@ impl TaskAgentExecutor {
                         .await?;
                         return Ok(TaskExecutorStartOutcome::Started);
                     }
+                    let runtime_kind = match binding.runtime_kind.as_str() {
+                        "codex" => CLIAgentRuntimeKind::Codex,
+                        "claude" => CLIAgentRuntimeKind::Claude,
+                        _ => {
+                            return Err(anyhow!(
+                                "unknown CLI runtime kind `{}` during task recovery",
+                                binding.runtime_kind
+                            ));
+                        }
+                    };
+                    let action_policy_generation =
+                        processor.current_authorization_revision().await?;
+                    let (mut action_adapter, action_options, action_capabilities) =
+                        materialize_task_agent_action_binding_for_execution(
+                            processor,
+                            &task_response.task,
+                            agent_spec,
+                            execution.id.as_str(),
+                            run.id.as_str(),
+                            parent.root_thread_id.as_str(),
+                            action_policy_generation,
+                            false,
+                        )
+                        .await
+                        .context("failed to restore child agent action binding")?;
+                    let action_facts = action_adapter.persistence_facts();
+                    let actor_contract = processor
+                        .crud_store
+                        .get_task_actor_contract(task_response.task.id.as_str())
+                        .await?
+                        .context("recovered CLI Task has no durable actor contract")?;
+                    let turn_settings = resolved_task_execution_turn_settings(
+                        processor,
+                        &task_response.task,
+                        agent_spec,
+                        &action_facts,
+                        actor_contract.launch.as_ref(),
+                    )
+                    .await?;
+                    if turn_settings.cli_runtime.as_ref()
+                        != Some(&(binding.runtime_id.clone(), runtime_kind))
+                    {
+                        bail!("persisted Task CLI binding differs from its pinned profile");
+                    }
+                    let graph = persist_task_agent_execution_graph(
+                        processor,
+                        task_response,
+                        run,
+                        agent_spec,
+                        &parent,
+                        &action_facts,
+                        child_authorization_fingerprint.as_str(),
+                    )
+                    .await
+                    .context("failed to restore agent domain task execution graph")?;
+                    action_adapter
+                        .bind_persisted_work_graph_root(graph.root_execution_id.as_str())
+                        .map_err(|error| {
+                            anyhow!("failed to restore persisted task work graph: {error:?}")
+                        })?;
+                    if graph.queued {
+                        return Ok(TaskExecutorStartOutcome::Queued);
+                    }
+                    processor
+                        .register_agent_action_binding(
+                            child_runtime.task_run_turn.turn_id.clone(),
+                            crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                                action_adapter,
+                                action_options,
+                                action_capabilities,
+                            ),
+                        )
+                        .await?;
                     spawn_execution_heartbeat(
                         processor,
                         execution.id.clone(),
                         child_runtime.task_run_turn.thread_id,
                         child_runtime.task_run_turn.turn_id,
                         run.id.clone(),
+                        task_agent_liveness_timeouts(&task_response.task),
                     );
                     return Ok(TaskExecutorStartOutcome::Started);
                 }
+                let parent = resolve_parent_context(processor, &task_response.task).await?;
+                let action_policy_generation = processor.current_authorization_revision().await?;
+                let (mut action_adapter, action_options, action_capabilities) =
+                    materialize_task_agent_action_binding_for_execution(
+                        processor,
+                        &task_response.task,
+                        agent_spec,
+                        execution.id.as_str(),
+                        run.id.as_str(),
+                        parent.root_thread_id.as_str(),
+                        action_policy_generation,
+                        false,
+                    )
+                    .await
+                    .context("failed to restore child agent action binding")?;
+                let action_facts = action_adapter.persistence_facts();
+                let graph = persist_task_agent_execution_graph(
+                    processor,
+                    task_response,
+                    run,
+                    agent_spec,
+                    &parent,
+                    &action_facts,
+                    child_authorization_fingerprint.as_str(),
+                )
+                .await
+                .context("failed to restore agent domain task execution graph")?;
+                action_adapter
+                    .bind_persisted_work_graph_root(graph.root_execution_id.as_str())
+                    .map_err(|error| {
+                        anyhow!("failed to restore persisted task work graph: {error:?}")
+                    })?;
+                if graph.queued {
+                    return Ok(TaskExecutorStartOutcome::Queued);
+                }
+                processor
+                    .register_agent_action_binding(
+                        child_runtime.task_run_turn.turn_id.clone(),
+                        crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                            action_adapter,
+                            action_options,
+                            action_capabilities,
+                        ),
+                    )
+                    .await?;
                 self.restart_in_progress_child_turn(
                     processor,
                     task_response,
@@ -2308,126 +3715,109 @@ impl TaskAgentExecutor {
             .get_thread_sandbox_mode(child_thread_id)
             .await?;
         let parent = resolve_parent_context(processor, task).await?;
-        let effective_model = effective_agent_model(agent_spec)?;
-        let thread_outcome = processor
-            .thread_manager
-            .system_thread_start_seeded(
-                task.workspace_id.clone(),
-                pioneer_protocol::ThreadStartParams {
-                    thread_id: child_runtime.task_run_turn.thread_id.clone(),
-                    workspace_id: task.workspace_id.clone(),
-                    name: thread_name_from_task(task),
-                    model: Some(effective_model.model.clone()),
-                    model_provider: Some(effective_model.model_provider.clone()),
-                    sandbox: seed_sandbox_mode,
-                    mode: Some(ThreadMode::Agent),
-                    origin_kind: Some(ThreadOriginKind::TaskRun),
-                    sidebar_visibility: Some(ThreadSidebarVisibility::Hidden),
-                    visibility: None,
-                    agent_nickname: agent_spec.agent_nickname.clone(),
-                    agent_role: agent_spec.agent_role.clone(),
-                },
-                Some(seed_thread),
-                seed_sandbox_mode,
+        let action_policy_generation = processor.current_authorization_revision().await?;
+        let (mut action_adapter, action_options, action_capabilities) =
+            materialize_task_agent_action_binding_for_execution(
+                processor,
+                task,
+                agent_spec,
+                execution.id.as_str(),
+                run.id.as_str(),
+                parent.root_thread_id.as_str(),
+                action_policy_generation,
+                false,
             )
+            .await
+            .context("failed to bind recovery agent action service")?;
+        bind_existing_task_agent_graph(
+            processor,
+            run.id.as_str(),
+            execution.id.as_str(),
+            &mut action_adapter,
+        )
+        .await?;
+        let action_facts = action_adapter.persistence_facts();
+        let actor_contract = processor
+            .crud_store
+            .get_task_actor_contract(task.id.as_str())
+            .await?
+            .context("recovered Task has no durable actor contract")?;
+        let turn_settings = resolved_task_execution_turn_settings(
+            processor,
+            task,
+            agent_spec,
+            &action_facts,
+            actor_contract.launch.as_ref(),
+        )
+        .await?;
+        if !matches!(
+            turn_settings.execution_backend,
+            AgentExecutionBackend::ApiProvider { .. }
+        ) {
+            bail!("non-API Task execution entered API recovery");
+        }
+        let effective_model = turn_settings.model.clone();
+        processor
+            .thread_manager
+            .system_thread_restore_persisted(seed_thread, seed_sandbox_mode)
             .await
             .context("failed to restore hidden task thread")?;
-        let child_permission_profile =
-            effective_task_child_permission_profile(agent_spec, launch_permission_profile)?;
-        let frozen_conversation_scope = if task_attachment(task) == TaskAttachmentMode::Detached {
-            Some(
-                load_task_execution_conversation_scope(
-                    processor,
-                    task,
-                    run,
-                    &parent,
-                    child_runtime.task_run_turn.kind,
-                    child_runtime.task_run_turn.thread_id.as_str(),
-                    child_runtime.task_run_turn.turn_id.as_str(),
-                    thread_outcome.started_notification.thread.model.as_str(),
-                    thread_outcome
-                        .started_notification
-                        .thread
-                        .model_provider
-                        .as_str(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        let input = materialize_child_task_input(
-            materialize_child_task_prompt(
-                processor,
-                task_response,
-                run,
-                agent_spec,
-                &parent,
-                Some(&child_runtime.task_run_turn),
-                &child_permission_profile,
-                frozen_conversation_scope
-                    .as_ref()
-                    .map(|(_, history)| history.as_slice()),
-            )
-            .await?,
-            agent_spec,
-        );
-        let turn_outcome = match processor
+        let restored_thread = processor
             .thread_manager
-            .system_turn_start_with_permission_profile(
-                TurnStartParams {
-                    thread_id: child_runtime.task_run_turn.thread_id.clone(),
-                    turn_id: child_runtime.task_run_turn.turn_id.clone(),
-                    input,
-                    capabilities: Vec::new(),
-                    model: Some(effective_model.model),
-                    model_provider: Some(effective_model.model_provider),
-                    sandbox_policy: None,
-                    mode: Some(ThreadMode::Agent),
-                    reply_to_turn_id: None,
-                    mentioned_principal_ids: Vec::new(),
-                    execution_backend: None,
-                    reasoning: None,
-                    permission_profile: None,
-                    cli_runtime_options: None,
-                },
-                child_permission_profile,
-            )
+            .thread_get(child_thread_id)
             .await
+            .context("restored hidden task thread is not loaded")?;
+        if let Some(launch_permission_profile) = launch_permission_profile
+            && launch_permission_profile.mode != turn_settings.permission_profile.mode
         {
-            Ok(outcome) => outcome,
-            Err(error) if format!("{error:#}").contains("already has a running turn") => {
-                load_required_task_child_execution_security_snapshot(processor, child_turn_id)
-                    .await?;
-                processor
-                    .ensure_agent_listener_task(child_thread_id)
-                    .await?;
-                spawn_execution_heartbeat(
-                    processor,
-                    execution.id.clone(),
-                    child_runtime.task_run_turn.thread_id.clone(),
-                    child_runtime.task_run_turn.turn_id.clone(),
-                    run.id.clone(),
-                );
-                return Ok(TaskExecutorStartOutcome::Queued);
-            }
-            Err(error) => return Err(error).context("failed to restore hidden task turn"),
+            bail!("recovered Task permission profile differs from its pinned launch");
+        }
+        let persisted_input = processor
+            .crud_store
+            .get_turn_inputs(child_turn_id)
+            .await
+            .context("failed to load restored task turn input")?;
+        let turn_start_params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
+            thread_id: child_runtime.task_run_turn.thread_id.clone(),
+            turn_id: child_runtime.task_run_turn.turn_id.clone(),
+            input: persisted_input.clone(),
+            capabilities: turn_settings.capabilities.clone(),
+            model: Some(effective_model.model),
+            model_provider: Some(effective_model.model_provider),
+            sandbox_policy: None,
+            mode: Some(ThreadMode::Agent),
+            agent_launch: None,
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
+            execution_backend: Some(turn_settings.execution_backend.clone()),
+            reasoning: turn_settings.reasoning.clone(),
+            permission_profile: turn_settings.permission_selection.clone(),
+            cli_runtime_options: None,
         };
+        let turn_outcome = processor
+            .thread_manager
+            .rehydrate_committed_agent_turn(&turn_start_params, persisted_input)
+            .await
+            .context("failed to rehydrate hidden task turn")?;
 
-        if let Err(error) = processor
+        processor
             .validate_turn_artifact_user_inputs(
                 task.workspace_id.as_str(),
                 parent.root_thread_id.as_str(),
                 turn_outcome.materialization.input.as_slice(),
             )
             .await
-        {
-            processor
-                .thread_manager
-                .rollback_turn_start(turn_outcome.rollback_context)
-                .await;
-            return Err(error).context("failed to validate restored task artifact input");
-        }
+            .context("failed to validate restored task artifact input")?;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id,
+            child_turn_id,
+            register_resolved_task_child_execution_lease(processor, child_turn_id)
+                .await
+                .context("failed to register restored task execution lease"),
+        )
+        .await?;
 
         processor.ensure_hook_runtime_with_run_store().await;
         processor
@@ -2437,6 +3827,16 @@ impl TaskAgentExecutor {
             .map_err(|error| anyhow!("failed to restore child agent runtime: {error}"))?;
         processor
             .ensure_agent_listener_task(child_thread_id)
+            .await?;
+        processor
+            .register_agent_action_binding(
+                child_turn_id.to_owned(),
+                crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                    action_adapter,
+                    action_options,
+                    action_capabilities,
+                ),
+            )
             .await?;
 
         if run.status != TaskRunStatus::Running
@@ -2493,9 +3893,8 @@ impl TaskAgentExecutor {
             .context("restored task turn is missing its authoritative runtime snapshot")?;
         if runtime_snapshot.thread_id != child_thread_id
             || runtime_snapshot.workspace_id != task.workspace_id
-            || runtime_snapshot.model != thread_outcome.started_notification.thread.model
-            || runtime_snapshot.provider_name
-                != thread_outcome.started_notification.thread.model_provider
+            || runtime_snapshot.model != restored_thread.model
+            || runtime_snapshot.provider_name != restored_thread.model_provider
         {
             bail!("restored task turn runtime identity does not match its authoritative snapshot");
         }
@@ -2524,8 +3923,8 @@ impl TaskAgentExecutor {
                 child_turn_id,
                 ThreadMode::Agent,
                 hook_runtime_context,
-                &thread_outcome.started_notification.thread.model,
-                &thread_outcome.started_notification.thread.model_provider,
+                &restored_thread.model,
+                &restored_thread.model_provider,
                 workspace_skill_policies,
                 skill_catalog,
                 agent_skill_overlay,
@@ -2549,6 +3948,7 @@ impl TaskAgentExecutor {
             child_runtime.task_run_turn.thread_id.clone(),
             child_runtime.task_run_turn.turn_id.clone(),
             run.id.clone(),
+            task_agent_liveness_timeouts(task),
         );
 
         Ok(TaskExecutorStartOutcome::Started)
@@ -3284,20 +4684,169 @@ impl TaskAgentExecutor {
         reviewer_spec: &TaskResultReviewerSpec,
         task_run_turn: TaskRunTurn,
     ) -> Result<()> {
-        if self
+        let review_event_exists = self
             .review_event_exists_for_turn(candidate.id.as_str(), task_run_turn.turn_id.as_str())
-            .await?
-        {
+            .await?;
+        if review_event_exists {
+            let reviewer_execution_id = task_run_turn
+                .execution_id
+                .clone()
+                .unwrap_or_else(|| task_run_turn.turn_id.clone());
+            let handle = TaskExecutionHandle::new(
+                processor.crud_store.clone(),
+                processor.task_runtime.event_bus(),
+                task_run_turn.task_id.clone(),
+                task_run_turn.run_id.clone(),
+            );
+            self.mark_reviewer_turn_recorded(handle, task_run_turn)
+                .await?;
+            processor
+                .finalize_agent_execution_and_notify(reviewer_execution_id.as_str(), "completed")
+                .await?;
             return Ok(());
         }
-        if let Some((_, turn)) = processor
+        let existing_turn = processor
             .crud_store
             .get_turn(
                 task_run_turn.thread_id.as_str(),
                 task_run_turn.turn_id.as_str(),
             )
             .await?
-        {
+            .map(|(_, turn)| turn);
+
+        let task = &task_response.task;
+        let run = processor
+            .crud_store
+            .get_task_run(task_run_turn.run_id.as_str())
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "reviewer Task run `{}` disappeared before dispatch",
+                    task_run_turn.run_id
+                )
+            })?;
+        let parent = resolve_parent_context(processor, task).await?;
+        let reviewer_execution_id = task_run_turn
+            .execution_id
+            .clone()
+            .unwrap_or_else(|| task_run_turn.turn_id.clone());
+        let reviewer_key = task_result_reviewer_spec_key(reviewer_index, reviewer_spec);
+        let mut reviewer_agent_spec = agent_spec.clone();
+        reviewer_agent_spec.id = format!("{}:reviewer:{reviewer_key}", agent_spec.id);
+        reviewer_agent_spec.agent_role = reviewer_spec
+            .agent_role
+            .clone()
+            .or_else(|| agent_spec.agent_role.clone());
+        reviewer_agent_spec.agent_nickname = reviewer_spec.agent_nickname.clone();
+        let action_policy_generation = processor.current_authorization_revision().await?;
+        let database = processor.crud_store.database_connection();
+        let (mut action_adapter, action_options, action_capabilities) =
+            if pioneer_crud::load_agent_execution(&database, reviewer_execution_id.as_str())
+                .await?
+                .is_some()
+            {
+                materialize_task_agent_action_binding_for_execution(
+                    processor,
+                    task,
+                    &reviewer_agent_spec,
+                    reviewer_execution_id.as_str(),
+                    run.id.as_str(),
+                    parent.root_thread_id.as_str(),
+                    action_policy_generation,
+                    existing_turn.is_some(),
+                )
+                .await
+                .context("failed to restore exact reviewer agent action service")?
+            } else {
+                let occurrence = processor
+                    .crud_store
+                    .get_task_occurrence_contract_by_run(run.id.as_str())
+                    .await?
+                    .context("reviewer run is missing its durable occurrence contract")?;
+                let candidate_execution_id = occurrence
+                    .agent_execution_id
+                    .as_deref()
+                    .context("reviewer run has no exact candidate execution")?;
+                let (candidate_adapter, candidate_options, candidate_capabilities) =
+                    materialize_task_agent_action_binding_for_execution(
+                        processor,
+                        task,
+                        agent_spec,
+                        candidate_execution_id,
+                        run.id.as_str(),
+                        parent.root_thread_id.as_str(),
+                        action_policy_generation,
+                        false,
+                    )
+                    .await
+                    .context("failed to restore candidate launch catalog for reviewer")?;
+                let mut catalog_binding =
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        candidate_adapter,
+                        candidate_options,
+                        candidate_capabilities,
+                    );
+                catalog_binding
+                    .refresh_start_options_catalog(processor, candidate.turn_id.as_str())
+                    .await
+                    .context("failed to project reviewer launch catalog")?;
+                let nickname = reviewer_spec
+                    .agent_nickname
+                    .as_deref()
+                    .context("review agent requires an exact configured nickname")?;
+                let (identity, profile) = catalog_binding
+                    .adapter
+                    .lock()
+                    .await
+                    .resolve_named_task_reviewer_launch(nickname)
+                    .map_err(|error| anyhow!("failed to resolve exact reviewer: {error:?}"))?;
+                let execution_id = AgentExecutionId::new(reviewer_execution_id.clone())
+                    .map_err(|error| anyhow!("reviewer execution id is invalid: {error:?}"))?;
+                let reviewer_root_execution_id = occurrence
+                    .work_graph_root_execution_id
+                    .as_deref()
+                    .context("reviewer occurrence has no exact work-graph root")?;
+                let reviewer_root_execution_id = AgentExecutionId::new(
+                    reviewer_root_execution_id.to_owned(),
+                )
+                .map_err(|error| anyhow!("reviewer work-graph root is invalid: {error:?}"))?;
+                crate::authorization::materialize_selected_task_agent_action_binding(
+                    execution_id,
+                    parent.home_root_thread_id.as_str(),
+                    reviewer_root_execution_id,
+                    reviewer_agent_spec.id.as_str(),
+                    identity,
+                    profile,
+                    occurrence.execution_generation,
+                    u64::from(occurrence.retry_attempt).saturating_add(1),
+                    u16::try_from(reviewer_agent_spec.depth)
+                        .context("reviewer depth is invalid")?,
+                    "agent_reviewer",
+                    action_policy_generation,
+                )
+                .map_err(|error| anyhow!("failed to bind exact reviewer agent: {error:?}"))?
+            };
+        let reviewer_facts = action_adapter.persistence_facts();
+        let turn_settings = resolved_task_execution_turn_settings(
+            processor,
+            task,
+            &reviewer_agent_spec,
+            &reviewer_facts,
+            None,
+        )
+        .await?;
+        let effective_model = turn_settings.model.clone();
+        if let Some(turn) = existing_turn {
+            processor
+                .register_agent_action_binding(
+                    task_run_turn.turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await?;
             match turn.status {
                 TurnStatus::Completed => {
                     let handle = TaskExecutionHandle::new(
@@ -3321,12 +4870,29 @@ impl TaskAgentExecutor {
                 TurnStatus::InProgress => {
                     revalidate_existing_task_child_execution_authorization(
                         processor,
-                        &task_response.task,
+                        task,
                         task_run_turn.thread_id.as_str(),
                         task_run_turn.turn_id.as_str(),
                     )
                     .await
                     .context("reviewer task continuation authorization is no longer active")?;
+                    let cli_binding = processor
+                        .crud_store
+                        .get_cli_runtime_turn_binding(task_run_turn.turn_id.as_str())
+                        .await?;
+                    match (turn_settings.cli_runtime.as_ref(), cli_binding.as_ref()) {
+                        (Some((runtime_id, runtime_kind)), Some(binding))
+                            if binding.runtime_id == *runtime_id
+                                && binding.runtime_kind
+                                    == match runtime_kind {
+                                        CLIAgentRuntimeKind::Codex => "codex",
+                                        CLIAgentRuntimeKind::Claude => "claude",
+                                    } => {}
+                        (None, None) => {}
+                        _ => bail!(
+                            "reviewer runtime binding differs from its pinned execution profile"
+                        ),
+                    }
                 }
                 TurnStatus::Failed | TurnStatus::Interrupted => {
                     let handle = TaskExecutionHandle::new(
@@ -3341,6 +4907,11 @@ impl TaskAgentExecutor {
                     let target_status =
                         task_run_turn_terminal_status_from_child_turn_status(turn.status)
                             .unwrap_or(TaskRunTurnStatus::Failed);
+                    let terminal_status = if turn.status == TurnStatus::Interrupted {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
                     let failed_at = now_timestamp_secs();
                     record_task_run_turn_failure(
                         &handle,
@@ -3355,6 +4926,12 @@ impl TaskAgentExecutor {
                         failed_at,
                     )
                     .await?;
+                    processor
+                        .finalize_agent_execution_and_notify(
+                            reviewer_execution_id.as_str(),
+                            terminal_status,
+                        )
+                        .await?;
                 }
                 TurnStatus::Blocked => {
                     let handle = TaskExecutionHandle::new(
@@ -3377,24 +4954,94 @@ impl TaskAgentExecutor {
                         handle,
                     )
                     .await?;
+                    processor
+                        .finalize_agent_execution_and_notify(
+                            reviewer_execution_id.as_str(),
+                            "failed",
+                        )
+                        .await?;
                 }
             }
             return Ok(());
         }
-
-        let task = &task_response.task;
-        let run = processor
-            .crud_store
-            .get_task_run(task_run_turn.run_id.as_str())
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "reviewer Task run `{}` disappeared before dispatch",
-                    task_run_turn.run_id
+        let reviewer_permission_profile = turn_settings.permission_profile.clone();
+        let reviewer_security_snapshot =
+            if let Some((runtime_id, runtime_kind)) = turn_settings.cli_runtime.as_ref() {
+                resolve_task_child_cli_execution_security_snapshot(
+                    processor,
+                    task.workspace_id.as_str(),
+                    &parent,
+                    &reviewer_agent_spec,
+                    reviewer_permission_profile.clone(),
+                    runtime_id.as_str(),
+                    *runtime_kind,
+                    task_run_turn.thread_id.as_str(),
+                    task_run_turn.turn_id.as_str(),
                 )
-            })?;
-        let parent = resolve_parent_context(processor, task).await?;
-        let effective_model = effective_agent_model(agent_spec)?;
+                .await
+                .context("failed to resolve reviewer CLI execution security")?
+            } else {
+                resolve_task_child_execution_security_snapshot(
+                    processor,
+                    task.workspace_id.as_str(),
+                    &parent,
+                    &reviewer_agent_spec,
+                    reviewer_permission_profile.clone(),
+                    effective_model.model_provider.as_str(),
+                    task_run_turn.thread_id.as_str(),
+                    task_run_turn.turn_id.as_str(),
+                )
+                .await
+                .context("failed to resolve reviewer execution security")?
+            };
+        let (reviewer_authorization, mut agent_skill_overlay) =
+            resolve_task_child_execution_authorization_context(
+                processor,
+                task,
+                &parent,
+                effective_model.model_provider.as_str(),
+                effective_model.model.as_str(),
+                Some(&turn_settings.execution_backend),
+                turn_settings.capabilities.as_slice(),
+                &reviewer_security_snapshot.permission_profile,
+                task_run_turn.turn_id.as_str(),
+            )
+            .await
+            .context("failed to resolve reviewer execution authorization")?;
+        let reviewer_authorization_context = reviewer_authorization.context;
+        let reviewer_authorization_revalidation = reviewer_authorization.revalidation;
+        let reviewer_authorization_fingerprint = reviewer_authorization_context
+            .authorization_fingerprint()
+            .context("failed to fingerprint reviewer execution authorization")?;
+        let graph = persist_task_reviewer_execution_graph(
+            processor,
+            task_response,
+            &run,
+            reviewer_key.as_str(),
+            &parent,
+            &reviewer_facts,
+            reviewer_authorization_fingerprint.as_str(),
+        )
+        .await?;
+        action_adapter
+            .bind_persisted_work_graph_root(graph.root_execution_id.as_str())
+            .map_err(|error| anyhow!("failed to bind reviewer work graph: {error:?}"))?;
+        if graph.queued {
+            return Ok(());
+        }
+        let actor_contract = processor
+            .crud_store
+            .get_task_actor_contract(task.id.as_str())
+            .await?
+            .context("reviewer Task has no durable actor contract")?;
+        let action_author = task_actor_turn_author(processor, &actor_contract).await?;
+        let action_actor = action_author.actor.clone();
+        let turn_response = agent_turn_response_input(
+            processor,
+            task_run_turn.turn_id.as_str(),
+            reviewer_execution_id.as_str(),
+        )
+        .await?;
         let parent_sandbox_mode = processor
             .crud_store
             .get_thread_sandbox_mode(parent.parent_thread_id.as_str())
@@ -3424,7 +5071,6 @@ impl TaskAgentExecutor {
             .system_thread_start_seeded(task.workspace_id.clone(), thread_params, None, None)
             .await
             .context("failed to create hidden reviewer thread")?;
-        let reviewer_key = task_result_reviewer_spec_key(reviewer_index, reviewer_spec);
         let prompt = materialize_reviewer_prompt(
             task_response,
             agent_spec,
@@ -3437,28 +5083,104 @@ impl TaskAgentExecutor {
             text: prompt,
             text_elements: Vec::new(),
         }];
-        let reviewer_permission_profile =
-            effective_task_child_permission_profile(agent_spec, None)?;
+        if let Some((runtime_id, runtime_kind)) = turn_settings.cli_runtime.clone() {
+            let (_, conversation_history) = load_task_execution_conversation_scope(
+                processor,
+                task,
+                &run,
+                &parent,
+                task_run_turn.kind,
+                task_run_turn.thread_id.as_str(),
+                task_run_turn.turn_id.as_str(),
+                thread_outcome.started_notification.thread.model.as_str(),
+                thread_outcome
+                    .started_notification
+                    .thread
+                    .model_provider
+                    .as_str(),
+            )
+            .await?;
+            let prepared = processor
+                .prepare_task_cli_runtime_turn(
+                    TurnStartParams {
+                        agent_delegation_routes: Vec::new(),
+                        thread_id: task_run_turn.thread_id.clone(),
+                        turn_id: task_run_turn.turn_id.clone(),
+                        input,
+                        capabilities: turn_settings.capabilities.clone(),
+                        model: Some(effective_model.model.clone()),
+                        model_provider: Some(effective_model.model_provider.clone()),
+                        sandbox_policy: None,
+                        mode: Some(ThreadMode::Agent),
+                        agent_launch: None,
+                        reply_to_turn_id: None,
+                        mentioned_principal_ids: Vec::new(),
+                        execution_backend: Some(turn_settings.execution_backend.clone()),
+                        reasoning: turn_settings.reasoning.clone(),
+                        permission_profile: turn_settings.permission_selection.clone(),
+                        cli_runtime_options: None,
+                    },
+                    runtime_id,
+                    runtime_kind,
+                    reviewer_permission_profile,
+                    reviewer_security_snapshot,
+                    reviewer_authorization_context,
+                    reviewer_authorization_revalidation,
+                    parent.parent_thread_id.clone(),
+                    parent.parent_thread_id.clone(),
+                    run.id.clone(),
+                    reviewer_execution_id.clone(),
+                    conversation_history,
+                    action_author,
+                    turn_response.clone(),
+                )
+                .await
+                .context("failed to prepare reviewer CLI runtime turn")?;
+            processor
+                .activate_prepared_task_cli_runtime_turn(prepared)
+                .await
+                .context("failed to activate reviewer CLI runtime turn")?;
+            processor
+                .register_agent_action_binding(
+                    task_run_turn.turn_id.clone(),
+                    crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                        action_adapter,
+                        action_options,
+                        action_capabilities,
+                    ),
+                )
+                .await?;
+            return Ok(());
+        }
+        if !matches!(
+            turn_settings.execution_backend,
+            AgentExecutionBackend::ApiProvider { .. }
+        ) {
+            bail!("reviewer Task backend has no installed runtime adapter");
+        }
         let turn_outcome = processor
             .thread_manager
-            .system_turn_start_with_permission_profile(
+            .agent_turn_start_with_permission_profile(
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: task_run_turn.thread_id.clone(),
                     turn_id: task_run_turn.turn_id.clone(),
                     input,
-                    capabilities: Vec::new(),
+                    capabilities: turn_settings.capabilities.clone(),
                     model: Some(effective_model.model),
                     model_provider: Some(effective_model.model_provider),
                     sandbox_policy: None,
                     mode: Some(ThreadMode::Agent),
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
-                    execution_backend: None,
-                    reasoning: None,
-                    permission_profile: None,
+                    execution_backend: Some(turn_settings.execution_backend.clone()),
+                    reasoning: turn_settings.reasoning.clone(),
+                    permission_profile: turn_settings.permission_selection.clone(),
                     cli_runtime_options: None,
                 },
                 reviewer_permission_profile,
+                action_author,
             )
             .await
             .context("failed to create hidden reviewer turn")?;
@@ -3489,55 +5211,16 @@ impl TaskAgentExecutor {
                 return Err(error).context("failed to resolve reviewer task permission profile");
             }
         };
-        let child_security_snapshot = match resolve_task_child_execution_security_snapshot(
-            processor,
-            task.workspace_id.as_str(),
-            &parent,
-            agent_spec,
-            turn_permission_profile.clone(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
-            task_run_turn.thread_id.as_str(),
-            task_run_turn.turn_id.as_str(),
-        )
-        .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                processor
-                    .thread_manager
-                    .rollback_turn_start(turn_outcome.rollback_context)
-                    .await;
-                return Err(error).context("failed to resolve hidden reviewer execution security");
-            }
-        };
-        let child_authorization = match resolve_task_child_execution_authorization_context(
-            processor,
-            task,
-            &parent,
-            turn_outcome.materialization.thread.model_provider.as_str(),
-            turn_outcome.materialization.thread.model.as_str(),
-            None,
-            turn_outcome.materialization.capabilities.as_slice(),
-            &child_security_snapshot.permission_profile,
-        )
-        .await
-        {
-            Ok(context) => context,
-            Err(error) => {
-                processor
-                    .thread_manager
-                    .rollback_turn_start(turn_outcome.rollback_context)
-                    .await;
-                return Err(error)
-                    .context("failed to resolve hidden reviewer execution authorization");
-            }
-        };
-        let child_authorization_context = child_authorization.context;
-        let child_authorization_revalidation = child_authorization.revalidation;
+        if turn_permission_profile != reviewer_security_snapshot.permission_profile {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            bail!("materialized reviewer permission profile differs from its execution admission");
+        }
+        let child_security_snapshot = reviewer_security_snapshot;
+        let child_authorization_context = reviewer_authorization_context;
+        let child_authorization_revalidation = reviewer_authorization_revalidation;
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
             task.workspace_id.as_str(),
             task_run_turn.thread_id.as_str(),
@@ -3551,7 +5234,7 @@ impl TaskAgentExecutor {
             .durable_turn_admission_after_revalidation(
                 task_run_turn.thread_id.as_str(),
                 task_run_turn.turn_id.as_str(),
-                None,
+                Some(&turn_settings.execution_backend),
                 &child_authorization_revalidation,
             ) {
             Ok(admission) => admission,
@@ -3570,17 +5253,29 @@ impl TaskAgentExecutor {
                 turn_outcome.materialization.sandbox_mode,
                 &turn_outcome.materialization.turn,
                 &turn_outcome.materialization.input,
-                None,
-                pioneer_protocol::PersistedActorRef::System,
+                turn_settings
+                    .reasoning
+                    .as_ref()
+                    .map(|reasoning| reasoning.effort.as_str()),
+                action_actor,
                 profile_selected_audit,
                 child_authority_json.as_str(),
                 None,
                 Some(child_turn_admission),
                 Some(super::turn_handlers::new_turn_execution(
                     processor.turn_execution_owner_id.as_ref(),
-                    None,
+                    Some(&turn_settings.execution_backend),
                     &turn_outcome.materialization,
                 )?),
+                &child_security_snapshot,
+                processor.turn_security_audit_events_for_turn(
+                    task.workspace_id.as_str(),
+                    task_run_turn.thread_id.as_str(),
+                    task_run_turn.turn_id.as_str(),
+                    &child_security_snapshot,
+                ),
+                None,
+                Some(turn_response),
             )
             .await
         {
@@ -3590,15 +5285,11 @@ impl TaskAgentExecutor {
                 .await;
             return Err(error).context("failed to persist hidden reviewer turn");
         }
-        if let Err(error) = persist_resolved_task_child_execution_envelope(
-            processor,
-            task_run_turn.turn_id.as_str(),
-            &child_security_snapshot,
-            &child_authorization_context,
-        )
-        .await
+        if let Err(error) =
+            register_resolved_task_child_execution_lease(processor, task_run_turn.turn_id.as_str())
+                .await
         {
-            let reason = format!("failed to persist hidden reviewer execution security: {error:#}");
+            let reason = "reviewer_execution_security_persist_failed".to_owned();
             if !processor
                 .mark_turn_blocked(
                     task_run_turn.thread_id.clone(),
@@ -3610,11 +5301,11 @@ impl TaskAgentExecutor {
                 warn!(
                     thread_id = task_run_turn.thread_id,
                     turn_id = task_run_turn.turn_id,
-                    error = %format!("{error:#}"),
+                    failure_class = "reviewer_execution_security_close_failed",
                     "failed to durably close reviewer turn after admission failure"
                 );
             }
-            return Err(error).context("failed to persist hidden reviewer execution security");
+            return Err(error).context("failed to register hidden reviewer execution lease");
         }
 
         processor.ensure_hook_runtime_with_run_store().await;
@@ -3638,6 +5329,16 @@ impl TaskAgentExecutor {
                 .await,
         )
         .await?;
+        processor
+            .register_agent_action_binding(
+                task_run_turn.turn_id.clone(),
+                crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
+                    action_adapter,
+                    action_options,
+                    action_capabilities,
+                ),
+            )
+            .await?;
         let workspace_skill_policies = close_admitted_task_turn_on_error(
             processor,
             task_run_turn.thread_id.as_str(),
@@ -3712,29 +5413,6 @@ impl TaskAgentExecutor {
             .await,
         )
         .await?;
-        let mut agent_skill_overlay = if processor.native_api_provider_supports_agent_skill_overlay(
-            task.workspace_id.as_str(),
-            thread_outcome
-                .started_notification
-                .thread
-                .model_provider
-                .as_str(),
-        ) {
-            close_admitted_task_turn_on_error(
-                processor,
-                task_run_turn.thread_id.as_str(),
-                task_run_turn.turn_id.as_str(),
-                load_task_agent_skill_overlay(
-                    processor,
-                    &child_authorization_context,
-                    task_run_turn.turn_id.as_str(),
-                )
-                .await,
-            )
-            .await?
-        } else {
-            Vec::new()
-        };
         if let Err(error) = processor
             .persist_turn_runtime_snapshot_with_optional_agent_overlay(
                 task_run_turn.thread_id.as_str(),
@@ -3823,6 +5501,11 @@ impl TaskAgentExecutor {
         reviewer_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
+        let reviewer_execution_id = reviewer_runtime
+            .task_run_turn
+            .execution_id
+            .clone()
+            .unwrap_or_else(|| reviewer_runtime.task_run_turn.turn_id.clone());
         let Some(candidate_id) = reviewer_runtime.task_run_turn.reviews_candidate_id.clone() else {
             return Ok(());
         };
@@ -3834,6 +5517,9 @@ impl TaskAgentExecutor {
             .await?
         {
             self.mark_reviewer_turn_recorded(handle, reviewer_runtime.task_run_turn)
+                .await?;
+            processor
+                .finalize_agent_execution_and_notify(reviewer_execution_id.as_str(), "completed")
                 .await?;
             return Ok(());
         }
@@ -3859,30 +5545,106 @@ impl TaskAgentExecutor {
         let advisory =
             extract_reviewer_advisory(processor, reviewer_runtime.task_run_turn.turn_id.as_str())
                 .await?;
+        let action_decision = match advisory.decision {
+            TaskResultReviewDecision::Accept => pioneer_protocol::AgentReviewDecision::Accept,
+            TaskResultReviewDecision::Reject => pioneer_protocol::AgentReviewDecision::Reject,
+            TaskResultReviewDecision::RequestChanges => {
+                pioneer_protocol::AgentReviewDecision::RequestChanges
+            }
+            TaskResultReviewDecision::Abstain | TaskResultReviewDecision::Cancel => {
+                pioneer_protocol::AgentReviewDecision::Abstain
+            }
+        };
+        let binding = processor
+            .agent_action_binding(reviewer_runtime.task_run_turn.turn_id.as_str())
+            .await
+            .context("reviewer Turn has no execution-bound canonical action service")?;
+        let source_fence = super::agent_action_tools::current_agent_identity_source_fence(
+            processor,
+            reviewer_execution_id.as_str(),
+        )
+        .await?;
+        let mut adapter = binding.adapter.lock().await;
+        let action_id = pioneer_protocol::AgentActionId::new(canonical_agent_id(
+            'A',
+            &format!(
+                "task-review-action\0{}\0{}",
+                candidate.id, reviewer_runtime.task_run_turn.turn_id
+            ),
+        ))
+        .map_err(|error| anyhow!("reviewer action id is invalid: {error:?}"))?;
+        let action_intent = pioneer_protocol::AgentActionIntent::ReviewTaskResult {
+            action_id,
+            execution_id: AgentExecutionId::new(reviewer_execution_id.clone())
+                .map_err(|error| anyhow!("reviewer execution id is invalid: {error:?}"))?,
+            task_id: candidate.task_id.clone(),
+            decision: action_decision,
+            idempotency_key: format!(
+                "task-review:{}:{}",
+                candidate.id, reviewer_runtime.task_run_turn.turn_id
+            ),
+        };
+        let prepared = adapter
+            .prepare(&action_intent)
+            .map_err(|error| anyhow!("reviewer action was denied: {error:?}"))?;
+        let policy_generation = adapter.current_policy_generation();
+        let mut action_plan = adapter
+            .prepare_commit(
+                &prepared,
+                Some(
+                    serde_json::json!({
+                        "candidateId": candidate.id,
+                        "reviewerTurnId": reviewer_runtime.task_run_turn.turn_id,
+                    })
+                    .to_string(),
+                ),
+                adapter.policy_fingerprint(),
+                policy_generation,
+            )
+            .map_err(|error| anyhow!("reviewer action commit was denied: {error:?}"))?;
+        super::agent_action_tools::apply_current_identity_source_fence(
+            &mut action_plan,
+            &source_fence,
+        );
+        drop(adapter);
         processor
             .task_runtime
             .service()
-            .record_task_result_review_event(RecordTaskResultReviewEventParams {
-                candidate_id: candidate.id,
-                review_event_id: Some(format!("trre_{}", reviewer_runtime.task_run_turn.turn_id)),
-                actor: TaskResultReviewActor {
-                    reviewer_kind: TaskResultReviewerKind::ReviewAgent,
-                    reviewer_thread_id: Some(reviewer_runtime.task_run_turn.thread_id.clone()),
-                    reviewer_turn_id: Some(reviewer_runtime.task_run_turn.turn_id.clone()),
-                    reviewer_user_id: None,
-                    reviewer_agent_spec_id: reviewer_key,
+            .record_task_result_review_event_with_agent_action(
+                RecordTaskResultReviewEventParams {
+                    candidate_id: candidate.id,
+                    review_event_id: Some(format!(
+                        "trre_{}",
+                        reviewer_runtime.task_run_turn.turn_id
+                    )),
+                    actor: TaskResultReviewActor {
+                        reviewer_kind: TaskResultReviewerKind::ReviewAgent,
+                        reviewer: pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+                            AgentExecutionId::new(reviewer_execution_id.clone()).map_err(
+                                |error| anyhow!("reviewer execution id is invalid: {error:?}"),
+                            )?,
+                        ),
+                        reviewer_thread_id: Some(reviewer_runtime.task_run_turn.thread_id.clone()),
+                        reviewer_turn_id: Some(reviewer_runtime.task_run_turn.turn_id.clone()),
+                        reviewer_user_id: None,
+                        reviewer_agent_spec_id: reviewer_key,
+                    },
+                    event_kind: TaskResultReviewEventKind::Advisory,
+                    decision: advisory.decision,
+                    feedback_text: advisory.feedback_text,
+                    feedback: advisory.feedback,
+                    confidence: advisory.confidence,
+                    supersedes_review_event_id: None,
+                    next_task_run_turn_id: None,
+                    created_at: Some(now_timestamp_secs()),
                 },
-                event_kind: TaskResultReviewEventKind::Advisory,
-                decision: advisory.decision,
-                feedback_text: advisory.feedback_text,
-                feedback: advisory.feedback,
-                confidence: advisory.confidence,
-                supersedes_review_event_id: None,
-                next_task_run_turn_id: None,
-                created_at: Some(now_timestamp_secs()),
-            })
+                Some(action_plan.input),
+            )
             .await?;
         self.mark_reviewer_turn_recorded(handle, reviewer_runtime.task_run_turn)
+            .await?;
+        processor
+            .finalize_agent_execution_and_notify(reviewer_execution_id.as_str(), "completed")
             .await?;
         Ok(())
     }
@@ -3942,8 +5704,12 @@ impl TaskAgentExecutor {
         )
         .await?;
         handle.fail_run(Some(error), failed_at).await?;
-        mark_task_run_occurrence_turn_failed(&processor, &child_runtime.lineage, error_message)
-            .await?;
+        mark_task_run_occurrence_turn_failed(
+            &processor,
+            &child_runtime.lineage,
+            "child_turn_failed",
+        )
+        .await?;
         Ok(())
     }
 
@@ -3976,7 +5742,7 @@ impl TaskAgentExecutor {
             &processor,
             &child_runtime.lineage,
             TurnStatus::Interrupted,
-            Some(reason.to_owned()),
+            Some("child_turn_cancelled".to_owned()),
             cancelled_at,
         )
         .await?;
@@ -4005,7 +5771,12 @@ impl TaskAgentExecutor {
             )
             .await?;
         handle.block_run(Some(error), blocked_at).await?;
-        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, reason).await?;
+        mark_task_run_occurrence_turn_blocked(
+            &processor,
+            &child_runtime.lineage,
+            "child_turn_blocked",
+        )
+        .await?;
         Ok(())
     }
 
@@ -4087,11 +5858,11 @@ impl TaskExecutor for TaskAgentExecutor {
                         )
                         .await;
                 }
-                Err(error) => {
+                Err(_error) => {
                     warn!(
                         run_id,
                         turn_id = child_runtime.task_run_turn.turn_id.as_str(),
-                        error = %format!("{error:#}"),
+                        failure_class = "task_cli_runtime_cancel_failed",
                         "failed to cancel native task CLI runtime turn"
                     );
                 }
@@ -4142,6 +5913,10 @@ impl TaskExecutor for TaskAgentExecutor {
 pub(super) struct TaskParentRuntimeContext {
     pub(super) parent_thread_id: String,
     pub(super) parent_turn_id: Option<String>,
+    /// Collaboration capsule that owns the occurrence conversation and local
+    /// control. This differs from `root_thread_id` only for an explicitly
+    /// routed Task; the latter remains the immutable source admission root.
+    pub(super) home_root_thread_id: String,
     pub(super) root_thread_id: String,
 }
 
@@ -4181,6 +5956,21 @@ fn task_cli_runtime_backend(task: &Task) -> Result<Option<(String, CLIAgentRunti
             | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => None,
         }),
     )
+}
+
+fn cli_runtime_backend_enabled(processor: &MessageProcessor, task: &Task) -> Result<bool> {
+    let Some((runtime_id, _)) = task_cli_runtime_backend(task)? else {
+        return Ok(true);
+    };
+    let instances = crate::cli_runtime::config::load_effective_cli_runtime_instances(
+        processor.artifact_runtime_home.as_path(),
+    )
+    .with_context(|| format!("failed to load CLI runtime `{runtime_id}` for task admission"))?;
+    let instance = instances
+        .into_iter()
+        .find(|instance| instance.id == runtime_id)
+        .ok_or_else(|| anyhow!("unknown CLI runtime `{runtime_id}` for task admission"))?;
+    Ok(instance.enabled)
 }
 
 fn rebound_composer_work_launch(
@@ -4296,12 +6086,114 @@ async fn resolve_parent_context(
         );
     }
     let root_thread_id = admission.root_thread_id;
-    let parent_thread_id = task
+    let actor_contract = processor
+        .crud_store
+        .get_task_actor_contract(task.id.as_str())
+        .await?
+        .with_context(|| format!("agent Task `{}` has no durable actor contract", task.id))?;
+    let mut parent_thread_id = task
         .created_by_thread_id
         .clone()
         .unwrap_or_else(|| root_thread_id.clone());
+    let mut home_root_thread_id = root_thread_id.clone();
 
-    if parent_thread_id != root_thread_id {
+    if let Some(destination_thread_id) = actor_contract.execution_destination_thread_id.as_deref() {
+        parent_thread_id = destination_thread_id.to_owned();
+        if let Some(route_id) = actor_contract.execution_route_id.as_deref() {
+            let database = processor.crud_store.database_connection();
+            let route = pioneer_crud::load_agent_delegation_route(&database, route_id)
+                .await?
+                .with_context(|| format!("Task execution route `{route_id}` is unavailable"))?;
+            let projection = pioneer_crud::agent_delegation_route_projection(&route)?;
+            let now_millis = pioneer_crud::utc_now().timestamp_millis();
+            projection
+                .validate(Some(now_millis))
+                .map_err(|error| anyhow!("Task execution route is invalid: {error:?}"))?;
+            let route_action = actor_contract
+                .execution_route_receipt_json
+                .as_deref()
+                .and_then(|receipt| serde_json::from_str::<serde_json::Value>(receipt).ok())
+                .and_then(|receipt| {
+                    receipt
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .and_then(|action| match action.as_str() {
+                    "create_task" => Some(pioneer_protocol::AgentActionKind::CreateTask),
+                    "schedule_task" => Some(pioneer_protocol::AgentActionKind::ScheduleTask),
+                    _ => None,
+                })
+                .context("Task execution route receipt has an invalid action")?;
+            if !projection.status.is_live()
+                || projection.destination_thread_id != destination_thread_id
+                || projection.source_workspace_id != task.workspace_id
+                || projection.destination_workspace_id != task.workspace_id
+                || actor_contract.execution_route_expires_at_millis != projection.expires_at
+                || actor_contract.execution_route_receipt_json.as_deref()
+                    != Some(
+                        crate::authorization::safe_route_receipt(
+                            &crate::authorization::AgentRouteFacts::from_projection(&projection)
+                                .map_err(|message| anyhow!(message))?,
+                            route_action,
+                        )
+                        .as_str(),
+                    )
+                || !projection.allowed_actions.contains(&match route_action {
+                    pioneer_protocol::AgentActionKind::CreateTask => {
+                        pioneer_protocol::AgentRouteAction::CreateTask
+                    }
+                    pioneer_protocol::AgentActionKind::ScheduleTask => {
+                        pioneer_protocol::AgentRouteAction::ScheduleTask
+                    }
+                    _ => unreachable!("route receipt was normalized above"),
+                })
+            {
+                bail!("Task execution route changed after admission");
+            }
+            match projection.kind {
+                pioneer_protocol::AgentRouteKind::ExecutionBound => {
+                    if actor_contract.creator
+                        != pioneer_protocol::PersistedActorRef::AgentExecution(
+                            projection.source_execution_id.clone(),
+                        )
+                    {
+                        bail!("Task execution route is bound to a different creator execution");
+                    }
+                }
+                pioneer_protocol::AgentRouteKind::IdentityBound => {
+                    if actor_contract
+                        .creator_presentation_snapshot
+                        .as_ref()
+                        .map(|snapshot| &snapshot.agent_identity_id)
+                        != Some(&projection.source_agent_identity_id)
+                    {
+                        bail!("Task execution route is bound to a different creator identity");
+                    }
+                }
+            }
+            let current_generation = processor.current_authorization_revision().await?.max(1);
+            if projection.source_policy_generation != current_generation
+                || projection.destination_policy_generation != current_generation
+            {
+                bail!("Task execution route policy generation is stale");
+            }
+            home_root_thread_id = projection.destination_capsule_id;
+        } else if destination_thread_id != root_thread_id {
+            bail!("Task destination outside its source capsule requires a durable route");
+        }
+    }
+
+    let destination_thread = processor
+        .crud_store
+        .get_thread_model(parent_thread_id.as_str())
+        .await?
+        .with_context(|| format!("Task destination thread `{parent_thread_id}` is unavailable"))?;
+    if destination_thread.workspace_id != task.workspace_id {
+        bail!("Task destination thread left its admitted workspace");
+    }
+
+    if actor_contract.execution_route_id.is_none() && parent_thread_id != root_thread_id {
         let lineage = processor
             .crud_store
             .get_task_thread_lineage(parent_thread_id.as_str())
@@ -4323,6 +6215,7 @@ async fn resolve_parent_context(
     Ok(TaskParentRuntimeContext {
         parent_thread_id,
         parent_turn_id: task.created_by_turn_id.clone(),
+        home_root_thread_id,
         root_thread_id,
     })
 }
@@ -4482,6 +6375,7 @@ async fn ensure_task_run_occurrence_context(
     processor: &Arc<MessageProcessor>,
     task_response: &TaskGetResponse,
     run: &TaskRun,
+    execution: &TaskRunExecution,
     agent_spec: &TaskAgentSpec,
     mut parent: TaskParentRuntimeContext,
     permission_profile: &TurnPermissionProfileSnapshot,
@@ -4524,6 +6418,7 @@ async fn ensure_task_run_occurrence_context(
         &task_response.task,
         parent.parent_thread_id.as_str(),
         run,
+        execution,
         origin,
         permission_profile,
         &occurrence_security_snapshot,
@@ -4579,6 +6474,7 @@ async fn ensure_task_run_occurrence_turn(
     task: &Task,
     parent_thread_id: &str,
     run: &TaskRun,
+    execution: &TaskRunExecution,
     origin: TurnOrigin,
     permission_profile: &TurnPermissionProfileSnapshot,
     execution_security_snapshot: &TurnExecutionSecuritySnapshot,
@@ -4669,10 +6565,19 @@ async fn ensure_task_run_occurrence_turn(
             &occurrence_turn,
             &[],
             None,
-            pioneer_protocol::PersistedActorRef::System,
+            exact_task_execution_actor(execution.id.as_str())?,
             profile_selected_audit,
             occurrence_authority_json.as_str(),
             None,
+            None,
+            None,
+            execution_security_snapshot,
+            processor.turn_security_audit_events_for_turn(
+                task.workspace_id.as_str(),
+                parent_thread_id,
+                run.id.as_str(),
+                execution_security_snapshot,
+            ),
             None,
             None,
         )
@@ -4683,18 +6588,10 @@ async fn ensure_task_run_occurrence_turn(
                 run.id, task.id
             )
         })?;
-    if let Err(error) = persist_resolved_task_child_execution_envelope(
-        processor,
-        run.id.as_str(),
-        execution_security_snapshot,
-        authorization_context,
-    )
-    .await
+    if let Err(error) =
+        register_resolved_task_child_execution_lease(processor, run.id.as_str()).await
     {
-        let reason = format!(
-            "failed to persist task run occurrence execution security snapshot `{}` for task `{}`: {error:#}",
-            run.id, task.id
-        );
+        let reason = "task_occurrence_execution_security_persist_failed".to_owned();
         if !processor
             .mark_turn_blocked(parent_thread_id.to_owned(), run.id.clone(), reason.clone())
             .await
@@ -4702,7 +6599,7 @@ async fn ensure_task_run_occurrence_turn(
             warn!(
                 thread_id = parent_thread_id,
                 turn_id = run.id,
-                error = %format!("{error:#}"),
+                failure_class = "task_occurrence_execution_security_close_failed",
                 "failed to durably close task run occurrence after admission failure"
             );
         }
@@ -5103,11 +7000,11 @@ async fn load_execution_checkpoint_context_for_turn(
         match serde_json::from_value::<ExecutionCheckpointPayload>(checkpoint.payload_json.clone())
         {
             Ok(payload) => payload,
-            Err(error) => {
+            Err(_error) => {
                 warn!(
                     turn_id,
                     checkpoint_id = %checkpoint.id,
-                    error = %format!("{error:#}"),
+                    failure_class = "task_recovery_checkpoint_invalid",
                     "skipping invalid execution checkpoint payload during task child recovery"
                 );
                 return Ok(None);
@@ -5211,7 +7108,7 @@ fn lineage_from_task_run_turn(
     TaskThreadLineage {
         child_thread_id: task_run_turn.thread_id.clone(),
         parent_thread_id: parent.parent_thread_id.clone(),
-        root_thread_id: parent.root_thread_id.clone(),
+        root_thread_id: parent.home_root_thread_id.clone(),
         depth: agent_spec.depth,
         origin_kind: Some("task_run".to_owned()),
         created_by_thread_id: Some(parent.parent_thread_id.clone()),
@@ -5480,6 +7377,7 @@ fn runtime_auto_accept_review_event(
         run_id: candidate.run_id.clone(),
         task_run_turn_id: candidate.task_run_turn_id.clone(),
         reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+        reviewer: pioneer_protocol::TaskResultReviewerRef::RuntimePolicy,
         reviewer_thread_id: None,
         reviewer_turn_id: None,
         reviewer_user_id: None,
@@ -5520,9 +7418,40 @@ fn spawn_execution_heartbeat(
     child_thread_id: String,
     child_turn_id: String,
     run_id: String,
+    liveness_timeouts: (i64, i64),
 ) {
     let processor = Arc::downgrade(processor);
     tokio::spawn(async move {
+        let Some(owner) = processor.upgrade() else {
+            return;
+        };
+        let Ok(Some(resource_state)) = pioneer_crud::load_agent_execution_resource_state(
+            &owner.crud_store.database_connection(),
+            execution_id.as_str(),
+        )
+        .await
+        else {
+            return;
+        };
+        let Ok(attempt_generation) = u64::try_from(resource_state.attempt_generation) else {
+            return;
+        };
+        drop(owner);
+        let typed_execution_id = AgentExecutionId::new(execution_id.clone()).ok();
+        let liveness_started_at = chrono::Utc::now().fixed_offset();
+        let mut liveness = typed_execution_id.clone().and_then(|execution_id| {
+            crate::authorization::ExecutionLivenessAdapter::new(
+                execution_id,
+                attempt_generation,
+                Some(liveness_started_at + chrono::Duration::seconds(liveness_timeouts.0.max(1))),
+                Some(
+                    liveness_started_at
+                        + chrono::Duration::seconds(liveness_timeouts.1.max(liveness_timeouts.0)),
+                ),
+                u64::try_from(TASK_EXECUTION_LEASE_SECONDS).unwrap_or_default(),
+            )
+            .ok()
+        });
         loop {
             sleep(Duration::from_secs(TASK_EXECUTION_HEARTBEAT_SECONDS)).await;
             let Some(processor) = processor.upgrade() else {
@@ -5548,41 +7477,127 @@ fn spawn_execution_heartbeat(
             if turn.status != TurnStatus::InProgress {
                 break;
             }
+            if let (Some(liveness), Some(typed_execution_id)) =
+                (liveness.as_mut(), typed_execution_id.as_ref())
+            {
+                let observation = liveness.observe(
+                    typed_execution_id,
+                    attempt_generation,
+                    crate::authorization::ExecutionObservation::Heartbeat,
+                    chrono::Utc::now().fixed_offset(),
+                );
+                if matches!(
+                    observation,
+                    crate::authorization::ExecutionLivenessDecision::StaleAttempt
+                ) {
+                    break;
+                }
+            }
             let now = now_timestamp_secs();
-            let _ = processor
+            let idle_lease_secs = TASK_EXECUTION_LEASE_SECONDS.max(liveness_timeouts.0.max(1));
+            let heartbeat = processor
                 .crud_store
-                .heartbeat_execution(
+                .heartbeat_execution_for_agent_attempt(
                     execution_id.as_str(),
+                    resource_state.attempt_generation,
                     now,
-                    Some(now.saturating_add(TASK_EXECUTION_LEASE_SECONDS)),
+                    Some(now.saturating_add(idle_lease_secs)),
                 )
                 .await;
+            if !matches!(heartbeat, Ok(Some(_))) {
+                break;
+            }
         }
     });
 }
 
-fn effective_agent_model(agent_spec: &TaskAgentSpec) -> Result<EffectiveAgentModel> {
-    let model = agent_spec
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("task agent spec `{}` is missing `model`", agent_spec.id))?;
-    let model_provider = agent_spec
-        .model_provider
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "task agent spec `{}` is missing `model_provider`",
-                agent_spec.id
-            )
-        })?;
+struct ResolvedTaskExecutionTurnSettings {
+    model: EffectiveAgentModel,
+    execution_backend: AgentExecutionBackend,
+    cli_runtime: Option<(String, CLIAgentRuntimeKind)>,
+    capabilities: Vec<pioneer_protocol::TurnCapability>,
+    reasoning: Option<pioneer_protocol::TurnReasoningSelection>,
+    permission_selection: Option<pioneer_protocol::TurnPermissionProfileSelection>,
+    permission_profile: TurnPermissionProfileSnapshot,
+}
 
-    Ok(EffectiveAgentModel {
-        model: model.to_owned(),
-        model_provider: model_provider.to_owned(),
+async fn resolved_task_execution_turn_settings(
+    processor: &MessageProcessor,
+    task: &Task,
+    agent_spec: &TaskAgentSpec,
+    facts: &AgentExecutionPersistenceFacts,
+    launch: Option<&pioneer_protocol::AgentLaunchSelection>,
+) -> Result<ResolvedTaskExecutionTurnSettings> {
+    let (execution_backend, cli_runtime) = match &facts.profile.backend {
+        AgentExecutionProfileBackend::ApiProvider => (
+            AgentExecutionBackend::ApiProvider {
+                provider: facts.profile.provider_id.clone(),
+            },
+            None,
+        ),
+        AgentExecutionProfileBackend::CliRuntime {
+            runtime_instance_id,
+        } => {
+            let runtime = processor
+                .load_cli_runtime_instances()?
+                .into_iter()
+                .find(|runtime| runtime.id == *runtime_instance_id && runtime.enabled)
+                .context("pinned Task CLI runtime is unavailable")?;
+            let runtime_kind = match runtime.kind {
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
+                    CLIAgentRuntimeKind::Codex
+                }
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
+                    CLIAgentRuntimeKind::Claude
+                }
+            };
+            (
+                AgentExecutionBackend::CLIAgentRuntime {
+                    runtime_id: runtime_instance_id.clone(),
+                    runtime_kind,
+                },
+                Some((runtime_instance_id.clone(), runtime_kind)),
+            )
+        }
+        AgentExecutionProfileBackend::AcpAgentRuntime { runtime_id } => (
+            AgentExecutionBackend::ACPAgentRuntime {
+                runtime_id: runtime_id.clone(),
+            },
+            None,
+        ),
+    };
+    let capabilities = match launch {
+        Some(launch) => {
+            let requested =
+                super::agent_action_tools::launch_selection_capabilities(&launch.execution)
+                    .context("pinned Task launch capabilities are invalid")?;
+            processor
+                .normalize_turn_skill_capabilities(task.workspace_id.as_str(), requested.as_slice())
+                .await
+                .map_err(|message| anyhow!(message))
+                .context("pinned Task launch capabilities are unavailable")?
+                .execution
+        }
+        None => Vec::new(),
+    };
+    let permission_selection =
+        launch.and_then(|launch| launch.execution.permission_profile.clone());
+    let launch_permission_profile = permission_selection
+        .as_ref()
+        .map(|selection| pioneer_protocol::resolve_turn_permission_profile(Some(selection)));
+    let permission_profile =
+        effective_task_child_permission_profile(agent_spec, launch_permission_profile.as_ref())?;
+    Ok(ResolvedTaskExecutionTurnSettings {
+        model: EffectiveAgentModel {
+            model: facts.profile.model_id.clone(),
+            model_provider: facts.profile.provider_id.clone(),
+        },
+        execution_backend,
+        cli_runtime,
+        capabilities,
+        reasoning: launch.and_then(|launch| launch.execution.reasoning.clone()),
+        permission_selection,
+        permission_profile,
     })
 }
 
@@ -5719,25 +7734,10 @@ async fn resolve_task_child_cli_execution_security_snapshot(
     )
 }
 
-async fn persist_resolved_task_child_execution_envelope(
+async fn register_resolved_task_child_execution_lease(
     processor: &Arc<MessageProcessor>,
     child_turn_id: &str,
-    snapshot: &TurnExecutionSecuritySnapshot,
-    authorization_context: &crate::authorization::ExecutionAuthorizationContext,
 ) -> Result<()> {
-    let encoded = authorization_context
-        .to_persisted_json()
-        .context("failed to encode task continuation authority envelope")?;
-    let updated = processor
-        .crud_store
-        .set_turn_execution_envelope(child_turn_id, snapshot, encoded.as_str())
-        .await?;
-    if !updated {
-        bail!(
-            "failed to persist task child execution envelope: turn `{}` was not found",
-            child_turn_id
-        );
-    }
     processor
         .register_execution_lease(child_turn_id)
         .await
@@ -5813,7 +7813,11 @@ async fn resolve_task_child_execution_authorization_context(
     execution_backend: Option<&AgentExecutionBackend>,
     capabilities: &[pioneer_protocol::TurnCapability],
     permission_profile: &TurnPermissionProfileSnapshot,
-) -> Result<RevalidatedTaskExecutionAuthorizationContext> {
+    turn_id: &str,
+) -> Result<(
+    RevalidatedTaskExecutionAuthorizationContext,
+    Vec<pioneer_skills::AgentSkillRuntimeEntry>,
+)> {
     let provider_authority_fingerprint = match execution_backend {
         Some(AgentExecutionBackend::CLIAgentRuntime { .. })
         | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => None,
@@ -5827,18 +7831,41 @@ async fn resolve_task_child_execution_authorization_context(
     };
     let parent_authorization =
         resolve_task_parent_execution_authorization_context(processor, task, parent).await?;
-    let context = parent_authorization.context.derive_continuation(
-        provider,
-        model,
+    let agent_skill_overlay = if !matches!(
         execution_backend,
+        Some(AgentExecutionBackend::CLIAgentRuntime { .. })
+            | Some(AgentExecutionBackend::ACPAgentRuntime { .. })
+    ) && processor
+        .native_api_provider_supports_agent_skill_overlay(task.workspace_id.as_str(), provider)
+    {
+        load_task_agent_skill_overlay(processor, &parent_authorization.context, turn_id).await?
+    } else {
+        Vec::new()
+    };
+    let grant_capabilities = crate::authorization::execution_grant_capabilities_with_agent_skills(
         capabilities,
-        permission_profile,
-        provider_authority_fingerprint.as_deref(),
-    )?;
-    Ok(RevalidatedTaskExecutionAuthorizationContext {
-        context,
-        revalidation: parent_authorization.revalidation,
-    })
+        agent_skill_overlay
+            .iter()
+            .map(|entry| entry.skill_id.clone()),
+    );
+    let child_authorization = parent_authorization
+        .context
+        .derive_continuation_with_grant_capabilities(
+            provider,
+            model,
+            execution_backend,
+            capabilities,
+            grant_capabilities.as_slice(),
+            permission_profile,
+            provider_authority_fingerprint.as_deref(),
+        )?;
+    Ok((
+        RevalidatedTaskExecutionAuthorizationContext {
+            context: child_authorization,
+            revalidation: parent_authorization.revalidation,
+        },
+        agent_skill_overlay,
+    ))
 }
 
 async fn revalidate_existing_task_child_execution_authorization(
@@ -5937,7 +7964,7 @@ fn normalized_task_policy_values(values: &[String]) -> Vec<String> {
     normalized
 }
 
-fn select_agent_spec(response: &TaskGetResponse, run_id: &str) -> Option<TaskAgentSpec> {
+pub(super) fn select_agent_spec(response: &TaskGetResponse, run_id: &str) -> Option<TaskAgentSpec> {
     response
         .agent_specs
         .iter()
@@ -7293,13 +9320,14 @@ async fn load_task_agent_skill_overlay(
 
 fn task_error(
     code: impl Into<String>,
-    message: impl Into<String>,
+    _message: impl Into<String>,
     class: TaskErrorClass,
     failed_run_id: Option<String>,
 ) -> TaskError {
+    let code = code.into();
     TaskError {
-        code: code.into(),
-        message: message.into(),
+        message: code.clone(),
+        code,
         class,
         details: None,
         failed_run_id,
@@ -7388,6 +9416,62 @@ mod tests {
         let mut self_rooted = valid;
         self_rooted.root_thread_id = task_run_turn.thread_id.clone();
         assert!(validate_task_thread_lineage(&task_run_turn, self_rooted).is_err());
+    }
+
+    #[test]
+    fn executable_task_actor_is_always_an_agent_execution() {
+        let actor = exact_task_execution_actor("E12345678901234567890")
+            .expect("valid execution id should become an agent actor");
+        assert_eq!(
+            actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(
+                pioneer_protocol::AgentExecutionId::new("E12345678901234567890").unwrap()
+            )
+        );
+        assert!(exact_task_execution_actor("system").is_err());
+    }
+
+    #[test]
+    fn task_occurrence_lineage_materializes_and_then_reuses_its_exact_root() {
+        assert_eq!(
+            task_occurrence_execution_lineage("new-root", None, None, None, None).unwrap(),
+            ("new-root".to_owned(), None)
+        );
+        assert_eq!(
+            task_occurrence_execution_lineage(
+                "first-child",
+                None,
+                None,
+                Some("creator-root"),
+                Some("creator-root"),
+            )
+            .unwrap(),
+            ("creator-root".to_owned(), Some("creator-root".to_owned()))
+        );
+        assert_eq!(
+            task_occurrence_execution_lineage(
+                "retry-execution",
+                Some("occurrence-root"),
+                Some("previous-execution"),
+                None,
+                None,
+            )
+            .unwrap(),
+            (
+                "occurrence-root".to_owned(),
+                Some("previous-execution".to_owned())
+            )
+        );
+        assert!(
+            task_occurrence_execution_lineage(
+                "orphan-child",
+                Some("occurrence-root"),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     fn permission_test_agent_spec(
@@ -7594,6 +9678,7 @@ mod tests {
         let parent = TaskParentRuntimeContext {
             parent_thread_id: "thread-parent".to_owned(),
             parent_turn_id: Some("turn-parent".to_owned()),
+            home_root_thread_id: "thread-parent".to_owned(),
             root_thread_id: "thread-parent".to_owned(),
         };
 
@@ -8375,6 +10460,7 @@ mod tests {
             &TaskParentRuntimeContext {
                 parent_thread_id: lineage.parent_thread_id,
                 parent_turn_id: lineage.created_by_turn_id,
+                home_root_thread_id: lineage.root_thread_id.clone(),
                 root_thread_id: lineage.root_thread_id,
             },
         )

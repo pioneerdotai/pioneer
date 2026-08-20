@@ -1,4 +1,12 @@
 mod admission;
+mod agent_action_service;
+mod agent_authored_operations;
+mod agent_execution;
+mod agent_facts;
+mod agent_liveness;
+mod agent_route_management;
+mod agent_route_service;
+mod agent_runtime_adapter;
 #[cfg(test)]
 mod catalog;
 mod domain;
@@ -22,6 +30,35 @@ pub(crate) use admission::{
     record_thread_notification_decision, record_tool_decision,
     record_workspace_notification_decision,
 };
+pub(crate) use agent_action_service::{
+    AgentActionCommitPlan, AgentActionCommitProjection, AgentActionKindName,
+    AgentActionServiceError, CanonicalAgentActionService, PreparedAgentAction,
+};
+pub(crate) use agent_authored_operations::exact_agent_actor;
+pub(crate) use agent_execution::{
+    ChildAgentLaunchGrant, ExecutionAttemptState, ExecutionMaterializationError,
+    MaterializedChildAgentStart, RootExecutionBinding, RunningPermit,
+    materialize_child_agent_start, resolve_agent_launch_selection,
+    resolve_ephemeral_agent_launch_selection,
+};
+pub(crate) use agent_facts::{
+    AgentAuthorizationFacts, AgentRouteFacts, AgentSecurityEnvelope, AgentStartFacts,
+    AgentWorkResourcePolicy, project_bounded_start_options, validate_agent_start_facts,
+};
+pub(crate) use agent_liveness::{
+    ExecutionLivenessAdapter, ExecutionLivenessDecision, ExecutionObservation,
+};
+pub(crate) use agent_route_management::AgentRouteManagementService;
+pub(crate) use agent_route_service::{
+    RouteAuthorizationRequest, authorize_route, safe_route_receipt,
+};
+pub(crate) use agent_runtime_adapter::{
+    AgentExecutionPersistenceFacts, AgentToolAdapterError, BoundAgentActionAdapter,
+    derive_task_agent_authorization_grant_seed, materialize_child_agent_action_binding,
+    materialize_persisted_selected_task_agent_action_binding,
+    materialize_persisted_task_agent_action_binding,
+    materialize_selected_task_agent_action_binding,
+};
 pub(crate) use domain::{
     ActionGateDecision, AgentsDocumentResourceId, AllowReason, ArtifactResourceId,
     AuthorizationDecision, AuthorizationResource, CapabilityKind, CapabilityResourceId, DenyReason,
@@ -31,8 +68,9 @@ pub(crate) use domain::{
 pub(crate) use execution::{
     ExecutionAdmissionEntryPoint, ExecutionAdmissionRequest, ExecutionAdmissionService,
     ExecutionAuthorizationAdmission, ExecutionAuthorizationContext, ExecutionContinuityPolicy,
-    ExecutionResourceBoundary, RevalidatedExecutionAuthorization, RuntimeDraftCreator,
-    RuntimeDraftMaterialization,
+    ExecutionResourceBoundary, RevalidatedExecutionAuthorization, RootAgentRouteGrant,
+    RuntimeDraftCreator, RuntimeDraftMaterialization,
+    execution_grant_capabilities_with_agent_skills,
 };
 pub(crate) use governor::{
     ExecutionAdmissionGovernor, ObservationAdmissionGovernor, ObservationAdmissionPermit,

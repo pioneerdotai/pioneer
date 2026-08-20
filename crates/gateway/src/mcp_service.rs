@@ -3460,6 +3460,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "test-model".to_owned(),
             model_provider: "test-provider".to_owned(),
@@ -3521,15 +3522,20 @@ mod tests {
             persisted.initiated_by_actor_id.as_deref(),
             Some(execution_principal.principal_id.as_str())
         );
-        let execution_context = ExecutionAuthorizationContext::for_test(
+        let mut execution_context = ExecutionAuthorizationContext::for_test(
             execution_principal.as_ref(),
             workspace_id,
             thread_id,
             &pioneer_protocol::default_turn_permission_profile_snapshot(),
             None,
-        )
-        .to_persisted_json()
-        .expect("test MCP execution context should serialize");
+        );
+        execution_context.bind_test_mcp_server_grants(
+            pioneer_protocol::McpScopeKind::Workspace,
+            ["resend".to_owned()],
+        );
+        let execution_context = execution_context
+            .to_persisted_json()
+            .expect("test MCP execution context should serialize");
         crud_store
             .set_turn_execution_authorization_context(turn_id, execution_context.as_str())
             .await
@@ -3752,15 +3758,20 @@ mod tests {
         )
         .await;
         ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
-        let execution_context = ExecutionAuthorizationContext::for_test(
+        let mut execution_context = ExecutionAuthorizationContext::for_test(
             authenticated_test_superuser().as_ref(),
             workspace_id.as_str(),
             thread_id.as_str(),
             &pioneer_protocol::default_turn_permission_profile_snapshot(),
             None,
-        )
-        .to_persisted_json()
-        .expect("test MCP execution context should serialize");
+        );
+        execution_context.bind_test_mcp_server_grants(
+            pioneer_protocol::McpScopeKind::Workspace,
+            ["resend".to_owned()],
+        );
+        let execution_context = execution_context
+            .to_persisted_json()
+            .expect("test MCP execution context should serialize");
         crud_store
             .set_turn_execution_authorization_context(turn_id.as_str(), execution_context.as_str())
             .await
@@ -3921,12 +3932,16 @@ mod tests {
             ),
             None,
         );
+        context.bind_test_mcp_server_grants(
+            pioneer_protocol::McpScopeKind::Workspace,
+            ["resend".to_owned()],
+        );
         context
             .bind_mcp_projection(
                 fixture.workspace_id.as_str(),
                 MCP_TURN_PROJECTION_VERSION,
                 fixture.manifest_hash.as_str(),
-                &[],
+                &["resend".to_owned()],
             )
             .expect("Member execution should bind the frozen MCP projection");
         let context_json = context

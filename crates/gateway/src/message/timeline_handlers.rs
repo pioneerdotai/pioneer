@@ -5,7 +5,7 @@ use super::timeline_cursor::{
 };
 use super::*;
 use crate::authorization::{AuthorizationExternalError, AuthorizedThread, AuthorizedTurn};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::{
     BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_DETACHED_TASK_RUN,
     BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM, BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE,
@@ -88,6 +88,12 @@ struct UserMessageTimelineBatch {
     turns: HashMap<String, Turn>,
     inputs: HashMap<String, Vec<UserInput>>,
     attachments: HashMap<String, Vec<UserMessageAttachment>>,
+}
+
+#[derive(Default)]
+struct AssistantMessageTimelineBatch {
+    items: HashMap<(String, String), TurnItem>,
+    authors: HashMap<String, pioneer_protocol::TurnAuthorSnapshot>,
 }
 
 fn log_thread_read_outcome(
@@ -1331,10 +1337,53 @@ impl MessageProcessor {
         approval_scope: Option<&ThreadTimelineApprovalScope>,
     ) -> Result<Vec<TimelineBlock>> {
         let user_messages = self.user_message_timeline_batch(rows.as_slice()).await?;
+        let action_targets = rows
+            .iter()
+            .filter_map(|row| match row.block_kind.as_str() {
+                BLOCK_KIND_USER_MESSAGE | BLOCK_KIND_RUNNING => {
+                    row.turn_id.clone().map(|turn_id| (turn_id, None))
+                }
+                BLOCK_KIND_ASSISTANT_MESSAGE => row
+                    .turn_id
+                    .clone()
+                    .zip(row.source_key.clone())
+                    .map(|(turn_id, item_id)| (turn_id, Some(item_id))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let action_timeline = pioneer_crud::load_agent_action_timeline_projections_for_targets(
+            &self.crud_store.database_connection(),
+            action_targets.as_slice(),
+        )
+        .await?;
+        let assistant_messages = self
+            .assistant_message_timeline_batch(rows.as_slice())
+            .await?;
         let mut blocks = Vec::with_capacity(rows.len());
         for row in rows {
+            let target_key = match row.block_kind.as_str() {
+                BLOCK_KIND_USER_MESSAGE => {
+                    row.turn_id.as_ref().map(|turn_id| (turn_id.clone(), None))
+                }
+                BLOCK_KIND_ASSISTANT_MESSAGE => row.turn_id.as_ref().and_then(|turn_id| {
+                    row.source_key
+                        .as_ref()
+                        .map(|item_id| (turn_id.clone(), Some(item_id.clone())))
+                }),
+                BLOCK_KIND_RUNNING => row.turn_id.as_ref().map(|turn_id| (turn_id.clone(), None)),
+                _ => None,
+            };
+            let action_projection = target_key
+                .as_ref()
+                .and_then(|target_key| action_timeline.get(target_key));
             if let Some(block) = self
-                .thread_timeline_block_from_row(row, approval_scope, &user_messages)
+                .thread_timeline_block_from_row(
+                    row,
+                    approval_scope,
+                    &user_messages,
+                    &assistant_messages,
+                    action_projection,
+                )
                 .await?
             {
                 blocks.push(block);
@@ -1473,6 +1522,141 @@ impl MessageProcessor {
         })
     }
 
+    async fn assistant_message_timeline_batch(
+        &self,
+        rows: &[thread_timeline_block::Model],
+    ) -> Result<AssistantMessageTimelineBatch> {
+        let item_targets = rows
+            .iter()
+            .filter(|row| row.block_kind == BLOCK_KIND_ASSISTANT_MESSAGE)
+            .map(|row| {
+                Ok::<_, anyhow::Error>((
+                    row.turn_id
+                        .clone()
+                        .context("assistant message timeline block is missing turn_id")?,
+                    row.source_key
+                        .clone()
+                        .context("assistant message timeline block is missing source_key")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let turn_ids = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.block_kind.as_str(),
+                    BLOCK_KIND_ASSISTANT_MESSAGE | BLOCK_KIND_RUNNING
+                )
+            })
+            .filter_map(|row| row.turn_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if turn_ids.is_empty() {
+            return Ok(AssistantMessageTimelineBatch::default());
+        }
+        let thread_id = rows
+            .first()
+            .context("assistant message timeline batch has no source row")?
+            .thread_id
+            .as_str();
+        let turns = self
+            .crud_store
+            .get_turns_by_thread_and_ids(thread_id, turn_ids.as_slice())
+            .await?;
+        for turn_id in &turn_ids {
+            if !turns.contains_key(turn_id.as_str()) {
+                bail!("assistant message timeline block references missing Turn `{turn_id}`");
+            }
+        }
+
+        let item_turn_ids = item_targets
+            .iter()
+            .map(|(turn_id, _)| turn_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let turn_items = if item_turn_ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.crud_store
+                .list_turn_items_by_type_for_turns(item_turn_ids.as_slice(), "agent_message")
+                .await?
+        };
+        let mut items = HashMap::new();
+        for (turn_id, item_id) in &item_targets {
+            let item = turn_items
+                .get(turn_id.as_str())
+                .and_then(|items| items.iter().find(|item| item.item_id() == item_id))
+                .with_context(|| {
+                    format!("assistant message item `{item_id}` for turn `{turn_id}` was not found")
+                })?;
+            if !matches!(item, TurnItem::AgentMessage { .. }) {
+                bail!("assistant message timeline target is not an Agent message");
+            }
+            items.insert((turn_id.clone(), item_id.clone()), item.clone());
+        }
+
+        let database = self.crud_store.database_connection();
+        let responses =
+            pioneer_crud::load_agent_turn_responses_for_turns(&database, turn_ids.as_slice())
+                .await?;
+        let responses_by_turn = responses
+            .iter()
+            .map(|response| (response.turn_id.as_str(), response))
+            .collect::<HashMap<_, _>>();
+        let execution_by_turn = turn_ids
+            .iter()
+            .filter_map(|turn_id| {
+                if let Some(response) = responses_by_turn.get(turn_id.as_str()) {
+                    return Some((turn_id.clone(), response.execution_id.clone()));
+                }
+                let turn = turns.get(turn_id.as_str())?;
+                (!matches!(
+                    turn.author.as_ref().map(|author| &author.actor),
+                    Some(pioneer_protocol::PersistedActorRef::AgentExecution(_))
+                ))
+                .then(|| {
+                    (
+                        turn_id.clone(),
+                        super::agent_action_tools::root_agent_execution_id_for_turn(turn_id),
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        let execution_ids = execution_by_turn.values().cloned().collect::<Vec<_>>();
+        let projected_by_execution =
+            pioneer_crud::load_agent_authors_for_executions(&database, execution_ids.as_slice())
+                .await?;
+        let mut authors = HashMap::new();
+        for turn_id in turn_ids {
+            let author = if let Some(execution_id) = execution_by_turn.get(turn_id.as_str()) {
+                let projected = projected_by_execution.get(execution_id.as_str());
+                if let Some(response) = responses_by_turn.get(turn_id.as_str()) {
+                    let projected = projected.with_context(|| {
+                        format!(
+                            "responding AgentExecution `{execution_id}` for turn `{turn_id}` is missing"
+                        )
+                    })?;
+                    if projected.presentation_snapshot_id != response.presentation_snapshot_id {
+                        bail!(
+                            "responding AgentExecution grant for turn `{turn_id}` is inconsistent"
+                        );
+                    }
+                    Some(projected.author.clone())
+                } else {
+                    projected.map(|projected| projected.author.clone())
+                }
+            } else {
+                None
+            };
+            if let Some(author) = author {
+                authors.insert(turn_id, author);
+            }
+        }
+        Ok(AssistantMessageTimelineBatch { items, authors })
+    }
+
     async fn descendant_pending_request_blocks(
         &self,
         workspace_id: &str,
@@ -1552,19 +1736,33 @@ impl MessageProcessor {
         row: thread_timeline_block::Model,
         approval_scope: Option<&ThreadTimelineApprovalScope>,
         user_messages: &UserMessageTimelineBatch,
+        assistant_messages: &AssistantMessageTimelineBatch,
+        action_projection: Option<&pioneer_crud::AgentActionTimelineProjection>,
     ) -> Result<Option<TimelineBlock>> {
         let kind = match row.block_kind.as_str() {
-            BLOCK_KIND_USER_MESSAGE => user_message_timeline_block_kind(&row, user_messages)?,
+            BLOCK_KIND_USER_MESSAGE => user_message_timeline_block_kind(
+                &row,
+                user_messages,
+                action_projection.and_then(|projection| projection.route.clone()),
+            )?,
             BLOCK_KIND_TURN_WORK => self.turn_work_timeline_block_kind(&row).await?,
             BLOCK_KIND_DETACHED_TASK_RUN => {
                 self.detached_task_run_timeline_block_kind(&row).await?
             }
-            BLOCK_KIND_ASSISTANT_MESSAGE => {
-                self.assistant_message_timeline_block_kind(&row).await?
-            }
+            BLOCK_KIND_ASSISTANT_MESSAGE => self.assistant_message_timeline_block_kind(
+                &row,
+                assistant_messages,
+                action_projection,
+            )?,
             BLOCK_KIND_RUNNING => TimelineBlockKind::TurnState {
                 state: TurnWorkState::Running,
                 message: None,
+                author: row
+                    .turn_id
+                    .as_deref()
+                    .and_then(|turn_id| assistant_messages.authors.get(turn_id))
+                    .cloned(),
+                route: action_projection.and_then(|projection| projection.route.clone()),
             },
             BLOCK_KIND_APPROVAL => {
                 let Some(kind) = self
@@ -1672,9 +1870,11 @@ impl MessageProcessor {
         })
     }
 
-    async fn assistant_message_timeline_block_kind(
+    fn assistant_message_timeline_block_kind(
         &self,
         row: &thread_timeline_block::Model,
+        batch: &AssistantMessageTimelineBatch,
+        action_projection: Option<&pioneer_crud::AgentActionTimelineProjection>,
     ) -> Result<TimelineBlockKind> {
         let turn_id = row
             .turn_id
@@ -1684,11 +1884,16 @@ impl MessageProcessor {
             .source_key
             .as_deref()
             .context("assistant message timeline block is missing source_key")?;
-        let Some(item) = self.crud_store.get_turn_item(turn_id, item_id).await? else {
-            return Err(anyhow!(
-                "assistant message item `{item_id}` for turn `{turn_id}` was not found"
-            ));
-        };
+        let item = batch
+            .items
+            .get(&(turn_id.to_owned(), item_id.to_owned()))
+            .with_context(|| {
+                format!("assistant message item `{item_id}` for turn `{turn_id}` was not batched")
+            })?
+            .clone();
+        let author = action_projection
+            .map(|projection| projection.author.clone())
+            .or_else(|| batch.authors.get(turn_id).cloned());
 
         let TurnItem::AgentMessage {
             id, text, markdown, ..
@@ -1706,6 +1911,8 @@ impl MessageProcessor {
             text,
             status: TurnWorkItemStatus::Completed,
             markdown,
+            author,
+            route: action_projection.and_then(|projection| projection.route.clone()),
         })
     }
 
@@ -1802,10 +2009,15 @@ impl MessageProcessor {
         };
 
         let visible_work_count = projection.visible_work_count.max(0) as u64;
+        let agent_work_graph = self
+            .crud_store
+            .get_agent_work_graph_projection_for_turn(projection.turn_id.as_str())
+            .await?;
         Ok(TurnWorkBlock {
             turn_id: projection.turn_id,
             presentation: parse_turn_work_presentation(projection.presentation.as_str()),
             state: parse_turn_work_state(projection.state.as_str()),
+            agent_work_graph,
             started_at_unix_ms: projection.started_at.map(|value| value.timestamp_millis()),
             completed_at_unix_ms: projection
                 .completed_at
@@ -1898,6 +2110,7 @@ fn turn_work_projection_revision(projection: &turn_work_projection::Model) -> (i
 fn user_message_timeline_block_kind(
     row: &thread_timeline_block::Model,
     batch: &UserMessageTimelineBatch,
+    route: Option<pioneer_protocol::SafeRouteProvenance>,
 ) -> Result<TimelineBlockKind> {
     let turn_id = row
         .turn_id
@@ -1957,6 +2170,7 @@ fn user_message_timeline_block_kind(
         attachments,
         mode: turn.mode,
         author: turn.author.clone(),
+        route,
         reply,
         mentions: turn.mentions.clone(),
         revision: turn.message_revision,
@@ -2093,7 +2307,12 @@ fn terminal_turn_state_timeline_block_kind_from_metadata(
         .and_then(|value| value.get("message"))
         .and_then(JsonValue::as_str)
         .map(str::to_owned);
-    Ok(TimelineBlockKind::TurnState { state, message })
+    Ok(TimelineBlockKind::TurnState {
+        state,
+        message,
+        author: None,
+        route: None,
+    })
 }
 
 fn parse_turn_work_state(value: &str) -> TurnWorkState {
@@ -2339,6 +2558,8 @@ mod timeline_handler_unit_tests {
             TimelineBlockKind::TurnState {
                 state: TurnWorkState::Interrupted,
                 message: Some("stopped by user".to_owned()),
+                author: None,
+                route: None,
             }
         );
     }

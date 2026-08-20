@@ -8088,6 +8088,19 @@ impl MessageProcessor {
                 pending.thread_id
             );
         }
+        if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
+            self.cleanup_cli_runtime_terminal_binding_status(
+                &binding,
+                "stale CLI runtime request response",
+            )
+            .await;
+            anyhow::bail!(
+                "turn `{}` is no longer active for CLI runtime `{}`; binding status is `{}`",
+                binding.turn_id,
+                binding.runtime_id,
+                binding.status
+            );
+        }
         if cli_runtime_request_kind_requires_turn_binding(request_kind) {
             let native_thread_id = pending.native_thread_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -8129,20 +8142,6 @@ impl MessageProcessor {
                 }
             }
         }
-        if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
-            self.cleanup_cli_runtime_terminal_binding_status(
-                &binding,
-                "stale CLI runtime request response",
-            )
-            .await;
-            anyhow::bail!(
-                "turn `{}` is no longer active for CLI runtime `{}`; binding status is `{}`",
-                binding.turn_id,
-                binding.runtime_id,
-                binding.status
-            );
-        }
-
         match self.cli_runtime_turn_status_for_binding(&binding).await? {
             Some(TurnStatus::InProgress) => Ok(()),
             Some(status) => {

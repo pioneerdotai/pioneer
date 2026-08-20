@@ -1498,6 +1498,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "hidden-model".to_owned(),
             model_provider: "hidden-provider".to_owned(),

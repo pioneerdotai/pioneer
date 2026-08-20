@@ -2,12 +2,14 @@ use super::*;
 use crate::message::artifacts::{ArtifactListAuthorization, ArtifactUploadAuthorization};
 use crate::message::thread_handlers::ThreadAccessAuthorization;
 use pioneer_protocol::{
-    ArtifactBindParams, ArtifactCapabilitiesParams, ArtifactDeleteParams, ArtifactGetParams,
-    ArtifactListForMessageParams, ArtifactListForThreadParams, ArtifactListForTurnParams,
-    ArtifactListParams, ArtifactRestoreParams, ArtifactUploadAbortParams,
-    ArtifactUploadFinishParams, ArtifactUploadStartParams, ArtifactViewGrantCreateParams,
-    AuthProfileUpdateParams, AuthSessionRevokeParams, AuthorizationCapabilitiesParams,
-    CLIRuntimeGetParams, CLIRuntimeListModelsParams, CLIRuntimeListParams, CLIRuntimeRefreshParams,
+    AgentDelegationRouteCreateParams, AgentDelegationRouteListParams,
+    AgentDelegationRouteRevokeParams, ArtifactBindParams, ArtifactCapabilitiesParams,
+    ArtifactDeleteParams, ArtifactGetParams, ArtifactListForMessageParams,
+    ArtifactListForThreadParams, ArtifactListForTurnParams, ArtifactListParams,
+    ArtifactRestoreParams, ArtifactUploadAbortParams, ArtifactUploadFinishParams,
+    ArtifactUploadStartParams, ArtifactViewGrantCreateParams, AuthProfileUpdateParams,
+    AuthSessionRevokeParams, AuthorizationCapabilitiesParams, CLIRuntimeGetParams,
+    CLIRuntimeListModelsParams, CLIRuntimeListParams, CLIRuntimeRefreshParams,
     CLIRuntimeReviewStartParams, CLIRuntimeStatusParams, CLIRuntimeThreadBindingGetParams,
     CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams, CLIRuntimeTurnSteerParams,
     GatewaySettingsGetParams, GatewaySettingsUpdateParams, InvitationCreateParams,
@@ -32,6 +34,7 @@ use pioneer_protocol::{
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
     WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
 };
+use sea_orm::TransactionTrait as _;
 use tracing::Instrument as _;
 
 use crate::authorization::{
@@ -47,6 +50,10 @@ use crate::authorization::{
 
 pub(super) enum RequestAdmission {
     Superuser,
+    /// The route domain resolves both exact collaboration roots from typed
+    /// params. Static method admission has checked the human/service action,
+    /// but must not manufacture a Gateway-wide resource proof.
+    RouteLifecycle,
     InvitationGrants(AuthorizedInvitationGrants),
     InvitationCollection(AuthorizedInvitationCollection),
     Invitation(AuthorizedInvitation),
@@ -839,6 +846,12 @@ impl MessageProcessor {
             return Err(external_error_for_decision(&decision)
                 .expect("denied action gate has external mapping")
                 .response(request.id.clone()));
+        }
+        if matches!(
+            request.method.as_str(),
+            methods::AGENT_ROUTE_CREATE | methods::AGENT_ROUTE_LIST | methods::AGENT_ROUTE_REVOKE
+        ) {
+            return Ok(RequestAdmission::RouteLifecycle);
         }
 
         let resolver = AuthorizationResolver::new((*self.crud_store).clone());
@@ -3009,6 +3022,7 @@ impl MessageProcessor {
             super::message_turn::contains_client_author_snapshot(&params_value);
         match serde_json::from_value::<TurnStartParams>(params_value) {
             Ok(mut params) => message_future(async move {
+                let root_route_requests = std::mem::take(&mut params.agent_delegation_routes);
                 if client_author_override {
                     self.send_error(
                         connection_id,
@@ -3045,6 +3059,18 @@ impl MessageProcessor {
                 params.mode = Some(effective_mode);
 
                 if effective_mode == pioneer_protocol::ThreadMode::Message {
+                    if !root_route_requests.is_empty() {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_PARAMS_CODE,
+                                "agentDelegationRoutes requires an Agent-mode Turn",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
                     match super::message_turn::MessageTurnAdmission::from_dispatch(
                         &context,
                         &admission,
@@ -3115,11 +3141,8 @@ impl MessageProcessor {
                 } else {
                     unreachable!("central admission supplies a persisted thread or runtime draft")
                 };
-                match execution_admission {
-                    Ok(execution_admission) => {
-                        self.turn_start(&context, execution_admission, request.id, params)
-                            .await;
-                    }
+                let mut execution_admission = match execution_admission {
+                    Ok(execution_admission) => execution_admission,
                     Err(error) => {
                         self.send_error(
                             connection_id,
@@ -3130,8 +3153,60 @@ impl MessageProcessor {
                             ),
                         )
                         .await;
+                        return;
+                    }
+                };
+                if !root_route_requests.is_empty() {
+                    let route_service = crate::authorization::AgentRouteManagementService::new(
+                        self.crud_store.clone(),
+                    );
+                    let grants = match route_service
+                        .prepare_root_routes(
+                            &context,
+                            execution_admission.workspace_id(),
+                            execution_admission.root_thread_id(),
+                            params.turn_id.as_str(),
+                            root_route_requests,
+                        )
+                        .await
+                    {
+                        Ok(grants) => grants,
+                        Err(_error) => {
+                            tracing::warn!(
+                                failure_class = "root_agent_route_admission_failed",
+                                "root Agent route admission failed"
+                            );
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_REQUEST_CODE,
+                                    "root Agent route request is not authorized or could not be completed",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    if let Err(_error) = execution_admission.bind_root_route_grants(grants) {
+                        tracing::warn!(
+                            failure_class = "root_agent_route_binding_failed",
+                            "root Agent route binding failed"
+                        );
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request.id),
+                                INVALID_REQUEST_CODE,
+                                "root Agent route request is not authorized or could not be completed",
+                            ),
+                        )
+                        .await;
+                        return;
                     }
                 }
+                self.turn_start(&context, execution_admission, request.id, params)
+                    .await;
             }),
             Err(error) => message_future(async move {
                 self.send_error(
@@ -3229,6 +3304,66 @@ impl MessageProcessor {
         let method = request.method.clone();
         dispatch_request_future! {
             method.as_str();
+                methods::AGENT_ROUTE_CREATE => {
+                    debug_assert!(matches!(&admission, RequestAdmission::RouteLifecycle | RequestAdmission::Superuser));
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<AgentDelegationRouteCreateParams>(params_value) {
+                        Ok(params) => {
+                            self.agent_route_create(&context, request.id, params).await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::AGENT_ROUTE_CREATE),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::AGENT_ROUTE_LIST => {
+                    debug_assert!(matches!(&admission, RequestAdmission::RouteLifecycle | RequestAdmission::Superuser));
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<AgentDelegationRouteListParams>(params_value) {
+                        Ok(params) => {
+                            self.agent_route_list(&context, request.id, params).await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::AGENT_ROUTE_LIST),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::AGENT_ROUTE_REVOKE => {
+                    debug_assert!(matches!(&admission, RequestAdmission::RouteLifecycle | RequestAdmission::Superuser));
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<AgentDelegationRouteRevokeParams>(params_value) {
+                        Ok(params) => {
+                            self.agent_route_revoke(&context, request.id, params).await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!("invalid params for `{}`: {error}", methods::AGENT_ROUTE_REVOKE),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 methods::WORKSPACE_MEMBER_LIST => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<WorkspaceMemberListParams>(params_value) {
@@ -7009,6 +7144,7 @@ impl MessageProcessor {
             config.gateway.settings_version,
             settings_file_name.as_str(),
         )?;
+        let previous_settings = settings.clone();
         let voice_reconfiguration = match update.voice_input.as_ref() {
             Some(voice_input) => settings.voice_input_update_would_reconfigure(voice_input)?,
             None => false,
@@ -7060,6 +7196,30 @@ impl MessageProcessor {
         });
         let changes =
             settings.apply_protocol_update_for_workspace(update, workspace_id.as_deref())?;
+        let cli_identity_transaction = if changes.cli_runtimes {
+            let effective_gateway = settings.apply_to_gateway_config(config.gateway.clone());
+            let identity_settings = settings.effective_cli_runtime_settings(&config.gateway);
+            let instances = crate::identity::catalog::from_effective_settings(
+                effective_gateway.effective_cli_agent_runtime_instances(),
+                &identity_settings,
+            )?;
+            let transaction = self
+                .crud_store
+                .database_connection()
+                .begin()
+                .await
+                .context("failed to begin atomic CLI identity settings projection")?;
+            pioneer_crud::sync_cli_runtime_identity_catalog(
+                &transaction,
+                instances.as_slice(),
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+            .context("failed to project CLI runtime identity settings")?;
+            Some(transaction)
+        } else {
+            None
+        };
         let disabled_local_embedding_model = previous_workspace_vector_search
             .as_ref()
             .zip(workspace_id.as_deref())
@@ -7105,6 +7265,30 @@ impl MessageProcessor {
                 }
             }
             return Err(error);
+        }
+        if let Some(transaction) = cli_identity_transaction
+            && let Err(commit_error) = transaction.commit().await
+        {
+            let restore_error =
+                crate::settings::save_gateway_settings(settings_path.as_path(), &previous_settings)
+                    .err();
+            if changes.general.keepawake.is_some()
+                && let Err(rollback_error) =
+                    self.apply_keepawake_setting(previous_general_settings.keepawake)
+            {
+                warn!(
+                    error = %format!("{rollback_error:#}"),
+                    "failed to roll back keepawake setting after CLI identity commit failure"
+                );
+            }
+            return match restore_error {
+                Some(restore_error) => Err(anyhow::anyhow!(
+                    "failed to commit CLI identity settings projection: {commit_error}; failed to restore settings file: {restore_error}"
+                )),
+                None => Err(commit_error).context(
+                    "failed to commit CLI identity settings projection; settings file restored",
+                ),
+            };
         }
 
         if changes.self_improvement {

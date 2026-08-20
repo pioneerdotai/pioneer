@@ -344,6 +344,7 @@ async fn ensure_test_superuser_execution_turn(
             id: thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "test-model".to_owned(),
             model_provider: "openai".to_owned(),
@@ -401,6 +402,33 @@ async fn ensure_test_superuser_execution_turn(
         )
         .await;
     }
+}
+
+async fn bind_test_execution_skill_grants(
+    processor: &MessageProcessor,
+    turn_id: &str,
+    skill_ids: impl IntoIterator<Item = pioneer_protocol::SkillId>,
+) {
+    let encoded = processor
+        .crud_store
+        .get_turn_execution_authorization_context(turn_id)
+        .await
+        .expect("test execution authorization should load")
+        .expect("test execution authorization should exist");
+    let mut context =
+        crate::authorization::ExecutionAuthorizationContext::from_persisted_json(encoded.as_str())
+            .expect("test execution authorization should decode");
+    context.bind_test_skill_grants(skill_ids);
+    let encoded = context
+        .to_persisted_json()
+        .expect("skill-authorized test execution should serialize");
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_authorization_context(turn_id, encoded.as_str())
+            .await
+            .expect("skill-authorized test execution should persist")
+    );
 }
 
 async fn persist_test_cli_execution_authorization_context(
@@ -1008,6 +1036,9 @@ async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
         .with_runtime_home_for_tests(runtime_home)
         .with_self_improvement_supervisor(self_improvement_supervisor.clone()),
     );
+    sync_test_cli_runtime_identities(&processor)
+        .await
+        .expect("CLI runtime security harness should project agent domain identities");
 
     CliRuntimeSecurityHarness {
         rx,
@@ -1400,6 +1431,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
                 id: runtime_id.clone(),
                 kind: runtime_kind,
                 display_name: format!("Proposal 51 {runtime_id}"),
+                nickname: format!("proposal-51-{runtime_id}"),
                 enabled: true,
                 binary_path: "recording-runtime".to_owned(),
                 home_path: native_home.to_string_lossy().into_owned(),
@@ -2910,6 +2942,7 @@ struct VerticalCollaborativeSourceProvider {
 struct VerticalUnfinishedSiblingProvider {
     child_main_calls: AtomicUsize,
     child_main_started: Notify,
+    requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
 
 struct VerticalReadSkillProvider {
@@ -3001,6 +3034,7 @@ struct GuardAwareProvider {
 
 struct CreateThenHangProvider {
     next_index: AtomicUsize,
+    root_main_started: Notify,
 }
 
 #[async_trait::async_trait]
@@ -3732,6 +3766,20 @@ impl Provider for GuardAwareProvider {
         if is_turn_preflight_request(&request) {
             return Ok(test_task_turn_preflight_response());
         }
+        if request.messages.iter().any(|message| {
+            message
+                .content
+                .contains("Generate a concise title (2-6 words)")
+        }) {
+            return Ok(ChatResponse {
+                text: "Delegated task".to_owned(),
+                usage: None,
+                reasoning_content: None,
+                provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
+                tool_calls: Vec::new(),
+            });
+        }
         if is_child_task_request(&request) {
             sleep(Duration::from_secs(10)).await;
             return Ok(ChatResponse {
@@ -3807,13 +3855,15 @@ impl Provider for GuardAwareProvider {
         request: ChatRequest,
     ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
         let response = self.chat(request).await?;
-        Ok(futures_util::stream::iter(vec![
-            Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk_with(
-                pioneer_provider::ProviderTermination::Complete,
-            )),
-        ])
-        .boxed())
+        let mut chunks = Vec::new();
+        if !response.tool_calls.is_empty() {
+            chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
+        }
+        if !response.text.is_empty() {
+            chunks.push(Ok(StreamChunk::delta(response.text)));
+        }
+        chunks.push(Ok(StreamChunk::final_chunk_with(response.termination)));
+        Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
 
@@ -3854,10 +3904,13 @@ impl Provider for CreateThenHangProvider {
         if is_turn_preflight_request(&request) {
             return Ok(test_task_turn_preflight_response());
         }
-        if is_child_task_request(&request) {
-            sleep(Duration::from_secs(10)).await;
+        if request.messages.iter().any(|message| {
+            message
+                .content
+                .contains("Generate a concise title (2-6 words)")
+        }) {
             return Ok(ChatResponse {
-                text: "slow child".to_owned(),
+                text: "Delegated task".to_owned(),
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
@@ -3865,9 +3918,9 @@ impl Provider for CreateThenHangProvider {
                 tool_calls: Vec::new(),
             });
         }
-
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
         if index == 0 {
+            self.root_main_started.notify_one();
             return Ok(ChatResponse {
                 text: String::new(),
                 usage: None,
@@ -3883,6 +3936,17 @@ impl Provider for CreateThenHangProvider {
                     })
                     .to_string(),
                 }],
+            });
+        }
+        if is_child_task_request(&request) {
+            sleep(Duration::from_secs(10)).await;
+            return Ok(ChatResponse {
+                text: "slow child".to_owned(),
+                usage: None,
+                reasoning_content: None,
+                provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
+                tool_calls: Vec::new(),
             });
         }
         sleep(Duration::from_secs(10)).await;
@@ -3901,13 +3965,15 @@ impl Provider for CreateThenHangProvider {
         request: ChatRequest,
     ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
         let response = self.chat(request).await?;
-        Ok(futures_util::stream::iter(vec![
-            Ok(StreamChunk::delta(response.text)),
-            Ok(StreamChunk::final_chunk_with(
-                pioneer_provider::ProviderTermination::Complete,
-            )),
-        ])
-        .boxed())
+        let mut chunks = Vec::new();
+        if !response.tool_calls.is_empty() {
+            chunks.push(Ok(StreamChunk::tool_calls(response.tool_calls)));
+        }
+        if !response.text.is_empty() {
+            chunks.push(Ok(StreamChunk::delta(response.text)));
+        }
+        chunks.push(Ok(StreamChunk::final_chunk_with(response.termination)));
+        Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
 
@@ -3915,6 +3981,16 @@ impl CreateThenHangProvider {
     fn new() -> Self {
         Self {
             next_index: AtomicUsize::new(0),
+            root_main_started: Notify::new(),
+        }
+    }
+
+    async fn wait_for_root_main(&self) {
+        loop {
+            if self.next_index.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            self.root_main_started.notified().await;
         }
     }
 }
@@ -4696,7 +4772,15 @@ impl VerticalUnfinishedSiblingProvider {
         Self {
             child_main_calls: AtomicUsize::new(0),
             child_main_started: Notify::new(),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn snapshot_requests(&self) -> Vec<ChatRequest> {
+        self.requests
+            .lock()
+            .expect("vertical unfinished sibling request lock poisoned")
+            .clone()
     }
 
     async fn wait_for_child_main(&self) {
@@ -4727,6 +4811,10 @@ impl Provider for VerticalUnfinishedSiblingProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.requests
+            .lock()
+            .expect("vertical unfinished sibling request lock poisoned")
+            .push(request.clone());
         if is_turn_preflight_request(&request) {
             return Ok(test_turn_preflight_response());
         }
@@ -4838,9 +4926,7 @@ impl Provider for VerticalCollaborativeSourceProvider {
         if !response.text.is_empty() {
             chunks.push(Ok(StreamChunk::delta(response.text)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk_with(
-            pioneer_provider::ProviderTermination::Complete,
-        )));
+        chunks.push(Ok(StreamChunk::final_chunk_with(response.termination)));
         Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
@@ -4886,7 +4972,9 @@ impl Provider for VerticalReadSkillProvider {
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         if is_turn_preflight_request(&request) {
-            return Ok(test_turn_preflight_response());
+            return Ok(test_turn_preflight_response_with_visible_tools(&[
+                "read_skill",
+            ]));
         }
         self.requests
             .lock()
@@ -4932,9 +5020,7 @@ impl Provider for VerticalReadSkillProvider {
         if !response.text.is_empty() {
             chunks.push(Ok(StreamChunk::delta(response.text)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk_with(
-            pioneer_provider::ProviderTermination::Complete,
-        )));
+        chunks.push(Ok(StreamChunk::final_chunk_with(response.termination)));
         Ok(futures_util::stream::iter(chunks).boxed())
     }
 }
@@ -5984,6 +6070,7 @@ fn test_task_create_params(
         trigger: TaskTriggerInput {
             spec: TaskTriggerSpec::Immediate,
         },
+        launch: None,
         agent_spec: Some(TaskAgentSpecInput {
             agent_role: Some("worker".to_owned()),
             agent_nickname: Some("Worker".to_owned()),
@@ -6096,6 +6183,7 @@ fn detached_cli_task_create_params(
         data: None,
         composer_work: Some(pioneer_protocol::TaskComposerWork::v1(
             pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: parent_thread_id.to_owned(),
                 turn_id: format!("planned_{runtime_id}"),
                 input: vec![UserInput::Text {
@@ -6109,6 +6197,7 @@ fn detached_cli_task_create_params(
                     SandboxMode::FullAccess,
                 )),
                 mode: Some(ThreadMode::Agent),
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -6189,11 +6278,135 @@ async fn complete_recorded_cli_task_turn(
         .await;
 }
 
+async fn sync_test_cli_runtime_identities(processor: &MessageProcessor) -> anyhow::Result<()> {
+    let configured = processor.load_cli_runtime_instances()?;
+    let identity_settings =
+        crate::cli_runtime::config::load_effective_cli_runtime_identity_settings(
+            processor.artifact_runtime_home.as_path(),
+        )?;
+    let catalog =
+        crate::identity::catalog::from_effective_settings(configured, &identity_settings)?;
+    pioneer_crud::sync_cli_runtime_identity_catalog(
+        &processor.crud_store.database_connection(),
+        catalog.as_slice(),
+        chrono::Utc::now().fixed_offset(),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn exact_cli_task_launch_for_test(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    default_provider: &str,
+    default_model: &str,
+    runtime_id: &str,
+) -> anyhow::Result<pioneer_protocol::AgentLaunchSelection> {
+    sync_test_cli_runtime_identities(processor).await?;
+
+    let (_, default_launch) = super::agent_action_tools::resolve_workspace_task_launch(
+        processor,
+        workspace_id,
+        default_provider,
+        default_model,
+        None,
+        None,
+        "test-cli-task-launch-catalog",
+    )
+    .await?;
+    let (default_identity, default_profile) =
+        default_launch.context("test workspace Pioneer launch projection is missing")?;
+    let (identities, profiles) = super::agent_action_tools::current_workspace_launch_catalog(
+        processor,
+        workspace_id,
+        &default_identity,
+        &default_profile,
+        default_provider,
+        default_model,
+    )
+    .await?;
+    let profile = profiles
+        .into_iter()
+        .find(|profile| {
+            matches!(
+                &profile.backend,
+                pioneer_protocol::AgentExecutionProfileBackend::CliRuntime {
+                    runtime_instance_id,
+                } if runtime_instance_id == runtime_id
+            )
+        })
+        .with_context(|| format!("test CLI runtime `{runtime_id}` has no exact launch profile"))?;
+    let identity = identities
+        .into_iter()
+        .find(|identity| {
+            identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+                && profile.compatible_agent_identity_ids.contains(&identity.id)
+        })
+        .with_context(|| format!("test CLI runtime `{runtime_id}` has no exact Agent identity"))?;
+    Ok(pioneer_protocol::AgentLaunchSelection {
+        agent: pioneer_protocol::AgentIdentitySelection::Exact {
+            agent_identity_id: identity.id,
+        },
+        execution: pioneer_protocol::AgentExecutionSelection {
+            profile: pioneer_protocol::AgentExecutionProfileSelection::Exact {
+                profile_id: profile.id,
+            },
+            reasoning: None,
+            permission_profile: None,
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+        },
+    })
+}
+
 async fn create_task_for_test(
     processor: &Arc<MessageProcessor>,
-    params: TaskCreateParams,
+    mut params: TaskCreateParams,
 ) -> anyhow::Result<pioneer_protocol::TaskCreateResponse> {
     ensure_task_create_parent_turn_for_test(processor, &params).await?;
+    let cli_runtime_id = params
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref())
+        .and_then(|work| work.launch.execution_backend.as_ref())
+        .and_then(|backend| match backend {
+            pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. } => {
+                Some(runtime_id.clone())
+            }
+            _ => None,
+        });
+    if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent
+        && params.launch.is_none()
+        && let Some(cli_runtime_id) = cli_runtime_id
+    {
+        let root_thread_id = params
+            .created_by_thread_id
+            .as_deref()
+            .context("test Agent Task requires an exact root thread")?;
+        let root_thread = processor
+            .crud_store
+            .get_thread_by_id(root_thread_id)
+            .await?
+            .context("test Agent Task root thread is missing")?;
+        params.launch = Some(
+            exact_cli_task_launch_for_test(
+                processor,
+                params.workspace_id.as_str(),
+                params
+                    .agent_spec
+                    .as_ref()
+                    .and_then(|spec| spec.model_provider.as_deref())
+                    .unwrap_or(root_thread.model_provider.as_str()),
+                params
+                    .agent_spec
+                    .as_ref()
+                    .and_then(|spec| spec.model.as_deref())
+                    .unwrap_or(root_thread.model.as_str()),
+                cli_runtime_id.as_str(),
+            )
+            .await?,
+        );
+    }
     let mut context = processor.task_create_context_for_params(&params).await?;
     let principal = authenticated_test_superuser();
     context.actor_id = Some(principal.principal_id.to_string());
@@ -6207,6 +6420,39 @@ async fn create_task_for_test(
             .get_thread_by_id(root_thread_id)
             .await?
             .context("test Agent Task root thread is missing")?;
+        let task_model_provider = params
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.model_provider.as_deref())
+            .unwrap_or(root_thread.model_provider.as_str())
+            .to_owned();
+        let task_model = params
+            .agent_spec
+            .as_ref()
+            .and_then(|spec| spec.model.as_deref())
+            .unwrap_or(root_thread.model.as_str())
+            .to_owned();
+        let (canonical_launch, resolved_launch) =
+            super::agent_action_tools::resolve_workspace_task_launch(
+                processor,
+                params.workspace_id.as_str(),
+                task_model_provider.as_str(),
+                task_model.as_str(),
+                params.launch.as_ref(),
+                None,
+                params
+                    .created_by_turn_id
+                    .as_deref()
+                    .unwrap_or("task-test-launch"),
+            )
+            .await?;
+        params.launch = Some(canonical_launch.clone());
+        context.launch_selection = Some(canonical_launch);
+        context.resolved_launch_identity = resolved_launch
+            .as_ref()
+            .map(|(identity, _)| identity.clone());
+        context.resolved_launch_profile =
+            resolved_launch.as_ref().map(|(_, profile)| profile.clone());
         let mut request = crate::authorization::ExecutionAdmissionRequest::for_task(
             &params,
             root_thread_id,
@@ -6243,6 +6489,40 @@ async fn create_task_for_test(
                 .and_then(|spec| spec.permission_cap.as_ref()),
         )
         .await?;
+        if let Some((identity, profile)) = resolved_launch.as_ref() {
+            let child_skill_ids = admitted
+                .granted_skill_ids()
+                .iter()
+                .map(|id| pioneer_protocol::SkillId::new(id.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| anyhow::anyhow!("test Task Skill grant is invalid: {error:?}"))?;
+            let child_launch_grant =
+                super::agent_action_tools::current_workspace_child_launch_ceiling(
+                    processor,
+                    params.workspace_id.as_str(),
+                    identity,
+                    profile,
+                    task_model_provider.as_str(),
+                    task_model.as_str(),
+                    true,
+                    child_skill_ids,
+                    admitted.granted_mcp_server_capability_ids().to_vec(),
+                    admitted.permission_profile_cap().clone(),
+                )
+                .await?;
+            context.agent_authorization_grant = Some(
+                crate::authorization::derive_task_agent_authorization_grant_seed(
+                    identity.id.clone(),
+                    admitted.root_thread_id(),
+                    "thread_agent",
+                    admitted.policy_revision(),
+                    child_launch_grant,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("test Task Agent authorization grant is invalid: {error:?}")
+                })?,
+            );
+        }
         context.execution_admission = Some(pioneer_tasks::TaskExecutionAdmissionSeed {
             workspace_id: admitted.workspace_id().to_owned(),
             root_thread_id: admitted.root_thread_id().to_owned(),
@@ -6292,6 +6572,7 @@ async fn ensure_task_create_parent_turn_for_test(
             id: parent_thread_id.to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "test-model".to_owned(),
             model_provider: "openai".to_owned(),
@@ -6377,6 +6658,15 @@ async fn seed_completed_task_parent_with_history(
 ) {
     ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
     let principal = authenticated_test_superuser();
+    let principal_actor =
+        pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone());
+    let preview_author = super::message_turn::resolve_turn_author_snapshot(
+        processor.crud_store.as_ref(),
+        &principal_actor,
+    )
+    .await
+    .expect("native Task parent author should resolve")
+    .expect("native Task parent principal should have an author snapshot");
     let created_at = super::now_timestamp_secs();
     processor
         .crud_store
@@ -6386,6 +6676,7 @@ async fn seed_completed_task_parent_with_history(
                 id: parent_thread_id.to_owned(),
                 name: Some("Native Task parent".to_owned()),
                 preview: history.to_owned(),
+                preview_author: Some(preview_author.clone()),
                 mode: ThreadMode::Agent,
                 model: "test-model".to_owned(),
                 model_provider: "openai".to_owned(),
@@ -6407,7 +6698,7 @@ async fn seed_completed_task_parent_with_history(
                 turn_kind: TurnKind::Conversation,
                 origin: TurnOrigin::User,
                 mode: Default::default(),
-                author: None,
+                author: Some(preview_author),
                 reply_to_turn_id: None,
                 mentions: Vec::new(),
                 message_revision: 0,
@@ -6423,7 +6714,7 @@ async fn seed_completed_task_parent_with_history(
                 text: history.to_owned(),
                 text_elements: Vec::new(),
             }],
-            pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
+            principal_actor,
         )
         .await
         .expect("native Task parent start should persist");
@@ -6489,6 +6780,10 @@ fn review_enabled_processor(
     workspace_manager: Arc<WorkspaceManager>,
     crud_store: Arc<CrudStore>,
 ) -> Arc<MessageProcessor> {
+    let runtime_home = unique_temp_dir("message-review");
+    let capsule_root = runtime_home.join("memory").join("capsules");
+    std::fs::create_dir_all(&capsule_root)
+        .expect("review-enabled test runtime directories should exist");
     Arc::new(MessageProcessor::new_with_memory_runtime_and_task_config(
         Arc::new(ThreadManager::new("test-model", "openai")),
         provider_registry,
@@ -6500,11 +6795,8 @@ fn review_enabled_processor(
         test_context_budget(),
         test_tool_loop_config(),
         Arc::new(GatewayMemoryRuntime::disabled(crud_store)),
-        std::env::temp_dir().join("pioneer-message-review-tests"),
-        std::env::temp_dir()
-            .join("pioneer-message-review-tests")
-            .join("memory")
-            .join("capsules"),
+        runtime_home,
+        capsule_root,
         pioneer_config::GatewayArtifactsConfig::default(),
         review_enabled_task_runtime_config(),
         crate::thread_episodic::ThreadEpisodicRuntimeConfig {
@@ -7077,6 +7369,7 @@ async fn setup_progress_delta_harness(
         id: thread_id.clone(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -7483,6 +7776,7 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         id: thread_id.to_owned(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -7569,6 +7863,7 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         id: thread_id.to_owned(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -7661,6 +7956,7 @@ async fn title_generation_retries_after_transient_failure() {
         id: thread_id.to_owned(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -7753,6 +8049,7 @@ async fn child_thread_scope_skips_auto_title_generation() {
         id: thread_id.to_owned(),
         name: Some(child_title.to_owned()),
         preview: String::new(),
+        preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -8188,8 +8485,15 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
     let _ = std::fs::remove_dir_all(base_dir);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
+#[test]
+fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
+    run_standard_stack_message_test(
+        "concurrent collaborative frozen-command test",
+        assert_concurrent_collaborative_tasks_receive_independent_frozen_commands(),
+    );
+}
+
+async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_commands() {
     let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -9120,6 +9424,7 @@ async fn materialize_artifact_api_thread(
         id: thread_id.to_owned(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: pioneer_protocol::ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -13223,6 +13528,8 @@ async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowl
         task_id: "K0000000000000000000N".to_owned(),
         run_id: "R0000000000000000000N".to_owned(),
         delivery_id: DELIVERY_ID.to_owned(),
+        author: None,
+        delivery_action_receipt_id: None,
         result: None,
         error: None,
         created_at: 1_725_000_000,
@@ -15294,8 +15601,17 @@ fn force_fail_tool_item_marks_in_progress_tool_as_failed() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result() {
+#[test]
+fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result() {
+    run_standard_stack_message_test(
+        "review-disabled immediate Task Agent run",
+        review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result_impl(
+        ),
+    );
+}
+
+async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result_impl()
+ {
     let session_manager = Arc::new(SessionManager::new());
     let (tx, _rx) = mpsc::channel(8);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -15622,8 +15938,15 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
     assert!(!event_types.contains(&events::TASK_RESULT_CANDIDATE_CANCELLED));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_run() {
+#[test]
+fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_run() {
+    run_standard_stack_message_test(
+        "review-enabled child Task completion",
+        review_enabled_child_completion_creates_pending_candidate_without_finalizing_run_impl(),
+    );
+}
+
+async fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_run_impl() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"ready for parent review","data":{"answer":"ok"}}</task_result>"#
@@ -15753,8 +16076,16 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
     assert!(!event_types.contains(&events::TASK_COMPLETED.to_owned()));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_enabled_window_continuation_does_not_create_revision_and_preserves_candidate() {
+#[test]
+fn review_enabled_window_continuation_does_not_create_revision_and_preserves_candidate() {
+    run_standard_stack_message_test(
+        "review-enabled execution-window continuation",
+        review_enabled_window_continuation_does_not_create_revision_and_preserves_candidate_impl(),
+    );
+}
+
+async fn review_enabled_window_continuation_does_not_create_revision_and_preserves_candidate_impl()
+{
     let provider = Arc::new(HangingChildProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -15930,8 +16261,15 @@ async fn review_enabled_window_continuation_does_not_create_revision_and_preserv
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
+#[test]
+fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
+    run_standard_stack_message_test(
+        "Task review accept and delivery",
+        task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(),
+    );
+}
+
+async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"ready for user approval","data":{"answer":"ok"}}</task_result>"#
@@ -15951,6 +16289,15 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         crud_store.clone(),
     );
     processor.bind_task_bridge().await;
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
+    let principal_actor =
+        pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone());
+    let parent_author =
+        super::message_turn::resolve_turn_author_snapshot(crud_store.as_ref(), &principal_actor)
+            .await
+            .expect("user-review parent author should resolve")
+            .expect("user-review parent principal should have an author snapshot");
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -15963,6 +16310,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         id: parent_thread_id.to_owned(),
         name: Some("User review accept parent".to_owned()),
         preview: "review accept".to_owned(),
+        preview_author: Some(parent_author.clone()),
         mode: ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -15983,7 +16331,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
         turn_kind: Default::default(),
         origin: Default::default(),
         mode: Default::default(),
-        author: None,
+        author: Some(parent_author),
         reply_to_turn_id: None,
         mentions: Vec::new(),
         message_revision: 0,
@@ -16001,7 +16349,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
                 ..parent_turn.clone()
             },
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            principal_actor,
         )
         .await
         .expect("parent turn start should persist");
@@ -16216,8 +16564,15 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_parent_turn() {
+#[test]
+fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_parent_turn() {
+    run_standard_stack_message_test(
+        "Task review observations scope",
+        phase_11_task_tool_provider_review_required_observations_are_scoped_to_parent_turn_body(),
+    );
+}
+
+async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_parent_turn_body() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(RevisionProvider::new()),
@@ -16378,8 +16733,15 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
     assert!(wrong_turn_observations.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision() {
+#[test]
+fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision() {
+    run_standard_stack_message_test(
+        "Task review revision dispatch",
+        task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_impl(),
+    );
+}
+
+async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_impl() {
     let provider = Arc::new(RevisionProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -16558,12 +16920,10 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision()
 
 #[test]
 fn task_revise_dispatch_failure_blocks_revision_turn_and_run() {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("test runtime should build")
-        .block_on(task_revise_dispatch_failure_blocks_revision_turn_and_run_impl());
+    run_standard_stack_message_test(
+        "Task revision dispatch failure",
+        task_revise_dispatch_failure_blocks_revision_turn_and_run_impl(),
+    );
 }
 
 async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
@@ -16622,7 +16982,9 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
         .task_runtime
         .service()
         .revise_task_result_candidate(
-            pioneer_tasks::TaskMutationContext::user("connection:revision-dispatch-failure"),
+            pioneer_tasks::TaskMutationContext::user(
+                authenticated_test_superuser().principal_id.to_string(),
+            ),
             TaskReviseParams {
                 task_id: response.task.id.clone(),
                 run_id: run.id.clone(),
@@ -16715,8 +17077,15 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_revise_restart_reuses_in_progress_revision_turn() {
+#[test]
+fn task_revise_restart_reuses_in_progress_revision_turn() {
+    run_standard_stack_message_test(
+        "Task review revision restart",
+        task_revise_restart_reuses_in_progress_revision_turn_impl(),
+    );
+}
+
+async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
     let provider = Arc::new(RevisionHangingProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -16769,7 +17138,9 @@ async fn task_revise_restart_reuses_in_progress_revision_turn() {
         .task_runtime
         .service()
         .revise_task_result_candidate(
-            pioneer_tasks::TaskMutationContext::user("connection:revision-restart"),
+            pioneer_tasks::TaskMutationContext::user(
+                authenticated_test_superuser().principal_id.to_string(),
+            ),
             TaskReviseParams {
                 task_id: response.task.id.clone(),
                 run_id: run.id.clone(),
@@ -16786,6 +17157,11 @@ async fn task_revise_restart_reuses_in_progress_revision_turn() {
         .dispatch_revision_turn(revised)
         .await
         .expect("revision dispatch should start");
+    assert_eq!(
+        dispatched.task_run_turn.status,
+        TaskRunTurnStatus::InProgress,
+        "revision dispatch did not remain active: {dispatched:?}"
+    );
     provider.wait_for_revision_call().await;
     assert_eq!(provider.revision_call_count(), 1);
 
@@ -16828,8 +17204,15 @@ async fn task_revise_restart_reuses_in_progress_revision_turn() {
     assert_eq!(next_candidate.turn_id, dispatched.child_turn_id);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
+#[test]
+fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
+    run_standard_stack_message_test(
+        "review-enabled invalid Task result",
+        review_enabled_invalid_result_creates_extraction_failed_candidate_impl(),
+    );
+}
+
+async fn review_enabled_invalid_result_creates_extraction_failed_candidate_impl() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
         text: "plain text that does not satisfy required json".to_owned(),
@@ -16927,8 +17310,15 @@ async fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
     assert!(!event_types.contains(&events::TASK_RUN_FAILED.to_owned()));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery() {
+#[test]
+fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery() {
+    run_standard_stack_message_test(
+        "waiting-review Task cancellation",
+        waiting_review_cancel_cancels_candidate_locks_and_no_delivery_impl(),
+    );
+}
+
+async fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery_impl() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"cancel me","data":{"answer":"ok"}}</task_result>"#
@@ -17085,8 +17475,15 @@ async fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery() {
     assert!(!event_types.contains(&events::TASK_DELIVERY_QUEUED.to_owned()));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parent_cancel_attached_subtree_cancels_waiting_review_candidate() {
+#[test]
+fn parent_cancel_attached_subtree_cancels_waiting_review_candidate() {
+    run_standard_stack_message_test(
+        "parent cancellation of attached review subtree",
+        parent_cancel_attached_subtree_cancels_waiting_review_candidate_body(),
+    );
+}
+
+async fn parent_cancel_attached_subtree_cancels_waiting_review_candidate_body() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"child waits for review"}</task_result>"#.to_owned(),
@@ -17187,8 +17584,15 @@ async fn parent_cancel_attached_subtree_cancels_waiting_review_candidate() {
     assert_eq!(review_events[0].decision, TaskResultReviewDecision::Cancel);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn waiting_review_detach_is_blocked_and_candidate_stays_active() {
+#[test]
+fn waiting_review_detach_is_blocked_and_candidate_stays_active() {
+    run_standard_stack_message_test(
+        "waiting-review Task detach rejection",
+        waiting_review_detach_is_blocked_and_candidate_stays_active_impl(),
+    );
+}
+
+async fn waiting_review_detach_is_blocked_and_candidate_stays_active_impl() {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"do not detach yet"}</task_result>"#.to_owned(),
@@ -17281,8 +17685,15 @@ async fn waiting_review_detach_is_blocked_and_candidate_stays_active() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile() {
+#[test]
+fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile() {
+    run_standard_stack_message_test(
+        "hidden Task preflight ordering",
+        hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_body(),
+    );
+}
+
+async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_body() {
     let provider = Arc::new(PreflightCaptureProvider::new("hidden child completed"));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -17368,8 +17779,15 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile()
     assert!(requests[child_main_pos].compiled_prompt.is_some());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile() {
+#[test]
+fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile() {
+    run_standard_stack_message_test(
+        "recovered hidden Task preflight ordering",
+        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(),
+    );
+}
+
+async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body() {
     let initial_provider = Arc::new(HangingChildProvider::new());
     let initial_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -17400,6 +17818,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         id: parent_thread_id.to_owned(),
         name: Some("Recovered child parent".to_owned()),
         preview: "recovery parent history".to_owned(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -17662,6 +18081,17 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
         .await
         .expect("execution lease should be made stale for startup recovery");
+    assert!(
+        crud_store
+            .mark_turn_execution_running_owned(
+                lineage.child_turn_id.as_str(),
+                initial_processor.turn_execution_owner_id.as_ref(),
+                stale_at,
+                stale_at,
+            )
+            .await
+            .expect("child Turn execution lease should be made stale")
+    );
     // Model an actual process restart. Leaving the original hanging agent loop
     // alive would create two in-memory owners for the same durable Turn and
     // turn this recovery test into an unsupported split-brain race.
@@ -17812,8 +18242,15 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_child_task_run_opens_recovery_without_candidate() {
+#[test]
+fn failed_child_task_run_opens_recovery_without_candidate() {
+    run_standard_stack_message_test(
+        "failed child Task recovery test",
+        failed_child_task_run_opens_recovery_without_candidate_impl(),
+    );
+}
+
+async fn failed_child_task_run_opens_recovery_without_candidate_impl() {
     let provider = Arc::new(HangingChildProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -17901,8 +18338,15 @@ async fn failed_child_task_run_opens_recovery_without_candidate() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure() {
+#[test]
+fn blocked_execution_window_recovery_blocks_child_task_run_without_failure() {
+    run_standard_stack_message_test(
+        "blocked execution window child Task recovery",
+        blocked_execution_window_recovery_blocks_child_task_run_without_failure_impl(),
+    );
+}
+
+async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure_impl() {
     let provider = Arc::new(HangingChildProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -18078,8 +18522,15 @@ async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure
     assert!(event_types.contains(&events::TASK_BLOCKED));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn execution_window_continuation_keeps_task_run_turn_in_progress() {
+#[test]
+fn execution_window_continuation_keeps_task_run_turn_in_progress() {
+    run_standard_stack_message_test(
+        "Task execution-window continuation test",
+        execution_window_continuation_keeps_task_run_turn_in_progress_impl(),
+    );
+}
+
+async fn execution_window_continuation_keeps_task_run_turn_in_progress_impl() {
     let provider = Arc::new(HangingChildProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -18211,8 +18662,15 @@ async fn execution_window_continuation_keeps_task_run_turn_in_progress() {
     assert_eq!(execution_after.worker_id, execution_before.worker_id);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exhausted_window_does_not_create_candidate_until_child_turn_completes() {
+#[test]
+fn exhausted_window_does_not_create_candidate_until_child_turn_completes() {
+    run_standard_stack_message_test(
+        "exhausted Task execution-window candidate test",
+        exhausted_window_does_not_create_candidate_until_child_turn_completes_impl(),
+    );
+}
+
+async fn exhausted_window_does_not_create_candidate_until_child_turn_completes_impl() {
     let provider = Arc::new(HangingChildProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -18425,8 +18883,15 @@ async fn exhausted_window_does_not_create_candidate_until_child_turn_completes()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
+#[test]
+fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
+    run_standard_stack_message_test(
+        "scheduled Task Agent occurrence turn",
+        scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl(),
+    );
+}
+
+async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -18442,6 +18907,15 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
+    let principal_actor =
+        pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone());
+    let parent_author =
+        super::message_turn::resolve_turn_author_snapshot(crud_store.as_ref(), &principal_actor)
+            .await
+            .expect("scheduled Task parent author should resolve")
+            .expect("scheduled Task parent principal should have an author snapshot");
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -18454,6 +18928,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         id: parent_thread_id.to_owned(),
         name: Some("Scheduled parent".to_owned()),
         preview: "schedule task".to_owned(),
+        preview_author: Some(parent_author.clone()),
         mode: ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -18474,7 +18949,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         turn_kind: Default::default(),
         origin: Default::default(),
         mode: Default::default(),
-        author: None,
+        author: Some(parent_author),
         reply_to_turn_id: None,
         mentions: Vec::new(),
         message_revision: 0,
@@ -18492,7 +18967,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
                 ..creation_turn.clone()
             },
             &[],
-            pioneer_protocol::PersistedActorRef::System,
+            principal_actor,
         )
         .await
         .expect("creation turn start should persist");
@@ -18582,6 +19057,11 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         .find(|run| run.trigger_id.is_some())
         .expect("scheduled run should exist");
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    let task_execution = crud_store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("scheduled task execution query should succeed")
+        .expect("scheduled task execution should exist");
     assert_eq!(lineage.parent_thread_id, parent_thread_id);
     assert_eq!(lineage.created_by_turn_id.as_deref(), Some(run.id.as_str()));
     assert_ne!(
@@ -18595,10 +19075,13 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         .expect("scheduled occurrence row should exist");
     assert_eq!(
         occurrence_actor.initiated_by_actor_kind.as_deref(),
-        Some("system"),
-        "scheduled task occurrence turns are background work"
+        Some("agent_execution"),
+        "scheduled task occurrence turns are authored by their exact execution"
     );
-    assert_eq!(occurrence_actor.initiated_by_actor_id, None);
+    assert_eq!(
+        occurrence_actor.initiated_by_actor_id.as_deref(),
+        Some(task_execution.id.as_str())
+    );
     let child_actor = turn::Entity::find_by_id(lineage.child_turn_id.as_str())
         .one(&crud_store.database_connection())
         .await
@@ -18606,10 +19089,13 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         .expect("scheduled child turn row should exist");
     assert_eq!(
         child_actor.initiated_by_actor_kind.as_deref(),
-        Some("system"),
-        "task-agent child turns are background work"
+        Some("principal"),
+        "the scheduled Task child input retains its exact creating principal"
     );
-    assert_eq!(child_actor.initiated_by_actor_id, None);
+    assert_eq!(
+        child_actor.initiated_by_actor_id.as_deref(),
+        Some(principal.principal_id.as_str())
+    );
     let child_thread_actor = thread::Entity::find_by_id(lineage.child_thread_id.as_str())
         .one(&crud_store.database_connection())
         .await
@@ -18617,9 +19103,12 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
         .expect("scheduled child thread row should exist");
     assert_eq!(
         child_thread_actor.created_by_actor_kind.as_deref(),
-        Some("system")
+        Some("principal")
     );
-    assert_eq!(child_thread_actor.created_by_actor_id, None);
+    assert_eq!(
+        child_thread_actor.created_by_actor_id.as_deref(),
+        Some(principal.principal_id.as_str())
+    );
 
     let (_, occurrence_turn) = crud_store
         .get_turn(parent_thread_id, run.id.as_str())
@@ -18691,8 +19180,15 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
     assert_eq!(old_creation_turn.status, TurnStatus::Completed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn() {
+#[test]
+fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn() {
+    run_standard_stack_message_test(
+        "immediate detached Task occurrence delivery",
+        immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn_body(),
+    );
+}
+
+async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn_body() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -19140,8 +19636,15 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
+#[test]
+fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
+    run_standard_stack_message_test(
+        "Composer exact hidden-task launch test",
+        assert_composer_work_replays_exact_launch_payload_in_hidden_task_child(),
+    );
+}
+
+async fn assert_composer_work_replays_exact_launch_payload_in_hidden_task_child() {
     let base_dir = unique_temp_dir("composer_work_exact_launch");
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
@@ -19189,6 +19692,15 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     ));
     processor.bind_task_bridge().await;
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    let principal = authenticated_test_superuser();
+    let principal_actor =
+        pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone());
+    let parent_author =
+        super::message_turn::resolve_turn_author_snapshot(crud_store.as_ref(), &principal_actor)
+            .await
+            .expect("Composer parent author should resolve")
+            .expect("Composer parent principal should have an author snapshot");
 
     let parent_thread_id = "thr_composer_work_exact";
     let parent_turn_id = "turn_composer_work_parent";
@@ -19199,6 +19711,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         id: parent_thread_id.to_owned(),
         name: Some("Composer work parent".to_owned()),
         preview: "parent history marker".to_owned(),
+        preview_author: Some(parent_author.clone()),
         mode: ThreadMode::Agent,
         model: "thread-default-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -19219,7 +19732,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         turn_kind: TurnKind::Conversation,
         origin: TurnOrigin::User,
         mode: Default::default(),
-        author: None,
+        author: Some(parent_author.clone()),
         reply_to_turn_id: None,
         mentions: Vec::new(),
         message_revision: 0,
@@ -19240,7 +19753,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
                 text: "PARENT HISTORY MARKER".to_owned(),
                 text_elements: Vec::new(),
             }],
-            pioneer_protocol::PersistedActorRef::System,
+            principal_actor.clone(),
         )
         .await
         .expect("parent history turn should persist");
@@ -19282,7 +19795,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
                 turn_kind: TurnKind::Conversation,
                 origin: TurnOrigin::User,
                 mode: Default::default(),
-                author: None,
+                author: Some(parent_author.clone()),
                 reply_to_turn_id: None,
                 mentions: Vec::new(),
                 message_revision: 0,
@@ -19292,7 +19805,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
                 permission_profile: default_test_permission_profile(),
             },
             exact_input.as_slice(),
-            pioneer_protocol::PersistedActorRef::System,
+            principal_actor.clone(),
         )
         .await
         .expect("Composer source turn should persist");
@@ -19307,7 +19820,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
                     turn_kind: TurnKind::Conversation,
                     origin: TurnOrigin::User,
                     mode: Default::default(),
-                    author: None,
+                    author: Some(parent_author.clone()),
                     reply_to_turn_id: None,
                     mentions: Vec::new(),
                     message_revision: 0,
@@ -19339,7 +19852,27 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         },
         label: Some("tests/composer-launch".to_owned()),
     }];
+    let (mut exact_agent_launch, _) = super::agent_action_tools::resolve_workspace_task_launch(
+        processor.as_ref(),
+        workspace_id.as_str(),
+        "openai",
+        "composer-selected-model",
+        None,
+        None,
+        planned_turn_id,
+    )
+    .await
+    .expect("Composer test launch profile should resolve");
+    exact_agent_launch.execution.reasoning = Some(pioneer_protocol::TurnReasoningSelection {
+        effort: "high".to_owned(),
+    });
+    exact_agent_launch.execution.permission_profile =
+        Some(pioneer_protocol::TurnPermissionProfileSelection {
+            mode: pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+        });
+    exact_agent_launch.execution.skill_ids = vec![skill_id.clone()];
     let exact_launch = pioneer_protocol::TurnStartParams {
+        agent_delegation_routes: Vec::new(),
         thread_id: parent_thread_id.to_owned(),
         turn_id: planned_turn_id.to_owned(),
         input: exact_input.clone(),
@@ -19350,6 +19883,7 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
             SandboxMode::FullAccess,
         )),
         mode: Some(ThreadMode::Agent),
+        agent_launch: Some(exact_agent_launch.clone()),
         reply_to_turn_id: None,
         mentioned_principal_ids: Vec::new(),
         execution_backend: Some(AgentExecutionBackend::ApiProvider {
@@ -19370,6 +19904,13 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
         "Task prompt must not replace composer input",
         3,
     );
+    params.launch = Some(exact_agent_launch);
+    let agent_spec = params
+        .agent_spec
+        .as_mut()
+        .expect("Composer test should have an Agent spec");
+    agent_spec.model = Some("composer-selected-model".to_owned());
+    agent_spec.model_provider = Some("openai".to_owned());
     params.lifecycle_policy = Some(TaskLifecyclePolicy {
         attachment: TaskAttachmentMode::Detached,
         on_parent_cancel: TaskParentTerminalAction::KeepRunning,
@@ -19522,8 +20063,15 @@ async fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
     let _ = std::fs::remove_dir_all(base_dir);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider_leakage() {
+#[test]
+fn collaborative_composer_dispatches_codex_and_claude_without_api_provider_leakage() {
+    run_gateway_message_test("collaborative-composer-cli-runtimes", || async {
+        collaborative_composer_dispatches_codex_and_claude_without_api_provider_leakage_impl()
+            .await;
+    });
+}
+
+async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider_leakage_impl() {
     for (runtime_id, runtime_kind, model) in [
         ("codex", CLIAgentRuntimeKind::Codex, "gpt-5"),
         ("claude", CLIAgentRuntimeKind::Claude, "claude-sonnet"),
@@ -19610,7 +20158,24 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             format!("{runtime_id}-attachment.txt").as_str(),
         )
         .await;
+        let mut exact_cli_launch = exact_cli_task_launch_for_test(
+            processor.as_ref(),
+            workspace_id.as_str(),
+            format!("cli_runtime:{runtime_id}").as_str(),
+            model,
+            runtime_id,
+        )
+        .await
+        .expect("dynamic CLI Composer should resolve an exact server-owned launch");
+        exact_cli_launch.execution.permission_profile =
+            Some(pioneer_protocol::TurnPermissionProfileSelection::full_access());
+        exact_cli_launch.execution.mcp_server_ids =
+            vec![pioneer_protocol::mcp_server_capability_key(
+                McpScopeKind::Workspace,
+                "resend",
+            )];
         let launch = pioneer_protocol::TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: parent_thread_id.clone(),
             turn_id: turn_id.clone(),
             input: vec![
@@ -19640,6 +20205,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 SandboxMode::FullAccess,
             )),
             mode: Some(ThreadMode::Agent),
+            agent_launch: Some(exact_cli_launch),
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -20020,8 +20586,15 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers() {
+#[test]
+fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers() {
+    run_standard_stack_message_test(
+        "detached native Composer delivery test",
+        detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_impl(),
+    );
+}
+
+async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_impl() {
     for (runtime_id, runtime_kind, model) in [
         ("codex", CLIAgentRuntimeKind::Codex, "gpt-5"),
         ("claude", CLIAgentRuntimeKind::Claude, "claude-sonnet"),
@@ -20129,10 +20702,14 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers()
             .expect("native Task child turn should exist");
         assert_eq!(
             native_child_actor.initiated_by_actor_kind.as_deref(),
-            Some("system"),
-            "detached CLI Task preparation must remain background work"
+            Some("principal"),
+            "the detached CLI Task must retain its exact initiating principal"
         );
-        assert_eq!(native_child_actor.initiated_by_actor_id, None);
+        assert_eq!(
+            native_child_actor.initiated_by_actor_id.as_deref(),
+            Some(authenticated_test_superuser().principal_id.as_str()),
+            "the detached CLI Task must not replace its initiator with System"
+        );
 
         let binding = crud_store
             .get_cli_runtime_turn_binding(lineage.child_turn_id.as_str())
@@ -20387,8 +20964,15 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continuation() {
+#[test]
+fn cancelling_detached_native_task_interrupts_runtime_and_releases_continuation() {
+    run_standard_stack_message_test(
+        "detached native Task cancellation and continuation",
+        cancelling_detached_native_task_interrupts_runtime_and_releases_continuation_impl(),
+    );
+}
+
+async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continuation_impl() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -20720,9 +21304,9 @@ async fn assert_detached_native_child_turn_cancellation() {
         TurnStatus::Interrupted
     );
 
-    // Cancellation also produces a terminal origin-thread delivery. That
-    // delivery must never overwrite the already-interrupted occurrence turn
-    // with `Completed`; reloading the parent timeline reads this durable turn.
+    // Cancellation also cancels its pending origin-thread delivery. The
+    // cancelled outbox row must never overwrite the already-interrupted
+    // occurrence turn with `Completed`; reloading reads the durable turn.
     processor
         .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(2), 10)
         .await
@@ -20747,8 +21331,8 @@ async fn assert_detached_native_child_turn_cancellation() {
         deliveries
             .deliveries
             .iter()
-            .all(|delivery| delivery.status == TaskDeliveryStatus::Delivered),
-        "all cancellation deliveries should be terminal before the reload assertion"
+            .all(|delivery| delivery.status == TaskDeliveryStatus::Cancelled),
+        "all pending cancellation deliveries should be cancelled before reload"
     );
     let (_, reloaded_occurrence_turn) = crud_store
         .get_turn(parent_thread_id, parent_occurrence_turn_id)
@@ -20770,8 +21354,15 @@ async fn assert_detached_native_child_turn_cancellation() {
     assert_eq!(reloaded_anchor.status, TaskStatus::Cancelled);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
+#[test]
+fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
+    run_standard_stack_message_test(
+        "detached Composer prompt parity test",
+        detached_composer_work_matches_parent_llm_prompts_end_to_end_impl(),
+    );
+}
+
+async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     let provider = Arc::new(PromptParityCaptureProvider::default());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -20847,6 +21438,7 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
     let direct_requests = provider.take_requests();
 
     let exact_launch = pioneer_protocol::TurnStartParams {
+        agent_delegation_routes: Vec::new(),
         thread_id: task_parent_thread_id.to_owned(),
         turn_id: "turn_prompt_parity_planned".to_owned(),
         input: vec![UserInput::Text {
@@ -20858,6 +21450,7 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
         model_provider: Some("openai".to_owned()),
         sandbox_policy: None,
         mode: Some(ThreadMode::Agent),
+        agent_launch: None,
         reply_to_turn_id: None,
         mentioned_principal_ids: Vec::new(),
         execution_backend: None,
@@ -20960,8 +21553,15 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
+#[test]
+fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
+    run_standard_stack_message_test(
+        "detached Composer full request parity test",
+        detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(),
+    );
+}
+
+async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl() {
     let base_dir = unique_temp_dir("detached_full_prompt_parity");
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
@@ -21114,7 +21714,8 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
         },
     ];
     let direct_turn_id = "turn_full_prompt_parity_direct";
-    let direct_launch = pioneer_protocol::TurnStartParams {
+    let mut direct_launch = pioneer_protocol::TurnStartParams {
+        agent_delegation_routes: Vec::new(),
         thread_id: direct_parent_thread_id.to_owned(),
         turn_id: direct_turn_id.to_owned(),
         input: exact_input.clone(),
@@ -21125,6 +21726,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
             SandboxMode::FullAccess,
         )),
         mode: Some(ThreadMode::Agent),
+        agent_launch: None,
         reply_to_turn_id: None,
         mentioned_principal_ids: Vec::new(),
         execution_backend: Some(AgentExecutionBackend::ApiProvider {
@@ -21138,6 +21740,26 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
         }),
         cli_runtime_options: None,
     };
+    let (mut exact_agent_launch, _) = super::agent_action_tools::resolve_workspace_task_launch(
+        harness.processor.as_ref(),
+        harness.workspace_id.as_str(),
+        "openai",
+        "gpt-5.4",
+        None,
+        None,
+        direct_turn_id,
+    )
+    .await
+    .expect("full prompt parity launch profile should resolve");
+    exact_agent_launch.execution.reasoning = direct_launch.reasoning.clone();
+    exact_agent_launch.execution.permission_profile = direct_launch.permission_profile.clone();
+    exact_agent_launch.execution.skill_ids = vec![skill_id.clone()];
+    exact_agent_launch.execution.mcp_server_ids =
+        vec![pioneer_protocol::mcp_server_capability_key(
+            McpScopeKind::Workspace,
+            "resend",
+        )];
+    direct_launch.agent_launch = Some(exact_agent_launch.clone());
     run_memory_e2e_turn_with_params(&mut harness, &direct_launch).await;
     if !wait_for_prompt_parity_request_count(
         provider.as_ref(),
@@ -21159,6 +21781,7 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
 
     let planned_child_turn_id = "turn_full_prompt_parity_planned";
     let mut task_launch = pioneer_protocol::TurnStartParams {
+        agent_delegation_routes: Vec::new(),
         thread_id: task_parent_thread_id.to_owned(),
         turn_id: planned_child_turn_id.to_owned(),
         ..direct_launch.clone()
@@ -21193,6 +21816,9 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
         .expect("full prompt parity task should have an agent spec");
     agent_spec.agent_role = None;
     agent_spec.agent_nickname = None;
+    agent_spec.model = Some("gpt-5.4".to_owned());
+    agent_spec.model_provider = Some("openai".to_owned());
+    params.launch = Some(exact_agent_launch);
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["full-prompt-parity".to_owned()],
         data: None,
@@ -21431,6 +22057,7 @@ async fn task_event_listener_fans_out_notifications_from_committed_event_log() {
                     allowed_actor: None,
                 },
             },
+            launch: None,
             agent_spec: None,
             lifecycle_policy: None,
             delivery_policy: None,
@@ -21492,6 +22119,7 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
                     allowed_actor: None,
                 },
             },
+            launch: None,
             agent_spec: None,
             lifecycle_policy: None,
             delivery_policy: None,
@@ -21730,8 +22358,15 @@ async fn task_depth_limit_rejects_subtask_creation() {
     assert!(format!("{error:#}").contains("exceeds max depth"));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions() {
+#[test]
+fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions() {
+    run_standard_stack_message_test(
+        "nested Task root lineage and permissions",
+        nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions_body(),
+    );
+}
+
+async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions_body() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![
             ProviderToolCall {
@@ -21759,11 +22394,25 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         r#"<task_result>{"summary":"nested work completed"}</task_result>"#,
     ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "nested", provider,
+        "nested",
+        provider.clone(),
     ));
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "nested"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    // This scenario intentionally drives three concurrent Agent Turns. A
+    // pooled `sqlite::memory:` URL can open isolated per-connection databases
+    // under that load, so use one unique file-backed database for the exact
+    // agent domain concurrency contract.
+    let database_temp = tempfile::tempdir().expect("nested Task database tempdir should exist");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        database_temp.path().join("nested-task.sqlite3").display()
+    );
+    let connection = Database::connect(database_url)
+        .await
+        .expect("nested Task database should connect");
+    let (workspace_manager, crud_store, workspace_id) =
+        setup_workspace_manager_with_connection(connection).await;
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -21800,16 +22449,11 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         pioneer_protocol::TaskStatus::Completed,
     )
     .await;
-    let root_after_execution = crud_store
-        .get_task(root.task.id.as_str())
-        .await
-        .expect("root task diagnostic should load");
     assert_eq!(
         root_status,
         pioneer_protocol::TaskStatus::Completed,
-        "root task should complete after its nested attached task: {root_after_execution:#?}"
+        "root task should complete after its nested attached task"
     );
-
     let tasks = processor
         .task_runtime
         .service()
@@ -21908,8 +22552,15 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_list_inside_child_turn_hides_its_execution_wrapper() {
+#[test]
+fn task_list_inside_child_turn_hides_its_execution_wrapper() {
+    run_standard_stack_message_test(
+        "Task list hides its execution wrapper",
+        task_list_inside_child_turn_hides_its_execution_wrapper_impl(),
+    );
+}
+
+async fn task_list_inside_child_turn_hides_its_execution_wrapper_impl() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_list_from_task_execution".to_owned(),
@@ -21981,8 +22632,15 @@ async fn task_list_inside_child_turn_hides_its_execution_wrapper() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_detach_updates_lifecycle_policy() {
+#[test]
+fn task_detach_updates_lifecycle_policy() {
+    run_standard_stack_message_test(
+        "Task detach lifecycle update",
+        task_detach_updates_lifecycle_policy_impl(),
+    );
+}
+
+async fn task_detach_updates_lifecycle_policy_impl() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -22082,7 +22740,7 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         provider_registry,
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -22102,6 +22760,19 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     )
     .await;
     let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+
+    let root_execution_id =
+        super::agent_action_tools::root_agent_execution_id_for_turn("turn_task_tools_agent");
+    assert!(
+        pioneer_crud::load_agent_execution(
+            &crud_store.database_connection(),
+            root_execution_id.as_str(),
+        )
+        .await
+        .expect("canonical Agent writer state should load")
+        .is_some(),
+        "Agent mode must materialize its canonical root execution"
+    );
 
     let agent_requests = provider.snapshot_requests();
     let first_agent_request = agent_requests
@@ -22305,8 +22976,15 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
+#[test]
+fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
+    run_standard_stack_message_test(
+        "Task delivery lineage parent turn",
+        task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl(),
+    );
+}
+
+async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() {
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("must connect to sqlite memory");
@@ -22385,6 +23063,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
                         catch_up_policy: None,
                     },
                 },
+                launch: None,
                 agent_spec: None,
                 lifecycle_policy: None,
                 delivery_policy: Some(TaskDeliveryPolicy {
@@ -22556,6 +23235,16 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
         "delivery failed: {:?}",
         delivery.last_error
     );
+    let delivered_result = delivery
+        .result_snapshot
+        .as_ref()
+        .expect("summary delivery should retain a result snapshot");
+    assert_eq!(
+        delivered_result.summary.as_deref(),
+        Some("delivered scheduled result")
+    );
+    assert!(delivered_result.data.is_none());
+    assert!(delivered_result.artifacts.is_empty());
     let delivered_turn_id = delivery
         .delivered_turn_id
         .as_deref()
@@ -22591,7 +23280,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
             TurnItemEventPayload::ItemStarted {
                 item: TurnItem::AgentMessage { text, .. },
                 ..
-            } if text == "delivered scheduled result\nfull detail"
+            } if text == "delivered scheduled result"
         )
     }));
     assert!(items.events.iter().any(|event| {
@@ -22600,7 +23289,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
             TurnItemEventPayload::ItemCompleted {
                 item: TurnItem::AgentMessage { text, .. },
                 ..
-            } if text == "delivered scheduled result\nfull detail"
+            } if text == "delivered scheduled result"
         )
     }));
     let ingestion_calls = delivery_ingestor.calls.lock().await;
@@ -22617,7 +23306,7 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
     assert!(matches!(
         &delivered_call.item,
         TurnItem::AgentMessage { text, .. }
-            if text == "delivered scheduled result\nfull detail"
+            if text == "delivered scheduled result"
     ));
     drop(ingestion_calls);
     let origin_thread = crud_store
@@ -22774,6 +23463,7 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
                         catch_up_policy: None,
                     },
                 },
+                launch: None,
                 agent_spec: None,
                 lifecycle_policy: None,
                 delivery_policy: Some(TaskDeliveryPolicy {
@@ -22926,6 +23616,7 @@ async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_gr
                     },
                 },
                 agent_spec: None,
+                launch: None,
                 lifecycle_policy: None,
                 delivery_policy: Some(TaskDeliveryPolicy {
                     mode: TaskDeliveryMode::Thread,
@@ -23072,6 +23763,7 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
                         catch_up_policy: None,
                     },
                 },
+                launch: None,
                 agent_spec: None,
                 lifecycle_policy: None,
                 delivery_policy: None,
@@ -23279,7 +23971,12 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             "parent",
         )
         .await;
-        let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+        let _ = recv_notification_by_method_timeout(
+            &mut rx,
+            events::TURN_COMPLETED,
+            Duration::from_secs(30),
+        )
+        .await;
 
         let requests = provider.snapshot_requests();
         assert!(
@@ -23367,7 +24064,8 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CreateThenHangProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent", provider,
+        "parent",
+        provider.clone(),
     ));
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
@@ -23395,6 +24093,10 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         "parent",
     )
     .await;
+
+    timeout(Duration::from_secs(5), provider.wait_for_root_main())
+        .await
+        .expect("task-anchor parent Turn must reach its main provider request");
 
     let task_id = wait_for_task_anchor(crud_store.clone(), thread_id, turn_id).await;
     let run_id = wait_for_task_run_id(crud_store.clone(), task_id.as_str()).await;
@@ -23451,7 +24153,8 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CreateThenHangProvider::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "parent", provider,
+        "parent",
+        provider.clone(),
     ));
     provider_registry.insert(
         "delayed",
@@ -23484,6 +24187,10 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         "parent",
     )
     .await;
+
+    timeout(Duration::from_secs(5), provider.wait_for_root_main())
+        .await
+        .expect("cancellable parent Turn must reach its main provider request");
 
     let task_id = wait_for_task_anchor(
         crud_store.clone(),
@@ -24577,6 +25284,7 @@ async fn user_message_lifecycle_ingests_thread_episodic_source_after_commit() {
         id: thread_id.to_owned(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "o4-mini".to_owned(),
         model_provider: "openai".to_owned(),
@@ -24752,6 +25460,7 @@ async fn user_message_lifecycle_survives_permission_profile_audit_event() {
         id: thread_id.to_owned(),
         name: None,
         preview: String::new(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "o4-mini".to_owned(),
         model_provider: "openai".to_owned(),
@@ -25222,6 +25931,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
     thread_manager
         .system_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 input: Vec::new(),
@@ -25230,6 +25940,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
@@ -25798,6 +26509,7 @@ async fn setup_execution_window_terminal_turn(
     thread_manager
         .system_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 input: Vec::new(),
@@ -25806,6 +26518,7 @@ async fn setup_execution_window_terminal_turn(
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
@@ -29207,6 +29920,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
             ),
             None,
             pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: "thread_security_native".to_owned(),
                 turn_id: "turn_security_native".to_owned(),
                 input: vec![UserInput::Text {
@@ -29218,6 +29932,7 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
@@ -29328,6 +30043,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
         authenticated_test_superuser().principal_id.clone(),
     );
     let params = pioneer_protocol::TurnStartParams {
+        agent_delegation_routes: Vec::new(),
         thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
         input: vec![UserInput::Text {
@@ -29339,6 +30055,7 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
         model_provider: None,
         sandbox_policy: None,
         mode: None,
+        agent_launch: None,
         reply_to_turn_id: None,
         mentioned_principal_ids: Vec::new(),
         execution_backend: None,
@@ -29462,6 +30179,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
             ),
             None,
             pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 input: vec![UserInput::Text {
@@ -29473,6 +30191,7 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
@@ -29970,12 +30689,11 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
     let sibling_started: TurnStartResponse = serde_json::from_value(sibling_started.result)
         .expect("unfinished sibling turn/start must decode");
     assert_eq!(sibling_started.turn.id, sibling_turn_id);
-    timeout(
+    let sibling_main = timeout(
         Duration::from_secs(30),
         sibling_provider.wait_for_child_main(),
     )
-    .await
-    .expect("unfinished sibling child must reach its provider and remain in progress");
+    .await;
     let sibling_tasks = harness
         .processor
         .task_runtime
@@ -29988,7 +30706,13 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
             ..Default::default()
         })
         .await
-        .expect("unfinished sibling Composer task must list");
+        .expect("unfinished sibling Composer tasks must list");
+    assert!(
+        sibling_main.is_ok(),
+        "unfinished sibling child must reach its provider and remain in progress; requests={:#?}; tasks={:#?}",
+        sibling_provider.snapshot_requests(),
+        sibling_tasks.tasks
+    );
     let sibling_task = sibling_tasks
         .tasks
         .iter()
@@ -30260,7 +30984,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
             .is_none(),
         "Collaborative parent admission must not own provider history or Agent-skill pins"
     );
-    timeout(Duration::from_secs(5), async {
+    let native_progress = timeout(Duration::from_secs(30), async {
         loop {
             if native_provider.snapshot_requests().len() >= 2 {
                 return;
@@ -30268,8 +30992,55 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
             sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("native Agent turn must invoke read_skill and continue");
+    .await;
+    if let Err(error) = native_progress {
+        let native_tasks = harness
+            .processor
+            .task_runtime
+            .service()
+            .list_tasks(TaskListParams {
+                workspace_id: harness.workspace_id.clone(),
+                owner_kind: Some(TaskOwnerKind::Thread),
+                owner_id: Some("thread_native_agent_skill".to_owned()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .expect("timed-out native Agent tasks must list");
+        let native_aggregate = match native_tasks.tasks.first() {
+            Some(task) => harness
+                .crud_store
+                .get_task(task.id.as_str())
+                .await
+                .expect("timed-out native Agent aggregate must load"),
+            None => None,
+        };
+        let native_child = native_aggregate
+            .as_ref()
+            .and_then(|aggregate| aggregate.task_run_turns.first());
+        let native_snapshot = match native_child {
+            Some(child) => harness
+                .crud_store
+                .get_turn_runtime_snapshot(child.turn_id.as_str())
+                .await
+                .expect("timed-out native Agent runtime snapshot must load"),
+            None => None,
+        };
+        let native_items = match native_child {
+            Some(child) => harness
+                .crud_store
+                .get_turn_item_events(child.thread_id.as_str(), child.turn_id.as_str())
+                .await
+                .expect("timed-out native Agent turn items must load"),
+            None => None,
+        };
+        panic!(
+            "native Agent turn must invoke read_skill and continue: {error:?}; transport_len={}; transport_capacity={}; requests={:#?}; snapshot={native_snapshot:#?}; items={native_items:#?}; aggregate={native_aggregate:#?}",
+            harness.rx.len(),
+            harness.rx.capacity(),
+            native_provider.snapshot_requests(),
+        );
+    }
     let native_requests = native_provider.snapshot_requests();
     let first_native = &native_requests[0];
     let compiled = first_native
@@ -30432,6 +31203,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
             .await;
         let request_id = generate_test_request_id("cliagentskill", suffix);
         let launch = pioneer_protocol::TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             input: vec![UserInput::Text {
@@ -30445,6 +31217,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
                 SandboxMode::FullAccess,
             )),
             mode: Some(ThreadMode::Agent),
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -30799,22 +31572,20 @@ async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl() {
 }
 
 #[test]
-fn turn_start_security_audit_events_include_unavailable_sandbox_decision() {
+fn turn_start_unavailable_sandbox_is_rejected_before_canonical_writes() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("CLI security audit test runtime should build")
         .block_on(async {
-            tokio::spawn(
-                turn_start_security_audit_events_include_unavailable_sandbox_decision_impl(),
-            )
-            .await
-            .expect("CLI security audit test task should finish");
+            tokio::spawn(turn_start_unavailable_sandbox_is_rejected_before_canonical_writes_impl())
+                .await
+                .expect("CLI security audit test task should finish");
         });
 }
 
-async fn turn_start_security_audit_events_include_unavailable_sandbox_decision_impl() {
+async fn turn_start_unavailable_sandbox_is_rejected_before_canonical_writes_impl() {
     let mut harness = setup_cli_runtime_security_harness().await;
     let thread_id = "thread_security_audit_claude";
     let turn_id = "turn_security_audit_claude";
@@ -30854,38 +31625,29 @@ async fn turn_start_security_audit_events_include_unavailable_sandbox_decision_i
         .get_turn_item_events(thread_id, turn_id)
         .await
         .expect("turn item events should load")
-        .expect("turn item events should exist");
-    let audit = turn_items
-        .events
-        .iter()
-        .find_map(|event| {
-            match &event.payload {
-            TurnItemEventPayload::TurnPermissionAudit(audit)
-                if audit.event_kind
-                    == pioneer_protocol::TurnPermissionAuditEventKind::SecuritySandboxUnavailable =>
-            {
-                Some(audit)
-            }
-            _ => None,
-        }
-        })
-        .expect("rejected turn/start should persist unavailable sandbox audit");
-
-    assert_eq!(
-        audit.security_snapshot_id.as_deref(),
-        Some("turn_security_audit_claude:security:v1")
+        .expect("seeded thread should produce an empty event page");
+    assert!(
+        turn_items.events.is_empty(),
+        "pre-write sandbox rejection must not leave canonical Turn events"
     );
-    assert_eq!(audit.security_snapshot_version, Some(1));
-    assert_eq!(
-        audit.security_reason_code.as_deref(),
-        Some("sandbox_unavailable")
+    assert!(
+        harness
+            .crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn lookup should succeed")
+            .is_none(),
+        "pre-write sandbox rejection must not leave a Turn ghost"
     );
-    assert_eq!(
-        audit.profile_mode,
-        pioneer_protocol::TurnPermissionMode::Supervised
+    assert!(
+        harness
+            .crud_store
+            .get_turn_execution_security_snapshot(turn_id)
+            .await
+            .expect("security snapshot lookup should succeed")
+            .is_none(),
+        "pre-write sandbox rejection must not leave a security snapshot ghost"
     );
-    assert!(audit.tool_name.is_none());
-    assert!(audit.request_key.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -32396,12 +33158,14 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
         .await
         .expect("turn binding and native attempt should persist");
     crud_store
-        .activate_cli_runtime_turn_attempt(
+        .activate_cli_runtime_turn_attempt_owned(
             turn_id,
             native_attempt.id.as_str(),
             "native-turn-transport-gap",
             None,
             now,
+            processor.turn_execution_owner_id.as_ref(),
+            now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
         )
         .await
         .expect("native attempt should activate");
@@ -32513,154 +33277,158 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
     assert!(cli_session.turn_starts.lock().await.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_events() {
-    let (tx, mut rx) = mpsc::channel(64);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-        "openai",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(30),
-            text: "late".to_owned(),
-        }),
-    ));
-    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
-    let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        provider_registry,
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+#[test]
+fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_events() {
+    run_gateway_message_test("cli-runtime-reconciliation", || async {
+        let (tx, mut rx) = mpsc::channel(64);
+        let session_manager = Arc::new(SessionManager::new());
+        let connection_id =
+            register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+        let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+        let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            Arc::new(DelayedProvider {
+                delay: Duration::from_secs(30),
+                text: "late".to_owned(),
+            }),
+        ));
+        let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+        let cli_manager = test_cli_runtime_manager(cli_session.clone());
+        let processor = MessageProcessor::new(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone());
 
-    let thread_id = "thread_cli_runtime_reconciliation";
-    let turn_id = "turn_cli_runtime_reconciliation";
-    let native_thread_id = "native_thread_cli_runtime_reconciliation";
-    let native_turn_id = "native_turn_cli_runtime_reconciliation";
-    start_loaded_thread_and_turn_for_cli_runtime_test(
-        &processor,
-        connection_id,
-        &mut rx,
-        workspace_id.as_str(),
-        thread_id,
-        turn_id,
-    )
-    .await;
-
-    let old = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(1);
-    crud_store
-        .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-            turn_id: turn_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            continuation_thread_id: thread_id.to_owned(),
-            workspace_id: workspace_id.clone(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            native_thread_id: native_thread_id.to_owned(),
-            native_turn_id: Some(native_turn_id.to_owned()),
-            request_id: None,
-            status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
-            model: Some("gpt-5".to_owned()),
-            cwd: Some("/tmp/project".to_owned()),
-            sandbox_json: None,
-            approval_policy: None,
-            input_mapping_json: "{}".to_owned(),
-            created_at: old,
-            updated_at: old,
-        })
-        .await
-        .expect("turn binding should upsert");
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
-        .expect("session key should build");
-    cli_manager
-        .get_or_start(key)
-        .await
-        .expect("test CLI runtime session should start");
-
-    *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
-        status: CLIAgentRuntimeObservedTurnStatus::InProgress,
-        message: None,
-        reconciliation_events: Vec::new(),
-    });
-    let first_probe_ms = chrono::Utc::now()
-        .fixed_offset()
-        .timestamp_millis()
-        .saturating_add(20 * 60 * 1_000);
-    processor.fail_stale_cli_runtime_turns(first_probe_ms).await;
-    let (_workspace_id, turn) = crud_store
-        .get_turn(thread_id, turn_id)
-        .await
-        .expect("turn lookup should succeed")
-        .expect("turn should exist");
-    assert_eq!(turn.status, TurnStatus::InProgress);
-    let liveness = crud_store
-        .get_turn_liveness(turn_id)
-        .await
-        .expect("turn liveness should load")
-        .expect("turn liveness should exist");
-    assert_eq!(liveness.last_activity_kind, "runtime/observed_in_progress");
-
-    *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
-        status: CLIAgentRuntimeObservedTurnStatus::Completed,
-        message: None,
-        reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
-            native_thread_id: Some(native_thread_id.to_owned()),
-            native_turn_id: native_turn_id.to_owned(),
-            native_item_id: "reconciled_final_item".to_owned(),
-            item_kind: "agentMessage".to_owned(),
-            text: Some("reconciled final answer".to_owned()),
-            summary: Vec::new(),
-            content: Vec::new(),
-            phase: RuntimeAgentMessagePhase::FinalAnswer,
-            metadata: None,
-            native_item_redacted: None,
-            native: None,
-        })],
-    });
-    processor
-        .fail_stale_cli_runtime_turns(first_probe_ms.saturating_add(20 * 60 * 1_000))
+        let thread_id = "thread_cli_runtime_reconciliation";
+        let turn_id = "turn_cli_runtime_reconciliation";
+        let native_thread_id = "native_thread_cli_runtime_reconciliation";
+        let native_turn_id = "native_turn_cli_runtime_reconciliation";
+        start_loaded_thread_and_turn_for_cli_runtime_test(
+            &processor,
+            connection_id,
+            &mut rx,
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+        )
         .await;
 
-    let (_workspace_id, turn) = crud_store
-        .get_turn(thread_id, turn_id)
-        .await
-        .expect("turn lookup should succeed")
-        .expect("turn should exist");
-    assert_eq!(turn.status, TurnStatus::Completed);
-    let item = crud_store
-        .get_turn_item(turn_id, "reconciled_final_item")
-        .await
-        .expect("reconciled item should load")
-        .expect("reconciled item should exist");
-    assert!(matches!(
-        item,
-        TurnItem::AgentMessage { text, .. } if text == "reconciled final answer"
-    ));
-    assert!(
+        let old = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(1);
         crud_store
-            .has_turn_finalization_intent(turn_id)
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.clone(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: native_thread_id.to_owned(),
+                native_turn_id: Some(native_turn_id.to_owned()),
+                request_id: None,
+                status: crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+                    .to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                created_at: old,
+                updated_at: old,
+            })
             .await
-            .expect("CLI finalization intent lookup should succeed"),
-        "terminal CLI reconciliation must durably prepare success before completing the Turn",
-    );
-    assert_eq!(
-        crud_store
-            .reconcile_prepared_turn_finalizations(10, chrono::Utc::now().timestamp())
+            .expect("turn binding should upsert");
+        let key = CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", thread_id)
+            .expect("session key should build");
+        cli_manager
+            .get_or_start(key)
             .await
-            .expect("committed finalization replay should succeed"),
-        0,
-        "a committed CLI finalization must be idempotent and leave no prepared backlog",
-    );
-    assert!(cli_session.interrupts.lock().await.is_empty());
+            .expect("test CLI runtime session should start");
+
+        *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+            status: CLIAgentRuntimeObservedTurnStatus::InProgress,
+            message: None,
+            reconciliation_events: Vec::new(),
+        });
+        let first_probe_ms = chrono::Utc::now()
+            .fixed_offset()
+            .timestamp_millis()
+            .saturating_add(20 * 60 * 1_000);
+        processor.fail_stale_cli_runtime_turns(first_probe_ms).await;
+        let (_workspace_id, turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist");
+        assert_eq!(turn.status, TurnStatus::InProgress);
+        let liveness = crud_store
+            .get_turn_liveness(turn_id)
+            .await
+            .expect("turn liveness should load")
+            .expect("turn liveness should exist");
+        assert_eq!(liveness.last_activity_kind, "runtime/observed_in_progress");
+
+        *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
+            status: CLIAgentRuntimeObservedTurnStatus::Completed,
+            message: None,
+            reconciliation_events: vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some(native_thread_id.to_owned()),
+                native_turn_id: native_turn_id.to_owned(),
+                native_item_id: "reconciled_final_item".to_owned(),
+                item_kind: "agentMessage".to_owned(),
+                text: Some("reconciled final answer".to_owned()),
+                summary: Vec::new(),
+                content: Vec::new(),
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: None,
+                native_item_redacted: None,
+                native: None,
+            })],
+        });
+        processor
+            .fail_stale_cli_runtime_turns(first_probe_ms.saturating_add(20 * 60 * 1_000))
+            .await;
+
+        let (_workspace_id, turn) = crud_store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist");
+        assert_eq!(turn.status, TurnStatus::Completed);
+        let item = crud_store
+            .get_turn_item(turn_id, "reconciled_final_item")
+            .await
+            .expect("reconciled item should load")
+            .expect("reconciled item should exist");
+        assert!(matches!(
+            item,
+            TurnItem::AgentMessage { text, .. } if text == "reconciled final answer"
+        ));
+        assert!(
+            crud_store
+                .has_turn_finalization_intent(turn_id)
+                .await
+                .expect("CLI finalization intent lookup should succeed"),
+            "terminal CLI reconciliation must durably prepare success before completing the Turn",
+        );
+        assert_eq!(
+            crud_store
+                .reconcile_prepared_turn_finalizations(10, chrono::Utc::now().timestamp())
+                .await
+                .expect("committed finalization replay should succeed"),
+            0,
+            "a committed CLI finalization must be idempotent and leave no prepared backlog",
+        );
+        assert!(cli_session.interrupts.lock().await.is_empty());
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -32693,6 +33461,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         id: thread_id.to_owned(),
         name: Some("Unloaded reconciliation".to_owned()),
         preview: "background turn".to_owned(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "gpt-5".to_owned(),
         model_provider: "cli_runtime:codex".to_owned(),
@@ -33411,7 +34180,15 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
         "turn/started must wait until the submission has an active durable attempt"
     );
     crud_store
-        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), submission_id, None, now)
+        .activate_cli_runtime_turn_attempt_owned(
+            turn_id,
+            attempt.id.as_str(),
+            submission_id,
+            None,
+            now,
+            processor.turn_execution_owner_id.as_ref(),
+            now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+        )
         .await
         .expect("Codex Goal attempt should activate");
     assert!(
@@ -33753,7 +34530,15 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
         .await
         .expect("Codex Goal cancel attempt should prepare");
     crud_store
-        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), submission_id, None, now)
+        .activate_cli_runtime_turn_attempt_owned(
+            turn_id,
+            attempt.id.as_str(),
+            submission_id,
+            None,
+            now,
+            processor.turn_execution_owner_id.as_ref(),
+            now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+        )
         .await
         .expect("Codex Goal cancel attempt should activate");
     crud_store
@@ -33981,7 +34766,15 @@ async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
         .await
         .expect("initial CLI attempt should prepare");
     crud_store
-        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), native_turn_id, None, now)
+        .activate_cli_runtime_turn_attempt_owned(
+            turn_id,
+            attempt.id.as_str(),
+            native_turn_id,
+            None,
+            now,
+            processor.turn_execution_owner_id.as_ref(),
+            now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+        )
         .await
         .expect("initial CLI attempt should activate");
     assert!(
@@ -34088,7 +34881,15 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
         .await
         .expect("initial CLI attempt should prepare");
     crud_store
-        .activate_cli_runtime_turn_attempt(turn_id, attempt.id.as_str(), native_turn_id, None, now)
+        .activate_cli_runtime_turn_attempt_owned(
+            turn_id,
+            attempt.id.as_str(),
+            native_turn_id,
+            None,
+            now,
+            processor.turn_execution_owner_id.as_ref(),
+            now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
+        )
         .await
         .expect("initial CLI attempt should activate");
     assert!(
@@ -34134,44 +34935,89 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
     );
 }
 
-#[tokio::test]
-async fn interrupted_cli_runtime_turn_recovers_in_same_native_thread_and_new_window() {
-    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, false, false, false,
-    ))
-    .await;
+#[test]
+fn interrupted_cli_runtime_turn_recovers_in_same_native_thread_and_new_window() {
+    run_interrupted_cli_runtime_turn_recovery_test(
+        "cli-runtime-interrupted-recovery",
+        false,
+        false,
+        false,
+        false,
+    );
 }
 
-#[tokio::test]
-async fn reconciled_cli_runtime_interruption_uses_same_recovery_lifecycle() {
-    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        true, false, false, false,
-    ))
-    .await;
+#[test]
+fn reconciled_cli_runtime_interruption_uses_same_recovery_lifecycle() {
+    run_interrupted_cli_runtime_turn_recovery_test(
+        "cli-runtime-reconciled-recovery",
+        true,
+        false,
+        false,
+        false,
+    );
 }
 
-#[tokio::test]
-async fn confirmed_cli_runtime_recovery_failure_starts_new_recovery_job() {
-    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, true, false, false,
-    ))
-    .await;
+#[test]
+fn confirmed_cli_runtime_recovery_failure_starts_new_recovery_job() {
+    run_interrupted_cli_runtime_turn_recovery_test(
+        "cli-runtime-confirmed-failure-recovery",
+        false,
+        true,
+        false,
+        false,
+    );
 }
 
-#[tokio::test]
-async fn detached_native_child_recovery_uses_parent_continuation_and_child_projection() {
-    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, false, true, false,
-    ))
-    .await;
+#[test]
+fn detached_native_child_recovery_uses_parent_continuation_and_child_projection() {
+    run_interrupted_cli_runtime_turn_recovery_test(
+        "cli-runtime-detached-child-recovery",
+        false,
+        false,
+        true,
+        false,
+    );
 }
 
-#[tokio::test]
-async fn cli_runtime_recovery_blocks_an_invalid_durable_working_directory() {
-    message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-        false, false, false, true,
-    ))
-    .await;
+#[test]
+fn cli_runtime_recovery_blocks_an_invalid_durable_working_directory() {
+    run_interrupted_cli_runtime_turn_recovery_test(
+        "cli-runtime-invalid-durable-cwd",
+        false,
+        false,
+        false,
+        true,
+    );
+}
+
+fn run_interrupted_cli_runtime_turn_recovery_test(
+    name: &str,
+    reconcile_from_runtime_observation: bool,
+    fail_after_confirmation: bool,
+    detached_child_owner: bool,
+    invalid_durable_cwd: bool,
+) {
+    let thread = std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("CLI recovery test runtime should build");
+            runtime.block_on(message_future(
+                run_interrupted_cli_runtime_turn_recovery_scenario(
+                    reconcile_from_runtime_observation,
+                    fail_after_confirmation,
+                    detached_child_owner,
+                    invalid_durable_cwd,
+                ),
+            ));
+        })
+        .expect("CLI recovery test thread should start");
+    thread
+        .join()
+        .expect("CLI recovery test thread should finish");
 }
 
 async fn run_interrupted_cli_runtime_turn_recovery_scenario(
@@ -34242,6 +35088,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .turn_start(
             connection_id,
             pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 input: vec![UserInput::Text {
@@ -34253,6 +35100,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -34289,6 +35137,7 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
                     id: continuation_thread_id.to_owned(),
                     name: Some("CLI recovery parent".to_owned()),
                     preview: String::new(),
+                    preview_author: None,
                     mode: ThreadMode::Agent,
                     model: "o4-mini".to_owned(),
                     model_provider: "openai".to_owned(),
@@ -34377,12 +35226,14 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .await
         .expect("initial CLI attempt should prepare");
     crud_store
-        .activate_cli_runtime_turn_attempt(
+        .activate_cli_runtime_turn_attempt_owned(
             turn_id,
             initial_attempt.id.as_str(),
             initial_native_turn_id,
             None,
             now,
+            processor.turn_execution_owner_id.as_ref(),
+            now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
         )
         .await
         .expect("initial CLI attempt should activate");
@@ -35020,6 +35871,7 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         id: "thread_cli_stale_db_only".to_owned(),
         name: Some("DB-only stale CLI turn".to_owned()),
         preview: "stale".to_owned(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "gpt-5".to_owned(),
         model_provider: "cli_runtime:codex".to_owned(),
@@ -37939,6 +38791,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         id: "thread_non_cli_timeout".to_owned(),
         name: Some("Non CLI timeout".to_owned()),
         preview: "non-cli".to_owned(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "o4-mini".to_owned(),
         model_provider: "openai".to_owned(),
@@ -37987,17 +38840,17 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
                 workspace_id: workspace_id.clone(),
                 thread_id: thread.id.clone(),
                 turn_id: turn.id.clone(),
-                item: command_execution_item("non-cli-command"),
+                item: context_compaction_item("non-cli-context-compaction"),
             },
             now.saturating_sub(120),
             TurnItemAttemptDeadlines {
-                lease_expires_at_unix: Some(now.saturating_sub(10)),
-                idle_deadline_at_unix: Some(now.saturating_sub(10)),
+                lease_expires_at_unix: Some(now.saturating_add(60)),
+                idle_deadline_at_unix: Some(now.saturating_add(60)),
                 hard_deadline_at_unix: Some(now.saturating_sub(10)),
             },
         )
         .await
-        .expect("non-CLI command attempt should materialize");
+        .expect("bounded non-CLI attempt should materialize");
 
     let pending_payload = CLIRuntimePendingRequest {
         kind: CLIRuntimeRequestKind::CommandApproval,
@@ -38036,7 +38889,7 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
     assert!(
         timed_out
             .iter()
-            .any(|candidate| candidate.item_id == "non-cli-command"),
+            .any(|candidate| candidate.item_id == "non-cli-context-compaction"),
         "stray CLI pending request without a CLI turn binding must not pause non-CLI timeout transitions"
     );
 }
@@ -38975,6 +39828,7 @@ async fn materialize_cli_runtime_approval_turn(
         id: thread_id.to_owned(),
         name: Some("CLI approval test".to_owned()),
         preview: String::new(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "gpt-5".to_owned(),
         model_provider: "cli_runtime:codex".to_owned(),
@@ -39722,6 +40576,12 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
     entries: &[AgentSkillRuntimeEntry],
 ) {
     ensure_test_superuser_execution_turn(processor, workspace_id, thread_id, turn_id).await;
+    bind_test_execution_skill_grants(
+        processor,
+        turn_id,
+        entries.iter().map(|entry| entry.skill_id.clone()),
+    )
+    .await;
     let mut overlay = entries.to_vec();
     let workspace_skill_policies =
         HashMap::<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>::new();
@@ -39926,6 +40786,8 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
     let thread_id = "thr_000000000000000020";
     let turn_id = "turn_000000000000000020";
     ensure_test_superuser_execution_turn(&processor, workspace_id.as_str(), thread_id, turn_id)
+        .await;
+    bind_test_execution_skill_grants(&processor, turn_id, [first_id.clone(), second_id.clone()])
         .await;
     let runtime_context = processor
         .skills_runtime_context(workspace_id.as_str())
@@ -40850,12 +41712,14 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
         .await
         .expect("CLI runtime cancel test attempt should prepare");
     crud_store
-        .activate_cli_runtime_turn_attempt(
+        .activate_cli_runtime_turn_attempt_owned(
             turn_id,
             initial_attempt.id.as_str(),
             "codex-turn-cancel-no-session",
             None,
             now,
+            processor.turn_execution_owner_id.as_ref(),
+            now + chrono::Duration::seconds(super::TURN_EXECUTION_OWNER_LEASE_SECONDS),
         )
         .await
         .expect("CLI runtime cancel test attempt should activate");
@@ -41818,6 +42682,7 @@ where
 {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
         .thread_name(name)
         .enable_all()
         .build()
@@ -44084,6 +44949,7 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
     thread_manager
         .system_turn_start_with_permission_profile(
             pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
                 input: vec![UserInput::Text {
@@ -44095,6 +44961,7 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
                 model_provider: None,
                 sandbox_policy: None,
                 mode: None,
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
@@ -45129,6 +45996,7 @@ fn semantic_fixture_thread(
         id: thread_id.to_owned(),
         name: name.map(str::to_owned),
         preview: String::new(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "gpt-5.5".to_owned(),
         model_provider: "openai".to_owned(),
@@ -53809,6 +54677,12 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
     let connection = Database::connect("sqlite::memory:")
         .await
         .expect("must connect to sqlite memory");
+    setup_workspace_manager_with_connection(connection).await
+}
+
+async fn setup_workspace_manager_with_connection(
+    connection: sea_orm::DatabaseConnection,
+) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
     Migrator::up(&connection, None)
         .await
         .expect("migrations must succeed");
@@ -53987,6 +54861,7 @@ fn phase_13_test_thread(
         id: thread_id.to_owned(),
         name: Some("Phase 13 Thread".to_owned()),
         preview: "phase 13 compaction".to_owned(),
+        preview_author: None,
         mode: ThreadMode::Agent,
         model: "test-model".to_owned(),
         model_provider: "openai".to_owned(),
@@ -55206,6 +56081,7 @@ async fn materialize_memory_tools_for_context(
             id: context.thread_id.clone(),
             name: Some("Memory tool authority fixture".to_owned()),
             preview: String::new(),
+            preview_author: None,
             mode: context.mode.clone(),
             model: "test-model".to_owned(),
             model_provider: "openai".to_owned(),
@@ -56359,6 +57235,7 @@ async fn memory_tool_uses_parent_thread_scope_with_child_provenance() {
                 id: parent_thread_id.to_owned(),
                 name: Some("Effective memory parent".to_owned()),
                 preview: String::new(),
+                preview_author: None,
                 mode: ThreadMode::Agent,
                 model: "test-model".to_owned(),
                 model_provider: "openai".to_owned(),
@@ -57226,7 +58103,11 @@ async fn wait_for_run_status(
     run_id: &str,
     expected_status: TaskRunStatus,
 ) -> TaskRunStatus {
-    for _ in 0..100 {
+    // Run and occurrence projections cross the same asynchronous scheduler
+    // boundary as the Task row. Keep all three full-suite oracles on the same
+    // bounded contention budget so a loaded Gateway test run cannot observe a
+    // partially projected cancellation as a contract failure.
+    for _ in 0..1_200 {
         let run = crud_store
             .get_task_run(run_id)
             .await
@@ -57251,7 +58132,7 @@ async fn wait_for_turn_status(
     turn_id: &str,
     expected_status: TurnStatus,
 ) -> TurnStatus {
-    for _ in 0..100 {
+    for _ in 0..1_200 {
         let (_, turn) = crud_store
             .get_turn(thread_id, turn_id)
             .await

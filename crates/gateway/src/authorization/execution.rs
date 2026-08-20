@@ -4,10 +4,10 @@ use pioneer_crud::{CrudStore, PersistedThreadAccessClass};
 #[cfg(test)]
 use pioneer_protocol::TurnPermissionMode;
 use pioneer_protocol::{
-    AgentExecutionBackend, AuthSessionId, CLIAgentRuntimeKind, GatewayId, PolicyGeneration,
-    PrincipalId, PrincipalKind, RoleKey, TaskCreateParams, TaskGetResponse, TaskTriggerKind,
-    ThreadVisibility, TurnCapability, TurnPermissionProfileCap, TurnPermissionProfileSnapshot,
-    TurnSkillBinding, TurnStartParams, UserInput,
+    AgentExecutionBackend, AgentExecutionId, AuthSessionId, CLIAgentRuntimeKind, GatewayId,
+    PolicyGeneration, PrincipalId, PrincipalKind, RoleKey, TaskCreateParams, TaskGetResponse,
+    TaskTriggerKind, ThreadVisibility, TurnCapability, TurnPermissionProfileCap,
+    TurnPermissionProfileSnapshot, TurnSkillBinding, TurnStartParams, UserInput,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,6 +88,7 @@ pub(crate) enum ExecutionAdmissionEntryPoint {
     Task,
     Scheduler,
     Subagent,
+    AgentTurnStart,
     CliRuntime,
     Recovery,
 }
@@ -144,8 +145,8 @@ impl ExecutionAdmissionRequest {
     pub(crate) fn for_task(
         params: &TaskCreateParams,
         root_thread_id: &str,
-        fallback_provider: &str,
-        fallback_model: &str,
+        default_provider: &str,
+        default_model: &str,
         provider_authority_fingerprint: Option<String>,
     ) -> Result<Self> {
         let launch = params
@@ -161,7 +162,7 @@ impl ExecutionAdmissionRequest {
                     .as_ref()
                     .and_then(|spec| spec.model_provider.as_deref())
             })
-            .unwrap_or(fallback_provider)
+            .unwrap_or(default_provider)
             .trim();
         let model = launch
             .and_then(|launch| launch.model.as_deref())
@@ -171,7 +172,7 @@ impl ExecutionAdmissionRequest {
                     .as_ref()
                     .and_then(|spec| spec.model.as_deref())
             })
-            .unwrap_or(fallback_model)
+            .unwrap_or(default_model)
             .trim();
         let entry_point = if params.trigger.spec.kind() == TaskTriggerKind::Immediate {
             ExecutionAdmissionEntryPoint::Task
@@ -231,8 +232,8 @@ impl ExecutionAdmissionRequest {
     pub(crate) fn for_existing_task(
         response: &TaskGetResponse,
         root_thread_id: &str,
-        fallback_provider: &str,
-        fallback_model: &str,
+        default_provider: &str,
+        default_model: &str,
         provider_authority_fingerprint: Option<String>,
     ) -> Result<Self> {
         let launch = response
@@ -249,12 +250,12 @@ impl ExecutionAdmissionRequest {
         let provider = launch
             .and_then(|launch| launch.model_provider.as_deref())
             .or_else(|| agent_spec.and_then(|spec| spec.model_provider.as_deref()))
-            .unwrap_or(fallback_provider)
+            .unwrap_or(default_provider)
             .trim();
         let model = launch
             .and_then(|launch| launch.model.as_deref())
             .or_else(|| agent_spec.and_then(|spec| spec.model.as_deref()))
-            .unwrap_or(fallback_model)
+            .unwrap_or(default_model)
             .trim();
         let entry_point = if response
             .triggers
@@ -481,6 +482,12 @@ pub(crate) struct ExecutionGrantManifest {
     skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     mcp_servers: Vec<String>,
+    /// Canonical, scope-qualified MCP server capability IDs frozen at
+    /// admission. `mcp_servers` remains the policy-facing server-name set;
+    /// launch contracts must use this exact set so equal names in user and
+    /// workspace scopes cannot be confused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_server_capability_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     artifacts: Vec<ExecutionArtifactGrant>,
 }
@@ -506,6 +513,10 @@ impl ExecutionGrantManifest {
                 .any(|action| ResourceAction::from_safe_name(action).is_none())
             || self.skills.windows(2).any(|pair| pair[0] >= pair[1])
             || self.mcp_servers.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .mcp_server_capability_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
             || self
                 .artifacts
                 .windows(2)
@@ -535,6 +546,25 @@ impl ExecutionGrantManifest {
         }
         for server_id in &self.mcp_servers {
             validate_non_empty_identity("MCP server", server_id)?;
+        }
+        for capability_id in &self.mcp_server_capability_ids {
+            validate_non_empty_identity("MCP server capability", capability_id)?;
+            let Some(rest) = capability_id.strip_prefix("mcp-server:") else {
+                bail!("invalid MCP server capability identity");
+            };
+            let Some((scope, name)) = rest.split_once(':') else {
+                bail!("invalid MCP server capability identity");
+            };
+            let scope_kind = match scope {
+                "workspace" => pioneer_protocol::McpScopeKind::Workspace,
+                "user" => pioneer_protocol::McpScopeKind::User,
+                _ => bail!("invalid MCP server capability scope"),
+            };
+            if pioneer_protocol::mcp_server_capability_key(scope_kind, name) != *capability_id
+                || !self.mcp_servers.iter().any(|server| server == name)
+            {
+                bail!("MCP server capability differs from its policy grant");
+            }
         }
         for artifact in &self.artifacts {
             validate_non_empty_identity("artifact", artifact.artifact_id.as_str())?;
@@ -601,6 +631,7 @@ fn test_execution_grant_manifest(
         cli,
         skills: Vec::new(),
         mcp_servers: Vec::new(),
+        mcp_server_capability_ids: Vec::new(),
         artifacts: Vec::new(),
     }
 }
@@ -733,6 +764,7 @@ impl ExecutionAdmissionService {
 
         let mut skills = BTreeSet::new();
         let mut mcp_servers = BTreeSet::new();
+        let mut mcp_server_capability_ids = BTreeSet::new();
         for capability in &request.capabilities {
             match &capability.kind {
                 pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => {
@@ -753,10 +785,7 @@ impl ExecutionAdmissionService {
                     actions.insert(ResourceAction::SkillUse.safe_name().to_owned());
                     skills.insert(skill_id.to_string());
                 }
-                pioneer_protocol::TurnCapabilityKind::McpServer { name, .. }
-                | pioneer_protocol::TurnCapabilityKind::McpTool {
-                    server_name: name, ..
-                } => {
+                pioneer_protocol::TurnCapabilityKind::McpServer { name, scope_kind } => {
                     self.require_root_action(
                         principal,
                         request,
@@ -773,6 +802,36 @@ impl ExecutionAdmissionService {
                     }
                     actions.insert(ResourceAction::McpUse.safe_name().to_owned());
                     mcp_servers.insert(name.clone());
+                    mcp_server_capability_ids.insert(pioneer_protocol::mcp_server_capability_key(
+                        *scope_kind,
+                        name,
+                    ));
+                }
+                pioneer_protocol::TurnCapabilityKind::McpTool {
+                    server_name,
+                    scope_kind,
+                    ..
+                } => {
+                    self.require_root_action(
+                        principal,
+                        request,
+                        ResourceAction::McpUse,
+                        runtime_draft,
+                    )
+                    .await?;
+                    if !self.policy.mcp_server_allowed(
+                        principal.kind,
+                        principal.role_key.as_ref(),
+                        server_name.as_str(),
+                    ) {
+                        bail!("selected MCP server is outside the role projection");
+                    }
+                    actions.insert(ResourceAction::McpUse.safe_name().to_owned());
+                    mcp_servers.insert(server_name.clone());
+                    mcp_server_capability_ids.insert(pioneer_protocol::mcp_server_capability_key(
+                        *scope_kind,
+                        server_name,
+                    ));
                 }
                 pioneer_protocol::TurnCapabilityKind::SkillPack { .. } => {
                     bail!("unexpanded skill pack reached execution admission");
@@ -858,6 +917,7 @@ impl ExecutionAdmissionService {
             cli,
             skills: skills.into_iter().collect(),
             mcp_servers: mcp_servers.into_iter().collect(),
+            mcp_server_capability_ids: mcp_server_capability_ids.into_iter().collect(),
             artifacts,
         };
         manifest.validate()?;
@@ -936,6 +996,7 @@ impl ExecutionAdmissionService {
             continuity_policy: ExecutionContinuityPolicy::StopOnAuthorityLoss,
             resource_boundary: ExecutionResourceBoundary::RootThreadCapsule,
             grant_manifest,
+            root_route_grants: Vec::new(),
             mcp_projection: None,
             skill_projection: None,
             cli_runtime_projection: cli_runtime_projection(request.execution_backend.as_ref()),
@@ -1030,6 +1091,28 @@ pub(crate) enum ExecutionAuthorityEnvelope {
     },
 }
 
+/// Server-authorized, non-bearer description of a short-lived route that must
+/// be committed with the first root AgentExecution. The exact source identity
+/// is intentionally filled only after root identity admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RootAgentRouteGrant {
+    pub(crate) route_id: pioneer_protocol::AgentDelegationRouteId,
+    pub(crate) destination_thread_id: String,
+    pub(crate) destination_capsule_id: String,
+    pub(crate) gateway_id: String,
+    pub(crate) allowed_actions: Vec<pioneer_protocol::AgentRouteAction>,
+    pub(crate) disclosure: pioneer_protocol::AgentRouteDisclosurePolicy,
+    pub(crate) destination_agent_identity_id: Option<pioneer_protocol::AgentIdentityId>,
+    pub(crate) destination_profile_id: Option<pioneer_protocol::AgentExecutionProfileId>,
+    pub(crate) expires_at: i64,
+    pub(crate) return_route_id: Option<pioneer_protocol::AgentDelegationRouteId>,
+    pub(crate) authority_actor_json: String,
+    pub(crate) authority_fingerprint: String,
+    pub(crate) grant_fingerprint: String,
+    pub(crate) policy_generation: u64,
+}
+
 /// Immutable, non-secret admission context for execution.
 ///
 /// The value is persisted for restart/recovery, but it is not a credential:
@@ -1054,6 +1137,8 @@ pub(crate) struct ExecutionAuthorizationContext {
     continuity_policy: ExecutionContinuityPolicy,
     resource_boundary: ExecutionResourceBoundary,
     grant_manifest: ExecutionGrantManifest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    root_route_grants: Vec<RootAgentRouteGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp_projection: Option<ExecutionMcpProjectionIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1121,6 +1206,7 @@ impl ExecutionAuthorizationContext {
                 "test-provider",
                 "test-model",
             ),
+            root_route_grants: Vec::new(),
             mcp_projection: None,
             skill_projection: None,
             cli_runtime_projection: cli_runtime_projection(execution_backend),
@@ -1140,6 +1226,36 @@ impl ExecutionAuthorizationContext {
             model: model.to_owned(),
             authority_fingerprint: authority_fingerprint.to_owned(),
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_test_skill_grants(
+        &mut self,
+        skill_ids: impl IntoIterator<Item = pioneer_protocol::SkillId>,
+    ) {
+        self.grant_manifest.skills = skill_ids
+            .into_iter()
+            .map(|skill_id| skill_id.to_string())
+            .collect();
+        self.grant_manifest.skills.sort();
+        self.grant_manifest.skills.dedup();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_test_mcp_server_grants(
+        &mut self,
+        scope_kind: pioneer_protocol::McpScopeKind,
+        server_names: impl IntoIterator<Item = String>,
+    ) {
+        self.grant_manifest.mcp_servers = server_names.into_iter().collect();
+        self.grant_manifest.mcp_servers.sort();
+        self.grant_manifest.mcp_servers.dedup();
+        self.grant_manifest.mcp_server_capability_ids = self
+            .grant_manifest
+            .mcp_servers
+            .iter()
+            .map(|name| pioneer_protocol::mcp_server_capability_key(scope_kind, name))
+            .collect();
     }
 
     pub(crate) fn initiating_principal_id(&self) -> &PrincipalId {
@@ -1279,6 +1395,10 @@ impl ExecutionAuthorizationContext {
         self.grant_manifest.mcp_servers.as_slice()
     }
 
+    pub(crate) fn granted_mcp_server_capability_ids(&self) -> &[String] {
+        self.grant_manifest.mcp_server_capability_ids.as_slice()
+    }
+
     pub(crate) fn workspace_id(&self) -> &str {
         self.workspace_id.as_str()
     }
@@ -1335,9 +1455,21 @@ impl ExecutionAuthorizationContext {
     }
 
     pub(crate) fn authorization_fingerprint(&self) -> Result<String> {
-        let encoded = serde_json::to_vec(self)
+        // MCP and Skill projection identities are resolved after the durable
+        // execution graph is admitted. They are exact, immutable once bound,
+        // and revalidated through their own persisted projections, but they
+        // must not change the fingerprint of the admission that pins this
+        // execution. The grant manifest remains the immutable ceiling.
+        let mut admitted = self.clone();
+        admitted.mcp_projection = None;
+        admitted.skill_projection = None;
+        let encoded = serde_json::to_vec(&admitted)
             .context("failed to encode execution authorization identity")?;
         Ok(hex::encode(Sha256::digest(encoded)))
+    }
+
+    pub(crate) fn root_route_grants(&self) -> &[RootAgentRouteGrant] {
+        self.root_route_grants.as_slice()
     }
 
     pub(crate) fn verify_current_provider_authority(
@@ -1370,6 +1502,7 @@ impl ExecutionAuthorizationContext {
                 context.version
             );
         }
+        validate_root_route_grants(&context)?;
         match &context.authority {
             ExecutionAuthorityEnvelope::PrincipalGrant {
                 principal_id,
@@ -1536,6 +1669,10 @@ impl ExecutionAuthorizationContext {
             pioneer_protocol::PersistedActorRef::System => {
                 self.verify_derived_turn(store, &scope, &turn).await?
             }
+            pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
+                self.verify_agent_execution_turn(store, &scope, &turn, execution_id)
+                    .await?
+            }
         };
         if scope.thread_id == self.root_thread_id {
             if scope.thread.access_class == PersistedThreadAccessClass::Internal {
@@ -1671,6 +1808,330 @@ impl ExecutionAuthorizationContext {
         })
     }
 
+    /// Agent-authored child Turns carry the exact execution actor in their
+    /// canonical TurnStarted event.  Their authority envelope still carries
+    /// the initiating principal as provenance, so recovery must validate both
+    /// facts independently: the actor must be the execution attached to the
+    /// durable TaskRunTurn, and the TaskRun must still derive from the same
+    /// root authority.  Falling back to `System` here would make the visible
+    /// author and the recovery authority disagree.
+    fn verify_agent_execution_turn<'a>(
+        &'a self,
+        store: &'a CrudStore,
+        scope: &'a pioneer_crud::TurnAuthorizationScope,
+        turn: &'a pioneer_protocol::Turn,
+        execution_id: &'a AgentExecutionId,
+    ) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(async move {
+            // Detached/scheduled Agent Tasks materialize one typed occurrence
+            // Turn in the capsule root before creating their isolated hidden
+            // child. This is the only root-level execution actor admitted by
+            // this verifier: the Turn id is the durable TaskRun id and the
+            // actor must be the exact execution reserved for that run.
+            if turn.turn_kind == pioneer_protocol::TurnKind::TaskRun
+                && matches!(
+                    turn.origin,
+                    pioneer_protocol::TurnOrigin::AttachedTask
+                        | pioneer_protocol::TurnOrigin::DetachedTask
+                        | pioneer_protocol::TurnOrigin::ScheduledTask
+                )
+                && let Some(run) = store.get_task_run(turn.id.as_str()).await?
+            {
+                if run.executor_kind != pioneer_protocol::TaskExecutorKind::Agent {
+                    bail!("agent-authored Task occurrence belongs to a non-Agent run");
+                }
+                let task = store
+                    .get_task_record(run.task_id.as_str())
+                    .await?
+                    .context("agent-authored Task occurrence has no durable Task")?;
+                let actor_contract = store
+                    .get_task_actor_contract(run.task_id.as_str())
+                    .await?
+                    .context("agent-authored Task occurrence has no exact actor contract")?;
+                let occurrence_thread_id = actor_contract
+                    .execution_destination_thread_id
+                    .as_deref()
+                    .or(task.created_by_thread_id.as_deref());
+                if task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
+                    || task.workspace_id != self.workspace_id
+                    || occurrence_thread_id != Some(scope.thread_id.as_str())
+                {
+                    bail!("agent-authored Task occurrence differs from its durable Task");
+                }
+                let execution = store
+                    .load_execution_for_run(run.id.as_str())
+                    .await?
+                    .context("agent-authored Task occurrence has no reserved execution")?;
+                if execution.id != execution_id.as_str()
+                    || execution.task_id != run.task_id
+                    || execution.task_run_id != run.id
+                    || execution.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
+                {
+                    bail!("Task occurrence actor differs from its reserved execution");
+                }
+                let admission = store
+                    .get_task_execution_admission(run.task_id.as_str())
+                    .await?
+                    .context("agent-authored Task occurrence has no durable admission")?;
+                let admission_context = Self::load_for_task_admission(store, &admission).await?;
+                self.verify_authority_derivation(&admission_context)?;
+                if task.created_by_turn_id.as_deref() == Some(turn.id.as_str()) {
+                    bail!("agent-authored Task occurrence lineage is self-referential");
+                }
+                return Ok(task.created_by_turn_id);
+            }
+
+            // A Task child Turn has two distinct execution actors by design:
+            // its authored input belongs to the execution that created the
+            // Task, while its response belongs to the newly reserved Task run
+            // execution.  Validate both typed bindings instead of comparing
+            // the parent author's row with the child Turn scope/grant.
+            if let Some(task_run_turn) = store
+                .get_task_run_turn_by_turn(scope.thread_id.as_str(), turn.id.as_str())
+                .await?
+            {
+                let run = store
+                    .get_task_run(task_run_turn.run_id.as_str())
+                    .await?
+                    .context("agent-authored Task child has no durable run")?;
+                let task = store
+                    .get_task_record(run.task_id.as_str())
+                    .await?
+                    .context("agent-authored Task child has no durable Task")?;
+                let actor_contract = store
+                    .get_task_actor_contract(run.task_id.as_str())
+                    .await?
+                    .context("agent-authored Task child has no exact actor contract")?;
+                if actor_contract.creator
+                    != pioneer_protocol::PersistedActorRef::AgentExecution(execution_id.clone())
+                {
+                    bail!("Task child input author differs from its exact creator execution");
+                }
+
+                let parent_turn_id = task
+                    .created_by_turn_id
+                    .as_deref()
+                    .context("agent-authored Task child has no creating Turn")?;
+                if parent_turn_id == turn.id {
+                    bail!("agent-authored Task child lineage is self-referential");
+                }
+                let parent_scope = pioneer_crud::resolve_turn_authorization_scope(
+                    &store.database_connection(),
+                    parent_turn_id,
+                    Some(self.workspace_id.as_str()),
+                    task.created_by_thread_id.as_deref(),
+                )
+                .await?
+                .context("agent-authored Task creating Turn is missing")?;
+                if task.created_by_thread_id.as_deref() != Some(parent_scope.thread_id.as_str()) {
+                    bail!("agent-authored Task creator thread differs from its creating Turn");
+                }
+                let parent_response = pioneer_crud::load_agent_turn_response(
+                    &store.database_connection(),
+                    parent_turn_id,
+                )
+                .await?
+                .context("agent-authored Task creating Turn has no responding execution")?;
+                if parent_response.execution_id != execution_id.as_str() {
+                    bail!("Task creator actor differs from its creating Turn execution");
+                }
+
+                let task_execution = store
+                    .load_execution_for_run(run.id.as_str())
+                    .await?
+                    .context("agent-authored Task child has no reserved execution")?;
+                let child_execution = pioneer_crud::load_agent_execution(
+                    &store.database_connection(),
+                    task_execution.id.as_str(),
+                )
+                .await?
+                .context("agent-authored Task child has no execution graph row")?;
+                let child_response = pioneer_crud::load_agent_turn_response(
+                    &store.database_connection(),
+                    turn.id.as_str(),
+                )
+                .await?
+                .context("agent-authored Task child has no responding execution")?;
+                if task_run_turn.thread_id != scope.thread_id
+                    || task_run_turn.turn_id != turn.id
+                    || task_run_turn.task_id != run.task_id
+                {
+                    bail!("Task child Turn differs from its exact run binding");
+                }
+                if task_run_turn.execution_id.as_deref() != Some(task_execution.id.as_str()) {
+                    bail!("Task child Turn differs from its reserved execution");
+                }
+                if child_response.execution_id != child_execution.id {
+                    bail!("Task child response differs from its execution graph actor");
+                }
+                if task_execution.task_id != run.task_id
+                    || task_execution.task_run_id != run.id
+                    || task_execution.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
+                {
+                    bail!("Task child execution differs from its durable run");
+                }
+                if child_execution.home_root_thread_id != self.root_thread_id {
+                    bail!("Task child execution left its admitted capsule");
+                }
+                if child_execution.authorization_context_fingerprint
+                    != self.authorization_fingerprint()?
+                {
+                    bail!("Task child execution differs from its authority envelope");
+                }
+
+                let occurrence = store
+                    .get_task_occurrence_contract_by_run(run.id.as_str())
+                    .await?
+                    .context("agent-authored Task child has no occurrence contract")?;
+                if occurrence.agent_execution_id.as_deref() != Some(task_execution.id.as_str()) {
+                    bail!("Task occurrence differs from its exact child execution");
+                }
+                if occurrence.work_graph_root_execution_id.as_deref()
+                    != Some(child_execution.work_graph_root_execution_id.as_str())
+                    || occurrence.root_resource_scope_id.as_deref()
+                        != Some(child_execution.work_graph_root_execution_id.as_str())
+                {
+                    bail!("Task occurrence differs from its execution resource scope");
+                }
+
+                let parent_execution = pioneer_crud::load_agent_execution(
+                    &store.database_connection(),
+                    execution_id.as_str(),
+                )
+                .await?
+                .context("agent-authored Task creator execution is missing")?;
+                if parent_execution.workspace_id != self.workspace_id {
+                    bail!("Task creator execution left its admitted workspace");
+                }
+                match actor_contract.work_graph_root_execution_id.as_deref() {
+                    Some(root_execution_id)
+                        if child_execution.parent_execution_id.as_deref()
+                            == Some(execution_id.as_str())
+                            && parent_execution.work_graph_root_execution_id
+                                == root_execution_id
+                            && child_execution.work_graph_root_execution_id
+                                == root_execution_id => {}
+                    None if child_execution.parent_execution_id.is_none()
+                        && child_execution.work_graph_root_execution_id == child_execution.id => {}
+                    _ => bail!("Task child execution differs from its immutable work graph"),
+                }
+
+                let admission = store
+                    .get_task_execution_admission(run.task_id.as_str())
+                    .await?
+                    .context("agent-authored Task child has no durable admission")?;
+                let admission_context = Self::load_for_task_admission(store, &admission).await?;
+                self.verify_authority_derivation(&admission_context)?;
+                return Ok(Some(parent_turn_id.to_owned()));
+            }
+
+            if let Some(execution) = pioneer_crud::load_agent_execution(
+                &store.database_connection(),
+                execution_id.as_str(),
+            )
+            .await?
+            {
+                let authorization_fingerprint = self.authorization_fingerprint()?;
+                if execution.workspace_id != self.workspace_id
+                    || execution.parent_execution_id.is_none()
+                    || execution.parent_thread_id.as_deref() != Some(scope.thread_id.as_str())
+                    || execution.home_root_thread_id != self.root_thread_id
+                    || execution.authorization_context_fingerprint != authorization_fingerprint
+                    || execution.status == "finished"
+                {
+                    bail!("agent-authored Turn differs from its durable execution graph");
+                }
+                if scope.thread_id != self.root_thread_id {
+                    let lineage = store
+                        .get_task_thread_lineage(scope.thread_id.as_str())
+                        .await?
+                        .context("agent-authored child execution has no durable lineage")?;
+                    if lineage.root_thread_id != self.root_thread_id {
+                        bail!("agent-authored child execution left its collaboration capsule");
+                    }
+                }
+                return Ok(None);
+            }
+            if scope.thread_id == self.root_thread_id {
+                bail!("agent execution actor cannot author a capsule-root Turn");
+            }
+
+            let lineage = store
+                .get_task_thread_lineage(scope.thread_id.as_str())
+                .await?
+                .context("agent-authored child execution has no durable lineage")?;
+            let parent_turn_id = lineage
+                .created_by_turn_id
+                .as_deref()
+                .context("agent-authored child lineage has no creating Turn")?;
+            if parent_turn_id == turn.id {
+                bail!("agent-authored child lineage is self-referential");
+            }
+            let parent_scope = pioneer_crud::resolve_turn_authorization_scope(
+                &store.database_connection(),
+                parent_turn_id,
+                Some(self.workspace_id.as_str()),
+                Some(lineage.parent_thread_id.as_str()),
+            )
+            .await?
+            .context("agent-authored child creating Turn is missing or outside its parent")?;
+            if lineage.created_by_thread_id.as_deref() != Some(parent_scope.thread_id.as_str()) {
+                bail!("agent-authored child lineage has inconsistent creating thread");
+            }
+            if parent_scope.thread_id != self.root_thread_id {
+                let parent_lineage = store
+                    .get_task_thread_lineage(parent_scope.thread_id.as_str())
+                    .await?
+                    .context("nested agent-authored parent has no durable lineage")?;
+                if parent_lineage.root_thread_id != self.root_thread_id
+                    || parent_lineage.depth >= lineage.depth
+                {
+                    bail!("nested agent-authored lineage does not monotonically approach its root");
+                }
+            }
+
+            let task_run_turn = store
+                .get_task_run_turn_by_turn(scope.thread_id.as_str(), turn.id.as_str())
+                .await?
+                .context("agent-authored child has no typed Task run Turn")?;
+            if task_run_turn.thread_id != scope.thread_id
+                || task_run_turn.turn_id != turn.id
+                || task_run_turn.execution_id.as_deref() != Some(execution_id.as_str())
+            {
+                bail!("agent-authored Turn differs from its exact Task execution actor");
+            }
+            let run = store
+                .get_task_run(task_run_turn.run_id.as_str())
+                .await?
+                .context("agent-authored child has no durable Task run")?;
+            if run.id != task_run_turn.run_id
+                || run.task_id != task_run_turn.task_id
+                || run.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
+            {
+                bail!("agent-authored child is not backed by an Agent Task run");
+            }
+            let execution = store
+                .load_execution_for_run(run.id.as_str())
+                .await?
+                .context("agent-authored child has no durable Task execution")?;
+            if execution.id != execution_id.as_str()
+                || execution.task_id != run.task_id
+                || execution.task_run_id != run.id
+                || execution.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
+            {
+                bail!("agent-authored Turn differs from its durable Task execution");
+            }
+            let admission = store
+                .get_task_execution_admission(run.task_id.as_str())
+                .await?
+                .context("agent-authored child has no durable Task execution admission")?;
+            let admission_context = Self::load_for_task_admission(store, &admission).await?;
+            self.verify_authority_derivation(&admission_context)?;
+
+            Ok(Some(parent_turn_id.to_owned()))
+        })
+    }
+
     fn verify_authority_derivation(&self, admitted: &Self) -> Result<()> {
         self.verify_same_authority_provenance(admitted)?;
         if !self.granted_action_names().iter().all(|action| {
@@ -1711,11 +2172,11 @@ impl ExecutionAuthorizationContext {
                 )
             })?;
         let task = store
-            .get_task(admission.task_id.as_str())
+            .get_task_record(admission.task_id.as_str())
             .await?
             .with_context(|| format!("execution Task `{}` no longer exists", admission.task_id))?;
-        if task.task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
-            || task.task.workspace_id != admission.workspace_id
+        if task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
+            || task.workspace_id != admission.workspace_id
         {
             bail!("Task execution admission differs from its durable Task");
         }
@@ -1804,8 +2265,10 @@ impl ExecutionAuthorizationContext {
     /// after its current collaboration authority has been revalidated. The
     /// context remains frozen at its original admission generation; only this
     /// new Turn reservation is stamped with the generation that was actually
-    /// checked. The repository still compares that generation atomically at
-    /// insert time, so a concurrent authority change remains fail closed.
+    /// checked. The root Turn owns the single admission lease for the work
+    /// graph; internal child Turns carry the same authority envelope without a
+    /// second full principal/workspace quota reservation. The repository still
+    /// compares the revalidated generation atomically at insert time.
     pub(crate) fn durable_turn_admission_after_revalidation(
         &self,
         actual_thread_id: &str,
@@ -1863,15 +2326,8 @@ impl ExecutionAuthorizationContext {
         digest.update(b"\0");
         digest.update(turn_id.as_bytes());
 
-        Ok(pioneer_crud::NewTurnAdmission {
-            turn_id: turn_id.to_owned(),
-            thread_id: actual_thread_id.to_owned(),
-            workspace_id: self.workspace_id.clone(),
-            request_digest: hex::encode(digest.finalize()),
-            policy_generation: Some(validated_policy_generation),
-            role_key: Some(self.role_key.clone()),
-            policy_fingerprint: Some(validated_policy_fingerprint.to_owned()),
-            execution_lease: Some(super::ExecutionAdmissionGovernor::lease(
+        let execution_lease = (actual_thread_id == self.root_thread_id).then(|| {
+            super::ExecutionAdmissionGovernor::lease(
                 self.initiating_principal_id.as_str(),
                 self.role_key.as_str(),
                 self.workspace_id.as_str(),
@@ -1880,7 +2336,17 @@ impl ExecutionAuthorizationContext {
                 operation_class,
                 "turn",
                 turn_id,
-            )),
+            )
+        });
+        Ok(pioneer_crud::NewTurnAdmission {
+            turn_id: turn_id.to_owned(),
+            thread_id: actual_thread_id.to_owned(),
+            workspace_id: self.workspace_id.clone(),
+            request_digest: hex::encode(digest.finalize()),
+            policy_generation: Some(validated_policy_generation),
+            role_key: Some(self.role_key.clone()),
+            policy_fingerprint: Some(validated_policy_fingerprint.to_owned()),
+            execution_lease,
         })
     }
 
@@ -1922,7 +2388,14 @@ impl ExecutionAuthorizationContext {
         }
         exact_servers.sort();
         exact_servers.dedup();
-        self.grant_manifest.mcp_servers = exact_servers;
+        if exact_servers.iter().any(|server| {
+            self.grant_manifest
+                .mcp_servers
+                .binary_search(server)
+                .is_err()
+        }) {
+            bail!("MCP projection exceeds the immutable execution admission");
+        }
         self.mcp_projection = Some(projection);
         Ok(())
     }
@@ -1982,7 +2455,12 @@ impl ExecutionAuthorizationContext {
         }
         exact_skills.sort();
         exact_skills.dedup();
-        self.grant_manifest.skills = exact_skills;
+        if exact_skills
+            .iter()
+            .any(|skill_id| self.grant_manifest.skills.binary_search(skill_id).is_err())
+        {
+            bail!("skill projection exceeds the immutable execution admission");
+        }
         self.skill_projection = Some(projection);
         Ok(())
     }
@@ -2035,6 +2513,28 @@ impl ExecutionAuthorizationContext {
         effective_permission_profile: &TurnPermissionProfileSnapshot,
         provider_authority_fingerprint: Option<&str>,
     ) -> Result<Self> {
+        self.derive_continuation_with_grant_capabilities(
+            provider,
+            model,
+            execution_backend,
+            capabilities,
+            capabilities,
+            effective_permission_profile,
+            provider_authority_fingerprint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn derive_continuation_with_grant_capabilities(
+        &self,
+        provider: &str,
+        model: &str,
+        execution_backend: Option<&AgentExecutionBackend>,
+        capabilities: &[TurnCapability],
+        grant_capabilities: &[TurnCapability],
+        effective_permission_profile: &TurnPermissionProfileSnapshot,
+        provider_authority_fingerprint: Option<&str>,
+    ) -> Result<Self> {
         let parent_cap =
             pioneer_protocol::task_permission_cap_snapshot(&self.permission_profile_cap);
         let capped = pioneer_protocol::intersect_turn_permission_profiles(
@@ -2060,7 +2560,7 @@ impl ExecutionAuthorizationContext {
             provider,
             model,
             execution_backend,
-            capabilities,
+            grant_capabilities,
             provider_authority_fingerprint,
         )?;
         Ok(Self {
@@ -2081,10 +2581,49 @@ impl ExecutionAuthorizationContext {
             continuity_policy: self.continuity_policy,
             resource_boundary: self.resource_boundary,
             grant_manifest,
+            root_route_grants: Vec::new(),
             mcp_projection: None,
             skill_projection: None,
             cli_runtime_projection: cli_runtime_projection(execution_backend),
         })
+    }
+
+    /// Derives an agent child continuation and, for an already-authorized
+    /// route, binds recovery to the destination collaboration root while
+    /// retaining the source principal/policy provenance and action ceiling.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn derive_agent_continuation(
+        &self,
+        destination_root_thread_id: &str,
+        provider: &str,
+        model: &str,
+        execution_backend: Option<&AgentExecutionBackend>,
+        capabilities: &[TurnCapability],
+        effective_permission_profile: &TurnPermissionProfileSnapshot,
+        provider_authority_fingerprint: Option<&str>,
+    ) -> Result<Self> {
+        if destination_root_thread_id.trim().is_empty() {
+            bail!("agent continuation destination root is required");
+        }
+        let mut continuation = self.derive_continuation(
+            provider,
+            model,
+            execution_backend,
+            capabilities,
+            effective_permission_profile,
+            provider_authority_fingerprint,
+        )?;
+        continuation.root_thread_id = destination_root_thread_id.to_owned();
+        continuation.capability_projection_fingerprint = capability_projection_fingerprint(
+            continuation.workspace_id.as_str(),
+            destination_root_thread_id,
+            provider,
+            model,
+            execution_backend,
+            capabilities,
+            &continuation.permission_profile_cap,
+        )?;
+        Ok(continuation)
     }
 
     fn derive_continuation_manifest(
@@ -2150,6 +2689,7 @@ impl ExecutionAuthorizationContext {
 
         let mut skills = BTreeSet::new();
         let mut mcp_servers = BTreeSet::new();
+        let mut mcp_server_capability_ids = BTreeSet::new();
         for capability in capabilities {
             match &capability.kind {
                 pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => {
@@ -2164,16 +2704,37 @@ impl ExecutionAuthorizationContext {
                     }
                     skills.insert(skill_id.to_string());
                 }
-                pioneer_protocol::TurnCapabilityKind::McpServer { name, .. }
-                | pioneer_protocol::TurnCapabilityKind::McpTool {
-                    server_name: name, ..
-                } => {
+                pioneer_protocol::TurnCapabilityKind::McpServer { name, scope_kind } => {
                     if !self.grant_manifest.allows_action(ResourceAction::McpUse)
                         || !policy.mcp_server_allowed(principal_kind, role_key.as_ref(), name)
                     {
                         bail!("task continuation MCP server is not granted");
                     }
                     mcp_servers.insert(name.clone());
+                    mcp_server_capability_ids.insert(pioneer_protocol::mcp_server_capability_key(
+                        *scope_kind,
+                        name,
+                    ));
+                }
+                pioneer_protocol::TurnCapabilityKind::McpTool {
+                    server_name,
+                    scope_kind,
+                    ..
+                } => {
+                    if !self.grant_manifest.allows_action(ResourceAction::McpUse)
+                        || !policy.mcp_server_allowed(
+                            principal_kind,
+                            role_key.as_ref(),
+                            server_name,
+                        )
+                    {
+                        bail!("task continuation MCP server is not granted");
+                    }
+                    mcp_servers.insert(server_name.clone());
+                    mcp_server_capability_ids.insert(pioneer_protocol::mcp_server_capability_key(
+                        *scope_kind,
+                        server_name,
+                    ));
                 }
                 pioneer_protocol::TurnCapabilityKind::SkillPack { .. } => {
                     bail!("unexpanded skill pack reached task continuation admission");
@@ -2193,6 +2754,7 @@ impl ExecutionAuthorizationContext {
             cli: cli_grant,
             skills: skills.into_iter().collect(),
             mcp_servers: mcp_servers.into_iter().collect(),
+            mcp_server_capability_ids: mcp_server_capability_ids.into_iter().collect(),
             artifacts: self.grant_manifest.artifacts.clone(),
         };
         manifest.validate()?;
@@ -2322,6 +2884,44 @@ impl ExecutionAuthorizationContext {
         }
         Ok(())
     }
+}
+
+fn validate_root_route_grants(context: &ExecutionAuthorizationContext) -> Result<()> {
+    if context.root_route_grants.len() > 8 {
+        bail!("execution authorization has too many root route grants");
+    }
+    let mut route_ids = BTreeSet::new();
+    for grant in &context.root_route_grants {
+        if !route_ids.insert(grant.route_id.as_str())
+            || grant.destination_thread_id.trim().is_empty()
+            || grant.destination_capsule_id.trim().is_empty()
+            || grant.gateway_id.trim().is_empty()
+            || grant.allowed_actions.is_empty()
+            || grant
+                .allowed_actions
+                .iter()
+                .enumerate()
+                .any(|(index, action)| grant.allowed_actions[..index].contains(action))
+            || !grant.disclosure.allows_anything()
+            || grant.expires_at < 1
+            || grant.authority_fingerprint.trim().is_empty()
+            || grant.grant_fingerprint.trim().is_empty()
+            || grant.policy_generation != context.policy_revision
+        {
+            bail!("execution authorization has an invalid root route grant");
+        }
+        let actor: pioneer_protocol::PersistedActorRef =
+            serde_json::from_str(grant.authority_actor_json.as_str())
+                .context("execution root route authority actor is invalid")?;
+        if actor
+            != pioneer_protocol::PersistedActorRef::Principal(
+                context.initiating_principal_id.clone(),
+            )
+        {
+            bail!("execution root route authority differs from its initiating principal");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2545,6 +3145,7 @@ pub(crate) struct ExecutionAuthorizationAdmission {
     native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
     execution_class: pioneer_crud::ExecutionAdmissionClass,
     grant_manifest: Option<ExecutionGrantManifest>,
+    root_route_grants: Vec<RootAgentRouteGrant>,
     runtime_draft: Option<RuntimeDraftMaterialization>,
 }
 
@@ -2722,6 +3323,7 @@ impl ExecutionAuthorizationAdmission {
             native_event_budget,
             execution_class: pioneer_crud::ExecutionAdmissionClass::InteractiveTurn,
             grant_manifest: None,
+            root_route_grants: Vec::new(),
             runtime_draft: None,
         })
     }
@@ -2761,6 +3363,23 @@ impl ExecutionAuthorizationAdmission {
             self.policy_revision,
             self.policy_fingerprint.as_str(),
         )
+    }
+
+    pub(crate) fn bind_root_route_grants(
+        &mut self,
+        grants: Vec<RootAgentRouteGrant>,
+    ) -> Result<()> {
+        if self.runtime_draft.is_some() && !grants.is_empty() {
+            bail!("runtime-draft execution cannot carry cross-capsule routes");
+        }
+        if grants
+            .iter()
+            .any(|grant| grant.policy_generation != self.policy_revision)
+        {
+            bail!("root route grant policy generation is stale");
+        }
+        self.root_route_grants = grants;
+        Ok(())
     }
 
     pub(crate) fn execution_quota_lease(
@@ -2968,11 +3587,41 @@ impl ExecutionAuthorizationAdmission {
             continuity_policy: ExecutionContinuityPolicy::StopOnAuthorityLoss,
             resource_boundary: ExecutionResourceBoundary::RootThreadCapsule,
             grant_manifest,
+            root_route_grants: self.root_route_grants.clone(),
             mcp_projection: None,
             skill_projection: None,
             cli_runtime_projection: cli_runtime_projection(execution_backend),
         })
     }
+}
+
+/// Adds server-selected Agent skills to the immutable execution ceiling
+/// without presenting them as user-selected Composer capabilities. The
+/// caller keeps using the original capability slice for its projection
+/// fingerprint and UI/runtime presentation.
+pub(crate) fn execution_grant_capabilities_with_agent_skills(
+    capabilities: &[TurnCapability],
+    skill_ids: impl IntoIterator<Item = pioneer_protocol::SkillId>,
+) -> Vec<TurnCapability> {
+    let mut grant_capabilities = capabilities.to_vec();
+    let mut seen = capabilities
+        .iter()
+        .filter_map(|capability| match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut additional = skill_ids.into_iter().collect::<BTreeSet<_>>();
+    additional.retain(|skill_id| seen.insert(skill_id.clone()));
+    grant_capabilities.extend(additional.into_iter().map(|skill_id| TurnCapability {
+        id: pioneer_protocol::skill_capability_key(&skill_id),
+        kind: pioneer_protocol::TurnCapabilityKind::Skill {
+            skill_id,
+            pack_id: None,
+        },
+        label: None,
+    }));
+    grant_capabilities
 }
 
 fn approval_scope_policy_for_mode(
@@ -3039,6 +3688,39 @@ mod tests {
         DeviceId, GatewayId, PersistedActorRef, RoleKey, TurnPermissionProfileSelection,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn execution_manifest_preserves_scope_qualified_mcp_launch_authority() {
+        let mut manifest = test_execution_grant_manifest(None, "provider", "model");
+        manifest.mcp_servers = vec!["github".to_owned()];
+        manifest.mcp_server_capability_ids = vec![
+            pioneer_protocol::mcp_server_capability_key(
+                pioneer_protocol::McpScopeKind::User,
+                "github",
+            ),
+            pioneer_protocol::mcp_server_capability_key(
+                pioneer_protocol::McpScopeKind::Workspace,
+                "github",
+            ),
+        ];
+        manifest.mcp_server_capability_ids.sort();
+        manifest.validate().unwrap();
+
+        let encoded = serde_json::to_string(&manifest).unwrap();
+        let restored: ExecutionGrantManifest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            restored.mcp_server_capability_ids,
+            manifest.mcp_server_capability_ids
+        );
+
+        let mut invalid = manifest;
+        invalid.mcp_server_capability_ids = vec![pioneer_protocol::mcp_tool_capability_key(
+            pioneer_protocol::McpScopeKind::Workspace,
+            "github",
+            "issues",
+        )];
+        assert!(invalid.validate().is_err());
+    }
 
     fn member_request() -> RequestContext {
         scoped_request(RoleKey::member())
@@ -3241,9 +3923,19 @@ mod tests {
             )
             .expect("execution context");
         let manifest_hash = "c".repeat(64);
+        let admission_fingerprint = context
+            .authorization_fingerprint()
+            .expect("fingerprint unbound MCP admission");
         context
             .bind_mcp_projection("workspace-a", 1, manifest_hash.as_str(), &[])
             .expect("bind exact MCP projection");
+        assert_eq!(
+            context
+                .authorization_fingerprint()
+                .expect("fingerprint MCP-bound admission"),
+            admission_fingerprint,
+            "runtime MCP projection identity must not rewrite execution admission identity"
+        );
         context
             .verify_mcp_projection("workspace-a", 1, manifest_hash.as_str())
             .expect("verify exact MCP projection");
@@ -3307,9 +3999,20 @@ mod tests {
             source_kind: "registry".to_owned(),
             resolved_reason: "explicit".to_owned(),
         };
+        context.grant_manifest.skills = vec![binding.skill_id.to_string()];
+        let admission_fingerprint = context
+            .authorization_fingerprint()
+            .expect("fingerprint unbound Skill admission");
         context
             .bind_skill_projection("workspace-a", std::slice::from_ref(&binding))
             .expect("bind exact skill projection");
+        assert_eq!(
+            context
+                .authorization_fingerprint()
+                .expect("fingerprint Skill-bound admission"),
+            admission_fingerprint,
+            "runtime Skill projection identity must not rewrite execution admission identity"
+        );
         context
             .verify_skill_projection("workspace-a", std::slice::from_ref(&binding))
             .expect("verify exact skill projection");
@@ -3409,7 +4112,7 @@ mod tests {
     }
 
     #[test]
-    fn every_durable_child_turn_gets_an_exact_active_quota_admission() {
+    fn only_the_work_graph_root_gets_the_active_quota_admission() {
         let request = member_request();
         let proof = authorized_thread(&request);
         let admission =
@@ -3457,13 +4160,10 @@ mod tests {
         assert_eq!(child.policy_generation, Some(60));
         assert_eq!(child.role_key.as_deref(), Some("member"));
         assert_eq!(child.request_digest.len(), 64);
-        let child_lease = child.execution_lease.expect("child quota lease");
-        assert_eq!(
-            child_lease.operation_class,
-            pioneer_crud::ExecutionAdmissionClass::AttachedChild
+        assert!(
+            child.execution_lease.is_none(),
+            "internal descendants use the root work-graph resource scope"
         );
-        assert_eq!(child_lease.subject_kind, "turn");
-        assert_eq!(child_lease.subject_id, "turn-child");
 
         let root = context
             .durable_turn_admission_after_revalidation("thread-a", "turn-root", None, &revalidated)
@@ -3487,12 +4187,9 @@ mod tests {
                 &revalidated,
             )
             .expect("CLI child admission");
-        assert_eq!(
-            cli_child
-                .execution_lease
-                .expect("CLI quota lease")
-                .operation_class,
-            pioneer_crud::ExecutionAdmissionClass::CliProcess
+        assert!(
+            cli_child.execution_lease.is_none(),
+            "a child CLI execution must not reserve a second full quota"
         );
 
         let mut unrelated = context.clone();

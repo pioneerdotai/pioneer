@@ -8,6 +8,9 @@ use pioneer_crud::CrudStore;
 #[cfg(test)]
 use pioneer_protocol::PrincipalKind;
 use pioneer_protocol::{
+    AgentControlTaskToolInput, AgentModelToolName, AgentReviewDecision, AgentReviewTaskToolInput,
+    AgentScheduleTaskToolInput, AgentTaskControl, AgentTaskToolInput, AgentToolCapability,
+    AgentToolIdentityChoice, AgentToolLaunchSelection, AgentToolProfileChoice,
     ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAcceptParams, TaskAcceptResponse,
     TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract,
     TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode, TaskCancelParams, TaskCancelScope,
@@ -31,6 +34,7 @@ use pioneer_tools::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
@@ -52,6 +56,7 @@ const TASK_PAUSE_TOOL: &str = "task_pause";
 const TASK_RESUME_TOOL: &str = "task_resume";
 const DEFAULT_ROOT_MAX_DEPTH: i64 = 3;
 const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
+const MAX_TASK_OBSERVATION_TARGETS: usize = 64;
 
 type TaskToolFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -140,6 +145,10 @@ impl TaskToolProvider for GatewayTaskToolProvider {
             )
             .await
             .is_ok();
+        let agent_capabilities = processor
+            .agent_action_binding(context.turn_id.as_str())
+            .await
+            .map(|binding| binding.capabilities);
         let handler = Arc::new(TaskToolHandler {
             processor,
             context,
@@ -149,6 +158,11 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         for configured in task_tool_specs() {
             let name = configured.spec.name.clone();
             if name == TASK_CREATE_TOOL && !can_create {
+                continue;
+            }
+            if let Some(capabilities) = agent_capabilities.as_ref()
+                && !agent_bound_task_tool_visible(name.as_str(), capabilities)
+            {
                 continue;
             }
             bundle.specs.push(configured);
@@ -345,6 +359,59 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         })
     }
 
+    async fn wait_for_attached_task_finalization_snapshot(
+        &self,
+        context: TaskTurnContext,
+        timeout_ms: u64,
+    ) -> Result<TaskFinalizationSnapshot, String> {
+        let processor = self.processor()?;
+        let authorization = resolve_task_tool_authorization_scope(processor.as_ref(), &context)
+            .await
+            .map_err(|error| error.to_string())?;
+        let tasks = processor
+            .crud_store
+            .list_tasks_created_by_turn(
+                context.workspace_id.as_str(),
+                context.thread_id.as_str(),
+                context.turn_id.as_str(),
+            )
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let mut task_ids = tasks
+            .into_iter()
+            .filter(|task| {
+                task.lifecycle_policy
+                    .as_ref()
+                    .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
+                    .unwrap_or(false)
+            })
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        task_ids.sort();
+        task_ids.dedup();
+
+        if timeout_ms > 0 && !task_ids.is_empty() {
+            processor
+                .task_runtime
+                .service()
+                .wait_tasks(
+                    authorization.wait_context(),
+                    TaskWaitParams {
+                        task_ids,
+                        run_ids: Vec::new(),
+                        timeout_ms: Some(timeout_ms),
+                        mode: TaskWaitMode::AllTerminalOrReviewRequired,
+                        return_completed: true,
+                        return_pending: true,
+                    },
+                )
+                .await
+                .map_err(|error| format!("{error:#}"))?;
+        }
+
+        self.attached_task_finalization_snapshot(context).await
+    }
+
     async fn pending_attached_tasks(
         &self,
         context: TaskTurnContext,
@@ -525,6 +592,31 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                 .map_err(|error| format!("{error:#}"))?;
         }
         Ok(())
+    }
+}
+
+fn agent_bound_task_tool_visible(name: &str, capabilities: &BTreeSet<AgentToolCapability>) -> bool {
+    match name {
+        TASK_CREATE_TOOL => {
+            capabilities.contains(&AgentToolCapability::TaskCreate)
+                || capabilities.contains(&AgentToolCapability::TaskSchedule)
+        }
+        TASK_WAIT_TOOL | TASK_GET_TOOL => {
+            capabilities.contains(&AgentToolCapability::TaskObserve)
+                || capabilities.contains(&AgentToolCapability::ResultRead)
+        }
+        TASK_LIST_TOOL => false,
+        TASK_ACCEPT_TOOL | TASK_REVISE_TOOL => {
+            capabilities.contains(&AgentToolCapability::TaskReview)
+        }
+        TASK_CANCEL_TOOL | TASK_DETACH_TOOL | TASK_RESUME_TOOL => {
+            capabilities.contains(&AgentToolCapability::TaskControl)
+        }
+        // These management operations have no agent domain typed intent.
+        // Keeping them out of an execution-bound catalog prevents a direct
+        // Task writer from bypassing the canonical receipt/revalidation path.
+        TASK_UPDATE_TOOL | TASK_RESCHEDULE_TOOL | TASK_PAUSE_TOOL => false,
+        _ => false,
     }
 }
 
@@ -990,15 +1082,19 @@ impl ToolHandler for TaskToolHandler {
         _trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let handler = self.clone();
-        match task_tool_fresh_task(async move { handler.handle_in_fresh_task(invocation).await })
+        let result =
+            match task_tool_fresh_task(
+                async move { handler.handle_in_fresh_task(invocation).await },
+            )
             .await
-        {
-            Ok(result) => result,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => Err(ToolError::execution_failed(format!(
-                "task tool handler failed: {error}"
-            ))),
-        }
+            {
+                Ok(result) => result,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => Err(ToolError::execution_failed(format!(
+                    "task tool handler failed: {error}"
+                ))),
+            };
+        result.map_err(crate::message::agent_action_tools::sanitize_agent_tool_error)
     }
 }
 
@@ -1098,6 +1194,101 @@ impl TaskToolHandler {
         Ok(Some(output))
     }
 
+    async fn prepare_bound_task_action(
+        &self,
+        invocation: &ToolInvocation,
+        tool: AgentModelToolName,
+        arguments: JsonValue,
+        required_capability: AgentToolCapability,
+        task_ids: &[String],
+    ) -> Result<Option<crate::authorization::AgentActionCommitPlan>, ToolError> {
+        let Some(binding) = self
+            .processor
+            .agent_action_binding(self.context.turn_id.as_str())
+            .await
+        else {
+            return Ok(None);
+        };
+        if !binding.capabilities.contains(&required_capability) {
+            return Err(task_tool_authorization_error());
+        }
+        let (execution_id, root_execution_id) = {
+            let adapter = binding.adapter.lock().await;
+            (
+                adapter.execution_id().clone(),
+                adapter.work_graph_root_execution_id().clone(),
+            )
+        };
+        crate::message::agent_action_tools::authorize_task_observations(
+            self.processor.as_ref(),
+            &execution_id,
+            &root_execution_id,
+            task_ids,
+        )
+        .await?;
+        let source_fence = crate::message::agent_action_tools::current_agent_identity_source_fence(
+            self.processor.as_ref(),
+            execution_id.as_str(),
+        )
+        .await
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "Agent identity source revalidation failed: {error:#}"
+            ))
+        })?;
+
+        let mut adapter = binding.adapter.lock().await;
+        let intent = adapter
+            .intent_from_model_call(
+                invocation.call_id.as_str(),
+                tool,
+                arguments,
+                Some(&binding.options),
+            )
+            .map_err(crate::message::agent_action_tools::adapter_tool_error)?
+            .ok_or_else(task_tool_authorization_error)?;
+        let prepared = adapter
+            .prepare(&intent)
+            .map_err(crate::message::agent_action_tools::adapter_tool_error)?;
+        let policy_fingerprint = adapter.policy_fingerprint().to_owned();
+        let policy_generation = adapter.current_policy_generation();
+        let mut plan = adapter
+            .prepare_commit(
+                &prepared,
+                None,
+                policy_fingerprint.as_str(),
+                policy_generation,
+            )
+            .map_err(crate::message::agent_action_tools::adapter_tool_error)?;
+        crate::message::agent_action_tools::apply_current_identity_source_fence(
+            &mut plan,
+            &source_fence,
+        );
+        Ok(Some(plan))
+    }
+
+    fn attach_agent_action_result(
+        output: &mut JsonValue,
+        plan: Option<&crate::authorization::AgentActionCommitPlan>,
+    ) -> Result<(), ToolError> {
+        let Some(plan) = plan else {
+            return Ok(());
+        };
+        let object = output
+            .as_object_mut()
+            .ok_or_else(|| ToolError::internal("Task mutation output is not an object"))?;
+        object.insert(
+            "agentAction".to_owned(),
+            serde_json::to_value(crate::authorization::BoundAgentActionAdapter::safe_result(
+                &plan.projection,
+            ))
+            .map_err(|error| {
+                ToolError::internal(format!("failed to encode agent action result: {error}"))
+            })?,
+        );
+        Ok(())
+    }
+
     async fn handle_create(
         &self,
         invocation: ToolInvocation,
@@ -1110,6 +1301,30 @@ impl TaskToolHandler {
             )
             .await?;
         let input: TaskCreateToolInput = decode_tool_args(invocation.clone())?;
+        let requested_target_option_id = input.target_option_id.clone();
+        let trigger_kind = input
+            .trigger
+            .as_ref()
+            .map(TaskTriggerToolInput::kind)
+            .unwrap_or(TaskTriggerKind::Immediate);
+        let requested_launch = input
+            .launch
+            .clone()
+            .unwrap_or_else(|| AgentToolLaunchSelection {
+                identity: AgentToolIdentityChoice::InheritParent,
+                profile: AgentToolProfileChoice::InheritParent,
+                reasoning: None,
+                permission_profile: None,
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+            });
+        let server_launch = requested_launch.clone().into_server_selection();
+        let template_fingerprint = {
+            let canonical = serde_json::to_vec(&input).map_err(|error| {
+                ToolError::internal(format!("failed to fingerprint task_create: {error}"))
+            })?;
+            hex::encode(Sha256::digest(canonical))
+        };
         let cache_key = self.mutation_cache_key(&invocation);
         let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
         if let Some(output) = self
@@ -1118,7 +1333,27 @@ impl TaskToolHandler {
         {
             return Ok(function_output(output));
         }
-        let params = self.create_params(input, authorization).await?;
+        let mut params = self.create_params(input, authorization).await?;
+        let agent_binding = self
+            .processor
+            .agent_action_binding(self.context.turn_id.as_str())
+            .await
+            .ok_or_else(task_tool_authorization_error)?;
+        params.launch = Some(server_launch.clone());
+        let nested_task = params.parent_task_id.is_some();
+        let immediate_detached = trigger_kind == TaskTriggerKind::Immediate
+            && params
+                .lifecycle_policy
+                .as_ref()
+                .map(|policy| policy.attachment)
+                .unwrap_or_else(|| {
+                    pioneer_tasks::default_lifecycle_policy(
+                        trigger_kind,
+                        params.created_by_turn_id.is_some(),
+                    )
+                    .attachment
+                })
+                == TaskAttachmentMode::Detached;
         let execution_admission = authorization
             .authorize_execution_intent(self.processor.as_ref(), &params)
             .await?;
@@ -1131,6 +1366,220 @@ impl TaskToolHandler {
                     "failed to freeze detached Task context: {error:#}"
                 ))
             })?;
+        // Agent-authored Task creation is bound to the exact execution that
+        // owns this turn.  Do not reuse the initiating human principal as the
+        // durable creator when the execution-bound action adapter is present.
+        let mut routed_task_return = None;
+        let binding = agent_binding;
+        let required_capability = if trigger_kind == TaskTriggerKind::Immediate {
+            AgentToolCapability::TaskCreate
+        } else {
+            AgentToolCapability::TaskSchedule
+        };
+        if !binding.capabilities.contains(&required_capability) {
+            return Err(task_tool_authorization_error());
+        }
+        let execution_id = {
+            let adapter = binding.adapter.lock().await;
+            adapter.execution_id().as_str().to_owned()
+        };
+        let source_fence = crate::message::agent_action_tools::current_agent_identity_source_fence(
+            self.processor.as_ref(),
+            execution_id.as_str(),
+        )
+        .await
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "Agent identity source revalidation failed: {error:#}"
+            ))
+        })?;
+        let mut adapter = binding.adapter.lock().await;
+        let mut server_required_actions = Vec::new();
+        if nested_task {
+            server_required_actions.push(crate::authorization::ResourceAction::ChildTaskCreate);
+        }
+        if immediate_detached {
+            server_required_actions.push(crate::authorization::ResourceAction::TaskDetach);
+        }
+        adapter
+            .require_source_actions(server_required_actions)
+            .map_err(crate::message::agent_action_tools::adapter_tool_error)?;
+        let snapshot = adapter.presentation_snapshot();
+        create_context.actor_id = Some(snapshot.agent_execution_id.to_string());
+        create_context.creator_presentation_snapshot = Some(snapshot);
+        let creator_work_graph_root_execution_id =
+            adapter.work_graph_root_execution_id().to_string();
+        create_context.creator_work_graph_root_execution_id =
+            Some(creator_work_graph_root_execution_id.clone());
+        if trigger_kind == TaskTriggerKind::Immediate {
+            create_context.work_graph_root_execution_id =
+                Some(creator_work_graph_root_execution_id);
+        }
+        create_context.launch_selection = Some(server_launch.clone());
+        let (identity, profile) = if matches!(
+            server_launch.agent,
+            pioneer_protocol::AgentIdentitySelection::ServerDerivedEphemeral { .. }
+        ) {
+            adapter
+                .resolve_ephemeral_task_launch(&server_launch, invocation.call_id.as_str())
+                .map_err(crate::message::agent_action_tools::adapter_tool_error)?
+        } else {
+            adapter
+                .resolve_task_launch(&server_launch)
+                .map_err(crate::message::agent_action_tools::adapter_tool_error)?
+        };
+        create_context.resolved_launch_identity = Some(identity);
+        create_context.resolved_launch_profile = Some(profile);
+        let target_option_id = requested_target_option_id
+            .clone()
+            .unwrap_or_else(|| adapter.current_target_option_id());
+
+        let (tool, arguments) = if trigger_kind == TaskTriggerKind::Immediate {
+            (
+                AgentModelToolName::CreateTask,
+                serde_json::to_value(AgentTaskToolInput {
+                    target_option_id: target_option_id.clone(),
+                    task_template_id: template_fingerprint,
+                    launch: requested_launch.clone(),
+                }),
+            )
+        } else {
+            (
+                AgentModelToolName::ScheduleTask,
+                serde_json::to_value(AgentScheduleTaskToolInput {
+                    target_option_id,
+                    task_template_id: template_fingerprint,
+                    schedule_option_id: format!("server-trigger:{trigger_kind:?}"),
+                    launch: requested_launch.clone(),
+                }),
+            )
+        };
+        let arguments = arguments.map_err(|error| {
+            ToolError::internal(format!("failed to encode canonical Task action: {error}"))
+        })?;
+        let intent = adapter
+            .intent_from_model_call(
+                invocation.call_id.as_str(),
+                tool,
+                arguments,
+                Some(&binding.options),
+            )
+            .map_err(crate::message::agent_action_tools::adapter_tool_error)?
+            .ok_or_else(task_tool_authorization_error)?;
+        let prepared = adapter
+            .prepare(&intent)
+            .map_err(crate::message::agent_action_tools::adapter_tool_error)?;
+        if let (Some(identity), Some(profile)) = (
+            create_context.resolved_launch_identity.as_ref(),
+            create_context.resolved_launch_profile.as_ref(),
+        ) {
+            create_context.agent_authorization_grant = Some(
+                adapter
+                    .task_authorization_grant_seed(&prepared, identity, profile)
+                    .map_err(crate::message::agent_action_tools::adapter_tool_error)?,
+            );
+        }
+        let policy_fingerprint = adapter.policy_fingerprint().to_owned();
+        let policy_generation = adapter.current_policy_generation();
+        let mut plan = adapter
+            .prepare_commit(
+                &prepared,
+                None,
+                policy_fingerprint.as_str(),
+                policy_generation,
+            )
+            .map_err(crate::message::agent_action_tools::adapter_tool_error)?;
+        crate::message::agent_action_tools::apply_current_identity_source_fence(
+            &mut plan,
+            &source_fence,
+        );
+        match prepared.normalized.target.as_ref() {
+            Some(pioneer_protocol::AgentStartTarget::CurrentThread) | None => {}
+            Some(pioneer_protocol::AgentStartTarget::SameCapsuleThread { thread_id }) => {
+                create_context.execution_destination_thread_id = Some(thread_id.clone());
+            }
+            Some(pioneer_protocol::AgentStartTarget::RoutedThread {
+                route_id,
+                thread_id,
+            }) => {
+                let route = prepared
+                    .route
+                    .as_ref()
+                    .ok_or_else(task_tool_authorization_error)?;
+                if route.route_id != route_id.as_str() || route.destination_thread_id != *thread_id
+                {
+                    return Err(task_tool_authorization_error());
+                }
+                validate_routed_task_disclosure(&params, route.disclosure)?;
+                create_context.execution_destination_thread_id = Some(thread_id.clone());
+                create_context.execution_route_id = Some(route.route_id.clone());
+                create_context.execution_route_receipt_json = plan.input.route_receipt_json.clone();
+                create_context.execution_route_expires_at_millis = route.expires_at_millis;
+                routed_task_return = route
+                    .return_route_id
+                    .as_ref()
+                    .map(|return_route_id| (route.route_id.clone(), return_route_id.clone()));
+            }
+        }
+        let agent_action_projection = plan.projection;
+        create_context.agent_action_commit = Some(plan.input);
+        if let Some((ingress_route_id, return_route_id)) = routed_task_return {
+            let database = self.processor.crud_store.database_connection();
+            let ingress = pioneer_crud::load_agent_delegation_route(&database, &ingress_route_id)
+                .await
+                .map_err(|_| task_tool_authorization_error())?
+                .ok_or_else(task_tool_authorization_error)?;
+            let return_route =
+                pioneer_crud::load_agent_delegation_route(&database, &return_route_id)
+                    .await
+                    .map_err(|_| task_tool_authorization_error())?
+                    .ok_or_else(task_tool_authorization_error)?;
+            let ingress = pioneer_crud::agent_delegation_route_projection(&ingress)
+                .map_err(|_| task_tool_authorization_error())?;
+            let return_route = pioneer_crud::agent_delegation_route_projection(&return_route)
+                .map_err(|_| task_tool_authorization_error())?;
+            let now_millis = pioneer_crud::utc_now().timestamp_millis();
+            let selected_identity = create_context
+                .resolved_launch_identity
+                .as_ref()
+                .ok_or_else(task_tool_authorization_error)?;
+            if return_route.kind != pioneer_protocol::AgentRouteKind::IdentityBound
+                || return_route.source_agent_identity_id != selected_identity.id
+                || !ingress.can_return_result_via(&return_route, Some(now_millis))
+            {
+                return Err(task_tool_authorization_error());
+            }
+            if let Some(policy) = params.delivery_policy.as_ref()
+                && policy.include_result
+                && !return_route.disclosure.permits_result_format(policy.format)
+            {
+                return Err(task_tool_authorization_error());
+            }
+            if params.delivery_policy.as_ref().is_some_and(|policy| {
+                policy.mode == TaskDeliveryMode::Thread
+                    && policy.thread_id.as_deref()
+                        != Some(return_route.destination_thread_id.as_str())
+            }) {
+                return Err(task_tool_authorization_error());
+            }
+            let return_facts =
+                crate::authorization::AgentRouteFacts::from_projection(&return_route)
+                    .map_err(|_| task_tool_authorization_error())?;
+            if params.delivery_policy.as_ref().is_some_and(|policy| {
+                matches!(
+                    policy.mode,
+                    TaskDeliveryMode::Thread | TaskDeliveryMode::UserNotification
+                )
+            }) {
+                create_context.delivery_route_id = Some(return_route.id.to_string());
+                create_context.delivery_route_receipt_json =
+                    Some(crate::authorization::safe_route_receipt(
+                        &return_facts,
+                        pioneer_protocol::AgentActionKind::DeliverResult,
+                    ));
+                create_context.delivery_route_expires_at_millis = return_route.expires_at;
+            }
+        }
         create_context.execution_admission = execution_admission;
         if let Some(seed) = create_context.execution_admission.as_ref() {
             self.processor
@@ -1156,7 +1605,18 @@ impl TaskToolHandler {
                 }
             };
         let anchor = self.persist_task_anchor(response.task.id.as_str()).await?;
-        let output = task_create_tool_output(&response, &anchor);
+        let mut output = task_create_tool_output(&response, &anchor);
+        if let Some(object) = output.as_object_mut() {
+            object.insert(
+                "agentAction".to_owned(),
+                serde_json::to_value(crate::authorization::BoundAgentActionAdapter::safe_result(
+                    &agent_action_projection,
+                ))
+                .map_err(|error| {
+                    ToolError::internal(format!("failed to encode agent action result: {error}"))
+                })?,
+            );
+        }
         self.cache_mutation_output(cache_key.as_deref(), &output)
             .await;
         Ok(function_output(output))
@@ -1178,6 +1638,39 @@ impl TaskToolHandler {
         authorization
             .authorize_wait_targets(self.processor.crud_store.as_ref(), &params)
             .await?;
+        if let Some(binding) = self
+            .processor
+            .agent_action_binding(self.context.turn_id.as_str())
+            .await
+        {
+            if !binding
+                .capabilities
+                .contains(&AgentToolCapability::TaskObserve)
+            {
+                return Err(task_tool_authorization_error());
+            }
+            let mut task_ids = params.task_ids.clone();
+            for run_id in &params.run_ids {
+                let run = self
+                    .processor
+                    .crud_store
+                    .get_task_run(run_id.as_str())
+                    .await
+                    .map_err(|_| task_tool_authorization_error())?
+                    .ok_or_else(task_tool_authorization_error)?;
+                task_ids.push(run.task_id);
+            }
+            task_ids.sort();
+            task_ids.dedup();
+            let adapter = binding.adapter.lock().await;
+            crate::message::agent_action_tools::authorize_task_observations(
+                self.processor.as_ref(),
+                adapter.execution_id(),
+                adapter.work_graph_root_execution_id(),
+                task_ids.as_slice(),
+            )
+            .await?;
+        }
 
         let signature = TaskWaitSignature::from_params(&params);
 
@@ -1334,11 +1827,37 @@ impl TaskToolHandler {
             return Ok(function_output(output));
         }
 
+        let action_plan = self
+            .prepare_bound_task_action(
+                &invocation,
+                AgentModelToolName::ReviewTask,
+                serde_json::to_value(AgentReviewTaskToolInput {
+                    task_id: params.task_id.clone(),
+                    decision: AgentReviewDecision::Accept,
+                })
+                .map_err(|error| {
+                    ToolError::internal(format!("failed to encode task_accept action: {error}"))
+                })?,
+                AgentToolCapability::TaskReview,
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
+
         let service = self.processor.task_runtime.service();
-        let context = pioneer_tasks::TaskMutationContext::parent_agent(
+        let mut context = pioneer_tasks::TaskMutationContext::parent_agent(
             self.context.thread_id.clone(),
             self.context.turn_id.clone(),
         );
+        context.actor_id = Some(
+            action_plan
+                .as_ref()
+                .ok_or_else(task_tool_authorization_error)?
+                .projection
+                .execution_id
+                .as_str()
+                .to_owned(),
+        );
+        context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
         let response = match task_tool_fresh_task(async move {
             service.accept_task_result_candidate(context, params).await
         })
@@ -1355,7 +1874,8 @@ impl TaskToolHandler {
             }
         };
         let final_answer_allowed = self.final_answer_allowed_after_accept(&response).await;
-        let output = task_accept_tool_output(&response, final_answer_allowed);
+        let mut output = task_accept_tool_output(&response, final_answer_allowed);
+        Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(cache_key.as_deref(), &output)
             .await;
         Ok(function_output(output))
@@ -1394,12 +1914,38 @@ impl TaskToolHandler {
             return Ok(function_output(output));
         }
 
+        let action_plan = self
+            .prepare_bound_task_action(
+                &invocation,
+                AgentModelToolName::ReviewTask,
+                serde_json::to_value(AgentReviewTaskToolInput {
+                    task_id: params.task_id.clone(),
+                    decision: AgentReviewDecision::RequestChanges,
+                })
+                .map_err(|error| {
+                    ToolError::internal(format!("failed to encode task_revise action: {error}"))
+                })?,
+                AgentToolCapability::TaskReview,
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
+
         let service = self.processor.task_runtime.service();
         let executor = self.processor.task_agent_executor.clone();
-        let context = pioneer_tasks::TaskMutationContext::parent_agent(
+        let mut context = pioneer_tasks::TaskMutationContext::parent_agent(
             self.context.thread_id.clone(),
             self.context.turn_id.clone(),
         );
+        context.actor_id = Some(
+            action_plan
+                .as_ref()
+                .ok_or_else(task_tool_authorization_error)?
+                .projection
+                .execution_id
+                .as_str()
+                .to_owned(),
+        );
+        context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
         let response = match task_tool_fresh_task(async move {
             let revised = service
                 .revise_task_result_candidate(context, params)
@@ -1418,7 +1964,8 @@ impl TaskToolHandler {
                 )));
             }
         };
-        let output = task_revise_tool_output(&response);
+        let mut output = task_revise_tool_output(&response);
+        Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(cache_key.as_deref(), &output)
             .await;
         Ok(function_output(output))
@@ -1446,14 +1993,32 @@ impl TaskToolHandler {
         {
             return Ok(function_output(output));
         }
+        let action_plan = self
+            .prepare_bound_task_action(
+                &invocation,
+                AgentModelToolName::ControlTask,
+                serde_json::to_value(AgentControlTaskToolInput {
+                    task_id: params.task_id.clone(),
+                    control: AgentTaskControl::Cancel,
+                })
+                .map_err(|error| {
+                    ToolError::internal(format!("failed to encode task_cancel action: {error}"))
+                })?,
+                AgentToolCapability::TaskControl,
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
+        let mut mutation_context = authorization.mutation_context(&self.context);
+        mutation_context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
         let response = self
             .processor
             .task_runtime
             .service()
-            .cancel_task(authorization.mutation_context(&self.context), params)
+            .cancel_task(mutation_context, params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        let output = json!({ "task": task_summary(&response.task) });
+        let mut output = json!({ "task": task_summary(&response.task) });
+        Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(cache_key.as_deref(), &output)
             .await;
         Ok(function_output(output))
@@ -1517,7 +2082,7 @@ impl TaskToolHandler {
         invocation: ToolInvocation,
         authorization: &TaskToolAuthorizationScope,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        let input: TaskIdToolInput = decode_tool_args(invocation)?;
+        let input: TaskIdToolInput = decode_tool_args(invocation.clone())?;
         let params = input.into_detach_params()?;
         authorization
             .authorize_task(
@@ -1526,16 +2091,43 @@ impl TaskToolHandler {
                 crate::authorization::ResourceAction::TaskDetach,
             )
             .await?;
+        let cache_key = self.mutation_cache_key(&invocation);
+        let _mutation_guard = self.mutation_key_guard(cache_key.as_deref()).await;
+        if let Some(output) = self
+            .cached_or_prior_mutation_output(&invocation, cache_key.as_deref())
+            .await?
+        {
+            return Ok(function_output(output));
+        }
+        let action_plan = self
+            .prepare_bound_task_action(
+                &invocation,
+                AgentModelToolName::ControlTask,
+                serde_json::to_value(AgentControlTaskToolInput {
+                    task_id: params.task_id.clone(),
+                    control: AgentTaskControl::Detach,
+                })
+                .map_err(|error| {
+                    ToolError::internal(format!("failed to encode task_detach action: {error}"))
+                })?,
+                AgentToolCapability::TaskControl,
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
+        let mut mutation_context = authorization.mutation_context(&self.context);
+        mutation_context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
         let response = self
             .processor
             .task_runtime
             .service()
-            .detach_task(authorization.mutation_context(&self.context), params)
+            .detach_task(mutation_context, params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        Ok(function_output(
-            json!({ "task": task_summary(&response.task) }),
-        ))
+        let mut output = json!({ "task": task_summary(&response.task) });
+        Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
+        self.cache_mutation_output(cache_key.as_deref(), &output)
+            .await;
+        Ok(function_output(output))
     }
 
     async fn handle_list(
@@ -1625,6 +2217,29 @@ impl TaskToolHandler {
         let configuration_allowed = authorization
             .task_configuration_allowed(self.processor.crud_store.as_ref(), params.task_id.as_str())
             .await;
+        if let Some(binding) = self
+            .processor
+            .agent_action_binding(self.context.turn_id.as_str())
+            .await
+        {
+            if !binding
+                .capabilities
+                .contains(&AgentToolCapability::ResultRead)
+                && !binding
+                    .capabilities
+                    .contains(&AgentToolCapability::TaskObserve)
+            {
+                return Err(task_tool_authorization_error());
+            }
+            let adapter = binding.adapter.lock().await;
+            crate::message::agent_action_tools::authorize_task_observations(
+                self.processor.as_ref(),
+                adapter.execution_id(),
+                adapter.work_graph_root_execution_id(),
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
+        }
         let _observation = authorization
             .acquire_observation_page(self.processor.as_ref())
             .await?;
@@ -1744,6 +2359,21 @@ impl TaskToolHandler {
         {
             return Ok(function_output(output));
         }
+        let action_plan = self
+            .prepare_bound_task_action(
+                &invocation,
+                AgentModelToolName::ControlTask,
+                serde_json::to_value(AgentControlTaskToolInput {
+                    task_id: params.task_id.clone(),
+                    control: AgentTaskControl::Resume,
+                })
+                .map_err(|error| {
+                    ToolError::internal(format!("failed to encode task_resume action: {error}"))
+                })?,
+                AgentToolCapability::TaskControl,
+                std::slice::from_ref(&params.task_id),
+            )
+            .await?;
         let execution_admission = self
             .processor
             .task_execution_readmission_seed(
@@ -1755,6 +2385,7 @@ impl TaskToolHandler {
             .map_err(|_| task_tool_authorization_error())?;
         let mut mutation_context = authorization.mutation_context(&self.context);
         mutation_context.execution_admission = execution_admission;
+        mutation_context.agent_action_commit = action_plan.as_ref().map(|plan| plan.input.clone());
         let response = self
             .processor
             .task_runtime
@@ -1762,10 +2393,11 @@ impl TaskToolHandler {
             .resume_task(mutation_context, params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
-        let output = json!({
+        let mut output = json!({
             "task": task_summary(&response.task),
             "triggers": task_trigger_details_output(&response.triggers),
         });
+        Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(cache_key.as_deref(), &output)
             .await;
         Ok(function_output(output))
@@ -1778,6 +2410,8 @@ impl TaskToolHandler {
     ) -> Result<TaskCreateParams, ToolError> {
         let title = required_tool_string(Some(input.title.as_str()), "title")?;
         let goal = required_tool_string(Some(input.goal.as_str()), "goal")?;
+        validate_model_visible_context_policy(input.context_policy.as_ref())?;
+        validate_model_task_tool_policy(input.tool_policy.as_ref())?;
         let (model, model_provider) =
             current_thread_model_identity(&self.processor, &self.context).await?;
         let trigger = input
@@ -1842,6 +2476,7 @@ impl TaskToolHandler {
             goal,
             priority: input.priority.unwrap_or_default(),
             trigger,
+            launch: None,
             agent_spec,
             lifecycle_policy,
             delivery_policy,
@@ -1957,6 +2592,8 @@ impl TaskToolHandler {
                 "`task_update` cannot clear and set input in the same request",
             ));
         }
+        validate_model_visible_context_policy(input.context_policy.as_ref())?;
+        validate_model_task_tool_policy(input.tool_policy.as_ref())?;
 
         let task_id = validate_entity_id(input.task_id, "taskId")?;
         let trigger = input
@@ -2113,6 +2750,15 @@ struct TaskCreateToolInput {
     title: String,
     /// Short concrete objective for the task executor. Put durable run instructions in instructions, task data in inputText/input, and result format in outputInstructions.
     goal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Opaque destination from agent_start_options. Omit for the current
+    /// thread. A routed option is revalidated at Task commit and again for
+    /// every occurrence; raw thread or route ids are never accepted here.
+    target_option_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional child identity/profile selection from agent_start_options.
+    /// Omit to inherit the currently bound agent identity and profile.
+    launch: Option<AgentToolLaunchSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Omit for an immediate attached subagent. Use this object directly; do not wrap it in spec, schedule, or triggerInput. For daily scheduled work choose the cron trigger kind and fill its leaf fields.
     trigger: Option<TaskTriggerToolInput>,
@@ -2330,6 +2976,18 @@ enum TaskTriggerToolInput {
 }
 
 impl TaskTriggerToolInput {
+    fn kind(&self) -> TaskTriggerKind {
+        match self {
+            Self::Immediate => TaskTriggerKind::Immediate,
+            Self::ScheduledAt { .. } => TaskTriggerKind::ScheduledAt,
+            Self::Interval { .. } => TaskTriggerKind::Interval,
+            Self::Cron { .. } => TaskTriggerKind::Cron,
+            Self::Manual { .. } => TaskTriggerKind::Manual,
+            Self::External { .. } => TaskTriggerKind::External,
+            Self::Dependency { .. } => TaskTriggerKind::Dependency,
+        }
+    }
+
     fn into_trigger_input(self) -> Result<TaskTriggerInput, ToolError> {
         let spec = match self {
             Self::Immediate => TaskTriggerSpec::Immediate,
@@ -2396,11 +3054,11 @@ impl TaskTriggerToolInput {
 struct TaskWaitToolInput {
     /// Active attached task ids to join. Each Pioneer entity id is exactly 21 characters. Use taskIds, not taskId, even for one task. Do not wait on scheduled/interval/cron tasks with waitable=false or runId=null; confirm their schedule instead.
     #[serde(default)]
-    #[schemars(inner(length(min = 21, max = 21)))]
+    #[schemars(length(max = 64), inner(length(min = 21, max = 21)))]
     task_ids: Vec<String>,
     /// Task run ids to join. Each Pioneer entity id is exactly 21 characters.
     #[serde(default)]
-    #[schemars(inner(length(min = 21, max = 21)))]
+    #[schemars(length(max = 64), inner(length(min = 21, max = 21)))]
     run_ids: Vec<String>,
     /// Optional timeout in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2424,6 +3082,14 @@ impl TaskWaitToolInput {
         if task_ids.is_empty() && run_ids.is_empty() {
             return Err(ToolError::invalid_arguments(
                 "`task_wait` requires at least one id in `taskIds` or `runIds`",
+            ));
+        }
+        if task_ids.len().saturating_add(run_ids.len()) > MAX_TASK_OBSERVATION_TARGETS
+            || task_ids.iter().collect::<BTreeSet<_>>().len() != task_ids.len()
+            || run_ids.iter().collect::<BTreeSet<_>>().len() != run_ids.len()
+        {
+            return Err(ToolError::invalid_arguments(
+                "`task_wait` accepts at most 64 distinct observation targets",
             ));
         }
         Ok(pioneer_protocol::TaskWaitParams {
@@ -3229,6 +3895,9 @@ fn merge_task_agent_input(
             }
         }
     }
+    if let Some(input) = input.as_ref() {
+        validate_model_visible_task_agent_input(input, "input")?;
+    }
     Ok(input)
 }
 
@@ -3238,6 +3907,140 @@ fn normalize_task_agent_input(mut input: TaskAgentInput) -> TaskAgentInput {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     input
+}
+
+fn validate_model_visible_context_policy(
+    policy: Option<&TaskAgentContextPolicy>,
+) -> Result<(), ToolError> {
+    let Some(context) = policy.and_then(|policy| policy.custom_context.as_ref()) else {
+        return Ok(());
+    };
+    validate_model_visible_artifact_sources(
+        &context.attachments,
+        &context.references,
+        "contextPolicy.customContext",
+    )
+}
+
+fn validate_model_visible_task_agent_input(
+    input: &TaskAgentInput,
+    field: &str,
+) -> Result<(), ToolError> {
+    validate_model_visible_artifact_sources(&input.attachments, &input.references, field)
+}
+
+fn validate_routed_task_disclosure(
+    params: &TaskCreateParams,
+    disclosure: pioneer_protocol::AgentRouteDisclosurePolicy,
+) -> Result<(), ToolError> {
+    // A routed Task carries explicit user/agent-provided Task facts even when
+    // the canonical action intent contains only the opaque server template.
+    if !disclosure.user_input || !disclosure.text {
+        return Err(task_tool_authorization_error());
+    }
+    let Some(spec) = params.agent_spec.as_ref() else {
+        return Ok(());
+    };
+    let input_uses_artifacts = spec.prompt.input.as_ref().is_some_and(|input| {
+        !input.attachments.is_empty()
+            || input.references.iter().any(|reference| {
+                reference.kind == pioneer_protocol::TaskAgentInputReferenceKind::Artifact
+            })
+    });
+    let context_uses_artifacts = spec.context_policy.as_ref().is_some_and(|policy| {
+        policy.include_artifacts
+            || policy.custom_context.as_ref().is_some_and(|context| {
+                !context.attachments.is_empty()
+                    || context.references.iter().any(|reference| {
+                        reference.kind == pioneer_protocol::TaskAgentInputReferenceKind::Artifact
+                    })
+            })
+    });
+    if (input_uses_artifacts || context_uses_artifacts) && !disclosure.artifacts {
+        return Err(task_tool_authorization_error());
+    }
+    let exports_parent_context = spec.context_policy.as_ref().is_some_and(|policy| {
+        policy.include_parent_summary
+            || !matches!(
+                policy.mode,
+                pioneer_protocol::TaskAgentContextMode::Empty
+                    | pioneer_protocol::TaskAgentContextMode::Custom
+            )
+    });
+    if exports_parent_context && !disclosure.context {
+        return Err(task_tool_authorization_error());
+    }
+    Ok(())
+}
+
+fn validate_model_visible_artifact_sources(
+    attachments: &[pioneer_protocol::TaskAgentInputAttachment],
+    references: &[pioneer_protocol::TaskAgentInputReference],
+    field: &str,
+) -> Result<(), ToolError> {
+    for attachment in attachments {
+        if attachment.kind != pioneer_protocol::TaskAgentInputAttachmentKind::Artifact {
+            return Err(ToolError::invalid_arguments(format!(
+                "`{field}.attachments` accepts only authorized artifact handles; local files and external URLs are not model-visible Task input"
+            )));
+        }
+        if attachment.path.is_some() || attachment.url.is_some() {
+            return Err(ToolError::invalid_arguments(format!(
+                "`{field}.attachments` must not contain host paths or URLs; use an exact authorized artifactId/versionId handle"
+            )));
+        }
+        validate_exact_artifact_handle_component(
+            attachment.artifact_id.as_deref(),
+            field,
+            "artifactId",
+        )?;
+        validate_exact_artifact_handle_component(
+            attachment.version_id.as_deref(),
+            field,
+            "versionId",
+        )?;
+    }
+    for reference in references {
+        if reference.kind != pioneer_protocol::TaskAgentInputReferenceKind::Artifact {
+            continue;
+        }
+        validate_exact_artifact_handle_component(Some(reference.id.as_str()), field, "id")?;
+        validate_exact_artifact_handle_component(
+            reference.version_id.as_deref(),
+            field,
+            "versionId",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_exact_artifact_handle_component(
+    value: Option<&str>,
+    field: &str,
+    component: &str,
+) -> Result<(), ToolError> {
+    let Some(value) = value else {
+        return Err(ToolError::invalid_arguments(format!(
+            "`{field}` artifact handle requires `{component}`"
+        )));
+    };
+    if value.is_empty() || value.trim() != value {
+        return Err(ToolError::invalid_arguments(format!(
+            "`{field}` artifact handle requires an exact non-empty `{component}`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_model_task_tool_policy(
+    policy: Option<&pioneer_protocol::TaskAgentToolPolicy>,
+) -> Result<(), ToolError> {
+    if policy.is_some_and(|policy| !policy.allowed_paths.is_empty()) {
+        return Err(ToolError::invalid_arguments(
+            "model-facing Task tools do not accept raw `toolPolicy.allowedPaths`; child filesystem authority is inherited from the immutable execution security cap",
+        ));
+    }
+    Ok(())
 }
 
 fn requires_durable_agent_prompt(kind: TaskTriggerKind) -> bool {
@@ -4768,6 +5571,7 @@ mod tests {
             trigger: TaskTriggerInput {
                 spec: TaskTriggerSpec::Immediate,
             },
+            launch: None,
             agent_spec: None,
             lifecycle_policy: None,
             delivery_policy: None,
@@ -5077,6 +5881,10 @@ mod tests {
                 run_id: "run_12345678901234567".to_owned(),
                 task_run_turn_id: "task_run_turn_123456".to_owned(),
                 reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                reviewer: pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+                    pioneer_protocol::AgentExecutionId::new("R".repeat(21))
+                        .expect("parent reviewer execution id"),
+                ),
                 reviewer_thread_id: Some("thread_parent1234567".to_owned()),
                 reviewer_turn_id: Some("turn_parent12345678".to_owned()),
                 reviewer_user_id: None,
@@ -5139,6 +5947,10 @@ mod tests {
                 run_id: "run_12345678901234567".to_owned(),
                 task_run_turn_id: "task_run_turn_123456".to_owned(),
                 reviewer_kind: TaskResultReviewerKind::ParentAgent,
+                reviewer: pioneer_protocol::TaskResultReviewerRef::AgentExecution(
+                    pioneer_protocol::AgentExecutionId::new("R".repeat(21))
+                        .expect("parent reviewer execution id"),
+                ),
                 reviewer_thread_id: Some("thread_parent1234567".to_owned()),
                 reviewer_turn_id: Some("turn_parent12345678".to_owned()),
                 reviewer_user_id: None,
@@ -5977,6 +6789,114 @@ mod tests {
             }),
         )
         .expect_err("conflicting inputText and input.text should be rejected");
+    }
+
+    #[test]
+    fn model_visible_task_input_rejects_paths_and_urls() {
+        let local_file = TaskAgentInput {
+            text: None,
+            variables: Vec::new(),
+            attachments: vec![pioneer_protocol::TaskAgentInputAttachment {
+                kind: pioneer_protocol::TaskAgentInputAttachmentKind::File,
+                name: Some("notes".to_owned()),
+                path: Some("/private/project/notes.txt".to_owned()),
+                url: None,
+                artifact_id: None,
+                version_id: None,
+                mime_type: None,
+            }],
+            references: Vec::new(),
+        };
+        merge_task_agent_input(None, Some(local_file))
+            .expect_err("model-visible Task input must reject a local file path");
+
+        let external_url = TaskAgentInput {
+            text: None,
+            variables: Vec::new(),
+            attachments: vec![pioneer_protocol::TaskAgentInputAttachment {
+                kind: pioneer_protocol::TaskAgentInputAttachmentKind::Url,
+                name: None,
+                path: None,
+                url: Some("https://example.test/private".to_owned()),
+                artifact_id: None,
+                version_id: None,
+                mime_type: None,
+            }],
+            references: Vec::new(),
+        };
+        merge_task_agent_input(None, Some(external_url))
+            .expect_err("model-visible Task input must reject an external URL");
+    }
+
+    #[test]
+    fn model_visible_task_input_accepts_only_exact_artifact_handles() {
+        let input = TaskAgentInput {
+            text: Some("review the attached report".to_owned()),
+            variables: Vec::new(),
+            attachments: vec![pioneer_protocol::TaskAgentInputAttachment {
+                kind: pioneer_protocol::TaskAgentInputAttachmentKind::Artifact,
+                name: Some("report".to_owned()),
+                path: None,
+                url: None,
+                artifact_id: Some("artifact_123456789012".to_owned()),
+                version_id: Some("version_1234567890123".to_owned()),
+                mime_type: Some("text/markdown".to_owned()),
+            }],
+            references: vec![pioneer_protocol::TaskAgentInputReference {
+                kind: pioneer_protocol::TaskAgentInputReferenceKind::Artifact,
+                id: "artifact_123456789012".to_owned(),
+                version_id: Some("version_1234567890123".to_owned()),
+                label: Some("source".to_owned()),
+            }],
+        };
+
+        merge_task_agent_input(None, Some(input.clone()))
+            .expect("exact authorized artifact handles should be accepted");
+
+        let mut missing_version = input;
+        missing_version.attachments[0].version_id = None;
+        merge_task_agent_input(None, Some(missing_version))
+            .expect_err("mutable artifact references without an exact version must be rejected");
+    }
+
+    #[test]
+    fn model_task_policy_rejects_raw_filesystem_configuration() {
+        let policy = pioneer_protocol::TaskAgentToolPolicy {
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            write_mode: pioneer_protocol::TaskAgentWriteMode::ReadOnly,
+            allowed_paths: vec!["/private/project".to_owned()],
+            network_access: false,
+        };
+        validate_model_task_tool_policy(Some(&policy))
+            .expect_err("raw filesystem paths must not cross the model tool boundary");
+    }
+
+    #[test]
+    fn model_visible_custom_context_uses_the_same_artifact_boundary() {
+        let policy = TaskAgentContextPolicy {
+            mode: pioneer_protocol::TaskAgentContextMode::Custom,
+            max_turns: None,
+            include_parent_summary: false,
+            include_artifacts: false,
+            custom_context: Some(pioneer_protocol::TaskAgentContext {
+                text: None,
+                variables: Vec::new(),
+                attachments: vec![pioneer_protocol::TaskAgentInputAttachment {
+                    kind: pioneer_protocol::TaskAgentInputAttachmentKind::File,
+                    name: None,
+                    path: Some("/private/project/context.txt".to_owned()),
+                    url: None,
+                    artifact_id: None,
+                    version_id: None,
+                    mime_type: None,
+                }],
+                references: Vec::new(),
+            }),
+        };
+
+        validate_model_visible_context_policy(Some(&policy))
+            .expect_err("custom context must not bypass the model-visible artifact boundary");
     }
 
     #[test]

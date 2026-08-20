@@ -953,6 +953,7 @@ mod tests {
             workspace_id: "ws_1".to_owned(),
             name: None,
             preview: String::new(),
+            preview_author: None,
             mode: ThreadMode::Chat,
             model: "test".to_owned(),
             model_provider: "test".to_owned(),

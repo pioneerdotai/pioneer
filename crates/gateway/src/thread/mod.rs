@@ -56,6 +56,7 @@ pub struct TurnStartRollbackContext {
     pub thread_id: String,
     pub turn_id: String,
     pub previous_preview: String,
+    pub previous_preview_author: Option<pioneer_protocol::TurnAuthorSnapshot>,
     pub previous_status: ThreadStatus,
     pub previous_updated_at: i64,
     pub previous_mode: ThreadMode,
@@ -245,6 +246,7 @@ impl ThreadManager {
                 workspace_id: workspace_id.to_owned(),
                 name,
                 preview: String::new(),
+                preview_author: None,
                 mode: params.mode.unwrap_or(DEFAULT_THREAD_MODE),
                 model,
                 model_provider,
@@ -615,6 +617,7 @@ impl ThreadManager {
                         workspace_id,
                         name: requested_name,
                         preview: String::new(),
+                        preview_author: None,
                         mode,
                         model: model.clone(),
                         model_provider: model_provider.clone(),
@@ -876,6 +879,107 @@ impl ThreadManager {
         .await
     }
 
+    /// Starts an execution-capable Task turn with the immutable Agent actor
+    /// resolved during admission. Runtime lifecycle events may remain
+    /// System-authored, but visible task instructions retain their exact
+    /// AgentExecution author and presentation snapshot.
+    pub async fn agent_turn_start_with_permission_profile(
+        &self,
+        params: TurnStartParams,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        author: pioneer_protocol::TurnAuthorSnapshot,
+    ) -> Result<TurnStartOutcome> {
+        self.agent_turn_start_with_permission_profile_and_origin(
+            params,
+            permission_profile,
+            author,
+            TurnOrigin::User,
+        )
+        .await
+    }
+
+    pub async fn agent_turn_start_with_permission_profile_and_origin(
+        &self,
+        params: TurnStartParams,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        author: pioneer_protocol::TurnAuthorSnapshot,
+        origin: TurnOrigin,
+    ) -> Result<TurnStartOutcome> {
+        self.turn_start_for_actor_with_permission_profile(
+            None,
+            params,
+            Some(permission_profile),
+            Some(author),
+            Vec::new(),
+            origin,
+        )
+        .await
+    }
+
+    /// Rebuild the runtime-only start envelope for a Turn whose canonical
+    /// events were committed before a crash. This method is read-only: the
+    /// durable Turn, author and input remain authoritative and no second Turn
+    /// is appended to the in-memory thread.
+    pub async fn rehydrate_committed_agent_turn(
+        &self,
+        params: &TurnStartParams,
+        persisted_input: Vec<UserInput>,
+    ) -> Result<TurnStartOutcome> {
+        let state = self.state.read().await;
+        let entry = state
+            .threads
+            .get(params.thread_id.as_str())
+            .with_context(|| format!("thread `{}` is not loaded", params.thread_id))?;
+        let turn = entry
+            .thread
+            .turns
+            .iter()
+            .find(|turn| turn.id == params.turn_id)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "committed Agent Turn `{}` is missing from thread `{}`",
+                    params.turn_id, params.thread_id
+                )
+            })?;
+        if turn.status != TurnStatus::InProgress || turn.mode != ThreadMode::Agent {
+            bail!("committed Agent Turn is not runnable");
+        }
+        let started_notification = TurnStartedNotification {
+            workspace_id: entry.thread.workspace_id.clone(),
+            thread_id: entry.thread.id.clone(),
+            turn: turn.clone(),
+        };
+        Ok(TurnStartOutcome {
+            response: TurnStartResponse { turn: turn.clone() },
+            started_notification,
+            started_notification_connection_ids: entry.subscribers.keys().copied().collect(),
+            materialization: TurnStartMaterialization {
+                thread: entry.thread.clone(),
+                turn,
+                input: persisted_input,
+                capabilities: params.capabilities.clone(),
+                sandbox_mode: entry.sandbox_mode,
+            },
+            // Recovery never calls rollback: durable events have already
+            // committed. Keep a structurally valid snapshot for the shared
+            // preparation/dispatch type without granting an undo path.
+            rollback_context: TurnStartRollbackContext {
+                thread_id: entry.thread.id.clone(),
+                turn_id: params.turn_id.clone(),
+                previous_preview: entry.thread.preview.clone(),
+                previous_preview_author: entry.thread.preview_author.clone(),
+                previous_status: entry.thread.status,
+                previous_updated_at: entry.thread.updated_at,
+                previous_mode: entry.thread.mode,
+                previous_model: entry.thread.model.clone(),
+                previous_model_provider: entry.thread.model_provider.clone(),
+                previous_reasoning_effort: entry.thread.reasoning_effort.clone(),
+                previous_sandbox_mode: entry.sandbox_mode,
+            },
+        })
+    }
+
     async fn turn_start_for_actor(
         &self,
         connection_id: Option<ConnectionId>,
@@ -970,6 +1074,7 @@ impl ThreadManager {
         }
 
         let previous_preview = entry.thread.preview.clone();
+        let previous_preview_author = entry.thread.preview_author.clone();
         let previous_status = entry.thread.status;
         let previous_updated_at = entry.thread.updated_at;
         let previous_mode = entry.thread.mode;
@@ -1015,6 +1120,7 @@ impl ThreadManager {
             }) {
                 if !text_input.is_empty() {
                     entry.thread.preview = text_input.to_owned();
+                    entry.thread.preview_author = turn.author.clone();
                 }
             }
         }
@@ -1045,6 +1151,7 @@ impl ThreadManager {
             thread_id: thread_id.to_owned(),
             turn_id: started_notification.turn.id.clone(),
             previous_preview,
+            previous_preview_author,
             previous_status,
             previous_updated_at,
             previous_mode,
@@ -1074,6 +1181,30 @@ impl ThreadManager {
         author: pioneer_protocol::TurnAuthorSnapshot,
         mentions: Vec<pioneer_protocol::TurnMention>,
     ) -> Result<CompletedMessageTurnStartOutcome> {
+        self.prepare_completed_message_turn_for_actor(Some(connection_id), params, author, mentions)
+            .await
+    }
+
+    /// Agent-authored Message preparation has no client subscription. The
+    /// exact execution is authorized before this method and the durable
+    /// transaction remains authoritative; subscribers are only notification
+    /// recipients, never an authorship requirement.
+    pub async fn prepare_completed_agent_message_turn(
+        &self,
+        params: &TurnStartParams,
+        author: pioneer_protocol::TurnAuthorSnapshot,
+    ) -> Result<CompletedMessageTurnStartOutcome> {
+        self.prepare_completed_message_turn_for_actor(None, params, author, Vec::new())
+            .await
+    }
+
+    async fn prepare_completed_message_turn_for_actor(
+        &self,
+        connection_id: Option<ConnectionId>,
+        params: &TurnStartParams,
+        author: pioneer_protocol::TurnAuthorSnapshot,
+        mentions: Vec<pioneer_protocol::TurnMention>,
+    ) -> Result<CompletedMessageTurnStartOutcome> {
         let thread_id = params.thread_id.trim();
         if thread_id.is_empty() {
             bail!("`thread_id` is required for `turn/start`");
@@ -1088,7 +1219,9 @@ impl ThreadManager {
         let Some(entry) = state.threads.get(thread_id) else {
             bail!("thread `{thread_id}` is not loaded");
         };
-        if !entry.subscribers.contains_key(&connection_id) {
+        if let Some(connection_id) = connection_id
+            && !entry.subscribers.contains_key(&connection_id)
+        {
             bail!("connection `{connection_id}` is not subscribed to thread `{thread_id}`");
         }
         if entry.thread.turns.iter().any(|turn| turn.id == turn_id) {
@@ -1127,6 +1260,7 @@ impl ThreadManager {
             && !text.is_empty()
         {
             started_thread.preview = text.to_owned();
+            started_thread.preview_author = started_turn.author.clone();
         }
         started_thread.updated_at = now;
         started_thread.turns.push(started_turn.clone());
@@ -1194,6 +1328,7 @@ impl ThreadManager {
             && !preview.is_empty()
         {
             entry.thread.preview = preview.to_owned();
+            entry.thread.preview_author = outcome.completed_notification.turn.author.clone();
         }
         entry.thread.updated_at = entry.thread.updated_at.max(outcome.final_thread.updated_at);
         entry
@@ -1211,6 +1346,7 @@ impl ThreadManager {
 
         entry.thread.turns.retain(|turn| turn.id != context.turn_id);
         entry.thread.preview = context.previous_preview;
+        entry.thread.preview_author = context.previous_preview_author;
         entry.thread.status = context.previous_status;
         entry.thread.updated_at = context.previous_updated_at;
         entry.thread.mode = context.previous_mode;
@@ -1795,6 +1931,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.to_owned(),
                     turn_id: "turn_running_agent".to_owned(),
                     input: vec![UserInput::Text {
@@ -1806,6 +1943,7 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: Some(ThreadMode::Agent),
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -1822,6 +1960,7 @@ mod tests {
             .prepare_completed_message_turn(
                 10,
                 &TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.to_owned(),
                     turn_id: "turn_message".to_owned(),
                     input: vec![UserInput::Text {
@@ -1833,6 +1972,7 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: Some(ThreadMode::Message),
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -1845,6 +1985,7 @@ mod tests {
                     display_name: "System".to_owned(),
                     nickname: "system".to_owned(),
                     avatar_revision: None,
+                    agent: None,
                 },
                 Vec::new(),
             )
@@ -1921,6 +2062,7 @@ mod tests {
             .await
             .expect("thread should start");
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: "turn_native_duplicate_terminal".to_owned(),
             input: vec![UserInput::Text {
@@ -1932,6 +2074,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: Some(ThreadMode::Agent),
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,
@@ -1984,6 +2127,7 @@ mod tests {
             .await
             .expect("thread should start");
         let params = TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: "turn_native_duplicate_concurrent".to_owned(),
             input: vec![UserInput::Text {
@@ -1995,6 +2139,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: Some(ThreadMode::Agent),
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,
@@ -2039,6 +2184,7 @@ mod tests {
             ("interrupted", TurnStatus::Interrupted),
         ] {
             let params = TurnStartParams {
+                agent_delegation_routes: Vec::new(),
                 thread_id: thread_id.to_owned(),
                 turn_id: format!("turn_terminal_{suffix}"),
                 input: vec![UserInput::Text {
@@ -2050,6 +2196,7 @@ mod tests {
                 model_provider: None,
                 sandbox_policy: None,
                 mode: Some(ThreadMode::Agent),
+                agent_launch: None,
                 reply_to_turn_id: None,
                 mentioned_principal_ids: Vec::new(),
                 execution_backend: None,
@@ -2090,8 +2237,10 @@ mod tests {
             display_name: "System".to_owned(),
             nickname: "system".to_owned(),
             avatar_revision: None,
+            agent: None,
         };
         let params = |turn_id: &str, text: &str| TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             input: vec![UserInput::Text {
@@ -2103,6 +2252,7 @@ mod tests {
             model_provider: None,
             sandbox_policy: None,
             mode: Some(ThreadMode::Message),
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,
@@ -2205,6 +2355,7 @@ mod tests {
             id: "thr_000000000000000099".to_owned(),
             name: Some("seed".to_owned()),
             preview: "seed preview".to_owned(),
+            preview_author: None,
             mode: ThreadMode::Chat,
             model: "o4-mini".to_owned(),
             model_provider: "openai".to_owned(),
@@ -2292,6 +2443,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: Some("restored".to_owned()),
             preview: "running work".to_owned(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "o4-mini".to_owned(),
             model_provider: "openai".to_owned(),
@@ -2348,6 +2500,7 @@ mod tests {
             id: thread_id.to_owned(),
             name: Some("restored detached task".to_owned()),
             preview: "background work".to_owned(),
+            preview_author: None,
             mode: ThreadMode::Agent,
             model: "o4-mini".to_owned(),
             model_provider: "openai".to_owned(),
@@ -2405,6 +2558,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.to_owned(),
                     turn_id: "turn_000000000000000122".to_owned(),
                     input: vec![UserInput::Text {
@@ -2416,6 +2570,7 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -2558,6 +2713,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
                     input: vec![UserInput::Text {
@@ -2569,6 +2725,7 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -2704,6 +2861,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000001".to_owned(),
                     input: vec![UserInput::Text {
@@ -2715,6 +2873,7 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -2759,6 +2918,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000010".to_owned(),
                     model: Some("o3".to_owned()),
@@ -2770,6 +2930,7 @@ mod tests {
                     capabilities: Vec::new(),
                     sandbox_policy: None,
                     mode: None,
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -2814,6 +2975,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000013".to_owned(),
                     input: Vec::new(),
@@ -2822,6 +2984,7 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -2863,6 +3026,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: "thr_missing".to_owned(),
                     turn_id: "turn_000000000000000002".to_owned(),
                     input: Vec::new(),
@@ -2871,6 +3035,7 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -2904,6 +3069,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000099".to_owned(),
                     model: Some("o3".to_owned()),
@@ -2915,6 +3081,7 @@ mod tests {
                     capabilities: Vec::new(),
                     sandbox_policy: None,
                     mode: None,
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,
@@ -2950,6 +3117,7 @@ mod tests {
             .turn_start(
                 10,
                 TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
                     thread_id: thread_outcome.response.thread.id.clone(),
                     turn_id: "turn_000000000000000100".to_owned(),
                     input: vec![UserInput::Text {
@@ -2961,6 +3129,7 @@ mod tests {
                     model_provider: None,
                     sandbox_policy: None,
                     mode: None,
+                    agent_launch: None,
                     reply_to_turn_id: None,
                     mentioned_principal_ids: Vec::new(),
                     execution_backend: None,

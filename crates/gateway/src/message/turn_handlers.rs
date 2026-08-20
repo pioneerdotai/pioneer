@@ -273,6 +273,98 @@ fn native_turn_admission_digest(
     Ok(hex::encode(Sha256::digest(canonical)))
 }
 
+fn validate_root_agent_launch_matches_turn(
+    params: &TurnStartParams,
+) -> Result<(), TurnStartFailure> {
+    let Some(launch) = params.agent_launch.as_ref() else {
+        return Ok(());
+    };
+    if params.mode != Some(pioneer_protocol::ThreadMode::Agent) {
+        return Err(TurnStartFailure::invalid_input(
+            "agent_launch is valid only for an Agent Turn",
+        ));
+    }
+    if launch.execution.reasoning != params.reasoning {
+        return Err(TurnStartFailure::invalid_input(
+            "root Agent launch reasoning differs from the Turn request",
+        ));
+    }
+    if launch.execution.permission_profile.as_ref() != params.permission_profile.as_ref() {
+        return Err(TurnStartFailure::invalid_input(
+            "root Agent launch permission profile differs from the Turn request",
+        ));
+    }
+    Ok(())
+}
+
+/// Compare a root launch with the already normalized execution capability
+/// set. Skill packs have been expanded at this point and MCP tools are reduced
+/// to their exact, scope-qualified server grant.
+pub(super) fn validate_root_agent_launch_capabilities(
+    params: &TurnStartParams,
+) -> Result<(), TurnStartFailure> {
+    let Some(launch) = params.agent_launch.as_ref() else {
+        return Ok(());
+    };
+    let mut selected_skills = params
+        .capabilities
+        .iter()
+        .filter_map(|capability| match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::Skill { skill_id, .. } => Some(skill_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    selected_skills.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    selected_skills.dedup();
+    let mut launch_skills = launch.execution.skill_ids.clone();
+    launch_skills.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    if launch_skills.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(TurnStartFailure::invalid_input(
+            "root Agent launch contains duplicate Skills",
+        ));
+    }
+    launch_skills.dedup();
+    if selected_skills != launch_skills {
+        return Err(TurnStartFailure::invalid_input(
+            "root Agent launch Skills differ from the Turn capabilities",
+        ));
+    }
+    let mut selected_mcp = params
+        .capabilities
+        .iter()
+        .filter_map(|capability| match &capability.kind {
+            pioneer_protocol::TurnCapabilityKind::McpServer { name, scope_kind } => Some(
+                pioneer_protocol::mcp_server_capability_key(*scope_kind, name),
+            ),
+            pioneer_protocol::TurnCapabilityKind::McpTool {
+                server_name,
+                scope_kind,
+                ..
+            } => Some(pioneer_protocol::mcp_server_capability_key(
+                *scope_kind,
+                server_name,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    selected_mcp.sort();
+    selected_mcp.dedup();
+    let mut launch_mcp = launch.execution.mcp_server_ids.clone();
+    launch_mcp.sort();
+    if launch_mcp.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(TurnStartFailure::invalid_input(
+            "root Agent launch contains duplicate MCP servers",
+        ));
+    }
+    launch_mcp.dedup();
+    if selected_mcp != launch_mcp {
+        return Err(TurnStartFailure::invalid_input(
+            "root Agent launch MCP selection differs from the Turn capabilities",
+        ));
+    }
+    Ok(())
+}
+
 async fn persist_admitted_turn_start(
     crud_store: &pioneer_crud::CrudStore,
     provider_registry: &pioneer_provider::ProviderRegistry,
@@ -284,7 +376,11 @@ async fn persist_admitted_turn_start(
     audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     execution_authority: ExecutionEnvelopeSource<'_>,
     request_digest: Option<String>,
-) -> anyhow::Result<()> {
+    execution_security_snapshot: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+    security_audit_events: Vec<pioneer_protocol::TurnPermissionAuditEvent>,
+    execution_graph: Option<pioneer_crud::AgentExecutionGraphCommitInput>,
+    agent_turn_response: Option<pioneer_crud::AgentTurnResponseInput>,
+) -> anyhow::Result<Option<pioneer_crud::AgentExecutionGraphCommitResult>> {
     let admission = match execution_authority {
         ExecutionEnvelopeSource::Fresh(admission) => {
             admission
@@ -303,9 +399,15 @@ async fn persist_admitted_turn_start(
                 policy_generation: Some(policy_generation),
                 role_key: Some(role_key.to_owned()),
                 policy_fingerprint: Some(policy_fingerprint.to_owned()),
-                execution_lease: Some(
-                    admission.execution_quota_lease("turn", materialization.turn.id.as_str())?,
-                ),
+                // The root Turn owns the durable principal/workspace
+                // admission lease.  Child Turns remain independently
+                // authorized, but their resource coordination is recorded in
+                // the root work graph rather than as another full quota lease.
+                execution_lease: (materialization.thread.id == admission.root_thread_id())
+                    .then(|| {
+                        admission.execution_quota_lease("turn", materialization.turn.id.as_str())
+                    })
+                    .transpose()?,
             }
         }
         ExecutionEnvelopeSource::Durable {
@@ -330,7 +432,7 @@ async fn persist_admitted_turn_start(
             materialization.thread.model.as_str(),
             params.execution_backend.as_ref(),
             materialization.capabilities.as_slice(),
-            &materialization.turn.permission_profile,
+            &execution_security_snapshot.permission_profile,
         )?,
     };
     if authorization_context.workspace_id() != materialization.thread.workspace_id {
@@ -388,6 +490,10 @@ async fn persist_admitted_turn_start(
             runtime_draft,
             Some(admission),
             Some(execution),
+            execution_security_snapshot,
+            security_audit_events,
+            execution_graph,
+            agent_turn_response,
         )
         .await
 }
@@ -543,6 +649,18 @@ struct ComposerDetachedTaskCreatedPhase {
     capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
 }
 
+fn task_creator_actor_id(actor: &pioneer_protocol::PersistedActorRef) -> Option<String> {
+    match actor {
+        pioneer_protocol::PersistedActorRef::Principal(principal_id) => {
+            Some(principal_id.to_string())
+        }
+        pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) => {
+            Some(execution_id.to_string())
+        }
+        pioneer_protocol::PersistedActorRef::System => None,
+    }
+}
+
 pub(super) enum TurnStartSuccessResponse {
     TurnStart,
     VoiceSessionFinalizeAccepted {
@@ -556,6 +674,23 @@ pub(super) enum TurnStartSuccessResponse {
         task_run_id: String,
         execution_id: String,
         conversation_history: Vec<ChatMessage>,
+        agent_author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+        agent_turn_response: pioneer_crud::AgentTurnResponseInput,
+        completion: std::sync::Arc<
+            std::sync::Mutex<
+                Option<
+                    tokio::sync::oneshot::Sender<anyhow::Result<PreparedCliRuntimeNativeTurnStart>>,
+                >,
+            >,
+        >,
+    },
+    DurableAgent {
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+        continuation_thread_id: String,
+        context_thread_id: String,
+        conversation_history: Vec<ChatMessage>,
+        agent_author: pioneer_protocol::TurnAuthorSnapshot,
         completion: std::sync::Arc<
             std::sync::Mutex<
                 Option<
@@ -572,6 +707,10 @@ impl TurnStartSuccessResponse {
             Self::Task {
                 continuation_thread_id,
                 ..
+            }
+            | Self::DurableAgent {
+                continuation_thread_id,
+                ..
             } => continuation_thread_id.as_str(),
             Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => execution_thread_id,
         }
@@ -580,6 +719,9 @@ impl TurnStartSuccessResponse {
     fn context_thread_id<'a>(&'a self, execution_thread_id: &'a str) -> &'a str {
         match self {
             Self::Task {
+                context_thread_id, ..
+            }
+            | Self::DurableAgent {
                 context_thread_id, ..
             } => context_thread_id.as_str(),
             Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => execution_thread_id,
@@ -594,8 +736,31 @@ impl TurnStartSuccessResponse {
         match self {
             Self::Task {
                 permission_profile, ..
+            }
+            | Self::DurableAgent {
+                permission_profile, ..
             } => Some(permission_profile.clone()),
             Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
+        }
+    }
+
+    fn task_agent_author(&self) -> Option<pioneer_protocol::TurnAuthorSnapshot> {
+        match self {
+            Self::Task { agent_author, .. } => agent_author.clone(),
+            Self::DurableAgent { agent_author, .. } => Some(agent_author.clone()),
+            Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
+        }
+    }
+
+    fn agent_turn_response(&self) -> Option<pioneer_crud::AgentTurnResponseInput> {
+        match self {
+            Self::Task {
+                agent_turn_response,
+                ..
+            } => Some(agent_turn_response.clone()),
+            Self::TurnStart
+            | Self::VoiceSessionFinalizeAccepted { .. }
+            | Self::DurableAgent { .. } => None,
         }
     }
 
@@ -604,6 +769,10 @@ impl TurnStartSuccessResponse {
     ) -> Option<pioneer_protocol::TurnExecutionSecuritySnapshot> {
         match self {
             Self::Task {
+                execution_security_snapshot,
+                ..
+            }
+            | Self::DurableAgent {
                 execution_security_snapshot,
                 ..
             } => Some(execution_security_snapshot.clone()),
@@ -618,7 +787,9 @@ impl TurnStartSuccessResponse {
                 execution_id,
                 ..
             } => Some((task_run_id.as_str(), execution_id.as_str())),
-            Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
+            Self::TurnStart
+            | Self::VoiceSessionFinalizeAccepted { .. }
+            | Self::DurableAgent { .. } => None,
         }
     }
 
@@ -627,14 +798,19 @@ impl TurnStartSuccessResponse {
             Self::Task {
                 conversation_history,
                 ..
+            }
+            | Self::DurableAgent {
+                conversation_history,
+                ..
             } => Some(conversation_history.as_slice()),
             Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
         }
     }
 
     fn complete_task(&self, result: anyhow::Result<PreparedCliRuntimeNativeTurnStart>) -> bool {
-        let Self::Task { completion, .. } = self else {
-            return false;
+        let completion = match self {
+            Self::Task { completion, .. } | Self::DurableAgent { completion, .. } => completion,
+            Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => return false,
         };
         let sender = completion.lock().ok().and_then(|mut sender| sender.take());
         if let Some(sender) = sender {
@@ -1165,6 +1341,11 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            if let Err(failure) = validate_root_agent_launch_matches_turn(&params) {
+                self.send_error(connection_id, public_turn_start_error(request_id, failure))
+                    .await;
+                return;
+            }
             let thread = match self
                 .thread_manager
                 .thread_get(params.thread_id.trim())
@@ -1467,6 +1648,18 @@ impl MessageProcessor {
                 // message render every pack member as an individually selected skill.
                 let launch = params.clone();
                 params.capabilities = normalized_capabilities.execution.clone();
+                if let Err(failure) = validate_root_agent_launch_capabilities(&params) {
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        thread.id.as_str(),
+                        turn_id.as_str(),
+                        failure,
+                    )
+                    .await;
+                    return None;
+                }
                 if let Err(error) = self
                     .validate_turn_artifact_user_inputs(
                         thread.workspace_id.as_str(),
@@ -1672,6 +1865,38 @@ impl MessageProcessor {
                     .await;
                     return None;
                 }
+                let security_snapshot = match self
+                    .resolve_turn_execution_security_snapshot(
+                        &launch,
+                        &outcome,
+                        None,
+                        ExecutionEnvelopeSource::Fresh(&execution_admission),
+                    )
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(failure) => {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            failure,
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                let security_audit_events = self.turn_security_audit_events_for_turn(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
+                    &security_snapshot,
+                );
                 if let Err(error) = persist_admitted_turn_start(
                     self.crud_store.as_ref(),
                     self.provider_registry.as_ref(),
@@ -1679,9 +1904,13 @@ impl MessageProcessor {
                     &launch,
                     &outcome.materialization,
                     requested_reasoning_effort(&launch).as_deref(),
-                    request_actor,
+                    request_actor.clone(),
                     profile_audit,
                     ExecutionEnvelopeSource::Fresh(&execution_admission),
+                    None,
+                    &security_snapshot,
+                    security_audit_events,
+                    None,
                     None,
                 )
                 .await
@@ -1704,36 +1933,28 @@ impl MessageProcessor {
                     &execution_admission,
                 ))
                 .await;
-                let security_snapshot = match self
-                    .persist_turn_execution_security_snapshot(
-                        &launch,
-                        &outcome,
-                        None,
-                        ExecutionEnvelopeSource::Fresh(&execution_admission),
-                    )
+                if let Err(error) = self
+                    .register_execution_lease(outcome.started_notification.turn.id.as_str())
                     .await
                 {
-                    Ok(snapshot) => snapshot,
-                    Err(failure) => {
-                        let message = failure.to_string();
-                        self.mark_turn_blocked(
-                            thread.id.clone(),
-                            launch.turn_id.clone(),
-                            message.clone(),
-                        )
-                        .await;
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            failure,
-                        )
-                        .await;
-                        return None;
-                    }
-                };
+                    let message = format!("failed to register execution lease: {error:#}");
+                    self.mark_turn_blocked(
+                        thread.id.clone(),
+                        launch.turn_id.clone(),
+                        message.clone(),
+                    )
+                    .await;
+                    self.send_turn_start_failure(
+                        connection_id,
+                        request_id.clone(),
+                        &success_response,
+                        thread.id.as_str(),
+                        turn_id.as_str(),
+                        TurnStartFailure::internal(message),
+                    )
+                    .await;
+                    return None;
+                }
 
                 Some(ComposerDetachedMaterializedPhase {
                     launch,
@@ -1798,7 +2019,7 @@ impl MessageProcessor {
                         return None;
                     }
                 };
-                let task_params = pioneer_protocol::TaskCreateParams {
+                let mut task_params = pioneer_protocol::TaskCreateParams {
                     workspace_id: thread.workspace_id.clone(),
                     owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
                     owner_id: Some(thread.id.clone()),
@@ -1812,11 +2033,12 @@ impl MessageProcessor {
                     trigger: pioneer_protocol::TaskTriggerInput {
                         spec: pioneer_protocol::TaskTriggerSpec::Immediate,
                     },
+                    launch: None,
                     agent_spec: Some(pioneer_protocol::TaskAgentSpecInput {
                         agent_role: thread.agent_role.clone(),
                         agent_nickname: thread.agent_nickname.clone(),
                         model: Some(outcome.materialization.thread.model.clone()),
-                        model_provider: Some(task_model_provider),
+                        model_provider: Some(task_model_provider.clone()),
                         prompt: pioneer_protocol::TaskAgentPrompt {
                             goal,
                             instructions: Vec::new(),
@@ -1903,7 +2125,111 @@ impl MessageProcessor {
                             return None;
                         }
                     };
+                let (canonical_launch, resolved_launch) =
+                    match super::agent_action_tools::resolve_workspace_task_launch(
+                        self,
+                        thread.workspace_id.as_str(),
+                        task_model_provider.as_str(),
+                        outcome.materialization.thread.model.as_str(),
+                        launch.agent_launch.as_ref(),
+                        launch.execution_backend.as_ref(),
+                        launch.turn_id.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            self.mark_turn_blocked(
+                                thread.id.clone(),
+                                launch.turn_id.clone(),
+                                format!("failed to resolve Composer Task launch: {error:#}"),
+                            )
+                            .await;
+                            return None;
+                        }
+                    };
+                task_params.launch = Some(canonical_launch.clone());
+                let agent_authorization_grant = match resolved_launch.as_ref() {
+                    Some((identity, profile)) => {
+                        let child_skill_ids = match task_execution_context
+                            .granted_skill_ids()
+                            .iter()
+                            .map(|id| pioneer_protocol::SkillId::new(id.clone()))
+                            .collect::<Result<Vec<_>, _>>()
+                        {
+                            Ok(ids) => ids,
+                            Err(error) => {
+                                self.mark_turn_blocked(
+                                    thread.id.clone(),
+                                    launch.turn_id.clone(),
+                                    format!(
+                                        "Composer child Skill grant is invalid: {error:?}"
+                                    ),
+                                )
+                                .await;
+                                return None;
+                            }
+                        };
+                        let child_launch_grant = match super::agent_action_tools::current_workspace_child_launch_ceiling(
+                            self,
+                            thread.workspace_id.as_str(),
+                            identity,
+                            profile,
+                            task_model_provider.as_str(),
+                            outcome.materialization.thread.model.as_str(),
+                            true,
+                            child_skill_ids,
+                            task_execution_context
+                                .granted_mcp_server_capability_ids()
+                                .to_vec(),
+                            task_execution_context.permission_profile_cap().clone(),
+                        )
+                        .await
+                        {
+                            Ok(grant) => grant,
+                            Err(error) => {
+                                self.mark_turn_blocked(
+                                    thread.id.clone(),
+                                    launch.turn_id.clone(),
+                                    format!(
+                                        "failed to freeze Composer child launch ceiling: {error:#}"
+                                    ),
+                                )
+                                .await;
+                                return None;
+                            }
+                        };
+                        match crate::authorization::derive_task_agent_authorization_grant_seed(
+                            identity.id.clone(),
+                            task_execution_context.root_thread_id(),
+                            "thread_agent",
+                            task_execution_context.policy_revision(),
+                            child_launch_grant,
+                        ) {
+                            Ok(grant) => Some(grant),
+                            Err(error) => {
+                                self.mark_turn_blocked(
+                                    thread.id.clone(),
+                                    launch.turn_id.clone(),
+                                    format!(
+                                        "failed to freeze Composer Agent authorization: {error:?}"
+                                    ),
+                                )
+                                .await;
+                                return None;
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 let create_context = pioneer_tasks::TaskCreateContext {
+                    actor_id: task_creator_actor_id(&request_actor),
+                    launch_selection: Some(canonical_launch),
+                    resolved_launch_identity: resolved_launch
+                        .as_ref()
+                        .map(|(identity, _)| identity.clone()),
+                    resolved_launch_profile: resolved_launch.map(|(_, profile)| profile),
+                    agent_authorization_grant,
                     conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
                         conversation_thread_id: thread.id.clone(),
                         source_turn_id: Some(launch.turn_id.clone()),
@@ -1993,7 +2319,8 @@ impl MessageProcessor {
                     )
                     .await
                 }
-                TurnStartSuccessResponse::Task { .. } => false,
+                TurnStartSuccessResponse::Task { .. }
+                | TurnStartSuccessResponse::DurableAgent { .. } => false,
             };
             if !success_sent {
                 self.mark_turn_blocked(
@@ -2054,6 +2381,7 @@ impl MessageProcessor {
             .await?;
         }
         params.capabilities = normalized_capabilities.execution.clone();
+        validate_root_agent_launch_capabilities(&params)?;
         super::message_turn::normalize_turn_collaboration_params(&mut params).map_err(|error| {
             TurnStartFailure::invalid_input(format!("invalid Turn collaboration metadata: {error}"))
         })?;
@@ -2205,41 +2533,6 @@ impl MessageProcessor {
                 return Err(message);
             }
         };
-        if let Err(message) = self
-            .admit_composite_execution_request(
-                &mut execution_admission,
-                entry_point,
-                Vec::new(),
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.started_notification.thread_id.as_str(),
-                outcome.materialization.thread.model_provider.as_str(),
-                outcome.materialization.thread.model.as_str(),
-                &security_params,
-                outcome.materialization.capabilities.as_slice(),
-            )
-            .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
-            return Err(message);
-        }
-        let user_message_capability_attachments =
-            match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
-                normalized_capabilities.presentation.as_slice(),
-                &skill_catalog,
-                &normalized_capabilities.pack_names,
-            ) {
-                Ok(attachments) => attachments,
-                Err(error) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
-                    return Err(TurnStartFailure::internal(format!(
-                        "failed to snapshot selected skill presentation: {error:#}"
-                    )));
-                }
-            };
         let mut agent_skill_overlay = if allow_agent_skill_overlay
             && self.native_api_provider_supports_agent_skill_overlay(
                 outcome.started_notification.workspace_id.as_str(),
@@ -2280,7 +2573,48 @@ impl MessageProcessor {
         } else {
             Vec::new()
         };
-
+        let execution_grant_capabilities =
+            crate::authorization::execution_grant_capabilities_with_agent_skills(
+                outcome.materialization.capabilities.as_slice(),
+                agent_skill_overlay
+                    .iter()
+                    .map(|entry| entry.skill_id.clone()),
+            );
+        if let Err(message) = self
+            .admit_composite_execution_request(
+                &mut execution_admission,
+                entry_point,
+                Vec::new(),
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.materialization.thread.model_provider.as_str(),
+                outcome.materialization.thread.model.as_str(),
+                &security_params,
+                execution_grant_capabilities.as_slice(),
+            )
+            .await
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            return Err(message);
+        }
+        let user_message_capability_attachments =
+            match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
+                normalized_capabilities.presentation.as_slice(),
+                &skill_catalog,
+                &normalized_capabilities.pack_names,
+            ) {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    return Err(TurnStartFailure::internal(format!(
+                        "failed to snapshot selected skill presentation: {error:#}"
+                    )));
+                }
+            };
         let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
             Ok(event) => event,
             Err(error) => {
@@ -2292,7 +2626,73 @@ impl MessageProcessor {
                 )));
             }
         };
-        if let Err(error) = message_future(persist_admitted_turn_start(
+        let execution_security_snapshot = match self
+            .resolve_turn_execution_security_snapshot(
+                &security_params,
+                &outcome,
+                None,
+                ExecutionEnvelopeSource::Fresh(&execution_admission),
+            )
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(failure) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                return Err(failure);
+            }
+        };
+        let security_audit_events = self.turn_security_audit_events_for_turn(
+            outcome.started_notification.workspace_id.as_str(),
+            outcome.started_notification.thread_id.as_str(),
+            outcome.started_notification.turn.id.as_str(),
+            &execution_security_snapshot,
+        );
+        let is_root_agent_turn = outcome.materialization.turn.mode
+            == pioneer_protocol::ThreadMode::Agent
+            && outcome.materialization.thread.id == execution_admission.root_thread_id();
+        let prepared_root_execution = if is_root_agent_turn {
+            let authority = execution_admission
+                .finalize(
+                    outcome.materialization.thread.workspace_id.as_str(),
+                    outcome.materialization.thread.id.as_str(),
+                    outcome.materialization.thread.model_provider.as_str(),
+                    outcome.materialization.thread.model.as_str(),
+                    security_params.execution_backend.as_ref(),
+                    outcome.materialization.capabilities.as_slice(),
+                    &execution_security_snapshot.permission_profile,
+                )
+                .map_err(|error| {
+                    TurnStartFailure::policy_denied(format!(
+                        "failed to finalize root Agent authority: {error:#}"
+                    ))
+                })?;
+            Some(
+                super::agent_action_tools::prepare_root_agent_execution_admission(
+                    self,
+                    &pioneer_agent::TurnToolContext {
+                        workspace_id: outcome.materialization.thread.workspace_id.clone(),
+                        thread_id: outcome.materialization.thread.id.clone(),
+                        turn_id: outcome.materialization.turn.id.clone(),
+                    },
+                    &outcome.materialization.thread,
+                    &authority,
+                    security_params.agent_launch.as_ref(),
+                    security_params.execution_backend.as_ref(),
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    TurnStartFailure::policy_denied(format!(
+                        "failed to admit root Agent execution: {error:#}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+        let persisted = message_future(persist_admitted_turn_start(
             self.crud_store.as_ref(),
             self.provider_registry.as_ref(),
             self.turn_execution_owner_id.as_ref(),
@@ -2303,42 +2703,71 @@ impl MessageProcessor {
             profile_selected_audit,
             ExecutionEnvelopeSource::Fresh(&execution_admission),
             Some(request_digest),
+            &execution_security_snapshot,
+            security_audit_events,
+            prepared_root_execution
+                .as_ref()
+                .map(|prepared| prepared.graph.clone()),
+            None,
         ))
-        .await
-        {
-            self.thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
+        .await;
+        let graph_result = match persisted {
+            Ok(result) => result,
+            Err(error) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
 
-            return Err(TurnStartFailure::internal(format!(
-                "failed to persist turn/start state and permission audit: {error:#}"
-            )));
+                return Err(TurnStartFailure::internal(format!(
+                    "failed to persist turn/start state and permission audit: {error:#}"
+                )));
+            }
+        };
+        if graph_result.as_ref().is_some_and(|result| result.queued) {
+            return Err(TurnStartFailure::internal(
+                "root Agent execution was unexpectedly queued",
+            ));
+        }
+        if let Some(prepared) = prepared_root_execution {
+            if let Err(error) =
+                super::agent_action_tools::register_prepared_root_agent_action_binding(
+                    self,
+                    &pioneer_agent::TurnToolContext {
+                        workspace_id: outcome.materialization.thread.workspace_id.clone(),
+                        thread_id: outcome.materialization.thread.id.clone(),
+                        turn_id: outcome.materialization.turn.id.clone(),
+                    },
+                    prepared,
+                )
+                .await
+            {
+                let message = format!("failed to bind admitted root Agent execution: {error:#}");
+                self.mark_turn_blocked(
+                    outcome.materialization.thread.id.clone(),
+                    outcome.materialization.turn.id.clone(),
+                    message.clone(),
+                )
+                .await;
+                return Err(TurnStartFailure::internal(message));
+            }
         }
         self.complete_runtime_draft_materialization(ExecutionEnvelopeSource::Fresh(
             &execution_admission,
         ))
         .await;
-        let execution_security_snapshot = match self
-            .persist_turn_execution_security_snapshot(
-                &security_params,
-                &outcome,
-                None,
-                ExecutionEnvelopeSource::Fresh(&execution_admission),
-            )
+        if let Err(error) = self
+            .register_execution_lease(outcome.started_notification.turn.id.as_str())
             .await
         {
-            Ok(snapshot) => snapshot,
-            Err(failure) => {
-                let message = failure.to_string();
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    message.clone(),
-                )
-                .await;
-                return Err(failure);
-            }
-        };
+            let message = format!("failed to register execution lease: {error:#}");
+            self.mark_turn_blocked(
+                outcome.started_notification.thread_id.clone(),
+                outcome.started_notification.turn.id.clone(),
+                message.clone(),
+            )
+            .await;
+            return Err(TurnStartFailure::internal(message));
+        }
 
         self.ensure_hook_runtime_with_run_store().await;
         if let Err(error) = self
@@ -2654,6 +3083,151 @@ impl MessageProcessor {
         }
     }
 
+    /// Builds the ordinary API-provider runtime payload for a agent domain
+    /// child whose canonical Turn/action/execution graph is already durable.
+    /// This is the post-commit half of native admission; it never rewrites the
+    /// Turn or substitutes a session/principal actor.
+    pub(super) async fn prepare_committed_agent_api_turn(
+        &self,
+        params: &TurnStartParams,
+        outcome: crate::thread::TurnStartOutcome,
+        authority: &crate::authorization::ExecutionAuthorizationContext,
+    ) -> Result<PreparedApiProviderTurnStart, String> {
+        if !matches!(
+            &params.execution_backend,
+            Some(pioneer_protocol::AgentExecutionBackend::ApiProvider { .. })
+        ) {
+            return Err("committed API child has a non-API execution backend".to_owned());
+        }
+        let effective_reasoning_effort = self
+            .resolve_turn_reasoning_effort(
+                outcome.started_notification.workspace_id.as_str(),
+                ReasoningModelLookupBackend::ApiProvider {
+                    provider: outcome.materialization.thread.model_provider.as_str(),
+                },
+                outcome.materialization.thread.model.as_str(),
+                requested_reasoning_effort(params).as_deref(),
+            )
+            .await?;
+        let skill_catalog = self
+            .validate_turn_skill_capabilities(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.materialization.capabilities.as_slice(),
+            )
+            .await
+            .map_err(|error| error.diagnostic)?;
+        let execution_security_snapshot = self
+            .crud_store
+            .get_turn_execution_security_snapshot(outcome.started_notification.turn.id.as_str())
+            .await
+            .map_err(|error| format!("failed to load committed security snapshot: {error:#}"))?
+            .ok_or_else(|| "committed Agent Turn has no security snapshot".to_owned())?
+            .snapshot;
+        if execution_security_snapshot.permission_profile
+            != outcome.materialization.turn.permission_profile
+        {
+            return Err(
+                "committed Agent Turn security snapshot differs from its permission profile"
+                    .to_owned(),
+            );
+        }
+        if authority.workspace_id() != outcome.started_notification.workspace_id {
+            return Err("committed Agent Turn authority differs from its workspace".to_owned());
+        }
+        self.register_execution_lease(outcome.started_notification.turn.id.as_str())
+            .await
+            .map_err(|error| format!("failed to register execution lease: {error:#}"))?;
+
+        self.ensure_hook_runtime_with_run_store().await;
+        self.agent_manager
+            .ensure_thread(
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.workspace_id.as_str(),
+            )
+            .await
+            .map_err(|error| format!("failed to prepare agent thread runtime: {error}"))?;
+        self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
+            .await
+            .map_err(|error| format!("failed to activate durable listener: {error:#}"))?;
+        let history = self
+            .load_conversation_history_for_workspace(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            )
+            .await;
+        let workspace_skill_policies = self
+            .crud_store
+            .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
+            .await
+            .map_err(|error| format!("failed to load workspace skill policies: {error:#}"))?
+            .into_iter()
+            .map(|record| {
+                (
+                    pioneer_skills::SkillPolicyKey::new(record.skill_id),
+                    pioneer_agent::WorkspaceSkillPolicy {
+                        enabled: record.enabled,
+                        allow_implicit_invocation: record.allow_implicit_invocation,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let resolved_artifacts = self
+            .resolve_provider_artifact_inputs(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.materialization.input.as_slice(),
+            )
+            .await
+            .map_err(|error| format!("failed to resolve artifact input: {error:#}"))?;
+        let runtime_environment = self
+            .create_artifact_output_environment(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            )
+            .await
+            .map_err(|error| format!("failed to prepare artifact output: {error:#}"))?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let mut agent_skill_overlay = Vec::new();
+        self.persist_turn_runtime_snapshot_with_optional_agent_overlay(
+            outcome.started_notification.thread_id.as_str(),
+            outcome.started_notification.workspace_id.as_str(),
+            outcome.started_notification.turn.id.as_str(),
+            outcome.materialization.turn.mode,
+            &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            &outcome.materialization.thread.model,
+            &outcome.materialization.thread.model_provider,
+            effective_reasoning_effort.as_deref(),
+            &workspace_skill_policies,
+            outcome.materialization.input.as_slice(),
+            outcome.materialization.capabilities.as_slice(),
+            resolved_artifacts.as_slice(),
+            &runtime_environment,
+            history.as_slice(),
+            &mut agent_skill_overlay,
+        )
+        .await
+        .map_err(|error| format!("failed to persist child runtime snapshot: {error:#}"))?;
+        let permission_profile = self
+            .materialized_turn_permission_profile(&outcome.materialization.turn)
+            .map_err(|error| format!("failed to resolve permission profile: {error:#}"))?;
+
+        Ok(PreparedApiProviderTurnStart {
+            outcome,
+            user_message_capability_attachments: Vec::new(),
+            workspace_skill_policies,
+            skill_catalog,
+            agent_skill_overlay,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            effective_reasoning_effort,
+            permission_profile,
+            execution_security_snapshot,
+        })
+    }
+
     async fn send_turn_start_failure(
         &self,
         connection_id: ConnectionId,
@@ -2710,7 +3284,8 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            TurnStartSuccessResponse::Task { .. } => {
+            TurnStartSuccessResponse::Task { .. }
+            | TurnStartSuccessResponse::DurableAgent { .. } => {
                 let encoded = serde_json::to_string(&public_error)
                     .unwrap_or_else(|_| public_error.correlation_id.clone());
                 success_response.complete_task(Err(anyhow::anyhow!(encoded)));
@@ -2732,6 +3307,8 @@ impl MessageProcessor {
         task_run_id: String,
         execution_id: String,
         conversation_history: Vec<ChatMessage>,
+        agent_author: pioneer_protocol::TurnAuthorSnapshot,
+        agent_turn_response: pioneer_crud::AgentTurnResponseInput,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let response = TurnStartSuccessResponse::Task {
@@ -2742,6 +3319,8 @@ impl MessageProcessor {
             task_run_id,
             execution_id,
             conversation_history,
+            agent_author: Some(agent_author),
+            agent_turn_response,
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         };
         self.turn_start_cli_runtime(
@@ -2762,6 +3341,85 @@ impl MessageProcessor {
         receiver
             .await
             .context("task CLI runtime preparation ended without a result")?
+    }
+
+    pub(super) async fn prepare_committed_agent_cli_runtime_turn(
+        &self,
+        params: TurnStartParams,
+        runtime_id: String,
+        runtime_kind: CLIAgentRuntimeKind,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+        execution_authorization_context: crate::authorization::ExecutionAuthorizationContext,
+        continuation_thread_id: String,
+        context_thread_id: String,
+        conversation_history: Vec<ChatMessage>,
+        agent_author: pioneer_protocol::TurnAuthorSnapshot,
+    ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
+        let execution_authorization_revalidation = self
+            .execution_leases
+            .revalidate_for_turn(
+                self.crud_store.as_ref(),
+                &execution_authorization_context,
+                execution_authorization_context.workspace_id(),
+                params.thread_id.as_str(),
+                params.turn_id.as_str(),
+                crate::authorization::ResourceAction::AgentTurnStart,
+                self.authorization_invalidation_hub
+                    .current_revision()
+                    .await
+                    .context("committed Agent policy generation is unavailable")?,
+            )
+            .await
+            .context("committed Agent authority no longer permits CLI activation")?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let response = TurnStartSuccessResponse::DurableAgent {
+            permission_profile,
+            execution_security_snapshot,
+            continuation_thread_id,
+            context_thread_id,
+            conversation_history,
+            agent_author,
+            completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
+        };
+        self.turn_start_cli_runtime(
+            0,
+            RequestId::new(generate_id(pioneer_protocol::REQUEST_ID_LEN))
+                .expect("generated request id must have protocol length"),
+            pioneer_protocol::PersistedActorRef::System,
+            params,
+            runtime_id,
+            runtime_kind,
+            TurnExecutionAuthority::Durable {
+                context: execution_authorization_context,
+                revalidation: std::sync::Arc::new(execution_authorization_revalidation),
+            },
+            response,
+        )
+        .await;
+        receiver
+            .await
+            .context("committed Agent CLI runtime preparation ended without a result")?
+    }
+
+    pub(super) async fn activate_prepared_committed_agent_cli_runtime_turn(
+        &self,
+        prepared: PreparedCliRuntimeNativeTurnStart,
+    ) -> anyhow::Result<()> {
+        let turn_id = prepared.outcome.started_notification.turn.id.clone();
+        if !self
+            .publish_turn_start_success(
+                &prepared.outcome,
+                prepared.user_message_capability_attachments.as_slice(),
+            )
+            .await
+        {
+            self.release_cli_runtime_session_turn_lease(turn_id.as_str())
+                .await;
+            anyhow::bail!("failed to publish committed Agent CLI runtime turn start");
+        }
+        self.spawn_prepared_cli_runtime_native_turn(prepared);
+        Ok(())
     }
 
     pub(super) async fn activate_prepared_task_cli_runtime_turn(
@@ -3172,6 +3830,14 @@ impl MessageProcessor {
         success_response: TurnStartSuccessResponse,
     ) -> MessageFuture<'a, ()> {
         message_future(async move {
+            // A hidden Task CLI turn is still authored by the admitted agent.
+            // The transport request itself is System-owned, so prefer the
+            // immutable author snapshot carried by the Task response before
+            // resolving any conversation metadata or persisted turn author.
+            let request_actor = success_response
+                .task_agent_author()
+                .map(|author| author.actor)
+                .unwrap_or(request_actor);
             let admission_entry_point = match &success_response {
                 TurnStartSuccessResponse::TurnStart => {
                     crate::authorization::ExecutionAdmissionEntryPoint::CliRuntime
@@ -3181,6 +3847,9 @@ impl MessageProcessor {
                 }
                 TurnStartSuccessResponse::Task { .. } => {
                     crate::authorization::ExecutionAdmissionEntryPoint::Task
+                }
+                TurnStartSuccessResponse::DurableAgent { .. } => {
+                    crate::authorization::ExecutionAdmissionEntryPoint::AgentTurnStart
                 }
             };
             let response_turn_id = params.turn_id.clone();
@@ -3204,6 +3873,9 @@ impl MessageProcessor {
                 (&success_response, &execution_authority),
                 (
                     TurnStartSuccessResponse::Task { .. },
+                    TurnExecutionAuthority::Durable { .. }
+                ) | (
+                    TurnStartSuccessResponse::DurableAgent { .. },
                     TurnExecutionAuthority::Durable { .. }
                 ) | (
                     TurnStartSuccessResponse::TurnStart
@@ -3282,6 +3954,10 @@ impl MessageProcessor {
             let normalized_presentation_capabilities = normalized_capabilities.presentation;
             let normalized_pack_names = normalized_capabilities.pack_names;
             params.capabilities = normalized_capabilities.execution;
+            if let Err(failure) = validate_root_agent_launch_capabilities(&params) {
+                send_turn_start_failure!(failure);
+                return None;
+            }
 
             // Validate the semantic catalog projection before any provider-specific
             // preflight. This keeps malformed/missing capabilities in the typed
@@ -3718,9 +4394,19 @@ impl MessageProcessor {
             let outcome_result = if let Some(permission_profile) =
                 success_response.task_permission_profile()
             {
-                self.thread_manager
-                    .system_turn_start_with_permission_profile(params, permission_profile)
-                    .await
+                if let Some(agent_author) = success_response.task_agent_author() {
+                    self.thread_manager
+                        .agent_turn_start_with_permission_profile(
+                            params,
+                            permission_profile,
+                            agent_author,
+                        )
+                        .await
+                } else {
+                    self.thread_manager
+                        .system_turn_start_with_permission_profile(params, permission_profile)
+                        .await
+                }
             } else if let Some(permission_profile) = resolved_permission_profile {
                 self.thread_manager
                     .turn_start_with_user_metadata_and_permission_profile(
@@ -3863,8 +4549,98 @@ impl MessageProcessor {
                     return None;
                 }
             };
+            let security_snapshot = match self
+                .resolve_turn_execution_security_snapshot(
+                    &security_params,
+                    &outcome,
+                    success_response.task_execution_security_snapshot(),
+                    execution_authority.source(),
+                )
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(failure) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    send_turn_start_failure!(failure);
+                    return None;
+                }
+            };
+            let security_audit_events = self.turn_security_audit_events_for_turn(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+                &security_snapshot,
+            );
+            let root_agent_admission = match &execution_authority {
+                TurnExecutionAuthority::Fresh(admission)
+                    if outcome.materialization.turn.mode
+                        == pioneer_protocol::ThreadMode::Agent
+                        && outcome.materialization.thread.id == admission.root_thread_id() =>
+                {
+                    Some(admission)
+                }
+                _ => None,
+            };
+            let prepared_root_execution = match root_agent_admission {
+                Some(admission) => {
+                    let authority = match admission.finalize(
+                        outcome.materialization.thread.workspace_id.as_str(),
+                        outcome.materialization.thread.id.as_str(),
+                        outcome.materialization.thread.model_provider.as_str(),
+                        outcome.materialization.thread.model.as_str(),
+                        security_params.execution_backend.as_ref(),
+                        outcome.materialization.capabilities.as_slice(),
+                        &security_snapshot.permission_profile,
+                    ) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            self.thread_manager
+                                .rollback_turn_start(outcome.rollback_context.clone())
+                                .await;
+                            send_turn_start_failure!(format!(
+                                "failed to finalize root CLI Agent authority: {error:#}"
+                            ));
+                            return None;
+                        }
+                    };
+                    match super::agent_action_tools::prepare_root_agent_execution_admission(
+                        self,
+                        &pioneer_agent::TurnToolContext {
+                            workspace_id: outcome.materialization.thread.workspace_id.clone(),
+                            thread_id: outcome.materialization.thread.id.clone(),
+                            turn_id: outcome.materialization.turn.id.clone(),
+                        },
+                        &outcome.materialization.thread,
+                        &authority,
+                        security_params.agent_launch.as_ref(),
+                        security_params.execution_backend.as_ref(),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => Some(prepared),
+                        Err(error) => {
+                            self.thread_manager
+                                .rollback_turn_start(outcome.rollback_context.clone())
+                                .await;
+                            send_turn_start_failure!(format!(
+                                "failed to admit root CLI Agent execution: {error:#}"
+                            ));
+                            return None;
+                        }
+                    }
+                }
+                _ => None,
+            };
             let materialization_authority = execution_authority.clone();
             let materialization_params = security_params.clone();
+            let materialization_security_snapshot = security_snapshot.clone();
+            let agent_turn_response = success_response.agent_turn_response();
+            let execution_graph = prepared_root_execution
+                .as_ref()
+                .map(|prepared| prepared.graph.clone());
             let materialization_result = {
                 let crud_store = self.crud_store.clone();
                 let provider_registry = self.provider_registry.clone();
@@ -3883,6 +4659,10 @@ impl MessageProcessor {
                         profile_selected_audit,
                         materialization_authority.source(),
                         None,
+                        &materialization_security_snapshot,
+                        security_audit_events,
+                        execution_graph,
+                        agent_turn_response,
                     )
                     .await
                 });
@@ -3894,40 +4674,64 @@ impl MessageProcessor {
                     "CLI runtime turn/start materialization task failed: {error}"
                 )),
             };
-            if let Err(error) = materialization_result {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
+            let graph_result = match materialization_result {
+                Ok(result) => result,
+                Err(error) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
 
-                send_turn_start_failure!(format!(
-                    "failed to persist CLI runtime turn/start state and permission audit: {error:#}"
-                ));
-                return None;
-            }
-            self.complete_runtime_draft_materialization(execution_authority.source())
-                .await;
-            let security_snapshot = match self
-                .persist_turn_execution_security_snapshot(
-                    &security_params,
-                    &outcome,
-                    success_response.task_execution_security_snapshot(),
-                    execution_authority.source(),
-                )
-                .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(failure) => {
-                    let message = failure.to_string();
-                    self.mark_turn_blocked(
-                        outcome.started_notification.thread_id.clone(),
-                        outcome.started_notification.turn.id.clone(),
-                        message.clone(),
-                    )
-                    .await;
-                    send_turn_start_failure!(failure);
+                    send_turn_start_failure!(format!(
+                        "failed to persist CLI runtime turn/start state and permission audit: {error:#}"
+                    ));
                     return None;
                 }
             };
+            if graph_result.as_ref().is_some_and(|result| result.queued) {
+                send_turn_start_failure!("root CLI Agent execution was unexpectedly queued");
+                return None;
+            }
+            if let Some(prepared) = prepared_root_execution {
+                if let Err(error) =
+                    super::agent_action_tools::register_prepared_root_agent_action_binding(
+                        self,
+                        &pioneer_agent::TurnToolContext {
+                            workspace_id: outcome.materialization.thread.workspace_id.clone(),
+                            thread_id: outcome.materialization.thread.id.clone(),
+                            turn_id: outcome.materialization.turn.id.clone(),
+                        },
+                        prepared,
+                    )
+                    .await
+                {
+                    self.mark_turn_blocked(
+                        outcome.materialization.thread.id.clone(),
+                        outcome.materialization.turn.id.clone(),
+                        format!("failed to bind admitted root CLI Agent execution: {error:#}"),
+                    )
+                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to bind admitted root CLI Agent execution: {error:#}"
+                    ));
+                    return None;
+                }
+            }
+            self.complete_runtime_draft_materialization(execution_authority.source())
+                .await;
+            if let Err(error) = self
+                .register_execution_lease(outcome.started_notification.turn.id.as_str())
+                .await
+            {
+                let message = format!("failed to register execution lease: {error:#}");
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    message.clone(),
+                )
+                .await;
+                send_turn_start_failure!(TurnStartFailure::internal(message));
+                return None;
+            }
             let native_event_budget = match execution_authority
                 .source()
                 .effective_native_event_resource_budget()
@@ -4639,7 +5443,8 @@ impl MessageProcessor {
                     )
                     .await
                 }
-                TurnStartSuccessResponse::Task { .. } => true,
+                TurnStartSuccessResponse::Task { .. }
+                | TurnStartSuccessResponse::DurableAgent { .. } => true,
             };
             if !success_sent {
                 self.mark_turn_blocked(
@@ -4673,7 +5478,11 @@ impl MessageProcessor {
                 session_turn_lease,
             )
             .await;
-            if success_response.is_task() {
+            if matches!(
+                success_response,
+                TurnStartSuccessResponse::Task { .. }
+                    | TurnStartSuccessResponse::DurableAgent { .. }
+            ) {
                 if !success_response.complete_task(Ok(native_turn_start)) {
                     self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
                         .await;
@@ -6043,15 +6852,25 @@ impl MessageProcessor {
         if execution.id != execution_id || execution.status.is_terminal() {
             return Ok(false);
         }
+        let Some(resource_state) = pioneer_crud::load_agent_execution_resource_state(
+            &self.crud_store.database_connection(),
+            execution_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
         let now = now_timestamp_secs();
-        self.crud_store
-            .heartbeat_execution(
+        let heartbeat = self
+            .crud_store
+            .heartbeat_execution_for_agent_attempt(
                 execution_id,
+                resource_state.attempt_generation,
                 now,
                 Some(now.saturating_add(pioneer_tasks::TASK_EXECUTION_LEASE_SECONDS)),
             )
             .await?;
-        Ok(true)
+        Ok(heartbeat.is_some())
     }
 
     async fn retain_cli_runtime_session_turn_lease(
@@ -6079,7 +6898,10 @@ impl MessageProcessor {
         Ok(turn.permission_profile.clone())
     }
 
-    async fn persist_turn_execution_security_snapshot(
+    /// Resolve and validate the exact security envelope before any durable
+    /// Turn/AgentExecution write. An unavailable backend therefore leaves no
+    /// visible Turn, admission lease, action, or execution-graph ghost.
+    async fn resolve_turn_execution_security_snapshot(
         &self,
         params: &TurnStartParams,
         outcome: &crate::thread::TurnStartOutcome,
@@ -6130,12 +6952,6 @@ impl MessageProcessor {
             )?
         };
         snapshot.authority_cap.resource_binding_revision = execution_authority.policy_revision();
-        let security_audit_events = self.turn_security_audit_events_for_turn(
-            outcome.started_notification.workspace_id.as_str(),
-            outcome.started_notification.thread_id.as_str(),
-            outcome.started_notification.turn.id.as_str(),
-            &snapshot,
-        );
         self.log_turn_security_snapshot(
             outcome.started_notification.workspace_id.as_str(),
             outcome.started_notification.thread_id.as_str(),
@@ -6145,79 +6961,10 @@ impl MessageProcessor {
         if let pioneer_protocol::TurnSecurityEnforcementStatus::Unavailable { reason } =
             &snapshot.enforcement
         {
-            self.materialize_turn_security_audit_events(security_audit_events)
-                .await?;
             return Err(TurnStartFailure::unavailable(format!(
                 "turn execution security unavailable: {reason}"
             )));
         }
-        let authorization_context = match execution_authority {
-            ExecutionEnvelopeSource::Durable { context, .. } => {
-                if outcome.started_notification.workspace_id != context.workspace_id() {
-                    return Err(TurnStartFailure::internal(
-                        "failed to persist execution authorization context: durable context belongs to a different workspace",
-                    ));
-                }
-                context.clone()
-            }
-            ExecutionEnvelopeSource::Fresh(admission) => {
-                if outcome.started_notification.thread_id != admission.target_thread_id()
-                    || outcome.started_notification.workspace_id != admission.workspace_id()
-                {
-                    return Err(TurnStartFailure::internal(
-                        "failed to persist execution authorization context: materialized turn differs from authorized target",
-                    ));
-                }
-                admission
-                    .finalize(
-                        outcome.started_notification.workspace_id.as_str(),
-                        outcome.started_notification.thread_id.as_str(),
-                        outcome.materialization.thread.model_provider.as_str(),
-                        outcome.materialization.thread.model.as_str(),
-                        params.execution_backend.as_ref(),
-                        outcome.materialization.capabilities.as_slice(),
-                        &snapshot.permission_profile,
-                    )
-                    .map_err(|error| {
-                        TurnStartFailure::internal(format!(
-                            "failed to finalize execution authorization context: {error:#}"
-                        ))
-                    })?
-            }
-        };
-        let authorization_context_json =
-            authorization_context.to_persisted_json().map_err(|error| {
-                TurnStartFailure::internal(format!(
-                    "failed to encode execution authorization context: {error:#}"
-                ))
-            })?;
-        let updated = self
-            .crud_store
-            .set_turn_execution_envelope(
-                outcome.started_notification.turn.id.as_str(),
-                &snapshot,
-                authorization_context_json.as_str(),
-            )
-            .await
-            .map_err(|error| {
-                TurnStartFailure::internal(format!(
-                    "failed to persist turn execution envelope: {error:#}"
-                ))
-            })?;
-        if !updated {
-            return Err(TurnStartFailure::internal(format!(
-                "failed to persist turn execution envelope: turn `{}` was not found",
-                outcome.started_notification.turn.id
-            )));
-        }
-        self.register_execution_lease(outcome.started_notification.turn.id.as_str())
-            .await
-            .map_err(|error| {
-                TurnStartFailure::internal(format!("failed to register execution lease: {error:#}"))
-            })?;
-        self.materialize_turn_security_audit_events(security_audit_events)
-            .await
-            .map_err(TurnStartFailure::internal)?;
         Ok(snapshot)
     }
 
@@ -6278,23 +7025,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn materialize_turn_security_audit_events(
-        &self,
-        events: Vec<pioneer_protocol::TurnPermissionAuditEvent>,
-    ) -> Result<(), String> {
-        let event_timestamp = now_timestamp_secs();
-        for event in events {
-            self.crud_store
-                .materialize_turn_permission_audit(event, event_timestamp)
-                .await
-                .map_err(|error| {
-                    format!("failed to persist turn execution security audit event: {error:#}")
-                })?;
-        }
-        Ok(())
-    }
-
-    fn turn_security_audit_events_for_turn(
+    pub(super) fn turn_security_audit_events_for_turn(
         &self,
         workspace_id: &str,
         thread_id: &str,
@@ -6791,6 +7522,40 @@ impl MessageProcessor {
             return;
         }
 
+        let cancel_intent_key = (thread_id.clone(), turn_id.clone());
+        self.user_turn_cancel_intents
+            .lock()
+            .await
+            .insert(cancel_intent_key.clone(), reason.clone());
+
+        if let Err(error) = self
+            .cancel_root_agent_work_graph_for_turn(&turn, reason.as_str())
+            .await
+        {
+            self.user_turn_cancel_intents
+                .lock()
+                .await
+                .remove(&cancel_intent_key);
+            warn!(
+                thread_id,
+                turn_id,
+                error = %format!("{error:#}"),
+                failure_class = "root_agent_work_graph_fence_failed",
+                "failed to fence cancelled root Agent work graph"
+            );
+            self.send_error(
+                connection_id,
+                public_turn_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    pioneer_protocol::PublicErrorStage::Persistence,
+                    "failed to cancel the root Agent work graph".to_owned(),
+                ),
+            )
+            .await;
+            return;
+        }
+
         self.mcp_service
             .cancel_turn_mcp_invocations(turn_id.as_str());
 
@@ -6801,6 +7566,10 @@ impl MessageProcessor {
         {
             Ok(binding) => binding,
             Err(error) => {
+                self.user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .remove(&cancel_intent_key);
                 self.send_error(
                     connection_id,
                     public_turn_error(
@@ -6821,6 +7590,32 @@ impl MessageProcessor {
                 .mark_turn_interrupted(thread_id.clone(), turn_id.clone(), reason.clone())
                 .await
             {
+                if let Some((workspace_id, turn)) = self
+                    .thread_manager
+                    .turn_get(thread_id.as_str(), turn_id.as_str())
+                    .await
+                    .filter(|(_, turn)| turn.status != TurnStatus::InProgress)
+                {
+                    self.user_turn_cancel_intents
+                        .lock()
+                        .await
+                        .remove(&cancel_intent_key);
+                    self.send_turn_cancel_response(
+                        connection_id,
+                        request_id,
+                        TurnCancelResponse {
+                            thread_id,
+                            workspace_id,
+                            turn,
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                self.user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .remove(&cancel_intent_key);
                 self.send_error(
                     connection_id,
                     public_turn_error(
@@ -6838,6 +7633,10 @@ impl MessageProcessor {
                 Some(reason.as_str()),
             )
             .await;
+            self.user_turn_cancel_intents
+                .lock()
+                .await
+                .remove(&cancel_intent_key);
 
             let Some((workspace_id, turn)) = self
                 .thread_manager
@@ -6870,11 +7669,6 @@ impl MessageProcessor {
             return;
         }
 
-        let cancel_intent_key = (thread_id.clone(), turn_id.clone());
-        self.user_turn_cancel_intents
-            .lock()
-            .await
-            .insert(cancel_intent_key.clone(), reason.clone());
         match self
             .agent_manager
             .cancel_turn(thread_id.as_str(), turn_id.as_str(), reason.as_str())
@@ -6916,6 +7710,29 @@ impl MessageProcessor {
             .await
             .remove(&cancel_intent_key);
         if !interrupted {
+            // Cancellation races with fail-closed admission/runtime paths.
+            // If that path already committed a terminal state, cancellation
+            // has reached its intended durable outcome and is idempotently
+            // successful. Only an absent or still-running Turn is a
+            // persistence failure.
+            if let Some((workspace_id, turn)) = self
+                .thread_manager
+                .turn_get(thread_id.as_str(), turn_id.as_str())
+                .await
+                .filter(|(_, turn)| turn.status != TurnStatus::InProgress)
+            {
+                self.send_turn_cancel_response(
+                    connection_id,
+                    request_id,
+                    TurnCancelResponse {
+                        thread_id,
+                        workspace_id,
+                        turn,
+                    },
+                )
+                .await;
+                return;
+            }
             self.send_error(
                 connection_id,
                 public_turn_error(
@@ -8444,6 +9261,137 @@ fn cli_runtime_binding_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_task_creator_keeps_the_exact_request_actor() {
+        let principal = pioneer_protocol::PersistedActorRef::Principal(
+            pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
+        );
+        let execution = pioneer_protocol::PersistedActorRef::AgentExecution(
+            pioneer_protocol::AgentExecutionId::new("E00000000000000000001").unwrap(),
+        );
+
+        assert_eq!(
+            task_creator_actor_id(&principal).as_deref(),
+            Some("P00000000000000000001")
+        );
+        assert_eq!(
+            task_creator_actor_id(&execution).as_deref(),
+            Some("E00000000000000000001")
+        );
+        assert_eq!(
+            task_creator_actor_id(&pioneer_protocol::PersistedActorRef::System),
+            None
+        );
+    }
+
+    #[test]
+    fn root_agent_launch_matches_normalized_skill_and_scope_qualified_mcp_authority() {
+        let skill_id = pioneer_protocol::SkillId::new("K12345678901234567890").unwrap();
+        let scope = pioneer_protocol::McpScopeKind::Workspace;
+        let server_id = pioneer_protocol::mcp_server_capability_key(scope, "github");
+        let mut params = root_agent_launch_params(
+            vec![
+                pioneer_protocol::TurnCapability {
+                    id: pioneer_protocol::skill_capability_key(&skill_id),
+                    label: None,
+                    kind: pioneer_protocol::TurnCapabilityKind::Skill {
+                        skill_id: skill_id.clone(),
+                        pack_id: None,
+                    },
+                },
+                pioneer_protocol::TurnCapability {
+                    id: pioneer_protocol::mcp_tool_capability_key(scope, "github", "issues"),
+                    label: None,
+                    kind: pioneer_protocol::TurnCapabilityKind::McpTool {
+                        server_name: "github".to_owned(),
+                        raw_tool_name: "issues".to_owned(),
+                        scope_kind: scope,
+                    },
+                },
+            ],
+            vec![skill_id],
+            vec![server_id],
+        );
+
+        validate_root_agent_launch_matches_turn(&params).unwrap();
+        validate_root_agent_launch_capabilities(&params).unwrap();
+
+        params
+            .agent_launch
+            .as_mut()
+            .unwrap()
+            .execution
+            .mcp_server_ids = vec![pioneer_protocol::mcp_tool_capability_key(
+            scope, "github", "issues",
+        )];
+        assert!(validate_root_agent_launch_capabilities(&params).is_err());
+    }
+
+    #[test]
+    fn root_agent_launch_rejects_non_agent_mode_and_duplicate_capability_grants() {
+        let server_id = pioneer_protocol::mcp_server_capability_key(
+            pioneer_protocol::McpScopeKind::User,
+            "github",
+        );
+        let mut params = root_agent_launch_params(Vec::new(), Vec::new(), Vec::new());
+        params.mode = Some(pioneer_protocol::ThreadMode::Message);
+        assert!(validate_root_agent_launch_matches_turn(&params).is_err());
+
+        params.mode = Some(pioneer_protocol::ThreadMode::Agent);
+        params
+            .agent_launch
+            .as_mut()
+            .unwrap()
+            .execution
+            .mcp_server_ids = vec![server_id.clone(), server_id];
+        assert!(validate_root_agent_launch_capabilities(&params).is_err());
+    }
+
+    fn root_agent_launch_params(
+        capabilities: Vec<pioneer_protocol::TurnCapability>,
+        skill_ids: Vec<pioneer_protocol::SkillId>,
+        mcp_server_ids: Vec<String>,
+    ) -> TurnStartParams {
+        let reasoning = pioneer_protocol::TurnReasoningSelection {
+            effort: "medium".to_owned(),
+        };
+        let permission_profile = pioneer_protocol::TurnPermissionProfileSelection {
+            mode: pioneer_protocol::TurnPermissionMode::Supervised,
+        };
+        TurnStartParams {
+            agent_delegation_routes: Vec::new(),
+            thread_id: "thread-root".to_owned(),
+            turn_id: "turn-root".to_owned(),
+            input: Vec::new(),
+            capabilities,
+            model: None,
+            model_provider: None,
+            sandbox_policy: None,
+            mode: Some(pioneer_protocol::ThreadMode::Agent),
+            agent_launch: Some(pioneer_protocol::AgentLaunchSelection {
+                agent: pioneer_protocol::AgentIdentitySelection::DefaultPioneer,
+                execution: pioneer_protocol::AgentExecutionSelection {
+                    profile: pioneer_protocol::AgentExecutionProfileSelection::Exact {
+                        profile_id: pioneer_protocol::AgentExecutionProfileId::new(
+                            "P12345678901234567890",
+                        )
+                        .unwrap(),
+                    },
+                    reasoning: Some(reasoning.clone()),
+                    permission_profile: Some(permission_profile.clone()),
+                    skill_ids,
+                    mcp_server_ids,
+                },
+            }),
+            reply_to_turn_id: None,
+            mentioned_principal_ids: Vec::new(),
+            execution_backend: None,
+            reasoning: Some(reasoning),
+            permission_profile: Some(permission_profile),
+            cli_runtime_options: None,
+        }
+    }
 
     fn observation_event(sequence: i64, message_bytes: usize) -> pioneer_protocol::TurnItemEvent {
         pioneer_protocol::TurnItemEvent {

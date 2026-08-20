@@ -281,6 +281,25 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     auth_service.set_disconnect_hook(session_manager.clone());
     let workspace_manager = Arc::new(WorkspaceManager::new(database.clone()));
     let crud_store = Arc::new(CrudStore::new(database.clone()));
+    let configured_agent_runtimes =
+        crate::cli_runtime::config::load_effective_cli_runtime_instances(runtime_home.as_path())
+            .context("failed to load CLI runtime catalog during Gateway startup")?;
+    let agent_identity_settings =
+        crate::cli_runtime::config::load_effective_cli_runtime_identity_settings(
+            runtime_home.as_path(),
+        )
+        .context("failed to load CLI runtime identity settings during Gateway startup")?;
+    let agent_identity_catalog = crate::identity::catalog::from_effective_settings(
+        configured_agent_runtimes,
+        &agent_identity_settings,
+    )?;
+    pioneer_crud::sync_cli_runtime_identity_catalog(
+        &database,
+        agent_identity_catalog.as_slice(),
+        chrono::Utc::now().fixed_offset(),
+    )
+    .await
+    .context("failed to synchronize Agent identities during Gateway startup")?;
     database::startup::enforce_execution_authority_integrity(crud_store.as_ref())
         .await
         .context("Gateway execution authority integrity gate failed")?;
@@ -693,6 +712,9 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     message_processor = message_processor.with_auth_service(auth_service.clone());
     let message_processor = Arc::new(message_processor);
+    database::startup::upgrade_agent_domain_data(message_processor.as_ref())
+        .await
+        .context("failed to complete the blocking Agent domain data upgrade")?;
     auth_service.set_invitation_accept_post_commit_hook(message_processor.clone());
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)

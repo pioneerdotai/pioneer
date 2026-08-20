@@ -19,6 +19,178 @@ pub(crate) enum RoleActionPolicy {
     Only(&'static [ResourceAction]),
 }
 
+/// Agent executions are subjects in the same authorization registry, not a
+/// second permission engine.  This role is deliberately narrow: it can work
+/// in its inherited capsule and delegate bounded children, but it cannot
+/// administer workspaces, members, secrets, installations or diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AgentRoleDefinition {
+    pub(crate) key: &'static str,
+    pub(crate) actions: RoleActionPolicy,
+    pub(crate) disclosure: RoleDisclosurePolicy,
+}
+
+const THREAD_AGENT_ACTIONS: &[ResourceAction] = &[
+    ResourceAction::ThreadRead,
+    ResourceAction::ThreadCreatePrivate,
+    ResourceAction::ThreadCreateWorkspace,
+    ResourceAction::MessageCreate,
+    ResourceAction::AgentTurnStart,
+    ResourceAction::AgentExecutionObserve,
+    ResourceAction::AgentRequestObserve,
+    ResourceAction::ChildObserve,
+    ResourceAction::ChildWrite,
+    ResourceAction::ChildStart,
+    ResourceAction::ChildRespond,
+    ResourceAction::ChildTaskCreate,
+    ResourceAction::ChildArtifactRead,
+    ResourceAction::ChildArtifactWrite,
+    ResourceAction::ArtifactRead,
+    ResourceAction::ArtifactCreateThread,
+    ResourceAction::ArtifactBindThread,
+    ResourceAction::MemoryRead,
+    ResourceAction::MemoryCreateThread,
+    ResourceAction::MemoryUpdateThread,
+    ResourceAction::TaskRead,
+    ResourceAction::TaskCreate,
+    ResourceAction::TaskReview,
+    ResourceAction::TaskCancel,
+    ResourceAction::TaskScheduleManage,
+    ResourceAction::TaskDetach,
+    ResourceAction::ProviderDiscover,
+    ResourceAction::ProviderUse,
+    ResourceAction::McpDiscover,
+    ResourceAction::McpUse,
+    ResourceAction::SkillDiscover,
+    ResourceAction::SkillUse,
+    ResourceAction::CliRuntimeDiscover,
+    ResourceAction::CliRuntimeUse,
+    ResourceAction::CliRuntimeControl,
+    ResourceAction::CliThreadFork,
+    ResourceAction::AgentSourceExport,
+];
+
+const THREAD_AGENT_ROLE: AgentRoleDefinition = AgentRoleDefinition {
+    key: "thread_agent",
+    actions: RoleActionPolicy::Only(THREAD_AGENT_ACTIONS),
+    disclosure: RoleDisclosurePolicy::Collaborator,
+};
+
+const AGENT_OBSERVER_ACTIONS: &[ResourceAction] = &[
+    ResourceAction::ThreadRead,
+    ResourceAction::AgentExecutionObserve,
+    ResourceAction::AgentRequestObserve,
+    ResourceAction::ChildObserve,
+    ResourceAction::ArtifactRead,
+    ResourceAction::MemoryRead,
+    ResourceAction::TaskRead,
+];
+
+const AGENT_OBSERVER_ROLE: AgentRoleDefinition = AgentRoleDefinition {
+    key: "agent_observer",
+    actions: RoleActionPolicy::Only(AGENT_OBSERVER_ACTIONS),
+    disclosure: RoleDisclosurePolicy::Collaborator,
+};
+
+const AGENT_MESSENGER_ACTIONS: &[ResourceAction] = &[
+    ResourceAction::ThreadRead,
+    ResourceAction::MessageCreate,
+    ResourceAction::AgentExecutionObserve,
+    ResourceAction::AgentRequestObserve,
+];
+
+const AGENT_MESSENGER_ROLE: AgentRoleDefinition = AgentRoleDefinition {
+    key: "agent_messenger",
+    actions: RoleActionPolicy::Only(AGENT_MESSENGER_ACTIONS),
+    disclosure: RoleDisclosurePolicy::Collaborator,
+};
+
+const AGENT_RUNNER_ACTIONS: &[ResourceAction] = &[
+    ResourceAction::ThreadRead,
+    ResourceAction::AgentTurnStart,
+    ResourceAction::AgentExecutionObserve,
+    ResourceAction::AgentRequestObserve,
+    ResourceAction::ChildObserve,
+    ResourceAction::ChildWrite,
+    ResourceAction::ChildStart,
+    ResourceAction::ChildRespond,
+    ResourceAction::ChildTaskCreate,
+    ResourceAction::ChildArtifactRead,
+    ResourceAction::ChildArtifactWrite,
+    ResourceAction::ArtifactRead,
+    ResourceAction::ArtifactCreateThread,
+    ResourceAction::ArtifactBindThread,
+    ResourceAction::TaskRead,
+    ResourceAction::TaskCreate,
+    ResourceAction::TaskCancel,
+    ResourceAction::ProviderDiscover,
+    ResourceAction::ProviderUse,
+    ResourceAction::McpDiscover,
+    ResourceAction::McpUse,
+    ResourceAction::SkillDiscover,
+    ResourceAction::SkillUse,
+    ResourceAction::CliRuntimeDiscover,
+    ResourceAction::CliRuntimeUse,
+    ResourceAction::CliRuntimeControl,
+];
+
+const AGENT_RUNNER_ROLE: AgentRoleDefinition = AgentRoleDefinition {
+    key: "agent_runner",
+    actions: RoleActionPolicy::Only(AGENT_RUNNER_ACTIONS),
+    disclosure: RoleDisclosurePolicy::Collaborator,
+};
+
+const AGENT_SCHEDULER_ACTIONS: &[ResourceAction] = &[
+    ResourceAction::ThreadRead,
+    ResourceAction::MessageCreate,
+    ResourceAction::AgentTurnStart,
+    ResourceAction::AgentExecutionObserve,
+    ResourceAction::AgentRequestObserve,
+    ResourceAction::ChildObserve,
+    ResourceAction::ChildStart,
+    ResourceAction::ChildTaskCreate,
+    ResourceAction::TaskRead,
+    ResourceAction::TaskCreate,
+    ResourceAction::TaskCancel,
+    ResourceAction::TaskScheduleManage,
+    ResourceAction::ProviderDiscover,
+    ResourceAction::ProviderUse,
+    ResourceAction::McpDiscover,
+    ResourceAction::McpUse,
+    ResourceAction::SkillDiscover,
+    ResourceAction::SkillUse,
+    ResourceAction::CliRuntimeDiscover,
+    ResourceAction::CliRuntimeUse,
+];
+
+const AGENT_SCHEDULER_ROLE: AgentRoleDefinition = AgentRoleDefinition {
+    key: "agent_scheduler",
+    actions: RoleActionPolicy::Only(AGENT_SCHEDULER_ACTIONS),
+    disclosure: RoleDisclosurePolicy::Collaborator,
+};
+
+// A reviewer is an Agent subject, but its durable purpose grant is narrower
+// than a normal working agent. It may inspect Task state and commit a review;
+// it cannot message, start descendants, cancel work or manage routes merely
+// because its runtime executes inside a collaborative capsule.
+const AGENT_REVIEWER_ACTIONS: &[ResourceAction] =
+    &[ResourceAction::TaskRead, ResourceAction::TaskReview];
+
+const AGENT_REVIEWER_ROLE: AgentRoleDefinition = AgentRoleDefinition {
+    key: "agent_reviewer",
+    actions: RoleActionPolicy::Only(AGENT_REVIEWER_ACTIONS),
+    disclosure: RoleDisclosurePolicy::Collaborator,
+};
+
+const AGENT_ROLE_DEFINITIONS: &[AgentRoleDefinition] = &[
+    THREAD_AGENT_ROLE,
+    AGENT_OBSERVER_ROLE,
+    AGENT_MESSENGER_ROLE,
+    AGENT_RUNNER_ROLE,
+    AGENT_REVIEWER_ROLE,
+    AGENT_SCHEDULER_ROLE,
+];
+
 impl RoleActionPolicy {
     pub(crate) fn allows(self, action: ResourceAction) -> bool {
         match self {
@@ -375,6 +547,9 @@ const MEMBER_ACTIONS: &[ResourceAction] = &[
     ResourceAction::ChildTaskCreate,
     ResourceAction::ChildArtifactRead,
     ResourceAction::ChildArtifactWrite,
+    ResourceAction::AgentSourceExport,
+    ResourceAction::AgentRouteCreate,
+    ResourceAction::AgentRouteRevoke,
     ResourceAction::AgentsDocumentRead,
     ResourceAction::ThreadManage,
     ResourceAction::ThreadParticipantsManage,
@@ -658,6 +833,17 @@ impl RoleDefinitionRegistry {
         self.resolve(PrincipalKind::User, Some(role_key))
     }
 
+    pub(crate) fn resolve_agent_role(self, role_key: &str) -> Option<&'static AgentRoleDefinition> {
+        AGENT_ROLE_DEFINITIONS
+            .iter()
+            .find(|definition| definition.key == role_key)
+    }
+
+    pub(crate) fn agent_policy_allows(self, role_key: &str, action: ResourceAction) -> bool {
+        self.resolve_agent_role(role_key)
+            .is_some_and(|role| role.actions.allows(action))
+    }
+
     pub(crate) fn invitation_role_options(self) -> Vec<AuthorizationInvitationRoleOption> {
         ROLE_DEFINITIONS
             .iter()
@@ -688,7 +874,25 @@ impl RoleDefinitionRegistry {
     /// Stable fingerprint used to advance durable policy generation whenever
     /// a code-defined role changes across deployments.
     pub(crate) fn policy_fingerprint(self) -> String {
-        policy_fingerprint_for(ROLE_DEFINITIONS)
+        let mut fingerprint = policy_fingerprint_for(ROLE_DEFINITIONS);
+        let mut digest = Sha256::new();
+        digest.update(fingerprint.as_bytes());
+        for definition in AGENT_ROLE_DEFINITIONS {
+            digest.update(definition.key.as_bytes());
+            digest.update([0]);
+            if let RoleActionPolicy::Only(actions) = definition.actions {
+                for action in actions {
+                    digest.update(action.safe_name().as_bytes());
+                    digest.update([0]);
+                }
+            }
+            digest.update([match definition.disclosure {
+                RoleDisclosurePolicy::Administrative => 0,
+                RoleDisclosurePolicy::Collaborator => 1,
+            }]);
+        }
+        fingerprint = hex::encode(digest.finalize());
+        fingerprint
     }
 }
 
@@ -846,6 +1050,78 @@ fn policy_fingerprint_for(definitions: &[RoleDefinition]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_reviewer_role_cannot_expand_beyond_review() {
+        let registry = RoleDefinitionRegistry::new();
+        let reviewer = registry
+            .resolve_agent_role("agent_reviewer")
+            .expect("reviewer role is registered");
+
+        assert!(reviewer.actions.allows(ResourceAction::TaskRead));
+        assert!(reviewer.actions.allows(ResourceAction::TaskReview));
+        for denied in [
+            ResourceAction::MessageCreate,
+            ResourceAction::AgentTurnStart,
+            ResourceAction::ChildStart,
+            ResourceAction::TaskCreate,
+            ResourceAction::TaskCancel,
+            ResourceAction::AgentRouteCreate,
+            ResourceAction::AgentRouteRevoke,
+        ] {
+            assert!(!reviewer.actions.allows(denied), "unexpected {denied:?}");
+        }
+    }
+
+    #[test]
+    fn working_agent_can_use_but_cannot_manage_routes() {
+        let registry = RoleDefinitionRegistry::new();
+        let agent = registry
+            .resolve_agent_role("thread_agent")
+            .expect("working Agent role is registered");
+
+        assert!(agent.actions.allows(ResourceAction::AgentSourceExport));
+        assert!(agent.actions.allows(ResourceAction::TaskScheduleManage));
+        assert!(!agent.actions.allows(ResourceAction::AgentRouteCreate));
+        assert!(!agent.actions.allows(ResourceAction::AgentRouteRevoke));
+    }
+
+    #[test]
+    fn narrow_agent_roles_follow_the_role_scalability_matrix() {
+        let registry = RoleDefinitionRegistry::new();
+        let observer = registry
+            .resolve_agent_role("agent_observer")
+            .expect("observer role is registered");
+        assert!(observer.actions.allows(ResourceAction::ThreadRead));
+        assert!(observer.actions.allows(ResourceAction::TaskRead));
+        assert!(!observer.actions.allows(ResourceAction::MessageCreate));
+        assert!(!observer.actions.allows(ResourceAction::AgentTurnStart));
+
+        let messenger = registry
+            .resolve_agent_role("agent_messenger")
+            .expect("messenger role is registered");
+        assert!(messenger.actions.allows(ResourceAction::MessageCreate));
+        assert!(!messenger.actions.allows(ResourceAction::AgentTurnStart));
+        assert!(!messenger.actions.allows(ResourceAction::TaskCreate));
+
+        let runner = registry
+            .resolve_agent_role("agent_runner")
+            .expect("runner role is registered");
+        assert!(runner.actions.allows(ResourceAction::AgentTurnStart));
+        assert!(runner.actions.allows(ResourceAction::TaskCreate));
+        assert!(!runner.actions.allows(ResourceAction::MessageCreate));
+        assert!(!runner.actions.allows(ResourceAction::TaskScheduleManage));
+        assert!(!runner.actions.allows(ResourceAction::TaskReview));
+
+        let scheduler = registry
+            .resolve_agent_role("agent_scheduler")
+            .expect("scheduler role is registered");
+        assert!(scheduler.actions.allows(ResourceAction::MessageCreate));
+        assert!(scheduler.actions.allows(ResourceAction::AgentTurnStart));
+        assert!(scheduler.actions.allows(ResourceAction::TaskCreate));
+        assert!(scheduler.actions.allows(ResourceAction::TaskScheduleManage));
+        assert!(!scheduler.actions.allows(ResourceAction::TaskReview));
+    }
 
     #[test]
     fn synthetic_role_is_added_by_one_definition_and_resolves_every_trait() {

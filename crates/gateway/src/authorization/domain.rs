@@ -130,6 +130,9 @@ pub(crate) enum ResourceAction {
     ChildTaskCreate,
     ChildArtifactRead,
     ChildArtifactWrite,
+    AgentSourceExport,
+    AgentRouteCreate,
+    AgentRouteRevoke,
     AgentsDocumentRead,
     AgentsDocumentManage,
     ThreadManage,
@@ -191,7 +194,7 @@ pub(crate) enum ResourceAction {
 }
 
 impl ResourceAction {
-    pub(crate) const ALL: [Self; 84] = [
+    pub(crate) const ALL: [Self; 87] = [
         Self::GatewayManage,
         Self::WorkspaceList,
         Self::WorkspaceRead,
@@ -218,6 +221,9 @@ impl ResourceAction {
         Self::ChildTaskCreate,
         Self::ChildArtifactRead,
         Self::ChildArtifactWrite,
+        Self::AgentSourceExport,
+        Self::AgentRouteCreate,
+        Self::AgentRouteRevoke,
         Self::AgentsDocumentRead,
         Self::AgentsDocumentManage,
         Self::ThreadManage,
@@ -306,6 +312,9 @@ impl ResourceAction {
             Self::ChildTaskCreate => "child_task_create",
             Self::ChildArtifactRead => "child_artifact_read",
             Self::ChildArtifactWrite => "child_artifact_write",
+            Self::AgentSourceExport => "agent_source_export",
+            Self::AgentRouteCreate => "agent_route_create",
+            Self::AgentRouteRevoke => "agent_route_revoke",
             Self::AgentsDocumentRead => "agents_document_read",
             Self::AgentsDocumentManage => "agents_document_manage",
             Self::ThreadManage => "thread_manage",
@@ -385,7 +394,8 @@ pub(crate) const fn execution_child_policy_action(
         | ResourceAction::AgentRequestObserve
         | ResourceAction::TaskRead
         | ResourceAction::TaskReadOperator
-        | ResourceAction::CliRuntimeReadOperator => Some(ResourceAction::ChildObserve),
+        | ResourceAction::CliRuntimeReadOperator
+        | ResourceAction::AgentSourceExport => Some(ResourceAction::ChildObserve),
         ResourceAction::MessageCreate
         | ResourceAction::MemoryRead
         | ResourceAction::MemoryCreateThread
@@ -400,7 +410,9 @@ pub(crate) const fn execution_child_policy_action(
         | ResourceAction::AgentExecutionSteer
         | ResourceAction::CliRuntimeUse
         | ResourceAction::CliRuntimeControl
-        | ResourceAction::CliThreadFork => Some(ResourceAction::ChildControl),
+        | ResourceAction::CliThreadFork
+        | ResourceAction::AgentRouteCreate
+        | ResourceAction::AgentRouteRevoke => Some(ResourceAction::ChildControl),
         ResourceAction::AgentRequestRespond => Some(ResourceAction::ChildRespond),
         ResourceAction::TaskCreate => Some(ResourceAction::ChildTaskCreate),
         ResourceAction::ArtifactRead => Some(ResourceAction::ChildArtifactRead),

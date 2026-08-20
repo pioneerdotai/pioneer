@@ -258,6 +258,12 @@ pub(crate) fn validate_identity_invariants(
                     );
                 }
             }
+            // Agent execution rows are owned by the execution subsystem rather
+            // than the gateway-principal table. Their typed identifier is
+            // validated by `actor_ref_from_db`; referential validation belongs
+            // to the execution invariant pass, so identity validation must not
+            // misclassify a valid agent actor as an invalid principal pair.
+            Ok(Some(PersistedActorRef::AgentExecution(_))) => {}
             Err(_) => push_violation(&mut violations, IdentityInvariantKind::InvalidActorPair),
         }
     }
