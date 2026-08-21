@@ -3081,7 +3081,7 @@ struct TaskWaitToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     timeout_ms: Option<u64>,
-    /// all_terminal waits for every target to become terminal. By default this tool also returns when every target is terminal or ready for review.
+    /// By default, return as soon as any target is terminal or ready for review. Use all_terminal only for an intentional barrier that does not process intermediate results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<TaskWaitMode>,
     /// Include terminal task results in the response. The handler enables this by default when both return flags are false.
@@ -3115,7 +3115,7 @@ impl TaskWaitToolInput {
             timeout_ms: self.timeout_ms,
             mode: self
                 .mode
-                .unwrap_or(TaskWaitMode::AllTerminalOrReviewRequired),
+                .unwrap_or(TaskWaitMode::AnyTerminalOrReviewRequired),
             return_completed: self.return_completed,
             return_pending: self.return_pending,
         })
@@ -3527,7 +3527,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_WAIT_TOOL,
-            "Join one or more active attached task ids or run ids using the task event bus. Use once for immediate attached tasks that have a runId or task_create returned waitable=true; by default it returns when all targets are terminal or ready for review. timeoutMs limits only this observation window and returns timedOut=true without cancelling the tasks or failing the parent Turn. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Do not repeatedly call it for the same task set unless the prior wait timed out.",
+            "Wait for progress from one or more active attached task ids or run ids using the task event bus. By default it returns as soon as any target is terminal or ready for review. Inspect every returned reviewRequired candidate and call task_accept, task_revise, or task_cancel as appropriate, then call task_wait again for the remaining active runs. Use all_terminal only when an intentional barrier without intermediate result handling is required. timeoutMs limits only this observation window and returns timedOut=true without cancelling the tasks or failing the parent Turn. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Repeat task_wait only after the prior call timed out or after its returned terminal/review-required progress was handled.",
             task_wait_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Transient,
@@ -6103,7 +6103,7 @@ mod tests {
 
         let params = input.into_params().expect("input should convert");
 
-        assert_eq!(params.mode, TaskWaitMode::AllTerminalOrReviewRequired);
+        assert_eq!(params.mode, TaskWaitMode::AnyTerminalOrReviewRequired);
     }
 
     #[test]
@@ -6113,7 +6113,7 @@ mod tests {
         }))
         .expect("signature should decode");
 
-        assert_eq!(signature.mode, TaskWaitMode::AllTerminalOrReviewRequired);
+        assert_eq!(signature.mode, TaskWaitMode::AnyTerminalOrReviewRequired);
     }
 
     #[test]

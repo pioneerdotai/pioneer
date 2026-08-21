@@ -35,10 +35,11 @@ Before delegating, decide whether attached subagents improve the current answer.
 1. If the user needs one direct answer and the work is small, tightly coupled, or sequential, do it in the parent turn.
 2. If independent focused work improves speed, coverage, verification, or auditability, create attached subagents.
 3. Create all independent child tasks first.
-4. Wait once with `task_wait`.
-5. Review every terminal or review-required result.
+4. Call `task_wait` until the next child result is terminal or requires review.
+5. Review every returned terminal or review-required result immediately.
 6. Accept good candidates, revise close-but-incomplete candidates, cancel irrelevant or unsafe candidates, or detach work that should no longer block the parent.
-7. Synthesize the parent answer from accepted results and direct parent work.
+7. Call `task_wait` again for the remaining active runs and repeat the review cycle until all child work is resolved.
+8. Synthesize the parent answer from accepted results and direct parent work.
 
 Do not finish the parent turn while attached subagents created by this turn are pending, running, waiting for review, or producing unreviewed candidates.
 
@@ -108,7 +109,7 @@ Read `references/tool-schemas.md` for exact payload examples.
 
 ## Wait And Review
 
-For independent attached subagents, create them all first, then call `task_wait` once with `taskIds` or `runIds`. Prefer `runIds` when available.
+For independent attached subagents, create them all first, then call `task_wait` with `taskIds` or `runIds`. Prefer `runIds` when available. By default, `task_wait` returns as soon as any target is terminal or requires review. Handle every returned result before calling `task_wait` again for the remaining active runs.
 
 `task_wait` can return terminal results, pending work, or `reviewRequired`. A review-required candidate is not final. Inspect every candidate and accept only when it satisfies:
 
@@ -121,6 +122,8 @@ For independent attached subagents, create them all first, then call `task_wait`
 Use `task_revise` when the result is close but incomplete or incorrectly shaped. Give concrete feedback: what is wrong, what to add/remove/correct, and what the revised output must look like.
 
 Use `task_accept` only after the candidate is good enough to use. Use accepted child results in the parent synthesis.
+
+After accepting, revising, or cancelling the returned candidates, call `task_wait` again for unresolved active runs. Continue this wait-review cycle until no attached child work remains unresolved.
 
 Use `task_cancel` when the child is irrelevant, unsafe, duplicate, or no longer needed.
 

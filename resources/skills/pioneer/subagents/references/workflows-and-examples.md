@@ -24,7 +24,7 @@ Good split:
 - Subagent B: inspect memory quality gate and scoring.
 - Subagent C: inspect write provider calls and diagnostics.
 
-Create all three first, then wait once:
+Create all three first, then wait for the next actionable result:
 
 ```json
 {
@@ -52,7 +52,7 @@ Then:
 }
 ```
 
-Review each candidate. Accept only evidence-backed results. Synthesize one parent answer.
+Review every returned candidate immediately. Accept evidence-backed results, revise incomplete results, or cancel unusable work. Then call `task_wait` again with the remaining active `runIds`. Repeat until all three runs are resolved, then synthesize one parent answer.
 
 ## Independent Review Subagent
 
