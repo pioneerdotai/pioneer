@@ -4278,6 +4278,7 @@ struct PriorWaitCall {
     item_id: String,
     timed_out: bool,
     terminal_count: u32,
+    pending_count: u32,
     review_required_count: u32,
 }
 
@@ -4339,6 +4340,7 @@ fn prior_wait_call_from_item(
             .and_then(JsonValue::as_bool)
             .unwrap_or(false),
         terminal_count: json_u32(&wait_result, "terminalCount"),
+        pending_count: json_u32(&wait_result, "pendingCount"),
         review_required_count: json_u32(&wait_result, "reviewRequiredCount"),
     })
 }
@@ -4355,11 +4357,23 @@ fn duplicate_wait_should_block(
     let last = prior
         .last()
         .expect("prior wait list checked as non-empty before last()");
-    if terminal_count > last.terminal_count || review_required_count > last.review_required_count {
+    if terminal_count != last.terminal_count
+        || pending_count != last.pending_count
+        || review_required_count != last.review_required_count
+    {
         return false;
     }
     if last.timed_out {
-        return prior.iter().filter(|entry| entry.timed_out).count() >= 2;
+        return prior
+            .iter()
+            .filter(|entry| {
+                entry.timed_out
+                    && entry.terminal_count == terminal_count
+                    && entry.pending_count == pending_count
+                    && entry.review_required_count == review_required_count
+            })
+            .count()
+            >= 2;
     }
     true
 }
@@ -5224,6 +5238,7 @@ mod tests {
             item_id: "wait_item".to_owned(),
             timed_out,
             terminal_count,
+            pending_count: 3,
             review_required_count: 0,
         }
     }
@@ -5237,6 +5252,7 @@ mod tests {
             item_id: "wait_item".to_owned(),
             timed_out,
             terminal_count,
+            pending_count: 0,
             review_required_count,
         }
     }
@@ -6080,6 +6096,16 @@ mod tests {
             0,
             1,
             1
+        ));
+    }
+
+    #[test]
+    fn duplicate_wait_guard_allows_review_to_revision_running_transition() {
+        assert!(!duplicate_wait_should_block(
+            &[prior_with_review(false, 0, 1)],
+            0,
+            1,
+            0
         ));
     }
 
