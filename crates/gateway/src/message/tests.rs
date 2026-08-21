@@ -16510,8 +16510,16 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
             .expect("occurrence turn should exist")
             .1
             .status,
-        TurnStatus::InProgress,
-        "accepted result must keep the parent occurrence active until delivery"
+        TurnStatus::Completed,
+        "canonical TaskRun success must terminalize the parent independently of delivery"
+    );
+    assert_eq!(
+        processor
+            .reconcile_terminal_task_run_occurrence_turns(10)
+            .await
+            .expect("terminal occurrence reconciliation should succeed"),
+        0,
+        "live task-event projection should already terminalize the occurrence"
     );
     processor
         .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
@@ -16522,8 +16530,8 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
             .reconcile_terminal_task_run_occurrence_turns(10)
             .await
             .expect("terminal occurrence reconciliation should succeed"),
-        1,
-        "durable delivery state must repair a missed live fanout"
+        0,
+        "delivery must not own parent occurrence terminalization"
     );
     assert_eq!(
         processor
@@ -19412,8 +19420,8 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     assert_eq!(occurrence_turn.origin, TurnOrigin::DetachedTask);
     assert_eq!(
         occurrence_turn.status,
-        TurnStatus::InProgress,
-        "the parent occurrence must remain active until its final AgentMessage is delivered"
+        TurnStatus::Completed,
+        "the parent occurrence lifecycle must follow the canonical TaskRun"
     );
     let anchor_item_id = crate::task_tools::task_run_anchor_id(run.id.as_str());
     let pending_delivery_anchor =
@@ -19421,7 +19429,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     assert_eq!(
         pending_delivery_anchor.status,
         TaskStatus::Running,
-        "the parent Task card must remain running while origin-thread delivery is pending"
+        "the Task card remains live until its result is delivered, independently of the parent Turn lifecycle"
     );
 
     let occurrence_items = crud_store
@@ -19524,7 +19532,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         )
         .await,
         TurnStatus::Completed,
-        "the parent occurrence may complete only after origin-thread delivery"
+        "origin-thread delivery must not regress the already completed occurrence"
     );
     let delivered_anchor = wait_for_task_anchor_item_status(
         crud_store.clone(),
@@ -41509,29 +41517,50 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
         .await;
     let _ = recv_response_by_id(&mut rx, thread_request_id.as_str()).await;
 
-    let turn_start_request_id = generate_test_request_id("turncancel", "start");
-    let turn_start_request = json!({
-        "jsonrpc": "2.0",
-        "id": turn_start_request_id,
-        "method": "turn/start",
-        "params": {
-            "thread_id": "thr_000000000000000022",
-            "turn_id": "turn_000000000000000022",
-            "mode": "Chat",
-            "model": "test-model",
-            "model_provider": "delayed",
-            "input": [{"type": "text", "text": "hello"}]
-        }
-    });
-    processor
-        .process_request_for_connection(connection_id, &turn_start_request.to_string())
-        .await;
-    let _ = recv_response_and_notification_by_id_method(
-        &mut rx,
-        turn_start_request_id.as_str(),
-        events::TURN_STARTED,
-    )
-    .await;
+    // Cancellation is the control-plane operation under test. Seed an admitted,
+    // durable in-progress Turn directly so the assertion does not depend on the
+    // separate launch-admission surface (which has its own exhaustive tests).
+    let turn_outcome = thread_manager_for_assert
+        .turn_start(
+            connection_id,
+            pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
+                thread_id: "thr_000000000000000022".to_owned(),
+                turn_id: "turn_000000000000000022".to_owned(),
+                input: vec![UserInput::Text {
+                    text: "hello".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                capabilities: Vec::new(),
+                model: Some("test-model".to_owned()),
+                model_provider: Some("delayed".to_owned()),
+                sandbox_policy: None,
+                mode: Some(ThreadMode::Agent),
+                agent_launch: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
+                execution_backend: Some(AgentExecutionBackend::ApiProvider {
+                    provider: "delayed".to_owned(),
+                }),
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            },
+        )
+        .await
+        .expect("turn cancellation fixture should seed an in-progress Turn");
+    crud_store_for_assert
+        .materialize_turn_start(
+            &turn_outcome.materialization.thread,
+            turn_outcome.materialization.sandbox_mode,
+            &turn_outcome.materialization.turn,
+            &turn_outcome.materialization.input,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+        )
+        .await
+        .expect("turn cancellation fixture should persist the in-progress Turn");
     wait_for_thread_manager_turn_status(
         thread_manager_for_assert.as_ref(),
         "thr_000000000000000022",
@@ -54706,6 +54735,13 @@ async fn setup_workspace_manager_with_connection(
         .expect("default workspace should exist after bootstrap")
         .id
         .clone();
+    pioneer_crud::ensure_pioneer_for_workspace(
+        &connection,
+        workspace_id.as_str(),
+        chrono::Utc::now().fixed_offset(),
+    )
+    .await
+    .expect("test workspace should include the reserved Pioneer identity");
     (workspace_manager, crud_store, workspace_id)
 }
 

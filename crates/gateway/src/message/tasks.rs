@@ -120,16 +120,6 @@ impl MessageProcessor {
             let Some(run) = self.crud_store.get_task_run(run_id.as_str()).await? else {
                 continue;
             };
-            let Some(task_response) = self.crud_store.get_task(run.task_id.as_str()).await? else {
-                continue;
-            };
-            if run.status == pioneer_protocol::TaskRunStatus::Succeeded
-                && self
-                    .task_run_awaits_origin_thread_delivery(&task_response, run.id.as_str())
-                    .await?
-            {
-                continue;
-            }
             match self
                 .mark_task_run_occurrence_turn_terminal(run.id.as_str())
                 .await?
@@ -327,10 +317,8 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::RunCompleted { run_id, .. } => {
-                if !awaits_origin_thread_delivery {
-                    self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
-                        .await?;
-                }
+                self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
+                    .await?;
                 if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),

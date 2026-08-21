@@ -7669,47 +7669,14 @@ impl MessageProcessor {
             return;
         }
 
-        match self
-            .agent_manager
-            .cancel_turn(thread_id.as_str(), turn_id.as_str(), reason.as_str())
-            .await
-        {
-            Ok(()) => {}
-            Err(pioneer_agent::AgentControlError::ThreadNotFound)
-            | Err(pioneer_agent::AgentControlError::NoActiveTurn) => {
-                warn!(
-                    thread_id,
-                    turn_id,
-                    "agent runtime had no active turn during turn/cancel; terminalizing in gateway"
-                );
-            }
-            Err(error) => {
-                self.user_turn_cancel_intents
-                    .lock()
-                    .await
-                    .remove(&cancel_intent_key);
-                self.send_error(
-                    connection_id,
-                    public_turn_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        pioneer_protocol::PublicErrorStage::Execution,
-                        format!("failed to cancel turn: {error}"),
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-
         let interrupted = self
-            .mark_turn_interrupted(thread_id.clone(), turn_id.clone(), reason)
+            .mark_turn_interrupted(thread_id.clone(), turn_id.clone(), reason.clone())
             .await;
-        self.user_turn_cancel_intents
-            .lock()
-            .await
-            .remove(&cancel_intent_key);
         if !interrupted {
+            self.user_turn_cancel_intents
+                .lock()
+                .await
+                .remove(&cancel_intent_key);
             // Cancellation races with fail-closed admission/runtime paths.
             // If that path already committed a terminal state, cancellation
             // has reached its intended durable outcome and is idempotently
@@ -7745,6 +7712,35 @@ impl MessageProcessor {
             .await;
             return;
         }
+
+        // The durable lifecycle transition is the cancellation commit point.
+        // Runtime signalling is deliberately downstream and best-effort: a
+        // provider actor that is blocked while publishing data-plane events
+        // cannot make the control-plane request fail or hang.
+        match self
+            .agent_manager
+            .cancel_turn(thread_id.as_str(), turn_id.as_str(), reason.as_str())
+            .await
+        {
+            Ok(()) => {}
+            Err(pioneer_agent::AgentControlError::ThreadNotFound)
+            | Err(pioneer_agent::AgentControlError::NoActiveTurn) => {
+                debug!(
+                    thread_id,
+                    turn_id, "agent runtime had no active owner after durable cancellation"
+                );
+            }
+            Err(error) => warn!(
+                thread_id,
+                turn_id,
+                error = %error,
+                "durable cancellation committed but runtime signalling failed"
+            ),
+        }
+        self.user_turn_cancel_intents
+            .lock()
+            .await
+            .remove(&cancel_intent_key);
 
         let Some((workspace_id, turn)) = self
             .thread_manager

@@ -8556,6 +8556,7 @@ name = "pioneer-cli-agent-runtime"
 version = "0.40.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "hex",
  "libc",
  "pioneer-protocol",

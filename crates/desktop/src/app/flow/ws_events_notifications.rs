@@ -574,6 +574,20 @@ impl PioneerDesktop {
                 cx.notify();
             }
         }
+        let terminal_work_reconciliation =
+            pioneer_client::timeline::semantic::terminal_turn_work_reconciliation(
+                &self.semantic_timelines,
+                &reduction.conversation_event,
+            );
+        if let (Some(reconciliation), Some(cx)) = (terminal_work_reconciliation, cx.as_deref_mut())
+        {
+            self.request_semantic_turn_work_items(
+                reconciliation.thread_id,
+                reconciliation.turn_id,
+                reconciliation.running_work_item_ids,
+                cx,
+            );
+        }
         if reduction.tick_conversation
             && let Some(conversation) = self.thread_conversation_mut(thread_id.as_str())
         {

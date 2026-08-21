@@ -37,7 +37,7 @@ use pioneer_skills::{
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -1070,6 +1070,7 @@ enum AgentCommand {
 #[derive(Clone)]
 struct TurnExecutionControl {
     attempt_controls: Arc<tokio::sync::Mutex<HashMap<String, AttemptControl>>>,
+    turn_cancellation_token: CancellationToken,
     command_tx: mpsc::Sender<AgentCommand>,
     run_id: u64,
 }
@@ -1084,13 +1085,14 @@ impl TurnExecutionControl {
     fn new(command_tx: mpsc::Sender<AgentCommand>, run_id: u64) -> Self {
         Self {
             attempt_controls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            turn_cancellation_token: CancellationToken::new(),
             command_tx,
             run_id,
         }
     }
 
     async fn register_attempt(&self, item_id: String) -> CancellationToken {
-        let token = CancellationToken::new();
+        let token = self.turn_cancellation_token.child_token();
         self.attempt_controls.lock().await.insert(
             item_id,
             AttemptControl {
@@ -1162,6 +1164,7 @@ impl TurnExecutionControl {
     }
 
     async fn cancel_all_attempts(&self) {
+        self.turn_cancellation_token.cancel();
         let tokens = self
             .attempt_controls
             .lock()
@@ -1173,11 +1176,100 @@ impl TurnExecutionControl {
             token.cancel();
         }
     }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.turn_cancellation_token.clone()
+    }
+}
+
+#[derive(Clone)]
+struct ActiveTurnControl {
+    turn_id: String,
+    run_id: u64,
+    execution: TurnExecutionControl,
+    observation: ExecutionTurnObservation,
+}
+
+/// Control-plane state is intentionally independent from the per-thread actor
+/// mailbox. Cancellation and liveness observation must remain available while
+/// the actor is committing data-plane events or waiting on a provider/tool.
+#[derive(Clone, Default)]
+struct AgentThreadControlPlane {
+    active: Arc<StdRwLock<Option<ActiveTurnControl>>>,
+}
+
+impl AgentThreadControlPlane {
+    fn activate(&self, turn_id: String, run_id: u64, execution: TurnExecutionControl) {
+        *self
+            .active
+            .write()
+            .expect("agent thread control plane lock poisoned") = Some(ActiveTurnControl {
+            turn_id,
+            run_id,
+            execution,
+            observation: ExecutionTurnObservation {
+                status: ExecutionTurnStatus::InProgress,
+                message: None,
+            },
+        });
+    }
+
+    fn clear(&self, turn_id: &str, run_id: u64) {
+        let mut active = self
+            .active
+            .write()
+            .expect("agent thread control plane lock poisoned");
+        if active
+            .as_ref()
+            .is_some_and(|active| active.turn_id == turn_id && active.run_id == run_id)
+        {
+            *active = None;
+        }
+    }
+
+    fn clear_all(&self) {
+        *self
+            .active
+            .write()
+            .expect("agent thread control plane lock poisoned") = None;
+    }
+
+    fn execution_for(&self, turn_id: &str) -> Option<TurnExecutionControl> {
+        self.active
+            .read()
+            .expect("agent thread control plane lock poisoned")
+            .as_ref()
+            .filter(|active| active.turn_id == turn_id)
+            .map(|active| active.execution.clone())
+    }
+
+    fn set_observation(&self, turn_id: &str, run_id: u64, observation: ExecutionTurnObservation) {
+        let mut active = self
+            .active
+            .write()
+            .expect("agent thread control plane lock poisoned");
+        if let Some(active) = active
+            .as_mut()
+            .filter(|active| active.turn_id == turn_id && active.run_id == run_id)
+        {
+            active.observation = observation;
+        }
+    }
+
+    fn observation_for(&self, turn_id: &str) -> Option<ExecutionTurnObservation> {
+        self.active
+            .read()
+            .expect("agent thread control plane lock poisoned")
+            .as_ref()
+            .filter(|active| active.turn_id == turn_id)
+            .map(|active| active.observation.clone())
+    }
 }
 
 struct AgentThreadHandle {
     workspace_id: String,
     command_tx: mpsc::Sender<AgentCommand>,
+    control_plane: AgentThreadControlPlane,
     event_hub: Arc<AgentEventHub>,
     loop_handle: JoinHandle<()>,
 }
@@ -1399,6 +1491,7 @@ impl AgentManager {
 
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let event_hub = Arc::new(AgentEventHub::new());
+        let control_plane = AgentThreadControlPlane::default();
 
         let hook_runtime = self.hook_runtime.read().await.clone();
         let tool_bundle_artifacts = hook_runtime
@@ -1421,6 +1514,7 @@ impl AgentManager {
             command_tx.clone(),
             command_rx,
             event_hub.clone(),
+            control_plane.clone(),
         )));
 
         self.state.write().await.threads.insert(
@@ -1428,6 +1522,7 @@ impl AgentManager {
             AgentThreadHandle {
                 workspace_id: workspace_id_owned,
                 command_tx,
+                control_plane,
                 event_hub,
                 loop_handle,
             },
@@ -1961,15 +2056,28 @@ impl AgentManager {
         turn_id: &str,
         reason: &str,
     ) -> Result<(), AgentControlError> {
-        let command_tx = {
+        let (command_tx, control_plane) = {
             let state = self.state.read().await;
             let Some(thread) = state.threads.get(thread_id) else {
                 return Err(AgentControlError::ThreadNotFound);
             };
-            thread.command_tx.clone()
+            (thread.command_tx.clone(), thread.control_plane.clone())
         };
 
         let (ack_tx, ack_rx) = oneshot::channel();
+
+        if let Some(control) = control_plane.execution_for(turn_id) {
+            // This is the authoritative control path. It does not depend on
+            // the actor consuming its mailbox, so a blocked durable commit
+            // cannot make cancellation unavailable.
+            control.cancel_all_attempts().await;
+            let _ = command_tx.try_send(AgentCommand::CancelTurn {
+                turn_id: turn_id.to_owned(),
+                reason: reason.to_owned(),
+                ack: ack_tx,
+            });
+            return Ok(());
+        }
 
         command_tx
             .send(AgentCommand::CancelTurn {
@@ -1980,11 +2088,18 @@ impl AgentManager {
             .await
             .map_err(|_| AgentControlError::ThreadNotFound)?;
 
-        ack_rx.await.unwrap_or_else(|_| {
-            Err(AgentControlError::Internal(
-                "agent loop dropped cancel turn ack".to_owned(),
-            ))
-        })
+        tokio::time::timeout(std::time::Duration::from_secs(2), ack_rx)
+            .await
+            .map_err(|_| {
+                AgentControlError::Internal(
+                    "agent loop did not acknowledge cancellation".to_owned(),
+                )
+            })?
+            .unwrap_or_else(|_| {
+                Err(AgentControlError::Internal(
+                    "agent loop dropped cancel turn ack".to_owned(),
+                ))
+            })
     }
 
     pub async fn observe_turn(
@@ -1992,10 +2107,14 @@ impl AgentManager {
         thread_id: &str,
         turn_id: &str,
     ) -> Option<ExecutionTurnObservation> {
-        let command_tx = {
+        let (command_tx, control_plane) = {
             let state = self.state.read().await;
-            state.threads.get(thread_id)?.command_tx.clone()
+            let thread = state.threads.get(thread_id)?;
+            (thread.command_tx.clone(), thread.control_plane.clone())
         };
+        if let Some(observation) = control_plane.observation_for(turn_id) {
+            return Some(observation);
+        }
         let (ack_tx, ack_rx) = oneshot::channel();
         command_tx
             .send(AgentCommand::ObserveTurn {
@@ -2004,7 +2123,11 @@ impl AgentManager {
             })
             .await
             .ok()?;
-        ack_rx.await.ok().flatten()
+        tokio::time::timeout(std::time::Duration::from_secs(2), ack_rx)
+            .await
+            .ok()?
+            .ok()
+            .flatten()
     }
 
     pub async fn start_recovery_attempt(

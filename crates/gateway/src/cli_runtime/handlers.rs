@@ -40,7 +40,8 @@ use pioneer_cli_agent_runtime::codex::{
 use pioneer_cli_agent_runtime::event::{
     RuntimeEvent, RuntimeEventMappingOptions, RuntimeRequestResolved, RuntimeTurnCompleted,
     RuntimeTurnFailed, RuntimeTurnInterrupted, RuntimeTurnTerminalKind,
-    map_codex_notification_event, map_codex_server_request_event,
+    classify_runtime_provider_failure, map_codex_notification_event,
+    map_codex_server_request_event,
 };
 use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
@@ -5126,6 +5127,67 @@ impl MessageProcessor {
                 }
                 return false;
             }
+        }
+        if terminal_status.is_some()
+            && let Some(provider_failure) =
+                classify_runtime_provider_failure(&event, chrono::Local::now().fixed_offset())
+        {
+            if let Some(attempt) = turn_attempt {
+                match self
+                    .crud_store
+                    .mark_cli_runtime_turn_attempt_terminal(
+                        attempt.id.as_str(),
+                        pioneer_crud::CliRuntimeTurnAttemptStatus::Failed,
+                        Some(provider_failure.message.clone()),
+                        chrono::Utc::now().fixed_offset(),
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!(
+                            turn_id = turn_binding.turn_id.as_str(),
+                            native_turn_id = native_turn_id_label,
+                            "CLI provider-failure attempt was already terminal; reconciling recovery idempotently"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            turn_id = turn_binding.turn_id.as_str(),
+                            native_turn_id = native_turn_id_label,
+                            error = %format!("{error:#}"),
+                            "failed to terminalize CLI provider-failure attempt"
+                        );
+                        return false;
+                    }
+                }
+            }
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+            return self
+                .handle_provider_failure_detected(
+                    turn_binding.thread_id.clone(),
+                    turn_binding.turn_id.clone(),
+                    "runtime:provider_failure".to_owned(),
+                    pioneer_protocol::TurnItemType::SystemEvent,
+                    pioneer_protocol::ProviderFailureDetails {
+                        provider: turn_binding.runtime_kind.clone(),
+                        model: turn_binding
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        transport: pioneer_protocol::ProviderTransportKind::NonStream,
+                        class: provider_failure.class,
+                        stage: pioneer_protocol::ProviderFailureStage::FirstChunk,
+                        http_status: None,
+                        provider_code: provider_failure.provider_code,
+                        retry_after_ms: provider_failure.retry_after_ms,
+                        is_recoverable_hint: true,
+                        message: Some(provider_failure.message),
+                    },
+                    recovery.clone(),
+                )
+                .await;
         }
         if terminal_status.is_some()
             && let Some(recovery) = recovery.as_ref()

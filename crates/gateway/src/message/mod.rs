@@ -68,6 +68,7 @@ use crate::thread_episodic_hooks::{
 };
 use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
+use futures_util::FutureExt;
 use pioneer_agent::MemoryLoopConfig;
 use pioneer_agent::{AgentManager, ResolvedArtifactInput, ToolLoopConfig};
 use pioneer_artifacts::{
@@ -177,6 +178,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::RwLock as StdRwLock;
@@ -1697,6 +1699,129 @@ impl MessageProcessor {
         self.keepawake.set_enabled(enabled)
     }
 
+    async fn run_projection_delivery_resilience_worker(processor: Weak<Self>) {
+        loop {
+            let Some(this) = processor.upgrade() else {
+                break;
+            };
+            let cycle = AssertUnwindSafe(async {
+                let now = now_timestamp_secs();
+                match retry_transient_storage_access(|| {
+                    this.reconcile_prepared_native_turn_finalizations(now, 64)
+                })
+                .await
+                {
+                    Ok(reconciled) if reconciled > 0 => {
+                        info!(reconciled, "reconciled prepared native Turn finalizations");
+                        this.kick_native_turn_event_deliveries();
+                    }
+                    Ok(_) => {}
+                    Err(error) => error!(
+                        error = %format!("{error:#}"),
+                        "native Turn finalization reconciler failed"
+                    ),
+                }
+
+                match retry_transient_storage_access(|| {
+                    this.crud_store.replay_due_turn_event_projections(now, 64)
+                })
+                .await
+                {
+                    Ok(summary) if summary.quarantined > 0 || summary.missing_events > 0 => warn!(
+                        claimed = summary.claimed,
+                        projected = summary.projected,
+                        failed = summary.failed,
+                        quarantined = summary.quarantined,
+                        missing_events = summary.missing_events,
+                        "turn event projection replay found quarantined streams"
+                    ),
+                    Ok(summary) if summary.projected > 0 || summary.deferred > 0 => debug!(
+                        projected = summary.projected,
+                        deferred = summary.deferred,
+                        "turn event projection replay advanced"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => error!(
+                        error = %format!("{error:#}"),
+                        "turn event projection replay failed"
+                    ),
+                }
+
+                if let Err(error) = retry_transient_storage_access(|| {
+                    this.process_due_native_turn_event_deliveries(now, 64)
+                })
+                .await
+                {
+                    error!(
+                        error = %format!("{error:#}"),
+                        "native turn-event optional delivery worker failed"
+                    );
+                }
+            })
+            .catch_unwind()
+            .await;
+            if cycle.is_err() {
+                error!("contained panic in projection/delivery resilience worker");
+            }
+            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+        }
+    }
+
+    async fn run_task_lifecycle_resilience_worker(processor: Weak<Self>) {
+        loop {
+            let Some(this) = processor.upgrade() else {
+                break;
+            };
+            let cycle = AssertUnwindSafe(async {
+                let now = now_timestamp_secs();
+                match retry_transient_storage_access(|| {
+                    this.reconcile_terminal_task_child_turns(64)
+                })
+                .await
+                {
+                    Ok(reconciled) if reconciled > 0 => info!(
+                        reconciled,
+                        "reconciled terminal child Turns with their TaskRun aggregates"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => error!(
+                        error = %format!("{error:#}"),
+                        "task child terminal reconciler failed"
+                    ),
+                }
+
+                match retry_transient_storage_access(|| {
+                    this.reconcile_terminal_task_run_occurrence_turns(64)
+                })
+                .await
+                {
+                    Ok(reconciled) if reconciled > 0 => info!(
+                        reconciled,
+                        "reconciled terminal TaskRuns with parent occurrence Turns"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => error!(
+                        error = %format!("{error:#}"),
+                        "task parent occurrence reconciler failed"
+                    ),
+                }
+
+                if let Err(error) =
+                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64))
+                        .await
+                {
+                    error!(error = %format!("{error:#}"), "task delivery worker failed");
+                }
+            })
+            .catch_unwind()
+            .await;
+            if cycle.is_err() {
+                error!("contained panic in task lifecycle resilience worker");
+            }
+            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+        }
+    }
+
     pub async fn start_resilience_workers(self: &Arc<Self>) {
         self.authorization_invalidation_hub
             .current_generation()
@@ -1789,6 +1914,24 @@ impl MessageProcessor {
 
         let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
+            struct IsolatedWorkerGuard(Vec<JoinHandle<()>>);
+
+            impl Drop for IsolatedWorkerGuard {
+                fn drop(&mut self) {
+                    for worker in &self.0 {
+                        worker.abort();
+                    }
+                }
+            }
+
+            let _isolated_workers = IsolatedWorkerGuard(vec![
+                tokio::spawn(Self::run_projection_delivery_resilience_worker(
+                    processor.clone(),
+                )),
+                tokio::spawn(Self::run_task_lifecycle_resilience_worker(
+                    processor.clone(),
+                )),
+            ]);
             let mut next_skill_upload_cleanup = 0;
             let mut next_agent_action_ledger_compaction = 0;
             loop {
@@ -2005,154 +2148,6 @@ impl MessageProcessor {
                             &mut transient_storage_poll_failed,
                         );
                     }
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                match retry_transient_storage_access(|| {
-                    this.reconcile_prepared_native_turn_finalizations(now, 64)
-                })
-                .await
-                {
-                    Ok(reconciled) if reconciled > 0 => {
-                        info!(reconciled, "reconciled prepared native Turn finalizations");
-                        this.kick_native_turn_event_deliveries();
-                    }
-                    Ok(_) => {}
-                    Err(error) => record_resilience_worker_poll_error(
-                        "native Turn finalization reconciler",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    ),
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                match retry_transient_storage_access(|| {
-                    this.crud_store.replay_due_turn_event_projections(now, 64)
-                })
-                .await
-                {
-                    Ok(summary) => {
-                        if summary.quarantined > 0 || summary.missing_events > 0 {
-                            warn!(
-                                claimed = summary.claimed,
-                                projected = summary.projected,
-                                failed = summary.failed,
-                                exhausted = summary.exhausted,
-                                quarantined_streams = summary.quarantined,
-                                missing_events = summary.missing_events,
-                                "turn event projection replay quarantined blocked streams"
-                            );
-                            for record in &summary.quarantined_streams {
-                                error!(
-                                    event_id = record.blocking_event_id,
-                                    thread_id = record.thread_id,
-                                    turn_id = record.turn_id,
-                                    error = record.error_message,
-                                    "turn event projection stream is quarantined until operator repair; raw events and successors were preserved"
-                                );
-                            }
-                        } else if summary.projected > 0
-                            || summary.deferred > 0
-                            || summary.failed > 0
-                        {
-                            info!(
-                                claimed = summary.claimed,
-                                projected = summary.projected,
-                                deferred = summary.deferred,
-                                failed = summary.failed,
-                                "turn event projection replay completed"
-                            );
-                        } else if summary.claimed > 0 {
-                            debug!(
-                                claimed = summary.claimed,
-                                "turn event projection replay claimed records with no changes"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        record_resilience_worker_poll_error(
-                            "turn event projection replay",
-                            &error,
-                            &mut transient_storage_poll_failed,
-                        );
-                    }
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                match retry_transient_storage_access(|| {
-                    this.reconcile_terminal_task_child_turns(64)
-                })
-                .await
-                {
-                    Ok(reconciled) if reconciled > 0 => {
-                        info!(
-                            reconciled,
-                            "reconciled terminal child Turns with their TaskRun aggregates"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => record_resilience_worker_poll_error(
-                        "task child terminal reconciler",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    ),
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                match retry_transient_storage_access(|| {
-                    this.reconcile_terminal_task_run_occurrence_turns(64)
-                })
-                .await
-                {
-                    Ok(reconciled) if reconciled > 0 => {
-                        info!(
-                            reconciled,
-                            "reconciled terminal TaskRuns with mismatched parent occurrence Turns"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => record_resilience_worker_poll_error(
-                        "task parent occurrence reconciler",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    ),
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.process_due_native_turn_event_deliveries(now, 64)
-                })
-                .await
-                {
-                    record_resilience_worker_poll_error(
-                        "native turn-event optional delivery worker",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
-                }
-
-                if let Err(error) =
-                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64))
-                        .await
-                {
-                    record_resilience_worker_poll_error(
-                        "task delivery worker",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                     continue;
@@ -3423,6 +3418,11 @@ impl MessageProcessor {
         tool_loop_config: ToolLoopConfig,
     ) -> Self {
         let memory_runtime = Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone()));
+        let runtime_home = std::env::temp_dir()
+            .join("pioneer-message-tests")
+            .join(generate_id(21));
+        std::fs::create_dir_all(&runtime_home)
+            .expect("message processor test runtime home should be created");
         Self::new_with_memory_runtime(
             thread_manager,
             provider_registry,
@@ -3434,7 +3434,7 @@ impl MessageProcessor {
             context_budget,
             tool_loop_config,
             memory_runtime,
-            std::env::temp_dir().join("pioneer-message-tests"),
+            runtime_home,
             GatewayArtifactsConfig::default(),
         )
     }

@@ -27,6 +27,13 @@ pub type TurnId = String;
 pub type TimelineBlockId = String;
 pub type TurnWorkItemId = String;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTurnWorkReconciliation {
+    pub thread_id: ThreadId,
+    pub turn_id: TurnId,
+    pub running_work_item_ids: Vec<TurnWorkItemId>,
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum SemanticTimelineRowId {
@@ -400,6 +407,37 @@ impl TurnWorkRangeCache {
         ids.sort();
         ids
     }
+}
+
+/// Returns the canonical work items that a shell must reconcile when a Turn
+/// reaches a non-running lifecycle state. This closes the notification-gap
+/// case where the shell received the Turn terminal event but missed one or
+/// more preceding item completion events.
+pub fn terminal_turn_work_reconciliation(
+    state: &SemanticTimelineState,
+    event: &ConversationEvent,
+) -> Option<TerminalTurnWorkReconciliation> {
+    let (thread_id, turn_id) = match event {
+        ConversationEvent::TurnCompleted { thread_id, turn }
+        | ConversationEvent::TurnFailed { thread_id, turn }
+        | ConversationEvent::TurnBlocked {
+            thread_id, turn, ..
+        } => (thread_id, turn.id.as_str()),
+        _ => return None,
+    };
+    let running_work_item_ids = state
+        .thread(thread_id)
+        .and_then(|thread| thread.work_range(turn_id))
+        .map(TurnWorkRangeCache::running_work_item_ids)
+        .unwrap_or_default();
+    if running_work_item_ids.is_empty() {
+        return None;
+    }
+    Some(TerminalTurnWorkReconciliation {
+        thread_id: thread_id.clone(),
+        turn_id: turn_id.to_owned(),
+        running_work_item_ids,
+    })
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -2098,6 +2136,15 @@ fn merge_turn_work_item(range: &mut TurnWorkRangeCache, item: TurnWorkItem) {
 }
 
 fn incoming_work_item_is_newer(existing: &TurnWorkItem, incoming: &TurnWorkItem) -> bool {
+    // Work-item terminality is monotonic. A terminal canonical projection is
+    // always allowed to close an optimistic/live running row, even when an
+    // older server encoded the item's first-event sequence as its revision or
+    // the local receipt timestamp is later than the server timestamp.
+    if existing.status == TurnWorkItemStatus::Running
+        && is_terminal_turn_work_item_status(incoming.status)
+    {
+        return true;
+    }
     if is_terminal_turn_work_item_status(existing.status)
         && incoming.status == TurnWorkItemStatus::Running
     {
@@ -2760,11 +2807,10 @@ fn upsert_detached_task_run_block(
     thread.detached_task_run_turn_ids.insert(turn_id.to_owned());
     let block_id = detached_task_run_block_id(turn_id, task.id.as_str());
     let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
-    let author = existing
-        .and_then(|block| match &block.kind {
-            TimelineBlockKind::DetachedTaskRun { author, .. } => author.clone(),
-            _ => None,
-        });
+    let author = existing.and_then(|block| match &block.kind {
+        TimelineBlockKind::DetachedTaskRun { author, .. } => author.clone(),
+        _ => None,
+    });
     let suffix = format!("detached-task-run:{}", task.id);
     let block = TimelineBlock {
         workspace_id: workspace_id.to_owned(),
@@ -4950,6 +4996,65 @@ mod tests {
             .expect("work item should remain cached");
         assert_eq!(item.status, TurnWorkItemStatus::Completed);
         assert_eq!(item.source_sequence, 12);
+    }
+
+    #[test]
+    fn canonical_terminal_item_closes_live_running_item_despite_legacy_revision() {
+        let mut state = SemanticTimelineState::default();
+        let mut running = work_item("work_a", "001");
+        running.status = TurnWorkItemStatus::Running;
+        running.source_sequence = 20;
+        running.source_updated_at_unix_micros = 20_000;
+        assert!(apply_turn_work_page(
+            &mut state,
+            work_page(vec![running.clone()]),
+            WorkPageMergeMode::MergeAfter
+        ));
+
+        let mut completed = running;
+        completed.status = TurnWorkItemStatus::Completed;
+        completed.source_sequence = 8;
+        completed.source_updated_at_unix_micros = 8_000;
+        assert!(apply_turn_work_items_get_response(
+            &mut state,
+            work_items_response("thread_a", "turn_a", 20, vec![completed]),
+        ));
+
+        let item = state
+            .thread("thread_a")
+            .and_then(|thread| thread.work_range("turn_a"))
+            .and_then(|range| range.item("work_a"))
+            .expect("work item should remain cached");
+        assert_eq!(item.status, TurnWorkItemStatus::Completed);
+    }
+
+    #[test]
+    fn terminal_turn_reconciles_cached_running_items_after_notification_gap() {
+        let mut state = SemanticTimelineState::default();
+        let mut running = work_item("work_a", "001");
+        running.status = TurnWorkItemStatus::Running;
+        assert!(apply_turn_work_page(
+            &mut state,
+            work_page(vec![running]),
+            WorkPageMergeMode::MergeAfter
+        ));
+
+        let mut turn = detached_task_turn("turn_a");
+        turn.status = TurnStatus::Completed;
+        turn.turn_kind = TurnKind::Conversation;
+        turn.origin = TurnOrigin::User;
+        let reconciliation = terminal_turn_work_reconciliation(
+            &state,
+            &ConversationEvent::TurnCompleted {
+                thread_id: "thread_a".to_owned(),
+                turn,
+            },
+        )
+        .expect("a terminal Turn must reconcile cached running items");
+
+        assert_eq!(reconciliation.thread_id, "thread_a");
+        assert_eq!(reconciliation.turn_id, "turn_a");
+        assert_eq!(reconciliation.running_work_item_ids, vec!["work_a"]);
     }
 
     #[test]

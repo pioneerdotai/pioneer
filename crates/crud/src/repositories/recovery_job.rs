@@ -41,6 +41,7 @@ pub struct NewRecoveryJob {
     pub provider_attempt_number: i64,
     pub policy_snapshot_json: String,
     pub max_attempts: i64,
+    pub created_at: DateTimeWithTimeZone,
     pub scheduled_at: DateTimeWithTimeZone,
     pub next_run_at: DateTimeWithTimeZone,
 }
@@ -83,8 +84,8 @@ pub async fn enqueue_recovery_job<C: ConnectionTrait>(
         claim_expires_at: Set(None),
         active_attempt_id: Set(None),
         active_attempt_started_at: Set(None),
-        created_at: Set(job.scheduled_at),
-        updated_at: Set(job.scheduled_at),
+        created_at: Set(job.created_at),
+        updated_at: Set(job.created_at),
     })
     .exec(db)
     .await
@@ -296,13 +297,14 @@ pub async fn mark_job_retrying<C: ConnectionTrait>(
     job_id: &str,
     active_attempt_id: &str,
     next_run_at: DateTimeWithTimeZone,
+    budget_origin_after_cooldown: Option<DateTimeWithTimeZone>,
     last_error: Option<String>,
     now: DateTimeWithTimeZone,
 ) -> Result<bool> {
     let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
     let active = recovery_job_status_to_db(RecoveryJobStatus::Active);
 
-    let affected = recovery_job::Entity::update_many()
+    let mut update = recovery_job::Entity::update_many()
         .col_expr(
             recovery_job::Column::Status,
             sea_orm::sea_query::Expr::value(pending.to_owned()),
@@ -346,7 +348,17 @@ pub async fn mark_job_retrying<C: ConnectionTrait>(
         .col_expr(
             recovery_job::Column::ActiveAttemptStartedAt,
             sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
-        )
+        );
+    if let Some(budget_origin_after_cooldown) = budget_origin_after_cooldown {
+        // Provider-declared cooldown is not execution time. Shift the budget
+        // origin by exactly the cooldown while preserving time already spent
+        // in active recovery attempts.
+        update = update.col_expr(
+            recovery_job::Column::ScheduledAt,
+            sea_orm::sea_query::Expr::value(budget_origin_after_cooldown),
+        );
+    }
+    let affected = update
         .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
         .filter(recovery_job::Column::Status.eq(active))
         .filter(recovery_job::Column::ActiveAttemptId.eq(active_attempt_id.to_owned()))

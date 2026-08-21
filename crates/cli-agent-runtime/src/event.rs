@@ -1,6 +1,8 @@
 //! Canonical CLI agent runtime events and Codex native event mapping.
 
 use crate::codex::{CodexJsonlRpcNotificationEvent, CodexJsonlRpcServerRequest};
+use chrono::{DateTime, FixedOffset, NaiveTime, TimeZone};
+use pioneer_protocol::ProviderFailureClass;
 use pioneer_runtime_events::{OrderedIngressClass, OrderedIngressEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -42,6 +44,110 @@ pub enum RuntimeTurnTerminalKind {
     Completed,
     Failed,
     Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeProviderFailure {
+    pub class: ProviderFailureClass,
+    pub retry_after_ms: Option<u64>,
+    pub provider_code: Option<String>,
+    pub message: String,
+}
+
+/// Classifies terminal CLI runtime failures at the adapter boundary. Native
+/// structured retry metadata wins; human text is only a compatibility fallback
+/// for CLI providers that do not expose a machine-readable cooldown yet.
+pub fn classify_runtime_provider_failure(
+    event: &RuntimeEvent,
+    now: DateTime<FixedOffset>,
+) -> Option<RuntimeProviderFailure> {
+    let (message, code, native) = match event {
+        RuntimeEvent::TurnFailed(event) => (
+            event.message.as_str(),
+            event.code.clone(),
+            event.native.as_ref(),
+        ),
+        RuntimeEvent::Error(event) if !event.retryable => (
+            event.message.as_str(),
+            event.code.clone(),
+            event.native.as_ref(),
+        ),
+        _ => return None,
+    };
+    let normalized_message = message.to_ascii_lowercase();
+    let normalized_code = code.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let class = if normalized_message.contains("usage limit")
+        || normalized_message.contains("rate limit")
+        || normalized_message.contains("too many requests")
+        || normalized_code.contains("usage_limit")
+        || normalized_code.contains("rate_limit")
+        || normalized_code == "429"
+    {
+        ProviderFailureClass::RateLimit
+    } else {
+        return None;
+    };
+
+    let retry_after_ms = native
+        .and_then(structured_retry_after_ms)
+        .or_else(|| retry_after_from_message(message, now));
+    Some(RuntimeProviderFailure {
+        class,
+        retry_after_ms,
+        provider_code: code,
+        message: message.to_owned(),
+    })
+}
+
+fn structured_retry_after_ms(native: &RuntimeNativeEvent) -> Option<u64> {
+    native
+        .payload_redacted
+        .as_ref()
+        .and_then(find_retry_after_ms)
+        .or_else(|| native.raw_redacted.as_ref().and_then(find_retry_after_ms))
+}
+
+fn find_retry_after_ms(value: &JsonValue) -> Option<u64> {
+    match value {
+        JsonValue::Object(map) => {
+            for key in ["retry_after_ms", "retryAfterMs"] {
+                if let Some(value) = map.get(key).and_then(JsonValue::as_u64) {
+                    return Some(value);
+                }
+            }
+            for key in ["retry_after", "retryAfter"] {
+                if let Some(value) = map.get(key).and_then(JsonValue::as_u64) {
+                    return Some(value.saturating_mul(1_000));
+                }
+            }
+            map.values().find_map(find_retry_after_ms)
+        }
+        JsonValue::Array(values) => values.iter().find_map(find_retry_after_ms),
+        _ => None,
+    }
+}
+
+fn retry_after_from_message(message: &str, now: DateTime<FixedOffset>) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    let marker = "try again at ";
+    let start = lower.find(marker)?.saturating_add(marker.len());
+    let suffix = message.get(start..)?.trim_start();
+    let candidate = suffix
+        .split(|character: char| matches!(character, '.' | ',' | ';' | '\n' | '\r'))
+        .next()?
+        .trim();
+    let uppercase = candidate.to_ascii_uppercase();
+    let time = ["%I:%M %p", "%I %p", "%H:%M"]
+        .into_iter()
+        .find_map(|format| NaiveTime::parse_from_str(uppercase.as_str(), format).ok())?;
+    let mut target = now
+        .offset()
+        .from_local_datetime(&now.date_naive().and_time(time))
+        .single()?;
+    if target <= now {
+        target += chrono::Duration::days(1);
+    }
+    u64::try_from((target - now).num_milliseconds().max(0)).ok()
 }
 
 impl RuntimeEvent {
@@ -1521,11 +1627,66 @@ fn is_secret_key(key: &str) -> bool {
 mod tests {
     use super::{
         RuntimeAgentMessagePhase, RuntimeEvent, RuntimeEventMappingOptions, RuntimeItemDeltaKind,
-        RuntimeTurnTerminalKind, map_codex_notification_event, map_codex_server_request_event,
+        RuntimeNativeEvent, RuntimeTurnFailed, RuntimeTurnTerminalKind,
+        classify_runtime_provider_failure, map_codex_notification_event,
+        map_codex_server_request_event,
     };
     use crate::codex::{CodexJsonlRpcNotificationEvent, CodexJsonlRpcServerRequest};
     use crate::driver::JsonlRpcId;
+    use chrono::TimeZone;
     use serde_json::json;
+
+    #[test]
+    fn usage_limit_message_maps_provider_cooldown_until_local_retry_time() {
+        let offset = chrono::FixedOffset::east_opt(3 * 60 * 60).expect("fixed offset");
+        let now = offset
+            .with_ymd_and_hms(2026, 8, 21, 0, 0, 0)
+            .single()
+            .expect("test time");
+        let failure = classify_runtime_provider_failure(
+            &RuntimeEvent::TurnFailed(RuntimeTurnFailed {
+                native_thread_id: Some("thread".to_owned()),
+                native_turn_id: Some("turn".to_owned()),
+                message: "You've hit your usage limit; try again at 6:31 AM.".to_owned(),
+                code: None,
+                native: None,
+            }),
+            now,
+        )
+        .expect("usage limit should be classified");
+
+        assert_eq!(
+            failure.class,
+            pioneer_protocol::ProviderFailureClass::RateLimit
+        );
+        assert_eq!(failure.retry_after_ms, Some(23_460_000));
+    }
+
+    #[test]
+    fn structured_cli_retry_after_wins_over_human_message() {
+        let offset = chrono::FixedOffset::east_opt(0).expect("fixed offset");
+        let now = offset
+            .with_ymd_and_hms(2026, 8, 21, 0, 0, 0)
+            .single()
+            .expect("test time");
+        let failure = classify_runtime_provider_failure(
+            &RuntimeEvent::TurnFailed(RuntimeTurnFailed {
+                native_thread_id: Some("thread".to_owned()),
+                native_turn_id: Some("turn".to_owned()),
+                message: "rate limit; try again at 6:31 AM".to_owned(),
+                code: Some("rate_limit".to_owned()),
+                native: Some(RuntimeNativeEvent {
+                    method: "turn/completed".to_owned(),
+                    payload_redacted: Some(json!({"error": {"retry_after_ms": 12_345}})),
+                    raw_redacted: None,
+                }),
+            }),
+            now,
+        )
+        .expect("rate limit should be classified");
+
+        assert_eq!(failure.retry_after_ms, Some(12_345));
+    }
 
     #[test]
     fn event_codex_unknown_notification_maps_to_raw_without_crashing() {

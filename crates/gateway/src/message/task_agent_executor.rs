@@ -4530,15 +4530,7 @@ impl TaskAgentExecutor {
                     candidate.resolved_at.unwrap_or_else(now_timestamp_secs),
                 )
                 .await?;
-            if !processor
-                .task_run_awaits_origin_thread_delivery(
-                    &task_response,
-                    child_runtime.task_run_turn.run_id.as_str(),
-                )
-                .await?
-            {
-                mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
-            }
+            mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
             return Ok(());
         }
         if let Some(candidate) = processor
@@ -4637,16 +4629,7 @@ impl TaskAgentExecutor {
                     )
                     .await?;
                 handle.complete_run(Some(result), completed_at).await?;
-                if !processor
-                    .task_run_awaits_origin_thread_delivery(
-                        &task_response,
-                        child_runtime.task_run_turn.run_id.as_str(),
-                    )
-                    .await?
-                {
-                    mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage)
-                        .await?;
-                }
+                mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
             }
             Err(error)
                 if review_policy.as_ref().is_some_and(|policy| {

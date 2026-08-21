@@ -4,13 +4,13 @@ use super::{
     AgentMcpProjectionBinding, AgentMcpProjectionPersistenceError,
     AgentMcpProjectionPersistenceRequest, AgentMcpToolProvider, AgentMemoryProvider,
     AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy, AgentStartError,
-    AgentTurnHookRuntimeContext, DurableEventReceiver, ExecutionCheckpointContext,
-    ExecutionTurnStatus, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
-    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
-    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask, RecoveryAttemptRequest,
-    ResolvedArtifactInput, ReviewRequiredTaskObservation, TaskFinalizationSnapshot,
-    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
-    TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    AgentThreadControlPlane, AgentTurnHookRuntimeContext, DurableEventReceiver,
+    ExecutionCheckpointContext, ExecutionTurnStatus, MemoryExtractionPolicy, MemoryRecallItem,
+    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask,
+    RecoveryAttemptRequest, ResolvedArtifactInput, ReviewRequiredTaskObservation,
+    TaskFinalizationSnapshot, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
+    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
     TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
     WorkspaceSkillPolicy,
 };
@@ -11645,7 +11645,7 @@ async fn start_turn_rejects_second_running_turn() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cancel_turn_emits_interrupted_durable_event() {
+async fn cancel_turn_returns_without_waiting_for_actor_terminal_event() {
     let registry = Arc::new(ProviderRegistry::with_provider(
         "pending",
         Arc::new(PendingProvider),
@@ -11658,11 +11658,6 @@ async fn cancel_turn_emits_interrupted_durable_event() {
         .ensure_thread(thread_id, "ws_000000000000000003")
         .await
         .expect("thread should be created");
-    let mut durable_events = manager
-        .take_durable_receiver(thread_id)
-        .await
-        .expect("thread should expose one durable receiver");
-
     manager
         .start_test_turn_with_default_profile(
             thread_id,
@@ -11680,50 +11675,16 @@ async fn cancel_turn_emits_interrupted_durable_event() {
         .await
         .expect("turn should start");
 
-    let cancel_manager = manager.clone();
-    let cancel_handle = tokio::spawn(async move {
-        cancel_manager
-            .cancel_turn(thread_id, turn_id, "user clicked stop")
-            .await
-    });
-
-    yield_now().await;
-    // The tool runtime has a one-second cleanup grace; the parent Turn waits
-    // longer before its hard fence so external subprocess cleanup can finish.
-    advance(Duration::from_millis(2_100)).await;
-    yield_now().await;
-
-    let mut saw_interrupted = false;
-    for _ in 0..16 {
-        let event = timeout(Duration::from_secs(1), durable_events.recv())
-            .await
-            .expect("durable event should be emitted")
-            .expect("durable receiver should stay open");
-        durable_events.acknowledge_last(Ok(()));
-        if let AgentDurableEvent::TurnInterrupted {
-            thread_id: event_thread_id,
-            turn_id: event_turn_id,
-            reason,
-            recovery,
-        } = event
-        {
-            assert_eq!(event_thread_id, thread_id);
-            assert_eq!(event_turn_id, turn_id);
-            assert_eq!(reason, "user clicked stop");
-            assert!(recovery.is_none());
-            saw_interrupted = true;
-            break;
-        }
-    }
-
-    assert!(
-        saw_interrupted,
-        "turn cancellation should emit TurnInterrupted"
-    );
-    cancel_handle
-        .await
-        .expect("cancel task should not panic")
-        .expect("turn cancellation should succeed");
+    // Gateway commits the durable Interrupted lifecycle before invoking this
+    // process control. The runtime must therefore stop independently without
+    // waiting for the actor to publish a second terminal event.
+    timeout(
+        Duration::from_millis(50),
+        manager.cancel_turn(thread_id, turn_id, "user clicked stop"),
+    )
+    .await
+    .expect("turn cancellation must not wait for the actor mailbox")
+    .expect("turn cancellation should succeed");
 }
 
 #[tokio::test(start_paused = true)]
@@ -12461,6 +12422,31 @@ async fn turn_execution_control_does_not_close_recovery_before_round_commit() {
             .is_err(),
         "tool completion must not close recovery before the durable provider round commit"
     );
+}
+
+#[tokio::test]
+async fn thread_control_plane_cancels_turn_without_actor_mailbox_progress() {
+    let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+    let control = TurnExecutionControl::new(command_tx, 9);
+    let attempt = control.register_attempt("tool_item_1".to_owned()).await;
+    let plane = AgentThreadControlPlane::default();
+    plane.activate("turn_control_plane".to_owned(), 9, control);
+
+    let execution = plane
+        .execution_for("turn_control_plane")
+        .expect("active turn should be observable outside the actor");
+    execution.cancel_all_attempts().await;
+
+    assert!(attempt.is_cancelled());
+    assert_eq!(
+        plane
+            .observation_for("turn_control_plane")
+            .expect("active turn should remain observable")
+            .status,
+        ExecutionTurnStatus::InProgress
+    );
+    plane.clear("turn_control_plane", 9);
+    assert!(plane.observation_for("turn_control_plane").is_none());
 }
 
 #[tokio::test]

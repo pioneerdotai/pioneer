@@ -557,7 +557,7 @@ async fn project_turn_item_row<C: ConnectionTrait>(
         }
         ProjectionPlacement::TopLevelAssistantMessage => {
             let source_order =
-                resolve_item_source_order(db, turn_model.id.as_str(), item_model, event).await?;
+                resolve_item_order(db, turn_model.id.as_str(), item_model, event).await?;
             let order_key = work_item_order_key(item_model, Some(&source_order));
             timeline_repository::delete_turn_work_item_projection_for_item(
                 db,
@@ -611,7 +611,7 @@ async fn project_turn_item_row<C: ConnectionTrait>(
         }
         ProjectionPlacement::TurnWork | ProjectionPlacement::Hidden => {
             let source_order =
-                resolve_item_source_order(db, turn_model.id.as_str(), item_model, event).await?;
+                resolve_item_order(db, turn_model.id.as_str(), item_model, event).await?;
             let order_key = work_item_order_key(item_model, Some(&source_order));
             let timing = resolve_turn_work_item_timing(
                 db,
@@ -637,8 +637,12 @@ async fn project_turn_item_row<C: ConnectionTrait>(
                     thread_id: thread_model.id.clone(),
                     turn_id: turn_model.id.clone(),
                     item_id: item_model.item_id.clone(),
-                    source_event_id: Some(source_order.event_id),
-                    source_sequence: source_order.sequence,
+                    // Ordering and freshness are separate concerns. `order_key`
+                    // is derived from the item's first durable event, while
+                    // these fields identify the event that produced the
+                    // current projected state.
+                    source_event_id: Some(event.id.clone()),
+                    source_sequence: event.sequence,
                     order_key,
                     item_type: item_model.item_type.clone(),
                     visibility: classification.visibility_str().to_owned(),
@@ -675,7 +679,7 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                 .await?;
         }
         ProjectionPlacement::TopLevelAssistantMessage => {
-            let source_order = resolve_snapshot_item_source_order(
+            let source_order = resolve_snapshot_item_order(
                 db,
                 turn_model.id.as_str(),
                 item_model,
@@ -734,7 +738,7 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
             .await?;
         }
         ProjectionPlacement::TurnWork | ProjectionPlacement::Hidden => {
-            let source_order = resolve_snapshot_item_source_order(
+            let source_order = resolve_snapshot_item_order(
                 db,
                 turn_model.id.as_str(),
                 item_model,
@@ -742,8 +746,6 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
             )
             .await?;
             let order_key = work_item_order_key(item_model, Some(&source_order));
-            let source_event_id =
-                (!source_order.event_id.is_empty()).then(|| source_order.event_id.clone());
             let timing = resolve_turn_work_item_timing(
                 db,
                 turn_model.id.as_str(),
@@ -767,8 +769,12 @@ async fn project_snapshot_turn_item_row<C: ConnectionTrait>(
                     thread_id: thread_model.id.clone(),
                     turn_id: turn_model.id.clone(),
                     item_id: item_model.item_id.clone(),
-                    source_event_id,
-                    source_sequence: source_order.sequence,
+                    // Snapshot refreshes have an authoritative stream
+                    // high-watermark but not necessarily the corresponding
+                    // event id. Do not retain an older event id as if it were
+                    // the current revision.
+                    source_event_id: None,
+                    source_sequence: source_sequence.max(0),
                     order_key,
                     item_type: item_model.item_type.clone(),
                     visibility: classification.visibility_str().to_owned(),
@@ -934,7 +940,7 @@ fn detached_task_run_origin_hint(turn_model: &turn_entity::Model) -> bool {
         )
 }
 
-async fn resolve_item_source_order<C: ConnectionTrait>(
+async fn resolve_item_order<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     item_model: &turn_item_entity::Model,
@@ -957,7 +963,7 @@ async fn resolve_item_source_order<C: ConnectionTrait>(
     })
 }
 
-async fn resolve_snapshot_item_source_order<C: ConnectionTrait>(
+async fn resolve_snapshot_item_order<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     item_model: &turn_item_entity::Model,

@@ -1231,10 +1231,12 @@ impl RecoveryCoordinator {
             policy.base_backoff_secs,
             job.run_count,
             job.id.as_str(),
-            retry_after_ms
-                .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
-                .or(job.retry_after_ms),
+            retry_after_ms.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
         );
+        let budget_origin_after_cooldown_unix = retry_after_ms.map(|_| {
+            let consumed_wall_clock_secs = now_unix.saturating_sub(job.scheduled_at_unix).max(0);
+            next_run_at_unix.saturating_sub(consumed_wall_clock_secs)
+        });
         let reason = failure_message;
         if self
             .crud_store
@@ -1242,6 +1244,7 @@ impl RecoveryCoordinator {
                 job.id.as_str(),
                 active_attempt_id,
                 next_run_at_unix,
+                budget_origin_after_cooldown_unix,
                 reason.clone(),
                 now_unix,
             )
@@ -2173,7 +2176,7 @@ impl RecoveryCoordinator {
                 policy.base_backoff_secs,
                 job.run_count,
                 job.id.as_str(),
-                job.retry_after_ms,
+                None,
             );
             let reason = Some("turn location missing".to_owned());
             if self
@@ -2786,7 +2789,7 @@ impl RecoveryCoordinator {
                 policy.base_backoff_secs,
                 job.run_count,
                 job.id.as_str(),
-                job.retry_after_ms,
+                None,
             );
             let reason = Some(error.to_string());
             if self
@@ -2795,6 +2798,7 @@ impl RecoveryCoordinator {
                     job.id.as_str(),
                     active_attempt_id.as_str(),
                     next_run_at_unix,
+                    None,
                     reason.clone(),
                     now_unix,
                 )
@@ -3850,11 +3854,7 @@ impl RecoveryCoordinator {
                     .then_some(item_id)
             })
             .collect::<HashSet<_>>();
-        assemble_retained_provider_history_with_recovery(
-            turn_id,
-            rows,
-            &resumable_item_ids,
-        )
+        assemble_retained_provider_history_with_recovery(turn_id, rows, &resumable_item_ids)
     }
 
     async fn cancel_other_open_jobs_after_terminal_recovery(
@@ -4307,10 +4307,8 @@ fn assemble_canonical_provider_history(
         for (identity, tool_name) in resumptions {
             let provider_call_id = identity.provider_call_id;
             let turn_item_id = identity.turn_item_id;
-            let message = resumable_tool_interruption_message(
-                provider_call_id.as_str(),
-                tool_name.as_str(),
-            );
+            let message =
+                resumable_tool_interruption_message(provider_call_id.as_str(), tool_name.as_str());
             pending.results.insert(turn_item_id, message);
         }
 
@@ -7922,6 +7920,111 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.status, RecoveryJobStatus::Pending);
         assert_eq!(reloaded.run_count, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_cooldown_defers_initial_recovery_until_declared_reset() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let now_unix = 1_700_000_000;
+        let cooldown_ms = 23_460_000;
+        let mut failure = provider_failure(ProviderFailureClass::RateLimit, "provider quota reset");
+        failure.retry_after_ms = Some(cooldown_ms);
+
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_provider_cooldown".to_owned(),
+                    item_id: "reasoning_provider_cooldown".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure,
+                },
+                now_unix,
+            )
+            .await
+            .expect("provider cooldown should enqueue")
+            .into_job();
+        let eligible_at_unix = now_unix + 23_460;
+        assert_eq!(job.scheduled_at_unix, eligible_at_unix);
+        assert_eq!(job.next_run_at_unix, eligible_at_unix);
+        assert!(
+            crud_store
+                .claim_due_recovery_jobs(now_unix + 60, 45, 1)
+                .await
+                .expect("early recovery claim should evaluate")
+                .is_empty(),
+            "provider cooldown must not consume an immediate recovery attempt"
+        );
+        assert_eq!(
+            crud_store
+                .claim_due_recovery_jobs(eligible_at_unix, 45, 1)
+                .await
+                .expect("eligible recovery should claim")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn renewed_provider_cooldown_suspends_recovery_wall_clock_budget() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let now_unix = 1_700_000_000;
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_renewed_provider_cooldown".to_owned(),
+                    item_id: "reasoning_renewed_provider_cooldown".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::RateLimit, "initial failure"),
+                },
+                now_unix,
+            )
+            .await
+            .expect("initial provider failure should enqueue")
+            .into_job();
+        let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
+        let failure_at_unix = now_unix + 2;
+        let cooldown_secs = 6 * 60 * 60;
+        let mut renewed =
+            provider_failure(ProviderFailureClass::RateLimit, "quota still exhausted");
+        renewed.retry_after_ms = Some((cooldown_secs * 1_000) as u64);
+
+        let events = coordinator
+            .record_recovery_provider_failure(
+                job.id.as_str(),
+                active_attempt_id.as_str(),
+                renewed,
+                failure_at_unix,
+            )
+            .await
+            .expect("renewed provider cooldown should requeue");
+        let eligible_at_unix = failure_at_unix + cooldown_secs;
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RetryScheduled { next_run_at_unix, .. }]
+                if *next_run_at_unix == eligible_at_unix
+        ));
+        let reloaded = crud_store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("recovery job should reload")
+            .expect("recovery job should exist");
+        assert_eq!(
+            reloaded.scheduled_at_unix,
+            eligible_at_unix - 2,
+            "provider cooldown must pause rather than reset consumed recovery budget"
+        );
+        assert_eq!(reloaded.next_run_at_unix, eligible_at_unix);
+
+        let resumed = coordinator
+            .run_ready_jobs(eligible_at_unix, 1)
+            .await
+            .expect("recovery should resume after the provider cooldown");
+        assert!(
+            !resumed
+                .iter()
+                .any(|event| matches!(event, RecoveryCoordinatorEvent::RecoveryExhausted(_))),
+            "provider-imposed waiting time must not exhaust the recovery wall-clock budget"
+        );
     }
 
     #[tokio::test]

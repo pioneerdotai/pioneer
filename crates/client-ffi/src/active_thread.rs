@@ -1273,42 +1273,61 @@ impl ClientFfiActiveThreadState {
                 SemanticTimelineCachePatch::default()
             }
             ClientRuntimeNotification::TurnLifecycle(reduction) => {
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-                {
-                    let coordinator = inner
-                        .coordinators
-                        .entry(reduction.thread_id.clone())
-                        .or_insert_with(|| {
-                            ThreadCoordinator::pending(
-                                reduction.thread_id.as_str(),
-                                reduction.workspace_id.as_str(),
-                            )
-                        });
-                    coordinator
-                        .conversation
-                        .apply(reduction.conversation_event.clone());
-                    if reduction.tick_conversation {
-                        let _ = coordinator.conversation.tick();
-                    }
-                    if let Some(status) = reduction.thread_status
-                        && let Some(thread) = coordinator.thread_mut()
+                let (patch, terminal_work_reconciliation) = {
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
                     {
-                        thread.status = status;
+                        let coordinator = inner
+                            .coordinators
+                            .entry(reduction.thread_id.clone())
+                            .or_insert_with(|| {
+                                ThreadCoordinator::pending(
+                                    reduction.thread_id.as_str(),
+                                    reduction.workspace_id.as_str(),
+                                )
+                            });
+                        coordinator
+                            .conversation
+                            .apply(reduction.conversation_event.clone());
+                        if reduction.tick_conversation {
+                            let _ = coordinator.conversation.tick();
+                        }
+                        if let Some(status) = reduction.thread_status
+                            && let Some(thread) = coordinator.thread_mut()
+                        {
+                            thread.status = status;
+                        }
                     }
+                    if let Some(pending_reduction) = reduction.pending_requests {
+                        inner.pending_requests.apply(pending_reduction);
+                    }
+                    clear_workspace_draft_markers(&mut inner, reduction.thread_id.as_str());
+                    let patch = apply_conversation_event_to_semantic_timeline_with_patch(
+                        &mut inner.semantic_timelines,
+                        reduction.workspace_id.as_str(),
+                        &reduction.conversation_event,
+                        now_unix_ms(),
+                    );
+                    let terminal_work_reconciliation =
+                        pioneer_client::timeline::semantic::terminal_turn_work_reconciliation(
+                            &inner.semantic_timelines,
+                            &reduction.conversation_event,
+                        );
+                    (patch, terminal_work_reconciliation)
+                };
+                if let Some(reconciliation) = terminal_work_reconciliation {
+                    self.reconcile_semantic_timeline(
+                        runtime,
+                        vec![SemanticTimelineReconcileRequest::TurnWorkItems {
+                            thread_id: reconciliation.thread_id,
+                            turn_id: reconciliation.turn_id,
+                            work_item_ids: reconciliation.running_work_item_ids,
+                        }],
+                    );
                 }
-                if let Some(pending_reduction) = reduction.pending_requests {
-                    inner.pending_requests.apply(pending_reduction);
-                }
-                clear_workspace_draft_markers(&mut inner, reduction.thread_id.as_str());
-                apply_conversation_event_to_semantic_timeline_with_patch(
-                    &mut inner.semantic_timelines,
-                    reduction.workspace_id.as_str(),
-                    &reduction.conversation_event,
-                    now_unix_ms(),
-                )
+                patch
             }
             ClientRuntimeNotification::ConversationEvent(reduction) => {
                 let mut inner = self

@@ -20652,6 +20652,10 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     ) -> Result<RecoveryJobRecord> {
         self.run_serialized_write(|| async {
             let now = unix_to_datetime(now_unix);
+            let retry_delay_secs = retry_after_ms
+                .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
+                .unwrap_or(0);
+            let scheduled_at = unix_to_datetime(now_unix.saturating_add(retry_delay_secs));
             let policy_json = serde_json::to_string(&policy_json)
                 .context("failed to serialize recovery policy json")?;
             let policy_snapshot_json = serde_json::to_string(&policy_snapshot)
@@ -20673,8 +20677,9 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     provider_attempt_number,
                     policy_snapshot_json,
                     max_attempts,
-                    scheduled_at: now,
-                    next_run_at: now,
+                    created_at: now,
+                    scheduled_at,
+                    next_run_at: scheduled_at,
                 },
             )
             .await?;
@@ -20760,6 +20765,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         job_id: &str,
         active_attempt_id: &str,
         next_run_at_unix: i64,
+        budget_origin_after_cooldown_unix: Option<i64>,
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
@@ -20770,6 +20776,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 job_id,
                 active_attempt_id,
                 unix_to_datetime(next_run_at_unix),
+                budget_origin_after_cooldown_unix.map(unix_to_datetime),
                 last_error_value.clone(),
                 unix_to_datetime(now_unix),
             )
@@ -25846,7 +25853,7 @@ mod tests {
         list_abandoned_runtime_draft_artifact_ids,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
-        tool_call_status, upsert_thread_timeline_block,
+        tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
     };
     use crate::repositories::{thread, turn, turn_finalization};
     use crate::util::unix_to_datetime;
@@ -28885,6 +28892,11 @@ mod tests {
             .await
             .expect("native work item should start");
         assert_eq!(state().await, "running");
+        let started_projection = store
+            .get_turn_work_item_projection(work_item_projection_id(turn_id, item_id).as_str())
+            .await
+            .expect("started item projection should load")
+            .expect("started item projection should exist");
 
         let mut completed_item = running_item;
         if let TurnItem::WebFetch {
@@ -28906,6 +28918,20 @@ mod tests {
             )
             .await
             .expect("native work item should complete");
+        let completed_projection = store
+            .get_turn_work_item_projection(work_item_projection_id(turn_id, item_id).as_str())
+            .await
+            .expect("completed item projection should load")
+            .expect("completed item projection should exist");
+        assert_eq!(completed_projection.order_key, started_projection.order_key);
+        assert!(
+            completed_projection.source_sequence > started_projection.source_sequence,
+            "projection revision must advance while stable ordering is preserved"
+        );
+        assert_ne!(
+            completed_projection.source_event_id, started_projection.source_event_id,
+            "projection revision must identify the completion event"
+        );
         assert_eq!(
             state().await,
             "running",
@@ -33104,6 +33130,7 @@ mod tests {
                     job.id.as_str(),
                     "recovery_attempt_1",
                     1_700_000_010,
+                    None,
                     Some("provider failed during recovery".to_owned()),
                     1_700_000_002,
                 )

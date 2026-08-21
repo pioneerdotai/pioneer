@@ -328,15 +328,21 @@ impl MessageProcessor {
             let processor = self.clone();
             let delivery_execution = delivery.clone();
             let attempt_execution = attempt.clone();
-            let execution_result = message_fresh_task(async move {
-                processor
-                    .execute_task_delivery(delivery_execution, attempt_execution)
-                    .await
-            })
+            let execution_result = tokio::time::timeout(
+                Duration::from_secs(60),
+                message_fresh_task(async move {
+                    processor
+                        .execute_task_delivery(delivery_execution, attempt_execution)
+                        .await
+                }),
+            )
             .await;
             let execution_result = match execution_result {
-                Ok(result) => result,
-                Err(error) => Err(anyhow!("task delivery execution task failed: {error}")),
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(anyhow!("task delivery execution task failed: {error}")),
+                Err(_) => Err(anyhow!(
+                    "task delivery execution exceeded its 60 second lease"
+                )),
             };
             if let Err(error) = execution_result {
                 let failed_at = now_timestamp_secs();

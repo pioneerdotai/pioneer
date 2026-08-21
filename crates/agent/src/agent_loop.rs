@@ -1,8 +1,8 @@
 use super::{
     ActiveTurnRequest, AgentCommand, AgentEventHub, AgentMcpToolProvider, AgentStartError,
-    ExecutionCheckpointContext, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
-    TurnExecutionControl, TurnExecutionUsageCounters, TurnFinalizationProvider, TurnTaskCompletion,
-    TurnTaskFailure, TurnTaskSuccess, TurnToolProvider,
+    AgentThreadControlPlane, ExecutionCheckpointContext, TaskToolProvider, TaskTurnContext,
+    ToolLoopConfig, TurnExecutionControl, TurnExecutionUsageCounters, TurnFinalizationProvider,
+    TurnTaskCompletion, TurnTaskFailure, TurnTaskSuccess, TurnToolProvider,
 };
 use crate::chat;
 use crate::hooks::{
@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 // Tool dispatch uses a one-second cleanup grace.  The parent Turn must wait
@@ -209,7 +210,9 @@ pub(super) async fn run_agent_loop(
     command_tx: mpsc::Sender<AgentCommand>,
     mut command_rx: mpsc::Receiver<AgentCommand>,
     event_hub: Arc<AgentEventHub>,
+    control_plane: AgentThreadControlPlane,
 ) {
+    let _control_plane_guard = AgentLoopControlPlaneGuard(control_plane.clone());
     let mut active_turn_id: Option<String> = None;
     // The actor is the owner of the active turn. If the actor exits
     // unexpectedly, dropping a bare JoinHandle would detach provider/tool
@@ -225,7 +228,15 @@ pub(super) async fn run_agent_loop(
 
     macro_rules! commit_or_stop {
         ($event:expr $(,)?) => {
-            if !publish_loop_durable_event(event_hub.as_ref(), $event).await {
+            if !publish_loop_durable_event(
+                event_hub.as_ref(),
+                $event,
+                active_turn_control
+                    .as_ref()
+                    .map(TurnExecutionControl::cancellation_token),
+            )
+            .await
+            {
                 error!(
                     thread_id = %thread_id,
                     "stopping agent loop after durable event commit was exhausted"
@@ -233,6 +244,27 @@ pub(super) async fn run_agent_loop(
                 return;
             }
         };
+    }
+
+    macro_rules! clear_active_turn_control {
+        () => {{
+            if let (Some(turn_id), Some(run_id)) = (active_turn_id.as_deref(), active_turn_run_id) {
+                control_plane.clear(turn_id, run_id);
+            }
+            active_turn_id = None;
+            active_turn_run_id = None;
+            active_turn_control = None;
+        }};
+    }
+
+    macro_rules! record_turn_observation {
+        ($turn_id:expr, $observation:expr $(,)?) => {{
+            let observation = $observation;
+            if let Some(run_id) = active_turn_run_id {
+                control_plane.set_observation($turn_id.as_str(), run_id, observation.clone());
+            }
+            last_turn_observation = Some(($turn_id.clone(), observation));
+        }};
     }
 
     while let Some(command) = command_rx.recv().await {
@@ -341,6 +373,7 @@ pub(super) async fn run_agent_loop(
 
                 let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                 active_turn_control = Some(turn_control.clone());
+                control_plane.activate(turn_id.clone(), run_id, turn_control.clone());
 
                 active_turn_run_id = Some(run_id);
 
@@ -382,8 +415,6 @@ pub(super) async fn run_agent_loop(
                 let turn_request_snapshot = active_turn_request.clone();
                 let recovery = active_recovery.clone();
                 active_turn_task = None;
-                active_turn_control = None;
-                active_turn_run_id = None;
 
                 let TurnTaskCompletion {
                     result,
@@ -392,13 +423,13 @@ pub(super) async fn run_agent_loop(
 
                 match result {
                     Ok(TurnTaskSuccess::Completed) => {
-                        last_turn_observation = Some((
-                            turn_id.clone(),
+                        record_turn_observation!(
+                            turn_id,
                             super::ExecutionTurnObservation {
                                 status: super::ExecutionTurnStatus::Completed,
                                 message: None,
                             },
-                        ));
+                        );
                         commit_or_stop!(AgentDurableEvent::TurnCompleted {
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
@@ -415,7 +446,7 @@ pub(super) async fn run_agent_loop(
                                 recovery,
                             },);
                         }
-                        active_turn_id = None;
+                        clear_active_turn_control!();
                         active_turn_request = None;
                         active_recovery = None;
                         maybe_dispatch_post_turn_hook(
@@ -438,13 +469,13 @@ pub(super) async fn run_agent_loop(
                             let blocked_reason =
                                 "execution window continuation could not resume: active turn request missing"
                                     .to_owned();
-                            last_turn_observation = Some((
-                                turn_id.clone(),
+                            record_turn_observation!(
+                                turn_id,
                                 super::ExecutionTurnObservation {
                                     status: super::ExecutionTurnStatus::Blocked,
                                     message: Some(blocked_reason.clone()),
                                 },
-                            ));
+                            );
                             commit_or_stop!(AgentDurableEvent::TurnExecutionWindowBlocked {
                                 notification: TurnExecutionWindowBlockedNotification {
                                     workspace_id: workspace_id.clone(),
@@ -476,9 +507,7 @@ pub(super) async fn run_agent_loop(
                                 reason: blocked_reason,
                                 recovery,
                             },);
-                            active_turn_id = None;
-                            active_turn_run_id = None;
-                            active_turn_control = None;
+                            clear_active_turn_control!();
                             active_turn_request = None;
                             active_recovery = None;
                             continue;
@@ -496,13 +525,13 @@ pub(super) async fn run_agent_loop(
                             }
                             ExecutionWindowTotalBudgetDecision::Block(block) => {
                                 let blocked_reason = block.reason.clone();
-                                last_turn_observation = Some((
-                                    turn_id.clone(),
+                                record_turn_observation!(
+                                    turn_id,
                                     super::ExecutionTurnObservation {
                                         status: super::ExecutionTurnStatus::Blocked,
                                         message: Some(blocked_reason.clone()),
                                     },
-                                ));
+                                );
                                 commit_or_stop!(AgentDurableEvent::TurnExecutionWindowBlocked {
                                     notification: TurnExecutionWindowBlockedNotification {
                                         workspace_id: workspace_id.clone(),
@@ -533,9 +562,7 @@ pub(super) async fn run_agent_loop(
                                     reason: blocked_reason,
                                     recovery,
                                 },);
-                                active_turn_id = None;
-                                active_turn_run_id = None;
-                                active_turn_control = None;
+                                clear_active_turn_control!();
                                 active_turn_request = None;
                                 active_recovery = None;
                                 continue;
@@ -565,20 +592,20 @@ pub(super) async fn run_agent_loop(
                                     "failed to recreate provider `{}` for execution window continuation: {error}",
                                     next_turn_request.provider_name
                                 );
-                                last_turn_observation = Some((
-                                    turn_id.clone(),
+                                record_turn_observation!(
+                                    turn_id,
                                     super::ExecutionTurnObservation {
                                         status: super::ExecutionTurnStatus::Failed,
                                         message: Some(failure_message.clone()),
                                     },
-                                ));
+                                );
                                 commit_or_stop!(AgentDurableEvent::TurnFailed {
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
                                     error: failure_message,
                                     recovery,
                                 },);
-                                active_turn_id = None;
+                                clear_active_turn_control!();
                                 active_turn_request = None;
                                 active_recovery = None;
                                 continue;
@@ -624,6 +651,7 @@ pub(super) async fn run_agent_loop(
                         active_turn_id = Some(turn_id.clone());
                         active_turn_run_id = Some(run_id);
                         active_turn_control = Some(turn_control.clone());
+                        control_plane.activate(turn_id.clone(), run_id, turn_control.clone());
                         active_turn_request = Some(next_turn_request.clone());
                         last_turn_request = Some(next_turn_request.clone());
                         active_recovery = None;
@@ -650,13 +678,13 @@ pub(super) async fn run_agent_loop(
                         )));
                     }
                     Err(TurnTaskFailure::Terminal(error)) => {
-                        last_turn_observation = Some((
-                            turn_id.clone(),
+                        record_turn_observation!(
+                            turn_id,
                             super::ExecutionTurnObservation {
                                 status: super::ExecutionTurnStatus::Failed,
                                 message: Some(error.clone()),
                             },
-                        ));
+                        );
                         let error_for_dispatch = error.clone();
                         commit_or_stop!(AgentDurableEvent::TurnFailed {
                             thread_id: thread_id.clone(),
@@ -664,7 +692,7 @@ pub(super) async fn run_agent_loop(
                             error,
                             recovery,
                         },);
-                        active_turn_id = None;
+                        clear_active_turn_control!();
                         active_turn_request = None;
                         active_recovery = None;
                         cleanup_attached_tasks(
@@ -694,13 +722,13 @@ pub(super) async fn run_agent_loop(
                         .await;
                     }
                     Err(TurnTaskFailure::Blocked(reason)) => {
-                        last_turn_observation = Some((
-                            turn_id.clone(),
+                        record_turn_observation!(
+                            turn_id,
                             super::ExecutionTurnObservation {
                                 status: super::ExecutionTurnStatus::Blocked,
                                 message: Some(reason.clone()),
                             },
-                        ));
+                        );
                         let reason_for_dispatch = reason.clone();
                         commit_or_stop!(AgentDurableEvent::TurnBlocked {
                             thread_id: thread_id.clone(),
@@ -708,7 +736,7 @@ pub(super) async fn run_agent_loop(
                             reason,
                             recovery,
                         },);
-                        active_turn_id = None;
+                        clear_active_turn_control!();
                         active_turn_request = None;
                         active_recovery = None;
                         let blocked_dispatch = post_turn_dispatch.or_else(|| {
@@ -749,7 +777,7 @@ pub(super) async fn run_agent_loop(
                             failure,
                             recovery,
                         },);
-                        active_turn_id = None;
+                        clear_active_turn_control!();
                         active_turn_request = None;
                         active_recovery = None;
                         let failure_dispatch = post_turn_dispatch.or_else(|| {
@@ -844,13 +872,13 @@ pub(super) async fn run_agent_loop(
                 }
                 let turn_request_snapshot = active_turn_request.clone();
                 let recovery = active_recovery.clone();
-                last_turn_observation = Some((
-                    turn_id.clone(),
+                record_turn_observation!(
+                    turn_id,
                     super::ExecutionTurnObservation {
                         status: super::ExecutionTurnStatus::Interrupted,
                         message: Some(reason.clone()),
                     },
-                ));
+                );
                 let reason_for_dispatch = reason.clone();
                 commit_or_stop!(AgentDurableEvent::TurnInterrupted {
                     thread_id: thread_id.clone(),
@@ -858,10 +886,8 @@ pub(super) async fn run_agent_loop(
                     reason,
                     recovery,
                 },);
-                active_turn_id = None;
-                active_turn_control = None;
+                clear_active_turn_control!();
                 active_turn_request = None;
-                active_turn_run_id = None;
                 active_recovery = None;
                 cleanup_attached_tasks(
                     task_tool_provider.as_ref(),
@@ -957,6 +983,7 @@ pub(super) async fn run_agent_loop(
 
                     let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                     active_turn_control = Some(turn_control.clone());
+                    control_plane.activate(request.turn_id.clone(), run_id, turn_control.clone());
 
                     active_turn_request = Some(turn_request.clone());
                     last_turn_request = Some(turn_request.clone());
@@ -1076,9 +1103,7 @@ pub(super) async fn run_agent_loop(
                         ),
                         recovery,
                     },);
-                    active_turn_id = None;
-                    active_turn_run_id = None;
-                    active_turn_control = None;
+                    clear_active_turn_control!();
                     active_turn_request = None;
                     active_recovery = None;
                     let _ = ack.send(Err(error));
@@ -1096,6 +1121,7 @@ pub(super) async fn run_agent_loop(
 
                 let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                 active_turn_control = Some(turn_control.clone());
+                control_plane.activate(request.turn_id.clone(), run_id, turn_control.clone());
 
                 active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
                     command_tx.clone(),
@@ -1203,6 +1229,11 @@ pub(super) async fn run_agent_loop(
                 active_turn_id = Some(active_request.turn_id.clone());
                 active_turn_run_id = Some(run_id);
                 active_turn_control = Some(turn_control.clone());
+                control_plane.activate(
+                    active_request.turn_id.clone(),
+                    run_id,
+                    turn_control.clone(),
+                );
                 active_turn_request = Some(active_request.clone());
                 last_turn_request = Some(active_request.clone());
                 active_recovery = Some(recovery.clone());
@@ -1333,6 +1364,14 @@ fn spawn_turn_task(
 
 struct ActiveTurnTask {
     handle: Option<JoinHandle<()>>,
+}
+
+struct AgentLoopControlPlaneGuard(AgentThreadControlPlane);
+
+impl Drop for AgentLoopControlPlaneGuard {
+    fn drop(&mut self) {
+        self.0.clear_all();
+    }
 }
 
 impl ActiveTurnTask {
@@ -1519,16 +1558,27 @@ async fn execute_turn_flow(
     }
 }
 
-async fn publish_loop_durable_event(event_hub: &AgentEventHub, event: AgentDurableEvent) -> bool {
+async fn publish_loop_durable_event(
+    event_hub: &AgentEventHub,
+    event: AgentDurableEvent,
+    cancellation: Option<CancellationToken>,
+) -> bool {
     const COMMIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
     let mut attempt = 0_u32;
     loop {
         attempt = attempt.saturating_add(1);
-        let result = timeout(
+        let commit = timeout(
             COMMIT_ATTEMPT_TIMEOUT,
             event_hub.publish_durable_and_wait(event.clone()),
-        )
-        .await;
+        );
+        let result = if let Some(cancellation) = cancellation.as_ref() {
+            tokio::select! {
+                _ = cancellation.cancelled() => return false,
+                result = commit => result,
+            }
+        } else {
+            commit.await
+        };
         match result {
             Ok(Ok(())) => return true,
             Ok(Err(error)) => error!(
@@ -1543,15 +1593,21 @@ async fn publish_loop_durable_event(event_hub: &AgentEventHub, event: AgentDurab
             ),
         }
 
-        // A terminal/checkpoint boundary cannot be abandoned or converted to
-        // process-local success. Retry indefinitely across transient listener
-        // and database outages, but cap the cadence so an unavailable sink does
-        // not create a hot no-progress loop. Each retry has stable event
-        // identity and is safe after an unknown commit result.
+        // A terminal/checkpoint boundary cannot be converted to process-local
+        // success. It remains retryable across transient listener/database
+        // outages, but an independently persisted cancellation is allowed to
+        // fence this owner and terminate the retry loop.
         let delay_ms = 100_u64
             .saturating_mul(1_u64 << attempt.saturating_sub(1).min(8))
             .min(30_000);
-        sleep(Duration::from_millis(delay_ms)).await;
+        if let Some(cancellation) = cancellation.as_ref() {
+            tokio::select! {
+                _ = cancellation.cancelled() => return false,
+                _ = sleep(Duration::from_millis(delay_ms)) => {}
+            }
+        } else {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
     }
 }
 
