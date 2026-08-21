@@ -39,8 +39,8 @@ pub(super) struct DesktopMemberAvatarPresentation {
 pub(super) struct DesktopMemberAvatarState {
     visible: HashMap<PrincipalId, DesktopMemberAvatarPresentation>,
     historical: HashMap<(PrincipalId, String), DesktopMemberAvatarPresentation>,
-    agent_cached_image_path: Option<PathBuf>,
-    agent_loading: bool,
+    agent_cached_image_paths: HashMap<String, PathBuf>,
+    agent_loading: HashSet<String>,
     agent_request_generation: u64,
 }
 
@@ -49,8 +49,8 @@ impl Default for DesktopMemberAvatarState {
         Self {
             visible: HashMap::new(),
             historical: HashMap::new(),
-            agent_cached_image_path: None,
-            agent_loading: false,
+            agent_cached_image_paths: HashMap::new(),
+            agent_loading: HashSet::new(),
             agent_request_generation: 0,
         }
     }
@@ -60,8 +60,8 @@ impl DesktopMemberAvatarState {
     pub(super) fn clear(&mut self) {
         self.visible.clear();
         self.historical.clear();
-        self.agent_cached_image_path = None;
-        self.agent_loading = false;
+        self.agent_cached_image_paths.clear();
+        self.agent_loading.clear();
         self.agent_request_generation = self.agent_request_generation.wrapping_add(1);
     }
 
@@ -236,32 +236,37 @@ impl DesktopMemberAvatarState {
             })
     }
 
-    pub(super) fn begin_agent_loading(&mut self) -> Option<u64> {
-        if self.agent_loading || self.agent_cached_image_path.is_some() {
+    pub(super) fn begin_agent_loading(&mut self, avatar_revision: &str) -> Option<u64> {
+        if self.agent_loading.contains(avatar_revision)
+            || self.agent_cached_image_paths.contains_key(avatar_revision)
+        {
             return None;
         }
-        self.agent_loading = true;
-        self.agent_request_generation = self.agent_request_generation.wrapping_add(1);
+        self.agent_loading.insert(avatar_revision.to_owned());
         Some(self.agent_request_generation)
     }
 
     pub(super) fn apply_agent_result(&mut self, generation: u64, result: AgentAvatarCacheResult) {
-        if !self.agent_loading || self.agent_request_generation != generation {
+        if self.agent_request_generation != generation
+            || !self.agent_loading.remove(result.avatar_revision.as_str())
+        {
             return;
         }
-        self.agent_loading = false;
-        self.agent_cached_image_path = Some(result.local_path.into_path_buf());
+        self.agent_cached_image_paths
+            .insert(result.avatar_revision, result.local_path.into_path_buf());
     }
 
-    pub(super) fn apply_agent_error(&mut self, generation: u64) {
+    pub(super) fn apply_agent_error(&mut self, generation: u64, avatar_revision: &str) {
         if self.agent_request_generation != generation {
             return;
         }
-        self.agent_loading = false;
+        self.agent_loading.remove(avatar_revision);
     }
 
-    pub(super) fn agent_cached_image_path(&self) -> Option<&Path> {
-        self.agent_cached_image_path.as_deref()
+    pub(super) fn agent_cached_image_path(&self, avatar_revision: &str) -> Option<&Path> {
+        self.agent_cached_image_paths
+            .get(avatar_revision)
+            .map(PathBuf::as_path)
     }
 }
 
@@ -355,33 +360,50 @@ impl PioneerDesktop {
     }
 
     pub(super) fn resolve_agent_avatar(&mut self, cx: &mut Context<Self>) {
-        let Some(generation) = self.member_avatar_state.begin_agent_loading() else {
-            return;
-        };
         let Ok(client) = self.active_gateway_http_client() else {
-            self.member_avatar_state.apply_agent_error(generation);
             return;
         };
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                let result = cx
-                    .background_spawn(async move {
-                        client.resolve_agent_avatar(CancellationToken::new())
-                    })
-                    .await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    match result {
-                        Ok(result) => view
-                            .member_avatar_state
-                            .apply_agent_result(generation, result),
-                        Err(_) => view.member_avatar_state.apply_agent_error(generation),
-                    }
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        for avatar_revision in [
+            pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION,
+            pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
+            pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
+        ] {
+            let Some(generation) = self
+                .member_avatar_state
+                .begin_agent_loading(avatar_revision)
+            else {
+                continue;
+            };
+            let client = client.clone();
+            let avatar_revision = avatar_revision.to_owned();
+            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let requested_revision = avatar_revision.clone();
+                    let result = cx
+                        .background_spawn(async move {
+                            client.resolve_agent_avatar(
+                                requested_revision,
+                                CancellationToken::new(),
+                            )
+                        })
+                        .await;
+                    let _ = this.update(&mut cx, |view, cx| {
+                        match result {
+                            Ok(result) => view
+                                .member_avatar_state
+                                .apply_agent_result(generation, result),
+                            Err(_) => view.member_avatar_state.apply_agent_error(
+                                generation,
+                                avatar_revision.as_str(),
+                            ),
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
     }
 }
 
@@ -555,7 +577,8 @@ mod tests {
     #[::core::prelude::v1::test]
     fn stale_agent_avatar_completion_cannot_cross_a_session_reset() {
         let mut state = DesktopMemberAvatarState::default();
-        let stale_generation = state.begin_agent_loading().unwrap();
+        let revision = pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION;
+        let stale_generation = state.begin_agent_loading(revision).unwrap();
         state.clear();
         state.apply_agent_result(
             stale_generation,
@@ -566,9 +589,9 @@ mod tests {
                 source: AvatarCacheSource::Downloaded,
             },
         );
-        assert!(state.agent_cached_image_path().is_none());
+        assert!(state.agent_cached_image_path(revision).is_none());
 
-        let current_generation = state.begin_agent_loading().unwrap();
+        let current_generation = state.begin_agent_loading(revision).unwrap();
         state.apply_agent_result(
             current_generation,
             AgentAvatarCacheResult {
@@ -579,7 +602,7 @@ mod tests {
             },
         );
         assert_eq!(
-            state.agent_cached_image_path(),
+            state.agent_cached_image_path(revision),
             Some(Path::new("/owned/cache/current-agent"))
         );
     }

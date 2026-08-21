@@ -403,10 +403,11 @@ impl PioneerDesktop {
                                     .ml(TIMELINE_AVATAR_RAIL_WIDTH)
                                     .text_sm()
                                     .font_semibold()
-                                    .when_some(
-                                        super::timeline_agent_label(author),
-                                        |this, label| this.child(label),
-                                    ),
+                                    .child(super::timeline_agent_label(author).unwrap_or_else(
+                                        || {
+                                            t!("chat.composer.mode.agent_label").to_string()
+                                        },
+                                    )),
                             ),
                     ),
                 )

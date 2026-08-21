@@ -91,11 +91,18 @@ impl PioneerDesktop {
                         )),
                     },
                     TimelineAvatarSource::Agent { author, .. } => {
-                        let Some(author) = super::timeline_agent_execution_author(author.as_ref())
-                        else {
-                            return TimelineAvatarVisual::Absent;
-                        };
-                        self.timeline_agent_avatar_visual(author)
+                        super::timeline_agent_execution_author(author.as_ref()).map_or_else(
+                            || TimelineAvatarVisual::Agent {
+                                display_name: t!("chat.composer.mode.agent_label").to_string(),
+                                cached_path: self
+                                    .member_avatar_state
+                                    .agent_cached_image_path(
+                                        pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION,
+                                    )
+                                    .map(Path::to_path_buf),
+                            },
+                            |author| self.timeline_agent_avatar_visual(author),
+                        )
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -198,32 +205,51 @@ impl PioneerDesktop {
         &self,
         author: &pioneer_protocol::TurnAuthorSnapshot,
     ) -> TimelineAvatarVisual {
-        let agent = super::timeline_agent_presentation(Some(author));
-        let display_name = agent
-            .map(|agent| agent.display_name.as_str())
-            .unwrap_or(author.display_name.as_str())
-            .trim()
-            .to_owned();
+        let Some(agent) = super::timeline_agent_presentation(Some(author)) else {
+            return TimelineAvatarVisual::Agent {
+                display_name: t!("chat.composer.mode.agent_label").to_string(),
+                cached_path: self
+                    .member_avatar_state
+                    .agent_cached_image_path(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION)
+                    .map(Path::to_path_buf),
+            };
+        };
+        let display_name = agent.display_name.trim().to_owned();
         if display_name.is_empty() {
             return TimelineAvatarVisual::Absent;
         }
-        let cached_path = agent
-            .is_some_and(|agent| {
-                agent.identity_source_kind == pioneer_protocol::AgentIdentitySourceKind::NativeAgent
-                    && agent.nickname == pioneer_protocol::PIONEER_AGENT_NICKNAME
-                    && agent.avatar_revision.as_deref()
-                        == Some(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION)
-            })
-            .then(|| {
-                self.member_avatar_state
-                    .agent_cached_image_path()
-                    .map(Path::to_path_buf)
-            })
-            .flatten();
+        let cached_path = timeline_agent_default_avatar_revision(agent).and_then(|revision| {
+            self.member_avatar_state
+                .agent_cached_image_path(revision)
+                .map(Path::to_path_buf)
+        });
         TimelineAvatarVisual::Agent {
             display_name,
             cached_path,
         }
+    }
+}
+
+fn timeline_agent_default_avatar_revision(
+    agent: &pioneer_protocol::AgentPresentationSnapshot,
+) -> Option<&'static str> {
+    let runtime_kind = agent.role_label.as_deref().unwrap_or(agent.nickname.as_str());
+    match agent.identity_source_kind {
+        pioneer_protocol::AgentIdentitySourceKind::NativeAgent => {
+            Some(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION)
+        }
+        pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+            if runtime_kind.eq_ignore_ascii_case("codex") =>
+        {
+            Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION)
+        }
+        pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+            if runtime_kind.eq_ignore_ascii_case("claude") =>
+        {
+            Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION)
+        }
+        pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+        | pioneer_protocol::AgentIdentitySourceKind::Ephemeral => None,
     }
 }
 

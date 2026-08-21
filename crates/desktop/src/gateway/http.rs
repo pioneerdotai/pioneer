@@ -104,10 +104,11 @@ impl DesktopGatewayHttpClient {
 
     pub(crate) fn resolve_agent_avatar(
         &self,
+        avatar_revision: String,
         cancellation: CancellationToken,
     ) -> Result<AgentAvatarCacheResult, AvatarCacheError> {
         self.runtime
-            .block_on(self.avatars.resolve_agent_avatar(cancellation))
+            .block_on(self.avatars.resolve_agent_avatar(avatar_revision, cancellation))
     }
 
     pub(crate) fn matches(

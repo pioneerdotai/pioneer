@@ -13,8 +13,8 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use pioneer_protocol::{
-    AuthSessionId, GatewayId, PIONEER_AGENT_AVATAR_REVISION, PROFILE_AVATAR_MAX_DECODED_BYTES,
-    PrincipalId, ProfileAvatarMediaType,
+    AuthSessionId, GatewayId, PROFILE_AVATAR_MAX_DECODED_BYTES, PrincipalId,
+    ProfileAvatarMediaType,
 };
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
@@ -181,9 +181,10 @@ impl AvatarCacheService {
 
     pub async fn resolve_agent_avatar(
         &self,
+        avatar_revision: String,
         cancellation: CancellationToken,
     ) -> Result<AgentAvatarCacheResult, AvatarCacheError> {
-        let request = ValidatedAvatarRequest::agent();
+        let request = ValidatedAvatarRequest::agent(avatar_revision)?;
         let representation = self.resolve_validated(&request, cancellation).await?;
         Ok(AgentAvatarCacheResult {
             local_path: representation.local_path,
@@ -346,12 +347,7 @@ struct ValidatedAvatarRequest {
 
 impl ValidatedAvatarRequest {
     fn member(request: AvatarCacheRequest) -> Result<Self, AvatarCacheError> {
-        if request.avatar_revision.len() != 64
-            || !request
-                .avatar_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if !valid_avatar_revision(request.avatar_revision.as_str()) {
             return Err(AvatarCacheError::InvalidRequest);
         }
         Ok(Self {
@@ -360,11 +356,14 @@ impl ValidatedAvatarRequest {
         })
     }
 
-    fn agent() -> Self {
-        Self {
-            target: AvatarCacheTarget::Agent,
-            revision: PIONEER_AGENT_AVATAR_REVISION.to_owned(),
+    fn agent(avatar_revision: String) -> Result<Self, AvatarCacheError> {
+        if !valid_avatar_revision(avatar_revision.as_str()) {
+            return Err(AvatarCacheError::InvalidRequest);
         }
+        Ok(Self {
+            target: AvatarCacheTarget::Agent,
+            revision: avatar_revision,
+        })
     }
 
     fn storage_path(&self) -> String {
@@ -390,6 +389,13 @@ impl ValidatedAvatarRequest {
             AvatarCacheTarget::Agent => session_root.join("system").join("agent"),
         }
     }
+}
+
+fn valid_avatar_revision(revision: &str) -> bool {
+    revision.len() == 64
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 struct ResolvedAvatarRepresentation {
@@ -973,10 +979,15 @@ mod tests {
     #[test]
     fn agent_avatar_uses_the_authenticated_system_route_and_an_isolated_cache_entry() {
         let temp = tempfile::tempdir().unwrap();
-        let agent_request = ValidatedAvatarRequest::agent();
+        let agent_request =
+            ValidatedAvatarRequest::agent(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION.to_owned())
+                .unwrap();
         assert_eq!(
             agent_request.storage_path(),
-            format!("storage/system/agent/avatar/{PIONEER_AGENT_AVATAR_REVISION}")
+            format!(
+                "storage/system/agent/avatar/{}",
+                pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION
+            )
         );
 
         let paths =

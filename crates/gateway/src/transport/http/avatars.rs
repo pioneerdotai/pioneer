@@ -6,7 +6,8 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_N
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use pioneer_protocol::{
-    PIONEER_AGENT_AVATAR_REVISION, PrincipalId, ProfileAvatarMediaType, RequestId,
+    CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, PIONEER_AGENT_AVATAR_REVISION,
+    PrincipalId, ProfileAvatarMediaType, RequestId,
 };
 use serde::Deserialize;
 
@@ -18,7 +19,9 @@ use super::errors::{HttpError, HttpErrorKind};
 use super::state::GatewayHttpState;
 
 const AVATAR_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
-const PIONEER_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/pioneer-avatar.jpeg");
+const PIONEER_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/pioneer-avatar.png");
+const CODEX_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/codex-avatar.png");
+const CLAUDE_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/claude-avatar.png");
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("pioneer-request-id");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 
@@ -83,15 +86,20 @@ pub(super) async fn agent_avatar_route(
         .request_id()
         .cloned()
         .expect("native HTTP authentication always assigns a request ID");
-    if path.avatar_revision != PIONEER_AGENT_AVATAR_REVISION {
-        record_avatar_hidden(&request_id, "invalid_revision");
-        return Err(HttpError::not_found(request_id));
-    }
+    let content = match path.avatar_revision.as_str() {
+        PIONEER_AGENT_AVATAR_REVISION => PIONEER_AGENT_AVATAR_BYTES,
+        CODEX_AGENT_AVATAR_REVISION => CODEX_AGENT_AVATAR_BYTES,
+        CLAUDE_AGENT_AVATAR_REVISION => CLAUDE_AGENT_AVATAR_BYTES,
+        _ => {
+            record_avatar_hidden(&request_id, "invalid_revision");
+            return Err(HttpError::not_found(request_id));
+        }
+    };
 
     avatar_representation_response(
-        PIONEER_AGENT_AVATAR_BYTES,
-        ProfileAvatarMediaType::Jpeg,
-        PIONEER_AGENT_AVATAR_REVISION,
+        content,
+        ProfileAvatarMediaType::Png,
+        path.avatar_revision.as_str(),
         method,
         &headers,
         &request_id,
@@ -319,11 +327,14 @@ mod tests {
     }
 
     #[test]
-    fn embedded_agent_avatar_matches_the_shared_immutable_revision() {
-        assert_eq!(
-            hex::encode(Sha256::digest(PIONEER_AGENT_AVATAR_BYTES)),
-            PIONEER_AGENT_AVATAR_REVISION,
-        );
-        assert!(PIONEER_AGENT_AVATAR_BYTES.starts_with(&[0xff, 0xd8, 0xff]));
+    fn embedded_agent_avatars_match_their_shared_immutable_revisions() {
+        for (bytes, revision) in [
+            (PIONEER_AGENT_AVATAR_BYTES, PIONEER_AGENT_AVATAR_REVISION),
+            (CODEX_AGENT_AVATAR_BYTES, CODEX_AGENT_AVATAR_REVISION),
+            (CLAUDE_AGENT_AVATAR_BYTES, CLAUDE_AGENT_AVATAR_REVISION),
+        ] {
+            assert_eq!(hex::encode(Sha256::digest(bytes)), revision);
+            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
     }
 }

@@ -99,7 +99,9 @@ impl PioneerDesktop {
             .flatten();
         let author = self.current_timeline_author_presentation(exact_author);
         let author_label = super::super::timeline_agent_label(exact_author).unwrap_or_else(|| {
-            if author.display_name == "?" {
+            if super::super::timeline_agent_execution_author(exact_author).is_some() {
+                t!("chat.composer.mode.agent_label").to_string()
+            } else if author.display_name == "?" {
                 t!("timeline.message.unknown_author").to_string()
             } else if author.nickname.is_empty() {
                 author.display_name

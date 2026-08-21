@@ -307,7 +307,9 @@ pub use skills::{
     SkillsUploadChunkAckNotification, SkillsUploadChunkHeader, SkillsUploadFinishParams,
     SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse,
 };
-pub use system_assets::PIONEER_AGENT_AVATAR_REVISION;
+pub use system_assets::{
+    CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, PIONEER_AGENT_AVATAR_REVISION,
+};
 pub use task::{
     PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse, PublicTaskAgentConfiguration,
     PublicTaskArtifact, PublicTaskConfiguration, PublicTaskDeliveriesResponse, PublicTaskDelivery,

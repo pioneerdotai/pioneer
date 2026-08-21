@@ -45,9 +45,11 @@ pub struct ClientMemberAvatarCacheResult {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ClientAgentAvatarCacheRequest {}
+pub struct ClientAgentAvatarCacheRequest {
+    pub avatar_revision: String,
+}
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -97,14 +99,17 @@ impl ClientFfiAvatarCache {
         &self,
         sender: &GatewayWsCommandSender,
         runtime_home: PathBuf,
-        _request: ClientAgentAvatarCacheRequest,
+        request: ClientAgentAvatarCacheRequest,
     ) -> Result<ClientAgentAvatarCacheResult, ClientFfiError> {
         let _operation = self.operation_gate.lock().map_err(|_| {
             ClientFfiError::new("avatar cache is unavailable", "avatar_cache_unavailable")
         })?;
         let (service, runtime) = avatar_cache_service(sender, runtime_home)?;
         let result = runtime
-            .block_on(service.resolve_agent_avatar(CancellationToken::new()))
+            .block_on(service.resolve_agent_avatar(
+                request.avatar_revision,
+                CancellationToken::new(),
+            ))
             .map_err(map_cache_error)?;
         agent_result_for_shell(result)
     }

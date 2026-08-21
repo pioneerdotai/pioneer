@@ -89,26 +89,14 @@ fn resolve_timeline_author_presentation(
 
 fn timeline_agent_label(author: Option<&TurnAuthorSnapshot>) -> Option<String> {
     let author = timeline_agent_execution_author(author)?;
-    let agent = timeline_agent_presentation(Some(author));
-    let display_name = agent
-        .map(|agent| agent.display_name.as_str())
-        .unwrap_or(author.display_name.as_str())
-        .trim();
-    let nickname = agent
-        .map(|agent| agent.nickname.as_str())
-        .unwrap_or(author.nickname.as_str())
-        .trim();
-    let role = agent
-        .and_then(|agent| agent.role_label.as_deref())
-        .map(str::trim)
-        .filter(|role| !role.is_empty());
-    match (display_name.is_empty(), nickname.is_empty(), role) {
-        (true, true, _) => None,
-        (true, false, _) => Some(format!("@{nickname}")),
-        (false, true, Some(role)) => Some(format!("{display_name} · {role}")),
-        (false, true, None) => Some(display_name.to_owned()),
-        (false, false, Some(role)) => Some(format!("{display_name} · @{nickname} · {role}")),
-        (false, false, None) => Some(format!("{display_name} · @{nickname}")),
+    let agent = timeline_agent_presentation(Some(author))?;
+    let display_name = agent.display_name.trim();
+    let nickname = agent.nickname.trim();
+    match (display_name.is_empty(), nickname.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(format!("@{nickname}")),
+        (false, true) => Some(display_name.to_owned()),
+        (false, false) => Some(format!("{display_name} · @{nickname}")),
     }
 }
 
@@ -521,10 +509,7 @@ mod author_presentation_tests {
             avatar_revision: None,
             agent: None,
         };
-        assert_eq!(
-            timeline_agent_label(Some(&author)),
-            Some("Codex CLI · @codex".to_owned())
-        );
+        assert_eq!(timeline_agent_label(Some(&author)), None);
 
         author.agent = Some(pioneer_protocol::AgentPresentationSnapshot {
             agent_identity_id: AgentIdentityId::new("A0000000000000000000A")
@@ -539,7 +524,7 @@ mod author_presentation_tests {
         });
         assert_eq!(
             timeline_agent_label(Some(&author)),
-            Some("Codex CLI · @codex · codex".to_owned())
+            Some("Codex CLI · @codex".to_owned())
         );
     }
 }
