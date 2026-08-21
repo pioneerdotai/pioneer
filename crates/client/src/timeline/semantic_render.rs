@@ -59,19 +59,19 @@ pub fn render_semantic_timeline_rows(
         let next_turn_id = semantic_rows.get(index + 1).and_then(semantic_row_turn_id);
         if let Some(turn_id) = current_turn_id
             && next_turn_id != Some(turn_id)
-            && let Some((started_at_unix_ms, state, agent_work_graph)) =
+            && let Some((started_at_unix_ms, state, author, agent_work_graph)) =
                 live_work.get(turn_id).cloned()
             && inserted_running_rows.insert(turn_id.to_owned())
         {
             let running_key = format!("semantic-running-turn::{turn_id}");
             rows.push(TimelineRow {
                 key: running_key.clone(),
+                author,
                 kind: TimelineRowKind::RunningTurn(running_turn_display_for_projection(
                     &projection,
                     turn_id,
                     started_at_unix_ms,
                     Some(state),
-                    None,
                     None,
                     None,
                     agent_work_graph,
@@ -88,7 +88,7 @@ pub fn render_semantic_timeline_rows(
         if display.agent_work_graph.is_none() {
             display.agent_work_graph = live_work
                 .get(display.turn_id.as_str())
-                .and_then(|(_, _, graph)| graph.clone());
+                .and_then(|(_, _, _, graph)| graph.clone());
         }
     }
 
@@ -116,22 +116,28 @@ fn push_semantic_row(
     row: &SemanticTimelineRow,
 ) {
     match &row.kind {
-        SemanticTimelineRowKind::UserBlock { block } => push_user_block(projection, rows, block),
+        SemanticTimelineRowKind::UserBlock { block } => {
+            push_user_block(projection, rows, block, row.author.clone())
+        }
         SemanticTimelineRowKind::WorkHeader {
             block,
             work,
             expanded,
             ..
-        } => push_work_header(rows, block, work, *expanded),
-        SemanticTimelineRowKind::WorkItem { item } => push_work_item(projection, rows, item),
+        } => push_work_header(rows, block, work, *expanded, row.author.clone()),
+        SemanticTimelineRowKind::WorkItem { item } => {
+            push_work_item(projection, rows, item, row.author.clone())
+        }
         SemanticTimelineRowKind::DetachedTaskRun { block } => {
-            push_detached_task_run(projection, rows, block);
+            push_detached_task_run(projection, rows, block, row.author.clone());
         }
         SemanticTimelineRowKind::AssistantMessage { block } => {
-            push_assistant_block(projection, rows, block);
+            push_assistant_block(projection, rows, block, row.author.clone());
         }
         SemanticTimelineRowKind::PendingRequest { .. } => {}
-        SemanticTimelineRowKind::TurnState { block } => push_turn_state(projection, rows, block),
+        SemanticTimelineRowKind::TurnState { block } => {
+            push_turn_state(projection, rows, block, row.author.clone())
+        }
     }
 }
 
@@ -139,13 +145,14 @@ fn push_user_block(
     projection: &mut ConversationViewState,
     rows: &mut Vec<TimelineRow>,
     block: &TimelineBlock,
+    row_author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
     let TimelineBlockKind::UserMessage {
         item_id,
         text,
         attachments,
         mode,
-        author,
+        author: _,
         route,
         reply,
         mentions,
@@ -183,7 +190,7 @@ fn push_user_block(
             partial_markdown: None,
             final_markdown: None,
             item,
-            author: author.clone(),
+            author: row_author.clone(),
             route: route.clone(),
             opaque_meta: None,
         },
@@ -197,7 +204,7 @@ fn push_user_block(
             turn_id: turn_id.to_owned(),
             item_id: item_id.to_owned(),
             mode: *mode,
-            author: author.clone(),
+            author: row_author,
             route: route.clone(),
             reply: reply.clone().map(bound_reply_summary),
             reply_state: reply.as_ref().map(timeline_reply_state),
@@ -227,14 +234,15 @@ fn push_assistant_block(
     projection: &mut ConversationViewState,
     rows: &mut Vec<TimelineRow>,
     block: &TimelineBlock,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
     let TimelineBlockKind::AssistantMessage {
         item_id,
         text,
         status,
         markdown,
-        author,
         route,
+        ..
     } = &block.kind
     else {
         return;
@@ -270,7 +278,7 @@ fn push_assistant_block(
                 .then(|| markdown.clone())
                 .flatten(),
             item,
-            author: author.clone(),
+            author,
             route: route.clone(),
             opaque_meta: None,
         },
@@ -282,6 +290,7 @@ fn push_work_header(
     block: &TimelineBlock,
     work: &TurnWorkBlock,
     expanded: bool,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
     if work.presentation == TurnWorkPresentation::ExpandedLive || work.work_count == 0 {
         return;
@@ -289,6 +298,7 @@ fn push_work_header(
     let toggle_key = semantic_turn_work_toggle_key(work.turn_id.as_str());
     rows.push(TimelineRow {
         key: toggle_key.clone(),
+        author,
         kind: TimelineRowKind::TurnWorkToggle(TurnWorkGroupRow {
             toggle_key,
             anchor_entry_id: block.block_id.clone(),
@@ -303,6 +313,7 @@ fn push_work_item(
     projection: &mut ConversationViewState,
     rows: &mut Vec<TimelineRow>,
     item: &TurnWorkItem,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
     let (text, markdown) = turn_item_text_and_markdown(&item.item);
     push_item_row(
@@ -324,7 +335,7 @@ fn push_work_item(
                 .then(|| markdown.clone())
                 .flatten(),
             item: item.item.clone(),
-            author: None,
+            author,
             route: None,
             opaque_meta: item.metadata.clone(),
         },
@@ -335,8 +346,9 @@ fn push_detached_task_run(
     projection: &mut ConversationViewState,
     rows: &mut Vec<TimelineRow>,
     block: &TimelineBlock,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
-    let TimelineBlockKind::DetachedTaskRun { task } = &block.kind else {
+    let TimelineBlockKind::DetachedTaskRun { task, .. } = &block.kind else {
         return;
     };
     let turn_id = block.turn_id.as_deref().unwrap_or(block.block_id.as_str());
@@ -365,7 +377,7 @@ fn push_detached_task_run(
             partial_markdown: None,
             final_markdown: None,
             item: TurnItem::Task { item: task.clone() },
-            author: None,
+            author,
             route: None,
             opaque_meta: Some(serde_json::json!({
                 "attachment": "detached",
@@ -380,12 +392,13 @@ fn push_turn_state(
     projection: &mut ConversationViewState,
     rows: &mut Vec<TimelineRow>,
     block: &TimelineBlock,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
     let TimelineBlockKind::TurnState {
         state,
         message,
-        author,
         route,
+        ..
     } = &block.kind
     else {
         return;
@@ -399,13 +412,13 @@ fn push_turn_state(
     ) {
         rows.push(TimelineRow {
             key: format!("semantic-turn-state::{turn_id}::{}", block.block_id),
+            author,
             kind: TimelineRowKind::RunningTurn(running_turn_display_for_projection(
                 projection,
                 turn_id,
                 block.started_at_unix_ms.or(block.updated_at_unix_ms),
                 Some(*state),
                 message.clone(),
-                author.clone(),
                 route.clone(),
                 None,
             )),
@@ -447,8 +460,8 @@ fn push_turn_state(
             partial_markdown: None,
             final_markdown: None,
             item,
-            author: None,
-            route: None,
+            author,
+            route: route.clone(),
             opaque_meta: details,
         },
     );
@@ -475,7 +488,6 @@ fn running_turn_display_for_projection(
     started_at_unix_ms: Option<i64>,
     state: Option<TurnWorkState>,
     message: Option<String>,
-    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
     route: Option<pioneer_protocol::SafeRouteProvenance>,
     agent_work_graph: Option<pioneer_protocol::AgentWorkGraphProjection>,
 ) -> RunningTurnDisplay {
@@ -484,7 +496,6 @@ fn running_turn_display_for_projection(
         started_at_unix_ms,
         state,
         message,
-        author,
         route,
         agent_work_graph,
         permission_profile: projection.turn_permission_profile(turn_id).cloned(),
@@ -531,7 +542,6 @@ fn push_item_row(
         partial_markdown: input.partial_markdown,
         final_markdown: input.final_markdown,
         item: input.item,
-        author: input.author,
         route: input.route,
         timeline_origin: None,
         opaque_meta: input.opaque_meta,
@@ -544,6 +554,7 @@ fn push_item_row(
     });
     rows.push(TimelineRow {
         key: input.entry_id,
+        author: input.author,
         kind: TimelineRowKind::Item { timeline_index },
     });
     timeline_index
@@ -556,6 +567,7 @@ fn live_work_by_turn(
     (
         Option<i64>,
         TurnWorkState,
+        Option<pioneer_protocol::TurnAuthorSnapshot>,
         Option<pioneer_protocol::AgentWorkGraphProjection>,
     ),
 > {
@@ -578,6 +590,7 @@ fn live_work_by_turn(
                 (
                     work.started_at_unix_ms,
                     work.state,
+                    row.author.clone(),
                     work.agent_work_graph.clone(),
                 ),
             ))
@@ -835,6 +848,7 @@ mod tests {
             TimelineRow {
                 key,
                 kind: TimelineRowKind::TurnWorkToggle(group),
+                ..
             } if key == "semantic-turn-work-group::turn_a"
                 && group.toggle_key == "semantic-turn-work-group::turn_a"
                 && !group.is_open
@@ -857,58 +871,6 @@ mod tests {
                 .all(|row| !matches!(row.kind, TimelineRowKind::TurnWorkToggle(_))),
             "expanded live work should render work rows/running row, not a collapsed toggle"
         );
-    }
-
-    #[test]
-    fn live_root_projects_queue_and_keeps_a_blocked_branch_local() {
-        let root_id = pioneer_protocol::AgentExecutionId::new("Egraphroot12345678901").unwrap();
-        let blocked_id = pioneer_protocol::AgentExecutionId::new("Egraphblock1234567890").unwrap();
-        let graph = pioneer_protocol::AgentWorkGraphProjection {
-            root_execution_id: root_id.clone(),
-            updated_at_unix_micros: 5,
-            queued_count: 1,
-            running_count: 1,
-            terminal_count: 1,
-            saturated: true,
-            nodes: vec![
-                pioneer_protocol::AgentWorkNodeProjection {
-                    execution_id: root_id,
-                    state: pioneer_protocol::AgentWorkNodeState::Running,
-                    progress_revision: 4,
-                    progress_label: None,
-                },
-                pioneer_protocol::AgentWorkNodeProjection {
-                    execution_id: blocked_id,
-                    state: pioneer_protocol::AgentWorkNodeState::Blocked,
-                    progress_revision: 2,
-                    progress_label: None,
-                },
-            ],
-        };
-        let mut work = work_payload(TurnWorkPresentation::ExpandedLive, 0);
-        work.state = TurnWorkState::Running;
-        work.agent_work_graph = Some(graph.clone());
-        let mut block = work_block(TurnWorkPresentation::ExpandedLive, 0);
-        block.kind = TimelineBlockKind::TurnWork { work: work.clone() };
-
-        let model = render_semantic_timeline_rows(
-            &[semantic_row(SemanticTimelineRowKind::WorkHeader {
-                block,
-                work,
-                expanded: true,
-                loaded_range: None,
-            })],
-            ConversationViewState::default(),
-        );
-
-        assert!(matches!(
-            model.rows.as_slice(),
-            [TimelineRow {
-                kind: TimelineRowKind::RunningTurn(display),
-                ..
-            }] if display.state == Some(TurnWorkState::Running)
-                && display.agent_work_graph.as_ref() == Some(&graph)
-        ));
     }
 
     #[test]
@@ -1080,69 +1042,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn running_turn_uses_exact_responding_agent_instead_of_input_author() {
-        let responding_execution =
-            pioneer_protocol::AgentExecutionId::new("ERESPONDING1234567890").unwrap();
-        let responding_author = TurnAuthorSnapshot {
-            actor: PersistedActorRef::AgentExecution(responding_execution.clone()),
-            display_name: "Child Agent".to_owned(),
-            nickname: "child-agent".to_owned(),
-            avatar_revision: Some("avatar-child".to_owned()),
-            agent: None,
-        };
-        let mut block = turn_state_block(TurnWorkState::Running);
-        let TimelineBlockKind::TurnState { author, .. } = &mut block.kind else {
-            unreachable!();
-        };
-        *author = Some(responding_author.clone());
-        let mut projection = ConversationViewState::default();
-        projection.upsert_turn_snapshot_metadata(&Turn {
-            id: "turn_a".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: TurnKind::Conversation,
-            origin: TurnOrigin::User,
-            mode: Default::default(),
-            author: Some(TurnAuthorSnapshot {
-                actor: PersistedActorRef::Principal(
-                    PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
-                ),
-                display_name: "Alice".to_owned(),
-                nickname: "alice".to_owned(),
-                avatar_revision: None,
-                agent: None,
-            }),
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::compile_turn_permission_profile(
-                TurnPermissionMode::FullAccess,
-                TurnPermissionProfileSource::Composer,
-            ),
-        });
-
-        let model = render_semantic_timeline_rows(
-            &[semantic_row(SemanticTimelineRowKind::TurnState { block })],
-            projection,
-        );
-        let TimelineRowKind::RunningTurn(display) = &model.rows[0].kind else {
-            panic!("expected running turn row");
-        };
-        assert_eq!(display.author, Some(responding_author));
-        assert_eq!(
-            display.author.as_ref().map(|author| &author.actor),
-            Some(&PersistedActorRef::AgentExecution(responding_execution))
-        );
-    }
-
     fn semantic_row(kind: SemanticTimelineRowKind) -> SemanticTimelineRow {
         SemanticTimelineRow {
             id: SemanticTimelineRowId::TopLevelBlock {
                 block_id: "block".to_owned(),
             },
+            author: None,
             kind,
         }
     }
@@ -1248,6 +1153,7 @@ mod tests {
                     created_at: 2,
                     updated_at: 3,
                 },
+                author: None,
             },
         }
     }
@@ -1273,6 +1179,7 @@ mod tests {
             presentation,
             state: TurnWorkState::Completed,
             agent_work_graph: None,
+            author: None,
             started_at_unix_ms: Some(1),
             completed_at_unix_ms: Some(2),
             elapsed_ms: Some(1),

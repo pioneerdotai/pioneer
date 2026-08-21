@@ -420,6 +420,7 @@ fn turn_start_request_receives_response_and_started_notification() {
 
     let turn_response = sender
         .turn_start(TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: thread_id.clone(),
             turn_id: generate_id(THREAD_ID_LEN),
             input: vec![UserInput::Text {
@@ -431,6 +432,7 @@ fn turn_start_request_receives_response_and_started_notification() {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,
@@ -482,6 +484,7 @@ fn turn_start_request_sends_reasoning_effort() {
 
     let _response = sender
         .turn_start(TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thr_test_thread_123456".to_owned(),
             turn_id: "turn_test_reasoning".to_owned(),
             input: vec![UserInput::Text {
@@ -493,6 +496,7 @@ fn turn_start_request_sends_reasoning_effort() {
             model_provider: Some("openai".to_owned()),
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,
@@ -536,6 +540,7 @@ fn turn_start_request_sends_cli_runtime_effort_options() {
 
     let _response = sender
         .turn_start(TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thr_test_thread_123456".to_owned(),
             turn_id: "turn_test_cli_effort".to_owned(),
             input: vec![UserInput::Text {
@@ -547,6 +552,7 @@ fn turn_start_request_sends_cli_runtime_effort_options() {
             model_provider: None,
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -601,6 +607,7 @@ fn turn_start_request_sends_permission_profile_selection() {
 
     let _response = sender
         .turn_start(TurnStartParams {
+            agent_delegation_routes: Vec::new(),
             thread_id: "thr_test_thread_123456".to_owned(),
             turn_id: "turn_test_permissions".to_owned(),
             input: vec![UserInput::Text {
@@ -612,6 +619,7 @@ fn turn_start_request_sends_permission_profile_selection() {
             model_provider: Some("openai".to_owned()),
             sandbox_policy: None,
             mode: None,
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: None,

@@ -355,7 +355,6 @@ pub(crate) fn test_config() -> AppConfig {
                 acquire_timeout_ms: 5_000,
                 idle_timeout_ms: 30_000,
                 sqlx_logging: false,
-                run_migrations_on_startup: true,
             },
             memory: GatewayMemoryConfig::default(),
             thread_episodic: Default::default(),

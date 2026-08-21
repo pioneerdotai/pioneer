@@ -354,6 +354,7 @@ mod tests {
                         updated_at: 2_000,
                     },
                 },
+                route: None,
                 timeline_origin: None,
                 opaque_meta: None,
             }],

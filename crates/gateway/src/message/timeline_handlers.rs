@@ -96,6 +96,20 @@ struct AssistantMessageTimelineBatch {
     authors: HashMap<String, pioneer_protocol::TurnAuthorSnapshot>,
 }
 
+fn exact_agent_turn_input_author(turn: &Turn) -> Option<pioneer_protocol::TurnAuthorSnapshot> {
+    let author = turn.author.as_ref()?;
+    let pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) = &author.actor else {
+        return None;
+    };
+    let presentation = author.agent.as_ref()?;
+    if &presentation.agent_execution_id != execution_id
+        || presentation.to_turn_author_snapshot() != *author
+    {
+        return None;
+    }
+    Some(author.clone())
+}
+
 fn log_thread_read_outcome(
     thread_id: &str,
     through_turn_id: &str,
@@ -1545,7 +1559,12 @@ impl MessageProcessor {
             .filter(|row| {
                 matches!(
                     row.block_kind.as_str(),
-                    BLOCK_KIND_ASSISTANT_MESSAGE | BLOCK_KIND_RUNNING
+                    BLOCK_KIND_ASSISTANT_MESSAGE
+                        | BLOCK_KIND_RUNNING
+                        | BLOCK_KIND_TURN_WORK
+                        | BLOCK_KIND_DETACHED_TASK_RUN
+                        | BLOCK_KIND_APPROVAL
+                        | BLOCK_KIND_SYSTEM
                 )
             })
             .filter_map(|row| row.turn_id.clone())
@@ -1597,64 +1616,58 @@ impl MessageProcessor {
             items.insert((turn_id.clone(), item_id.clone()), item.clone());
         }
 
+        let authors = self
+            .timeline_row_authors(&turns, turn_ids.as_slice())
+            .await?;
+        Ok(AssistantMessageTimelineBatch { items, authors })
+    }
+
+    async fn timeline_row_authors(
+        &self,
+        turns: &HashMap<String, Turn>,
+        turn_ids: &[String],
+    ) -> Result<HashMap<String, pioneer_protocol::TurnAuthorSnapshot>> {
         let database = self.crud_store.database_connection();
-        let responses =
-            pioneer_crud::load_agent_turn_responses_for_turns(&database, turn_ids.as_slice())
-                .await?;
+        let responses = pioneer_crud::load_agent_turn_responses_for_turns(&database, turn_ids)
+            .await?;
         let responses_by_turn = responses
             .iter()
             .map(|response| (response.turn_id.as_str(), response))
             .collect::<HashMap<_, _>>();
-        let execution_by_turn = turn_ids
+        let direct_authors_by_turn = turn_ids
             .iter()
             .filter_map(|turn_id| {
-                if let Some(response) = responses_by_turn.get(turn_id.as_str()) {
-                    return Some((turn_id.clone(), response.execution_id.clone()));
-                }
-                let turn = turns.get(turn_id.as_str())?;
-                (!matches!(
-                    turn.author.as_ref().map(|author| &author.actor),
-                    Some(pioneer_protocol::PersistedActorRef::AgentExecution(_))
-                ))
-                .then(|| {
-                    (
-                        turn_id.clone(),
-                        super::agent_action_tools::root_agent_execution_id_for_turn(turn_id),
-                    )
-                })
+                turns
+                    .get(turn_id.as_str())
+                    .filter(|turn| turn.turn_kind == pioneer_protocol::TurnKind::TaskRun)
+                    .and_then(exact_agent_turn_input_author)
+                    .map(|author| (turn_id.clone(), author))
             })
             .collect::<HashMap<_, _>>();
-        let execution_ids = execution_by_turn.values().cloned().collect::<Vec<_>>();
+        let execution_ids = responses
+            .iter()
+            .map(|response| response.execution_id.clone())
+            .collect::<Vec<_>>();
         let projected_by_execution =
             pioneer_crud::load_agent_authors_for_executions(&database, execution_ids.as_slice())
                 .await?;
         let mut authors = HashMap::new();
         for turn_id in turn_ids {
-            let author = if let Some(execution_id) = execution_by_turn.get(turn_id.as_str()) {
-                let projected = projected_by_execution.get(execution_id.as_str());
-                if let Some(response) = responses_by_turn.get(turn_id.as_str()) {
-                    let projected = projected.with_context(|| {
-                        format!(
-                            "responding AgentExecution `{execution_id}` for turn `{turn_id}` is missing"
-                        )
-                    })?;
-                    if projected.presentation_snapshot_id != response.presentation_snapshot_id {
-                        bail!(
-                            "responding AgentExecution grant for turn `{turn_id}` is inconsistent"
-                        );
-                    }
-                    Some(projected.author.clone())
-                } else {
-                    projected.map(|projected| projected.author.clone())
-                }
+            let author = if let Some(response) = responses_by_turn.get(turn_id.as_str()) {
+                projected_by_execution
+                    .get(response.execution_id.as_str())
+                    .filter(|projected| {
+                        projected.presentation_snapshot_id == response.presentation_snapshot_id
+                    })
+                    .map(|projected| projected.author.clone())
             } else {
-                None
+                direct_authors_by_turn.get(turn_id.as_str()).cloned()
             };
             if let Some(author) = author {
-                authors.insert(turn_id, author);
+                authors.insert(turn_id.clone(), author);
             }
         }
-        Ok(AssistantMessageTimelineBatch { items, authors })
+        Ok(authors)
     }
 
     async fn descendant_pending_request_blocks(
@@ -1677,16 +1690,26 @@ impl MessageProcessor {
                 .crud_store
                 .list_cli_runtime_pending_requests(CliRuntimePendingRequestListFilter {
                     workspace_id: Some(workspace_id.to_owned()),
-                    thread_id: Some(descendant_thread_id),
+                    thread_id: Some(descendant_thread_id.clone()),
                     open_only: true,
                     ..Default::default()
                 })
                 .await?;
             for request in requests {
-                if cli_runtime_pending_request_visible_to_scope(&request, approval_scope)
-                    && let Some(block) = pending_request_proxy_block(request)?
-                {
-                    blocks.push(block);
+                if cli_runtime_pending_request_visible_to_scope(&request, approval_scope) {
+                    let author = match request.turn_id.as_deref() {
+                        Some(turn_id) => {
+                            self.timeline_agent_author_for_turn(
+                                descendant_thread_id.as_str(),
+                                turn_id,
+                            )
+                            .await?
+                        }
+                        None => None,
+                    };
+                    if let Some(block) = pending_request_proxy_block(request, author)? {
+                        blocks.push(block);
+                    }
                 }
             }
         }
@@ -1745,15 +1768,30 @@ impl MessageProcessor {
                 user_messages,
                 action_projection.and_then(|projection| projection.route.clone()),
             )?,
-            BLOCK_KIND_TURN_WORK => self.turn_work_timeline_block_kind(&row).await?,
-            BLOCK_KIND_DETACHED_TASK_RUN => {
-                self.detached_task_run_timeline_block_kind(&row).await?
+            BLOCK_KIND_TURN_WORK => {
+                let author = row
+                    .turn_id
+                    .as_deref()
+                    .and_then(|turn_id| assistant_messages.authors.get(turn_id))
+                    .cloned();
+                self.turn_work_timeline_block_kind(&row, author).await?
             }
-            BLOCK_KIND_ASSISTANT_MESSAGE => self.assistant_message_timeline_block_kind(
-                &row,
-                assistant_messages,
-                action_projection,
-            )?,
+            BLOCK_KIND_DETACHED_TASK_RUN => {
+                let author = row
+                    .turn_id
+                    .as_deref()
+                    .and_then(|turn_id| assistant_messages.authors.get(turn_id))
+                    .cloned();
+                self.detached_task_run_timeline_block_kind(&row, author)
+                    .await?
+            }
+            BLOCK_KIND_ASSISTANT_MESSAGE => {
+                self.assistant_message_timeline_block_kind(
+                    &row,
+                    assistant_messages,
+                    action_projection,
+                )?
+            }
             BLOCK_KIND_RUNNING => TimelineBlockKind::TurnState {
                 state: TurnWorkState::Running,
                 message: None,
@@ -1765,15 +1803,27 @@ impl MessageProcessor {
                 route: action_projection.and_then(|projection| projection.route.clone()),
             },
             BLOCK_KIND_APPROVAL => {
+                let author = row
+                    .turn_id
+                    .as_deref()
+                    .and_then(|turn_id| assistant_messages.authors.get(turn_id))
+                    .cloned();
                 let Some(kind) = self
-                    .approval_timeline_block_kind(&row, approval_scope)
+                    .approval_timeline_block_kind(&row, approval_scope, author)
                     .await?
                 else {
                     return Ok(None);
                 };
                 kind
             }
-            BLOCK_KIND_SYSTEM => terminal_turn_state_timeline_block_kind(&row)?,
+            BLOCK_KIND_SYSTEM => {
+                let author = row
+                    .turn_id
+                    .as_deref()
+                    .and_then(|turn_id| assistant_messages.authors.get(turn_id))
+                    .cloned();
+                terminal_turn_state_timeline_block_kind(&row, author)?
+            }
             other => {
                 return Err(anyhow!(
                     "unsupported thread timeline block kind `{other}` for block `{}`",
@@ -1798,6 +1848,7 @@ impl MessageProcessor {
         &self,
         row: &thread_timeline_block::Model,
         approval_scope: Option<&ThreadTimelineApprovalScope>,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
     ) -> Result<Option<TimelineBlockKind>> {
         let request_id = row
             .source_key
@@ -1819,6 +1870,7 @@ impl MessageProcessor {
                 request_id: request_id.to_owned(),
                 status: CLIRuntimePendingRequestStatus::Expired,
                 item_id: None,
+                author,
                 request: CLIRuntimePendingRequest {
                     kind: CLIRuntimeRequestKind::Other,
                     title: None,
@@ -1845,6 +1897,7 @@ impl MessageProcessor {
             request_id: record.request_id,
             status: parse_cli_runtime_pending_request_status(record.status.as_str()),
             item_id: record.native_item_id,
+            author,
             request,
         }))
     }
@@ -1852,6 +1905,7 @@ impl MessageProcessor {
     async fn turn_work_timeline_block_kind(
         &self,
         row: &thread_timeline_block::Model,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
     ) -> Result<TimelineBlockKind> {
         let turn_id = row
             .turn_id
@@ -1865,7 +1919,7 @@ impl MessageProcessor {
 
         Ok(TimelineBlockKind::TurnWork {
             work: self
-                .turn_work_block_from_projection(work_projection)
+                .turn_work_block_from_projection_with_author(work_projection, author)
                 .await?,
         })
     }
@@ -1891,9 +1945,7 @@ impl MessageProcessor {
                 format!("assistant message item `{item_id}` for turn `{turn_id}` was not batched")
             })?
             .clone();
-        let author = action_projection
-            .map(|projection| projection.author.clone())
-            .or_else(|| batch.authors.get(turn_id).cloned());
+        let author = batch.authors.get(turn_id).cloned();
 
         let TurnItem::AgentMessage {
             id, text, markdown, ..
@@ -1919,6 +1971,7 @@ impl MessageProcessor {
     async fn detached_task_run_timeline_block_kind(
         &self,
         row: &thread_timeline_block::Model,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
     ) -> Result<TimelineBlockKind> {
         let turn_id = row
             .turn_id
@@ -1939,8 +1992,7 @@ impl MessageProcessor {
                 row.block_id
             ));
         };
-
-        Ok(TimelineBlockKind::DetachedTaskRun { task })
+        Ok(TimelineBlockKind::DetachedTaskRun { task, author })
     }
 
     async fn turn_work_items_from_rows(
@@ -1999,6 +2051,21 @@ impl MessageProcessor {
         &self,
         projection: turn_work_projection::Model,
     ) -> Result<TurnWorkBlock> {
+        let author = self
+            .timeline_agent_author_for_turn(
+                projection.thread_id.as_str(),
+                projection.turn_id.as_str(),
+            )
+            .await?;
+        self.turn_work_block_from_projection_with_author(projection, author)
+            .await
+    }
+
+    async fn turn_work_block_from_projection_with_author(
+        &self,
+        projection: turn_work_projection::Model,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+    ) -> Result<TurnWorkBlock> {
         let first_cursor = match projection.first_work_item_id.as_deref() {
             Some(work_item_id) => self.turn_work_item_cursor(work_item_id).await?,
             None => None,
@@ -2018,6 +2085,7 @@ impl MessageProcessor {
             presentation: parse_turn_work_presentation(projection.presentation.as_str()),
             state: parse_turn_work_state(projection.state.as_str()),
             agent_work_graph,
+            author,
             started_at_unix_ms: projection.started_at.map(|value| value.timestamp_millis()),
             completed_at_unix_ms: projection
                 .completed_at
@@ -2035,6 +2103,22 @@ impl MessageProcessor {
             first_work_item_id: projection.first_work_item_id,
             last_work_item_id: projection.last_work_item_id,
         })
+    }
+
+    pub(super) async fn timeline_agent_author_for_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::TurnAuthorSnapshot>> {
+        let Some((_, turn)) = self.crud_store.get_turn(thread_id, turn_id).await? else {
+            return Ok(None);
+        };
+        let turn_id = turn_id.to_owned();
+        let turns = HashMap::from([(turn_id.clone(), turn)]);
+        Ok(self
+            .timeline_row_authors(&turns, std::slice::from_ref(&turn_id))
+            .await?
+            .remove(turn_id.as_str()))
     }
 
     async fn turn_work_item_cursor(
@@ -2288,12 +2372,14 @@ fn parse_turn_work_presentation(value: &str) -> TurnWorkPresentation {
 
 fn terminal_turn_state_timeline_block_kind(
     row: &thread_timeline_block::Model,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) -> Result<TimelineBlockKind> {
-    terminal_turn_state_timeline_block_kind_from_metadata(row.metadata_json.as_str())
+    terminal_turn_state_timeline_block_kind_from_metadata(row.metadata_json.as_str(), author)
 }
 
 fn terminal_turn_state_timeline_block_kind_from_metadata(
     metadata_json: &str,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) -> Result<TimelineBlockKind> {
     let metadata = parse_optional_metadata(metadata_json)?;
     let state = metadata
@@ -2310,7 +2396,7 @@ fn terminal_turn_state_timeline_block_kind_from_metadata(
     Ok(TimelineBlockKind::TurnState {
         state,
         message,
-        author: None,
+        author,
         route: None,
     })
 }
@@ -2360,6 +2446,7 @@ fn cli_runtime_pending_request_visible_to_scope(
 
 fn pending_request_proxy_block(
     record: CliRuntimePendingRequestRecord,
+    author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) -> Result<Option<TimelineBlock>> {
     if record.status.is_terminal() {
         return Ok(None);
@@ -2390,6 +2477,7 @@ fn pending_request_proxy_block(
             request_id: record.request_id,
             status: CLIRuntimePendingRequestStatus::Pending,
             item_id: record.native_item_id,
+            author,
             request,
         },
     }))
@@ -2471,6 +2559,39 @@ fn parse_optional_metadata(value: &str) -> Result<Option<JsonValue>> {
 mod timeline_handler_unit_tests {
     use super::*;
 
+    fn agent_authored_turn() -> Turn {
+        let presentation = pioneer_protocol::AgentPresentationSnapshot {
+            agent_identity_id: pioneer_protocol::AgentIdentityId::new("AAAAAAAAAAAAAAAAAAAAA")
+                .unwrap(),
+            agent_execution_id: pioneer_protocol::AgentExecutionId::new("EAAAAAAAAAAAAAAAAAAAA")
+                .unwrap(),
+            identity_source_kind: pioneer_protocol::AgentIdentitySourceKind::NativeAgent,
+            identity_source_revision: 1,
+            display_name: "Codex CLI".to_owned(),
+            nickname: "codex".to_owned(),
+            avatar_revision: Some("agent-avatar".to_owned()),
+            role_label: None,
+        };
+        Turn {
+            id: "turn".to_owned(),
+            status: pioneer_protocol::TurnStatus::InProgress,
+            turn_kind: pioneer_protocol::TurnKind::TaskRun,
+            origin: pioneer_protocol::TurnOrigin::DetachedTask,
+            mode: pioneer_protocol::ThreadMode::Agent,
+            author: Some(presentation.to_turn_author_snapshot()),
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::compile_turn_permission_profile(
+                pioneer_protocol::TurnPermissionMode::FullAccess,
+                pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+        }
+    }
+
     fn artifact_attachment(
         status: pioneer_protocol::ArtifactStatus,
         preview: Option<pioneer_protocol::ArtifactPreviewRef>,
@@ -2549,10 +2670,26 @@ mod timeline_handler_unit_tests {
     }
 
     #[test]
+    fn exact_agent_input_author_is_available_before_execution_graph_projection() {
+        let turn = agent_authored_turn();
+
+        assert_eq!(exact_agent_turn_input_author(&turn), turn.author);
+    }
+
+    #[test]
+    fn agent_input_author_without_immutable_presentation_is_omitted() {
+        let mut turn = agent_authored_turn();
+        turn.author.as_mut().unwrap().agent = None;
+
+        assert!(exact_agent_turn_input_author(&turn).is_none());
+    }
+
+    #[test]
     fn terminal_system_row_metadata_preserves_state_and_message() {
         assert_eq!(
             terminal_turn_state_timeline_block_kind_from_metadata(
                 r#"{"state":"interrupted","message":"stopped by user"}"#,
+                None,
             )
             .unwrap(),
             TimelineBlockKind::TurnState {

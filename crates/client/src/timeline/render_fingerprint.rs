@@ -58,6 +58,7 @@ pub fn timeline_row_content_fingerprint(
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     row.key.hash(&mut hasher);
+    hash_serializable(&row.author, &mut hasher);
     match &row.kind {
         TimelineRowKind::TurnWorkToggle(group) => {
             1u8.hash(&mut hasher);
@@ -78,7 +79,6 @@ pub fn timeline_row_content_fingerprint(
             running_turn.turn_id.hash(&mut hasher);
             running_turn.state.hash(&mut hasher);
             running_turn.message.hash(&mut hasher);
-            hash_serializable(&running_turn.author, &mut hasher);
             hash_serializable(&running_turn.route, &mut hasher);
             hash_serializable(&running_turn.agent_work_graph, &mut hasher);
             running_turn
@@ -125,7 +125,6 @@ pub fn timeline_row_content_fingerprint(
                     hash_serializable(&item_view.partial_markdown, &mut hasher);
                     hash_serializable(&item_view.final_markdown, &mut hasher);
                     hash_turn_item_without_identity(&item_view.item, &mut hasher);
-                    hash_serializable(&item_view.author, &mut hasher);
                     hash_serializable(&item_view.route, &mut hasher);
                     hash_serializable(&item_view.timeline_origin, &mut hasher);
                     hash_serializable(&item_view.opaque_meta, &mut hasher);
@@ -278,9 +277,7 @@ mod tests {
         timeline::labels::RunningTurnDisplay,
         timeline::rows::{TimelineRow, TimelineRowKind},
     };
-    use pioneer_protocol::{
-        AgentRouteAction, PersistedActorRef, SafeRouteProvenance, TurnAuthorSnapshot, TurnItem,
-    };
+    use pioneer_protocol::{PersistedActorRef, TurnAuthorSnapshot, TurnItem};
     use std::collections::HashSet;
 
     #[test]
@@ -336,54 +333,9 @@ mod tests {
     }
 
     #[test]
-    fn item_render_fingerprint_tracks_author_and_route_provenance() {
+    fn item_render_fingerprint_tracks_exact_author() {
         let (projection, row) = projection_with_target_item(false);
-        let mut authored = projection.clone();
-        authored.items[0].author = Some(TurnAuthorSnapshot {
-            actor: PersistedActorRef::System,
-            display_name: "System".to_owned(),
-            nickname: "system".to_owned(),
-            avatar_revision: None,
-            agent: None,
-        });
-        let mut routed = projection.clone();
-        routed.items[0].route = Some(SafeRouteProvenance::delegated_action(
-            AgentRouteAction::SendMessage,
-        ));
-        let expanded = HashSet::new();
-
-        let original = timeline_row_render_fingerprint(&projection, &row, &expanded);
-        assert_ne!(
-            original,
-            timeline_row_render_fingerprint(&authored, &row, &expanded)
-        );
-        assert_ne!(
-            original,
-            timeline_row_render_fingerprint(&routed, &row, &expanded)
-        );
-    }
-
-    #[test]
-    fn running_render_fingerprint_tracks_exact_author_and_route_provenance() {
-        let projection = ConversationViewState::default();
-        let row = TimelineRow {
-            key: "running-target".to_owned(),
-            kind: TimelineRowKind::RunningTurn(RunningTurnDisplay {
-                turn_id: "target-turn".to_owned(),
-                started_at_unix_ms: Some(1),
-                state: Some(pioneer_protocol::TurnWorkState::Running),
-                message: None,
-                author: None,
-                route: None,
-                agent_work_graph: None,
-                permission_profile: None,
-                security_summary: None,
-            }),
-        };
-        let TimelineRowKind::RunningTurn(base) = &row.kind else {
-            unreachable!("fixture is a running row")
-        };
-        let mut authored = base.clone();
+        let mut authored = row.clone();
         authored.author = Some(TurnAuthorSnapshot {
             actor: PersistedActorRef::System,
             display_name: "System".to_owned(),
@@ -391,10 +343,40 @@ mod tests {
             avatar_revision: None,
             agent: None,
         });
-        let mut routed = base.clone();
-        routed.route = Some(SafeRouteProvenance::delegated_action(
-            AgentRouteAction::SendMessage,
-        ));
+        let expanded = HashSet::new();
+
+        let original = timeline_row_render_fingerprint(&projection, &row, &expanded);
+        assert_ne!(
+            original,
+            timeline_row_render_fingerprint(&projection, &authored, &expanded)
+        );
+    }
+
+    #[test]
+    fn running_render_fingerprint_tracks_exact_author() {
+        let projection = ConversationViewState::default();
+        let row = TimelineRow {
+            key: "running-target".to_owned(),
+            author: None,
+            kind: TimelineRowKind::RunningTurn(RunningTurnDisplay {
+                turn_id: "target-turn".to_owned(),
+                started_at_unix_ms: Some(1),
+                state: Some(pioneer_protocol::TurnWorkState::Running),
+                message: None,
+                route: None,
+                agent_work_graph: None,
+                permission_profile: None,
+                security_summary: None,
+            }),
+        };
+        let mut authored = row.clone();
+        authored.author = Some(TurnAuthorSnapshot {
+            actor: PersistedActorRef::System,
+            display_name: "System".to_owned(),
+            nickname: "system".to_owned(),
+            avatar_revision: None,
+            agent: None,
+        });
         let expanded = HashSet::new();
         let original = timeline_row_render_fingerprint(&projection, &row, &expanded);
 
@@ -404,18 +386,8 @@ mod tests {
                 &projection,
                 &TimelineRow {
                     key: row.key.clone(),
-                    kind: TimelineRowKind::RunningTurn(authored),
-                },
-                &expanded,
-            )
-        );
-        assert_ne!(
-            original,
-            timeline_row_render_fingerprint(
-                &projection,
-                &TimelineRow {
-                    key: row.key,
-                    kind: TimelineRowKind::RunningTurn(routed),
+                    author: authored.author,
+                    kind: row.kind,
                 },
                 &expanded,
             )
@@ -447,6 +419,7 @@ mod tests {
             projection,
             TimelineRow {
                 key: "target-entry".to_owned(),
+                author: None,
                 kind: TimelineRowKind::Item { timeline_index },
             },
         )
@@ -477,7 +450,6 @@ mod tests {
                 text: text.to_owned(),
                 attachments: Vec::new(),
             },
-            author: None,
             route: None,
             timeline_origin: None,
             opaque_meta: None,

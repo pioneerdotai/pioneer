@@ -249,6 +249,7 @@ impl PioneerDesktop {
                 item_view,
                 item,
                 None,
+                None,
                 top_spacing,
                 is_last_row,
                 content_width,

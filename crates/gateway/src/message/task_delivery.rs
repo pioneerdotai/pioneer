@@ -1026,6 +1026,7 @@ impl MessageProcessor {
                 return Err(error);
             }
         };
+        let started_notification = turn_outcome.started_notification.clone();
         match item {
             Some(item) => {
                 let item_started = pioneer_protocol::ItemStartedNotification {
@@ -1073,7 +1074,7 @@ impl MessageProcessor {
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
-                    &turn_outcome.started_notification,
+                    &started_notification,
                     turn_outcome.started_notification_connection_ids.clone(),
                 )
                 .await;
@@ -1145,7 +1146,7 @@ impl MessageProcessor {
                 self.send_notification_to_authorized_thread_connections(
                     thread_id,
                     events::TURN_STARTED,
-                    &turn_outcome.started_notification,
+                    &started_notification,
                     turn_outcome.started_notification_connection_ids.clone(),
                 )
                 .await;

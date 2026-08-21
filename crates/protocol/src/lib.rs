@@ -161,11 +161,8 @@ pub use cli_runtime::{
     sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };
 pub use client_projection::{
-    AgentAuthoredMessage, AgentAuthoredMessageState, AgentWorkGraphProjection,
-    AgentWorkNodeProjection, AgentWorkNodeState, ClientAgentPresentationSnapshot,
-    ClientAuthorProjectionError, ConversationAuthorPresentation, CrossThreadSourceVisibility,
-    PrincipalAuthorSnapshot, SafeExecutionProfileMetadata, SafeRouteProvenance,
-    project_agent_authored_message, project_conversation_author,
+    AgentWorkGraphProjection, AgentWorkNodeProjection, AgentWorkNodeState,
+    CrossThreadSourceVisibility, SafeExecutionProfileMetadata, SafeRouteProvenance,
 };
 pub use gateway_endpoint::{
     DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError, GatewayTransportSecurity,

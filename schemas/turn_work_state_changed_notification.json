@@ -43,6 +43,322 @@
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
     },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentPresentationSnapshot": {
+      "type": "object",
+      "properties": {
+        "agent_execution_id": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "agent_identity_id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "identity_source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "identity_source_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_identity_id",
+        "agent_execution_id",
+        "identity_source_kind",
+        "identity_source_revision",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "PersistedActorRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/AgentExecutionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent_execution"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TimelineChangeReason": {
+      "type": "string",
+      "enum": [
+        "backfill",
+        "live_event",
+        "state_changed",
+        "page_invalidated"
+      ]
+    },
+    "TimelineCursor": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ]
+    },
+    "TurnAuthorSnapshot": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/PersistedActorRef"
+        },
+        "agent": {
+          "description": "Full immutable identity presentation for an agent-authored Turn.  This\nis carried with the Turn instead of being reconstructed from mutable\nidentity/runtime state. Non-agent actors leave it absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentPresentationSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        }
+      },
+      "required": [
+        "actor",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "TurnWorkBlock": {
+      "type": "object",
+      "properties": {
+        "afterCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "author": {
+          "description": "Exact execution whose work this row presents. This is separate from\nthe Turn input author and is required for stable Agent attribution.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnAuthorSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "beforeCursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "completedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "elapsedMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "firstWorkItemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hasMoreAfter": {
+          "type": "boolean"
+        },
+        "hasMoreBefore": {
+          "type": "boolean"
+        },
+        "hiddenWorkCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lastWorkItemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "presentation": {
+          "$ref": "#/$defs/TurnWorkPresentation"
+        },
+        "startedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "state": {
+          "$ref": "#/$defs/TurnWorkState"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "visibleWorkCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "agentWorkGraph": {
+          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentWorkGraphProjection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "turnId",
+        "presentation",
+        "state",
+        "workCount",
+        "visibleWorkCount",
+        "hiddenWorkCount",
+        "hasMoreBefore",
+        "hasMoreAfter"
+      ]
+    },
+    "TurnWorkPresentation": {
+      "type": "string",
+      "enum": [
+        "expanded_live",
+        "collapsed_after_final",
+        "expanded_terminal_no_final"
+      ]
+    },
+    "TurnWorkState": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "waiting_for_approval",
+        "stalled",
+        "completed",
+        "blocked",
+        "failed",
+        "interrupted"
+      ]
+    },
     "AgentWorkGraphProjection": {
       "type": "object",
       "properties": {
@@ -129,157 +445,6 @@
         "failed",
         "cancelled",
         "blocked"
-      ]
-    },
-    "TimelineChangeReason": {
-      "type": "string",
-      "enum": [
-        "backfill",
-        "live_event",
-        "state_changed",
-        "page_invalidated"
-      ]
-    },
-    "TimelineCursor": {
-      "type": "object",
-      "properties": {
-        "value": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "value"
-      ]
-    },
-    "TurnWorkBlock": {
-      "type": "object",
-      "properties": {
-        "afterCursor": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimelineCursor"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "agentWorkGraph": {
-          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AgentWorkGraphProjection"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "beforeCursor": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimelineCursor"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "completedAtUnixMs": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "elapsedMs": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "firstWorkItemId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "hasMoreAfter": {
-          "type": "boolean"
-        },
-        "hasMoreBefore": {
-          "type": "boolean"
-        },
-        "hiddenWorkCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "lastWorkItemId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "presentation": {
-          "$ref": "#/$defs/TurnWorkPresentation"
-        },
-        "startedAtUnixMs": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "state": {
-          "$ref": "#/$defs/TurnWorkState"
-        },
-        "turnId": {
-          "type": "string"
-        },
-        "visibleWorkCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "workCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        }
-      },
-      "required": [
-        "turnId",
-        "presentation",
-        "state",
-        "workCount",
-        "visibleWorkCount",
-        "hiddenWorkCount",
-        "hasMoreBefore",
-        "hasMoreAfter"
-      ]
-    },
-    "TurnWorkPresentation": {
-      "type": "string",
-      "enum": [
-        "expanded_live",
-        "collapsed_after_final",
-        "expanded_terminal_no_final"
-      ]
-    },
-    "TurnWorkState": {
-      "type": "string",
-      "enum": [
-        "starting",
-        "running",
-        "waiting_for_approval",
-        "stalled",
-        "completed",
-        "blocked",
-        "failed",
-        "interrupted"
       ]
     }
   }

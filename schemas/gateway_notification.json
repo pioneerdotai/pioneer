@@ -2012,94 +2012,6 @@
       },
       "additionalProperties": false
     },
-    "AgentWorkGraphProjection": {
-      "type": "object",
-      "properties": {
-        "nodes": {
-          "description": "Stable, bounded nodes in the exact root graph. No prompt, provider,\nmodel, thread title, runtime path, or other private payload is exposed.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/AgentWorkNodeProjection"
-          }
-        },
-        "queuedCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "rootExecutionId": {
-          "$ref": "#/$defs/AgentExecutionId"
-        },
-        "runningCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "saturated": {
-          "description": "True while one or more authorized nodes are durably queued for\nserver-owned capacity. This is resource state, not an authorization\nfailure and never implies that the whole graph is blocked.",
-          "type": "boolean"
-        },
-        "terminalCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "updatedAtUnixMicros": {
-          "description": "Monotonic persisted resource-state timestamp used only to reject stale\ngraph projections racing with live queue/promotion/finalization events.",
-          "type": "integer",
-          "format": "int64"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "rootExecutionId",
-        "updatedAtUnixMicros",
-        "queuedCount",
-        "runningCount",
-        "terminalCount",
-        "saturated",
-        "nodes"
-      ]
-    },
-    "AgentWorkNodeProjection": {
-      "type": "object",
-      "properties": {
-        "executionId": {
-          "$ref": "#/$defs/AgentExecutionId"
-        },
-        "progressLabel": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "progressRevision": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "state": {
-          "$ref": "#/$defs/AgentWorkNodeState"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "executionId",
-        "state",
-        "progressRevision"
-      ]
-    },
-    "AgentWorkNodeState": {
-      "type": "string",
-      "enum": [
-        "queued",
-        "running",
-        "completed",
-        "failed",
-        "cancelled",
-        "blocked"
-      ]
-    },
     "ArtifactBindingDirection": {
       "type": "string",
       "enum": [
@@ -3535,6 +3447,17 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "agentWorkGraph": {
+          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentWorkGraphProjection"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -13089,11 +13012,11 @@
             }
           ]
         },
-        "agentWorkGraph": {
-          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
+        "author": {
+          "description": "Exact execution whose work this row presents. This is separate from\nthe Turn input author and is required for stable Agent attribution.",
           "anyOf": [
             {
-              "$ref": "#/$defs/AgentWorkGraphProjection"
+              "$ref": "#/$defs/TurnAuthorSnapshot"
             },
             {
               "type": "null"
@@ -13955,6 +13878,94 @@
       "required": [
         "revision",
         "workspace_id"
+      ]
+    },
+    "AgentWorkGraphProjection": {
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "description": "Stable, bounded nodes in the exact root graph. No prompt, provider,\nmodel, thread title, runtime path, or other private payload is exposed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentWorkNodeProjection"
+          }
+        },
+        "queuedCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "rootExecutionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "runningCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "saturated": {
+          "description": "True while one or more authorized nodes are durably queued for\nserver-owned capacity. This is resource state, not an authorization\nfailure and never implies that the whole graph is blocked.",
+          "type": "boolean"
+        },
+        "terminalCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "updatedAtUnixMicros": {
+          "description": "Monotonic persisted resource-state timestamp used only to reject stale\ngraph projections racing with live queue/promotion/finalization events.",
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rootExecutionId",
+        "updatedAtUnixMicros",
+        "queuedCount",
+        "runningCount",
+        "terminalCount",
+        "saturated",
+        "nodes"
+      ]
+    },
+    "AgentWorkNodeProjection": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "progressLabel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progressRevision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/AgentWorkNodeState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "executionId",
+        "state",
+        "progressRevision"
+      ]
+    },
+    "AgentWorkNodeState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "blocked"
       ]
     }
   }

@@ -48,6 +48,7 @@ impl GatewayServiceWarning {
 
 pub fn run_gateway_service() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(pioneer_gateway::GATEWAY_WORKER_STACK_SIZE_BYTES)
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;

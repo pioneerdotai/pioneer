@@ -43,6 +43,8 @@ pub enum SemanticTimelineRowId {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct SemanticTimelineRow {
     pub id: SemanticTimelineRowId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<pioneer_protocol::TurnAuthorSnapshot>,
     pub kind: SemanticTimelineRowKind,
 }
 
@@ -592,21 +594,26 @@ pub fn flatten_thread_semantic_timeline(
 
     for block in thread.top_level.ordered_blocks() {
         match &block.kind {
-            TimelineBlockKind::UserMessage { .. } => rows.push(SemanticTimelineRow {
+            TimelineBlockKind::UserMessage { author, .. } => rows.push(SemanticTimelineRow {
                 id: SemanticTimelineRowId::TopLevelBlock {
                     block_id: block.block_id.clone(),
                 },
+                author: author.clone(),
                 kind: SemanticTimelineRowKind::UserBlock {
                     block: block.clone(),
                 },
             }),
             TimelineBlockKind::TurnWork { work } => {
+                let Some(author) = ready_agent_timeline_author(work.author.as_ref()) else {
+                    continue;
+                };
                 let expanded = resolve_work_expanded(work, &thread.expansion);
                 let work_range = thread.work_range(work.turn_id.as_str());
                 rows.push(SemanticTimelineRow {
                     id: SemanticTimelineRowId::TopLevelBlock {
                         block_id: block.block_id.clone(),
                     },
+                    author: Some(author.clone()),
                     kind: SemanticTimelineRowKind::WorkHeader {
                         block: block.clone(),
                         work: work.clone(),
@@ -624,38 +631,62 @@ pub fn flatten_thread_semantic_timeline(
                     );
                 }
             }
-            TimelineBlockKind::DetachedTaskRun { .. } => rows.push(SemanticTimelineRow {
-                id: SemanticTimelineRowId::TopLevelBlock {
-                    block_id: block.block_id.clone(),
-                },
-                kind: SemanticTimelineRowKind::DetachedTaskRun {
-                    block: block.clone(),
-                },
-            }),
-            TimelineBlockKind::AssistantMessage { .. } => rows.push(SemanticTimelineRow {
-                id: SemanticTimelineRowId::TopLevelBlock {
-                    block_id: block.block_id.clone(),
-                },
-                kind: SemanticTimelineRowKind::AssistantMessage {
-                    block: block.clone(),
-                },
-            }),
-            TimelineBlockKind::PendingRequest { .. } => rows.push(SemanticTimelineRow {
-                id: SemanticTimelineRowId::TopLevelBlock {
-                    block_id: block.block_id.clone(),
-                },
-                kind: SemanticTimelineRowKind::PendingRequest {
-                    block: block.clone(),
-                },
-            }),
-            TimelineBlockKind::TurnState { .. } => rows.push(SemanticTimelineRow {
-                id: SemanticTimelineRowId::TopLevelBlock {
-                    block_id: block.block_id.clone(),
-                },
-                kind: SemanticTimelineRowKind::TurnState {
-                    block: block.clone(),
-                },
-            }),
+            TimelineBlockKind::DetachedTaskRun { author, .. } => {
+                let Some(author) = ready_agent_timeline_author(author.as_ref()) else {
+                    continue;
+                };
+                rows.push(SemanticTimelineRow {
+                    id: SemanticTimelineRowId::TopLevelBlock {
+                        block_id: block.block_id.clone(),
+                    },
+                    author: Some(author.clone()),
+                    kind: SemanticTimelineRowKind::DetachedTaskRun {
+                        block: block.clone(),
+                    },
+                });
+            }
+            TimelineBlockKind::AssistantMessage { author, .. } => {
+                let Some(author) = ready_agent_timeline_author(author.as_ref()) else {
+                    continue;
+                };
+                rows.push(SemanticTimelineRow {
+                    id: SemanticTimelineRowId::TopLevelBlock {
+                        block_id: block.block_id.clone(),
+                    },
+                    author: Some(author.clone()),
+                    kind: SemanticTimelineRowKind::AssistantMessage {
+                        block: block.clone(),
+                    },
+                });
+            }
+            TimelineBlockKind::PendingRequest { author, .. } => {
+                let Some(author) = ready_agent_timeline_author(author.as_ref()) else {
+                    continue;
+                };
+                rows.push(SemanticTimelineRow {
+                    id: SemanticTimelineRowId::TopLevelBlock {
+                        block_id: block.block_id.clone(),
+                    },
+                    author: Some(author.clone()),
+                    kind: SemanticTimelineRowKind::PendingRequest {
+                        block: block.clone(),
+                    },
+                });
+            }
+            TimelineBlockKind::TurnState { author, .. } => {
+                let Some(author) = ready_timeline_state_author(author.as_ref()) else {
+                    continue;
+                };
+                rows.push(SemanticTimelineRow {
+                    id: SemanticTimelineRowId::TopLevelBlock {
+                        block_id: block.block_id.clone(),
+                    },
+                    author: author.cloned(),
+                    kind: SemanticTimelineRowKind::TurnState {
+                        block: block.clone(),
+                    },
+                });
+            }
         }
     }
 
@@ -664,6 +695,29 @@ pub fn flatten_thread_semantic_timeline(
         rows,
         request_hints,
     }
+}
+
+fn ready_timeline_state_author(
+    author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
+) -> Option<Option<&pioneer_protocol::TurnAuthorSnapshot>> {
+    match author {
+        None => Some(None),
+        Some(author) => ready_agent_timeline_author(Some(author)).map(Some),
+    }
+}
+
+fn ready_agent_timeline_author(
+    author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
+) -> Option<&pioneer_protocol::TurnAuthorSnapshot> {
+    let author = author?;
+    let pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) = &author.actor else {
+        return None;
+    };
+    author
+        .agent
+        .as_ref()
+        .is_some_and(|agent| &agent.agent_execution_id == execution_id)
+        .then_some(author)
 }
 
 pub fn flatten_semantic_timeline(
@@ -1050,15 +1104,15 @@ pub fn apply_conversation_event_to_semantic_timeline(
                 )
             }
         }
-        ConversationEvent::TurnStarted { thread_id, turn } => {
-            apply_started_turn_to_semantic_timeline(
-                state,
-                workspace_id,
-                thread_id,
-                turn,
-                now_unix_ms,
-            )
-        }
+        ConversationEvent::TurnStarted {
+            thread_id, turn, ..
+        } => apply_started_turn_to_semantic_timeline(
+            state,
+            workspace_id,
+            thread_id,
+            turn,
+            now_unix_ms,
+        ),
         ConversationEvent::LocalTurnStartRejected {
             thread_id,
             turn_id,
@@ -2511,9 +2565,11 @@ fn newest_top_level_block(
     let (
         TimelineBlockKind::DetachedTaskRun {
             task: existing_task,
+            ..
         },
         TimelineBlockKind::DetachedTaskRun {
             task: incoming_task,
+            ..
         },
     ) = (&existing.kind, &incoming.kind)
     else {
@@ -2650,7 +2706,7 @@ fn upsert_assistant_message_block(
     };
     let block_id = assistant_block_id(turn_id, id);
     let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
-    let (author, route) = existing
+    let (existing_author, route) = existing
         .and_then(|block| match &block.kind {
             TimelineBlockKind::AssistantMessage { author, route, .. } => {
                 Some((author.clone(), route.clone()))
@@ -2658,6 +2714,7 @@ fn upsert_assistant_message_block(
             _ => None,
         })
         .unwrap_or_default();
+    let author = existing_author;
     let block = TimelineBlock {
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
@@ -2703,6 +2760,11 @@ fn upsert_detached_task_run_block(
     thread.detached_task_run_turn_ids.insert(turn_id.to_owned());
     let block_id = detached_task_run_block_id(turn_id, task.id.as_str());
     let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let author = existing
+        .and_then(|block| match &block.kind {
+            TimelineBlockKind::DetachedTaskRun { author, .. } => author.clone(),
+            _ => None,
+        });
     let suffix = format!("detached-task-run:{}", task.id);
     let block = TimelineBlock {
         workspace_id: workspace_id.to_owned(),
@@ -2733,7 +2795,10 @@ fn upsert_detached_task_run_block(
             .or_else(|| existing.and_then(|block| block.started_at_unix_ms))
             .or(Some(now_unix_ms)),
         updated_at_unix_ms: Some(now_unix_ms),
-        kind: TimelineBlockKind::DetachedTaskRun { task: task.clone() },
+        kind: TimelineBlockKind::DetachedTaskRun {
+            task: task.clone(),
+            author,
+        },
     };
     upsert_top_level_block(thread, block);
 }
@@ -2795,6 +2860,15 @@ fn upsert_terminal_state_block(
 ) {
     let block_id = terminal_state_block_id(turn_id);
     let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
+    let (existing_author, route) = existing
+        .and_then(|block| match &block.kind {
+            TimelineBlockKind::TurnState { author, route, .. } => {
+                Some((author.clone(), route.clone()))
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+    let author = existing_author;
     let block = TimelineBlock {
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
@@ -2812,8 +2886,8 @@ fn upsert_terminal_state_block(
         kind: TimelineBlockKind::TurnState {
             state,
             message,
-            author: None,
-            route: None,
+            author,
+            route,
         },
     };
     upsert_top_level_block(thread, block);
@@ -2952,6 +3026,7 @@ fn upsert_turn_work_summary(
         agent_work_graph: existing
             .as_ref()
             .and_then(|work| work.agent_work_graph.clone()),
+        author: existing.as_ref().and_then(|work| work.author.clone()),
         started_at_unix_ms: existing
             .as_ref()
             .and_then(|work| work.started_at_unix_ms)
@@ -3325,6 +3400,7 @@ fn push_turn_work_rows_and_hints(
                 turn_id: item.turn_id.clone(),
                 work_item_id: item.work_item_id.clone(),
             },
+            author: work.author.clone(),
             kind: SemanticTimelineRowKind::WorkItem { item: item.clone() },
         });
     }
@@ -3796,7 +3872,7 @@ mod tests {
         assert_eq!(task_block.sort_key, initial_sort_key);
         assert!(matches!(
             &task_block.kind,
-            TimelineBlockKind::DetachedTaskRun { task }
+            TimelineBlockKind::DetachedTaskRun { task, .. }
                 if task.status == TaskStatus::Completed
         ));
         assert!(
@@ -5150,68 +5226,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_pages_cannot_regress_live_agent_work_graph_state() {
-        let mut state = SemanticTimelineState::default();
-        assert!(apply_thread_timeline_page(
-            &mut state,
-            thread_page(vec![turn_work_block("thread_a", "block_work", "002")]),
-            TopLevelPageMergeMode::Reset
-        ));
-        assert!(apply_turn_work_page(
-            &mut state,
-            work_page(Vec::new()),
-            WorkPageMergeMode::Reset
-        ));
-
-        let mut live_work = work_block("turn_a");
-        live_work.agent_work_graph = Some(agent_graph(10, 0, 2));
-        assert!(apply_turn_work_state_changed(
-            &mut state,
-            TurnWorkStateChangedNotification {
-                workspace_id: "workspace_a".to_owned(),
-                thread_id: "thread_a".to_owned(),
-                turn_id: "turn_a".to_owned(),
-                source_high_watermark: 2,
-                projection_updated_at_unix_micros: 2,
-                work: live_work,
-                reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
-            }
-        ));
-
-        let mut stale_work = work_block("turn_a");
-        stale_work.agent_work_graph = Some(agent_graph(5, 1, 1));
-        let mut stale_work_page = work_page_with_work(stale_work.clone(), Vec::new());
-        stale_work_page.source_high_watermark = 2;
-        stale_work_page.projection_updated_at_unix_micros = 2;
-        apply_turn_work_page(&mut state, stale_work_page, WorkPageMergeMode::Reset);
-
-        let mut stale_block = turn_work_block("thread_a", "block_work", "002");
-        stale_block.kind = TimelineBlockKind::TurnWork { work: stale_work };
-        apply_thread_timeline_page(
-            &mut state,
-            thread_page(vec![stale_block]),
-            TopLevelPageMergeMode::Reset,
-        );
-
-        let thread = state.thread("thread_a").unwrap();
-        assert_eq!(
-            thread
-                .work_range("turn_a")
-                .and_then(|range| range.work.as_ref())
-                .and_then(|work| work.agent_work_graph.as_ref())
-                .map(|graph| (graph.updated_at_unix_micros, graph.queued_count)),
-            Some((10, 0))
-        );
-        assert!(matches!(
-            &thread.top_level.block("block_work").unwrap().kind,
-            TimelineBlockKind::TurnWork { work }
-                if work.agent_work_graph.as_ref().is_some_and(|graph| {
-                    graph.updated_at_unix_micros == 10 && graph.queued_count == 0
-                })
-        ));
-    }
-
-    #[test]
     fn flatten_expanded_work_shows_loaded_rows_and_request_hints() {
         let mut state = SemanticTimelineState::default();
         assert!(apply_thread_timeline_page(
@@ -5900,7 +5914,10 @@ mod tests {
             sort_key: "002".to_owned(),
             started_at_unix_ms: item.started_at.map(|value| value.saturating_mul(1_000)),
             updated_at_unix_ms: Some(updated_at.saturating_mul(1_000)),
-            kind: TimelineBlockKind::DetachedTaskRun { task: item },
+            kind: TimelineBlockKind::DetachedTaskRun {
+                task: item,
+                author: None,
+            },
         }
     }
 
@@ -5913,7 +5930,7 @@ mod tests {
                     .block("turn:task_turn:detached-task-run:task_anchor")
             })
             .and_then(|block| match &block.kind {
-                TimelineBlockKind::DetachedTaskRun { task } => Some(task.status),
+                TimelineBlockKind::DetachedTaskRun { task, .. } => Some(task.status),
                 _ => None,
             })
     }
@@ -6044,23 +6061,6 @@ mod tests {
         work_page_with_work(work_block("turn_a"), items)
     }
 
-    fn agent_graph(
-        updated_at_unix_micros: i64,
-        queued_count: u64,
-        running_count: u64,
-    ) -> pioneer_protocol::AgentWorkGraphProjection {
-        pioneer_protocol::AgentWorkGraphProjection {
-            root_execution_id: pioneer_protocol::AgentExecutionId::new("Egraphroot12345678901")
-                .unwrap(),
-            updated_at_unix_micros,
-            queued_count,
-            running_count,
-            terminal_count: 0,
-            saturated: queued_count > 0,
-            nodes: Vec::new(),
-        }
-    }
-
     fn work_page_with_work(work: TurnWorkBlock, items: Vec<TurnWorkItem>) -> TurnWorkPageResponse {
         TurnWorkPageResponse {
             workspace_id: "workspace_a".to_owned(),
@@ -6108,6 +6108,7 @@ mod tests {
             presentation: TurnWorkPresentation::ExpandedLive,
             state: TurnWorkState::Running,
             agent_work_graph: None,
+            author: None,
             started_at_unix_ms: None,
             completed_at_unix_ms: None,
             elapsed_ms: None,

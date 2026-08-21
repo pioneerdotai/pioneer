@@ -827,6 +827,8 @@ impl TaskToolAuthorizationScope {
 
     fn constrain_create_params(&self, params: &mut TaskCreateParams) {
         params.workspace_id = self.workspace_id.clone();
+        // Task ownership scopes access and delivery. The durable creator is
+        // recorded independently in TaskActorContract by the create context.
         params.owner_kind = TaskOwnerKind::User;
         params.owner_id = Some(self.principal.principal_id.to_string());
     }

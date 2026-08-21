@@ -1050,18 +1050,23 @@ async fn restore_persisted_agent_action_binding(
             allowed_action_names.as_slice(),
         )
         .map_err(|error| anyhow::anyhow!("failed to restore Agent action binding: {error:?}"))?;
-    processor
-        .register_agent_action_binding(
+    let binding = processor
+        .prepare_agent_action_binding(
             context.turn_id.clone(),
             AgentActionRuntimeBinding::new(adapter, options, capabilities),
         )
         .await?;
+    processor
+        .register_agent_action_binding(context.turn_id.clone(), binding)
+        .await;
     Ok(())
 }
 
-/// Materialize the first AgentExecution for a user-started Agent Turn.
+/// Materialize the first AgentExecution for a user-started executable Turn.
 /// Descendant and Task Turns install their binding at their own atomic writer;
-/// this path owns only a root Composer/CLI Turn that has no parent execution.
+/// this path owns only a root Chat/Agent Composer or CLI Turn that has no
+/// parent execution. Message Turns are authored messages and have no
+/// responding execution.
 async fn ensure_root_agent_action_binding(
     processor: &Arc<MessageProcessor>,
     context: &TurnToolContext,
@@ -1083,7 +1088,7 @@ async fn ensure_root_agent_action_binding(
     else {
         anyhow::bail!("Agent Turn disappeared before root execution admission");
     };
-    if turn.mode != ThreadMode::Agent {
+    if turn.mode == ThreadMode::Message {
         return Ok(());
     }
     if let Some(response) =
@@ -1166,13 +1171,58 @@ pub(crate) async fn prepare_root_agent_execution_admission(
     requested_backend: Option<&pioneer_protocol::AgentExecutionBackend>,
     bound_cli_runtime_id: Option<&str>,
 ) -> anyhow::Result<PreparedRootAgentExecutionAdmission> {
-    if thread.workspace_id != context.workspace_id
+    if thread.id != context.thread_id
+        || thread.workspace_id != context.workspace_id
         || authority.workspace_id() != context.workspace_id
-        || authority.root_thread_id() != context.thread_id
     {
         anyhow::bail!("root Agent admission differs from its collaboration root");
     }
     let home_root_thread_id = authority.root_thread_id().to_owned();
+    let database = processor.crud_store.database_connection();
+    let current_scope = pioneer_crud::resolve_thread_authorization_scope(
+        &database,
+        context.thread_id.as_str(),
+        Some(context.workspace_id.as_str()),
+    )
+    .await?
+    .context("root Agent Turn thread is unavailable for collaboration admission")?;
+    if context.thread_id == home_root_thread_id {
+        if current_scope.access_class == pioneer_crud::PersistedThreadAccessClass::Internal
+            || processor
+                .crud_store
+                .get_task_thread_lineage(context.thread_id.as_str())
+                .await?
+                .is_some()
+        {
+            anyhow::bail!("root Agent admission points at an internal collaboration child");
+        }
+    } else {
+        if current_scope.access_class != pioneer_crud::PersistedThreadAccessClass::Internal {
+            anyhow::bail!("child Agent Turn is not in an internal collaboration thread");
+        }
+        let lineage = processor
+            .crud_store
+            .get_task_thread_lineage(context.thread_id.as_str())
+            .await?
+            .context("child Agent Turn has no durable collaboration lineage")?;
+        if lineage.child_thread_id != context.thread_id
+            || lineage.root_thread_id != home_root_thread_id
+            || lineage.root_thread_id == lineage.child_thread_id
+            || lineage.depth <= 0
+        {
+            anyhow::bail!("child Agent Turn lineage differs from its collaboration root");
+        }
+        let root_scope = pioneer_crud::resolve_thread_authorization_scope(
+            &database,
+            home_root_thread_id.as_str(),
+            Some(context.workspace_id.as_str()),
+        )
+        .await?
+        .context("root Agent collaboration thread is unavailable")?;
+        if root_scope.access_class == pioneer_crud::PersistedThreadAccessClass::Internal {
+            anyhow::bail!("root Agent collaboration root resolves to an internal child");
+        }
+    }
     let requested_cli_runtime_id = match requested_backend {
         Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { runtime_id, .. }) => {
             Some(runtime_id.as_str())
@@ -1194,7 +1244,6 @@ pub(crate) async fn prepare_root_agent_execution_admission(
         requested_identity,
         Some(pioneer_protocol::AgentIdentitySelection::ServerDerivedEphemeral { .. })
     );
-    let database = processor.crud_store.database_connection();
     let cli_runtimes = processor.load_cli_runtime_instances()?;
     let cli_identity_catalog = cli_identity_catalog(processor, cli_runtimes.as_slice())?;
     let identity_row = if let Some(runtime_id) = requested_cli_runtime_id {
@@ -1700,12 +1749,13 @@ pub(crate) async fn register_prepared_root_agent_action_binding(
             prepared.allowed_actions.as_slice(),
         )
         .map_err(|error| anyhow::anyhow!("failed to bind root Agent tools: {error:?}"))?;
-    processor
-        .register_agent_action_binding(
-            context.turn_id.clone(),
-            AgentActionRuntimeBinding::new(adapter, options, capabilities),
-        )
+    let mut binding = AgentActionRuntimeBinding::new(adapter, options, capabilities);
+    binding
+        .refresh_start_options_catalog(processor, context.turn_id.as_str())
         .await?;
+    processor
+        .register_agent_action_binding(context.turn_id.clone(), binding)
+        .await;
     Ok(())
 }
 
@@ -2051,12 +2101,15 @@ async fn dispatch_agent_action_outbox_row(
             dispatch.allowed_actions.as_slice(),
         )
         .map_err(|error| anyhow::anyhow!("failed to restore StartAgent tools: {error:?}"))?;
-    processor
-        .register_agent_action_binding(
+    let binding = processor
+        .prepare_agent_action_binding(
             dispatch.turn_id.clone(),
             AgentActionRuntimeBinding::new(adapter, options, capabilities),
         )
         .await?;
+    processor
+        .register_agent_action_binding(dispatch.turn_id.clone(), binding)
+        .await;
     match dispatch.params.execution_backend.clone() {
         Some(pioneer_protocol::AgentExecutionBackend::ApiProvider { .. }) => {
             let prepared = processor
@@ -2966,10 +3019,14 @@ impl AgentActionToolHandler {
         processor
             .notify_agent_work_graph_state_changed(graph_result.root_execution_id.as_str())
             .await;
-        processor
-            .register_agent_action_binding(
+        let binding = processor
+            .prepare_agent_action_binding(
                 turn_id.clone(),
-                AgentActionRuntimeBinding::new(child_adapter, child_options, child_capabilities),
+                AgentActionRuntimeBinding::new(
+                    child_adapter,
+                    child_options,
+                    child_capabilities,
+                ),
             )
             .await
             .map_err(|error| {
@@ -2977,6 +3034,9 @@ impl AgentActionToolHandler {
                     "failed to project child Agent launch catalog: {error:#}"
                 ))
             })?;
+        processor
+            .register_agent_action_binding(turn_id.clone(), binding)
+            .await;
         processor
             .send_notification_to_authorized_thread_connections(
                 thread_id.as_str(),

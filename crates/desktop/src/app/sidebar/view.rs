@@ -1252,6 +1252,7 @@ mod tests {
             id: "thr_1".to_owned(),
             name: None,
             preview: "one two three four five six seven".to_owned(),
+            preview_author: None,
             mode: ThreadMode::Chat,
             model: "gpt-5.4".to_owned(),
             model_provider: "openai".to_owned(),
@@ -1271,7 +1272,6 @@ mod tests {
             sidebar_thread_title_from_coordinator(Some(&coordinator_with_preview)),
             "one two three four five six..."
         );
-
         let thread_without_preview = Thread {
             preview: "   ".to_owned(),
             ..coordinator_with_preview

@@ -149,13 +149,12 @@ use pioneer_protocol::{
     VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
 };
 use presentation::{
-    ClientAgentAuthoredMessageProjectionRequest, ClientArtifactPresentationPolicyRequest,
-    ClientAuthorizationProjectionAcceptRequest, ClientAuthorizationProjectionAcceptResult,
-    ClientCurrentPrincipalPresentationRequest, ClientExecutionDraftReconcileRequest,
-    ClientInvitationListRowRequest, ClientMemberPresentationRequest,
-    ClientThreadCreateVisibilityRequest, ClientThreadScopeMutationPlanRequest,
-    ClientThreadScopePresentationRequest, accept_authorization_projection,
-    agent_authored_message_projection, artifact_presentation_policy, current_principal,
+    ClientArtifactPresentationPolicyRequest, ClientAuthorizationProjectionAcceptRequest,
+    ClientAuthorizationProjectionAcceptResult, ClientCurrentPrincipalPresentationRequest,
+    ClientExecutionDraftReconcileRequest, ClientInvitationListRowRequest,
+    ClientMemberPresentationRequest, ClientThreadCreateVisibilityRequest,
+    ClientThreadScopeMutationPlanRequest, ClientThreadScopePresentationRequest,
+    accept_authorization_projection, artifact_presentation_policy, current_principal,
     invitation_list_row, member_presentation, reconcile_execution_draft, session_list_row,
     thread_create_visibility, thread_scope, thread_scope_mutation_plan,
 };
@@ -363,16 +362,6 @@ impl ClientFfiRuntime {
             .map_err(|_| "client ffi config lock is poisoned".to_owned())? = Some(config);
 
         Ok(ClientFfiInitializeResult { initialized: true })
-    }
-
-    fn agent_authored_message_projection(
-        &self,
-        input_json: &str,
-    ) -> Result<pioneer_client::timeline::authorship::SemanticAgentAuthoredMessageRow, String> {
-        let request =
-            serde_json::from_str::<ClientAgentAuthoredMessageProjectionRequest>(input_json)
-                .map_err(|error| format!("invalid agent authored message projection: {error}"))?;
-        agent_authored_message_projection(request)
     }
 
     fn gateway_validate_remote(&self, input_json: &str) -> Result<RemoteGatewayValidation, String> {
@@ -3168,10 +3157,6 @@ ffi_client_json_method!(
     thread_scope_mutation_plan
 );
 ffi_client_json_method!(pioneer_client_ffi_member_presentation, member_presentation);
-ffi_client_json_method!(
-    pioneer_client_ffi_agent_authored_message_projection,
-    agent_authored_message_projection
-);
 ffi_client_json_method!(pioneer_client_ffi_invitation_list_row, invitation_list_row);
 ffi_client_json_method!(
     pioneer_client_ffi_administration_conflict_refetch,

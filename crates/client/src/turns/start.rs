@@ -608,6 +608,7 @@ mod tests {
                 ref turn_id,
                 ref pending_request_id,
                 mode,
+                ..
             } if thread_id == "thread"
                 && turn_id == "turn"
                 && pending_request_id == "pending"
@@ -671,6 +672,7 @@ mod tests {
                 turn_id,
                 pending_request_id,
                 mode,
+                ..
             } if thread_id == "thread"
                 && turn_id == "turn"
                 && pending_request_id == "pending"
@@ -678,7 +680,11 @@ mod tests {
         ));
         assert!(matches!(
             &events[1],
-            ConversationEvent::TurnStarted { thread_id, turn: started }
+            ConversationEvent::TurnStarted {
+                thread_id,
+                turn: started,
+                ..
+            }
                 if thread_id == "thread" && started == &turn
         ));
     }

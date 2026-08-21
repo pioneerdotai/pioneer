@@ -72,6 +72,10 @@ pub struct TurnWorkBlock {
     /// this Turn. Descendant Turns do not repeat the graph projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_work_graph: Option<crate::AgentWorkGraphProjection>,
+    /// Exact execution whose work this row presents. This is separate from
+    /// the Turn input author and is required for stable Agent attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<TurnAuthorSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,7 +130,11 @@ pub enum TimelineBlockKind {
     #[serde(rename_all = "camelCase")]
     TurnWork { work: TurnWorkBlock },
     #[serde(rename_all = "camelCase")]
-    DetachedTaskRun { task: TaskTurnItem },
+    DetachedTaskRun {
+        task: TaskTurnItem,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<TurnAuthorSnapshot>,
+    },
     #[serde(rename_all = "camelCase")]
     AssistantMessage {
         item_id: String,
@@ -145,8 +153,7 @@ pub enum TimelineBlockKind {
         state: TurnWorkState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
-        /// Exact responding execution for live Agent work. Terminal lifecycle
-        /// rows remain System-classified and therefore leave this absent.
+        /// Exact responding execution whose work this lifecycle row describes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         author: Option<TurnAuthorSnapshot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +166,8 @@ pub enum TimelineBlockKind {
         status: CLIRuntimePendingRequestStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<TurnAuthorSnapshot>,
         request: CLIRuntimePendingRequest,
     },
 }

@@ -57,7 +57,14 @@ impl PioneerDesktop {
 
         self.ensure_running_task_indicator_timer(projection.as_ref(), cx);
         let rows = self.hydrate_running_turn_render_rows(model.rows, cx);
-        let rows = Rc::new(merge_pending_timeline_render_rows(rows, pending_requests));
+        let pending_requests = pending_requests
+            .into_iter()
+            .map(|request| (request, None))
+            .collect();
+        let rows = Rc::new(merge_pending_timeline_render_rows_with_authors(
+            rows,
+            pending_requests,
+        ));
         let expanded = self.thread_timeline_item_expanded.borrow().clone();
         let rows_render_fingerprint = timeline_render_rows_fingerprint(
             projection.as_ref(),
@@ -210,6 +217,7 @@ impl PioneerDesktop {
                                         row,
                                         ix + 1 == render_row_count,
                                         render_grouping.row_layout(ix),
+                                        render_grouping.agent_author_for_group_start(ix),
                                         content_width,
                                         cx,
                                     )
@@ -242,6 +250,7 @@ impl PioneerDesktop {
         row: &TimelineRenderRow,
         is_last_row: bool,
         row_layout: TimelineRowLayout,
+        agent_group_author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
         content_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -260,7 +269,12 @@ impl PioneerDesktop {
                 grouped_content_width,
                 cx,
             );
-            return self.render_agent_timeline_group_row(body, row_layout, content_width);
+            return self.render_agent_timeline_group_row(
+                body,
+                agent_group_author,
+                row_layout,
+                content_width,
+            );
         }
 
         self.render_timeline_row_body(
@@ -284,6 +298,7 @@ impl PioneerDesktop {
     ) -> AnyElement {
         match row {
             TimelineRenderRow::Timeline(TimelineRow {
+                author,
                 kind:
                     TimelineRowKind::UserMessage {
                         timeline_index,
@@ -302,6 +317,7 @@ impl PioneerDesktop {
                     item_view,
                     &item_view.item,
                     Some(presentation),
+                    author.as_ref(),
                     top_spacing,
                     is_last_row,
                     content_width,
@@ -368,6 +384,7 @@ impl PioneerDesktop {
     fn render_agent_timeline_group_row(
         &self,
         body: AnyElement,
+        author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
         row_layout: TimelineRowLayout,
         content_width: Pixels,
     ) -> AnyElement {
@@ -386,7 +403,10 @@ impl PioneerDesktop {
                                     .ml(TIMELINE_AVATAR_RAIL_WIDTH)
                                     .text_sm()
                                     .font_semibold()
-                                    .child(t!("chat.composer.mode.agent_label").to_string()),
+                                    .when_some(
+                                        super::timeline_agent_label(author),
+                                        |this, label| this.child(label),
+                                    ),
                             ),
                     ),
                 )
@@ -542,9 +562,9 @@ fn coalesced_tools_label(group: &TimelineCoalescedToolsRow) -> String {
     }
 }
 
-pub(in crate::app::thread::view::timeline) fn merge_pending_timeline_render_rows(
+pub(in crate::app::thread::view::timeline) fn merge_pending_timeline_render_rows_with_authors(
     rows: Rc<Vec<TimelineRenderRow>>,
-    pending_requests: Vec<PendingRequest>,
+    pending_requests: Vec<(PendingRequest, Option<pioneer_protocol::TurnAuthorSnapshot>)>,
 ) -> Vec<TimelineRenderRow> {
     if pending_requests.is_empty() {
         return rows.as_ref().clone();
@@ -569,12 +589,20 @@ pub(in crate::app::thread::view::timeline) fn merge_pending_timeline_render_rows
 
     let mut render_rows = Vec::with_capacity(rows.len() + pending_requests.len());
     render_rows.extend(rows[..running_index].iter().cloned());
-    render_rows.extend(pending_requests.into_iter().filter_map(|request| {
-        let key = format!("timeline-pending-request::{}", request.request_id);
-        (!existing_keys.contains(key.as_str())).then_some(TimelineRenderRow::PendingRequest(
-            TimelinePendingRequestRow { key, request },
-        ))
-    }));
+    render_rows.extend(
+        pending_requests
+            .into_iter()
+            .filter_map(|(request, author)| {
+                let key = format!("timeline-pending-request::{}", request.request_id);
+                (!existing_keys.contains(key.as_str())).then_some(
+                    TimelineRenderRow::PendingRequest(TimelinePendingRequestRow {
+                        key,
+                        request,
+                        author,
+                    }),
+                )
+            }),
+    );
     render_rows.extend(rows[running_index..].iter().cloned());
     render_rows
 }
@@ -658,6 +686,7 @@ mod tests {
         projection.revision = 1;
         let mut rows = vec![TimelineRenderRow::Timeline(TimelineRow {
             key: "work-toggle".to_owned(),
+            author: None,
             kind: TimelineRowKind::TurnWorkToggle(TurnWorkGroupRow {
                 toggle_key: "work-toggle".to_owned(),
                 anchor_entry_id: "work-block".to_owned(),

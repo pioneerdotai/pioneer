@@ -1,6 +1,5 @@
 //! Timeline rows, grouping, and selectors.
 
-pub mod authorship;
 pub mod labels;
 pub mod render_fingerprint;
 pub mod rows;

@@ -1,6 +1,6 @@
 use super::super::markdown::CodeHighlightPolicy;
 use super::super::{
-    TimelinePresentationContext, TimelineRowTopSpacing,
+    TimelineRowTopSpacing,
     layout::{
         TIMELINE_AVATAR_RAIL_WIDTH, TIMELINE_CONTENT_HORIZONTAL_PADDING,
         TIMELINE_MESSAGE_END_BOTTOM_SPACING,
@@ -30,7 +30,7 @@ use pioneer_client::timeline::rows::{
     TimelineReplyState, UserMessageAlignment, UserMessagePresentation,
     user_message_mutation_availability,
 };
-use pioneer_protocol::TurnItem;
+use pioneer_protocol::{TurnAuthorSnapshot, TurnItem};
 use std::path::PathBuf;
 
 impl PioneerDesktop {
@@ -40,6 +40,7 @@ impl PioneerDesktop {
         item_view: &ItemView,
         item: &TurnItem,
         presentation: Option<&UserMessagePresentation>,
+        exact_author: Option<&TurnAuthorSnapshot>,
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
@@ -73,13 +74,10 @@ impl PioneerDesktop {
             .current_auth
             .as_ref()
             .map(|auth| &auth.principal.id);
-        let presentation_context = TimelinePresentationContext {
-            task_child_thread: self.active_task_thread_navigation().is_some(),
-        };
         let alignment = if super::super::user_message_uses_current_principal_alignment(
             presentation,
+            exact_author,
             current_principal_id.map(|principal_id| principal_id.as_str()),
-            presentation_context,
         ) {
             UserMessageAlignment::CurrentPrincipal
         } else {
@@ -99,16 +97,16 @@ impl PioneerDesktop {
             .is_some_and(|value| value.can_delete)
             .then(|| presentation.cloned())
             .flatten();
-        let author = self.current_timeline_author_presentation(
-            presentation.and_then(|presentation| presentation.author.as_ref()),
-        );
-        let author_label = if author.display_name == "?" {
-            t!("timeline.message.unknown_author").to_string()
-        } else if author.nickname.is_empty() {
-            author.display_name
-        } else {
-            format!("{} · @{}", author.display_name, author.nickname)
-        };
+        let author = self.current_timeline_author_presentation(exact_author);
+        let author_label = super::super::timeline_agent_label(exact_author).unwrap_or_else(|| {
+            if author.display_name == "?" {
+                t!("timeline.message.unknown_author").to_string()
+            } else if author.nickname.is_empty() {
+                author.display_name
+            } else {
+                format!("{} · @{}", author.display_name, author.nickname)
+            }
+        });
         let active_workspace_id = self
             .current_active_thread_id()
             .and_then(|thread_id| self.thread_workspace_id(thread_id))

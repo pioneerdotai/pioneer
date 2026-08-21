@@ -33,8 +33,8 @@ use crate::artifact::{
 use crate::{
     AccessChangeKind, AccessChangedNotification, AdministrativeActorRef, AgentActionId,
     AgentActionIntent, AgentActionKind, AgentActionNormalizationError, AgentAuthoredInput,
-    AgentAuthoredInputError, AgentAuthoredMessage, AgentAuthoredMessageState,
-    AgentAuthoredProjectionError, AgentAuthoredTaskProjection, AgentAuthoredTurnProjection,
+    AgentAuthoredInputError, AgentAuthoredProjectionError, AgentAuthoredTaskProjection,
+    AgentAuthoredTurnProjection,
     AgentBoundRuntimeSelection, AgentControlTaskToolInput, AgentCreateThreadToolInput,
     AgentDelegationRouteCreateParams, AgentDelegationRouteId, AgentDelegationRouteListParams,
     AgentDelegationRouteListResponse, AgentDelegationRouteProjection,
@@ -82,8 +82,8 @@ use crate::{
     CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams,
     CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
     CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, ChildAgentLaunchGrantSet,
-    ChildAgentLaunchGrantSetError, ClientAgentPresentationSnapshot, ContextCompressedNotification,
-    ContextCompressingNotification, ConversationActorRef, ConversationAuthorPresentation,
+    ChildAgentLaunchGrantSetError, ContextCompressedNotification,
+    ContextCompressingNotification, ConversationActorRef,
     CrossThreadSourceVisibility, DurableEventCausalityKey,
     ExecutionCheckpointOriginalRequestSummary, ExecutionCheckpointPayload,
     ExecutionCheckpointProviderBudgetSummary, ExecutionCheckpointStrictObligation,
@@ -145,7 +145,7 @@ use crate::{
     MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
     MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
     MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation, NormalizedAgentAction,
-    PermissionBehavior, PrincipalAuthorSnapshot, ProgressCoalescingKey, PromptManifest,
+    PermissionBehavior, ProgressCoalescingKey, PromptManifest,
     PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
     PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
     PromptManifestHookTruncation, PromptManifestProfile, ProviderConfigureParams,
@@ -438,24 +438,10 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             "agent_authored_task_projection.json",
             AgentAuthoredTaskProjection
         ),
-        schema_doc!("agent_authored_message.json", AgentAuthoredMessage),
-        schema_doc!(
-            "agent_authored_message_state.json",
-            AgentAuthoredMessageState
-        ),
-        schema_doc!(
-            "client_agent_presentation_snapshot.json",
-            ClientAgentPresentationSnapshot
-        ),
-        schema_doc!(
-            "conversation_author_presentation.json",
-            ConversationAuthorPresentation
-        ),
         schema_doc!(
             "cross_thread_source_visibility.json",
             CrossThreadSourceVisibility
         ),
-        schema_doc!("principal_author_snapshot.json", PrincipalAuthorSnapshot),
         schema_doc!("safe_route_provenance.json", SafeRouteProvenance),
         schema_doc!(
             "safe_execution_profile_metadata.json",

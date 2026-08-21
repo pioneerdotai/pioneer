@@ -1350,20 +1350,35 @@ impl MessageProcessor {
         self.bind_artifact_tool_bridge().await;
     }
 
+    /// Resolve the database-backed launch catalog on an isolated Tokio task.
+    /// Task scheduling and turn admission compose large futures, so catalog
+    /// projection must not inherit their worker stack.
+    pub(crate) async fn prepare_agent_action_binding(
+        self: &Arc<Self>,
+        turn_id: String,
+        mut binding: agent_action_tools::AgentActionRuntimeBinding,
+    ) -> anyhow::Result<agent_action_tools::AgentActionRuntimeBinding> {
+        let processor = Arc::clone(self);
+        message_fresh_task(async move {
+            binding
+                .refresh_start_options_catalog(processor.as_ref(), turn_id.as_str())
+                .await?;
+            Ok(binding)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("agent action binding preparation task failed: {error}"))?
+    }
+
+    /// Publish a fully prepared runtime binding without database or projection work.
     pub(crate) async fn register_agent_action_binding(
         &self,
         turn_id: impl Into<String>,
-        mut binding: agent_action_tools::AgentActionRuntimeBinding,
-    ) -> anyhow::Result<()> {
-        let turn_id = turn_id.into();
-        binding
-            .refresh_start_options_catalog(self, turn_id.as_str())
-            .await?;
+        binding: agent_action_tools::AgentActionRuntimeBinding,
+    ) {
         self.agent_action_bindings
             .lock()
             .await
-            .insert(turn_id, binding);
-        Ok(())
+            .insert(turn_id.into(), binding);
     }
 
     pub(crate) async fn unregister_agent_action_binding(&self, turn_id: &str) {

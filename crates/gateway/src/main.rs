@@ -6,6 +6,7 @@ fn main() -> anyhow::Result<()> {
     pioneer_observability::init_tracing(sentry_guard.is_some());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(pioneer_gateway::GATEWAY_WORKER_STACK_SIZE_BYTES)
         .enable_all()
         .build()
         .context("failed to build gateway Tokio runtime")?;

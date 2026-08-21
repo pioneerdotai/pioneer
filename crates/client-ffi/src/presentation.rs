@@ -14,34 +14,6 @@ use serde::Deserialize;
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ClientAgentAuthoredMessageProjectionRequest {
-    pub message_id: String,
-    pub turn_id: String,
-    pub author: pioneer_protocol::TurnAuthorSnapshot,
-    pub agent: pioneer_protocol::AgentPresentationSnapshot,
-    pub identity_status: pioneer_protocol::AgentIdentityStatus,
-    pub status: pioneer_protocol::AgentAuthoredMessageState,
-    #[serde(default)]
-    pub route: Option<pioneer_protocol::SafeRouteProvenance>,
-}
-
-pub fn agent_authored_message_projection(
-    request: ClientAgentAuthoredMessageProjectionRequest,
-) -> Result<pioneer_client::timeline::authorship::SemanticAgentAuthoredMessageRow, String> {
-    pioneer_client::timeline::authorship::project_agent_authored_message_row(
-        request.message_id,
-        request.turn_id,
-        &request.author,
-        Some((&request.agent, request.identity_status)),
-        request.status,
-        request.route,
-    )
-    .map_err(|error| format!("agent authored message projection failed: {error:?}"))
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ClientArtifactPresentationPolicyRequest {
     pub can_read_artifacts: bool,
     pub can_attach_artifacts: bool,
@@ -315,41 +287,12 @@ fn capabilities_for_auth(
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AgentExecutionId, AgentIdentityId,
-        AgentIdentitySourceKind, AgentIdentityStatus, AgentPresentationSnapshot,
-        AuthDeviceSnapshot, AuthGatewaySnapshot, AuthPrincipalSnapshot, AuthSessionSnapshot,
-        AuthSessionStatus, AuthorizationGlobalCapabilities, AuthorizationRolePresentation,
+        AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AuthDeviceSnapshot, AuthGatewaySnapshot,
+        AuthPrincipalSnapshot, AuthSessionSnapshot, AuthSessionStatus,
+        AuthorizationGlobalCapabilities, AuthorizationRolePresentation,
         AuthorizationWorkspaceCapabilitySnapshot, ClientKind, DeviceId, DeviceStatus, GatewayId,
         PrincipalId, PrincipalKind, RoleKey, ThreadVisibility, TokenFamilyId,
     };
-
-    #[test]
-    fn agent_projection_preserves_explicit_retired_identity_status() {
-        let agent = AgentPresentationSnapshot {
-            agent_identity_id: AgentIdentityId::new("A12345678901234567890").unwrap(),
-            agent_execution_id: AgentExecutionId::new("E12345678901234567890").unwrap(),
-            identity_source_kind: AgentIdentitySourceKind::NativeAgent,
-            identity_source_revision: 7,
-            display_name: "Historical Researcher".to_owned(),
-            nickname: "researcher-old".to_owned(),
-            avatar_revision: None,
-            role_label: Some("Researcher".to_owned()),
-        };
-        let result =
-            agent_authored_message_projection(ClientAgentAuthoredMessageProjectionRequest {
-                message_id: "message".to_owned(),
-                turn_id: "turn".to_owned(),
-                author: agent.to_turn_author_snapshot(),
-                agent,
-                identity_status: AgentIdentityStatus::Retired,
-                status: pioneer_protocol::AgentAuthoredMessageState::Completed,
-                route: None,
-            })
-            .expect("exact historical projection");
-
-        assert_eq!(result.message.author.status, AgentIdentityStatus::Retired);
-        assert_eq!(result.message.author.display_name, "Historical Researcher");
-    }
 
     fn auth(kind: PrincipalKind, role_key: Option<RoleKey>) -> AuthMeResponse {
         let device_id = DeviceId::new("DAAAAAAAAAAAAAAAAAAAA").expect("device id");

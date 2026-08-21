@@ -2424,6 +2424,41 @@ impl ExecutionAuthorizationContext {
         workspace_id: &str,
         bindings: &[TurnSkillBinding],
     ) -> Result<()> {
+        self.bind_skill_projection_with_admission(workspace_id, bindings, false)
+    }
+
+    /// Binds the exact base-skill projection resolved by the runtime after the
+    /// caller has revalidated every binding against the current catalog,
+    /// workspace policy, installation fingerprint, and collaboration grant.
+    /// Explicit Composer skills and learned Agent skills must still have been
+    /// present in the immutable admission; only ordinary implicit/path-based
+    /// resolution happens at this second admission stage.
+    pub(crate) fn bind_revalidated_runtime_skill_projection(
+        &mut self,
+        workspace_id: &str,
+        bindings: &[TurnSkillBinding],
+    ) -> Result<()> {
+        if bindings.iter().any(|binding| {
+            if binding.source_kind == "agent" {
+                binding.resolved_reason != "agent_catalog"
+            } else {
+                !matches!(
+                    binding.resolved_reason.as_str(),
+                    "explicit_composer_capability" | "path_match" | "implicit"
+                )
+            }
+        }) {
+            bail!("skill projection contains unsupported resolution provenance");
+        }
+        self.bind_skill_projection_with_admission(workspace_id, bindings, true)
+    }
+
+    fn bind_skill_projection_with_admission(
+        &mut self,
+        workspace_id: &str,
+        bindings: &[TurnSkillBinding],
+        allow_revalidated_runtime_base_skills: bool,
+    ) -> Result<()> {
         if workspace_id != self.workspace_id {
             bail!("skill projection workspace differs from authorized execution workspace");
         }
@@ -2455,10 +2490,17 @@ impl ExecutionAuthorizationContext {
         }
         exact_skills.sort();
         exact_skills.dedup();
-        if exact_skills
-            .iter()
-            .any(|skill_id| self.grant_manifest.skills.binary_search(skill_id).is_err())
-        {
+        if bindings.iter().any(|binding| {
+            let admitted = self
+                .grant_manifest
+                .skills
+                .binary_search_by(|skill_id| skill_id.as_str().cmp(binding.skill_id.as_str()))
+                .is_ok();
+            let dynamically_resolved_base = allow_revalidated_runtime_base_skills
+                && binding.source_kind != "agent"
+                && matches!(binding.resolved_reason.as_str(), "path_match" | "implicit");
+            !admitted && !dynamically_resolved_base
+        }) {
             bail!("skill projection exceeds the immutable execution admission");
         }
         self.skill_projection = Some(projection);

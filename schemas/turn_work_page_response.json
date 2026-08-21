@@ -55,6 +55,20 @@
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
     },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
     "AgentMessagePhase": {
       "type": "string",
       "enum": [
@@ -62,92 +76,49 @@
         "commentary"
       ]
     },
-    "AgentWorkGraphProjection": {
+    "AgentPresentationSnapshot": {
       "type": "object",
       "properties": {
-        "nodes": {
-          "description": "Stable, bounded nodes in the exact root graph. No prompt, provider,\nmodel, thread title, runtime path, or other private payload is exposed.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/AgentWorkNodeProjection"
-          }
-        },
-        "queuedCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "rootExecutionId": {
+        "agent_execution_id": {
           "$ref": "#/$defs/AgentExecutionId"
         },
-        "runningCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
+        "agent_identity_id": {
+          "$ref": "#/$defs/AgentIdentityId"
         },
-        "saturated": {
-          "description": "True while one or more authorized nodes are durably queued for\nserver-owned capacity. This is resource state, not an authorization\nfailure and never implies that the whole graph is blocked.",
-          "type": "boolean"
-        },
-        "terminalCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "updatedAtUnixMicros": {
-          "description": "Monotonic persisted resource-state timestamp used only to reject stale\ngraph projections racing with live queue/promotion/finalization events.",
-          "type": "integer",
-          "format": "int64"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "rootExecutionId",
-        "updatedAtUnixMicros",
-        "queuedCount",
-        "runningCount",
-        "terminalCount",
-        "saturated",
-        "nodes"
-      ]
-    },
-    "AgentWorkNodeProjection": {
-      "type": "object",
-      "properties": {
-        "executionId": {
-          "$ref": "#/$defs/AgentExecutionId"
-        },
-        "progressLabel": {
+        "avatar_revision": {
           "type": [
             "string",
             "null"
           ]
         },
-        "progressRevision": {
+        "display_name": {
+          "type": "string"
+        },
+        "identity_source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "identity_source_revision": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         },
-        "state": {
-          "$ref": "#/$defs/AgentWorkNodeState"
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
-      "additionalProperties": false,
       "required": [
-        "executionId",
-        "state",
-        "progressRevision"
-      ]
-    },
-    "AgentWorkNodeState": {
-      "type": "string",
-      "enum": [
-        "queued",
-        "running",
-        "completed",
-        "failed",
-        "cancelled",
-        "blocked"
+        "agent_identity_id",
+        "agent_execution_id",
+        "identity_source_kind",
+        "identity_source_revision",
+        "display_name",
+        "nickname"
       ]
     },
     "ArtifactKind": {
@@ -771,6 +742,60 @@
         "workspace",
         "user"
       ]
+    },
+    "PersistedActorRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/AgentExecutionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent_execution"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
     },
     "RecoveryAction": {
       "type": "string",
@@ -1750,6 +1775,47 @@
             "kind"
           ]
         }
+      ]
+    },
+    "TurnAuthorSnapshot": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/PersistedActorRef"
+        },
+        "agent": {
+          "description": "Full immutable identity presentation for an agent-authored Turn.  This\nis carried with the Turn instead of being reconstructed from mutable\nidentity/runtime state. Non-agent actors leave it absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentPresentationSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        }
+      },
+      "required": [
+        "actor",
+        "display_name",
+        "nickname"
       ]
     },
     "TurnItem": {
@@ -2883,11 +2949,11 @@
             }
           ]
         },
-        "agentWorkGraph": {
-          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
+        "author": {
+          "description": "Exact execution whose work this row presents. This is separate from\nthe Turn input author and is required for stable Agent attribution.",
           "anyOf": [
             {
-              "$ref": "#/$defs/AgentWorkGraphProjection"
+              "$ref": "#/$defs/TurnAuthorSnapshot"
             },
             {
               "type": "null"
@@ -2967,6 +3033,17 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "agentWorkGraph": {
+          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentWorkGraphProjection"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -3331,6 +3408,94 @@
         "url",
         "snippet",
         "source"
+      ]
+    },
+    "AgentWorkGraphProjection": {
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "description": "Stable, bounded nodes in the exact root graph. No prompt, provider,\nmodel, thread title, runtime path, or other private payload is exposed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentWorkNodeProjection"
+          }
+        },
+        "queuedCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "rootExecutionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "runningCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "saturated": {
+          "description": "True while one or more authorized nodes are durably queued for\nserver-owned capacity. This is resource state, not an authorization\nfailure and never implies that the whole graph is blocked.",
+          "type": "boolean"
+        },
+        "terminalCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "updatedAtUnixMicros": {
+          "description": "Monotonic persisted resource-state timestamp used only to reject stale\ngraph projections racing with live queue/promotion/finalization events.",
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rootExecutionId",
+        "updatedAtUnixMicros",
+        "queuedCount",
+        "runningCount",
+        "terminalCount",
+        "saturated",
+        "nodes"
+      ]
+    },
+    "AgentWorkNodeProjection": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "progressLabel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progressRevision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/AgentWorkNodeState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "executionId",
+        "state",
+        "progressRevision"
+      ]
+    },
+    "AgentWorkNodeState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "blocked"
       ]
     }
   }

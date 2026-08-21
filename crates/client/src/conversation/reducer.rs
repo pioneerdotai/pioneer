@@ -100,8 +100,6 @@ pub struct TurnView {
     pub completed_at_unix_ms: Option<i64>,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub author: Option<pioneer_protocol::TurnAuthorSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_profile: Option<TurnPermissionProfileSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security_summary: Option<ClientTurnSecuritySummary>,
@@ -153,8 +151,6 @@ pub struct ItemView {
     pub partial_markdown: Option<MarkdownDocument>,
     pub final_markdown: Option<MarkdownDocument>,
     pub item: TurnItem,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub author: Option<pioneer_protocol::TurnAuthorSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<pioneer_protocol::SafeRouteProvenance>,
     pub timeline_origin: Option<TimelineOrigin>,
@@ -241,7 +237,6 @@ impl ConversationViewState {
                 existing.error = turn.error.clone();
             }
             existing.permission_profile = permission_profile;
-            existing.author = turn.author.clone();
             return;
         }
 
@@ -251,7 +246,6 @@ impl ConversationViewState {
             started_at_unix_ms: None,
             completed_at_unix_ms: None,
             error: turn.error.clone(),
-            author: turn.author.clone(),
             permission_profile,
             security_summary: None,
             resume: None,
@@ -278,7 +272,6 @@ impl ConversationViewState {
             started_at_unix_ms: None,
             completed_at_unix_ms: None,
             error: None,
-            author: None,
             permission_profile: None,
             security_summary: Some(security_summary),
             resume: None,
@@ -1125,7 +1118,6 @@ impl ConversationProjector {
                 partial_markdown: markdown.clone(),
                 final_markdown: None,
                 item: item_payload.clone(),
-                author: None,
                 route: None,
                 timeline_origin: None,
                 opaque_meta: opaque_meta.clone(),
@@ -1242,7 +1234,6 @@ impl ConversationProjector {
             started_at_unix_ms,
             completed_at_unix_ms,
             error,
-            author: None,
             permission_profile: None,
             security_summary: None,
             resume: None,

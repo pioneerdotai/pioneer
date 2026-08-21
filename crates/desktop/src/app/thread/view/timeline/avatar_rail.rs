@@ -13,11 +13,13 @@ use std::{
 
 #[derive(Clone)]
 enum TimelineAvatarVisual {
+    Absent,
     HistoricalUser {
         display_name: String,
         cached_path: Option<PathBuf>,
     },
     Agent {
+        display_name: String,
         cached_path: Option<PathBuf>,
     },
     RunningAgent {
@@ -66,6 +68,11 @@ impl PioneerDesktop {
                 .iter()
                 .map(|group| match &group.source {
                     TimelineAvatarSource::HistoricalUser { author } => {
+                        if let Some(author) =
+                            super::timeline_agent_execution_author(author.as_ref())
+                        {
+                            return self.timeline_agent_avatar_visual(author);
+                        }
                         let (display_name, cached_path) =
                             self.timeline_author_avatar_parts(author.as_ref());
                         TimelineAvatarVisual::HistoricalUser {
@@ -75,6 +82,7 @@ impl PioneerDesktop {
                     }
                     TimelineAvatarSource::Agent {
                         shows_running_dino: true,
+                        ..
                     } => TimelineAvatarVisual::RunningAgent {
                         is_dark: cx.theme().mode.is_dark(),
                         image_id: ElementId::from((
@@ -82,12 +90,13 @@ impl PioneerDesktop {
                             format!("{}:{}", group.first_row_index, group.last_row_index),
                         )),
                     },
-                    TimelineAvatarSource::Agent { .. } => TimelineAvatarVisual::Agent {
-                        cached_path: self
-                            .member_avatar_state
-                            .agent_cached_image_path()
-                            .map(Path::to_path_buf),
-                    },
+                    TimelineAvatarSource::Agent { author, .. } => {
+                        let Some(author) = super::timeline_agent_execution_author(author.as_ref())
+                        else {
+                            return TimelineAvatarVisual::Absent;
+                        };
+                        self.timeline_agent_avatar_visual(author)
+                    }
                 })
                 .collect::<Vec<_>>(),
         );
@@ -184,10 +193,46 @@ impl PioneerDesktop {
         });
         (author.display_name, cached_path)
     }
+
+    fn timeline_agent_avatar_visual(
+        &self,
+        author: &pioneer_protocol::TurnAuthorSnapshot,
+    ) -> TimelineAvatarVisual {
+        let agent = super::timeline_agent_presentation(Some(author));
+        let display_name = agent
+            .map(|agent| agent.display_name.as_str())
+            .unwrap_or(author.display_name.as_str())
+            .trim()
+            .to_owned();
+        if display_name.is_empty() {
+            return TimelineAvatarVisual::Absent;
+        }
+        let cached_path = agent
+            .is_some_and(|agent| {
+                agent.identity_source_kind == pioneer_protocol::AgentIdentitySourceKind::NativeAgent
+                    && agent.nickname == pioneer_protocol::PIONEER_AGENT_NICKNAME
+                    && agent.avatar_revision.as_deref()
+                        == Some(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION)
+            })
+            .then(|| {
+                self.member_avatar_state
+                    .agent_cached_image_path()
+                    .map(Path::to_path_buf)
+            })
+            .flatten();
+        TimelineAvatarVisual::Agent {
+            display_name,
+            cached_path,
+        }
+    }
 }
 
 fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
     match visual {
+        TimelineAvatarVisual::Absent => div()
+            .w(TIMELINE_AVATAR_SIZE)
+            .h(TIMELINE_AVATAR_SIZE)
+            .into_any_element(),
         TimelineAvatarVisual::HistoricalUser {
             display_name,
             cached_path: Some(path),
@@ -205,14 +250,15 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
             .border_0()
             .into_any_element(),
         TimelineAvatarVisual::Agent {
+            display_name: _,
             cached_path: Some(path),
         } => Avatar::new()
             .src(path.clone())
             .with_size(TIMELINE_AVATAR_SIZE)
             .border_0()
             .into_any_element(),
-        TimelineAvatarVisual::Agent { .. } => Avatar::new()
-            .name("Agent")
+        TimelineAvatarVisual::Agent { display_name, .. } => Avatar::new()
+            .name(display_name.clone())
             .size(TIMELINE_AVATAR_SIZE)
             .border_0()
             .into_any_element(),

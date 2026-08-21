@@ -2019,8 +2019,8 @@ impl TaskAgentExecutor {
                 })
                 .await;
                 if matches!(activation_result, Ok(Ok(()))) {
-                    processor
-                        .register_agent_action_binding(
+                    let action_binding = processor
+                        .prepare_agent_action_binding(
                             child_turn_id.clone(),
                             crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                                 action_adapter,
@@ -2029,6 +2029,9 @@ impl TaskAgentExecutor {
                             ),
                         )
                         .await?;
+                    processor
+                        .register_agent_action_binding(child_turn_id.clone(), action_binding)
+                        .await;
                     spawn_execution_heartbeat(
                         processor,
                         execution.id,
@@ -2043,7 +2046,22 @@ impl TaskAgentExecutor {
             .await;
         }
         let materialize_actor = non_cli_action_author.actor.clone();
-        message_future(async move {
+        // LLDB shows that polling this workflow underneath start_run,
+        // start_or_recover_run and start_new_child_turn exhausts the Tokio
+        // worker's native stack before the first post-materialization query.
+        // Own every borrowed input and schedule the complete workflow as one
+        // task so its poll stack starts at the runtime boundary.
+        let workflow_processor = Arc::clone(processor);
+        let workflow_context = (*context).clone();
+        let workflow_task = (*task).clone();
+        let workflow_run = (*run).clone();
+        let workflow_parent = (*parent).clone();
+        message_fresh_task(async move {
+            let processor = &workflow_processor;
+            let context = &workflow_context;
+            let task = &workflow_task;
+            let run = &workflow_run;
+            let parent = &workflow_parent;
             let turn_outcome = processor
                 .thread_manager
                 .agent_turn_start_with_permission_profile(
@@ -2226,8 +2244,8 @@ impl TaskAgentExecutor {
         )
         .await?;
 
-        processor
-            .register_agent_action_binding(
+        let action_binding = processor
+            .prepare_agent_action_binding(
                 child_turn_id.clone(),
                 crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                     action_adapter,
@@ -2236,6 +2254,9 @@ impl TaskAgentExecutor {
                 ),
             )
             .await?;
+        processor
+            .register_agent_action_binding(child_turn_id.clone(), action_binding)
+            .await;
 
         let started_at = now_timestamp_secs();
         close_admitted_task_turn_on_error(
@@ -2456,6 +2477,7 @@ impl TaskAgentExecutor {
             Ok(TaskExecutorStartOutcome::Started)
         })
         .await
+        .map_err(|error| anyhow!("hidden task turn workflow task failed: {error}"))?
     }
 
     pub(crate) async fn dispatch_revision_turn(
@@ -2813,8 +2835,8 @@ impl TaskAgentExecutor {
                 .activate_prepared_task_cli_runtime_turn(prepared)
                 .await
                 .context("failed to activate revision CLI runtime turn")?;
-            processor
-                .register_agent_action_binding(
+            let action_binding = processor
+                .prepare_agent_action_binding(
                     child_turn_id.clone(),
                     crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                         action_adapter,
@@ -2823,6 +2845,9 @@ impl TaskAgentExecutor {
                     ),
                 )
                 .await?;
+            processor
+                .register_agent_action_binding(child_turn_id.clone(), action_binding)
+                .await;
             let started_at = now_timestamp_secs();
             processor
                 .crud_store
@@ -3212,8 +3237,8 @@ impl TaskAgentExecutor {
                 .await,
         )
         .await?;
-        processor
-            .register_agent_action_binding(
+        let action_binding = processor
+            .prepare_agent_action_binding(
                 child_turn_id.to_owned(),
                 crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                     action_adapter,
@@ -3222,6 +3247,9 @@ impl TaskAgentExecutor {
                 ),
             )
             .await?;
+        processor
+            .register_agent_action_binding(child_turn_id.to_owned(), action_binding)
+            .await;
 
         let started_at = now_timestamp_secs();
         close_admitted_task_turn_on_error(
@@ -3615,8 +3643,8 @@ impl TaskAgentExecutor {
                     if graph.queued {
                         return Ok(TaskExecutorStartOutcome::Queued);
                     }
-                    processor
-                        .register_agent_action_binding(
+                    let action_binding = processor
+                        .prepare_agent_action_binding(
                             child_runtime.task_run_turn.turn_id.clone(),
                             crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                                 action_adapter,
@@ -3625,6 +3653,12 @@ impl TaskAgentExecutor {
                             ),
                         )
                         .await?;
+                    processor
+                        .register_agent_action_binding(
+                            child_runtime.task_run_turn.turn_id.clone(),
+                            action_binding,
+                        )
+                        .await;
                     spawn_execution_heartbeat(
                         processor,
                         execution.id.clone(),
@@ -3670,8 +3704,8 @@ impl TaskAgentExecutor {
                 if graph.queued {
                     return Ok(TaskExecutorStartOutcome::Queued);
                 }
-                processor
-                    .register_agent_action_binding(
+                let action_binding = processor
+                    .prepare_agent_action_binding(
                         child_runtime.task_run_turn.turn_id.clone(),
                         crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                             action_adapter,
@@ -3680,6 +3714,12 @@ impl TaskAgentExecutor {
                         ),
                     )
                     .await?;
+                processor
+                    .register_agent_action_binding(
+                        child_runtime.task_run_turn.turn_id.clone(),
+                        action_binding,
+                    )
+                    .await;
                 self.restart_in_progress_child_turn(
                     processor,
                     task_response,
@@ -3853,8 +3893,8 @@ impl TaskAgentExecutor {
         processor
             .ensure_agent_listener_task(child_thread_id)
             .await?;
-        processor
-            .register_agent_action_binding(
+        let action_binding = processor
+            .prepare_agent_action_binding(
                 child_turn_id.to_owned(),
                 crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                     action_adapter,
@@ -3863,6 +3903,9 @@ impl TaskAgentExecutor {
                 ),
             )
             .await?;
+        processor
+            .register_agent_action_binding(child_turn_id.to_owned(), action_binding)
+            .await;
 
         if run.status != TaskRunStatus::Running
             || execution.status != TaskRunExecutionStatus::Running
@@ -4862,8 +4905,8 @@ impl TaskAgentExecutor {
         .await?;
         let effective_model = turn_settings.model.clone();
         if let Some(turn) = existing_turn {
-            processor
-                .register_agent_action_binding(
+            let action_binding = processor
+                .prepare_agent_action_binding(
                     task_run_turn.turn_id.clone(),
                     crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                         action_adapter,
@@ -4872,6 +4915,9 @@ impl TaskAgentExecutor {
                     ),
                 )
                 .await?;
+            processor
+                .register_agent_action_binding(task_run_turn.turn_id.clone(), action_binding)
+                .await;
             match turn.status {
                 TurnStatus::Completed => {
                     let handle = TaskExecutionHandle::new(
@@ -5165,8 +5211,8 @@ impl TaskAgentExecutor {
                 .activate_prepared_task_cli_runtime_turn(prepared)
                 .await
                 .context("failed to activate reviewer CLI runtime turn")?;
-            processor
-                .register_agent_action_binding(
+            let action_binding = processor
+                .prepare_agent_action_binding(
                     task_run_turn.turn_id.clone(),
                     crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                         action_adapter,
@@ -5175,6 +5221,9 @@ impl TaskAgentExecutor {
                     ),
                 )
                 .await?;
+            processor
+                .register_agent_action_binding(task_run_turn.turn_id.clone(), action_binding)
+                .await;
             return Ok(());
         }
         if !matches!(
@@ -5354,8 +5403,8 @@ impl TaskAgentExecutor {
                 .await,
         )
         .await?;
-        processor
-            .register_agent_action_binding(
+        let action_binding = processor
+            .prepare_agent_action_binding(
                 task_run_turn.turn_id.clone(),
                 crate::message::agent_action_tools::AgentActionRuntimeBinding::new(
                     action_adapter,
@@ -5364,6 +5413,9 @@ impl TaskAgentExecutor {
                 ),
             )
             .await?;
+        processor
+            .register_agent_action_binding(task_run_turn.turn_id.clone(), action_binding)
+            .await;
         let workspace_skill_policies = close_admitted_task_turn_on_error(
             processor,
             task_run_turn.thread_id.as_str(),

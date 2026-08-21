@@ -228,6 +228,7 @@ fn turn_work(presentation: TurnWorkPresentation, work_count: u64) -> TurnWorkBlo
         presentation,
         state: TurnWorkState::Completed,
         agent_work_graph: None,
+        author: None,
         started_at_unix_ms: Some(1_001),
         completed_at_unix_ms: Some(1_500),
         elapsed_ms: Some(499),

@@ -50,8 +50,13 @@ pub(crate) enum TimelineAvatarGroupKind {
 
 #[derive(Clone, Debug)]
 pub(crate) enum TimelineAvatarSource {
-    HistoricalUser { author: Option<TurnAuthorSnapshot> },
-    Agent { shows_running_dino: bool },
+    HistoricalUser {
+        author: Option<TurnAuthorSnapshot>,
+    },
+    Agent {
+        author: Option<TurnAuthorSnapshot>,
+        shows_running_dino: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -95,9 +100,7 @@ impl TimelineGrouping {
     ) -> Rc<Self> {
         let descriptors = rows
             .iter()
-            .map(|row| {
-                row_cluster_descriptor(row, projection, current_principal_id, presentation_context)
-            })
+            .map(|row| row_cluster_descriptor(row, projection, current_principal_id))
             .collect::<Vec<_>>();
         let mut row_layouts = vec![TimelineRowLayout::default(); rows.len()];
         let mut avatar_groups = Vec::new();
@@ -140,18 +143,23 @@ impl TimelineGrouping {
 
             if let Some(source) = descriptor.avatar_source.clone() {
                 let source = match source {
-                    TimelineAvatarSource::Agent { .. } => TimelineAvatarSource::Agent {
-                        shows_running_dino: presentation_context.task_child_thread
-                            && rows[index..=end].iter().any(|row| {
-                                matches!(
-                                    row,
-                                    TimelineRenderRow::Timeline(TimelineRow {
-                                        kind: TimelineRowKind::RunningTurn(_),
-                                        ..
-                                    })
-                                )
-                            }),
-                    },
+                    TimelineAvatarSource::Agent { author, .. } => {
+                        let exact_author = super::timeline_agent_execution_author(author.as_ref())
+                            .cloned();
+                        TimelineAvatarSource::Agent {
+                            author: exact_author,
+                            shows_running_dino: presentation_context.task_child_thread
+                                && rows[index..=end].iter().any(|row| {
+                                    matches!(
+                                        row,
+                                        TimelineRenderRow::Timeline(TimelineRow {
+                                            kind: TimelineRowKind::RunningTurn(_),
+                                            ..
+                                        })
+                                    )
+                                }),
+                        }
+                    }
                     source => source,
                 };
                 avatar_groups.push(TimelineAvatarGroup {
@@ -182,6 +190,19 @@ impl TimelineGrouping {
 
     pub(crate) fn avatar_groups(&self) -> &[TimelineAvatarGroup] {
         self.avatar_groups.as_slice()
+    }
+
+    pub(crate) fn agent_author_for_group_start(
+        &self,
+        row_index: usize,
+    ) -> Option<&TurnAuthorSnapshot> {
+        self.avatar_groups
+            .iter()
+            .find(|group| group.first_row_index == row_index)
+            .and_then(|group| match &group.source {
+                TimelineAvatarSource::Agent { author, .. } => author.as_ref(),
+                TimelineAvatarSource::HistoricalUser { .. } => None,
+            })
     }
 }
 
@@ -317,14 +338,14 @@ fn row_cluster_descriptor(
     row: &TimelineRenderRow,
     projection: &ConversationViewState,
     current_principal_id: Option<&str>,
-    presentation_context: TimelinePresentationContext,
 ) -> Option<TimelineClusterDescriptor> {
     if let TimelineRenderRow::Timeline(TimelineRow {
-        kind: TimelineRowKind::UserMessage { presentation, .. },
+        author,
+        kind: TimelineRowKind::UserMessage { .. },
         ..
     }) = row
     {
-        if is_current_principal_user_message(row, current_principal_id, presentation_context) {
+        if is_current_principal_user_message(row, current_principal_id) {
             return Some(TimelineClusterDescriptor {
                 key: TimelineClusterKey::CurrentPrincipal,
                 avatar_kind: None,
@@ -332,7 +353,6 @@ fn row_cluster_descriptor(
             });
         }
 
-        let author = presentation.author.clone();
         let key = author
             .as_ref()
             .map(|author| TimelineClusterKey::HistoricalUser(author.actor.clone()))
@@ -340,7 +360,9 @@ fn row_cluster_descriptor(
         return Some(TimelineClusterDescriptor {
             key,
             avatar_kind: Some(TimelineAvatarGroupKind::HistoricalUser),
-            avatar_source: Some(TimelineAvatarSource::HistoricalUser { author }),
+            avatar_source: Some(TimelineAvatarSource::HistoricalUser {
+                author: author.clone(),
+            }),
         });
     }
 
@@ -367,9 +389,20 @@ fn row_cluster_descriptor(
         key: TimelineClusterKey::Agent(turn_id),
         avatar_kind: Some(TimelineAvatarGroupKind::Agent),
         avatar_source: Some(TimelineAvatarSource::Agent {
+            author: super::timeline_agent_execution_author(timeline_render_row_author(row))
+                .cloned(),
             shows_running_dino: false,
         }),
     })
+}
+
+pub(crate) fn timeline_render_row_author<'a>(
+    row: &'a TimelineRenderRow,
+) -> Option<&'a TurnAuthorSnapshot> {
+    match row {
+        TimelineRenderRow::Timeline(row) => row.author.as_ref(),
+        TimelineRenderRow::PendingRequest(row) => row.author.as_ref(),
+    }
 }
 
 fn timeline_render_row_turn_id(
@@ -424,7 +457,7 @@ mod tests {
     use super::*;
     use crate::app::conversation::TimelineEntry;
     use pioneer_client::timeline::rows::UserMessagePresentation;
-    use pioneer_protocol::{PrincipalId, ThreadMode};
+    use pioneer_protocol::{AgentExecutionId, PrincipalId, ThreadMode};
 
     fn principal(value: &str) -> PrincipalId {
         PrincipalId::new(value).expect("valid principal id")
@@ -441,8 +474,16 @@ mod tests {
         nickname: &str,
         avatar_revision: Option<&str>,
     ) -> TimelineRenderRow {
+        let author = TurnAuthorSnapshot {
+            actor: PersistedActorRef::Principal(principal(author_id)),
+            display_name: display_name.to_owned(),
+            nickname: nickname.to_owned(),
+            avatar_revision: avatar_revision.map(str::to_owned),
+            agent: None,
+        };
         TimelineRenderRow::Timeline(TimelineRow {
             key: key.to_owned(),
+            author: Some(author.clone()),
             kind: TimelineRowKind::UserMessage {
                 timeline_index: 0,
                 presentation: UserMessagePresentation {
@@ -452,12 +493,8 @@ mod tests {
                     turn_id: key.to_owned(),
                     item_id: key.to_owned(),
                     mode: ThreadMode::Message,
-                    author: Some(TurnAuthorSnapshot {
-                        actor: PersistedActorRef::Principal(principal(author_id)),
-                        display_name: display_name.to_owned(),
-                        nickname: nickname.to_owned(),
-                        avatar_revision: avatar_revision.map(str::to_owned),
-                    }),
+                    author: Some(author),
+                    route: None,
                     reply: None,
                     reply_state: None,
                     mentions: Vec::new(),
@@ -471,8 +508,16 @@ mod tests {
     }
 
     fn system_message(key: &str) -> TimelineRenderRow {
+        let author = TurnAuthorSnapshot {
+            actor: PersistedActorRef::System,
+            display_name: "System".to_owned(),
+            nickname: "system".to_owned(),
+            avatar_revision: None,
+            agent: None,
+        };
         TimelineRenderRow::Timeline(TimelineRow {
             key: key.to_owned(),
+            author: Some(author.clone()),
             kind: TimelineRowKind::UserMessage {
                 timeline_index: 0,
                 presentation: UserMessagePresentation {
@@ -482,12 +527,8 @@ mod tests {
                     turn_id: key.to_owned(),
                     item_id: format!("turn:{key}:user"),
                     mode: ThreadMode::Agent,
-                    author: Some(TurnAuthorSnapshot {
-                        actor: PersistedActorRef::System,
-                        display_name: "System".to_owned(),
-                        nickname: "system".to_owned(),
-                        avatar_revision: None,
-                    }),
+                    author: Some(author),
+                    route: None,
                     reply: None,
                     reply_state: None,
                     mentions: Vec::new(),
@@ -498,6 +539,18 @@ mod tests {
                 },
             },
         })
+    }
+
+    fn agent_author() -> TurnAuthorSnapshot {
+        TurnAuthorSnapshot {
+            actor: PersistedActorRef::AgentExecution(
+                AgentExecutionId::new("EAAAAAAAAAAAAAAAAAAAA").unwrap(),
+            ),
+            display_name: "Codex CLI".to_owned(),
+            nickname: "codex".to_owned(),
+            avatar_revision: Some("agent-avatar".to_owned()),
+            agent: None,
+        }
     }
 
     #[test]
@@ -572,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn task_child_input_uses_current_principal_alignment_without_an_avatar() {
+    fn task_child_system_input_keeps_its_persisted_actor() {
         let rows = vec![system_message("child-input")];
 
         let standard_grouping = TimelineGrouping::build(
@@ -593,13 +646,108 @@ mod tests {
         );
 
         assert_eq!(standard_grouping.avatar_groups.len(), 1);
-        assert!(child_grouping.avatar_groups.is_empty());
-        assert_eq!(child_grouping.row_layout(0).avatar_group_kind, None,);
+        assert_eq!(child_grouping.avatar_groups.len(), 1);
+        assert_eq!(
+            child_grouping.row_layout(0).avatar_group_kind,
+            Some(TimelineAvatarGroupKind::HistoricalUser)
+        );
+    }
+
+    #[test]
+    fn optimistic_local_message_keeps_the_old_right_alignment_without_unknown_author() {
+        let mut row = system_message("optimistic");
+        let TimelineRenderRow::Timeline(TimelineRow {
+            author,
+            kind: TimelineRowKind::UserMessage { presentation, .. },
+            ..
+        }) = &mut row
+        else {
+            unreachable!();
+        };
+        *author = None;
+        presentation.author = None;
+
+        let grouping = TimelineGrouping::build(
+            &[row],
+            &ConversationViewState::default(),
+            None,
+            TimelinePresentationContext::default(),
+            px(0.),
+        );
+
+        assert!(grouping.avatar_groups.is_empty());
+        assert_eq!(grouping.row_layout(0).avatar_group_kind, None);
+    }
+
+    #[test]
+    fn task_child_agent_input_keeps_its_persisted_actor() {
+        let mut row = system_message("child-agent-input");
+        let TimelineRenderRow::Timeline(TimelineRow {
+            author,
+            kind: TimelineRowKind::UserMessage { presentation, .. },
+            ..
+        }) = &mut row
+        else {
+            unreachable!();
+        };
+        let agent_author = agent_author();
+        *author = Some(agent_author.clone());
+        presentation.author = Some(agent_author);
+
+        let rows = [row];
+        let standard_grouping = TimelineGrouping::build(
+            &rows,
+            &ConversationViewState::default(),
+            None,
+            TimelinePresentationContext::default(),
+            px(0.),
+        );
+        let child_grouping = TimelineGrouping::build(
+            &rows,
+            &ConversationViewState::default(),
+            None,
+            TimelinePresentationContext {
+                task_child_thread: true,
+            },
+            px(0.),
+        );
+
+        assert_eq!(standard_grouping.avatar_groups.len(), 1);
+        assert_eq!(
+            standard_grouping.row_layout(0).avatar_group_kind,
+            Some(TimelineAvatarGroupKind::HistoricalUser)
+        );
+        assert_eq!(child_grouping.avatar_groups.len(), 1);
+        assert_eq!(
+            child_grouping.row_layout(0).avatar_group_kind,
+            Some(TimelineAvatarGroupKind::HistoricalUser)
+        );
+        let TimelineAvatarSource::HistoricalUser {
+            author: Some(author),
+        } = &child_grouping.avatar_groups[0].source
+        else {
+            panic!("agent-authored input must preserve its exact author snapshot");
+        };
+        assert!(matches!(
+            &author.actor,
+            PersistedActorRef::AgentExecution(_)
+        ));
     }
 
     #[test]
     fn consecutive_agent_rows_from_one_turn_share_one_avatar_group() {
         let mut projection = ConversationViewState::default();
+        let author = agent_author();
+        projection.turns.push(crate::app::conversation::TurnView {
+            id: "turn".to_owned(),
+            phase: crate::app::conversation::TurnPhase::Completed,
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            error: None,
+            permission_profile: None,
+            security_summary: None,
+            resume: None,
+        });
         projection.timeline = vec![
             TimelineEntry {
                 id: "tool".to_owned(),
@@ -617,10 +765,12 @@ mod tests {
         let rows = vec![
             TimelineRenderRow::Timeline(TimelineRow {
                 key: "tool".to_owned(),
+                author: Some(author.clone()),
                 kind: TimelineRowKind::Item { timeline_index: 0 },
             }),
             TimelineRenderRow::Timeline(TimelineRow {
                 key: "answer".to_owned(),
+                author: Some(author.clone()),
                 kind: TimelineRowKind::Item { timeline_index: 1 },
             }),
         ];
@@ -640,6 +790,7 @@ mod tests {
         ));
         assert_eq!(grouping.avatar_groups[0].first_row_index, 0);
         assert_eq!(grouping.avatar_groups[0].last_row_index, 1);
+        assert_eq!(grouping.agent_author_for_group_start(0), Some(&author));
         assert_eq!(
             grouping.row_layout(1).top_spacing,
             TimelineRowTopSpacing::GroupMessage
@@ -651,6 +802,7 @@ mod tests {
         let rows = vec![
             TimelineRenderRow::Timeline(TimelineRow {
                 key: "work".to_owned(),
+                author: None,
                 kind: TimelineRowKind::TurnWorkToggle(
                     pioneer_client::timeline::rows::TurnWorkGroupRow {
                         toggle_key: format!("{SEMANTIC_TURN_WORK_GROUP_PREFIX}turn"),
@@ -663,12 +815,15 @@ mod tests {
             }),
             TimelineRenderRow::Timeline(TimelineRow {
                 key: "running".to_owned(),
+                author: None,
                 kind: TimelineRowKind::RunningTurn(
                     pioneer_client::timeline::labels::RunningTurnDisplay {
                         turn_id: "turn".to_owned(),
                         started_at_unix_ms: None,
                         state: None,
                         message: None,
+                        route: None,
+                        agent_work_graph: None,
                         permission_profile: None,
                         security_summary: None,
                     },
@@ -690,15 +845,68 @@ mod tests {
     }
 
     #[test]
-    fn running_child_turn_replaces_only_its_agent_avatar_with_the_dino() {
+    fn task_card_and_running_state_keep_one_turn_group_with_exact_agent() {
+        let author = agent_author();
+        let rows = vec![
+            TimelineRenderRow::Timeline(TimelineRow {
+                key: "task-card".to_owned(),
+                author: Some(author.clone()),
+                kind: TimelineRowKind::TurnWorkToggle(
+                    pioneer_client::timeline::rows::TurnWorkGroupRow {
+                        toggle_key: format!("{SEMANTIC_TURN_WORK_GROUP_PREFIX}turn"),
+                        anchor_entry_id: "task-card".to_owned(),
+                        elapsed_ms: None,
+                        is_open: false,
+                        state: None,
+                    },
+                ),
+            }),
+            TimelineRenderRow::Timeline(TimelineRow {
+                key: "running".to_owned(),
+                author: Some(author.clone()),
+                kind: TimelineRowKind::RunningTurn(
+                    pioneer_client::timeline::labels::RunningTurnDisplay {
+                        turn_id: "turn".to_owned(),
+                        started_at_unix_ms: None,
+                        state: Some(pioneer_protocol::TurnWorkState::Running),
+                        message: None,
+                        route: None,
+                        agent_work_graph: None,
+                        permission_profile: None,
+                        security_summary: None,
+                    },
+                ),
+            }),
+        ];
+
+        let grouping = TimelineGrouping::build(
+            &rows,
+            &ConversationViewState::default(),
+            None,
+            TimelinePresentationContext::default(),
+            px(0.),
+        );
+
+        assert_eq!(grouping.avatar_groups.len(), 1);
+        assert_eq!(grouping.avatar_groups[0].first_row_index, 0);
+        assert_eq!(grouping.avatar_groups[0].last_row_index, 1);
+        assert_eq!(grouping.agent_author_for_group_start(0), Some(&author));
+    }
+
+    #[test]
+    fn running_child_turn_keeps_the_old_dino_and_the_exact_agent_identity() {
+        let author = agent_author();
         let rows = vec![TimelineRenderRow::Timeline(TimelineRow {
             key: "running".to_owned(),
+            author: Some(author.clone()),
             kind: TimelineRowKind::RunningTurn(
                 pioneer_client::timeline::labels::RunningTurnDisplay {
                     turn_id: "turn".to_owned(),
                     started_at_unix_ms: None,
                     state: None,
                     message: None,
+                    route: None,
+                    agent_work_graph: None,
                     permission_profile: None,
                     security_summary: None,
                 },
@@ -722,18 +930,24 @@ mod tests {
             px(0.),
         );
 
-        assert!(matches!(
-            &root_grouping.avatar_groups[0].source,
-            TimelineAvatarSource::Agent {
-                shows_running_dino: false
-            }
-        ));
-        assert!(matches!(
-            &child_grouping.avatar_groups[0].source,
-            TimelineAvatarSource::Agent {
-                shows_running_dino: true
-            }
-        ));
+        let TimelineAvatarSource::Agent {
+            author: root_author,
+            shows_running_dino: root_shows_running_dino,
+        } = &root_grouping.avatar_groups[0].source
+        else {
+            panic!("root running row must use an agent avatar");
+        };
+        let TimelineAvatarSource::Agent {
+            author: child_author,
+            shows_running_dino: child_shows_running_dino,
+        } = &child_grouping.avatar_groups[0].source
+        else {
+            panic!("child running row must use an agent avatar");
+        };
+        assert_eq!(root_author.as_ref(), Some(&author));
+        assert_eq!(child_author.as_ref(), Some(&author));
+        assert!(!root_shows_running_dino);
+        assert!(*child_shows_running_dino);
     }
 
     #[test]

@@ -1084,7 +1084,7 @@ impl MessageProcessor {
         .await?;
         let workspace_id = context.workspace_id().to_owned();
         context
-            .bind_skill_projection(workspace_id.as_str(), bindings)
+            .bind_revalidated_runtime_skill_projection(workspace_id.as_str(), bindings)
             .context("failed to bind exact skill projection")?;
 
         let event_timestamp = now_timestamp_secs();

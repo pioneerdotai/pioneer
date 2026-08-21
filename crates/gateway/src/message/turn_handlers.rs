@@ -2649,10 +2649,10 @@ impl MessageProcessor {
             outcome.started_notification.turn.id.as_str(),
             &execution_security_snapshot,
         );
-        let is_root_agent_turn = outcome.materialization.turn.mode
-            == pioneer_protocol::ThreadMode::Agent
+        let is_root_executable_turn = outcome.materialization.turn.mode
+            != pioneer_protocol::ThreadMode::Message
             && outcome.materialization.thread.id == execution_admission.root_thread_id();
-        let prepared_root_execution = if is_root_agent_turn {
+        let prepared_root_execution = if is_root_executable_turn {
             let authority = execution_admission
                 .finalize(
                     outcome.materialization.thread.workspace_id.as_str(),
@@ -4576,7 +4576,7 @@ impl MessageProcessor {
             let root_agent_admission = match &execution_authority {
                 TurnExecutionAuthority::Fresh(admission)
                     if outcome.materialization.turn.mode
-                        == pioneer_protocol::ThreadMode::Agent
+                        != pioneer_protocol::ThreadMode::Message
                         && outcome.materialization.thread.id == admission.root_thread_id() =>
                 {
                     Some(admission)

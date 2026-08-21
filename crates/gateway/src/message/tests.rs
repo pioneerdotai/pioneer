@@ -44443,6 +44443,7 @@ async fn live_semantic_timeline_pending_request_projects_approval_block() {
                 status,
                 item_id,
                 request,
+                ..
             } => Some((runtime_id, request_id, status, item_id, request)),
             _ => None,
         })

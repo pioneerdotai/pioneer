@@ -88,14 +88,6 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("client_event.json", crate::contracts::ClientEvent),
         schema_doc!(
-            "client_agent_authored_message_projection_request.json",
-            crate::presentation::ClientAgentAuthoredMessageProjectionRequest
-        ),
-        schema_doc!(
-            "client_agent_authored_message_projection_result.json",
-            pioneer_client::timeline::authorship::SemanticAgentAuthoredMessageRow
-        ),
-        schema_doc!(
             "client_thread_scope_presentation_request.json",
             crate::presentation::ClientThreadScopePresentationRequest
         ),
