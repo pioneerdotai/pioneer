@@ -445,7 +445,7 @@ impl GatewayCliRuntimeInstanceSettings {
         Self {
             id: "codex".to_owned(),
             kind: CLIAgentRuntimeKind::Codex,
-            display_name: "Codex CLI".to_owned(),
+            display_name: "Codex".to_owned(),
             nickname: "codex".to_owned(),
             enabled: true,
             binary_path: "codex".to_owned(),
@@ -458,7 +458,7 @@ impl GatewayCliRuntimeInstanceSettings {
         Self {
             id: "claude".to_owned(),
             kind: CLIAgentRuntimeKind::Claude,
-            display_name: "Claude CLI".to_owned(),
+            display_name: "Claude".to_owned(),
             nickname: "claude".to_owned(),
             enabled: true,
             binary_path: "claude".to_owned(),
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(settings.instances.len(), 2);
         assert_eq!(settings.instances[0].id, "codex");
         assert_eq!(settings.instances[0].kind, CLIAgentRuntimeKind::Codex);
-        assert_eq!(settings.instances[0].display_name, "Codex CLI");
+        assert_eq!(settings.instances[0].display_name, "Codex");
         assert_eq!(settings.instances[0].nickname, "codex");
         assert!(settings.instances[0].enabled);
         assert_eq!(settings.instances[0].binary_path, "codex");
@@ -783,7 +783,7 @@ mod tests {
         assert!(settings.instances[0].shadow_home_path.is_none());
         assert_eq!(settings.instances[1].id, "claude");
         assert_eq!(settings.instances[1].kind, CLIAgentRuntimeKind::Claude);
-        assert_eq!(settings.instances[1].display_name, "Claude CLI");
+        assert_eq!(settings.instances[1].display_name, "Claude");
         assert_eq!(settings.instances[1].nickname, "claude");
         assert!(settings.instances[1].enabled);
         assert_eq!(settings.instances[1].binary_path, "claude");

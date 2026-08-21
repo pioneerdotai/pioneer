@@ -2386,7 +2386,8 @@ mod tests {
         assert!(!content.contains("[voice_input]"));
         assert!(content.contains("[[cli_runtimes.instances]]"));
         assert!(content.contains("id = \"codex\""));
-        assert!(content.contains("display_name = \"Codex CLI\""));
+        assert!(content.contains("display_name = \"Codex\""));
+        assert!(content.contains("display_name = \"Claude\""));
         assert!(content.contains("enabled = true"));
 
         let _ = fs::remove_dir_all(temp_dir);

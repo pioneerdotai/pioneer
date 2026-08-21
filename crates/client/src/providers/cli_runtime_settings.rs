@@ -566,7 +566,7 @@ fn cli_runtime_provider_kind_defaults(kind: CLIAgentRuntimeKind) -> CLIRuntimePr
         CLIAgentRuntimeKind::Codex => CLIRuntimeProviderKindDefaults {
             id_base: "codex",
             kind_label: "Codex",
-            display_name: "Codex CLI",
+            display_name: "Codex",
             binary_path: "codex",
             home_path: "~/.codex",
             shadow_home_placeholder: "~/.pioneer/codex-work",
@@ -574,7 +574,7 @@ fn cli_runtime_provider_kind_defaults(kind: CLIAgentRuntimeKind) -> CLIRuntimePr
         CLIAgentRuntimeKind::Claude => CLIRuntimeProviderKindDefaults {
             id_base: "claude",
             kind_label: "Claude",
-            display_name: "Claude CLI",
+            display_name: "Claude",
             binary_path: "claude",
             home_path: "~/.claude",
             shadow_home_placeholder: "~/.pioneer/claude-work",
@@ -631,13 +631,13 @@ mod tests {
 
     #[test]
     fn create_draft_for_kind_uses_runtime_specific_defaults() {
-        let current = snapshot(vec![codex_instance("codex", "Codex CLI")]);
+        let current = snapshot(vec![codex_instance("codex", "Codex")]);
         let draft =
             CLIRuntimeProviderDraft::create_for_kind(Some(&current), CLIAgentRuntimeKind::Claude);
 
         assert_eq!(draft.kind, CLIAgentRuntimeKind::Claude);
         assert_eq!(draft.id, "claude");
-        assert_eq!(draft.display_name, "Claude CLI");
+        assert_eq!(draft.display_name, "Claude");
         assert_eq!(draft.binary_path, "claude");
         assert_eq!(draft.home_path, "~/.claude");
         assert!(draft.shadow_home_path.is_empty());
@@ -645,11 +645,11 @@ mod tests {
 
     #[test]
     fn create_draft_plan_builds_gateway_settings_update() {
-        let current = snapshot(vec![codex_instance("codex", "Codex CLI")]);
+        let current = snapshot(vec![codex_instance("codex", "Codex")]);
         let mut draft =
             CLIRuntimeProviderDraft::create_for_kind(Some(&current), CLIAgentRuntimeKind::Codex);
         assert_eq!(draft.id, "codex_2");
-        assert_eq!(draft.display_name, "Codex CLI 2");
+        assert_eq!(draft.display_name, "Codex 2");
         draft.display_name = "Codex Work".to_owned();
         draft.home_path = "~/.codex-work".to_owned();
 

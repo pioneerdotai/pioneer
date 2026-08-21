@@ -2361,7 +2361,7 @@ fn default_codex_cli_agent_runtime_instance(
     EffectiveGatewayCliAgentRuntimeInstanceConfig {
         id: "codex".to_owned(),
         kind: GatewayCliAgentRuntimeKindConfig::Codex,
-        display_name: "Codex CLI".to_owned(),
+        display_name: "Codex".to_owned(),
         enabled: defaults.enabled,
         binary_path: "codex".to_owned(),
         home_path: "~/.codex".to_owned(),
@@ -2383,7 +2383,7 @@ fn default_claude_cli_agent_runtime_instance(
     EffectiveGatewayCliAgentRuntimeInstanceConfig {
         id: "claude".to_owned(),
         kind: GatewayCliAgentRuntimeKindConfig::Claude,
-        display_name: "Claude CLI".to_owned(),
+        display_name: "Claude".to_owned(),
         enabled: defaults.enabled,
         binary_path: "claude".to_owned(),
         home_path: "~/.claude".to_owned(),
@@ -3679,7 +3679,7 @@ request_timeout_ms = 60000
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].id, "codex");
         assert_eq!(instances[0].kind, GatewayCliAgentRuntimeKindConfig::Codex);
-        assert_eq!(instances[0].display_name, "Codex CLI");
+        assert_eq!(instances[0].display_name, "Codex");
         assert!(instances[0].enabled);
         assert_eq!(instances[0].binary_path, "codex");
         assert_eq!(instances[0].home_path, "~/.codex");
@@ -3687,7 +3687,7 @@ request_timeout_ms = 60000
         assert_eq!(instances[0].request_timeout_ms, 60_000);
         assert_eq!(instances[1].id, "claude");
         assert_eq!(instances[1].kind, GatewayCliAgentRuntimeKindConfig::Claude);
-        assert_eq!(instances[1].display_name, "Claude CLI");
+        assert_eq!(instances[1].display_name, "Claude");
         assert!(instances[1].enabled);
         assert_eq!(instances[1].binary_path, "claude");
         assert_eq!(instances[1].home_path, "~/.claude");
