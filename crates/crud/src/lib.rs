@@ -19801,6 +19801,31 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         idle_deadline_at_unix: Option<i64>,
         hard_deadline_at_unix: Option<i64>,
     ) -> Result<bool> {
+        self.heartbeat_turn_item_attempt_with_activity_kind(
+            turn_id,
+            item_id,
+            item_type,
+            heartbeat_at_unix,
+            lease_expires_at_unix,
+            idle_deadline_at_unix,
+            hard_deadline_at_unix,
+            "item/heartbeat",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn heartbeat_turn_item_attempt_with_activity_kind(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+        item_type: TurnItemType,
+        heartbeat_at_unix: i64,
+        lease_expires_at_unix: Option<i64>,
+        idle_deadline_at_unix: Option<i64>,
+        hard_deadline_at_unix: Option<i64>,
+        activity_kind: &str,
+    ) -> Result<bool> {
         self.run_serialized_write(|| async {
             let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
             let updated = turn_item_attempt::heartbeat_running_attempt(
@@ -19817,6 +19842,14 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 return Ok(false);
             }
 
+            // An owner lease proves only that the supervising loop is alive;
+            // it is not causal work progress and must not replace the Turn's
+            // durable progress frontier. Confirmed external activity is
+            // recorded through the explicit activity kind below.
+            if activity_kind == "item/heartbeat" {
+                return Ok(true);
+            }
+
             let Some(turn_model) = turn::find_turn_by_id(&self.connection, turn_id).await? else {
                 return Ok(true);
             };
@@ -19830,7 +19863,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     turn_id: turn_id.to_owned(),
                     thread_id: turn_model.thread_id,
                     activity_sequence: source_sequence,
-                    activity_kind: "item/heartbeat".to_owned(),
+                    activity_kind: activity_kind.to_owned(),
                     item_id: Some(item_id.to_owned()),
                     item_type: Some(turn_item_type_to_db(item_type).to_owned()),
                     observed_at: heartbeat_at,
@@ -33389,6 +33422,7 @@ mod tests {
             arguments: serde_json::json!({ "title": "Daily weather" }),
             status: ToolCallStatus::InProgress,
             recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: ToolOutputPolicySnapshot::for_tool_name("task_create"),
             display: ToolDisplayPayload::Hidden,
             storage: ToolStoragePayload::Metadata {
@@ -34129,6 +34163,7 @@ mod tests {
             arguments: serde_json::json!({"path": "/tmp/secret.txt"}),
             status: ToolCallStatus::Completed,
             recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
             display: ToolDisplayPayload::Hidden,
             storage: ToolStoragePayload::Shell {
@@ -34165,6 +34200,7 @@ mod tests {
             arguments: serde_json::json!({"slug": "secret-skill"}),
             status: ToolCallStatus::Completed,
             recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: ToolOutputPolicySnapshot::for_tool_name("read_skill"),
             display: ToolDisplayPayload::Hidden,
             storage: ToolStoragePayload::Summary(pioneer_protocol::ToolOutputSummary {
@@ -34210,6 +34246,7 @@ mod tests {
             arguments: serde_json::json!({"to": "alexander.oskin@gmail.com"}),
             status: ToolCallStatus::Completed,
             recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name(
                 "mcp:Resend/send-email",
             ),
@@ -34241,6 +34278,7 @@ mod tests {
             arguments: serde_json::json!({"path": "/tmp/secret.txt"}),
             status: ToolCallStatus::Completed,
             recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
             display: ToolDisplayPayload::Hidden,
             storage: ToolStoragePayload::Metadata {
@@ -34672,7 +34710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_liveness_tracks_item_heartbeat_without_new_turn_event() {
+    async fn turn_liveness_tracks_confirmed_external_activity_without_new_turn_event() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -34718,7 +34756,7 @@ mod tests {
 
         assert!(
             store
-                .heartbeat_turn_item_attempt(
+                .heartbeat_turn_item_attempt_with_activity_kind(
                     turn_id,
                     item_id,
                     TurnItemType::Reasoning,
@@ -34726,6 +34764,7 @@ mod tests {
                     Some(timestamp + 905),
                     Some(timestamp + 905),
                     None,
+                    "item/confirmed_external_activity",
                 )
                 .await
                 .expect("heartbeat should persist")
@@ -34737,7 +34776,10 @@ mod tests {
             .expect("liveness query should succeed")
             .expect("liveness row should exist");
         assert_eq!(liveness.last_activity_sequence, 2);
-        assert_eq!(liveness.last_activity_kind, "item/heartbeat");
+        assert_eq!(
+            liveness.last_activity_kind,
+            "item/confirmed_external_activity"
+        );
         assert_eq!(liveness.last_activity_item_id.as_deref(), Some(item_id));
         assert_eq!(
             liveness.last_activity_item_type.as_deref(),

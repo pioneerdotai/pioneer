@@ -436,6 +436,7 @@ mod tests {
             arguments: json!({"action": "snapshot"}),
             status: ToolCallStatus::Completed,
             recovery_policy: Some(recovery_policy()),
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: output_policy(),
             display: Default::default(),
             storage: ToolStoragePayload::Metadata {
@@ -467,6 +468,7 @@ mod tests {
             arguments: json!({"action": "snapshot"}),
             status: ToolCallStatus::Completed,
             recovery_policy: Some(recovery_policy()),
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: output_policy(),
             display: Default::default(),
             storage: ToolStoragePayload::Metadata {

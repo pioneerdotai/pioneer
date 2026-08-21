@@ -8511,6 +8511,7 @@ mod tests {
                 arguments: serde_json::json!({"cmd":"cat secret.txt"}),
                 status: ToolCallStatus::Completed,
                 recovery_policy: None,
+                execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
                 output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
                 display: ToolDisplayPayload::Shell {
                     stdout: Some("secret".to_owned()),
@@ -8536,6 +8537,7 @@ mod tests {
                 arguments: serde_json::json!({"path":"README.md"}),
                 status: ToolCallStatus::Completed,
                 recovery_policy: None,
+                execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
                 output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
                 display: ToolDisplayPayload::Summary(ToolOutputSummary {
                     title: "Read README.md".to_owned(),

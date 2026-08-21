@@ -1382,6 +1382,7 @@ impl MessageProcessor {
                     request_context.principal().kind,
                     request_context.principal().role_key.as_ref(),
                 ),
+            confirmed_activity: None,
         };
         match self
             .task_runtime

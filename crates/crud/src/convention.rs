@@ -1101,6 +1101,7 @@ pub fn turn_item_type_from_db(value: &str) -> Option<TurnItemType> {
 pub fn turn_item_execution_class_to_db(execution_class: TurnItemExecutionClass) -> &'static str {
     match execution_class {
         TurnItemExecutionClass::Standard => "standard",
+        TurnItemExecutionClass::DurableWait => "durable_wait",
         TurnItemExecutionClass::ContextCompaction => "context_compaction",
     }
 }
@@ -1108,6 +1109,7 @@ pub fn turn_item_execution_class_to_db(execution_class: TurnItemExecutionClass) 
 pub fn turn_item_execution_class_from_db(value: &str) -> Option<TurnItemExecutionClass> {
     match value {
         "standard" => Some(TurnItemExecutionClass::Standard),
+        "durable_wait" => Some(TurnItemExecutionClass::DurableWait),
         "context_compaction" => Some(TurnItemExecutionClass::ContextCompaction),
         _ => None,
     }

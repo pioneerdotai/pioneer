@@ -50,8 +50,8 @@ const RECOVERY_ATTEMPT_MAX_WALL_CLOCK_SECS: u64 = 15 * 60;
 /// operation and therefore can continue indefinitely even when that operation
 /// is stuck. It keeps the short idle lease alive, but must not defeat the
 /// bounded recovery-episode watchdog. Runtime observations are handled by the
-/// explicit CLI/native liveness paths and are not a recovery progress frontier
-/// by themselves.
+/// explicit CLI/native liveness paths. Confirmed external activity uses its
+/// own activity kind and is therefore a causal progress frontier.
 fn is_causal_recovery_progress(activity_kind: &str) -> bool {
     !activity_kind.starts_with("runtime/") && activity_kind != "item/heartbeat"
 }
@@ -3834,8 +3834,27 @@ impl RecoveryCoordinator {
                 tool_name: row.tool_name,
                 payload: row.payload,
             })
-            .collect();
-        assemble_retained_provider_history(turn_id, rows)
+            .collect::<Vec<_>>();
+        let item_ids = retained_provider_history_item_ids(rows.as_slice());
+        let resumable_item_ids = self
+            .crud_store
+            .get_turn_items_by_ids(turn_id, item_ids.as_slice())
+            .await?
+            .into_iter()
+            .filter_map(|(item_id, item)| {
+                item.recovery_policy()
+                    .is_some_and(|policy| {
+                        policy.can_resume
+                            && policy.idempotency_mode == ToolRecoveryIdempotencyMode::Safe
+                    })
+                    .then_some(item_id)
+            })
+            .collect::<HashSet<_>>();
+        assemble_retained_provider_history_with_recovery(
+            turn_id,
+            rows,
+            &resumable_item_ids,
+        )
     }
 
     async fn cancel_other_open_jobs_after_terminal_recovery(
@@ -4020,9 +4039,18 @@ fn provider_snapshot_field<'a>(job: &'a RecoveryJobRecord, key: &str) -> Option<
     job.policy_snapshot.get(key)?.as_str()
 }
 
+#[cfg(test)]
 fn assemble_retained_provider_history(
     turn_id: &str,
+    rows: Vec<RetainedProviderHistoryRow>,
+) -> Result<Vec<RetainedProviderHistoryMessage>> {
+    assemble_retained_provider_history_with_recovery(turn_id, rows, &HashSet::new())
+}
+
+fn assemble_retained_provider_history_with_recovery(
+    turn_id: &str,
     mut rows: Vec<RetainedProviderHistoryRow>,
+    resumable_item_ids: &HashSet<String>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
     rows.sort_by_key(|row| row.sequence);
 
@@ -4043,8 +4071,31 @@ fn assemble_retained_provider_history(
     retained.extend(assemble_canonical_provider_history(
         turn_id,
         canonical_rows,
+        resumable_item_ids,
     )?);
     Ok(retained)
+}
+
+fn retained_provider_history_item_ids(rows: &[RetainedProviderHistoryRow]) -> Vec<String> {
+    let mut item_ids = HashSet::new();
+    for row in rows {
+        if let Some(item_id) = row.item_id.as_ref() {
+            item_ids.insert(item_id.clone());
+        }
+        if row.source == "assistant_round"
+            && let Ok(envelope) = serde_json::from_str::<
+                pioneer_provider::CanonicalProviderRoundEnvelope,
+            >(row.payload.as_str())
+        {
+            item_ids.extend(
+                envelope
+                    .calls
+                    .into_iter()
+                    .map(|identity| identity.turn_item_id),
+            );
+        }
+    }
+    item_ids.into_iter().collect()
 }
 
 fn assemble_legacy_provider_history(
@@ -4159,6 +4210,7 @@ fn assemble_legacy_provider_history(
 fn assemble_canonical_provider_history(
     turn_id: &str,
     rows: Vec<RetainedProviderHistoryRow>,
+    resumable_item_ids: &HashSet<String>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
     use pioneer_provider::{CanonicalProviderRoundEnvelope, ProviderTermination};
 
@@ -4170,7 +4222,8 @@ fn assemble_canonical_provider_history(
 
     fn flush_round(
         turn_id: &str,
-        pending: PendingRound,
+        mut pending: PendingRound,
+        resumable_item_ids: &HashSet<String>,
         retained: &mut Vec<RetainedProviderHistoryMessage>,
     ) -> Result<()> {
         if pending.envelope.version != 1 {
@@ -4239,6 +4292,28 @@ fn assemble_canonical_provider_history(
             }
         }
 
+        let resumptions = identities
+            .iter()
+            .filter(|identity| {
+                !pending.results.contains_key(identity.turn_item_id.as_str())
+                    && resumable_item_ids.contains(identity.turn_item_id.as_str())
+            })
+            .filter_map(|identity| {
+                calls
+                    .get(identity.ordinal as usize)
+                    .map(|call| (identity.clone(), call.name.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (identity, tool_name) in resumptions {
+            let provider_call_id = identity.provider_call_id;
+            let turn_item_id = identity.turn_item_id;
+            let message = resumable_tool_interruption_message(
+                provider_call_id.as_str(),
+                tool_name.as_str(),
+            );
+            pending.results.insert(turn_item_id, message);
+        }
+
         let missing = identities
             .iter()
             .filter(|identity| !pending.results.contains_key(identity.turn_item_id.as_str()))
@@ -4285,7 +4360,7 @@ fn assemble_canonical_provider_history(
         match row.source.as_str() {
             "assistant_round" => {
                 if let Some(previous) = pending.take() {
-                    flush_round(turn_id, previous, &mut retained)?;
+                    flush_round(turn_id, previous, resumable_item_ids, &mut retained)?;
                 }
                 let envelope =
                     serde_json::from_str::<CanonicalProviderRoundEnvelope>(row.payload.as_str())
@@ -4336,9 +4411,25 @@ fn assemble_canonical_provider_history(
         }
     }
     if let Some(pending) = pending {
-        flush_round(turn_id, pending, &mut retained)?;
+        flush_round(turn_id, pending, resumable_item_ids, &mut retained)?;
     }
     Ok(retained)
+}
+
+fn resumable_tool_interruption_message(provider_call_id: &str, tool_name: &str) -> ChatMessage {
+    let payload = serde_json::json!({
+        "status": "observation_interrupted",
+        "resumable": true,
+        "retryRecommended": true,
+        "message": "The prior observation ended before its result was durably recorded. Reissue this safe tool call to resume from its durable targets and current state."
+    });
+    ModelInputItem::tool_result(
+        provider_call_id,
+        tool_name,
+        payload.to_string(),
+        Some(payload),
+    )
+    .into_chat_message()
 }
 
 fn recovered_tool_result_message(
@@ -8717,6 +8808,9 @@ mod tests {
     fn periodic_item_heartbeat_is_not_recovery_progress() {
         assert!(!is_causal_recovery_progress("item/heartbeat"));
         assert!(!is_causal_recovery_progress("runtime/observed_in_progress"));
+        assert!(is_causal_recovery_progress(
+            "item/confirmed_external_activity"
+        ));
         assert!(is_causal_recovery_progress("item/snapshot_updated"));
         assert!(is_causal_recovery_progress(
             "turn/execution_window_continued"

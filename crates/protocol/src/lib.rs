@@ -56,11 +56,12 @@ pub use agent_authorship::{
     AgentTaskReviewProjection,
 };
 pub use agent_event::{
-    AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ProgressCoalescingKey,
-    ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
-    TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
-    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
-    TurnPermissionAuditRequestKey, TurnRejectedCapability, TurnSkillBinding,
+    AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ItemHeartbeatSource,
+    ProgressCoalescingKey, ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent,
+    ToolResultView, TurnAcceptedCapability, TurnCapabilityAcceptedReason,
+    TurnCapabilityRejectedReason, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
+    TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnRejectedCapability,
+    TurnSkillBinding,
 };
 pub use agent_launch::{
     AgentAuthoredInput, AgentAuthoredInputError, AgentExecutionProfileBackend,

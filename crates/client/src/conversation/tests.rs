@@ -2004,6 +2004,7 @@ fn history_hydration_keeps_dynamic_model_only_body_out_of_desktop_state() {
         arguments: serde_json::json!({}),
         status: pioneer_protocol::ToolCallStatus::Completed,
         recovery_policy: None,
+        execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
         output_policy: ToolOutputPolicySnapshot::for_tool_name("dynamic_tool"),
         display: ToolDisplayPayload::Hidden,
         storage: ToolStoragePayload::Metadata {
@@ -2060,6 +2061,7 @@ fn history_hydration_keeps_dynamic_model_only_body_out_of_desktop_state() {
                     arguments: serde_json::json!({}),
                     status: pioneer_protocol::ToolCallStatus::InProgress,
                     recovery_policy: None,
+                    execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
                     output_policy: ToolOutputPolicySnapshot::for_tool_name("dynamic_tool"),
                     display: ToolDisplayPayload::Hidden,
                     storage: ToolStoragePayload::Metadata {
@@ -2129,6 +2131,7 @@ fn timeout_event_terminalizes_running_item_with_recovery_context() {
             arguments: serde_json::json!({}),
             status: pioneer_protocol::ToolCallStatus::InProgress,
             recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: ToolOutputPolicySnapshot::for_tool_name("web_fetch"),
             display: ToolDisplayPayload::Hidden,
             storage: ToolStoragePayload::Metadata {

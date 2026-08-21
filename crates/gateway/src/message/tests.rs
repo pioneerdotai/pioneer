@@ -25768,6 +25768,7 @@ async fn thread_episodic_store_ingestor_indexes_visible_task_summaries_only() {
             arguments: serde_json::json!({"path":"README.md"}),
             status: ToolCallStatus::Completed,
             recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
             display: ToolDisplayPayload::Summary(ToolOutputSummary {
                 title: "Read README.md".to_owned(),

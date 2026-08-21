@@ -1688,6 +1688,7 @@ mod tests {
                         }),
                         status: ToolCallStatus::Completed,
                         recovery_policy: None,
+                        execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
                         output_policy: ToolOutputPolicySnapshot::for_tool_name("visible_tool"),
                         display: ToolDisplayPayload::Hidden,
                         storage: ToolStoragePayload::Metadata {
@@ -1966,6 +1967,7 @@ mod tests {
                         }),
                         status: ToolCallStatus::Completed,
                         recovery_policy: None,
+                        execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
                         output_policy: ToolOutputPolicySnapshot::for_tool_name("request_tools"),
                         display: ToolDisplayPayload::Hidden,
                         storage: ToolStoragePayload::Metadata {

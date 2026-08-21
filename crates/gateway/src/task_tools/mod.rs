@@ -395,7 +395,7 @@ impl TaskToolProvider for GatewayTaskToolProvider {
                 .task_runtime
                 .service()
                 .wait_tasks(
-                    authorization.wait_context(),
+                    authorization.wait_context(None),
                     TaskWaitParams {
                         task_ids,
                         run_ids: Vec::new(),
@@ -817,11 +817,15 @@ impl TaskToolAuthorizationScope {
         context
     }
 
-    fn wait_context(&self) -> pioneer_tasks::TaskWaitContext {
+    fn wait_context(
+        &self,
+        confirmed_activity: Option<pioneer_tasks::TaskWaitActivityObserver>,
+    ) -> pioneer_tasks::TaskWaitContext {
         pioneer_tasks::TaskWaitContext {
             actor_id: Some(self.principal.principal_id.to_string()),
             task_resource_budget: crate::authorization::AuthorizationService::new()
                 .task_resource_budget(self.principal.kind, self.principal.role_key.as_ref()),
+            confirmed_activity,
         }
     }
 
@@ -1081,12 +1085,12 @@ impl ToolHandler for TaskToolHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-        _trace: pioneer_tools::ToolEventTrace,
+        trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let handler = self.clone();
         let result =
             match task_tool_fresh_task(
-                async move { handler.handle_in_fresh_task(invocation).await },
+                async move { handler.handle_in_fresh_task(invocation, trace).await },
             )
             .await
             {
@@ -1104,6 +1108,7 @@ impl TaskToolHandler {
     async fn handle_in_fresh_task(
         &self,
         invocation: ToolInvocation,
+        trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let authorization =
             resolve_task_tool_authorization_scope(self.processor.as_ref(), &self.context).await?;
@@ -1111,7 +1116,9 @@ impl TaskToolHandler {
             TASK_CREATE_TOOL => {
                 task_tool_future(self.handle_create(invocation, &authorization)).await
             }
-            TASK_WAIT_TOOL => task_tool_future(self.handle_wait(invocation, &authorization)).await,
+            TASK_WAIT_TOOL => {
+                task_tool_future(self.handle_wait(invocation, &authorization, trace)).await
+            }
             TASK_ACCEPT_TOOL => {
                 task_tool_future(self.handle_accept(invocation, &authorization)).await
             }
@@ -1628,7 +1635,9 @@ impl TaskToolHandler {
         &self,
         invocation: ToolInvocation,
         authorization: &TaskToolAuthorizationScope,
+        trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let attempt_id = invocation.attempt_id;
         let current_call_id = invocation.call_id.clone();
         let input: TaskWaitToolInput = decode_tool_args(invocation)?;
         let mut params = input.into_params()?;
@@ -1690,11 +1699,17 @@ impl TaskToolHandler {
             return Ok(function_output(guard_output));
         }
 
+        let confirmed_activity: pioneer_tasks::TaskWaitActivityObserver = Arc::new(move || {
+            trace.emit_heartbeat(attempt_id);
+        });
         let response = self
             .processor
             .task_runtime
             .service()
-            .wait_tasks(authorization.wait_context(), params)
+            .wait_tasks(
+                authorization.wait_context(Some(confirmed_activity)),
+                params,
+            )
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
@@ -3512,15 +3527,18 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_WAIT_TOOL,
-            "Join one or more active attached task ids or run ids using the task event bus. Use once for immediate attached tasks that have a runId or task_create returned waitable=true; by default it returns when all targets are terminal or ready for review, or on timeout. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Do not repeatedly call it for the same task set unless the prior wait timed out.",
+            "Join one or more active attached task ids or run ids using the task event bus. Use once for immediate attached tasks that have a runId or task_create returned waitable=true; by default it returns when all targets are terminal or ready for review. timeoutMs limits only this observation window and returns timedOut=true without cancelling the tasks or failing the parent Turn. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Do not repeatedly call it for the same task set unless the prior wait timed out.",
             task_wait_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Transient,
                 idempotency_mode: ToolIdempotencyMode::Safe,
                 max_attempts: 2,
                 can_resume: true,
-                max_wall_clock_secs: Some(3_600),
+                max_wall_clock_secs: None,
             },
+        )
+        .with_turn_item_execution_class(
+            pioneer_protocol::TurnItemExecutionClass::DurableWait,
         ),
         task_tool_spec(
             TASK_ACCEPT_TOOL,
@@ -5595,14 +5613,18 @@ mod tests {
     }
 
     #[test]
-    fn task_wait_has_long_wall_clock_recovery_budget() {
+    fn task_wait_declares_resumable_durable_observation() {
         let specs = task_tool_specs();
         let task_wait = specs
             .iter()
             .find(|configured| configured.spec.name == TASK_WAIT_TOOL)
             .expect("task_wait spec should exist");
 
-        assert_eq!(task_wait.spec.recovery.max_wall_clock_secs, Some(3_600));
+        assert_eq!(task_wait.spec.recovery.max_wall_clock_secs, None);
+        assert_eq!(
+            task_wait.spec.turn_item_execution_class,
+            pioneer_protocol::TurnItemExecutionClass::DurableWait
+        );
     }
 
     fn sample_task(status: TaskStatus) -> Task {

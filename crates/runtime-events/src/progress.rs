@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemDeltaNotification, ItemDeltaStream,
-    ProgressCoalescingKey, TurnItemType,
+    ItemHeartbeatSource, ProgressCoalescingKey, TurnItemType,
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::broadcast;
@@ -106,6 +106,7 @@ struct PendingHeartbeat {
     turn_id: String,
     item_id: String,
     item_type: TurnItemType,
+    source: ItemHeartbeatSource,
 }
 
 #[derive(Debug, Default)]
@@ -158,6 +159,43 @@ impl ProgressCoalescer {
         item_id: String,
         item_type: TurnItemType,
     ) {
+        self.offer_heartbeat_with_source(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            item_type,
+            ItemHeartbeatSource::OwnerLease,
+        );
+    }
+
+    pub fn offer_confirmed_activity(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: TurnItemType,
+    ) {
+        self.offer_heartbeat_with_source(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            item_type,
+            ItemHeartbeatSource::ConfirmedExternalActivity,
+        );
+    }
+
+    fn offer_heartbeat_with_source(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: TurnItemType,
+        source: ItemHeartbeatSource,
+    ) {
         let mut should_schedule = false;
         {
             let mut state = self
@@ -178,6 +216,18 @@ impl ProgressCoalescer {
                 );
                 return;
             }
+            let source = if matches!(source, ItemHeartbeatSource::ConfirmedExternalActivity)
+                || state.heartbeats.get(&key).is_some_and(|heartbeat| {
+                    matches!(
+                        heartbeat.source,
+                        ItemHeartbeatSource::ConfirmedExternalActivity
+                    )
+                })
+            {
+                ItemHeartbeatSource::ConfirmedExternalActivity
+            } else {
+                ItemHeartbeatSource::OwnerLease
+            };
             state.heartbeats.insert(
                 key,
                 PendingHeartbeat {
@@ -186,6 +236,7 @@ impl ProgressCoalescer {
                     turn_id,
                     item_id,
                     item_type,
+                    source,
                 },
             );
             if !state.flush_scheduled {
@@ -480,6 +531,7 @@ fn heartbeat_event(heartbeat: PendingHeartbeat) -> AgentProgressEvent {
         turn_id: heartbeat.turn_id,
         item_id: heartbeat.item_id,
         item_type: heartbeat.item_type,
+        source: heartbeat.source,
     }
 }
 

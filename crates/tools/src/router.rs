@@ -18,7 +18,7 @@ use crate::visibility::{
     FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilitySnapshot,
     compute_final_tool_visibility, materialized_dynamic_extension_tool_names,
 };
-use pioneer_protocol::TurnExecutionSecuritySnapshot;
+use pioneer_protocol::{TurnExecutionSecuritySnapshot, TurnItemExecutionClass};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -38,6 +38,7 @@ pub struct ToolCall {
     pub tool_name: String,
     pub payload: ToolPayload,
     pub execution_class: ExecutionClass,
+    pub turn_item_execution_class: TurnItemExecutionClass,
     pub recovery: ToolRecoveryMetadata,
     pub permission_metadata: ToolPermissionMetadata,
     pub output_policy: ToolOutputPolicySnapshot,
@@ -279,6 +280,7 @@ impl ToolRouter {
             session_scope_key,
             payload,
             execution_class: configured.execution_class,
+            turn_item_execution_class: configured.spec.turn_item_execution_class,
             recovery: configured.spec.recovery,
             permission_metadata: configured.spec.permission_metadata,
             output_policy: configured.output_policy,

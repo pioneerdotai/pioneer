@@ -5,7 +5,7 @@ use pioneer_protocol::{
     ItemDeltaStream, ItemStartedNotification, LlmRetentionPolicy, StorageOutputPolicy,
     TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolMetadataValue,
     ToolObservation, ToolOutputPolicySnapshot, ToolOutputSummary, ToolRecoveryPolicySnapshot,
-    ToolRecoveryView, ToolStoragePayload, TurnItem, TurnItemType,
+    ToolRecoveryView, ToolStoragePayload, TurnItem, TurnItemExecutionClass, TurnItemType,
 };
 use pioneer_tools::{ToolDeltaPayload, ToolEvent, ToolEventPayload, ToolOutcome, ToolResultView};
 use serde_json::Value as JsonValue;
@@ -28,6 +28,7 @@ pub(super) async fn forward_tool_event_to_agent(
                 tool_name,
                 arguments,
                 recovery_policy,
+                turn_item_execution_class,
                 output_policy,
                 should_emit_started,
                 latest_observation,
@@ -46,6 +47,7 @@ pub(super) async fn forward_tool_event_to_agent(
                 if state.recovery_policy.is_none() {
                     state.recovery_policy = started.recovery_policy.clone();
                 }
+                state.turn_item_execution_class = started.turn_item_execution_class;
                 state.output_policy = Some(started.output_policy.clone());
                 state.latest_observation = observation.clone();
                 let should_emit_started = if state.started_sent {
@@ -63,6 +65,7 @@ pub(super) async fn forward_tool_event_to_agent(
                     state.tool_name.clone(),
                     parse_arguments_json(arguments.as_str()),
                     state.recovery_policy.clone(),
+                    state.turn_item_execution_class,
                     started.output_policy,
                     should_emit_started,
                     state.latest_observation.clone(),
@@ -81,12 +84,30 @@ pub(super) async fn forward_tool_event_to_agent(
                                 tool_name,
                                 arguments,
                                 recovery_policy,
+                                turn_item_execution_class,
                                 output_policy,
                                 latest_observation,
                             )),
                         },
                     })
                     .await?;
+            }
+        }
+        ToolEventPayload::Heartbeat => {
+            let should_forward = {
+                let pending = pending_tool_ui.lock().await;
+                pending
+                    .get(event.call_id.as_str())
+                    .is_some_and(|state| state.started_sent)
+            };
+            if should_forward {
+                event_tx.publish_confirmed_activity(
+                    workspace_id.to_owned(),
+                    thread_id.to_owned(),
+                    turn_id.to_owned(),
+                    event.call_id,
+                    tool_item_type_from_name(event.tool_name.as_str()),
+                );
             }
         }
         ToolEventPayload::PermissionAudit(audit_event) => {
@@ -133,7 +154,14 @@ pub(super) async fn forward_tool_event_to_agent(
             }
         }
         ToolEventPayload::CallCompleted(completed) => {
-            let (tool_name, arguments, recovery_policy, should_emit_started, state_observation) = {
+            let (
+                tool_name,
+                arguments,
+                recovery_policy,
+                turn_item_execution_class,
+                should_emit_started,
+                state_observation,
+            ) = {
                 let mut pending = pending_tool_ui.lock().await;
                 let mut state = pending.remove(event.call_id.as_str()).unwrap_or_default();
                 if state.tool_name.is_empty() {
@@ -150,6 +178,7 @@ pub(super) async fn forward_tool_event_to_agent(
                     state.tool_name,
                     parse_arguments_json(arguments.as_str()),
                     state.recovery_policy,
+                    state.turn_item_execution_class,
                     should_emit_started,
                     state.latest_observation,
                 )
@@ -167,6 +196,7 @@ pub(super) async fn forward_tool_event_to_agent(
                                 tool_name.clone(),
                                 arguments.clone(),
                                 recovery_policy.clone(),
+                                turn_item_execution_class,
                                 completed.output_policy.clone(),
                                 state_observation.clone(),
                             )),
@@ -192,6 +222,7 @@ pub(super) async fn forward_tool_event_to_agent(
                             outcome: Some(outcome),
                             output_policy: completed.output_policy,
                             recovery_policy,
+                            turn_item_execution_class,
                             display: completed.display,
                             storage: completed.storage,
                             recovery: completed.recovery,
@@ -202,7 +233,14 @@ pub(super) async fn forward_tool_event_to_agent(
                 .await?;
         }
         ToolEventPayload::CallFailed(failed) => {
-            let (tool_name, arguments, recovery_policy, should_emit_started, state_observation) = {
+            let (
+                tool_name,
+                arguments,
+                recovery_policy,
+                turn_item_execution_class,
+                should_emit_started,
+                state_observation,
+            ) = {
                 let mut pending = pending_tool_ui.lock().await;
                 let mut state = pending.remove(event.call_id.as_str()).unwrap_or_default();
                 if state.tool_name.is_empty() {
@@ -219,6 +257,7 @@ pub(super) async fn forward_tool_event_to_agent(
                     state.tool_name,
                     parse_arguments_json(arguments.as_str()),
                     state.recovery_policy,
+                    state.turn_item_execution_class,
                     should_emit_started,
                     state.latest_observation,
                 )
@@ -236,6 +275,7 @@ pub(super) async fn forward_tool_event_to_agent(
                                 tool_name.clone(),
                                 arguments.clone(),
                                 recovery_policy.clone(),
+                                turn_item_execution_class,
                                 failed.output_policy.clone(),
                                 state_observation.clone(),
                             )),
@@ -261,6 +301,7 @@ pub(super) async fn forward_tool_event_to_agent(
                             outcome: Some(outcome),
                             output_policy: failed.output_policy,
                             recovery_policy,
+                            turn_item_execution_class,
                             display: failed.display,
                             storage: failed.storage,
                             recovery: failed.recovery,
@@ -736,6 +777,7 @@ pub(super) struct ProjectedToolItemInput {
     pub outcome: Option<pioneer_protocol::ToolOutcome>,
     pub output_policy: ToolOutputPolicySnapshot,
     pub recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+    pub turn_item_execution_class: TurnItemExecutionClass,
     pub display: ToolDisplayPayload,
     pub storage: ToolStoragePayload,
     pub recovery: Option<ToolRecoveryView>,
@@ -748,6 +790,7 @@ impl ProjectedToolItemInput {
         tool_name: String,
         arguments: JsonValue,
         recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+        turn_item_execution_class: TurnItemExecutionClass,
         output_policy: ToolOutputPolicySnapshot,
         observation: Option<ToolObservation>,
     ) -> Self {
@@ -760,6 +803,7 @@ impl ProjectedToolItemInput {
             outcome: None,
             output_policy,
             recovery_policy,
+            turn_item_execution_class,
             display: ToolDisplayPayload::Progress {
                 stage: "running".to_owned(),
                 metadata: ToolMetadata::empty(),
@@ -779,6 +823,7 @@ impl ProjectedToolItemInput {
         error: String,
         outcome: pioneer_protocol::ToolOutcome,
         recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+        turn_item_execution_class: TurnItemExecutionClass,
         output_policy: ToolOutputPolicySnapshot,
         observation: Option<ToolObservation>,
     ) -> Self {
@@ -801,6 +846,7 @@ impl ProjectedToolItemInput {
             outcome: Some(outcome.clone()),
             output_policy,
             recovery_policy,
+            turn_item_execution_class,
             display,
             storage,
             recovery: recovery_view_from_outcome(Some(&outcome)),
@@ -814,6 +860,7 @@ pub(super) fn build_started_tool_turn_item(
     tool_name: String,
     arguments: String,
     recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+    turn_item_execution_class: TurnItemExecutionClass,
     output_policy: Option<ToolOutputPolicySnapshot>,
     observation: Option<ToolObservation>,
 ) -> TurnItem {
@@ -824,6 +871,7 @@ pub(super) fn build_started_tool_turn_item(
         tool_name,
         parse_arguments_json(arguments.as_str()),
         recovery_policy,
+        turn_item_execution_class,
         output_policy,
         observation,
     ))
@@ -836,6 +884,7 @@ pub(super) fn build_failed_tool_turn_item(
     error: String,
     outcome: ToolOutcome,
     recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+    turn_item_execution_class: TurnItemExecutionClass,
     output_policy: Option<ToolOutputPolicySnapshot>,
     observation: Option<ToolObservation>,
 ) -> TurnItem {
@@ -848,6 +897,7 @@ pub(super) fn build_failed_tool_turn_item(
         error,
         protocol_outcome_from_tool_outcome(&outcome),
         recovery_policy,
+        turn_item_execution_class,
         output_policy,
         observation,
     ))
@@ -858,6 +908,7 @@ pub(super) fn build_completed_tool_turn_item(
     tool_name: String,
     arguments: String,
     recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+    turn_item_execution_class: TurnItemExecutionClass,
     output_policy: Option<ToolOutputPolicySnapshot>,
     observation: Option<ToolObservation>,
 ) -> TurnItem {
@@ -880,6 +931,7 @@ pub(super) fn build_completed_tool_turn_item(
         outcome: None,
         output_policy,
         recovery_policy,
+        turn_item_execution_class,
         display,
         storage,
         recovery: None,
@@ -928,6 +980,7 @@ pub(super) fn build_tool_turn_item(input: ProjectedToolItemInput) -> TurnItem {
         outcome,
         output_policy,
         recovery_policy,
+        turn_item_execution_class,
         display,
         storage,
         recovery,
@@ -1232,6 +1285,7 @@ pub(super) fn build_tool_turn_item(input: ProjectedToolItemInput) -> TurnItem {
                 tool_name,
                 arguments: arguments_json,
                 status,
+                execution_class: turn_item_execution_class,
                 recovery_policy,
                 output_policy,
                 display: display_projection
@@ -1501,6 +1555,7 @@ mod tests {
             "tool not visible: hidden_tool".to_owned(),
             outcome,
             None,
+            TurnItemExecutionClass::Standard,
             None,
             None,
         );
@@ -1545,6 +1600,7 @@ mod tests {
                 Some("target not found".to_owned()),
             ),
             None,
+            TurnItemExecutionClass::Standard,
             Some(ToolOutputPolicySnapshot::for_tool_name("computer_use")),
             None,
         );

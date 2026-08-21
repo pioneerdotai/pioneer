@@ -6,7 +6,8 @@ use crate::output_policy::{
 };
 use pioneer_protocol::{
     ItemDeltaStream, ProtocolEventClass, StorageOutputPolicy, TimelineOutputPolicy, ToolMetadata,
-    ToolOutputSummary, ToolRecoveryPolicySnapshot, TurnPermissionAuditEvent,
+    ToolOutputSummary, ToolRecoveryPolicySnapshot, TurnItemExecutionClass,
+    TurnPermissionAuditEvent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -22,6 +23,7 @@ use tracing::debug;
 #[serde(rename_all = "snake_case")]
 pub enum ToolEventKind {
     CallStarted,
+    Heartbeat,
     PermissionAudit,
     OutputDelta,
     CallCompleted,
@@ -32,6 +34,7 @@ pub enum ToolEventKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolEventPayload {
     CallStarted(ToolCallStartedEvent),
+    Heartbeat,
     PermissionAudit(TurnPermissionAuditEvent),
     OutputDelta(ToolOutputDeltaEvent),
     CallCompleted(ToolCallCompletedEvent),
@@ -42,6 +45,7 @@ impl ToolEventPayload {
     pub fn kind(&self) -> ToolEventKind {
         match self {
             Self::CallStarted(_) => ToolEventKind::CallStarted,
+            Self::Heartbeat => ToolEventKind::Heartbeat,
             Self::PermissionAudit(_) => ToolEventKind::PermissionAudit,
             Self::OutputDelta(_) => ToolEventKind::OutputDelta,
             Self::CallCompleted(_) => ToolEventKind::CallCompleted,
@@ -51,7 +55,7 @@ impl ToolEventPayload {
 
     pub fn event_class(&self) -> ProtocolEventClass {
         match self {
-            Self::OutputDelta(_) => ProtocolEventClass::Progress,
+            Self::Heartbeat | Self::OutputDelta(_) => ProtocolEventClass::Progress,
             Self::CallStarted(_)
             | Self::PermissionAudit(_)
             | Self::CallCompleted(_)
@@ -67,6 +71,8 @@ pub struct ToolCallStartedEvent {
     pub arguments: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+    #[serde(default)]
+    pub turn_item_execution_class: TurnItemExecutionClass,
     pub output_policy: ToolOutputPolicySnapshot,
 }
 
@@ -268,6 +274,7 @@ impl ToolEventTrace {
         attempt_id: u32,
         arguments: Option<JsonValue>,
         recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+        turn_item_execution_class: TurnItemExecutionClass,
         output_policy: ToolOutputPolicySnapshot,
     ) -> Result<(), ToolError> {
         self.event_bus
@@ -278,10 +285,21 @@ impl ToolEventTrace {
                 ToolEventPayload::CallStarted(ToolCallStartedEvent {
                     arguments,
                     recovery_policy,
+                    turn_item_execution_class,
                     output_policy,
                 }),
             )
             .await
+    }
+
+    /// Publish confirmed liveness without inventing visible tool output.
+    pub fn emit_heartbeat(&self, attempt_id: u32) {
+        self.event_bus.emit_progress(
+            self,
+            attempt_id,
+            "runtime.call.heartbeat",
+            ToolEventPayload::Heartbeat,
+        );
     }
 
     pub fn emit_delta(&self, attempt_id: u32, text: String) {
@@ -708,7 +726,13 @@ mod tests {
         let started_trace = trace.clone();
         let started = tokio::spawn(async move {
             started_trace
-                .emit_started(1, None, None, output_policy)
+                .emit_started(
+                    1,
+                    None,
+                    None,
+                    TurnItemExecutionClass::Standard,
+                    output_policy,
+                )
                 .await
         });
         tokio::pin!(started);
@@ -772,6 +796,7 @@ mod tests {
                     2,
                     None,
                     None,
+                    TurnItemExecutionClass::Standard,
                     ToolOutputPolicySnapshot::for_tool_name("test_tool"),
                 )
                 .await

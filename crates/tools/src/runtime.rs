@@ -149,6 +149,7 @@ impl ToolCallRuntime {
                 1,
                 Some(payload_arguments_json(&call.payload)),
                 None,
+                call.turn_item_execution_class,
                 call.output_policy.clone(),
             )
             .await?;
@@ -628,6 +629,7 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
             execution_class: class,
+            turn_item_execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             output_policy: crate::output_policy::ToolOutputPolicySnapshot::for_tool_name(tool_name),
@@ -649,6 +651,7 @@ mod tests {
                 max_output_tokens: None,
             })),
             execution_class: ExecutionClass::SessionScoped,
+            turn_item_execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             output_policy: crate::output_policy::ToolOutputPolicySnapshot::for_tool_name(tool_name),
@@ -927,6 +930,7 @@ mod tests {
 
             match event.kind() {
                 ToolEventKind::CallStarted => seen_started = true,
+                ToolEventKind::Heartbeat => {}
                 ToolEventKind::PermissionAudit => {}
                 ToolEventKind::OutputDelta => seen_delta = true,
                 ToolEventKind::CallCompleted => {

@@ -238,6 +238,23 @@ impl ExecutionEventHub {
             .offer_heartbeat(workspace_id, thread_id, turn_id, item_id, item_type);
     }
 
+    pub fn publish_confirmed_activity(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: TurnItemType,
+    ) {
+        self.progress.offer_confirmed_activity(
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            item_type,
+        );
+    }
+
     pub fn subscribe_live(&self) -> broadcast::Receiver<AgentProgressEvent> {
         self.progress.subscribe_live()
     }

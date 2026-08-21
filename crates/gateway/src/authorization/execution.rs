@@ -2419,6 +2419,7 @@ impl ExecutionAuthorizationContext {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_skill_projection(
         &mut self,
         workspace_id: &str,

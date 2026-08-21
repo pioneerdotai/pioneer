@@ -57,13 +57,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, MissedTickBehavior, interval, timeout};
+use tokio::time::{Duration, Instant, MissedTickBehavior, interval, timeout};
 use tracing::warn;
 
 const ID_LEN: usize = 21;
 const DEFAULT_MAX_TASK_DEPTH: i64 = 3;
 const MAX_ROOT_TASK_DEPTH_LIMIT: i64 = 10;
 const WAIT_RESCAN_INTERVAL: Duration = Duration::from_millis(250);
+const WAIT_LIVENESS_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
@@ -2106,13 +2107,11 @@ impl TaskService {
                 budget.max_wait_targets
             );
         }
-        params.timeout_ms = Some(
-            params
-                .timeout_ms
-                .unwrap_or(budget.max_wait_duration_ms)
-                .min(budget.max_wait_duration_ms)
-                .max(1),
-        );
+        // A requested timeout bounds only this observation call. Omitting it
+        // keeps the join open; it must never become a hidden Task lifetime.
+        params.timeout_ms = params
+            .timeout_ms
+            .map(|timeout_ms| timeout_ms.min(budget.max_wait_duration_ms).max(1));
         if !params.return_completed && !params.return_pending {
             params.return_completed = true;
             params.return_pending = true;
@@ -2143,19 +2142,36 @@ impl TaskService {
             return Ok(after_subscribe);
         }
 
+        let confirmed_activity = context.confirmed_activity.clone();
+        let initial_frontier = if confirmed_activity.is_some() {
+            self.collect_confirmed_wait_activity_frontier(&plan)
+                .await?
+        } else {
+            BTreeMap::new()
+        };
+        if !initial_frontier.is_empty()
+            && let Some(observer) = confirmed_activity.as_ref()
+        {
+            observer();
+        }
+
         let wait_future = async {
             let mut bus_closed = false;
             let mut rescan = interval(WAIT_RESCAN_INTERVAL);
             rescan.set_missed_tick_behavior(MissedTickBehavior::Delay);
             rescan.tick().await;
+            let mut activity_frontier = initial_frontier;
+            let mut next_liveness_scan = Instant::now() + WAIT_LIVENESS_SCAN_INTERVAL;
             loop {
+                let mut durable_target_event = false;
                 if bus_closed {
                     rescan.tick().await;
                 } else {
                     tokio::select! {
                         delivery = subscription.recv() => {
                             match delivery {
-                                TaskEventWakeDelivery::Wake(_) | TaskEventWakeDelivery::Lagged(_) => {}
+                                TaskEventWakeDelivery::Wake(_) => durable_target_event = true,
+                                TaskEventWakeDelivery::Lagged(_) => {}
                                 TaskEventWakeDelivery::Closed => bus_closed = true,
                             }
                         }
@@ -2164,23 +2180,72 @@ impl TaskService {
                 }
 
                 let response = self.collect_wait_state_for_plan(&plan).await?;
+                if durable_target_event
+                    && let Some(observer) = confirmed_activity.as_ref()
+                {
+                    observer();
+                }
+                if confirmed_activity.is_some() && Instant::now() >= next_liveness_scan {
+                    let next_frontier = self
+                        .collect_confirmed_wait_activity_frontier(&plan)
+                        .await?;
+                    if wait_activity_frontier_advanced(&activity_frontier, &next_frontier)
+                        && let Some(observer) = confirmed_activity.as_ref()
+                    {
+                        observer();
+                    }
+                    activity_frontier = next_frontier;
+                    next_liveness_scan = Instant::now() + WAIT_LIVENESS_SCAN_INTERVAL;
+                }
                 if wait_condition_satisfied(&response) {
                     return Ok(response);
                 }
             }
         };
 
-        let timeout_ms = params
-            .timeout_ms
-            .expect("Task wait admission always establishes a deadline");
-        match timeout(Duration::from_millis(timeout_ms), wait_future).await {
-            Ok(response) => response,
-            Err(_) => {
-                let mut response = self.collect_wait_state_for_plan(&plan).await?;
-                response.timed_out = true;
-                Ok(response)
+        match params.timeout_ms {
+            Some(timeout_ms) => match timeout(Duration::from_millis(timeout_ms), wait_future).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let mut response = self.collect_wait_state_for_plan(&plan).await?;
+                    response.timed_out = true;
+                    Ok(response)
+                }
+            },
+            None => wait_future.await,
+        }
+    }
+
+    async fn collect_confirmed_wait_activity_frontier(
+        &self,
+        plan: &WaitTargetPlan,
+    ) -> TaskRuntimeResult<BTreeMap<String, i64>> {
+        // Liveness supervision is independent from the caller's response
+        // projection. A caller may omit pending items from its output without
+        // hiding the executions that keep this wait alive.
+        let mut activity_plan = plan.clone();
+        activity_plan.wait_params.return_completed = false;
+        activity_plan.wait_params.return_pending = true;
+        let response = self.collect_wait_state_for_plan(&activity_plan).await?;
+        let now = now_timestamp_secs();
+        let mut frontier = BTreeMap::new();
+        for item in response.pending {
+            let Some(run) = item.run.as_ref() else {
+                continue;
+            };
+            let Some(execution) = self.store.load_execution_for_run(run.id.as_str()).await? else {
+                continue;
+            };
+            if execution.status.is_terminal()
+                || execution.lease_until.is_none_or(|lease_until| lease_until <= now)
+            {
+                continue;
+            }
+            if let Some(heartbeat_at) = execution.heartbeat_at {
+                frontier.insert(run.id.clone(), heartbeat_at);
             }
         }
+        Ok(frontier)
     }
 
     async fn wait_scope_key(
@@ -5759,6 +5824,17 @@ fn wait_condition_satisfied(response: &TaskWaitResponse) -> bool {
             response.terminal_count > 0 || response.review_required_count > 0 || waitable_total == 0
         }
     }
+}
+
+fn wait_activity_frontier_advanced(
+    previous: &BTreeMap<String, i64>,
+    current: &BTreeMap<String, i64>,
+) -> bool {
+    current.iter().any(|(run_id, heartbeat_at)| {
+        previous
+            .get(run_id)
+            .is_none_or(|previous_heartbeat| heartbeat_at > previous_heartbeat)
+    })
 }
 
 pub(crate) fn task_error(

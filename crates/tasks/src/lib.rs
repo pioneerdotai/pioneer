@@ -34,8 +34,8 @@ pub use invariant::{
 pub use notifications::TaskNotificationMapper;
 pub use policy::{
     TaskAgentAuthorizationGrantSeed, TaskCreateContext, TaskExecutionAdmissionSeed,
-    TaskMutationContext, TaskRunConversationSnapshotSeed, TaskWaitContext, default_delivery_policy,
-    default_lifecycle_policy,
+    TaskMutationContext, TaskRunConversationSnapshotSeed, TaskWaitActivityObserver,
+    TaskWaitContext, default_delivery_policy, default_lifecycle_policy,
 };
 pub use projector::TaskProjector;
 pub use reconciliation::{ReconciliationReport, TaskStartupReconciler};

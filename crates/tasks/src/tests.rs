@@ -6129,7 +6129,7 @@ async fn wait_timeout_returns_partial_pending_state() {
 }
 
 #[tokio::test]
-async fn wait_without_requested_timeout_uses_the_role_deadline() {
+async fn wait_with_requested_timeout_uses_the_observation_deadline() {
     let runtime = runtime().await;
     let response = runtime
         .service()
@@ -6156,14 +6156,14 @@ async fn wait_without_requested_timeout_uses_the_role_deadline() {
             TaskWaitParams {
                 task_ids: vec![response.task.id],
                 run_ids: Vec::new(),
-                timeout_ms: None,
+                timeout_ms: Some(50),
                 return_completed: true,
                 return_pending: true,
                 ..Default::default()
             },
         )
         .await
-        .expect("wait should return control at the role deadline");
+        .expect("wait should return control at the observation deadline");
 
     assert!(waited.timed_out);
     assert_eq!(waited.pending.len(), 1);

@@ -447,6 +447,8 @@ pub enum AgentProgressEvent {
         turn_id: String,
         item_id: String,
         item_type: TurnItemType,
+        #[serde(default)]
+        source: ItemHeartbeatSource,
     },
     ToolOutputDelta {
         workspace_id: String,
@@ -468,6 +470,16 @@ pub enum AgentProgressEvent {
         run_id: Option<String>,
         summary: String,
     },
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemHeartbeatSource {
+    #[default]
+    OwnerLease,
+    ConfirmedExternalActivity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]

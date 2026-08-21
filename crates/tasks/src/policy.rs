@@ -4,6 +4,7 @@ use pioneer_protocol::{
     TaskOwnerKind, TaskParentTerminalAction, TaskRetryBackoffKind, TaskRetryPolicy,
     TaskTriggerKind,
 };
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRunConversationSnapshotSeed {
@@ -113,10 +114,26 @@ impl TaskMutationContext {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+pub type TaskWaitActivityObserver = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct TaskWaitContext {
     pub actor_id: Option<String>,
     pub task_resource_budget: Option<pioneer_protocol::TaskResourceBudget>,
+    /// Called only when durable Task state or a live execution heartbeat
+    /// proves that an observed target is still making progress.
+    pub confirmed_activity: Option<TaskWaitActivityObserver>,
+}
+
+impl std::fmt::Debug for TaskWaitContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TaskWaitContext")
+            .field("actor_id", &self.actor_id)
+            .field("task_resource_budget", &self.task_resource_budget)
+            .field("confirmed_activity", &self.confirmed_activity.is_some())
+            .finish()
+    }
 }
 
 pub fn default_lifecycle_policy(

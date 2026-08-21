@@ -1,4 +1,4 @@
-use pioneer_protocol::SkillId;
+use pioneer_protocol::{SkillId, TurnItemExecutionClass};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -130,6 +130,10 @@ pub struct ToolSpec {
     pub parameters: JsonValue,
     pub payload_kind: PayloadKind,
     pub recovery: ToolRecoveryMetadata,
+    /// Operational timeout/liveness semantics projected onto the durable
+    /// Turn-item attempt. Tool scheduling and UI item type remain independent.
+    #[serde(default)]
+    pub turn_item_execution_class: TurnItemExecutionClass,
     #[serde(default)]
     pub permission_metadata: ToolPermissionMetadata,
 }
@@ -147,12 +151,21 @@ impl ToolSpec {
             parameters,
             payload_kind,
             recovery: ToolRecoveryMetadata::default(),
+            turn_item_execution_class: TurnItemExecutionClass::Standard,
             permission_metadata: ToolPermissionMetadata::default(),
         }
     }
 
     pub fn with_recovery(mut self, recovery: ToolRecoveryMetadata) -> Self {
         self.recovery = recovery;
+        self
+    }
+
+    pub fn with_turn_item_execution_class(
+        mut self,
+        execution_class: TurnItemExecutionClass,
+    ) -> Self {
+        self.turn_item_execution_class = execution_class;
         self
     }
 
@@ -203,6 +216,14 @@ impl ConfiguredToolSpec {
 
     pub fn with_payload_binding(mut self, payload_binding: ToolPayloadBinding) -> Self {
         self.payload_binding = payload_binding;
+        self
+    }
+
+    pub fn with_turn_item_execution_class(
+        mut self,
+        execution_class: TurnItemExecutionClass,
+    ) -> Self {
+        self.spec.turn_item_execution_class = execution_class;
         self
     }
 }

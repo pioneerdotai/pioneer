@@ -3085,18 +3085,30 @@ impl MessageProcessor {
                 turn_id,
                 item_id,
                 item_type,
+                source,
             } => {
                 let event_timestamp = now_timestamp_secs();
-                if let Err(error) = self
-                    .timeout_supervisor
-                    .heartbeat_item_attempt(
-                        turn_id.as_str(),
-                        item_id.as_str(),
-                        item_type,
-                        event_timestamp,
-                    )
-                    .await
-                {
+                let heartbeat = match source {
+                    pioneer_protocol::ItemHeartbeatSource::OwnerLease => self
+                        .timeout_supervisor
+                        .heartbeat_item_attempt(
+                            turn_id.as_str(),
+                            item_id.as_str(),
+                            item_type,
+                            event_timestamp,
+                        )
+                        .await,
+                    pioneer_protocol::ItemHeartbeatSource::ConfirmedExternalActivity => self
+                        .timeout_supervisor
+                        .heartbeat_item_attempt_from_confirmed_external_activity(
+                            turn_id.as_str(),
+                            item_id.as_str(),
+                            item_type,
+                            event_timestamp,
+                        )
+                        .await,
+                };
+                if let Err(error) = heartbeat {
                     warn!(
                         thread_id,
                         turn_id,

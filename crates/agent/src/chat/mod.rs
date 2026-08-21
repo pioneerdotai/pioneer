@@ -80,7 +80,8 @@ use pioneer_protocol::{
     TurnCapabilityAcceptedReason, TurnCapabilityKind, TurnCapabilityRejectedReason,
     TurnExecutionSecuritySnapshot, TurnExecutionWindowCheckpointedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
-    TurnItemType, TurnPermissionProfileSnapshot, TurnRejectedCapability, UserInput,
+    TurnItemExecutionClass, TurnItemType, TurnPermissionProfileSnapshot, TurnRejectedCapability,
+    UserInput,
     build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
     build_execution_checkpoint_provider_budget_summary, generate_id,
 };
@@ -181,6 +182,7 @@ struct PendingToolUiState {
     tool_name: String,
     arguments: String,
     recovery_policy: Option<ToolRecoveryPolicySnapshot>,
+    turn_item_execution_class: TurnItemExecutionClass,
     output_policy: Option<pioneer_protocol::ToolOutputPolicySnapshot>,
     latest_observation: Option<pioneer_protocol::ToolObservation>,
     started_sent: bool,
@@ -4144,7 +4146,12 @@ async fn execute_agent_provider_response(
                 }
                 event = tool_progress_rx.recv() => {
                     match event {
-                        Ok(event) if matches!(&event.payload, ToolEventPayload::OutputDelta(_)) => {
+                        Ok(event)
+                            if matches!(
+                                &event.payload,
+                                ToolEventPayload::Heartbeat | ToolEventPayload::OutputDelta(_)
+                            ) =>
+                        {
                             tooling::forward_tool_event_to_agent(
                                 event,
                                 &event_tx_for_tools,
@@ -5438,6 +5445,10 @@ async fn execute_agent_provider_response(
                             .unwrap_or_else(|| {
                                 tool_recovery_policy::conservative_no_recovery_snapshot(item_type)
                             });
+                        let turn_item_execution_class = router
+                            .find_spec(tool_name.as_str())
+                            .map(|configured| configured.spec.turn_item_execution_class)
+                            .unwrap_or_default();
 
                         {
                             let mut pending = pending_tool_ui.lock().await;
@@ -5445,6 +5456,7 @@ async fn execute_agent_provider_response(
                             state.tool_name = tool_name.clone();
                             state.arguments = arguments.clone();
                             state.recovery_policy = Some(recovery_policy.clone());
+                            state.turn_item_execution_class = turn_item_execution_class;
                             state.output_policy = router
                                 .find_spec(tool_name.as_str())
                                 .map(|configured| configured.output_policy.clone());
@@ -5479,6 +5491,7 @@ async fn execute_agent_provider_response(
                                             tool_name.clone(),
                                             arguments.clone(),
                                             Some(recovery_policy.clone()),
+                                            turn_item_execution_class,
                                             output_policy.clone(),
                                             None,
                                         ),
@@ -5500,6 +5513,7 @@ async fn execute_agent_provider_response(
                                             message.clone(),
                                             outcome.clone(),
                                             Some(recovery_policy.clone()),
+                                            turn_item_execution_class,
                                             output_policy,
                                             None,
                                         ),
@@ -5601,6 +5615,7 @@ async fn execute_agent_provider_response(
                                                 tool_name.clone(),
                                                 arguments.clone(),
                                                 Some(recovery_policy.clone()),
+                                                turn_item_execution_class,
                                                 output_policy.clone(),
                                                 None,
                                             ),
@@ -5623,6 +5638,7 @@ async fn execute_agent_provider_response(
                                                 error_text.clone(),
                                                 outcome.clone(),
                                                 Some(recovery_policy.clone()),
+                                                turn_item_execution_class,
                                                 output_policy,
                                                 None,
                                             ),
@@ -5720,6 +5736,7 @@ async fn execute_agent_provider_response(
                                                     tool_name.clone(),
                                                     arguments.clone(),
                                                     Some(recovery_policy.clone()),
+                                                    turn_item_execution_class,
                                                     output_policy.clone(),
                                                     None,
                                                 ),
@@ -5741,6 +5758,7 @@ async fn execute_agent_provider_response(
                                                     error_text.clone(),
                                                     outcome.clone(),
                                                     Some(recovery_policy.clone()),
+                                                    turn_item_execution_class,
                                                     output_policy,
                                                     None,
                                                 ),
@@ -5944,6 +5962,7 @@ async fn execute_agent_provider_response(
                                             text.clone(),
                                             outcome.clone(),
                                             None,
+                                            TurnItemExecutionClass::Standard,
                                             None,
                                             None,
                                         ),

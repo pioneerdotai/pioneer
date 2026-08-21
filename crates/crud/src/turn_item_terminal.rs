@@ -465,6 +465,7 @@ mod tests {
             arguments: json!({"pattern":"x"}),
             status: ToolCallStatus::InProgress,
             recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
             output_policy: ToolOutputPolicySnapshot::for_tool_name("grep_files"),
             display: ToolDisplayPayload::Progress {
                 stage: "running".to_owned(),

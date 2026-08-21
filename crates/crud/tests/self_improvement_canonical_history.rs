@@ -163,6 +163,7 @@ fn tool_item(status: ToolCallStatus, success: Option<bool>) -> TurnItem {
         }),
         status,
         recovery_policy: None,
+        execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
         output_policy: ToolOutputPolicySnapshot::for_tool_name("request_tools"),
         display: ToolDisplayPayload::Hidden,
         storage: ToolStoragePayload::Metadata {

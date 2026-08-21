@@ -3066,7 +3066,16 @@ pub enum TurnItemType {
 pub enum TurnItemExecutionClass {
     #[default]
     Standard,
+    /// A durable observation whose lifetime is renewed only by confirmed
+    /// activity from the external execution it is joining.
+    DurableWait,
     ContextCompaction,
+}
+
+impl TurnItemExecutionClass {
+    pub const fn is_standard(&self) -> bool {
+        matches!(self, Self::Standard)
+    }
 }
 
 impl TurnItemType {
@@ -4153,6 +4162,10 @@ pub enum TurnItem {
         tool_name: String,
         arguments: JsonValue,
         status: ToolCallStatus,
+        /// Operational supervision semantics declared by the tool contract.
+        /// This is independent from the presentation-level item type.
+        #[serde(default, skip_serializing_if = "TurnItemExecutionClass::is_standard")]
+        execution_class: TurnItemExecutionClass,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery_policy: Option<ToolRecoveryPolicySnapshot>,
         output_policy: ToolOutputPolicySnapshot,
@@ -4209,6 +4222,9 @@ impl TurnItem {
     /// operational semantics from presentation payloads.
     pub fn execution_class(&self) -> TurnItemExecutionClass {
         match self {
+            Self::DynamicToolCall {
+                execution_class, ..
+            } => *execution_class,
             Self::SystemEvent { code, details, .. }
                 if code.as_deref() == Some("agent_context_compaction")
                     && details
@@ -6791,6 +6807,7 @@ mod tests {
                 arguments: json!({}),
                 status: ToolCallStatus::InProgress,
                 recovery_policy,
+                execution_class: TurnItemExecutionClass::Standard,
                 output_policy: ToolOutputPolicySnapshot::for_tool_name("dynamic"),
                 display: ToolDisplayPayload::default(),
                 storage: ToolStoragePayload::default(),
