@@ -25,7 +25,9 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use pioneer_client::timeline::rows::UserMessagePresentation;
-use pioneer_protocol::{PersistedActorRef, PrincipalId, TurnAuthorSnapshot};
+use pioneer_protocol::{
+    MemberSummary, PersistedActorRef, PrincipalId, TurnAuthorSnapshot, WorkspaceId,
+};
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -69,8 +71,9 @@ struct TimelineAuthorPresentation {
 
 fn resolve_timeline_author_presentation(
     author: Option<&TurnAuthorSnapshot>,
+    current_member: Option<&MemberSummary>,
 ) -> TimelineAuthorPresentation {
-    TimelineAuthorPresentation {
+    let fallback = || TimelineAuthorPresentation {
         principal_id: author.and_then(|author| match &author.actor {
             PersistedActorRef::Principal(principal_id) => Some(principal_id.clone()),
             PersistedActorRef::AgentExecution(_) => None,
@@ -84,14 +87,31 @@ fn resolve_timeline_author_presentation(
             .map(|author| author.nickname.trim().to_owned())
             .unwrap_or_default(),
         avatar_revision: author.and_then(|author| author.avatar_revision.clone()),
+    };
+
+    let Some(author) = author else {
+        return fallback();
+    };
+    let PersistedActorRef::Principal(principal_id) = &author.actor else {
+        return fallback();
+    };
+    let Some(member) = current_member.filter(|member| member.principal_id == *principal_id) else {
+        return fallback();
+    };
+
+    TimelineAuthorPresentation {
+        principal_id: Some(principal_id.clone()),
+        display_name: member.display_name.trim().to_owned(),
+        nickname: member.nickname.trim().to_owned(),
+        avatar_revision: member.avatar_revision.clone(),
     }
 }
 
 fn timeline_agent_label(author: Option<&TurnAuthorSnapshot>) -> Option<String> {
     let author = timeline_agent_execution_author(author)?;
-    let agent = timeline_agent_presentation(Some(author))?;
-    let display_name = agent.display_name.trim();
-    let nickname = agent.nickname.trim();
+    timeline_agent_presentation(Some(author))?;
+    let display_name = author.display_name.trim();
+    let nickname = author.nickname.trim();
     match (display_name.is_empty(), nickname.is_empty()) {
         (true, true) => None,
         (true, false) => Some(format!("@{nickname}")),
@@ -190,7 +210,41 @@ impl PioneerDesktop {
         &self,
         author: Option<&TurnAuthorSnapshot>,
     ) -> TimelineAuthorPresentation {
-        resolve_timeline_author_presentation(author)
+        let Some(PersistedActorRef::Principal(principal_id)) = author.map(|author| &author.actor)
+        else {
+            return resolve_timeline_author_presentation(author, None);
+        };
+
+        if let Some(auth) = self
+            .gateway
+            .current_auth
+            .as_ref()
+            .filter(|auth| auth.principal.id == *principal_id)
+        {
+            return TimelineAuthorPresentation {
+                principal_id: Some(principal_id.clone()),
+                display_name: auth.principal.display_name.trim().to_owned(),
+                nickname: auth.principal.nickname.trim().to_owned(),
+                avatar_revision: auth.principal.avatar_revision.clone(),
+            };
+        }
+
+        let directory_member = self
+            .administration
+            .members()
+            .find(|member| member.principal_id == *principal_id);
+        let workspace_member = self
+            .current_active_thread_id()
+            .and_then(|thread_id| self.thread_workspace_id(thread_id))
+            .and_then(|workspace_id| WorkspaceId::new(workspace_id.to_owned()).ok())
+            .and_then(|workspace_id| self.administration.workspace_members(&workspace_id))
+            .and_then(|members| {
+                members
+                    .iter()
+                    .find(|member| member.principal_id == *principal_id)
+            });
+
+        resolve_timeline_author_presentation(author, directory_member.or(workspace_member))
     }
 
     fn sync_timeline_layout_width(&self, cx: &mut Context<Self>) {
@@ -463,7 +517,10 @@ fn timeline_pending_request_render_fingerprint(row: &TimelinePendingRequestRow) 
 #[cfg(test)]
 mod author_presentation_tests {
     use super::*;
-    use pioneer_protocol::{AgentExecutionId, AgentIdentityId, AgentIdentitySourceKind};
+    use pioneer_protocol::{
+        AgentExecutionId, AgentIdentityId, AgentIdentitySourceKind, PrincipalKind,
+        PrincipalStatus, RoleKey,
+    };
 
     fn principal(value: &str) -> PrincipalId {
         PrincipalId::new(value).expect("valid principal id")
@@ -479,12 +536,48 @@ mod author_presentation_tests {
         }
     }
 
+    fn member(principal_id: &PrincipalId) -> MemberSummary {
+        MemberSummary {
+            principal_id: principal_id.clone(),
+            kind: PrincipalKind::User,
+            display_name: "Current Name".to_owned(),
+            nickname: "current".to_owned(),
+            role_key: Some(RoleKey::member()),
+            role: pioneer_protocol::AuthorizationRolePresentation {
+                key: "member".to_owned(),
+                display_name: "Member".to_owned(),
+                description: "Workspace collaborator".to_owned(),
+                built_in: true,
+            },
+            lifecycle_managed: true,
+            status: PrincipalStatus::Active,
+            avatar_revision: Some("current-avatar".to_owned()),
+        }
+    }
+
     #[::core::prelude::v1::test]
-    fn persisted_author_snapshot_is_the_timeline_presentation() {
+    fn current_member_profile_overlays_the_persisted_author_snapshot() {
+        let principal_id = principal("P0000000000000000000A");
+        let author = snapshot(&principal_id);
+        let member = member(&principal_id);
+
+        let presentation = resolve_timeline_author_presentation(Some(&author), Some(&member));
+
+        assert_eq!(presentation.principal_id.as_ref(), Some(&principal_id));
+        assert_eq!(presentation.display_name, "Current Name");
+        assert_eq!(presentation.nickname, "current");
+        assert_eq!(
+            presentation.avatar_revision.as_deref(),
+            Some("current-avatar")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn persisted_author_snapshot_remains_the_fallback_without_a_visible_member() {
         let principal_id = principal("P0000000000000000000A");
         let author = snapshot(&principal_id);
 
-        let presentation = resolve_timeline_author_presentation(Some(&author));
+        let presentation = resolve_timeline_author_presentation(Some(&author), None);
 
         assert_eq!(presentation.display_name, "Historical Name");
         assert_eq!(presentation.nickname, "historical");
@@ -515,7 +608,7 @@ mod author_presentation_tests {
             agent_identity_id: AgentIdentityId::new("A0000000000000000000A")
                 .expect("agent identity id"),
             agent_execution_id: execution_id,
-            identity_source_kind: AgentIdentitySourceKind::CliRuntime,
+            identity_source_kind: AgentIdentitySourceKind::CliRuntimeInstance,
             identity_source_revision: 1,
             display_name: "Codex CLI".to_owned(),
             nickname: "codex".to_owned(),
@@ -525,6 +618,17 @@ mod author_presentation_tests {
         assert_eq!(
             timeline_agent_label(Some(&author)),
             Some("Codex CLI · @codex".to_owned())
+        );
+
+        author.display_name = "Renamed Codex".to_owned();
+        author.nickname = "renamed-codex".to_owned();
+        assert_eq!(
+            timeline_agent_label(Some(&author)),
+            Some("Renamed Codex · @renamed-codex".to_owned())
+        );
+        assert_eq!(
+            author.agent.as_ref().map(|agent| agent.display_name.as_str()),
+            Some("Codex CLI")
         );
     }
 }

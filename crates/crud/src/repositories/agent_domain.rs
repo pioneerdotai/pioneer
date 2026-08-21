@@ -593,12 +593,7 @@ pub fn agent_presentation_snapshot_from_rows(
     {
         bail!("AgentExecution presentation rows do not form one exact immutable snapshot");
     }
-    let source_kind = match identity.source_kind.as_str() {
-        SOURCE_NATIVE_AGENT => AgentIdentitySourceKind::NativeAgent,
-        SOURCE_CLI_RUNTIME_INSTANCE => AgentIdentitySourceKind::CliRuntimeInstance,
-        SOURCE_EPHEMERAL => AgentIdentitySourceKind::Ephemeral,
-        value => bail!("AgentIdentity has unsupported source kind `{value}`"),
-    };
+    let source_kind = agent_identity_source_kind(identity.source_kind.as_str())?;
     let source_revision = u64::try_from(snapshot.source_revision)
         .context("Agent presentation source revision is negative")?;
     if source_revision == 0 {
@@ -628,6 +623,64 @@ pub fn agent_presentation_snapshot_from_rows(
         avatar_revision: projection.avatar_revision,
         role_label: projection.role_label,
     })
+}
+
+fn current_agent_identity_projection_from_rows(
+    identity: &agent_identity::Model,
+    snapshot: &agent_presentation_snapshot::Model,
+) -> Result<AgentIdentityProjection> {
+    if snapshot.agent_identity_id != identity.id
+        || snapshot.source_revision != identity.source_revision
+        || snapshot.source_fingerprint != identity.source_fingerprint
+    {
+        bail!("Agent timeline presentation rows do not form the current identity version");
+    }
+    let source_revision = u64::try_from(snapshot.source_revision)
+        .context("Agent presentation source revision is negative")?;
+    if source_revision == 0 {
+        bail!("Agent presentation source revision must be positive");
+    }
+    AgentIdentityProjection::new(
+        AgentIdentityId::new(identity.id.clone())
+            .map_err(|error| anyhow!("AgentIdentity id is invalid: {error:?}"))?,
+        agent_identity_source_kind(identity.source_kind.as_str())?,
+        snapshot.display_name.clone(),
+        snapshot.nickname.clone(),
+        snapshot.avatar_revision.clone(),
+        snapshot.role_label.clone(),
+        source_revision,
+        snapshot.source_fingerprint.clone(),
+    )
+    .map_err(|error| anyhow!("current Agent presentation is invalid: {error:?}"))
+}
+
+fn current_agent_author_from_rows(
+    identity: &agent_identity::Model,
+    execution: &agent_execution::Model,
+    immutable_snapshot: &agent_presentation_snapshot::Model,
+    current_snapshot: &agent_presentation_snapshot::Model,
+) -> Result<pioneer_protocol::TurnAuthorSnapshot> {
+    let immutable =
+        agent_presentation_snapshot_from_rows(identity, execution, immutable_snapshot)?;
+    let current = current_agent_identity_projection_from_rows(identity, current_snapshot)?;
+    let mut author = immutable.to_turn_author_snapshot();
+
+    // The nested AgentPresentationSnapshot remains the exact immutable
+    // execution snapshot. Timeline labels use these top-level presentation
+    // fields, which follow the current version of the stable AgentIdentity.
+    author.display_name = current.display_name;
+    author.nickname = current.nickname;
+    author.avatar_revision = current.avatar_revision;
+    Ok(author)
+}
+
+fn agent_identity_source_kind(source_kind: &str) -> Result<AgentIdentitySourceKind> {
+    match source_kind {
+        SOURCE_NATIVE_AGENT => Ok(AgentIdentitySourceKind::NativeAgent),
+        SOURCE_CLI_RUNTIME_INSTANCE => Ok(AgentIdentitySourceKind::CliRuntimeInstance),
+        SOURCE_EPHEMERAL => Ok(AgentIdentitySourceKind::Ephemeral),
+        value => bail!("AgentIdentity has unsupported source kind `{value}`"),
+    }
 }
 
 pub(crate) async fn revalidate_agent_presentation_for_execution<C: ConnectionTrait>(
@@ -2257,7 +2310,12 @@ pub async fn load_agent_turn_responses_for_turns<C: ConnectionTrait>(
         .context("failed to batch-load responding AgentExecutions")
 }
 
-pub async fn load_agent_authors_for_executions<C: ConnectionTrait>(
+/// Resolves exact AgentExecution actors with the current presentation of their
+/// stable AgentIdentity. The nested execution snapshot remains immutable;
+/// only the top-level timeline label and avatar fields are overlaid. If no
+/// current presentation is available, the immutable execution snapshot is the
+/// safe fallback, matching the existing Principal timeline behavior.
+pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
     db: &C,
     execution_ids: &[String],
 ) -> Result<BTreeMap<String, AgentExecutionAuthorProjection>> {
@@ -2290,6 +2348,37 @@ pub async fn load_agent_authors_for_executions<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to batch-load author presentation snapshots")?;
+    let current_snapshot_filter = identities.iter().fold(
+        Condition::any(),
+        |condition, identity| {
+            condition.add(
+                Condition::all()
+                    .add(
+                        agent_presentation_snapshot::Column::AgentIdentityId
+                            .eq(identity.id.clone()),
+                    )
+                    .add(
+                        agent_presentation_snapshot::Column::SourceRevision
+                            .eq(identity.source_revision),
+                    )
+                    .add(
+                        agent_presentation_snapshot::Column::SourceFingerprint
+                            .eq(identity.source_fingerprint.clone()),
+                    ),
+            )
+        },
+    );
+    let current_snapshots = if identities.is_empty() {
+        Vec::new()
+    } else {
+        agent_presentation_snapshot::Entity::find()
+            .filter(current_snapshot_filter)
+            .order_by_desc(agent_presentation_snapshot::Column::CreatedAt)
+            .order_by_desc(agent_presentation_snapshot::Column::Id)
+            .all(db)
+            .await
+            .context("failed to batch-load current Agent presentation snapshots")?
+    };
     let identities_by_id = identities
         .iter()
         .map(|identity| (identity.id.as_str(), identity))
@@ -2298,6 +2387,12 @@ pub async fn load_agent_authors_for_executions<C: ConnectionTrait>(
         .iter()
         .map(|snapshot| (snapshot.id.as_str(), snapshot))
         .collect::<BTreeMap<_, _>>();
+    let mut current_snapshots_by_identity_id = BTreeMap::new();
+    for snapshot in &current_snapshots {
+        current_snapshots_by_identity_id
+            .entry(snapshot.agent_identity_id.as_str())
+            .or_insert(snapshot);
+    }
     let mut result = BTreeMap::new();
     for execution in executions {
         let identity = identities_by_id
@@ -2310,8 +2405,19 @@ pub async fn load_agent_authors_for_executions<C: ConnectionTrait>(
         let snapshot = snapshots_by_id
             .get(snapshot_id)
             .context("author AgentExecution presentation snapshot is missing")?;
-        let author = agent_presentation_snapshot_from_rows(identity, &execution, snapshot)?
-            .to_turn_author_snapshot();
+        let author = if let Some(current_snapshot) =
+            current_snapshots_by_identity_id.get(identity.id.as_str())
+        {
+            current_agent_author_from_rows(
+                identity,
+                &execution,
+                snapshot,
+                current_snapshot,
+            )?
+        } else {
+            agent_presentation_snapshot_from_rows(identity, &execution, snapshot)?
+                .to_turn_author_snapshot()
+        };
         result.insert(
             execution.id,
             AgentExecutionAuthorProjection {
@@ -6508,6 +6614,93 @@ mod tests {
                 "turn_item:database-row".to_owned(),
                 "turn_input:turn-b".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn timeline_agent_author_uses_current_identity_presentation_without_rewriting_execution() {
+        let now = utc_now();
+        let identity = agent_identity::Model {
+            id: "A0000000000000000000A".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            source_kind: SOURCE_CLI_RUNTIME_INSTANCE.to_owned(),
+            source_id: "codex".to_owned(),
+            source_revision: 2,
+            source_fingerprint: "current-fingerprint".to_owned(),
+            status: "active".to_owned(),
+            created_at: now,
+            updated_at: now,
+            retired_at: None,
+        };
+        let execution = agent_execution::Model {
+            id: "E0000000000000000000A".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            agent_identity_id: identity.id.clone(),
+            identity_source_revision: 1,
+            identity_source_fingerprint: "historical-fingerprint".to_owned(),
+            parent_execution_id: None,
+            parent_task_id: None,
+            parent_thread_id: None,
+            home_root_thread_id: "thread".to_owned(),
+            work_graph_root_execution_id: "E0000000000000000000A".to_owned(),
+            requested_identity_selection_json: "{}".to_owned(),
+            requested_profile_selection_json: "{}".to_owned(),
+            resolved_profile_id: None,
+            resolved_profile_fingerprint: None,
+            presentation_snapshot_id: Some("snapshot-historical".to_owned()),
+            authorization_context_fingerprint: "authorization".to_owned(),
+            execution_generation: 1,
+            status: "completed".to_owned(),
+            created_at: now,
+            updated_at: now,
+            finished_at: Some(now),
+        };
+        let immutable_snapshot = agent_presentation_snapshot::Model {
+            id: "snapshot-historical".to_owned(),
+            agent_identity_id: identity.id.clone(),
+            source_revision: 1,
+            source_fingerprint: "historical-fingerprint".to_owned(),
+            display_name: "Codex CLI".to_owned(),
+            nickname: "codex".to_owned(),
+            avatar_revision: Some("historical-avatar".to_owned()),
+            role_label: Some("codex".to_owned()),
+            created_at: now,
+        };
+        let current_snapshot = agent_presentation_snapshot::Model {
+            id: "snapshot-current".to_owned(),
+            agent_identity_id: identity.id.clone(),
+            source_revision: 2,
+            source_fingerprint: "current-fingerprint".to_owned(),
+            display_name: "Renamed Codex".to_owned(),
+            nickname: "renamed-codex".to_owned(),
+            avatar_revision: Some("current-avatar".to_owned()),
+            role_label: Some("codex".to_owned()),
+            created_at: now,
+        };
+
+        let author = current_agent_author_from_rows(
+            &identity,
+            &execution,
+            &immutable_snapshot,
+            &current_snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(author.display_name, "Renamed Codex");
+        assert_eq!(author.nickname, "renamed-codex");
+        assert_eq!(author.avatar_revision.as_deref(), Some("current-avatar"));
+        assert!(matches!(
+            author.actor,
+            pioneer_protocol::PersistedActorRef::AgentExecution(ref execution_id)
+                if execution_id.as_str() == execution.id
+        ));
+        let immutable = author.agent.expect("immutable execution presentation");
+        assert_eq!(immutable.identity_source_revision, 1);
+        assert_eq!(immutable.display_name, "Codex CLI");
+        assert_eq!(immutable.nickname, "codex");
+        assert_eq!(
+            immutable.avatar_revision.as_deref(),
+            Some("historical-avatar")
         );
     }
 

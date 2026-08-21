@@ -1644,13 +1644,33 @@ impl MessageProcessor {
                     .map(|author| (turn_id.clone(), author))
             })
             .collect::<HashMap<_, _>>();
+        let direct_execution_ids_by_turn = direct_authors_by_turn
+            .iter()
+            .filter_map(|(turn_id, author)| {
+                let pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) =
+                    &author.actor
+                else {
+                    return None;
+                };
+                Some((turn_id.as_str(), execution_id.as_str()))
+            })
+            .collect::<HashMap<_, _>>();
         let execution_ids = responses
             .iter()
             .map(|response| response.execution_id.clone())
+            .chain(
+                direct_execution_ids_by_turn
+                    .values()
+                    .map(|execution_id| (*execution_id).to_owned()),
+            )
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
-        let projected_by_execution =
-            pioneer_crud::load_agent_authors_for_executions(&database, execution_ids.as_slice())
-                .await?;
+        let projected_by_execution = pioneer_crud::load_current_agent_authors_for_executions(
+            &database,
+            execution_ids.as_slice(),
+        )
+        .await?;
         let mut authors = HashMap::new();
         for turn_id in turn_ids {
             let author = if let Some(response) = responses_by_turn.get(turn_id.as_str()) {
@@ -1660,8 +1680,15 @@ impl MessageProcessor {
                         projected.presentation_snapshot_id == response.presentation_snapshot_id
                     })
                     .map(|projected| projected.author.clone())
+            } else if let Some(execution_id) =
+                direct_execution_ids_by_turn.get(turn_id.as_str())
+            {
+                projected_by_execution
+                    .get(*execution_id)
+                    .map(|projected| projected.author.clone())
+                    .or_else(|| direct_authors_by_turn.get(turn_id.as_str()).cloned())
             } else {
-                direct_authors_by_turn.get(turn_id.as_str()).cloned()
+                None
             };
             if let Some(author) = author {
                 authors.insert(turn_id.clone(), author);

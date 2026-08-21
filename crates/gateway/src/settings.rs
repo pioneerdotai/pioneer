@@ -90,7 +90,6 @@ impl<'de> Deserialize<'de> for GatewaySettings {
             migrated: migrated_legacy_self_improvement,
         };
         settings.migrate_legacy_active_recall_model();
-        settings.migrate_default_codex_cli_display_name();
         settings.migrate_default_claude_cli_runtime_instance();
         Ok(settings)
     }
@@ -948,24 +947,6 @@ impl GatewaySettings {
             }
             migrated = memory.legacy_active_recall_model.is_some();
             memory.legacy_active_recall_model = None;
-        }
-        self.migrated |= migrated;
-        migrated
-    }
-
-    fn migrate_default_codex_cli_display_name(&mut self) -> bool {
-        let Some(cli_runtimes) = &mut self.cli_runtimes else {
-            return false;
-        };
-        let mut migrated = false;
-        for instance in &mut cli_runtimes.instances {
-            if instance.id == "codex"
-                && instance.kind == GatewayCliAgentRuntimeKindConfig::Codex
-                && instance.display_name == "Codex"
-            {
-                instance.display_name = "Codex CLI".to_owned();
-                migrated = true;
-            }
         }
         self.migrated |= migrated;
         migrated
@@ -2306,8 +2287,6 @@ fn load_gateway_settings(
 pub fn save_gateway_settings(path: &Path, settings: &GatewaySettings) -> Result<()> {
     let mut settings = settings.clone();
     settings.migrate_legacy_active_recall_model();
-    settings.migrate_default_codex_cli_display_name();
-    settings.migrate_default_claude_cli_runtime_instance();
     let content =
         toml::to_string_pretty(&settings).context("failed to serialize gateway settings")?;
     write_settings_file(path, content.as_str())
@@ -4152,7 +4131,7 @@ backend = "keystore"
     }
 
     #[test]
-    fn gateway_settings_migrates_default_codex_display_name() {
+    fn gateway_settings_preserves_custom_codex_display_name() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("create temp dir");
         let path = temp_dir.join("gateway-settings.toml");
@@ -4184,7 +4163,7 @@ home_path = "~/.codex-work"
         .expect("write settings");
 
         let settings = load_or_create_gateway_settings(&path, 1, "gateway-settings.toml")
-            .expect("settings should load and migrate");
+            .expect("settings should load without rewriting the custom display name");
         let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
 
         let codex = snapshot
@@ -4192,8 +4171,8 @@ home_path = "~/.codex-work"
             .instances
             .iter()
             .find(|instance| instance.id == "codex")
-            .expect("default Codex CLI runtime should exist");
-        assert_eq!(codex.display_name, "Codex CLI");
+            .expect("Codex runtime should exist");
+        assert_eq!(codex.display_name, "Codex");
         let codex_work = snapshot
             .cli_runtimes
             .instances
@@ -4202,8 +4181,10 @@ home_path = "~/.codex-work"
             .expect("custom Codex CLI runtime should exist");
         assert_eq!(codex_work.display_name, "Codex Work");
 
-        let content = fs::read_to_string(&path).expect("read migrated settings");
-        assert!(content.contains("display_name = \"Codex CLI\""));
+        save_gateway_settings(&path, &settings)
+            .expect("settings should save without rewriting the custom display name");
+        let content = fs::read_to_string(&path).expect("read settings");
+        assert!(content.contains("display_name = \"Codex\""));
         assert!(content.contains("display_name = \"Codex Work\""));
 
         let _ = fs::remove_dir_all(temp_dir);
@@ -4225,7 +4206,7 @@ backend = "keystore"
 [[cli_runtimes.instances]]
 id = "codex"
 kind = "codex"
-display_name = "Codex CLI"
+display_name = "Codex"
 enabled = true
 binary_path = "codex"
 home_path = "~/.codex"
@@ -4238,13 +4219,13 @@ home_path = "~/.codex"
         let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
 
         assert_eq!(snapshot.cli_runtimes.instances.len(), 2);
-        assert!(
-            snapshot
-                .cli_runtimes
-                .instances
-                .iter()
-                .any(|instance| instance.id == "codex")
-        );
+        let codex = snapshot
+            .cli_runtimes
+            .instances
+            .iter()
+            .find(|instance| instance.id == "codex")
+            .expect("Codex runtime should remain configured");
+        assert_eq!(codex.display_name, "Codex");
         let claude = snapshot
             .cli_runtimes
             .instances
@@ -4257,6 +4238,7 @@ home_path = "~/.codex"
         let content = fs::read_to_string(&path).expect("read migrated settings");
         assert!(content.contains("id = \"codex\""));
         assert!(content.contains("id = \"claude\""));
+        assert!(content.contains("display_name = \"Codex\""));
         assert!(content.contains("display_name = \"Claude CLI\""));
         assert!(content.contains("binary_path = \"claude\""));
         assert!(content.contains("home_path = \"~/.claude\""));

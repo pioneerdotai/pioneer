@@ -214,7 +214,7 @@ impl PioneerDesktop {
                     .map(Path::to_path_buf),
             };
         };
-        let display_name = agent.display_name.trim().to_owned();
+        let display_name = author.display_name.trim().to_owned();
         if display_name.is_empty() {
             return TimelineAvatarVisual::Absent;
         }

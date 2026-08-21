@@ -1263,7 +1263,7 @@ fn cli_runtime_inline_input_state(
             let runtime_id = runtime_id.clone();
             move |_, input, event: &InputEvent, cx| match field_id {
                 Some(field) => {
-                    if !matches!(event, InputEvent::Change) {
+                    if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                         return;
                     }
                     let value = input.read(cx).value().to_string();
