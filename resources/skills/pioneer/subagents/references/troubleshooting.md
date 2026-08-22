@@ -21,6 +21,8 @@ Do not treat the candidate as accepted. Inspect it and then:
 - `task_revise` if it needs focused correction;
 - `task_cancel` if it should not be used.
 
+Inspect `reviewContent`, not only `candidate.result.summary`. Summary is deliberately short. If the content is truncated or was lost after recovery/compaction, call `task_result` with the exact `candidateId` and continue with `nextCursor` until the result is complete. Never inspect a different "latest" task result when deciding an immutable candidate round.
+
 ## Child Result Is Bad Or Missing Evidence
 
 Use `task_revise` with specific feedback. Avoid vague prompts.
@@ -68,6 +70,8 @@ Inspect:
 - error snapshot;
 - result candidates;
 - child thread evidence when available.
+
+Use `task_result(candidateId)` before looking for child-thread or database workarounds. Direct database access is not part of the review protocol and must not be required to accept or revise a candidate.
 
 Then choose:
 

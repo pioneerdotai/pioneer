@@ -4,15 +4,21 @@ use pioneer_protocol::{
     PublicTaskDeliveriesResponse, PublicTaskDelivery, PublicTaskDeliveryAttempt,
     PublicTaskDeliveryPolicy, PublicTaskDependency, PublicTaskEvent, PublicTaskEventsResponse,
     PublicTaskFailure, PublicTaskGetResponse, PublicTaskListResponse, PublicTaskResult,
-    PublicTaskResultCandidate, PublicTaskResultContractConfiguration, PublicTaskRun,
-    PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger, PublicTaskTriggerConfiguration,
+    PublicTaskResultCandidate, PublicTaskResultContractConfiguration, PublicTaskResultReadResponse,
+    PublicTaskReviewContent, PublicTaskReviewContentFormat, PublicTaskRun, PublicTaskTree,
+    PublicTaskTreeResponse, PublicTaskTrigger, PublicTaskTriggerConfiguration,
     PublicTaskTriggerSpec, PublicTaskWaitItem, PublicTaskWaitNonWaitableItem,
     PublicTaskWaitResponse, PublicTaskWaitReviewItem, Task, TaskAgendaResponse,
     TaskDeliveriesResponse, TaskDelivery, TaskDeliveryAttempt, TaskError, TaskErrorClass,
     TaskEventsResponse, TaskGetResponse, TaskListResponse, TaskOperatorDeliveries,
     TaskOperatorDetails, TaskResult, TaskResultCandidate, TaskRun, TaskTree, TaskTreeResponse,
-    TaskTrigger, TaskTriggerSpec, TaskWaitItem, TaskWaitResponse,
+    TaskTrigger, TaskTriggerSpec, TaskValue, TaskWaitItem, TaskWaitResponse,
 };
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+pub(crate) const DEFAULT_TASK_REVIEW_CONTENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TASK_REVIEW_CONTENT_BYTES: usize = 512 * 1024;
 
 pub(crate) fn project_task_get(
     response: &TaskGetResponse,
@@ -220,6 +226,13 @@ pub(crate) fn project_task_deliveries(
 }
 
 pub(crate) fn project_task_wait(response: &TaskWaitResponse) -> PublicTaskWaitResponse {
+    project_task_wait_with_review_content(response, &BTreeMap::new())
+}
+
+pub(crate) fn project_task_wait_with_review_content(
+    response: &TaskWaitResponse,
+    review_content: &BTreeMap<String, PublicTaskReviewContent>,
+) -> PublicTaskWaitResponse {
     PublicTaskWaitResponse {
         completed: response.completed.iter().map(project_wait_item).collect(),
         failed: response.failed.iter().map(project_wait_item).collect(),
@@ -231,6 +244,7 @@ pub(crate) fn project_task_wait(response: &TaskWaitResponse) -> PublicTaskWaitRe
             .map(|review| PublicTaskWaitReviewItem {
                 item: project_wait_item(&review.item),
                 candidate: project_candidate(&review.candidate),
+                review_content: review_content.get(review.candidate.id.as_str()).cloned(),
                 remaining_revision_rounds: review.remaining_revision_rounds,
                 allowed_actions: review.allowed_actions.clone(),
                 revision_blocked_reason: review.revision_blocked_reason,
@@ -254,6 +268,118 @@ pub(crate) fn project_task_wait(response: &TaskWaitResponse) -> PublicTaskWaitRe
         blocked_count: response.blocked_count,
         non_waitable_count: response.non_waitable_count,
         mode: response.mode,
+    }
+}
+
+pub(crate) fn project_task_result_read_response(
+    candidate: &TaskResultCandidate,
+    cursor: Option<&str>,
+    max_bytes: usize,
+) -> Result<PublicTaskResultReadResponse, String> {
+    Ok(PublicTaskResultReadResponse {
+        candidate: project_candidate(candidate),
+        review_content: project_task_review_content(candidate, cursor, max_bytes)?,
+    })
+}
+
+pub(crate) fn project_task_review_content(
+    candidate: &TaskResultCandidate,
+    cursor: Option<&str>,
+    max_bytes: usize,
+) -> Result<PublicTaskReviewContent, String> {
+    let (format, full_content) = review_content_source(candidate)?;
+    let total_bytes = full_content.len();
+    let start = match cursor {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "task result cursor is invalid".to_owned())?,
+        None => 0,
+    };
+    if start > total_bytes || !full_content.is_char_boundary(start) {
+        return Err("task result cursor is invalid".to_owned());
+    }
+
+    let max_bytes = max_bytes.clamp(1, MAX_TASK_REVIEW_CONTENT_BYTES);
+    let mut end = start.saturating_add(max_bytes).min(total_bytes);
+    while end > start && !full_content.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == start && start < total_bytes {
+        end = start
+            + full_content[start..]
+                .chars()
+                .next()
+                .expect("non-empty suffix has a first character")
+                .len_utf8();
+    }
+
+    let truncated = end < total_bytes;
+    Ok(PublicTaskReviewContent {
+        format,
+        content: full_content[start..end].to_owned(),
+        total_bytes: total_bytes as u64,
+        content_sha256: format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(full_content.as_bytes()))
+        ),
+        truncated,
+        next_cursor: truncated.then(|| end.to_string()),
+    })
+}
+
+fn review_content_source(
+    candidate: &TaskResultCandidate,
+) -> Result<(PublicTaskReviewContentFormat, String), String> {
+    let result = candidate.result.as_ref();
+    if let Some(TaskResult {
+        data: Some(TaskValue::Object(values)),
+        ..
+    }) = result
+        && values.get("fallbackUsed") == Some(&TaskValue::Bool(true))
+        && let Some(TaskValue::String(raw_text)) = values.get("rawText")
+    {
+        return Ok((PublicTaskReviewContentFormat::Text, raw_text.clone()));
+    }
+
+    if let Some(TaskResult {
+        data: Some(TaskValue::String(text)),
+        ..
+    }) = result
+    {
+        return Ok((PublicTaskReviewContentFormat::Text, text.clone()));
+    }
+
+    if let Some(data) = result.and_then(|result| result.data.as_ref()) {
+        return serde_json::to_string(&task_value_to_json(data))
+            .map(|content| (PublicTaskReviewContentFormat::Json, content))
+            .map_err(|error| format!("failed to encode task result content: {error}"));
+    }
+
+    result
+        .and_then(|result| result.summary.clone())
+        .or_else(|| candidate.summary.clone())
+        .map(|content| (PublicTaskReviewContentFormat::Text, content))
+        .ok_or_else(|| "task result candidate has no reviewable content".to_owned())
+}
+
+fn task_value_to_json(value: &TaskValue) -> serde_json::Value {
+    match value {
+        TaskValue::Null => serde_json::Value::Null,
+        TaskValue::Bool(value) => serde_json::Value::Bool(*value),
+        TaskValue::Integer(value) => serde_json::Value::Number((*value).into()),
+        TaskValue::Number(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        TaskValue::String(value) => serde_json::Value::String(value.clone()),
+        TaskValue::List(values) => {
+            serde_json::Value::Array(values.iter().map(task_value_to_json).collect())
+        }
+        TaskValue::Object(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), task_value_to_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -459,12 +585,148 @@ fn project_dependency(dependency: &pioneer_protocol::TaskDependency) -> PublicTa
 mod tests {
     use pioneer_protocol::{
         Task, TaskAgentInput, TaskAgentPrompt, TaskAgentSpec, TaskError, TaskErrorClass,
-        TaskExecutorKind, TaskExternalTriggerFilter, TaskGetResponse, TaskOwnerKind, TaskStatus,
-        TaskTrigger, TaskTriggerSpec, TaskTriggerStatus, TaskValue,
+        TaskExecutorKind, TaskExternalTriggerFilter, TaskGetResponse, TaskOwnerKind, TaskResult,
+        TaskResultCandidate, TaskResultCandidateStatus, TaskStatus, TaskTrigger, TaskTriggerSpec,
+        TaskTriggerStatus, TaskValue,
     };
     use std::collections::BTreeMap;
 
-    use super::{project_task_get, project_task_get_with_configuration};
+    use super::{
+        DEFAULT_TASK_REVIEW_CONTENT_BYTES, project_result, project_task_get,
+        project_task_get_with_configuration, project_task_result_read_response,
+        project_task_review_content,
+    };
+
+    fn review_candidate(data: TaskValue) -> TaskResultCandidate {
+        TaskResultCandidate {
+            id: "candidate_review_content_1".to_owned(),
+            task_id: "task_review_content_1".to_owned(),
+            run_id: "run_review_content_01".to_owned(),
+            task_run_turn_id: "task_run_turn_review_1".to_owned(),
+            thread_id: "thread_review_child_1".to_owned(),
+            turn_id: "turn_review_child_01".to_owned(),
+            round: 1,
+            status: TaskResultCandidateStatus::PendingReview,
+            result: Some(TaskResult {
+                summary: Some("short preview".to_owned()),
+                data: Some(data),
+                artifacts: Vec::new(),
+                completed_by_run_id: Some("run_review_content_01".to_owned()),
+            }),
+            extraction_error: None,
+            summary: Some("short preview".to_owned()),
+            diagnostics: vec!["private extractor diagnostic".to_owned()],
+            final_review_event_id: None,
+            created_at: 1,
+            updated_at: 1,
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn fallback_review_content_returns_raw_text_without_internal_metadata() {
+        let candidate = review_candidate(TaskValue::Object(BTreeMap::from([
+            (
+                "rawText".to_owned(),
+                TaskValue::String("full child-authored result".to_owned()),
+            ),
+            ("schemaValid".to_owned(), TaskValue::Bool(false)),
+            ("fallbackUsed".to_owned(), TaskValue::Bool(true)),
+            (
+                "diagnostics".to_owned(),
+                TaskValue::List(vec![TaskValue::String("private parser path".to_owned())]),
+            ),
+            (
+                "sourceThreadId".to_owned(),
+                TaskValue::String("hidden_thread".to_owned()),
+            ),
+            (
+                "sourceTurnId".to_owned(),
+                TaskValue::String("hidden_turn".to_owned()),
+            ),
+        ])));
+
+        let response =
+            project_task_result_read_response(&candidate, None, DEFAULT_TASK_REVIEW_CONTENT_BYTES)
+                .expect("fallback result should project");
+        let encoded = serde_json::to_string(&response).expect("result response should serialize");
+
+        assert_eq!(
+            response.review_content.content,
+            "full child-authored result"
+        );
+        assert_eq!(
+            response.review_content.format,
+            pioneer_protocol::PublicTaskReviewContentFormat::Text
+        );
+        assert!(!encoded.contains("private parser path"));
+        assert!(!encoded.contains("hidden_thread"));
+        assert!(!encoded.contains("hidden_turn"));
+        assert!(!encoded.contains("private extractor diagnostic"));
+    }
+
+    #[test]
+    fn structured_review_content_uses_natural_json() {
+        let candidate = review_candidate(TaskValue::Object(BTreeMap::from([
+            ("answer".to_owned(), TaskValue::Bool(true)),
+            ("count".to_owned(), TaskValue::Integer(3)),
+        ])));
+
+        let content = project_task_review_content(&candidate, None, 1024)
+            .expect("structured result should project");
+
+        assert_eq!(
+            content.format,
+            pioneer_protocol::PublicTaskReviewContentFormat::Json
+        );
+        assert_eq!(content.content, r#"{"answer":true,"count":3}"#);
+    }
+
+    #[test]
+    fn large_review_content_pages_on_utf8_boundaries_and_reassembles() {
+        let full_text = format!("начало:{}:конец", "я".repeat(40_000));
+        let candidate = review_candidate(TaskValue::Object(BTreeMap::from([
+            ("rawText".to_owned(), TaskValue::String(full_text.clone())),
+            ("fallbackUsed".to_owned(), TaskValue::Bool(true)),
+        ])));
+        let mut cursor = None;
+        let mut rebuilt = String::new();
+        let mut expected_hash = None;
+
+        loop {
+            let page = project_task_review_content(&candidate, cursor.as_deref(), 10_001)
+                .expect("every continuation page should project");
+            if let Some(hash) = expected_hash.as_ref() {
+                assert_eq!(&page.content_sha256, hash);
+            } else {
+                expected_hash = Some(page.content_sha256.clone());
+            }
+            rebuilt.push_str(page.content.as_str());
+            if !page.truncated {
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        assert_eq!(rebuilt, full_text);
+    }
+
+    #[test]
+    fn ordinary_result_projection_remains_summary_only() {
+        let result = TaskResult {
+            summary: Some("visible summary".to_owned()),
+            data: Some(TaskValue::String("private full result".to_owned())),
+            artifacts: Vec::new(),
+            completed_by_run_id: None,
+        };
+
+        let encoded = serde_json::to_string(&project_result(&result))
+            .expect("ordinary public result should serialize");
+
+        assert!(encoded.contains("visible summary"));
+        assert!(!encoded.contains("private full result"));
+    }
 
     #[test]
     fn collaborator_projection_drops_host_paths_webhooks_and_raw_diagnostics() {

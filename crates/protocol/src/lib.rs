@@ -316,6 +316,7 @@ pub use task::{
     PublicTaskDeliveryAttempt, PublicTaskDeliveryPolicy, PublicTaskDependency, PublicTaskEvent,
     PublicTaskEventsResponse, PublicTaskFailure, PublicTaskGetResponse, PublicTaskListResponse,
     PublicTaskResult, PublicTaskResultCandidate, PublicTaskResultContractConfiguration,
+    PublicTaskResultReadResponse, PublicTaskReviewContent, PublicTaskReviewContentFormat,
     PublicTaskRun, PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger,
     PublicTaskTriggerConfiguration, PublicTaskTriggerSpec, PublicTaskWaitItem,
     PublicTaskWaitNonWaitableItem, PublicTaskWaitResponse, PublicTaskWaitReviewItem,

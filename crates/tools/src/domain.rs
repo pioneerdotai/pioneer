@@ -10,6 +10,7 @@ pub const MEMORY_DOMAIN_TOOL_NAMES: &[&str] = &[
 pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
     "task_create",
     "task_wait",
+    "task_result",
     "task_accept",
     "task_revise",
     "task_cancel",
@@ -220,6 +221,7 @@ mod tests {
             [
                 "task_create",
                 "task_wait",
+                "task_result",
                 "task_accept",
                 "task_revise",
                 "task_cancel",

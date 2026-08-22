@@ -763,6 +763,48 @@ impl TaskService {
         })
     }
 
+    /// Return one immutable candidate only after validating the same exact
+    /// reviewer identity and durable review policy used by accept/revise.
+    /// Observation capability checks remain the caller's responsibility.
+    pub async fn get_task_result_candidate_for_reviewer(
+        &self,
+        context: TaskMutationContext,
+        candidate_id: &str,
+    ) -> TaskRuntimeResult<TaskResultCandidate> {
+        let candidate = self
+            .store
+            .get_task_result_candidate(candidate_id)
+            .await?
+            .ok_or_else(|| anyhow!("task result candidate `{candidate_id}` not found"))?;
+        let response = self
+            .store
+            .get_task(candidate.task_id.as_str())
+            .await?
+            .ok_or_else(|| anyhow!("task `{}` not found", candidate.task_id))?;
+        let run = response
+            .runs
+            .iter()
+            .find(|run| run.id == candidate.run_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "task run `{}` not found for task `{}`",
+                    candidate.run_id,
+                    candidate.task_id
+                )
+            })?;
+        let actor = resolve_parent_or_user_review_actor(&context, &response, &candidate, "read")?;
+        self.validate_review_actor_contract(&response, &candidate, &actor)
+            .await?;
+        if actor.reviewer_kind == TaskResultReviewerKind::User
+            && let Some(user_id) = actor.reviewer_user_id.as_deref()
+        {
+            validate_user_can_review_task(user_id, &response.task)?;
+        }
+        self.validate_final_review_actor_allowed_by_policy(&response, run, &candidate, &actor)
+            .await?;
+        Ok(candidate)
+    }
+
     #[cfg(test)]
     pub(crate) async fn validate_task_result_candidate_accept_for_test(
         &self,

@@ -11,19 +11,19 @@ use pioneer_protocol::{
     AgentControlTaskToolInput, AgentModelToolName, AgentReviewDecision, AgentReviewTaskToolInput,
     AgentScheduleTaskToolInput, AgentTaskControl, AgentTaskToolInput, AgentToolCapability,
     AgentToolIdentityChoice, AgentToolLaunchSelection, AgentToolProfileChoice,
-    ItemCompletedNotification, ItemUpdatedNotification, Task, TaskAcceptParams, TaskAcceptResponse,
-    TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt, TaskAgentResultContract,
-    TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode, TaskCancelParams, TaskCancelScope,
-    TaskCompletionBehavior, TaskCreateParams, TaskCreateResponse, TaskDeliveryMode,
-    TaskDeliveryPolicy, TaskDependencyTriggerPolicy, TaskDetachParams, TaskError, TaskExecutorKind,
-    TaskExternalTriggerFilter, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
-    TaskManualActor, TaskMetadata, TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams,
-    TaskRescheduleParams, TaskResult, TaskResultCandidateStatus, TaskResultReviewerKind,
-    TaskResumeParams, TaskRetryPolicy, TaskReviseParams, TaskReviseResponse, TaskRun,
-    TaskRunStatus, TaskRunThreadBindingKind, TaskStatus, TaskTimeoutPolicy, TaskTrigger,
-    TaskTriggerCatchUpPolicy, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec, TaskTurnItem,
-    TaskUpdateParams, TaskUpdateResponse, TaskWaitMode, TaskWaitParams, ToolCallStatus,
-    ToolStoragePayload, TurnItem, constants::events,
+    ItemCompletedNotification, ItemUpdatedNotification, PublicTaskReviewContent, Task,
+    TaskAcceptParams, TaskAcceptResponse, TaskAgentContextPolicy, TaskAgentInput, TaskAgentPrompt,
+    TaskAgentResultContract, TaskAgentSpec, TaskAgentSpecInput, TaskAttachmentMode,
+    TaskCancelParams, TaskCancelScope, TaskCompletionBehavior, TaskCreateParams,
+    TaskCreateResponse, TaskDeliveryMode, TaskDeliveryPolicy, TaskDependencyTriggerPolicy,
+    TaskDetachParams, TaskError, TaskExecutorKind, TaskExternalTriggerFilter, TaskGetParams,
+    TaskGetResponse, TaskLifecyclePolicy, TaskListParams, TaskManualActor, TaskMetadata,
+    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskRescheduleParams, TaskResult,
+    TaskResultCandidateStatus, TaskResultReviewerKind, TaskResumeParams, TaskRetryPolicy,
+    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunStatus, TaskRunThreadBindingKind,
+    TaskStatus, TaskTimeoutPolicy, TaskTrigger, TaskTriggerCatchUpPolicy, TaskTriggerInput,
+    TaskTriggerKind, TaskTriggerSpec, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse,
+    TaskWaitMode, TaskWaitParams, ToolCallStatus, ToolStoragePayload, TurnItem, constants::events,
 };
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
@@ -35,7 +35,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -51,6 +51,7 @@ const TASK_UPDATE_TOOL: &str = "task_update";
 const TASK_DETACH_TOOL: &str = "task_detach";
 const TASK_LIST_TOOL: &str = "task_list";
 const TASK_GET_TOOL: &str = "task_get";
+const TASK_RESULT_TOOL: &str = "task_result";
 const TASK_RESCHEDULE_TOOL: &str = "task_reschedule";
 const TASK_PAUSE_TOOL: &str = "task_pause";
 const TASK_RESUME_TOOL: &str = "task_resume";
@@ -605,6 +606,10 @@ fn agent_bound_task_tool_visible(name: &str, capabilities: &BTreeSet<AgentToolCa
             capabilities.contains(&AgentToolCapability::TaskObserve)
                 || capabilities.contains(&AgentToolCapability::ResultRead)
         }
+        TASK_RESULT_TOOL => {
+            capabilities.contains(&AgentToolCapability::ResultRead)
+                && capabilities.contains(&AgentToolCapability::TaskReview)
+        }
         TASK_LIST_TOOL => false,
         TASK_ACCEPT_TOOL | TASK_REVISE_TOOL => {
             capabilities.contains(&AgentToolCapability::TaskReview)
@@ -1135,6 +1140,9 @@ impl TaskToolHandler {
             }
             TASK_LIST_TOOL => task_tool_future(self.handle_list(invocation, &authorization)).await,
             TASK_GET_TOOL => task_tool_future(self.handle_get(invocation, &authorization)).await,
+            TASK_RESULT_TOOL => {
+                task_tool_future(self.handle_result(invocation, &authorization)).await
+            }
             TASK_RESCHEDULE_TOOL => {
                 task_tool_future(self.handle_reschedule(invocation, &authorization)).await
             }
@@ -1150,6 +1158,88 @@ impl TaskToolHandler {
 }
 
 impl TaskToolHandler {
+    async fn reviewer_result_read_context(
+        &self,
+        task_ids: &[String],
+    ) -> Result<Option<pioneer_tasks::TaskMutationContext>, ToolError> {
+        let Some(binding) = self
+            .processor
+            .agent_action_binding(self.context.turn_id.as_str())
+            .await
+        else {
+            return Ok(None);
+        };
+        if !binding
+            .capabilities
+            .contains(&AgentToolCapability::ResultRead)
+            || !binding
+                .capabilities
+                .contains(&AgentToolCapability::TaskReview)
+        {
+            return Ok(None);
+        }
+
+        let adapter = binding.adapter.lock().await;
+        crate::message::agent_action_tools::authorize_task_observations(
+            self.processor.as_ref(),
+            adapter.execution_id(),
+            adapter.work_graph_root_execution_id(),
+            task_ids,
+        )
+        .await?;
+        let mut context = pioneer_tasks::TaskMutationContext::parent_agent(
+            self.context.thread_id.clone(),
+            self.context.turn_id.clone(),
+        );
+        context.actor_id = Some(adapter.execution_id().as_str().to_owned());
+        Ok(Some(context))
+    }
+
+    async fn wait_review_content(
+        &self,
+        response: &pioneer_protocol::TaskWaitResponse,
+    ) -> Result<BTreeMap<String, PublicTaskReviewContent>, ToolError> {
+        let mut task_ids = response
+            .review_required
+            .iter()
+            .map(|item| item.candidate.task_id.clone())
+            .collect::<Vec<_>>();
+        task_ids.sort();
+        task_ids.dedup();
+        if task_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let Some(context) = self
+            .reviewer_result_read_context(task_ids.as_slice())
+            .await?
+        else {
+            return Ok(BTreeMap::new());
+        };
+
+        let service = self.processor.task_runtime.service();
+        let mut contents = BTreeMap::new();
+        for item in &response.review_required {
+            // A wait may be visible to a summary-only observer. Failure of the
+            // exact reviewer check therefore withholds content for that item
+            // without turning an otherwise valid observation into an oracle.
+            let Ok(candidate) = service
+                .get_task_result_candidate_for_reviewer(context.clone(), item.candidate.id.as_str())
+                .await
+            else {
+                continue;
+            };
+            let Ok(content) = crate::task_projection::project_task_review_content(
+                &candidate,
+                None,
+                crate::task_projection::DEFAULT_TASK_REVIEW_CONTENT_BYTES,
+            ) else {
+                continue;
+            };
+            contents.insert(candidate.id, content);
+        }
+        Ok(contents)
+    }
+
     fn mutation_cache_key(&self, invocation: &ToolInvocation) -> Option<String> {
         invocation
             .idempotency_key
@@ -1708,9 +1798,12 @@ impl TaskToolHandler {
             .wait_tasks(authorization.wait_context(Some(confirmed_activity)), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+        let review_content = self.wait_review_content(&response).await?;
 
         Ok(function_output(task_wait_tool_output(
-            &response, &signature,
+            &response,
+            &signature,
+            &review_content,
         )))
     }
 
@@ -2271,6 +2364,57 @@ impl TaskToolHandler {
             ),
         )
         .map_err(|error| ToolError::execution_failed(format!("failed to project task: {error}")))?;
+        Ok(function_output(payload))
+    }
+
+    async fn handle_result(
+        &self,
+        invocation: ToolInvocation,
+        authorization: &TaskToolAuthorizationScope,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let input: TaskResultToolInput = decode_tool_args(invocation)?;
+        let candidate_id = validate_candidate_id(input.candidate_id, "candidateId")?;
+        let candidate = self
+            .processor
+            .crud_store
+            .get_task_result_candidate(candidate_id.as_str())
+            .await
+            .map_err(|_| task_tool_authorization_error())?
+            .ok_or_else(task_tool_authorization_error)?;
+        authorization
+            .authorize_task(
+                self.processor.crud_store.as_ref(),
+                candidate.task_id.as_str(),
+                crate::authorization::ResourceAction::TaskRead,
+            )
+            .await?;
+        let _observation = authorization
+            .acquire_observation_page(self.processor.as_ref())
+            .await?;
+        let context = self
+            .reviewer_result_read_context(std::slice::from_ref(&candidate.task_id))
+            .await?
+            .ok_or_else(task_tool_authorization_error)?;
+        let candidate = self
+            .processor
+            .task_runtime
+            .service()
+            .get_task_result_candidate_for_reviewer(context, candidate_id.as_str())
+            .await
+            .map_err(|_| task_tool_authorization_error())?;
+        let max_bytes = input
+            .max_bytes
+            .map(|value| value as usize)
+            .unwrap_or(crate::task_projection::DEFAULT_TASK_REVIEW_CONTENT_BYTES);
+        let response = crate::task_projection::project_task_result_read_response(
+            &candidate,
+            input.cursor.as_deref(),
+            max_bytes,
+        )
+        .map_err(ToolError::invalid_arguments)?;
+        let payload = serde_json::to_value(response).map_err(|error| {
+            ToolError::execution_failed(format!("failed to project task result: {error}"))
+        })?;
         Ok(function_output(payload))
     }
 
@@ -3120,6 +3264,23 @@ impl TaskWaitToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Model-facing input for reading the full, reviewer-safe content of one immutable result candidate.
+struct TaskResultToolInput {
+    /// Exact candidate id returned by task_wait reviewRequired.
+    #[schemars(length(min = 1, max = 128))]
+    candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Opaque continuation cursor returned by a previous task_result call.
+    #[schemars(length(min = 1, max = 32))]
+    cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Maximum UTF-8 bytes to return in this page. Values above 524288 are capped.
+    #[schemars(range(min = 1, max = 524288))]
+    max_bytes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Model-facing input for task_accept. Use this only for a candidate returned by task_wait reviewRequired.
 struct TaskAcceptToolInput {
     /// Task id that owns the candidate. Pioneer entity ids are exactly 21 characters.
@@ -3523,7 +3684,7 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_WAIT_TOOL,
-            "Wait for progress from one or more active attached task ids or run ids using the task event bus. By default it returns as soon as any target is terminal or ready for review. Inspect every returned reviewRequired candidate and call task_accept, task_revise, or task_cancel as appropriate, then call task_wait again for the remaining active runs. Use all_terminal only when an intentional barrier without intermediate result handling is required. timeoutMs limits only this observation window and returns timedOut=true without cancelling the tasks or failing the parent Turn. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Repeat task_wait only after the prior call timed out or after its returned terminal/review-required progress was handled.",
+            "Wait for progress from one or more active attached task ids or run ids using the task event bus. By default it returns as soon as any target is terminal or ready for review. For an authorized reviewer, each reviewRequired item includes reviewer-safe reviewContent from the exact immutable candidate. Inspect that content before task_accept or task_revise. If reviewContent is truncated, or must be read again after recovery/compaction, call task_result with the returned candidateId and continue with nextCursor. Then handle the candidate and call task_wait again for remaining active runs. Use all_terminal only when an intentional barrier without intermediate result handling is required. timeoutMs limits only this observation window and returns timedOut=true without cancelling the tasks or failing the parent Turn. When timeoutMs is omitted, confirmed target activity keeps the durable wait alive until its condition is satisfied. Do not call task_wait after creating scheduled, interval, or cron tasks when task_create returned waitable=false/runId=null; confirm the schedule instead. Repeat task_wait only after the prior call timed out or after its returned terminal/review-required progress was handled.",
             task_wait_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Transient,
@@ -3535,6 +3696,12 @@ fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         )
         .with_turn_item_execution_class(
             pioneer_protocol::TurnItemExecutionClass::DurableWait,
+        ),
+        task_tool_spec(
+            TASK_RESULT_TOOL,
+            "Read reviewer-safe content for the exact immutable candidate returned by task_wait. Use candidateId, not taskId, so a revision round cannot race with the result being inspected. If truncated=true, call task_result again with nextCursor until the content is complete. This tool never returns extraction diagnostics, source runtime ids, host paths, or task configuration.",
+            task_result_schema(),
+            safe_read_recovery(),
         ),
         task_tool_spec(
             TASK_ACCEPT_TOOL,
@@ -3641,6 +3808,10 @@ fn task_wait_schema() -> JsonValue {
     tool_input_schema::<TaskWaitToolInput>()
 }
 
+fn task_result_schema() -> JsonValue {
+    tool_input_schema::<TaskResultToolInput>()
+}
+
 fn task_accept_schema() -> JsonValue {
     tool_input_schema::<TaskAcceptToolInput>()
 }
@@ -3729,6 +3900,7 @@ fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
     match tool_name {
         TASK_CREATE_TOOL => task_create_schema(),
         TASK_WAIT_TOOL => task_wait_schema(),
+        TASK_RESULT_TOOL => task_result_schema(),
         TASK_ACCEPT_TOOL => task_accept_schema(),
         TASK_REVISE_TOOL => task_revise_schema(),
         TASK_CANCEL_TOOL => task_cancel_schema(),
@@ -3755,6 +3927,9 @@ fn task_tool_argument_hint(tool_name: &str) -> &'static str {
         }
         TASK_WAIT_TOOL => {
             "Expected fields: taskIds or runIds, with optional timeoutMs. Use taskIds or runIds arrays, not a single taskId. Example timeoutMs value: 180000."
+        }
+        TASK_RESULT_TOOL => {
+            "Expected field: candidateId from task_wait reviewRequired. To continue truncated content, also pass the exact nextCursor returned by the previous task_result call."
         }
         TASK_ACCEPT_TOOL => {
             "Expected fields: taskId, runId, candidateId, and optional reason. Use candidate ids returned by task_wait reviewRequired."
@@ -4698,9 +4873,12 @@ fn task_update_tool_output(response: &TaskUpdateResponse) -> JsonValue {
 fn task_wait_tool_output(
     response: &pioneer_protocol::TaskWaitResponse,
     signature: &TaskWaitSignature,
+    review_content: &BTreeMap<String, PublicTaskReviewContent>,
 ) -> JsonValue {
-    let mut output = serde_json::to_value(crate::task_projection::project_task_wait(response))
-        .unwrap_or_else(|_| json!({}));
+    let mut output = serde_json::to_value(
+        crate::task_projection::project_task_wait_with_review_content(response, review_content),
+    )
+    .unwrap_or_else(|_| json!({}));
     if let Some(object) = output.as_object_mut() {
         object.insert("waitSignature".to_owned(), signature.to_json());
     }
@@ -5831,7 +6009,7 @@ mod tests {
             mode: TaskWaitMode::AllTerminalOrReviewRequired,
         };
 
-        let output = task_wait_tool_output(&response, &signature);
+        let output = task_wait_tool_output(&response, &signature, &BTreeMap::new());
 
         assert_eq!(output["reviewRequiredCount"], 1);
         assert_eq!(output["completed"].as_array().unwrap().len(), 0);
@@ -5850,9 +6028,84 @@ mod tests {
         );
         assert_eq!(review["revisionBlockedReason"], JsonValue::Null);
         assert!(review.get("reviewPolicy").is_none());
+        assert!(review.get("reviewContent").is_none());
         assert!(review.get("diagnostics").is_none());
         assert!(review["item"].get("childThreadId").is_none());
         assert!(review["item"].get("childTurnId").is_none());
+    }
+
+    #[test]
+    fn task_wait_includes_full_content_only_when_reviewer_projection_supplies_it() {
+        let response = sample_review_wait_response(
+            vec![
+                pioneer_protocol::TaskWaitReviewAction::TaskAccept,
+                pioneer_protocol::TaskWaitReviewAction::TaskRevise,
+            ],
+            1,
+            None,
+            TaskResultCandidateStatus::PendingReview,
+        );
+        let signature = TaskWaitSignature {
+            task_ids: vec!["task_1234567890123456".to_owned()],
+            run_ids: Vec::new(),
+            mode: TaskWaitMode::AnyTerminalOrReviewRequired,
+        };
+        let review_content = BTreeMap::from([(
+            "candidate_123456789012".to_owned(),
+            PublicTaskReviewContent {
+                format: pioneer_protocol::PublicTaskReviewContentFormat::Text,
+                content: "complete immutable candidate".to_owned(),
+                total_bytes: 28,
+                content_sha256: "sha256:test".to_owned(),
+                truncated: false,
+                next_cursor: None,
+            },
+        )]);
+
+        let output = task_wait_tool_output(&response, &signature, &review_content);
+        let content = &output["reviewRequired"][0]["reviewContent"];
+
+        assert_eq!(content["format"], "text");
+        assert_eq!(content["content"], "complete immutable candidate");
+        assert_eq!(content["truncated"], false);
+    }
+
+    #[test]
+    fn task_result_requires_both_result_read_and_review_capabilities() {
+        let observe_only = BTreeSet::from([AgentToolCapability::TaskObserve]);
+        let result_only = BTreeSet::from([AgentToolCapability::ResultRead]);
+        let reviewer = BTreeSet::from([
+            AgentToolCapability::ResultRead,
+            AgentToolCapability::TaskReview,
+        ]);
+
+        assert!(!agent_bound_task_tool_visible(
+            TASK_RESULT_TOOL,
+            &observe_only
+        ));
+        assert!(!agent_bound_task_tool_visible(
+            TASK_RESULT_TOOL,
+            &result_only
+        ));
+        assert!(agent_bound_task_tool_visible(TASK_RESULT_TOOL, &reviewer));
+        assert!(
+            task_tool_specs()
+                .iter()
+                .any(|configured| configured.spec.name == TASK_RESULT_TOOL)
+        );
+    }
+
+    #[test]
+    fn task_result_input_targets_exact_candidate_and_continuation() {
+        let input = TaskResultToolInput {
+            candidate_id: "trc_run_candidate_round_1".to_owned(),
+            cursor: Some("65536".to_owned()),
+            max_bytes: Some(131_072),
+        };
+
+        assert_eq!(input.candidate_id, "trc_run_candidate_round_1");
+        assert_eq!(input.cursor.as_deref(), Some("65536"));
+        assert_eq!(input.max_bytes, Some(131_072));
     }
 
     #[test]
@@ -6031,7 +6284,7 @@ mod tests {
             mode: TaskWaitMode::AllTerminalOrReviewRequired,
         };
 
-        let output = task_wait_tool_output(&response, &signature);
+        let output = task_wait_tool_output(&response, &signature, &BTreeMap::new());
         let review = &output["reviewRequired"][0];
 
         assert_eq!(review["remainingRevisionRounds"], 0);

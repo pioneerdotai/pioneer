@@ -1828,6 +1828,50 @@ async fn accept_validation_allows_own_parent_review_context() {
 }
 
 #[tokio::test]
+async fn result_read_returns_exact_candidate_for_its_parent_reviewer() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let context =
+        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
+            .await;
+
+    let candidate = runtime
+        .service()
+        .get_task_result_candidate_for_reviewer(context, candidate_id.as_str())
+        .await
+        .expect("exact parent reviewer should read its immutable candidate");
+
+    assert_eq!(candidate.id, candidate_id);
+    assert_eq!(candidate.round, 0);
+    assert!(candidate.result.is_some());
+}
+
+#[tokio::test]
+async fn result_read_rejects_sibling_execution_for_parent_candidate() {
+    let runtime = runtime_with_review_config().await;
+    let (task_id, _run_id, candidate_id) =
+        create_waiting_review_agent_task(&runtime, 2, 0, TaskResultCandidateStatus::PendingReview)
+            .await;
+    let mut context =
+        parent_accept_context_for_candidate(&runtime, task_id.as_str(), candidate_id.as_str())
+            .await;
+    context.actor_id = Some("Z".repeat(21));
+
+    let error = runtime
+        .service()
+        .get_task_result_candidate_for_reviewer(context, candidate_id.as_str())
+        .await
+        .expect_err("a sibling execution must not read another parent's candidate");
+
+    assert!(
+        format!("{error:#}").contains("immutable reviewer intent"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[tokio::test]
 async fn accept_validation_rejects_missing_actor_without_state_change() {
     let runtime = runtime_with_review_config().await;
     let (task_id, run_id, candidate_id) =

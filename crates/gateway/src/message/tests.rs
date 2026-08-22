@@ -5358,6 +5358,7 @@ fn test_task_turn_preflight_response() -> ChatResponse {
     test_turn_preflight_response_with_visible_tools(&[
         "task_create",
         "task_wait",
+        "task_result",
         "task_accept",
         "task_revise",
         "task_cancel",

@@ -157,6 +157,7 @@ use crate::{
     PublicTaskDeliveryAttempt, PublicTaskDeliveryPolicy, PublicTaskDependency, PublicTaskEvent,
     PublicTaskEventsResponse, PublicTaskFailure, PublicTaskGetResponse, PublicTaskListResponse,
     PublicTaskResult, PublicTaskResultCandidate, PublicTaskResultContractConfiguration,
+    PublicTaskResultReadResponse, PublicTaskReviewContent, PublicTaskReviewContentFormat,
     PublicTaskRun, PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger,
     PublicTaskTriggerConfiguration, PublicTaskTriggerSpec, PublicTaskWaitItem,
     PublicTaskWaitNonWaitableItem, PublicTaskWaitResponse, PublicTaskWaitReviewItem,
@@ -1272,6 +1273,15 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "public_task_result_candidate.json",
             PublicTaskResultCandidate
+        ),
+        schema_doc!(
+            "public_task_review_content_format.json",
+            PublicTaskReviewContentFormat
+        ),
+        schema_doc!("public_task_review_content.json", PublicTaskReviewContent),
+        schema_doc!(
+            "public_task_result_read_response.json",
+            PublicTaskResultReadResponse
         ),
         schema_doc!(
             "public_task_wait_review_item.json",

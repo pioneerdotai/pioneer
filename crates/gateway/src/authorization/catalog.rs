@@ -273,6 +273,15 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
+        "task_result",
+        "task_read|task_review",
+        "immutable_task_result_candidate",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
         "task_accept",
         "task_review",
         "root_thread_task",

@@ -106,7 +106,7 @@ When a candidate is close but incomplete:
 1. Identify the missing requirement.
 2. Request revision with precise feedback.
 3. Wait again.
-4. Review the revised candidate.
+4. Review the revised candidate's complete `reviewContent`. If it is truncated or must be re-read, call `task_result` with the revised `candidateId` and follow `nextCursor` until complete.
 5. Accept only the revised satisfactory candidate.
 
 Example feedback:
@@ -120,6 +120,8 @@ Example feedback:
   ]
 }
 ```
+
+Do not compare only the old and new summaries. Both rounds may have the same first-line summary while their full immutable candidate contents differ.
 
 ## Cancel Or Detach
 

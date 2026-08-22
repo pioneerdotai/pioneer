@@ -7,6 +7,7 @@ Use this reference when exact task tool arguments matter for immediate attached 
 - Tool Visibility
 - task_create for attached subagents
 - task_wait
+- task_result
 - task_accept
 - task_revise
 - task_cancel
@@ -90,6 +91,28 @@ Rules:
 - Prefer `runIds` when `task_create` returned run ids.
 - Do not use singular `taskId` or `runId`.
 - A timeout does not cancel child work.
+- Authorized reviewers receive `reviewContent` for each `reviewRequired` candidate. `summary` alone is not the full result.
+
+## task_result
+
+Use `task_result` to re-read the reviewer-safe content of the exact immutable candidate, or to continue a truncated result.
+
+```json
+{
+  "candidateId": "CANDIDATE_ID"
+}
+```
+
+When the response has `truncated: true`, continue with the returned cursor:
+
+```json
+{
+  "candidateId": "CANDIDATE_ID",
+  "cursor": "NEXT_CURSOR"
+}
+```
+
+Do not substitute `taskId` or a different revision candidate. The review decision must target the same `candidateId` whose content was inspected.
 
 ## task_accept
 

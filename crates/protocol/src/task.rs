@@ -3060,6 +3060,37 @@ pub struct PublicTaskResultCandidate {
     pub updated_at: i64,
 }
 
+/// Reviewer-facing content extracted from one immutable result candidate.
+///
+/// This is deliberately separate from `TaskResult::data`: the persisted value
+/// may also contain extraction diagnostics and source-runtime identifiers that
+/// are not part of the child-authored result.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicTaskReviewContentFormat {
+    Text,
+    Json,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskReviewContent {
+    pub format: PublicTaskReviewContentFormat,
+    pub content: String,
+    pub total_bytes: u64,
+    pub content_sha256: String,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskResultReadResponse {
+    pub candidate: PublicTaskResultCandidate,
+    pub review_content: PublicTaskReviewContent,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicTaskWaitItem {
@@ -3073,6 +3104,8 @@ pub struct PublicTaskWaitItem {
 pub struct PublicTaskWaitReviewItem {
     pub item: PublicTaskWaitItem,
     pub candidate: PublicTaskResultCandidate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_content: Option<PublicTaskReviewContent>,
     #[serde(default)]
     pub remaining_revision_rounds: u32,
     #[serde(default)]

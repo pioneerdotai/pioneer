@@ -36,7 +36,7 @@ Before delegating, decide whether attached subagents improve the current answer.
 2. If independent focused work improves speed, coverage, verification, or auditability, create attached subagents.
 3. Create all independent child tasks first.
 4. Call `task_wait` until the next child result is terminal or requires review.
-5. Review every returned terminal or review-required result immediately.
+5. Review every returned terminal or review-required result immediately. Use the candidate's `reviewContent`; if it is truncated or no longer present in context, read the exact candidate again with `task_result`.
 6. Accept good candidates, revise close-but-incomplete candidates, cancel irrelevant or unsafe candidates, or detach work that should no longer block the parent.
 7. Call `task_wait` again for the remaining active runs and repeat the review cycle until all child work is resolved.
 8. Synthesize the parent answer from accepted results and direct parent work.
@@ -119,6 +119,10 @@ For independent attached subagents, create them all first, then call `task_wait`
 - evidence and artifact requirements;
 - safety, scope, and write constraints.
 
+For an authorized parent reviewer, `reviewRequired.reviewContent` contains the reviewer-safe child result for that exact candidate. Do not decide from `summary` alone; summary is only a preview and may be just the first heading. If `reviewContent.truncated` is true, call `task_result` with the candidate's `candidateId`, then continue with each returned `nextCursor` until the complete content has been inspected. Use the same `task_result(candidateId)` flow to re-read a candidate after recovery or context compaction.
+
+Always read by `candidateId`, not by `taskId`: a task may have several immutable revision rounds, and the review decision must apply to the exact content that was inspected.
+
 Use `task_revise` when the result is close but incomplete or incorrectly shaped. Give concrete feedback: what is wrong, what to add/remove/correct, and what the revised output must look like.
 
 Use `task_accept` only after the candidate is good enough to use. Use accepted child results in the parent synthesis.
@@ -157,6 +161,7 @@ Do not paste raw child outputs blindly. Combine duplicate findings, preserve imp
 - Attached subagents are for current-turn delegation, not scheduled future work.
 - `task_wait` uses arrays: `taskIds` or `runIds`, not singular `taskId` or `runId`.
 - A `pending_review` candidate is not accepted work.
+- A candidate `summary` is a preview, not sufficient review evidence; inspect `reviewContent` or call `task_result`.
 - Do not quote rejected candidates as final results.
 - Do not finish while attached child work from this turn is unresolved.
 - Do not claim a child was created, accepted, revised, cancelled, or detached unless the relevant tool succeeded.

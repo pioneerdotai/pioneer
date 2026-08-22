@@ -8158,6 +8158,7 @@ mod tests {
             [
                 "task_create",
                 "task_wait",
+                "task_result",
                 "task_accept",
                 "task_revise",
                 "task_cancel",
