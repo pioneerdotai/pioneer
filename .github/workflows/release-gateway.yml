@@ -3,7 +3,7 @@ name: Release Gateway
 on:
   push:
     tags:
-      - "v*"
+      - "0.*"
 
 permissions:
   contents: write

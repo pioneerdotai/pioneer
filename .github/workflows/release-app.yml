@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - "v*"
+      - "0.*"
   pull_request:
     paths:
       - "Cargo.toml"
