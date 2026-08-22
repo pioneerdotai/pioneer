@@ -3089,24 +3089,26 @@ impl MessageProcessor {
             } => {
                 let event_timestamp = now_timestamp_secs();
                 let heartbeat = match source {
-                    pioneer_protocol::ItemHeartbeatSource::OwnerLease => self
-                        .timeout_supervisor
-                        .heartbeat_item_attempt(
-                            turn_id.as_str(),
-                            item_id.as_str(),
-                            item_type,
-                            event_timestamp,
-                        )
-                        .await,
-                    pioneer_protocol::ItemHeartbeatSource::ConfirmedExternalActivity => self
-                        .timeout_supervisor
-                        .heartbeat_item_attempt_from_confirmed_external_activity(
-                            turn_id.as_str(),
-                            item_id.as_str(),
-                            item_type,
-                            event_timestamp,
-                        )
-                        .await,
+                    pioneer_protocol::ItemHeartbeatSource::OwnerLease => {
+                        self.timeout_supervisor
+                            .heartbeat_item_attempt(
+                                turn_id.as_str(),
+                                item_id.as_str(),
+                                item_type,
+                                event_timestamp,
+                            )
+                            .await
+                    }
+                    pioneer_protocol::ItemHeartbeatSource::ConfirmedExternalActivity => {
+                        self.timeout_supervisor
+                            .heartbeat_item_attempt_from_confirmed_external_activity(
+                                turn_id.as_str(),
+                                item_id.as_str(),
+                                item_type,
+                                event_timestamp,
+                            )
+                            .await
+                    }
                 };
                 if let Err(error) = heartbeat {
                     warn!(
@@ -5621,6 +5623,7 @@ impl MessageProcessor {
 
     pub(super) async fn cancel_root_agent_work_graph_for_turn(
         &self,
+        thread_id: &str,
         turn: &pioneer_protocol::Turn,
         reason: &str,
     ) -> anyhow::Result<bool> {
@@ -5660,10 +5663,30 @@ impl MessageProcessor {
             .cancel_agent_work_graph(execution.id.as_str(), reason, pioneer_crud::utc_now())
             .await?;
 
-        let task_ids = targets
+        let mut task_ids = targets
             .iter()
             .filter_map(|target| target.parent_task_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
+        // A Task becomes durably visible before its child AgentExecution is
+        // admitted. Include Tasks created by this exact Turn so cancellation
+        // also closes that legitimate pre-admission window instead of leaving
+        // the scheduler to reinterpret the closed root scope as a start error.
+        for task in self
+            .crud_store
+            .list_tasks_created_by_turn(
+                execution.workspace_id.as_str(),
+                thread_id,
+                turn.id.as_str(),
+            )
+            .await?
+        {
+            if task.lifecycle_policy.as_ref().is_some_and(|policy| {
+                policy.attachment == pioneer_protocol::TaskAttachmentMode::Attached
+                    && policy.on_parent_cancel == pioneer_protocol::TaskParentTerminalAction::Cancel
+            }) {
+                task_ids.insert(task.id);
+            }
+        }
         for task_id in task_ids {
             if let Err(error) = self
                 .task_runtime

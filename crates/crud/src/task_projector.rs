@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use pioneer_protocol::{
-    PersistedActorRef, TaskDelivery, TaskDeliveryMode, TaskDeliveryStatus, TaskError,
-    TaskErrorClass, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
+    PersistedActorRef, TaskAgentReviewPolicy, TaskDelivery, TaskDeliveryMode, TaskDeliveryStatus,
+    TaskError, TaskErrorClass, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
     TaskResultReviewerRef, TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind,
     TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskValue, ThreadLineage,
@@ -19,7 +19,7 @@ use crate::repositories::{
     task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread_lineage,
 };
 use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
-use crate::util::unix_to_datetime;
+use crate::util::{optional_typed_json_from_db, unix_to_datetime};
 
 type ProjectFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
@@ -791,7 +791,9 @@ async fn project_task_delivery<C: ConnectionTrait + Sync>(
     } else {
         PersistedActorRef::System
     };
-    let reviewer = if delivery.error_snapshot.is_some() {
+    let review_required = delivery.error_snapshot.is_none()
+        && task_delivery_requires_final_review(db, &delivery.task_id, &delivery.run_id).await?;
+    let reviewer = if !review_required {
         None
     } else {
         let candidate = task_result_candidate::find_candidate_by_run_and_status(
@@ -840,6 +842,28 @@ async fn project_task_delivery<C: ConnectionTrait + Sync>(
         delivery.updated_at,
     )
     .await
+}
+
+async fn task_delivery_requires_final_review<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    run_id: &str,
+) -> Result<bool> {
+    let agent_spec = match task_agent_spec::find_agent_spec_by_run(db, run_id).await? {
+        Some(agent_spec) => Some(agent_spec),
+        None => task_agent_spec::find_latest_agent_spec_by_task(db, task_id).await?,
+    };
+    let Some(agent_spec) = agent_spec else {
+        return Ok(false);
+    };
+    if agent_spec.task_id != task_id {
+        anyhow::bail!("Task delivery Agent spec belongs to another Task");
+    }
+    let review_policy: Option<TaskAgentReviewPolicy> =
+        optional_typed_json_from_db(agent_spec.review_policy_json)?;
+    Ok(review_policy
+        .as_ref()
+        .is_some_and(TaskAgentReviewPolicy::is_enabled))
 }
 
 async fn task_is_terminal_db<C: ConnectionTrait + Sync>(db: &C, task_id: &str) -> Result<bool> {

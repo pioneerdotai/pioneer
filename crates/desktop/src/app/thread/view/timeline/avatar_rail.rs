@@ -233,7 +233,10 @@ impl PioneerDesktop {
 fn timeline_agent_default_avatar_revision(
     agent: &pioneer_protocol::AgentPresentationSnapshot,
 ) -> Option<&'static str> {
-    let runtime_kind = agent.role_label.as_deref().unwrap_or(agent.nickname.as_str());
+    let runtime_kind = agent
+        .role_label
+        .as_deref()
+        .unwrap_or(agent.nickname.as_str());
     match agent.identity_source_kind {
         pioneer_protocol::AgentIdentitySourceKind::NativeAgent => {
             Some(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION)

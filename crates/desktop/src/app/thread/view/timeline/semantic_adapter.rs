@@ -237,6 +237,7 @@ mod tests {
     fn timeline_row(key: &str, kind: TimelineRowKind) -> TimelineRenderRow {
         TimelineRenderRow::Timeline(TimelineRow {
             key: key.to_owned(),
+            author: None,
             kind,
         })
     }

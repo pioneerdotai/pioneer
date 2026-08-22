@@ -1088,18 +1088,17 @@ impl ToolHandler for TaskToolHandler {
         trace: pioneer_tools::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let handler = self.clone();
-        let result =
-            match task_tool_fresh_task(
-                async move { handler.handle_in_fresh_task(invocation, trace).await },
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-                Err(error) => Err(ToolError::execution_failed(format!(
-                    "task tool handler failed: {error}"
-                ))),
-            };
+        let result = match task_tool_fresh_task(async move {
+            handler.handle_in_fresh_task(invocation, trace).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(ToolError::execution_failed(format!(
+                "task tool handler failed: {error}"
+            ))),
+        };
         result.map_err(crate::message::agent_action_tools::sanitize_agent_tool_error)
     }
 }
@@ -1706,10 +1705,7 @@ impl TaskToolHandler {
             .processor
             .task_runtime
             .service()
-            .wait_tasks(
-                authorization.wait_context(Some(confirmed_activity)),
-                params,
-            )
+            .wait_tasks(authorization.wait_context(Some(confirmed_activity)), params)
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 

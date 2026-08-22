@@ -81,9 +81,9 @@ use pioneer_protocol::{
     TurnExecutionSecuritySnapshot, TurnExecutionWindowCheckpointedNotification,
     TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItem,
     TurnItemExecutionClass, TurnItemType, TurnPermissionProfileSnapshot, TurnRejectedCapability,
-    UserInput,
-    build_execution_checkpoint_original_request_summary, build_execution_checkpoint_payload,
-    build_execution_checkpoint_provider_budget_summary, generate_id,
+    UserInput, build_execution_checkpoint_original_request_summary,
+    build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
+    generate_id,
 };
 use pioneer_provider::{
     AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest,

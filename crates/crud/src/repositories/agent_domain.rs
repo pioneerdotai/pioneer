@@ -660,8 +660,7 @@ fn current_agent_author_from_rows(
     immutable_snapshot: &agent_presentation_snapshot::Model,
     current_snapshot: &agent_presentation_snapshot::Model,
 ) -> Result<pioneer_protocol::TurnAuthorSnapshot> {
-    let immutable =
-        agent_presentation_snapshot_from_rows(identity, execution, immutable_snapshot)?;
+    let immutable = agent_presentation_snapshot_from_rows(identity, execution, immutable_snapshot)?;
     let current = current_agent_identity_projection_from_rows(identity, current_snapshot)?;
     let mut author = immutable.to_turn_author_snapshot();
 
@@ -2348,26 +2347,26 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to batch-load author presentation snapshots")?;
-    let current_snapshot_filter = identities.iter().fold(
-        Condition::any(),
-        |condition, identity| {
-            condition.add(
-                Condition::all()
-                    .add(
-                        agent_presentation_snapshot::Column::AgentIdentityId
-                            .eq(identity.id.clone()),
-                    )
-                    .add(
-                        agent_presentation_snapshot::Column::SourceRevision
-                            .eq(identity.source_revision),
-                    )
-                    .add(
-                        agent_presentation_snapshot::Column::SourceFingerprint
-                            .eq(identity.source_fingerprint.clone()),
-                    ),
-            )
-        },
-    );
+    let current_snapshot_filter =
+        identities
+            .iter()
+            .fold(Condition::any(), |condition, identity| {
+                condition.add(
+                    Condition::all()
+                        .add(
+                            agent_presentation_snapshot::Column::AgentIdentityId
+                                .eq(identity.id.clone()),
+                        )
+                        .add(
+                            agent_presentation_snapshot::Column::SourceRevision
+                                .eq(identity.source_revision),
+                        )
+                        .add(
+                            agent_presentation_snapshot::Column::SourceFingerprint
+                                .eq(identity.source_fingerprint.clone()),
+                        ),
+                )
+            });
     let current_snapshots = if identities.is_empty() {
         Vec::new()
     } else {
@@ -2408,12 +2407,7 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
         let author = if let Some(current_snapshot) =
             current_snapshots_by_identity_id.get(identity.id.as_str())
         {
-            current_agent_author_from_rows(
-                identity,
-                &execution,
-                snapshot,
-                current_snapshot,
-            )?
+            current_agent_author_from_rows(identity, &execution, snapshot, current_snapshot)?
         } else {
             agent_presentation_snapshot_from_rows(identity, &execution, snapshot)?
                 .to_turn_author_snapshot()
@@ -5951,6 +5945,87 @@ pub async fn finalize_agent_execution<C: ConnectionTrait>(
     let root_id = execution.work_graph_root_execution_id.clone();
     close_agent_root_scope_if_drained(db, root_id.as_str(), finished_at).await?;
     Ok(true)
+}
+
+/// Reopen the immutable AgentExecution for an explicit retry while leaving
+/// the terminal resource attempt as history. The caller advances the Task
+/// occurrence retry generation in the same transaction, so subsequent graph
+/// materialization creates a fresh resource state and permit/queue row.
+pub async fn reopen_agent_execution_for_retry<C: ConnectionTrait>(
+    db: &C,
+    execution_id: &str,
+    expected_root_execution_id: &str,
+    reopened_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let execution = agent_execution::Entity::find_by_id(execution_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to load AgentExecution for retry")?
+        .with_context(|| format!("AgentExecution `{execution_id}` is missing"))?;
+    if execution.work_graph_root_execution_id != expected_root_execution_id {
+        bail!("AgentExecution retry crosses its immutable work-graph root");
+    }
+    if !matches!(
+        execution.status.as_str(),
+        "blocked" | "failed" | "timed_out"
+    ) {
+        bail!(
+            "AgentExecution `{execution_id}` is `{}`; only a failed resumable execution can retry",
+            execution.status
+        );
+    }
+
+    let scope =
+        agent_work_resource_scope::Entity::find_by_id(expected_root_execution_id.to_owned())
+            .one(db)
+            .await
+            .context("failed to load AgentExecution root scope for retry")?
+            .context("AgentExecution retry has no durable root resource scope")?;
+    if !matches!(scope.status.as_str(), "active" | "closed") {
+        bail!("AgentExecution retry root scope is not resumable");
+    }
+    if scope.status == "closed" {
+        let reopened_scope = agent_work_resource_scope::Entity::update_many()
+            .col_expr(
+                agent_work_resource_scope::Column::Status,
+                sea_orm::sea_query::Expr::value("active"),
+            )
+            .col_expr(
+                agent_work_resource_scope::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(reopened_at),
+            )
+            .filter(
+                agent_work_resource_scope::Column::RootExecutionId
+                    .eq(expected_root_execution_id.to_owned()),
+            )
+            .filter(agent_work_resource_scope::Column::Status.eq("closed"))
+            .exec(db)
+            .await
+            .context("failed to reopen AgentExecution root scope for retry")?;
+        if reopened_scope.rows_affected != 1 {
+            bail!("AgentExecution root scope changed while retry was committing");
+        }
+    }
+
+    let reopened = agent_execution::Entity::update_many()
+        .col_expr(
+            agent_execution::Column::Status,
+            sea_orm::sea_query::Expr::value("recovering"),
+        )
+        .col_expr(
+            agent_execution::Column::FinishedAt,
+            sea_orm::sea_query::Expr::value(None::<DateTimeWithTimeZone>),
+        )
+        .col_expr(
+            agent_execution::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(reopened_at),
+        )
+        .filter(agent_execution::Column::Id.eq(execution_id.to_owned()))
+        .filter(agent_execution::Column::Status.is_in(["blocked", "failed", "timed_out"]))
+        .exec(db)
+        .await
+        .context("failed to reopen AgentExecution for retry")?;
+    Ok(reopened.rows_affected == 1)
 }
 
 /// Fence an explicitly cancelled root work graph in one durable transition.

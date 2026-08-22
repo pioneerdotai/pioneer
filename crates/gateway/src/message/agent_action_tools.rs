@@ -1131,6 +1131,7 @@ async fn ensure_root_agent_action_binding(
         context,
         &thread,
         &authority,
+        None,
         requested_launch,
         requested_backend,
         cli_binding
@@ -1167,6 +1168,7 @@ pub(crate) async fn prepare_root_agent_execution_admission(
     context: &TurnToolContext,
     thread: &pioneer_protocol::Thread,
     authority: &crate::authorization::ExecutionAuthorizationContext,
+    runtime_draft_access: Option<&crate::thread::RuntimeDraftAccess>,
     requested_launch: Option<&pioneer_protocol::AgentLaunchSelection>,
     requested_backend: Option<&pioneer_protocol::AgentExecutionBackend>,
     bound_cli_runtime_id: Option<&str>,
@@ -1179,25 +1181,44 @@ pub(crate) async fn prepare_root_agent_execution_admission(
     }
     let home_root_thread_id = authority.root_thread_id().to_owned();
     let database = processor.crud_store.database_connection();
-    let current_scope = pioneer_crud::resolve_thread_authorization_scope(
-        &database,
-        context.thread_id.as_str(),
-        Some(context.workspace_id.as_str()),
-    )
-    .await?
-    .context("root Agent Turn thread is unavailable for collaboration admission")?;
+    let current_access_class = match runtime_draft_access {
+        Some(access) => {
+            if access.thread_id() != context.thread_id
+                || access.workspace_id() != context.workspace_id
+                || context.thread_id != home_root_thread_id
+            {
+                anyhow::bail!("root Agent runtime draft differs from its collaboration root");
+            }
+            if access.visibility() == Some(pioneer_protocol::ThreadVisibility::Workspace) {
+                pioneer_crud::PersistedThreadAccessClass::Workspace
+            } else {
+                pioneer_crud::PersistedThreadAccessClass::Private
+            }
+        }
+        None => {
+            pioneer_crud::resolve_thread_authorization_scope(
+                &database,
+                context.thread_id.as_str(),
+                Some(context.workspace_id.as_str()),
+            )
+            .await?
+            .context("root Agent Turn thread is unavailable for collaboration admission")?
+            .access_class
+        }
+    };
     if context.thread_id == home_root_thread_id {
-        if current_scope.access_class == pioneer_crud::PersistedThreadAccessClass::Internal
-            || processor
-                .crud_store
-                .get_task_thread_lineage(context.thread_id.as_str())
-                .await?
-                .is_some()
+        if current_access_class == pioneer_crud::PersistedThreadAccessClass::Internal
+            || (runtime_draft_access.is_none()
+                && processor
+                    .crud_store
+                    .get_task_thread_lineage(context.thread_id.as_str())
+                    .await?
+                    .is_some())
         {
             anyhow::bail!("root Agent admission points at an internal collaboration child");
         }
     } else {
-        if current_scope.access_class != pioneer_crud::PersistedThreadAccessClass::Internal {
+        if current_access_class != pioneer_crud::PersistedThreadAccessClass::Internal {
             anyhow::bail!("child Agent Turn is not in an internal collaboration thread");
         }
         let lineage = processor
@@ -3022,11 +3043,7 @@ impl AgentActionToolHandler {
         let binding = processor
             .prepare_agent_action_binding(
                 turn_id.clone(),
-                AgentActionRuntimeBinding::new(
-                    child_adapter,
-                    child_options,
-                    child_capabilities,
-                ),
+                AgentActionRuntimeBinding::new(child_adapter, child_options, child_capabilities),
             )
             .await
             .map_err(|error| {

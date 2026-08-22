@@ -651,7 +651,7 @@ pub fn flatten_thread_semantic_timeline(
                     id: SemanticTimelineRowId::TopLevelBlock {
                         block_id: block.block_id.clone(),
                     },
-                    author: Some(author.clone()),
+                    author: author.cloned(),
                     kind: SemanticTimelineRowKind::WorkHeader {
                         block: block.clone(),
                         work: work.clone(),
@@ -677,7 +677,7 @@ pub fn flatten_thread_semantic_timeline(
                     id: SemanticTimelineRowId::TopLevelBlock {
                         block_id: block.block_id.clone(),
                     },
-                    author: Some(author.clone()),
+                    author: author.cloned(),
                     kind: SemanticTimelineRowKind::DetachedTaskRun {
                         block: block.clone(),
                     },
@@ -691,7 +691,7 @@ pub fn flatten_thread_semantic_timeline(
                     id: SemanticTimelineRowId::TopLevelBlock {
                         block_id: block.block_id.clone(),
                     },
-                    author: Some(author.clone()),
+                    author: author.cloned(),
                     kind: SemanticTimelineRowKind::AssistantMessage {
                         block: block.clone(),
                     },
@@ -705,7 +705,7 @@ pub fn flatten_thread_semantic_timeline(
                     id: SemanticTimelineRowId::TopLevelBlock {
                         block_id: block.block_id.clone(),
                     },
-                    author: Some(author.clone()),
+                    author: author.cloned(),
                     kind: SemanticTimelineRowKind::PendingRequest {
                         block: block.clone(),
                     },
@@ -738,24 +738,23 @@ pub fn flatten_thread_semantic_timeline(
 fn ready_timeline_state_author(
     author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
 ) -> Option<Option<&pioneer_protocol::TurnAuthorSnapshot>> {
-    match author {
-        None => Some(None),
-        Some(author) => ready_agent_timeline_author(Some(author)).map(Some),
-    }
+    ready_agent_timeline_author(author)
 }
 
 fn ready_agent_timeline_author(
     author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
-) -> Option<&pioneer_protocol::TurnAuthorSnapshot> {
-    let author = author?;
+) -> Option<Option<&pioneer_protocol::TurnAuthorSnapshot>> {
+    let Some(author) = author else {
+        return Some(None);
+    };
     let pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) = &author.actor else {
         return None;
     };
-    author
-        .agent
-        .as_ref()
-        .is_some_and(|agent| &agent.agent_execution_id == execution_id)
-        .then_some(author)
+    match author.agent.as_ref() {
+        None => Some(Some(author)),
+        Some(agent) if &agent.agent_execution_id == execution_id => Some(Some(author)),
+        Some(_) => None,
+    }
 }
 
 pub fn flatten_semantic_timeline(
@@ -3610,12 +3609,60 @@ fn merge_work_loaded_range(
 mod tests {
     use super::*;
     use pioneer_protocol::{
+        AgentExecutionId, AgentIdentityId, AgentIdentitySourceKind, AgentPresentationSnapshot,
         ArtifactKind, ArtifactRef, ArtifactStatus, PersistedActorRef, PrincipalId,
         SystemEventLevel, TaskAttachmentMode, TaskExecutorKind, TaskStatus, TaskTriggerKind,
         TaskTurnItem, ThreadMode, TimelineBlockKind, TimelineReplySummary, TurnAuthorSnapshot,
         TurnItem, TurnItemType, TurnMention, TurnWorkItemStatus, TurnWorkPresentation,
         TurnWorkState,
     };
+
+    #[test]
+    fn agent_author_readiness_preserves_legacy_absence_and_rejects_contradictions() {
+        assert_eq!(ready_agent_timeline_author(None), Some(None));
+
+        let principal_author = TurnAuthorSnapshot {
+            actor: PersistedActorRef::Principal(
+                PrincipalId::new("P0000000000000000000A").expect("principal id"),
+            ),
+            display_name: "Alice".to_owned(),
+            nickname: "alice".to_owned(),
+            avatar_revision: None,
+            agent: None,
+        };
+        assert!(ready_agent_timeline_author(Some(&principal_author)).is_none());
+
+        let execution_id =
+            AgentExecutionId::new("E0000000000000000000A").expect("agent execution id");
+        let legacy_agent_author = TurnAuthorSnapshot {
+            actor: PersistedActorRef::AgentExecution(execution_id.clone()),
+            display_name: "Legacy agent".to_owned(),
+            nickname: "legacy-agent".to_owned(),
+            avatar_revision: None,
+            agent: None,
+        };
+        assert_eq!(
+            ready_agent_timeline_author(Some(&legacy_agent_author)),
+            Some(Some(&legacy_agent_author))
+        );
+
+        let mismatched_agent_author = TurnAuthorSnapshot {
+            agent: Some(AgentPresentationSnapshot {
+                agent_identity_id: AgentIdentityId::new("A0000000000000000000A")
+                    .expect("agent identity id"),
+                agent_execution_id: AgentExecutionId::new("E0000000000000000000B")
+                    .expect("other agent execution id"),
+                identity_source_kind: AgentIdentitySourceKind::CliRuntimeInstance,
+                identity_source_revision: 1,
+                display_name: "Other agent".to_owned(),
+                nickname: "other-agent".to_owned(),
+                avatar_revision: None,
+                role_label: Some("codex".to_owned()),
+            }),
+            ..legacy_agent_author
+        };
+        assert!(ready_agent_timeline_author(Some(&mismatched_agent_author)).is_none());
+    }
 
     #[test]
     fn applying_same_top_level_page_twice_is_idempotent() {

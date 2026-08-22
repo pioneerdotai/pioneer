@@ -424,7 +424,7 @@ async fn persist_task_agent_execution_graph(
     .to_string();
     let grant_fingerprint = pioneer_crud::agent_execution_grant_fingerprint(&grant_json)?;
 
-    let result = processor
+    let result = match processor
         .crud_store
         .commit_agent_execution_graph(AgentExecutionGraphCommitInput {
             identity: AgentIdentityInput {
@@ -540,7 +540,31 @@ async fn persist_task_agent_execution_graph(
             contract_now: now_timestamp_secs(),
         })
         .await
-        .context("failed to persist agent domain task execution graph")?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let root_was_cancelled = pioneer_crud::load_agent_execution(
+                &processor.crud_store.database_connection(),
+                root_execution_id.as_str(),
+            )
+            .await?
+            .is_some_and(|execution| execution.status == "cancelled");
+            if !root_was_cancelled {
+                return Err(error).context("failed to persist agent domain task execution graph");
+            }
+            // Parent cancellation may fence the graph after Task creation but
+            // before this child admission transaction. This is an intentional
+            // terminal race, not an executor-start failure. Leave the run
+            // non-failed so the parent cancellation path can project the exact
+            // Task/Run cancellation through TaskService.
+            pioneer_crud::AgentExecutionGraphCommitResult {
+                root_execution_id: root_execution_id.clone(),
+                execution_id: execution_id.clone(),
+                queued: true,
+                queue_position: None,
+            }
+        }
+    };
     processor
         .notify_agent_work_graph_state_changed(result.root_execution_id.as_str())
         .await;
@@ -1847,6 +1871,23 @@ impl TaskAgentExecutor {
             child_authorization_fingerprint.as_str(),
         )
         .await?;
+        if graph.queued
+            && pioneer_crud::load_agent_execution(
+                &processor.crud_store.database_connection(),
+                graph.root_execution_id.as_str(),
+            )
+            .await?
+            .is_some_and(|execution| execution.status == "cancelled")
+        {
+            self.cancel_run(
+                context.clone(),
+                run.id.as_str(),
+                "parent Agent work graph cancelled",
+                handle,
+            )
+            .await?;
+            return Ok(TaskExecutorStartOutcome::Started);
+        }
         action_adapter
             .bind_persisted_work_graph_root(graph.root_execution_id.as_str())
             .map_err(|error| anyhow!("failed to bind persisted task work graph: {error:?}"))?;
@@ -5889,7 +5930,7 @@ impl TaskExecutor for TaskAgentExecutor {
         handle: TaskExecutionHandle,
     ) -> pioneer_tasks::TaskRuntimeResult<()> {
         let processor = self.processor()?;
-        let child_runtimes = list_child_runtimes_for_run(&processor, run_id).await?;
+        let task_run_turns = processor.crud_store.list_task_run_turns(run_id).await?;
         let cancelled_at = now_timestamp_secs();
         // Task cancellation owns the run terminal state. Commit it before
         // interrupting the child so the generic turn-interruption projector
@@ -5898,7 +5939,39 @@ impl TaskExecutor for TaskAgentExecutor {
         handle
             .cancel_run(Some(reason.to_owned()), cancelled_at)
             .await?;
-        for child_runtime in child_runtimes {
+        for task_run_turn in task_run_turns {
+            let error = task_error(
+                "task_run_cancelled",
+                reason.to_owned(),
+                TaskErrorClass::Cancelled,
+                Some(run_id.to_owned()),
+            );
+            record_task_run_turn_failure(
+                &handle,
+                &task_run_turn,
+                TaskRunTurnStatus::Cancelled,
+                Some(error),
+                cancelled_at,
+            )
+            .await?;
+            let child_runtime = match load_child_runtime_from_task_run_turn(
+                &processor,
+                task_run_turn.clone(),
+            )
+            .await
+            {
+                Ok(child_runtime) => child_runtime,
+                Err(error) => {
+                    warn!(
+                        run_id,
+                        turn_id = task_run_turn.turn_id,
+                        error = %format!("{error:#}"),
+                        failure_class = "task_cancel_partial_runtime_cleanup_skipped",
+                        "Task run Turn was cancelled before its child runtime lineage completed"
+                    );
+                    continue;
+                }
+            };
             let cancelled_cli_runtime = processor
                 .cancel_task_cli_runtime_turn(
                     child_runtime.task_run_turn.thread_id.as_str(),
@@ -5927,20 +6000,6 @@ impl TaskExecutor for TaskAgentExecutor {
                     );
                 }
             }
-            let error = task_error(
-                "task_run_cancelled",
-                reason.to_owned(),
-                TaskErrorClass::Cancelled,
-                Some(run_id.to_owned()),
-            );
-            record_task_run_turn_failure(
-                &handle,
-                &child_runtime.task_run_turn,
-                TaskRunTurnStatus::Cancelled,
-                Some(error),
-                cancelled_at,
-            )
-            .await?;
             if child_runtime.task_run_turn.kind != TaskRunTurnKind::Review {
                 mark_task_run_occurrence_turn_terminal(
                     &processor,
@@ -6943,18 +7002,6 @@ async fn load_child_runtime_for_run(
     load_child_runtime_from_task_run_turn(processor, task_run_turn)
         .await
         .map(Some)
-}
-
-async fn list_child_runtimes_for_run(
-    processor: &Arc<MessageProcessor>,
-    run_id: &str,
-) -> Result<Vec<TaskRunChildRuntime>> {
-    let task_run_turns = processor.crud_store.list_task_run_turns(run_id).await?;
-    let mut runtimes = Vec::with_capacity(task_run_turns.len());
-    for task_run_turn in task_run_turns {
-        runtimes.push(load_child_runtime_from_task_run_turn(processor, task_run_turn).await?);
-    }
-    Ok(runtimes)
 }
 
 async fn load_child_runtime_for_turn(

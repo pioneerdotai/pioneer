@@ -106,10 +106,9 @@ impl ClientFfiAvatarCache {
         })?;
         let (service, runtime) = avatar_cache_service(sender, runtime_home)?;
         let result = runtime
-            .block_on(service.resolve_agent_avatar(
-                request.avatar_revision,
-                CancellationToken::new(),
-            ))
+            .block_on(
+                service.resolve_agent_avatar(request.avatar_revision, CancellationToken::new()),
+            )
             .map_err(map_cache_error)?;
         agent_result_for_shell(result)
     }

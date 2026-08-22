@@ -719,6 +719,76 @@ async fn persist_test_agent_turn(
     .expect("test Agent turn response should persist");
 }
 
+async fn persist_test_child_agent_execution(runtime: &TaskRuntime, execution_id: &str) {
+    let store = runtime.service().store();
+    let database = store.database_connection();
+    let now = pioneer_crud::utc_now();
+    let (launch, identity, profile, _) = test_agent_launch_facts();
+    let snapshot = test_agent_presentation_snapshot(execution_id);
+
+    pioneer_crud::ensure_agent_identity(
+        &database,
+        &pioneer_crud::AgentIdentityInput {
+            id: identity.id.as_str().to_owned(),
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            source_kind: pioneer_crud::SOURCE_NATIVE_AGENT.to_owned(),
+            source_id: "tasks-test-agent".to_owned(),
+            source_revision: i64::try_from(identity.source_revision)
+                .expect("test identity revision should fit i64"),
+            source_fingerprint: identity.source_fingerprint.clone(),
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("test child Agent identity should persist");
+    pioneer_crud::insert_presentation_snapshot(
+        &database,
+        &pioneer_crud::PresentationSnapshotInput {
+            id: TEST_PRESENTATION_SNAPSHOT_ID.to_owned(),
+            agent_identity_id: identity.id.as_str().to_owned(),
+            source_revision: i64::try_from(identity.source_revision)
+                .expect("test identity revision should fit i64"),
+            source_fingerprint: identity.source_fingerprint.clone(),
+            display_name: snapshot.display_name,
+            nickname: snapshot.nickname,
+            avatar_revision: snapshot.avatar_revision,
+            role_label: snapshot.role_label,
+            now: now.clone(),
+        },
+    )
+    .await
+    .expect("test child Agent presentation should persist");
+    pioneer_crud::insert_agent_execution(
+        &database,
+        &pioneer_crud::AgentExecutionInput {
+            id: execution_id.to_owned(),
+            workspace_id: TEST_WORKSPACE_ID.to_owned(),
+            agent_identity_id: identity.id.as_str().to_owned(),
+            identity_source_revision: i64::try_from(identity.source_revision)
+                .expect("test identity revision should fit i64"),
+            identity_source_fingerprint: identity.source_fingerprint,
+            parent_execution_id: Some(TEST_PARENT_EXECUTION_ID.to_owned()),
+            parent_task_id: None,
+            parent_thread_id: Some(TEST_PARENT_THREAD_ID.to_owned()),
+            home_root_thread_id: TEST_PARENT_THREAD_ID.to_owned(),
+            work_graph_root_execution_id: TEST_PARENT_EXECUTION_ID.to_owned(),
+            requested_identity_selection_json: serde_json::to_string(&launch.agent)
+                .expect("test identity selection should serialize"),
+            requested_profile_selection_json: serde_json::to_string(&launch.execution.profile)
+                .expect("test profile selection should serialize"),
+            resolved_profile_id: Some(profile.id.as_str().to_owned()),
+            resolved_profile_fingerprint: Some(profile.fingerprint),
+            presentation_snapshot_id: Some(TEST_PRESENTATION_SNAPSHOT_ID.to_owned()),
+            authorization_context_fingerprint: "b".repeat(64),
+            execution_generation: 1,
+            status: "running".to_owned(),
+            now,
+        },
+    )
+    .await
+    .expect("test child Agent execution should persist");
+}
+
 /// Produces the explicit positive authority seed required by Agent Tasks in
 /// service-level tests. The Tasks crate deliberately treats the serialized
 /// authorization context as opaque; Gateway integration tests exercise the
@@ -918,6 +988,7 @@ async fn create_waiting_review_agent_task_with_policy(
         .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, run.created_at)
         .await
         .expect("execution should reserve");
+    persist_test_child_agent_execution(runtime, execution.id.as_str()).await;
     let handle = TaskExecutionHandle::new(
         runtime.service().store(),
         runtime.event_bus(),

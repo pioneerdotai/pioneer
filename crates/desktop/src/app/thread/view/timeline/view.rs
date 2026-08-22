@@ -404,9 +404,7 @@ impl PioneerDesktop {
                                     .text_sm()
                                     .font_semibold()
                                     .child(super::timeline_agent_label(author).unwrap_or_else(
-                                        || {
-                                            t!("chat.composer.mode.agent_label").to_string()
-                                        },
+                                        || t!("chat.composer.mode.agent_label").to_string(),
                                     )),
                             ),
                     ),

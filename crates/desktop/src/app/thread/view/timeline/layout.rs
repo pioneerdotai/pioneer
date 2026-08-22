@@ -144,8 +144,8 @@ impl TimelineGrouping {
             if let Some(source) = descriptor.avatar_source.clone() {
                 let source = match source {
                     TimelineAvatarSource::Agent { author, .. } => {
-                        let exact_author = super::timeline_agent_execution_author(author.as_ref())
-                            .cloned();
+                        let exact_author =
+                            super::timeline_agent_execution_author(author.as_ref()).cloned();
                         TimelineAvatarSource::Agent {
                             author: exact_author,
                             shows_running_dino: presentation_context.task_child_thread
@@ -456,6 +456,7 @@ fn turn_id_from_toggle_key(toggle_key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::app::conversation::TimelineEntry;
+    use pioneer_client::conversation::reducer::{TurnPhase, TurnView};
     use pioneer_client::timeline::rows::UserMessagePresentation;
     use pioneer_protocol::{AgentExecutionId, PrincipalId, ThreadMode};
 
@@ -738,9 +739,9 @@ mod tests {
     fn consecutive_agent_rows_from_one_turn_share_one_avatar_group() {
         let mut projection = ConversationViewState::default();
         let author = agent_author();
-        projection.turns.push(crate::app::conversation::TurnView {
+        projection.turns.push(TurnView {
             id: "turn".to_owned(),
-            phase: crate::app::conversation::TurnPhase::Completed,
+            phase: TurnPhase::Completed,
             started_at_unix_ms: None,
             completed_at_unix_ms: None,
             error: None,

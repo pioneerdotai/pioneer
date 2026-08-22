@@ -518,8 +518,8 @@ fn timeline_pending_request_render_fingerprint(row: &TimelinePendingRequestRow) 
 mod author_presentation_tests {
     use super::*;
     use pioneer_protocol::{
-        AgentExecutionId, AgentIdentityId, AgentIdentitySourceKind, PrincipalKind,
-        PrincipalStatus, RoleKey,
+        AgentExecutionId, AgentIdentityId, AgentIdentitySourceKind, PrincipalKind, PrincipalStatus,
+        RoleKey,
     };
 
     fn principal(value: &str) -> PrincipalId {
@@ -627,7 +627,10 @@ mod author_presentation_tests {
             Some("Renamed Codex · @renamed-codex".to_owned())
         );
         assert_eq!(
-            author.agent.as_ref().map(|agent| agent.display_name.as_str()),
+            author
+                .agent
+                .as_ref()
+                .map(|agent| agent.display_name.as_str()),
             Some("Codex CLI")
         );
     }

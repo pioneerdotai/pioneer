@@ -2678,6 +2678,9 @@ impl MessageProcessor {
                     },
                     &outcome.materialization.thread,
                     &authority,
+                    execution_admission
+                        .runtime_draft()
+                        .map(|draft| draft.access()),
                     security_params.agent_launch.as_ref(),
                     security_params.execution_backend.as_ref(),
                     None,
@@ -4614,6 +4617,7 @@ impl MessageProcessor {
                         },
                         &outcome.materialization.thread,
                         &authority,
+                        admission.runtime_draft().map(|draft| draft.access()),
                         security_params.agent_launch.as_ref(),
                         security_params.execution_backend.as_ref(),
                         None,
@@ -7529,7 +7533,7 @@ impl MessageProcessor {
             .insert(cancel_intent_key.clone(), reason.clone());
 
         if let Err(error) = self
-            .cancel_root_agent_work_graph_for_turn(&turn, reason.as_str())
+            .cancel_root_agent_work_graph_for_turn(thread_id.as_str(), &turn, reason.as_str())
             .await
         {
             self.user_turn_cancel_intents

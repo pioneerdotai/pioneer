@@ -472,9 +472,7 @@ pub enum AgentProgressEvent {
     },
 }
 
-#[derive(
-    Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash,
-)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemHeartbeatSource {
     #[default]

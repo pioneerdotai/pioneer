@@ -1628,8 +1628,8 @@ impl MessageProcessor {
         turn_ids: &[String],
     ) -> Result<HashMap<String, pioneer_protocol::TurnAuthorSnapshot>> {
         let database = self.crud_store.database_connection();
-        let responses = pioneer_crud::load_agent_turn_responses_for_turns(&database, turn_ids)
-            .await?;
+        let responses =
+            pioneer_crud::load_agent_turn_responses_for_turns(&database, turn_ids).await?;
         let responses_by_turn = responses
             .iter()
             .map(|response| (response.turn_id.as_str(), response))
@@ -1680,9 +1680,7 @@ impl MessageProcessor {
                         projected.presentation_snapshot_id == response.presentation_snapshot_id
                     })
                     .map(|projected| projected.author.clone())
-            } else if let Some(execution_id) =
-                direct_execution_ids_by_turn.get(turn_id.as_str())
-            {
+            } else if let Some(execution_id) = direct_execution_ids_by_turn.get(turn_id.as_str()) {
                 projected_by_execution
                     .get(*execution_id)
                     .map(|projected| projected.author.clone())
@@ -1812,13 +1810,11 @@ impl MessageProcessor {
                 self.detached_task_run_timeline_block_kind(&row, author)
                     .await?
             }
-            BLOCK_KIND_ASSISTANT_MESSAGE => {
-                self.assistant_message_timeline_block_kind(
-                    &row,
-                    assistant_messages,
-                    action_projection,
-                )?
-            }
+            BLOCK_KIND_ASSISTANT_MESSAGE => self.assistant_message_timeline_block_kind(
+                &row,
+                assistant_messages,
+                action_projection,
+            )?,
             BLOCK_KIND_RUNNING => TimelineBlockKind::TurnState {
                 state: TurnWorkState::Running,
                 message: None,

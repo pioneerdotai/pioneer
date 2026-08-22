@@ -382,10 +382,8 @@ impl PioneerDesktop {
                     let requested_revision = avatar_revision.clone();
                     let result = cx
                         .background_spawn(async move {
-                            client.resolve_agent_avatar(
-                                requested_revision,
-                                CancellationToken::new(),
-                            )
+                            client
+                                .resolve_agent_avatar(requested_revision, CancellationToken::new())
                         })
                         .await;
                     let _ = this.update(&mut cx, |view, cx| {
@@ -393,10 +391,9 @@ impl PioneerDesktop {
                             Ok(result) => view
                                 .member_avatar_state
                                 .apply_agent_result(generation, result),
-                            Err(_) => view.member_avatar_state.apply_agent_error(
-                                generation,
-                                avatar_revision.as_str(),
-                            ),
+                            Err(_) => view
+                                .member_avatar_state
+                                .apply_agent_error(generation, avatar_revision.as_str()),
                         }
                         cx.notify();
                     });

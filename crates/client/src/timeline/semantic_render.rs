@@ -1043,11 +1043,29 @@ mod tests {
     }
 
     fn semantic_row(kind: SemanticTimelineRowKind) -> SemanticTimelineRow {
+        let author = match &kind {
+            SemanticTimelineRowKind::UserBlock { block }
+            | SemanticTimelineRowKind::AssistantMessage { block }
+            | SemanticTimelineRowKind::PendingRequest { block }
+            | SemanticTimelineRowKind::TurnState { block } => match &block.kind {
+                TimelineBlockKind::UserMessage { author, .. }
+                | TimelineBlockKind::AssistantMessage { author, .. }
+                | TimelineBlockKind::PendingRequest { author, .. }
+                | TimelineBlockKind::TurnState { author, .. } => author.clone(),
+                _ => None,
+            },
+            SemanticTimelineRowKind::DetachedTaskRun { block } => match &block.kind {
+                TimelineBlockKind::DetachedTaskRun { author, .. } => author.clone(),
+                _ => None,
+            },
+            SemanticTimelineRowKind::WorkHeader { work, .. } => work.author.clone(),
+            SemanticTimelineRowKind::WorkItem { .. } => None,
+        };
         SemanticTimelineRow {
             id: SemanticTimelineRowId::TopLevelBlock {
                 block_id: "block".to_owned(),
             },
-            author: None,
+            author,
             kind,
         }
     }

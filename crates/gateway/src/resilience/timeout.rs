@@ -45,9 +45,7 @@ pub const fn hard_deadline_mode(
     item_type: TurnItemType,
 ) -> HardDeadlineMode {
     match (execution_class, item_type) {
-        (TurnItemExecutionClass::DurableWait, _) => {
-            HardDeadlineMode::RollingOnConfirmedActivity
-        }
+        (TurnItemExecutionClass::DurableWait, _) => HardDeadlineMode::RollingOnConfirmedActivity,
         (TurnItemExecutionClass::Standard, TurnItemType::CommandExecution) => {
             HardDeadlineMode::RollingOnConfirmedActivity
         }

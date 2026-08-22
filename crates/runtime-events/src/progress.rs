@@ -222,8 +222,7 @@ impl ProgressCoalescer {
                         heartbeat.source,
                         ItemHeartbeatSource::ConfirmedExternalActivity
                     )
-                })
-            {
+                }) {
                 ItemHeartbeatSource::ConfirmedExternalActivity
             } else {
                 ItemHeartbeatSource::OwnerLease

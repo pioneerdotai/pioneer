@@ -13,8 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use pioneer_protocol::{
-    AuthSessionId, GatewayId, PROFILE_AVATAR_MAX_DECODED_BYTES, PrincipalId,
-    ProfileAvatarMediaType,
+    AuthSessionId, GatewayId, PROFILE_AVATAR_MAX_DECODED_BYTES, PrincipalId, ProfileAvatarMediaType,
 };
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
@@ -979,9 +978,10 @@ mod tests {
     #[test]
     fn agent_avatar_uses_the_authenticated_system_route_and_an_isolated_cache_entry() {
         let temp = tempfile::tempdir().unwrap();
-        let agent_request =
-            ValidatedAvatarRequest::agent(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION.to_owned())
-                .unwrap();
+        let agent_request = ValidatedAvatarRequest::agent(
+            pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION.to_owned(),
+        )
+        .unwrap();
         assert_eq!(
             agent_request.storage_path(),
             format!(

@@ -1467,6 +1467,9 @@ async fn setup_cli_runtime_skill_preflight_harness(
     )
     .with_runtime_home_for_tests(runtime_home.clone())
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    sync_test_cli_runtime_identities(&processor)
+        .await
+        .expect("CLI runtime skill harness should materialize its Agent identities");
     let event_log = processor.cli_runtime_skill_preflight_test_events();
     cli_session.set_event_log(event_log.clone()).await;
 
@@ -10799,8 +10802,15 @@ async fn first_voice_turn_materializes_runtime_draft() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn voice_turn_start_replay_does_not_dispatch_provider_again() {
+#[test]
+fn voice_turn_start_replay_does_not_dispatch_provider_again() {
+    run_standard_stack_message_test(
+        "voice turn admission replay",
+        voice_turn_start_replay_does_not_dispatch_provider_again_impl(),
+    );
+}
+
+async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -11133,8 +11143,15 @@ async fn task_run_voice_composer_stays_foreground() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_attachments() {
+#[test]
+fn voice_session_transcript_starts_turn_and_preserves_authorized_context_attachments() {
+    run_standard_stack_message_test(
+        "voice transcript starts turn with authorized context attachments",
+        voice_session_transcript_starts_turn_and_preserves_authorized_context_attachments_impl(),
+    );
+}
+
+async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_attachments_impl() {
     let base_dir = unique_temp_dir("voice_turn_capability");
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
@@ -22810,15 +22827,20 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "task_wait",
         "task_cancel",
         "task_detach",
-        "task_list",
         "task_get",
-        "task_reschedule",
-        "task_pause",
         "task_resume",
     ] {
         assert!(
             tool_names.contains(&expected),
             "agent mode should expose {expected}"
+        );
+    }
+    for hidden_without_typed_agent_intent in
+        ["task_update", "task_list", "task_reschedule", "task_pause"]
+    {
+        assert!(
+            !tool_names.contains(&hidden_without_typed_agent_intent),
+            "agent mode must hide {hidden_without_typed_agent_intent} without a typed Agent capability"
         );
     }
     for hidden_until_review in ["task_accept", "task_revise"] {
@@ -23098,17 +23120,35 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
         .await
         .expect("scheduled task should fire");
 
-    let task_after_run = processor
+    let started_task = processor
         .crud_store
         .get_task(task_id.as_str())
         .await
         .expect("task should read")
         .expect("task should exist");
-    let run = task_after_run
+    let run = started_task
         .runs
         .last()
         .expect("scheduled run should exist")
         .clone();
+    let terminal_status = wait_for_run_status(
+        processor.crud_store.clone(),
+        run.id.as_str(),
+        TaskRunStatus::Succeeded,
+    )
+    .await;
+    let terminal_run = processor
+        .crud_store
+        .get_task_run(run.id.as_str())
+        .await
+        .expect("terminal scheduled run should reload")
+        .expect("terminal scheduled run should exist");
+    assert_eq!(
+        terminal_status,
+        TaskRunStatus::Succeeded,
+        "scheduled result must be terminal before its delivery is projected; error={:?}",
+        terminal_run.error
+    );
     let parent_thread = processor
         .thread_manager
         .thread_get(origin_thread_id)
@@ -24206,22 +24246,47 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         "turn_task_cancel_parent",
     )
     .await;
+    let cancel_request_id = generate_test_request_id("parentcancel", "attached");
     processor
-        .agent_manager
-        .cancel_turn(
-            "thr_task_cancel_parent",
-            "turn_task_cancel_parent",
-            "test parent cancellation",
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": cancel_request_id,
+                "method": "turn/cancel",
+                "params": {
+                    "thread_id": "thr_task_cancel_parent",
+                    "turn_id": "turn_task_cancel_parent",
+                    "reason": "test parent cancellation"
+                }
+            })
+            .to_string(),
         )
-        .await
-        .expect("parent cancel should dispatch");
-    let _ = recv_notification_by_method(&mut rx, events::TURN_FAILED).await;
+        .await;
+    let (_cancel_response, _failed_notification) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        cancel_request_id.as_str(),
+        events::TURN_FAILED,
+    )
+    .await;
 
+    let observed_status = wait_for_task_status(
+        crud_store.clone(),
+        task_id.as_str(),
+        pioneer_protocol::TaskStatus::Cancelled,
+    )
+    .await;
     let task = crud_store
         .get_task(task_id.as_str())
         .await
         .expect("task should load")
         .expect("task should exist");
+    assert_eq!(
+        observed_status,
+        pioneer_protocol::TaskStatus::Cancelled,
+        "parent cancellation must propagate through TaskService; task error: {:?}",
+        task.task.error
+    );
     assert_eq!(task.task.status, pioneer_protocol::TaskStatus::Cancelled);
     let run = task
         .runs
@@ -24234,8 +24299,12 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
     assert!(
         task_run_turns
             .iter()
-            .any(|turn| turn.status == TaskRunTurnStatus::Cancelled),
-        "cancelled child task should mark its target task_run_turn cancelled"
+            .all(|turn| turn.status == TaskRunTurnStatus::Cancelled),
+        "parent cancellation must not leave an active task_run_turn; observed: {:?}",
+        task_run_turns
+            .iter()
+            .map(|turn| (&turn.id, turn.kind, turn.status))
+            .collect::<Vec<_>>()
     );
     assert!(
         crud_store
@@ -41218,6 +41287,13 @@ async fn turn_start_materializes_thread_and_turn_state() {
         .find(|workspace| workspace.is_active && workspace.is_current)
         .expect("default workspace should exist")
         .id;
+    pioneer_crud::ensure_pioneer_for_workspace(
+        &connection,
+        workspace_id.as_str(),
+        chrono::Utc::now().fixed_offset(),
+    )
+    .await
+    .expect("materialization test should include the reserved Pioneer identity");
     let crud_store = Arc::new(CrudStore::new(connection.clone()));
     ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
     let processor = MessageProcessor::with_agent_manager(

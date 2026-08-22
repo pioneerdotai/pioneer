@@ -3915,6 +3915,10 @@ mod tests {
                 "runId": "run_review000000001",
                 "taskRunTurnId": "run_turn_initial001",
                 "reviewerKind": "review_agent",
+                "reviewer": {
+                    "kind": "agent_execution",
+                    "id": "R00000000000000000001"
+                },
                 "reviewerThreadId": "thread_reviewer0001",
                 "reviewerTurnId": "turn_reviewer00001",
                 "eventKind": "advisory",

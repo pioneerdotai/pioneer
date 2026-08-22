@@ -2144,8 +2144,7 @@ impl TaskService {
 
         let confirmed_activity = context.confirmed_activity.clone();
         let initial_frontier = if confirmed_activity.is_some() {
-            self.collect_confirmed_wait_activity_frontier(&plan)
-                .await?
+            self.collect_confirmed_wait_activity_frontier(&plan).await?
         } else {
             BTreeMap::new()
         };
@@ -2180,15 +2179,12 @@ impl TaskService {
                 }
 
                 let response = self.collect_wait_state_for_plan(&plan).await?;
-                if durable_target_event
-                    && let Some(observer) = confirmed_activity.as_ref()
-                {
+                if durable_target_event && let Some(observer) = confirmed_activity.as_ref() {
                     observer();
                 }
                 if confirmed_activity.is_some() && Instant::now() >= next_liveness_scan {
-                    let next_frontier = self
-                        .collect_confirmed_wait_activity_frontier(&plan)
-                        .await?;
+                    let next_frontier =
+                        self.collect_confirmed_wait_activity_frontier(&plan).await?;
                     if wait_activity_frontier_advanced(&activity_frontier, &next_frontier)
                         && let Some(observer) = confirmed_activity.as_ref()
                     {
@@ -2204,7 +2200,8 @@ impl TaskService {
         };
 
         match params.timeout_ms {
-            Some(timeout_ms) => match timeout(Duration::from_millis(timeout_ms), wait_future).await {
+            Some(timeout_ms) => match timeout(Duration::from_millis(timeout_ms), wait_future).await
+            {
                 Ok(response) => response,
                 Err(_) => {
                     let mut response = self.collect_wait_state_for_plan(&plan).await?;
@@ -2237,7 +2234,9 @@ impl TaskService {
                 continue;
             };
             if execution.status.is_terminal()
-                || execution.lease_until.is_none_or(|lease_until| lease_until <= now)
+                || execution
+                    .lease_until
+                    .is_none_or(|lease_until| lease_until <= now)
             {
                 continue;
             }

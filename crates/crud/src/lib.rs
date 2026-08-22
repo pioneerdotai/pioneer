@@ -41,17 +41,17 @@ pub use repositories::agent_domain::{
     list_agent_delegation_routes, list_agent_delegation_routes_for_source,
     load_active_agent_identity, load_active_agent_identity_by_source, load_agent_action,
     load_agent_action_outbox, load_agent_action_receipt,
-    load_agent_action_timeline_projections_for_targets,
-    load_current_agent_authors_for_executions,
-    load_agent_delegation_route, load_agent_execution, load_agent_execution_grant,
-    load_agent_execution_resource_state, load_agent_identity, load_agent_identity_by_source,
-    load_agent_presentation_snapshot, load_agent_turn_response,
-    load_agent_turn_responses_for_turns, load_agent_work_graph_projection_for_turn,
-    load_agent_work_graph_projection_target, load_current_agent_presentation_snapshot,
+    load_agent_action_timeline_projections_for_targets, load_agent_delegation_route,
+    load_agent_execution, load_agent_execution_grant, load_agent_execution_resource_state,
+    load_agent_identity, load_agent_identity_by_source, load_agent_presentation_snapshot,
+    load_agent_turn_response, load_agent_turn_responses_for_turns,
+    load_agent_work_graph_projection_for_turn, load_agent_work_graph_projection_target,
+    load_current_agent_authors_for_executions, load_current_agent_presentation_snapshot,
     load_native_agent_config, load_native_agent_config_by_system_key,
     mark_agent_action_outbox_delivered, mark_agent_action_outbox_failed,
     promote_queued_agent_executions, record_agent_execution_progress,
-    revoke_agent_delegation_route, utc_now, wake_agent_action_outbox_for_execution,
+    reopen_agent_execution_for_retry, revoke_agent_delegation_route, utc_now,
+    wake_agent_action_outbox_for_execution,
 };
 pub use repositories::agent_identity_catalog::{
     AgentIdentityCatalogSyncReport, CliRuntimeIdentitySeed, cli_runtime_identity_fingerprint,
@@ -21682,6 +21682,22 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 }));
             }
 
+            let mut occurrence = repositories::task_actor_contract::find_task_occurrence_by_run_id(
+                &tx,
+                run.id.as_str(),
+            )
+            .await?
+            .with_context(|| {
+                format!(
+                    "blocked Task run `{}` has no durable occurrence contract",
+                    run.id
+                )
+            })?;
+            anyhow::ensure!(
+                occurrence.task_id == task_model.id && occurrence.run_id == run.id,
+                "blocked Task run occurrence crosses its aggregate boundary"
+            );
+
             let other_runs = task_run::list_runs_by_task(&tx, run.task_id.as_str()).await?;
             if let Some(successor) = other_runs.into_iter().find(|candidate| {
                 candidate.id != run.id
@@ -21916,7 +21932,52 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     "task execution `{}` changed while resume was committing",
                     execution.id
                 );
+
+                if execution.executor_kind == "agent" {
+                    let agent_execution_id = occurrence
+                        .agent_execution_id
+                        .as_deref()
+                        .context("blocked Agent Task occurrence has no exact AgentExecution")?;
+                    let root_execution_id = occurrence
+                        .work_graph_root_execution_id
+                        .as_deref()
+                        .context("blocked Agent Task occurrence has no work-graph root")?;
+                    anyhow::ensure!(
+                        agent_execution_id == execution.id,
+                        "blocked Agent Task occurrence points at a different execution"
+                    );
+                    anyhow::ensure!(
+                        occurrence.root_resource_scope_id.as_deref() == Some(root_execution_id),
+                        "blocked Agent Task occurrence has an inconsistent resource root"
+                    );
+                    anyhow::ensure!(
+                        repositories::agent_domain::reopen_agent_execution_for_retry(
+                            &tx,
+                            execution.id.as_str(),
+                            root_execution_id,
+                            now,
+                        )
+                        .await?,
+                        "AgentExecution `{}` changed while resume was committing",
+                        execution.id
+                    );
+                }
             }
+
+            let retry_attempt = occurrence
+                .retry_attempt
+                .checked_add(1)
+                .context("Task occurrence retry generation exhausted")?;
+            occurrence = occurrence.retry(retry_attempt).map_err(|error| {
+                anyhow::anyhow!("failed to advance Task occurrence retry: {error:?}")
+            })?;
+            occurrence.status = pioneer_protocol::TaskOccurrenceStatus::Recovering;
+            repositories::task_actor_contract::upsert_task_occurrence_contract(
+                &tx,
+                &occurrence,
+                now_unix,
+            )
+            .await?;
 
             let turn_update = pioneer_entity::task_run_turn::Entity::update_many()
                 .filter(pioneer_entity::task_run_turn::Column::Id.eq(task_run_turn.id.clone()))
@@ -25816,15 +25877,15 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTEMPT_STATUS_COMPLETED, ArtifactBindingTargetRecord, BLOCK_KIND_APPROVAL,
-        BLOCK_KIND_USER_MESSAGE, BlockedTurnRecoveryResumeOutcome, CanonicalTurnEventPayload,
-        ClaimedRecoveryActivation, CliRuntimeExecutionSegmentStatus,
-        CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
-        CliRuntimePendingRequestStatus, CliRuntimeProviderSessionLifecycle,
-        CliRuntimeRequestAuthorizationBinding, CliRuntimeThreadMcpMetadata,
-        CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter, CliRuntimeTurnMcpMetadata,
-        CompletedMessageTurnWrite, ConversationArtifactRefLimits, CrudStore,
-        DeleteTurnMessageRequest, EditTurnMessageRequest, IngestArtifactMetadataRecord,
+        ATTEMPT_STATUS_COMPLETED, AgentExecutionInput, AgentResourceStateInput,
+        ArtifactBindingTargetRecord, BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE,
+        BlockedTurnRecoveryResumeOutcome, CanonicalTurnEventPayload, ClaimedRecoveryActivation,
+        CliRuntimeExecutionSegmentStatus, CliRuntimeNativeEventListFilter,
+        CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
+        CliRuntimeProviderSessionLifecycle, CliRuntimeRequestAuthorizationBinding,
+        CliRuntimeThreadMcpMetadata, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
+        CliRuntimeTurnMcpMetadata, CompletedMessageTurnWrite, ConversationArtifactRefLimits,
+        CrudStore, DeleteTurnMessageRequest, EditTurnMessageRequest, IngestArtifactMetadataRecord,
         McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
         NativeExecutionWindowTransition, NewArtifactBlobRecord, NewCliRuntimeInstructionProjection,
         NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
@@ -25875,14 +25936,15 @@ mod tests {
         SandboxMode, SkillId, SkillPackId, SystemEventLevel, Task, TaskAgentPrompt,
         TaskAgentResultContract, TaskAgentResultFormat, TaskAgentSpec, TaskAttachmentMode,
         TaskCompletionBehavior, TaskConcurrencyConflictPolicy, TaskExecutorKind,
-        TaskLifecyclePolicy, TaskMetadata, TaskOwnerKind, TaskParentTerminalAction, TaskResult,
-        TaskResultCandidate, TaskResultCandidateStatus, TaskResultReviewDecision,
-        TaskResultReviewEvent, TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun,
-        TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind,
-        TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger,
-        TaskTriggerSpec, TaskTriggerStatus, TaskValue, TaskWriteLock, TaskWriteLockScopeKind,
-        TaskWriteLockStatus, Thread, ThreadEpisodicSourceContext, ThreadHistoryEventPayload,
-        ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
+        TaskLifecyclePolicy, TaskMetadata, TaskOccurrenceContract, TaskOccurrenceStatus,
+        TaskOwnerKind, TaskParentTerminalAction, TaskResult, TaskResultCandidate,
+        TaskResultCandidateStatus, TaskResultReviewDecision, TaskResultReviewEvent,
+        TaskResultReviewEventKind, TaskResultReviewerKind, TaskRun, TaskRunExecutionStatus,
+        TaskRunStatus, TaskRunThreadBinding, TaskRunThreadBindingKind, TaskRunTurn,
+        TaskRunTurnKind, TaskRunTurnStatus, TaskSchema, TaskStatus, TaskTrigger, TaskTriggerSpec,
+        TaskTriggerStatus, TaskValue, TaskWriteLock, TaskWriteLockScopeKind, TaskWriteLockStatus,
+        Thread, ThreadEpisodicSourceContext, ThreadHistoryEventPayload, ThreadMode,
+        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus, ToolCallStatus,
         ToolDisplayPayload, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
         ToolOutputPolicySnapshot, ToolPermissionPolicySnapshot, ToolRecoveryIdempotencyMode,
         ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass, ToolRetryBudgetKind,
@@ -25905,6 +25967,8 @@ mod tests {
 
     const NATIVE_DELIVERY_MIGRATION: &str = "m20260805_000001_native_durable_delivery";
     const ATOMIC_TERMINALIZATION_MIGRATION: &str = "m20260806_000001_atomic_turn_terminalization";
+    const EXECUTION_WINDOW_MIGRATION: &str = "m20260603_000001_turn_execution_window";
+    const INITIAL_SCHEMA_MIGRATION: &str = "m20260313_125253_create_workspace_table";
     fn migrations_before(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
         let migrations = Migrator::migrations();
         assert!(
@@ -25917,13 +25981,20 @@ mod tests {
             .collect()
     }
 
-    fn rollback_steps_through(name: &str) -> u32 {
-        let offset_from_latest = Migrator::migrations()
-            .iter()
-            .rev()
-            .position(|migration| migration.name() == name)
-            .unwrap_or_else(|| panic!("target migration {name} must remain registered"));
-        u32::try_from(offset_from_latest + 1).expect("migration rollback step count must fit u32")
+    fn migrations_through(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
+        let mut found = false;
+        let migrations = Migrator::migrations()
+            .into_iter()
+            .take_while(|migration| {
+                let include = !found;
+                if migration.name() == name {
+                    found = true;
+                }
+                include
+            })
+            .collect::<Vec<_>>();
+        assert!(found, "target migration {name} must remain registered");
+        migrations
     }
 
     struct PreNativeDeliveryMigrator;
@@ -25942,15 +26013,35 @@ mod tests {
         }
     }
 
-    // Legacy migration tests use an all-but-latest migrator so the newest
-    // additive migration can be exercised independently.
-    struct ReversibleMigrator;
+    struct NativeDeliveryMigrator;
 
-    impl MigratorTrait for ReversibleMigrator {
+    impl MigratorTrait for NativeDeliveryMigrator {
         fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-            let mut migrations = Migrator::migrations();
-            migrations.pop();
-            migrations
+            migrations_through(NATIVE_DELIVERY_MIGRATION)
+        }
+    }
+
+    struct AtomicTerminalizationMigrator;
+
+    impl MigratorTrait for AtomicTerminalizationMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            migrations_through(ATOMIC_TERMINALIZATION_MIGRATION)
+        }
+    }
+
+    struct ExecutionWindowMigrator;
+
+    impl MigratorTrait for ExecutionWindowMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            migrations_through(EXECUTION_WINDOW_MIGRATION)
+        }
+    }
+
+    struct InitialSchemaMigrator;
+
+    impl MigratorTrait for InitialSchemaMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            migrations_through(INITIAL_SCHEMA_MIGRATION)
         }
     }
 
@@ -25983,6 +26074,100 @@ mod tests {
         ensure_pioneer_for_workspace(&store.connection, workspace_id, now.clone())
             .await
             .expect("agent domain workspace identity should seed");
+    }
+
+    async fn attach_test_agent_execution_contract(
+        store: &CrudStore,
+        workspace_id: &str,
+        task_id: &str,
+        run_id: &str,
+        execution_id: &str,
+        home_root_thread_id: &str,
+        timestamp: i64,
+    ) {
+        let now = unix_to_datetime(timestamp);
+        let identity = pioneer_entity::agent_identity::Entity::find()
+            .filter(pioneer_entity::agent_identity::Column::WorkspaceId.eq(workspace_id))
+            .one(&store.connection)
+            .await
+            .expect("test Agent identity lookup should succeed")
+            .expect("test Agent identity should exist");
+        let snapshot = super::load_current_agent_presentation_snapshot(
+            &store.connection,
+            identity.id.as_str(),
+            identity.source_revision,
+            identity.source_fingerprint.as_str(),
+        )
+        .await
+        .expect("test Agent presentation lookup should succeed")
+        .expect("test Agent presentation should exist");
+
+        super::insert_agent_execution(
+            &store.connection,
+            &AgentExecutionInput {
+                id: execution_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                agent_identity_id: identity.id,
+                identity_source_revision: identity.source_revision,
+                identity_source_fingerprint: identity.source_fingerprint,
+                parent_execution_id: None,
+                parent_task_id: Some(task_id.to_owned()),
+                parent_thread_id: Some(home_root_thread_id.to_owned()),
+                home_root_thread_id: home_root_thread_id.to_owned(),
+                work_graph_root_execution_id: execution_id.to_owned(),
+                requested_identity_selection_json: "{}".to_owned(),
+                requested_profile_selection_json: "{}".to_owned(),
+                resolved_profile_id: None,
+                resolved_profile_fingerprint: None,
+                presentation_snapshot_id: Some(snapshot.id),
+                authorization_context_fingerprint: "test-authorization".to_owned(),
+                execution_generation: 1,
+                status: "running".to_owned(),
+                now,
+            },
+        )
+        .await
+        .expect("test AgentExecution should persist");
+        super::ensure_root_resource_scope(&store.connection, execution_id, 1, 8, 8, 8, 64, now)
+            .await
+            .expect("test Agent root scope should persist");
+        super::insert_agent_resource_state(
+            &store.connection,
+            &AgentResourceStateInput {
+                id: format!("resource-{execution_id}-1"),
+                execution_id: execution_id.to_owned(),
+                attempt_generation: 1,
+                branch_key: format!("task:{task_id}:{run_id}"),
+                fair_order: 1,
+                now,
+            },
+        )
+        .await
+        .expect("test Agent resource attempt should persist");
+        store
+            .upsert_task_occurrence_contract(
+                &TaskOccurrenceContract {
+                    occurrence_id: run_id.to_owned(),
+                    task_id: task_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    trigger_id: None,
+                    occurrence_key: format!("immediate:{run_id}"),
+                    execution_generation: 1,
+                    agent_execution_id: Some(execution_id.to_owned()),
+                    work_graph_root_execution_id: Some(execution_id.to_owned()),
+                    root_resource_scope_id: Some(execution_id.to_owned()),
+                    status: TaskOccurrenceStatus::Running,
+                    queue_position: None,
+                    retry_attempt: 0,
+                    action_idempotency_key: format!("task:{task_id}:{run_id}"),
+                    route_id: None,
+                    result_return_route_id: None,
+                    terminal_reason: None,
+                },
+                timestamp,
+            )
+            .await
+            .expect("test Task occurrence contract should persist");
     }
 
     async fn test_store_with_started_turn(
@@ -26130,7 +26315,7 @@ mod tests {
         PreNativeDeliveryMigrator::up(&connection, None)
             .await
             .expect("baseline migrations must succeed");
-        Migrator::up(&connection, None)
+        NativeDeliveryMigrator::up(&connection, None)
             .await
             .expect("native delivery expansion must succeed");
 
@@ -26162,12 +26347,9 @@ mod tests {
                 .is_some()
         );
 
-        Migrator::down(
-            &connection,
-            Some(rollback_steps_through(NATIVE_DELIVERY_MIGRATION)),
-        )
-        .await
-        .expect("native delivery rollback must succeed");
+        NativeDeliveryMigrator::down(&connection, Some(1))
+            .await
+            .expect("native delivery rollback must succeed");
         assert!(
             connection
                 .query_one_raw(Statement::from_string(
@@ -26189,7 +26371,7 @@ mod tests {
         PreAtomicTerminalizationMigrator::up(&connection, None)
             .await
             .expect("baseline migrations must succeed");
-        Migrator::up(&connection, None)
+        AtomicTerminalizationMigrator::up(&connection, None)
             .await
             .expect("atomic terminalization expansion must succeed");
 
@@ -26213,12 +26395,9 @@ mod tests {
             );
         }
 
-        Migrator::down(
-            &connection,
-            Some(rollback_steps_through(ATOMIC_TERMINALIZATION_MIGRATION)),
-        )
-        .await
-        .expect("atomic terminalization rollback must succeed");
+        AtomicTerminalizationMigrator::down(&connection, Some(1))
+            .await
+            .expect("atomic terminalization rollback must succeed");
         for table_name in [
             "turn_admission",
             "turn_finalization",
@@ -30083,6 +30262,16 @@ mod tests {
             .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, timestamp + 1)
             .await
             .expect("execution should reserve");
+        attach_test_agent_execution_contract(
+            &store,
+            task.workspace_id.as_str(),
+            task.id.as_str(),
+            run.id.as_str(),
+            execution.id.as_str(),
+            thread_id,
+            timestamp + 1,
+        )
+        .await;
         store
             .mark_execution_terminal(
                 execution.id.as_str(),
@@ -30185,9 +30374,39 @@ mod tests {
         assert_eq!(resumed_turn.status, TaskRunTurnStatus::InProgress);
         assert_eq!(
             resumed_execution
+                .as_ref()
                 .expect("execution should remain durable")
                 .status,
             TaskRunExecutionStatus::Reserved
+        );
+        let resumed_execution_id = resumed_execution
+            .expect("execution should remain durable")
+            .id;
+        let occurrence = store
+            .get_task_occurrence_contract_by_run(run.id.as_str())
+            .await
+            .expect("resumed occurrence should load")
+            .expect("resumed occurrence should exist");
+        assert_eq!(occurrence.status, TaskOccurrenceStatus::Recovering);
+        assert_eq!(occurrence.retry_attempt, 1);
+        assert_eq!(
+            super::load_agent_execution(&store.connection, resumed_execution_id.as_str())
+                .await
+                .expect("resumed AgentExecution should load")
+                .expect("resumed AgentExecution should exist")
+                .status,
+            "recovering"
+        );
+        assert_eq!(
+            pioneer_entity::agent_work_resource_scope::Entity::find_by_id(
+                resumed_execution_id.clone()
+            )
+            .one(&store.connection)
+            .await
+            .expect("resumed Agent root scope should load")
+            .expect("resumed Agent root scope should exist")
+            .status,
+            "active"
         );
         assert_eq!(
             pioneer_entity::turn::Entity::find_by_id(turn_id.to_owned())
@@ -30247,6 +30466,16 @@ mod tests {
             .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, timestamp + 1)
             .await
             .expect("conflict fixture execution should reserve");
+        attach_test_agent_execution_contract(
+            &store,
+            task.workspace_id.as_str(),
+            task.id.as_str(),
+            run.id.as_str(),
+            execution.id.as_str(),
+            thread_id.as_str(),
+            timestamp + 1,
+        )
+        .await;
         store
             .mark_execution_terminal(
                 execution.id.as_str(),
@@ -35266,12 +35495,9 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        ReversibleMigrator::up(&connection, None)
+        NativeDeliveryMigrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
-        Migrator::up(&connection, None)
-            .await
-            .expect("latest additive migrations must succeed");
 
         let table = connection
             .query_one_raw(Statement::from_string(
@@ -35354,10 +35580,10 @@ mod tests {
             .expect("turn_llm_context entity should match migration columns");
         assert!(rows.is_empty());
 
-        Migrator::down(&connection, Some(1))
+        NativeDeliveryMigrator::down(&connection, Some(1))
             .await
-            .expect("latest additive migration down should succeed");
-        ReversibleMigrator::down(&connection, None)
+            .expect("native delivery migration down should succeed");
+        PreNativeDeliveryMigrator::down(&connection, None)
             .await
             .expect("migration down should succeed");
         let table_after_down = connection
@@ -35379,7 +35605,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        ReversibleMigrator::up(&connection, None)
+        ExecutionWindowMigrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
 
@@ -35525,7 +35751,7 @@ mod tests {
                 .is_empty()
         );
 
-        ReversibleMigrator::down(&connection, None)
+        ExecutionWindowMigrator::down(&connection, None)
             .await
             .expect("migration down should succeed");
         for table_name in ["turn_execution_window", "turn_execution_checkpoint"] {
@@ -35847,7 +36073,7 @@ mod tests {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
-        ReversibleMigrator::up(&connection, None)
+        InitialSchemaMigrator::up(&connection, None)
             .await
             .expect("migrations must succeed");
 
@@ -35949,7 +36175,7 @@ mod tests {
             "unique scope/name index should reject duplicate MCP installations"
         );
 
-        ReversibleMigrator::down(&connection, None)
+        InitialSchemaMigrator::down(&connection, None)
             .await
             .expect("migration down should succeed");
         for table_name in [
