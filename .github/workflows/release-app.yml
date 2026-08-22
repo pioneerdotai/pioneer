@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - "0.*"
+      - "*"
   pull_request:
     paths:
       - "Cargo.toml"
@@ -111,18 +111,22 @@ jobs:
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
       - name: setup-macos-signing-keychain
-        if: matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && github.ref_type == 'tag'
         shell: bash
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+          MACOS_DMG_SIGN_IDENTITY: ${{ secrets.MACOS_DMG_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           [[ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ]] || { echo "missing MACOS_CERTIFICATE_P12_BASE64 secret" >&2; exit 1; }
           [[ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || { echo "missing MACOS_CERTIFICATE_PASSWORD secret" >&2; exit 1; }
+          [[ -n "${MACOS_DESKTOP_SIGN_IDENTITY:-}" ]] || { echo "missing MACOS_DESKTOP_SIGN_IDENTITY secret" >&2; exit 1; }
 
           keychain_path="${RUNNER_TEMP}/pioneer-signing.keychain-db"
           cert_path="${RUNNER_TEMP}/pioneer-signing-cert.p12"
+          trap 'rm -f "$cert_path"' EXIT
 
           python3 - <<'PY'
           import base64
@@ -154,7 +158,17 @@ jobs:
             -T /usr/bin/security
 
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain_path"
-          rm -f "$cert_path"
+
+          identities="$(security find-identity -v -p codesigning "$keychain_path")"
+          printf '%s\n' "$identities"
+          for identity_name in MACOS_DESKTOP_SIGN_IDENTITY MACOS_DMG_SIGN_IDENTITY; do
+            identity="${!identity_name:-}"
+            [[ -z "$identity" ]] && continue
+            grep -Fqi -- "$identity" <<<"$identities" || {
+              echo "configured ${identity_name} was not found in the imported keychain" >&2
+              exit 1
+            }
+          done
 
       - name: setup-appimagetool
         if: matrix.package_kind == 'linux_appimage'
@@ -202,13 +216,13 @@ jobs:
         if: matrix.package_kind == 'macos_dmg'
         shell: bash
         env:
-          MACOS_SIGNING_REQUIRED: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
-          MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
-          MACOS_DMG_SIGN_IDENTITY: ${{ secrets.MACOS_DMG_SIGN_IDENTITY }}
-          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
-          APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
-          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
-          APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
+          MACOS_SIGNING_REQUIRED: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'true' || 'false' }}
+          MACOS_DESKTOP_SIGN_IDENTITY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.MACOS_DESKTOP_SIGN_IDENTITY || '' }}
+          MACOS_DMG_SIGN_IDENTITY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.MACOS_DMG_SIGN_IDENTITY || '' }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARIZATION_KEY_ID || '' }}
+          APPLE_NOTARIZATION_ISSUER_ID: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARIZATION_ISSUER_ID || '' }}
+          APPLE_NOTARIZATION_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARIZATION_KEY || '' }}
+          APPLE_NOTARIZATION_KEY_BASE64: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_NOTARIZATION_KEY_BASE64 || '' }}
         run: |
           set -euo pipefail
           scripts/packaging/desktop/package-macos.sh \
@@ -247,7 +261,7 @@ jobs:
           if-no-files-found: error
 
       - name: cleanup-macos-signing-keychain
-        if: always() && matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        if: always() && matrix.package_kind == 'macos_dmg' && github.event_name == 'push' && github.ref_type == 'tag'
         shell: bash
         run: |
           set -euo pipefail
@@ -259,7 +273,7 @@ jobs:
     name: publish-desktop-release
     runs-on: ubuntu-latest
     needs: package-desktop
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
