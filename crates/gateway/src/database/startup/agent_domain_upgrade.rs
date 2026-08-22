@@ -718,10 +718,24 @@ async fn verify_conversion(processor: &MessageProcessor) -> Result<()> {
              )",
         ),
         (
-            "successful Task deliveries without exact reviewers",
+            "review-required successful Task deliveries without exact reviewers",
             "SELECT COUNT(*) AS row_count FROM task_delivery delivery \
              JOIN task_delivery_authority authority ON authority.delivery_id = delivery.id \
-             WHERE delivery.error_snapshot_json IS NULL AND authority.reviewer_json IS NULL",
+             WHERE delivery.error_snapshot_json IS NULL \
+               AND authority.reviewer_json IS NULL \
+               AND EXISTS (\
+                   SELECT 1 FROM task_agent_spec agent_spec \
+                   WHERE agent_spec.id = COALESCE(\
+                       (SELECT run_spec.id FROM task_agent_spec run_spec \
+                        WHERE run_spec.run_id = delivery.run_id \
+                        ORDER BY run_spec.updated_at DESC LIMIT 1), \
+                       (SELECT task_spec.id FROM task_agent_spec task_spec \
+                        WHERE task_spec.task_id = delivery.task_id \
+                        ORDER BY task_spec.updated_at DESC LIMIT 1)\
+                   ) \
+                     AND agent_spec.review_policy_json IS NOT NULL \
+                     AND json_extract(agent_spec.review_policy_json, '$.mode') <> 'none'\
+               )",
         ),
     ] {
         let count = database

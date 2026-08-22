@@ -15954,6 +15954,12 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
     assert!(event_types.contains(&events::TASK_COMPLETED));
     assert!(!event_types.contains(&events::TASK_RUN_ENTERED_REVIEW));
     assert!(!event_types.contains(&events::TASK_RESULT_CANDIDATE_CANCELLED));
+
+    crate::database::startup::upgrade_agent_domain_data(processor.as_ref())
+        .await
+        .expect(
+            "startup Agent-domain verification must accept a successful review-disabled delivery",
+        );
 }
 
 #[test]
@@ -16587,6 +16593,23 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
         )
         .await,
         TurnStatus::Completed
+    );
+
+    crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "UPDATE task_delivery_authority SET reviewer_json = NULL WHERE delivery_id = '{}'",
+            deliveries.deliveries[0].id
+        ))
+        .await
+        .expect("test must be able to corrupt the required delivery reviewer");
+    let startup_error = crate::database::startup::upgrade_agent_domain_data(processor.as_ref())
+        .await
+        .expect_err("startup verification must reject a missing required reviewer");
+    assert!(
+        format!("{startup_error:#}")
+            .contains("review-required successful Task deliveries without exact reviewers"),
+        "unexpected startup verification error: {startup_error:#}"
     );
 }
 
