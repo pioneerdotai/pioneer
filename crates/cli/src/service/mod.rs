@@ -47,13 +47,18 @@ impl GatewayServiceWarning {
 }
 
 pub fn run_gateway_service() -> Result<()> {
+    let startup = pioneer_observability::GatewayStartupTrace::start();
+    let runtime_stage = startup.stage(pioneer_observability::GatewayStartupStage::RuntimeBuild);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(pioneer_gateway::GATEWAY_WORKER_STACK_SIZE_BYTES)
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
+    runtime_stage.succeed();
 
-    runtime.block_on(pioneer_gateway::run_gateway_until_shutdown())
+    runtime.block_on(pioneer_gateway::run_gateway_until_shutdown_with_startup(
+        startup,
+    ))
 }
 
 pub fn start_gateway_service() -> Result<Vec<GatewayServiceWarning>> {

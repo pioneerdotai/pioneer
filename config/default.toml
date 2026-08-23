@@ -24,6 +24,15 @@ trusted_proxy_peers = []
 keepawake = false
 preflight_model = "thread"
 
+[gateway.telemetry]
+# User consent overrides `enabled` in gateway-settings.toml. This is the exact
+# public OTLP/HTTP endpoints; observability backend credentials stay on the server.
+enabled = true
+otlp_metrics_endpoint = "https://telemetry.getpioneer.dev/v1/metrics"
+otlp_traces_endpoint = "https://telemetry.getpioneer.dev/v1/traces"
+export_interval_ms = 30000
+export_timeout_ms = 3000
+
 [gateway.hooks.recovery]
 enabled = true
 startup_scan = true

@@ -8,6 +8,10 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 dotenvy.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 sentry.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true

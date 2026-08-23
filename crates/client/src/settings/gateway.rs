@@ -206,6 +206,32 @@ pub fn keepawake_update_plan(
         update: GatewaySettingsUpdate {
             general: Some(GatewayGeneralSettingsUpdate {
                 keepawake: Some(enabled),
+                telemetry_enabled: None,
+                preflight_model: None,
+            }),
+            memory: None,
+            self_improvement: None,
+            thread_episodic: None,
+            cli_runtimes: None,
+            remote_access: None,
+            voice_input: None,
+        },
+    })
+}
+
+pub fn telemetry_enabled_update_plan(
+    current: Option<&GatewaySettingsSnapshot>,
+    enabled: bool,
+) -> Option<GatewaySettingsUpdatePlan> {
+    let mut snapshot = current.cloned()?;
+    snapshot.general.telemetry_enabled = enabled;
+
+    Some(GatewaySettingsUpdatePlan {
+        snapshot,
+        update: GatewaySettingsUpdate {
+            general: Some(GatewayGeneralSettingsUpdate {
+                keepawake: None,
+                telemetry_enabled: Some(enabled),
                 preflight_model: None,
             }),
             memory: None,
@@ -230,6 +256,7 @@ pub fn preflight_model_update_plan(
         update: GatewaySettingsUpdate {
             general: Some(GatewayGeneralSettingsUpdate {
                 keepawake: None,
+                telemetry_enabled: None,
                 preflight_model: Some(model_selection),
             }),
             memory: None,
@@ -594,10 +621,25 @@ mod tests {
         assert!(plan.snapshot.general.keepawake);
         let general = plan.update.general.expect("general update");
         assert_eq!(general.keepawake, Some(true));
+        assert!(general.telemetry_enabled.is_none());
         assert!(general.preflight_model.is_none());
         assert!(plan.update.memory.is_none());
         assert!(plan.update.thread_episodic.is_none());
         assert!(keepawake_update_plan(None, true).is_none());
+    }
+
+    #[test]
+    fn telemetry_update_plan_updates_general_only() {
+        let plan = telemetry_enabled_update_plan(Some(&snapshot(false)), false).expect("plan");
+
+        assert!(!plan.snapshot.general.telemetry_enabled);
+        let general = plan.update.general.expect("general update");
+        assert!(general.keepawake.is_none());
+        assert_eq!(general.telemetry_enabled, Some(false));
+        assert!(general.preflight_model.is_none());
+        assert!(plan.update.memory.is_none());
+        assert!(plan.update.thread_episodic.is_none());
+        assert!(telemetry_enabled_update_plan(None, true).is_none());
     }
 
     #[test]
@@ -610,6 +652,7 @@ mod tests {
         assert!(plan.snapshot.general.keepawake);
         let general = plan.update.general.expect("general update");
         assert!(general.keepawake.is_none());
+        assert!(general.telemetry_enabled.is_none());
         assert_eq!(general.preflight_model, Some(model_selection));
         assert!(plan.update.memory.is_none());
         assert!(plan.update.thread_episodic.is_none());

@@ -18,6 +18,12 @@
           "type": "null"
         }
       ]
+    },
+    "telemetry_enabled": {
+      "type": [
+        "boolean",
+        "null"
+      ]
     }
   },
   "$defs": {

@@ -7291,6 +7291,11 @@ impl MessageProcessor {
             };
         }
 
+        if let Some(telemetry_enabled) = changes.general.telemetry_enabled {
+            pioneer_observability::set_telemetry_enabled(telemetry_enabled);
+            info!(telemetry_enabled, "gateway telemetry preference updated");
+        }
+
         if changes.self_improvement {
             if let Some(supervisor) = self.self_improvement_supervisor.as_ref() {
                 let workspace_id = changes

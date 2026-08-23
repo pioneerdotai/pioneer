@@ -12,6 +12,10 @@
       "default": {
         "source": "thread"
       }
+    },
+    "telemetry_enabled": {
+      "type": "boolean",
+      "default": true
     }
   },
   "$defs": {

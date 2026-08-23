@@ -978,6 +978,10 @@ label = "Idle sleep रोकें"
 description = "जब gateway चल रहा हो, तो सिस्टम को idle sleep में जाने से रोकता है। Laptop lid बंद करने पर यह काम जारी रहने की गारंटी नहीं देता; ऐसे उपयोग के लिए clamshell mode या always-on machine चाहिए."
 tooltip = "सिर्फ idle sleep रोकता है। Lid बंद रखने के लिए clamshell mode या always-on machine चाहिए."
 
+[settings.option.telemetry]
+label = "Gateway telemetry साझा करें"
+description = "Pioneer को Gateway performance metrics, startup traces और error reports भेजें। Startup traces में केवल तय stage names, outcomes और timings होते हैं। Database metrics में केवल operation categories, timings और pool state शामिल होते हैं। Telemetry में app version और environment भी शामिल होते हैं; SQL text, database contents, file paths और user content नहीं भेजे जाते। इसे कभी भी बंद किया जा सकता है।"
+
 [settings.general.preflight_model]
 label = "Preflight मॉडल"
 description = "चरण से पहले की आंतरिक योजना के लिए प्रदाता और मॉडल चुनें. डिफ़ॉल्ट वर्तमान थ्रेड का मॉडल इस्तेमाल करता है."

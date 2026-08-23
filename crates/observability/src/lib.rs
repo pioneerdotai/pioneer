@@ -1,4 +1,4 @@
-//! Shared Sentry and tracing setup for Pioneer runtime binaries.
+//! Shared Sentry, tracing, and consent-gated OpenTelemetry setup for Pioneer runtime binaries.
 //!
 //! `PIONEER_SENTRY_DSN` is used by non-desktop binaries. `PIONEER_DESKTOP_SENTRY_DSN`
 //! is used by the desktop app. A local `.env` file is loaded automatically before
@@ -6,18 +6,31 @@
 //! and build-time values with the same names.
 
 use std::borrow::Cow;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 
 use sentry::integrations::tracing::{
     EventFilter, EventMapping, breadcrumb_from_event, event_from_event,
 };
 use sentry::{ClientInitGuard, ClientOptions};
 use tracing::field::{Field, Visit};
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::Context as TracingContext;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
+
+mod metrics;
+mod startup;
+mod telemetry;
+
+pub use metrics::{
+    DatabaseOperation, DatabasePoolSnapshot, DatabaseRole, record_database_operation,
+    register_database_pool_observer,
+};
+pub use startup::{GatewayStartupStage, GatewayStartupStageGuard, GatewayStartupTrace};
+pub use telemetry::{OtlpTelemetryConfig, init_otlp_observability, shutdown_observability};
 
 /// DSN for non-desktop runtime binaries.
 pub const SENTRY_DSN_ENV: &str = "PIONEER_SENTRY_DSN";
@@ -31,6 +44,9 @@ const BUILD_DESKTOP_SENTRY_DSN: Option<&str> = option_env!("PIONEER_DESKTOP_SENT
 const BUILD_SENTRY_ENVIRONMENT: Option<&str> = option_env!("PIONEER_SENTRY_ENVIRONMENT");
 
 static LOAD_DOTENV: Once = Once::new();
+// Runtime binaries participate by default. The gateway explicitly closes this
+// gate before Sentry initialization and reopens it only after loading consent.
+static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Copy, Debug)]
 pub enum SentryTarget {
@@ -74,6 +90,7 @@ pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
         dsn: Some(dsn),
         release: Some(Cow::Owned(format!("pioneer@{}", env!("CARGO_PKG_VERSION")))),
         environment,
+        before_send: Some(Arc::new(|event| telemetry_enabled().then_some(event))),
         ..Default::default()
     });
 
@@ -89,22 +106,38 @@ pub fn init_tracing(sentry_enabled: bool) {
         .with_default(LevelFilter::INFO)
         .with_target("rmcp::service", LevelFilter::WARN);
 
-    let subscriber = tracing_subscriber::fmt()
+    let format_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .without_time()
-        .with_max_level(LevelFilter::TRACE)
-        .finish()
-        .with(filter);
+        .with_filter(filter.clone());
+    let database_metrics_filter = Targets::new()
+        .with_default(LevelFilter::OFF)
+        .with_target("sqlx::pool::acquire", LevelFilter::TRACE);
+    let subscriber = tracing_subscriber::registry()
+        .with(metrics::DatabasePoolAcquireMetricsLayer.with_filter(database_metrics_filter))
+        .with(format_layer);
 
     if sentry_enabled {
-        let _ = subscriber.with(sentry_tracing_layer()).try_init();
+        let _ = subscriber
+            .with(sentry_tracing_layer().with_filter(filter))
+            .try_init();
     } else {
         let _ = subscriber.try_init();
     }
 }
 
 pub fn capture_anyhow(error: &anyhow::Error) {
-    sentry::integrations::anyhow::capture_anyhow(error);
+    if telemetry_enabled() {
+        sentry::integrations::anyhow::capture_anyhow(error);
+    }
+}
+
+pub fn set_telemetry_enabled(enabled: bool) {
+    TELEMETRY_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn telemetry_enabled() -> bool {
+    TELEMETRY_ENABLED.load(Ordering::Acquire)
 }
 
 fn load_local_dotenv() {
@@ -126,6 +159,9 @@ fn sentry_event_mapper<S>(event: &tracing::Event<'_>, _ctx: TracingContext<'_, S
 where
     S: tracing::Subscriber + for<'span> LookupSpan<'span>,
 {
+    if !telemetry_enabled() {
+        return EventMapping::Ignore;
+    }
     let fields = tracing_event_fields(event);
     if should_demote_rmcp_transport_worker_failure(
         event.metadata().level(),
@@ -355,6 +391,43 @@ mod tests {
         should_demote_tantivy_reader_commit_reload_not_found,
     };
     use sentry::integrations::tracing::EventFilter;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::layer::{Context as TracingContext, Layer, SubscriberExt};
+
+    struct CountingLayer(Arc<AtomicUsize>);
+
+    impl<S> Layer<S> for CountingLayer
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, _event: &Event<'_>, _ctx: TracingContext<'_, S>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn database_metrics_filter_does_not_suppress_normal_logs() {
+        let events = Arc::new(AtomicUsize::new(0));
+        let database_metrics_filter = Targets::new()
+            .with_default(LevelFilter::OFF)
+            .with_target("sqlx::pool::acquire", LevelFilter::TRACE);
+        let log_filter = Targets::new().with_default(LevelFilter::INFO);
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                super::metrics::DatabasePoolAcquireMetricsLayer
+                    .with_filter(database_metrics_filter),
+            )
+            .with(CountingLayer(events.clone()).with_filter(log_filter));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "pioneer::test", "normal log event");
+        });
+
+        assert_eq!(events.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn demotes_expected_rmcp_streamable_http_initialize_response_failure() {

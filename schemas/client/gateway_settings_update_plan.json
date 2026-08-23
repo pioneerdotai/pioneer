@@ -88,6 +88,10 @@
           "default": {
             "source": "thread"
           }
+        },
+        "telemetry_enabled": {
+          "type": "boolean",
+          "default": true
         }
       }
     },
@@ -108,6 +112,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "telemetry_enabled": {
+          "type": [
+            "boolean",
+            "null"
           ]
         }
       }
@@ -398,7 +408,8 @@
             "keepawake": false,
             "preflight_model": {
               "source": "thread"
-            }
+            },
+            "telemetry_enabled": true
           }
         },
         "memory": {

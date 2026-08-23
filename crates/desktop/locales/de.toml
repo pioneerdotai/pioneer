@@ -978,6 +978,10 @@ label = "Ruhezustand bei Inaktivität verhindern"
 description = "Verhindert, dass der Computer bei Inaktivität in den Ruhezustand wechselt, solange das Gateway läuft. Beim Zuklappen eines Laptops ist das nicht garantiert; dafür brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
 tooltip = "Verhindert nur den Ruhezustand bei Inaktivität. Für zugeklappte Laptops brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
 
+[settings.option.telemetry]
+label = "Gateway-Telemetrie teilen"
+description = "Sendet Gateway-Leistungsmetriken, Start-Traces und Fehlerberichte an Pioneer. Start-Traces enthalten nur feste Phasennamen, Ergebnisse und Laufzeiten. Datenbankmetriken enthalten nur Operationskategorien, Laufzeiten und Pool-Status. Die Telemetrie enthält außerdem App-Version und Umgebung; SQL-Text, Datenbankinhalte, Dateipfade und Benutzerinhalte werden nicht gesendet. Dies kann jederzeit deaktiviert werden."
+
 [settings.general.preflight_model]
 label = "Preflight-Modell"
 description = "Wähle Anbieter und Modell für die interne Planung vor einem Zug. Standard verwendet das Modell des aktuellen Threads."

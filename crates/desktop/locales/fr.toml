@@ -978,6 +978,10 @@ label = "Empêcher la veille d'inactivité"
 description = "Empêche l'ordinateur de passer en veille pour cause d'inactivité tant que la gateway est en cours d'exécution. Cela ne garantit pas le fonctionnement capot fermé ; pour ce cas, utilisez le mode clamshell ou une machine toujours en marche."
 tooltip = "Empêche seulement la veille d'inactivité. Capot fermé, utilisez le mode clamshell ou une machine toujours en marche."
 
+[settings.option.telemetry]
+label = "Partager la télémétrie de la gateway"
+description = "Envoie à Pioneer des métriques de performance de la gateway, des traces de démarrage et des rapports d'erreur. Les traces contiennent uniquement des noms d'étapes fixes, les résultats et les durées. Les métriques de base de données contiennent uniquement les catégories d'opérations, les durées et l'état du pool. La télémétrie inclut aussi la version de l'app et l'environnement ; le texte SQL, le contenu de la base, les chemins de fichiers et le contenu utilisateur ne sont pas envoyés. Cette option peut être désactivée à tout moment."
+
 [settings.general.preflight_model]
 label = "Modèle de preflight"
 description = "Choisissez le fournisseur et le modèle pour la planification interne avant le tour. Par défaut utilise le modèle du fil actuel."

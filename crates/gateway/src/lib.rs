@@ -101,7 +101,7 @@ use tracing::{info, warn};
 
 use crate::auth::{AuthAdmissionService, GatewayAuthService, ensure_auth_readiness};
 use crate::bootstrap::bootstrap as run_bootstrap;
-use crate::database::initialize as initialize_database;
+use crate::database::initialize_with_startup as initialize_database;
 use crate::identity::bootstrap_identity;
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::memory_runtime::GatewayMemoryRuntime;
@@ -161,7 +161,28 @@ fn start_voice_input_supervisor(
 }
 
 pub async fn run_gateway_until_shutdown() -> Result<()> {
+    run_gateway_until_shutdown_with_startup(pioneer_observability::GatewayStartupTrace::start())
+        .await
+}
+
+pub async fn run_gateway_until_shutdown_with_startup(
+    startup: pioneer_observability::GatewayStartupTrace,
+) -> Result<()> {
+    let result = run_gateway_until_shutdown_inner(&startup).await;
+    if result.is_err() {
+        startup.finish_failure();
+    }
+    result
+}
+
+async fn run_gateway_until_shutdown_inner(
+    startup: &pioneer_observability::GatewayStartupTrace,
+) -> Result<()> {
+    let config_stage = startup.stage(pioneer_observability::GatewayStartupStage::ConfigLoad);
     let mut config = AppConfig::load()?;
+    config_stage.succeed();
+
+    let runtime_stage = startup.stage(pioneer_observability::GatewayStartupStage::RuntimePrepare);
     let runtime_home = config.ensure_runtime_home_dir()?;
     info!(
         runtime_home = %runtime_home.display(),
@@ -174,26 +195,60 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         existing = identity_files_report.existing.len(),
         "runtime identity files are ready"
     );
+    runtime_stage.succeed();
 
+    let settings_stage = startup.stage(pioneer_observability::GatewayStartupStage::SettingsLoad);
     let gateway_settings = load_gateway_settings(&runtime_home, &config)?;
     config = gateway_settings.apply_to_app_config(config);
+    settings_stage.succeed();
+    pioneer_observability::set_telemetry_enabled(config.gateway.telemetry.enabled);
+    let observability_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::ObservabilityInit);
+    match pioneer_observability::init_otlp_observability(
+        pioneer_observability::OtlpTelemetryConfig {
+            metrics_endpoint: config.gateway.telemetry.otlp_metrics_endpoint.clone(),
+            traces_endpoint: config.gateway.telemetry.otlp_traces_endpoint.clone(),
+            export_interval: Duration::from_millis(config.gateway.telemetry.export_interval_ms),
+            export_timeout: Duration::from_millis(config.gateway.telemetry.export_timeout_ms),
+        },
+    ) {
+        Ok(()) => observability_stage.succeed(),
+        Err(error) => {
+            drop(observability_stage);
+            warn!(
+                error = %format!("{error:#}"),
+                "gateway OTLP observability pipeline is unavailable"
+            );
+        }
+    }
+    let security_validate_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::SecurityValidate);
     config
         .gateway
         .auth
         .validate_session_security()
         .context("invalid Gateway session security configuration")?;
+    security_validate_stage.succeed();
     let voice_models = voice_model_catalog();
     info!(
         voice_model_count = voice_models.len(),
         "local voice model catalog is ready"
     );
+    let secrets_open_stage = startup.stage(pioneer_observability::GatewayStartupStage::SecretsOpen);
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
-    let database = initialize_database(&runtime_home, &config).await?;
+    secrets_open_stage.succeed();
+    let database = initialize_database(&runtime_home, &config, startup).await?;
 
+    let database_bootstrap_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::DatabaseBootstrap);
     run_bootstrap(&database).await?;
+    database_bootstrap_stage.succeed();
+    let identity_bootstrap_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::IdentityBootstrap);
     let identity_bootstrap = bootstrap_identity(&database)
         .await
         .context("failed to bootstrap stable Gateway identity")?;
+    identity_bootstrap_stage.succeed();
     info!(
         gateway_created = identity_bootstrap.gateway_created,
         superuser_created = identity_bootstrap.superuser_created,
@@ -208,6 +263,8 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         "stable Gateway identity is ready"
     );
     let identity_snapshot = Arc::new(identity_bootstrap.snapshot);
+    let security_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::SecurityInitialize);
     let access_jwt_material = gateway_secrets
         .load_or_create_access_jwt_signing_key(config.gateway.auth.secret_size_bytes)?;
     let credential_hmac_material = gateway_secrets
@@ -272,7 +329,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         );
     }
     auth_service.spawn_auth_maintenance();
+    security_stage.succeed();
 
+    let services_initialize_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::ServicesInitialize);
     let voice_input_desired_state = VoiceInputDesiredState::from_config(&config.gateway.voice);
     let voice_input_supervisor = create_voice_input_supervisor(
         Arc::new(FilesystemVoiceModelInstaller::new(
@@ -720,9 +780,15 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     message_processor = message_processor.with_auth_service(auth_service.clone());
     let message_processor = Arc::new(message_processor);
+    services_initialize_stage.succeed();
+    let agent_domain_upgrade_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::AgentDomainUpgrade);
     database::startup::upgrade_agent_domain_data(message_processor.as_ref())
         .await
         .context("failed to complete the blocking Agent domain data upgrade")?;
+    agent_domain_upgrade_stage.succeed();
+    let services_prepare_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::ServicesPrepare);
     auth_service.set_invitation_accept_post_commit_hook(message_processor.clone());
     message_processor
         .apply_keepawake_setting(config.gateway.keepawake)
@@ -738,6 +804,11 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
     let remote_access_config = config.gateway.remote_access.clone();
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
+    let telemetry_shutdown_timeout =
+        Duration::from_millis(config.gateway.telemetry.export_timeout_ms);
+    services_prepare_stage.succeed();
+    let listener_bind_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::ListenerBind);
     let handle = spawn_server(
         config,
         auth,
@@ -746,7 +817,10 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         session_manager,
     )
     .await?;
-    let runtime_result: Result<()> = async {
+    listener_bind_stage.succeed();
+    let services_start_stage =
+        startup.stage(pioneer_observability::GatewayStartupStage::ServicesStart);
+    let services_start_result: Result<()> = async {
         start_voice_input_supervisor(&voice_input_supervisor, voice_input_desired_state)?;
         self_improvement_supervisor
             .start()
@@ -781,10 +855,22 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
             .await
             .context("failed to apply initial remote access settings")?;
 
-        info!(listen_addr = %handle.local_addr(), "gateway daemon started");
-        wait_for_shutdown_signal().await
+        Ok(())
     }
     .await;
+    let runtime_result = match services_start_result {
+        Ok(()) => {
+            services_start_stage.succeed();
+            startup.finish_success();
+            info!(listen_addr = %handle.local_addr(), "gateway daemon started");
+            wait_for_shutdown_signal().await
+        }
+        Err(error) => {
+            drop(services_start_stage);
+            startup.finish_failure();
+            Err(error)
+        }
+    };
 
     info!("gateway daemon stopping with telemetry snapshot");
     message_processor.shutdown_remote_access_supervisor().await;
@@ -796,6 +882,21 @@ pub async fn run_gateway_until_shutdown() -> Result<()> {
         .close()
         .await
         .context("failed to close gateway database connection");
+    match tokio::task::spawn_blocking(move || {
+        pioneer_observability::shutdown_observability(telemetry_shutdown_timeout)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(
+            error = %format!("{error:#}"),
+            "failed to shut down gateway OTLP observability pipeline"
+        ),
+        Err(error) => warn!(
+            error = %error,
+            "gateway OTLP observability shutdown worker failed"
+        ),
+    }
 
     runtime_result?;
     server_shutdown_result?;

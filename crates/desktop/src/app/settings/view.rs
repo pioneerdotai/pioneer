@@ -122,6 +122,12 @@ impl PioneerDesktop {
                         cx,
                     ))
                     .child(Self::render_settings_divider(cx))
+                    .child(Self::render_telemetry_setting(
+                        settings.general.telemetry_enabled,
+                        desktop_entity.clone(),
+                        cx,
+                    ))
+                    .child(Self::render_settings_divider(cx))
                     .child(Self::render_preflight_model_setting(
                         settings.general.preflight_model.clone(),
                         desktop_entity.clone(),
@@ -945,6 +951,47 @@ impl PioneerDesktop {
                     .on_click(move |enabled, _, cx| {
                         let _ = desktop_entity.update(cx, |view, cx| {
                             view.apply_keepawake_setting(*enabled, cx);
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_telemetry_setting(
+        selected: bool,
+        desktop_entity: Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .gap_6()
+            .py_3()
+            .justify_between()
+            .items_center()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.option.telemetry.label").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.option.telemetry.description").to_string()),
+                    ),
+            )
+            .child(
+                Switch::new("settings-telemetry")
+                    .checked(selected)
+                    .on_click(move |enabled, _, cx| {
+                        let _ = desktop_entity.update(cx, |view, cx| {
+                            view.apply_telemetry_setting(*enabled, cx);
                             cx.notify();
                         });
                     }),
@@ -2237,12 +2284,14 @@ mod tests {
             .expect("general renderer body exists");
 
         assert!(general_view.contains("render_preflight_model_setting"));
+        assert!(general_view.contains("render_telemetry_setting"));
         assert!(general_view.contains("render_remote_access_setting"));
         assert!(general_view.contains("settings.general.preflight_model"));
         assert!(general_view.contains("settings.remote_access"));
         assert!(!general_view.contains("\"settings-general-thread-context\""));
         assert!(!general_view.contains("settings.general.thread_context"));
         assert!(source.contains("\"settings-preflight-model\""));
+        assert!(source.contains("\"settings-telemetry\""));
 
         let remote_access_view = source
             .split("fn render_remote_access_setting")
@@ -2537,6 +2586,35 @@ mod tests {
                 assert!(source.contains(key), "missing locale key `{key}`");
             }
             assert!(!source.contains("[settings.memory.active_recall_model]"));
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn settings_telemetry_locales_have_complete_key_parity() {
+        let locales = [
+            ("de", include_str!("../../../locales/de.toml")),
+            ("en", include_str!("../../../locales/en.toml")),
+            ("es", include_str!("../../../locales/es.toml")),
+            ("fr", include_str!("../../../locales/fr.toml")),
+            ("hi", include_str!("../../../locales/hi.toml")),
+            ("jp", include_str!("../../../locales/jp.toml")),
+            ("ru", include_str!("../../../locales/ru.toml")),
+            ("zh", include_str!("../../../locales/zh.toml")),
+        ];
+
+        for (locale, source) in locales {
+            let section = source
+                .split("[settings.option.telemetry]")
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing telemetry locale section for {locale}"))
+                .split("\n[")
+                .next()
+                .expect("telemetry locale section body exists");
+            assert!(section.contains("label ="), "missing label for {locale}");
+            assert!(
+                section.contains("description ="),
+                "missing description for {locale}"
+            );
         }
     }
 

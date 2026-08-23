@@ -47,6 +47,8 @@ pub struct GatewayConfig {
     pub keepawake: bool,
     #[serde(default)]
     pub preflight_model: GatewayMemoryModelSelectionConfig,
+    #[serde(default)]
+    pub telemetry: GatewayTelemetryConfig,
     pub thread: GatewayThreadConfig,
     #[serde(default)]
     pub tools: GatewayToolsConfig,
@@ -2845,6 +2847,52 @@ pub struct GatewayDatabaseConfig {
     pub sqlx_logging: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GatewayTelemetryConfig {
+    #[serde(default = "default_gateway_telemetry_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_gateway_telemetry_otlp_metrics_endpoint")]
+    pub otlp_metrics_endpoint: String,
+    #[serde(default = "default_gateway_telemetry_otlp_traces_endpoint")]
+    pub otlp_traces_endpoint: String,
+    #[serde(default = "default_gateway_telemetry_export_interval_ms")]
+    pub export_interval_ms: u64,
+    #[serde(default = "default_gateway_telemetry_export_timeout_ms")]
+    pub export_timeout_ms: u64,
+}
+
+impl Default for GatewayTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gateway_telemetry_enabled(),
+            otlp_metrics_endpoint: default_gateway_telemetry_otlp_metrics_endpoint(),
+            otlp_traces_endpoint: default_gateway_telemetry_otlp_traces_endpoint(),
+            export_interval_ms: default_gateway_telemetry_export_interval_ms(),
+            export_timeout_ms: default_gateway_telemetry_export_timeout_ms(),
+        }
+    }
+}
+
+const fn default_gateway_telemetry_enabled() -> bool {
+    true
+}
+
+fn default_gateway_telemetry_otlp_metrics_endpoint() -> String {
+    "https://telemetry.getpioneer.dev/v1/metrics".to_owned()
+}
+
+fn default_gateway_telemetry_otlp_traces_endpoint() -> String {
+    "https://telemetry.getpioneer.dev/v1/traces".to_owned()
+}
+
+const fn default_gateway_telemetry_export_interval_ms() -> u64 {
+    30_000
+}
+
+const fn default_gateway_telemetry_export_timeout_ms() -> u64 {
+    3_000
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayAuthConfig {
@@ -3339,8 +3387,8 @@ mod tests {
     use super::{
         DEFAULT_CONFIG_TOML, GatewayCliAgentRuntimeConfig, GatewayCliAgentRuntimeKindConfig,
         GatewayMemoryConfig, GatewayMemoryModelSelectionConfig, GatewayResilienceConfig,
-        GatewaySelfImprovementConfig, InstallManagedBy, InstallState, load_config_from_sources,
-        load_install_state, save_install_state,
+        GatewaySelfImprovementConfig, GatewayTelemetryConfig, InstallManagedBy, InstallState,
+        load_config_from_sources, load_install_state, save_install_state,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -3375,6 +3423,24 @@ mod tests {
         let path = unique_temp_file_path("missing-install-state");
         let loaded = load_install_state(&path).expect("load install state should succeed");
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn gateway_telemetry_defaults_are_enabled_and_point_to_otlp_http() {
+        let telemetry =
+            toml::from_str::<GatewayTelemetryConfig>("").expect("telemetry defaults must parse");
+
+        assert!(telemetry.enabled);
+        assert_eq!(
+            telemetry.otlp_metrics_endpoint,
+            "https://telemetry.getpioneer.dev/v1/metrics"
+        );
+        assert_eq!(
+            telemetry.otlp_traces_endpoint,
+            "https://telemetry.getpioneer.dev/v1/traces"
+        );
+        assert_eq!(telemetry.export_interval_ms, 30_000);
+        assert_eq!(telemetry.export_timeout_ms, 3_000);
     }
 
     #[test]

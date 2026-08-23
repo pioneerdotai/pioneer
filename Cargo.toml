@@ -96,6 +96,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
 sentry = { version = "0.48", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
 dotenvy = "0.15"
+opentelemetry = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace", "http-proto", "reqwest-blocking-client"] }
 
 # UI
 gpui = { git = "https://github.com/zed-industries/zed" }

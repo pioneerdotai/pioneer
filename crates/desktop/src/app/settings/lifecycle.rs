@@ -190,6 +190,18 @@ impl PioneerDesktop {
         self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
     }
 
+    pub(super) fn apply_telemetry_setting(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(plan) = gateway_settings::telemetry_enabled_update_plan(
+            self.gateway.settings.as_ref(),
+            enabled,
+        ) else {
+            self.refresh_gateway_settings(cx);
+            return;
+        };
+
+        self.apply_gateway_settings_update(plan.snapshot, plan.update, cx);
+    }
+
     pub(super) fn toggle_remote_access_settings_expanded(&mut self) {
         self.remote_access_settings_expanded = !self.remote_access_settings_expanded;
     }
@@ -989,6 +1001,21 @@ mod tests {
         assert!(preflight_fn.contains("gateway_settings::preflight_model_update_plan"));
         assert!(preflight_fn.contains("self.apply_gateway_settings_update"));
         assert!(!preflight_fn.contains("settings_memory::gateway_settings_update_for_memory"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn telemetry_lifecycle_uses_shared_client_plan_and_common_update_path() {
+        let source = production_lifecycle_source();
+        let telemetry_fn = source
+            .split("pub(super) fn apply_telemetry_setting")
+            .nth(1)
+            .expect("telemetry setting function exists")
+            .split("pub(super) fn toggle_remote_access_settings_expanded")
+            .next()
+            .expect("telemetry setting function body exists");
+
+        assert!(telemetry_fn.contains("gateway_settings::telemetry_enabled_update_plan"));
+        assert!(telemetry_fn.contains("self.apply_gateway_settings_update"));
     }
 
     #[::core::prelude::v1::test]

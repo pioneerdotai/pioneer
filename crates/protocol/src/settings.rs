@@ -36,6 +36,8 @@ pub struct GatewayGeneralSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepawake: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight_model: Option<GatewayMemoryModelSelection>,
 }
 
@@ -150,12 +152,28 @@ pub struct GatewayVoiceInputStatusChangedNotification {
     pub settings: GatewayVoiceInputSettings,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayGeneralSettings {
     #[serde(default)]
     pub keepawake: bool,
+    #[serde(default = "default_telemetry_enabled")]
+    pub telemetry_enabled: bool,
     #[serde(default)]
     pub preflight_model: GatewayMemoryModelSelection,
+}
+
+impl Default for GatewayGeneralSettings {
+    fn default() -> Self {
+        Self {
+            keepawake: false,
+            telemetry_enabled: default_telemetry_enabled(),
+            preflight_model: GatewayMemoryModelSelection::default(),
+        }
+    }
+}
+
+const fn default_telemetry_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -765,6 +783,7 @@ mod tests {
         let settings = GatewayGeneralSettings::default();
 
         assert!(!settings.keepawake);
+        assert!(settings.telemetry_enabled);
         assert!(settings.preflight_model.is_thread_model());
     }
 
@@ -863,6 +882,7 @@ mod tests {
     fn settings_general_update_roundtrips_preflight_model() {
         let update = GatewayGeneralSettingsUpdate {
             keepawake: Some(true),
+            telemetry_enabled: Some(false),
             preflight_model: Some(GatewayMemoryModelSelection::custom(
                 "planner-provider",
                 "planner-model",
@@ -871,6 +891,7 @@ mod tests {
 
         let serialized = serde_json::to_string(&update).expect("settings update should serialize");
         assert!(serialized.contains("preflight_model"));
+        assert!(serialized.contains("telemetry_enabled"));
         assert!(serialized.contains("planner-provider"));
         assert!(serialized.contains("planner-model"));
 

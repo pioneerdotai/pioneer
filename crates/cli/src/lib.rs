@@ -22,6 +22,13 @@ pub fn main_entry() {
         return;
     }
 
+    // The service loads its persisted telemetry preference inside the Gateway.
+    // Keep external reporting closed until then so an existing opt-out also
+    // covers the service bootstrap performed by this shared CLI binary.
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(service::SERVICE_MODE_ARG)) {
+        pioneer_observability::set_telemetry_enabled(false);
+    }
+
     let sentry_guard =
         pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Shared);
     pioneer_observability::init_tracing(sentry_guard.is_some());

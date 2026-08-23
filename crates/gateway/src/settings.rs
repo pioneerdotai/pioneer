@@ -101,6 +101,8 @@ struct GatewayGeneralSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keepawake: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    telemetry_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     preflight_model: Option<GatewayMemoryModelSelectionConfig>,
 }
 
@@ -187,6 +189,7 @@ impl GatewayGeneralSettings {
     fn effective(&self, config: &GatewayConfig) -> pioneer_protocol::GatewayGeneralSettings {
         pioneer_protocol::GatewayGeneralSettings {
             keepawake: self.keepawake.unwrap_or(config.keepawake),
+            telemetry_enabled: self.telemetry_enabled.unwrap_or(config.telemetry.enabled),
             preflight_model: model_selection_to_protocol(
                 self.preflight_model
                     .as_ref()
@@ -203,6 +206,10 @@ impl GatewayGeneralSettings {
         if let Some(keepawake) = update.keepawake {
             self.keepawake = Some(keepawake);
             changes.keepawake = Some(keepawake);
+        }
+        if let Some(telemetry_enabled) = update.telemetry_enabled {
+            self.telemetry_enabled = Some(telemetry_enabled);
+            changes.telemetry_enabled = Some(telemetry_enabled);
         }
         if let Some(preflight_model) = update.preflight_model {
             let preflight_model = model_selection_from_protocol(preflight_model);
@@ -919,6 +926,7 @@ impl GatewaySettings {
     pub fn apply_to_gateway_config(&self, mut config: GatewayConfig) -> GatewayConfig {
         let general = self.effective_general_settings(&config);
         config.keepawake = general.keepawake;
+        config.telemetry.enabled = general.telemetry_enabled;
         config.preflight_model = model_selection_from_protocol(general.preflight_model);
         config.memory = self.apply_to_gateway_memory_config(config.memory);
         config.thread_episodic =
@@ -1559,6 +1567,7 @@ pub struct GatewayVoiceInputChangeSet {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayGeneralSettingsChangeSet {
     pub keepawake: Option<bool>,
+    pub telemetry_enabled: Option<bool>,
     pub preflight_model: Option<GatewayMemoryModelSelectionConfig>,
 }
 
@@ -2837,6 +2846,7 @@ backend = "keystore"
             .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
                 general: Some(pioneer_protocol::GatewayGeneralSettingsUpdate {
                     keepawake: Some(true),
+                    telemetry_enabled: Some(false),
                     preflight_model: Some(pioneer_protocol::GatewayMemoryModelSelection::custom(
                         "planner-provider",
                         "planner-model",
@@ -2855,12 +2865,63 @@ backend = "keystore"
         let content = fs::read_to_string(&path).expect("read settings");
         assert!(content.contains("[general]"));
         assert!(content.contains("keepawake = true"));
+        assert!(content.contains("telemetry_enabled = false"));
         assert!(content.contains("preflight_model"));
         assert!(content.contains("model_provider = \"planner-provider\""));
         assert!(content.contains("model = \"planner-model\""));
         assert!(!content.contains("[memory]"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn telemetry_consent_falls_back_to_config_and_old_settings_remain_compatible() {
+        let settings_without_override = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("settings created before telemetry consent must still parse");
+        let mut config = gateway_config_with_keepawake(false);
+        assert!(
+            settings_without_override
+                .effective_general_settings(&config)
+                .telemetry_enabled
+        );
+        config.telemetry.enabled = false;
+        assert!(
+            !settings_without_override
+                .effective_general_settings(&config)
+                .telemetry_enabled
+        );
+
+        let settings_with_override = toml::from_str::<super::GatewaySettings>(
+            r#"
+version = 1
+
+[general]
+telemetry_enabled = false
+
+[secrets]
+backend = "keystore"
+"#,
+        )
+        .expect("telemetry consent override must parse");
+        config.telemetry.enabled = true;
+        assert!(
+            !settings_with_override
+                .effective_general_settings(&config)
+                .telemetry_enabled
+        );
+        assert!(
+            !settings_with_override
+                .apply_to_gateway_config(config)
+                .telemetry
+                .enabled
+        );
     }
 
     #[test]
@@ -4689,6 +4750,7 @@ model = "legacy-model"
             outbound_queue_capacity: 128,
             keepawake,
             preflight_model: Default::default(),
+            telemetry: Default::default(),
             thread: GatewayThreadConfig {
                 default_model: "gpt-5.4".to_owned(),
                 default_model_provider: "openai".to_owned(),
