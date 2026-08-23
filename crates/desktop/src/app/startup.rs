@@ -6,6 +6,12 @@ use pioneer_observability::{
 };
 use std::collections::{HashMap, HashSet};
 
+const fn operational_desktop_outcome() -> DesktopStartupOutcome {
+    // Provider/model selection controls whether Composer can submit a turn;
+    // it does not control whether the Desktop application itself is ready.
+    DesktopStartupOutcome::Ready
+}
+
 pub(super) struct DesktopStartupCoordinator {
     trace: DesktopStartupTrace,
     active: HashMap<DesktopStartupStage, DesktopStartupStageGuard>,
@@ -62,9 +68,11 @@ impl DesktopStartupCoordinator {
             DesktopStartupStage::GatewayRuntimeLoad,
             DesktopStartupStage::GatewaySessionConnect,
             DesktopStartupStage::WorkspaceLoad,
+            DesktopStartupStage::CliRuntimeRequest,
             DesktopStartupStage::ThreadTreeLoad,
+            DesktopStartupStage::ActiveThreadBootstrap,
+            DesktopStartupStage::ActiveThreadSubscribe,
             DesktopStartupStage::ThreadCapabilitiesLoad,
-            DesktopStartupStage::ActiveThreadPrepare,
         ]
         .into_iter()
         .any(|stage| self.failed.contains(&stage))
@@ -137,9 +145,7 @@ impl PioneerDesktop {
         }
         if !self.providers.cli_loading() {
             if self.providers.cli_error().is_some() {
-                self.startup.fail(DesktopStartupStage::CliRuntimeLoad);
-            } else {
-                self.startup.succeed(DesktopStartupStage::CliRuntimeLoad);
+                self.startup.fail(DesktopStartupStage::CliRuntimeRequest);
             }
         }
         if !self.thread_list_loading && self.current_active_thread_id().is_some() {
@@ -154,12 +160,9 @@ impl PioneerDesktop {
             self.startup
                 .succeed(DesktopStartupStage::ThreadCapabilitiesLoad);
         }
-        let active_thread_ready =
-            thread_capabilities_ready && self.composer_authorization_fingerprint.is_some();
-        if active_thread_ready {
-            self.startup
-                .succeed(DesktopStartupStage::ActiveThreadPrepare);
-        }
+        let active_thread_ready = thread_capabilities_ready
+            && !self.active_thread_resubscribe_pending
+            && self.composer_authorization_fingerprint.is_some();
 
         let outcome = if let Some(outcome) = self.startup.terminal_failure_outcome() {
             Some(outcome)
@@ -181,15 +184,7 @@ impl PioneerDesktop {
                 && !self.providers.cli_loading()
                 && !self.thread_list_loading
                 && active_thread_ready;
-            initial_data_ready.then_some(
-                if self.composer_selected_provider.is_some()
-                    && self.composer_selected_model.is_some()
-                {
-                    DesktopStartupOutcome::Ready
-                } else {
-                    DesktopStartupOutcome::SetupRequired
-                },
-            )
+            initial_data_ready.then_some(operational_desktop_outcome())
         };
 
         if let Some(outcome) = outcome {
@@ -231,6 +226,14 @@ mod tests {
         assert_eq!(
             startup.terminal_failure_outcome(),
             Some(DesktopStartupOutcome::Degraded)
+        );
+    }
+
+    #[test]
+    fn composer_selection_is_not_part_of_desktop_readiness_outcome() {
+        assert_eq!(
+            super::operational_desktop_outcome(),
+            DesktopStartupOutcome::Ready
         );
     }
 }

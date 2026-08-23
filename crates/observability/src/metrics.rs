@@ -75,6 +75,9 @@ pub(crate) struct GatewayMetrics {
     pub(crate) database_operations: Counter<u64>,
     pub(crate) database_operation_duration: Histogram<f64>,
     pub(crate) database_pool_acquire_duration: Histogram<f64>,
+    pub(crate) cli_runtime_refresh_duration: Histogram<f64>,
+    pub(crate) cli_runtime_refresh_stage_duration: Histogram<f64>,
+    pub(crate) cli_runtime_refresh_failures: Counter<u64>,
 }
 
 impl GatewayMetrics {
@@ -102,11 +105,31 @@ impl GatewayMetrics {
                 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
             ])
             .build();
+        let cli_runtime_refresh_duration = meter
+            .f64_histogram("pioneer.gateway.cli_runtime.refresh.duration")
+            .with_description("End-to-end duration of a Gateway CLI runtime refresh")
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let cli_runtime_refresh_stage_duration = meter
+            .f64_histogram("pioneer.gateway.cli_runtime.refresh.stage.duration")
+            .with_description("Duration of a stable CLI runtime refresh stage")
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let cli_runtime_refresh_failures = meter
+            .u64_counter("pioneer.gateway.cli_runtime.refresh.failures")
+            .with_description("Number of failed Gateway CLI runtime refreshes")
+            .with_unit("{failure}")
+            .build();
         Self {
             meter,
             database_operations,
             database_operation_duration,
             database_pool_acquire_duration,
+            cli_runtime_refresh_duration,
+            cli_runtime_refresh_stage_duration,
+            cli_runtime_refresh_failures,
         }
     }
 }
@@ -161,6 +184,13 @@ fn startup_duration_boundaries() -> Vec<f64> {
     vec![
         1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
         20_000.0, 30_000.0, 60_000.0, 120_000.0,
+    ]
+}
+
+fn operation_duration_boundaries() -> Vec<f64> {
+    vec![
+        0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0,
+        5_000.0, 10_000.0, 30_000.0,
     ]
 }
 

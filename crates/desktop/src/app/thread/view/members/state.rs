@@ -175,7 +175,13 @@ impl PioneerDesktop {
                                                 .authorization_projections
                                                 .snapshot(None, None)
                                         });
+                                    view.startup.begin(
+                                        pioneer_observability::DesktopStartupStage::ComposerPolicyReconcile,
+                                    );
                                     view.reconcile_composer_draft_with_capabilities();
+                                    view.startup.succeed(
+                                        pioneer_observability::DesktopStartupStage::ComposerPolicyReconcile,
+                                    );
                                     view.thread_scope_capabilities_thread_id =
                                         Some(thread_id.clone());
                                     view.thread_scope_capabilities_loading_thread_id = None;

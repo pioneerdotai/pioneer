@@ -73,7 +73,11 @@ impl PioneerDesktop {
             let _ = self.drive_thread_start_queue(cx);
         }
         if reduction.sync_composer_model_selection {
+            self.startup
+                .begin(pioneer_observability::DesktopStartupStage::ComposerModelSelectionResolve);
             self.sync_composer_model_selection_for_active_thread();
+            self.startup
+                .succeed(pioneer_observability::DesktopStartupStage::ComposerModelSelectionResolve);
         }
     }
 
@@ -245,8 +249,6 @@ impl PioneerDesktop {
 
         self.startup
             .begin(pioneer_observability::DesktopStartupStage::ThreadTreeLoad);
-        self.startup
-            .begin(pioneer_observability::DesktopStartupStage::ActiveThreadPrepare);
         self.thread_list_loading = true;
         let ws_sender = self.gateway.ws_command_sender.clone();
 
@@ -315,10 +317,16 @@ impl PioneerDesktop {
                                     has_known_threads_for_workspace: false,
                                 },
                             );
+                            view.startup.begin(
+                                pioneer_observability::DesktopStartupStage::ActiveThreadResolve,
+                            );
                             view.apply_thread_tree_refresh_success_reduction(
                                 reduction,
                                 connection_id,
                                 cx,
+                            );
+                            view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::ActiveThreadResolve,
                             );
                             view.startup.succeed(
                                 pioneer_observability::DesktopStartupStage::ThreadTreeLoad,
@@ -386,7 +394,11 @@ impl PioneerDesktop {
             return;
         }
 
-        if self.current_active_thread_id() == Some(thread_id.as_str()) {
+        let tracks_startup_active_thread =
+            self.current_active_thread_id() == Some(thread_id.as_str());
+        if tracks_startup_active_thread {
+            self.startup
+                .begin(pioneer_observability::DesktopStartupStage::ActiveThreadSubscribe);
             self.active_thread_resubscribe_pending = true;
         }
 
@@ -408,6 +420,11 @@ impl PioneerDesktop {
 
                 let _ = this.update(&mut cx, |view, cx| {
                     if view.gateway.ws_connection_id != Some(connection_id) {
+                        if tracks_startup_active_thread {
+                            view.startup.fail(
+                                pioneer_observability::DesktopStartupStage::ActiveThreadSubscribe,
+                            );
+                        }
                         return;
                     }
 
@@ -426,8 +443,18 @@ impl PioneerDesktop {
                                 view.reconcile_semantic_timeline_after_reconnect(cx);
                                 view.refresh_desktop_voice_status(cx);
                             }
+                            if tracks_startup_active_thread {
+                                view.startup.succeed(
+                                    pioneer_observability::DesktopStartupStage::ActiveThreadSubscribe,
+                                );
+                            }
                         }
                         Err(error) => {
+                            if tracks_startup_active_thread {
+                                view.startup.fail(
+                                    pioneer_observability::DesktopStartupStage::ActiveThreadSubscribe,
+                                );
+                            }
                             warn!(
                                 thread_id = thread_id.as_str(),
                                 error = %format!("{error:#}"),

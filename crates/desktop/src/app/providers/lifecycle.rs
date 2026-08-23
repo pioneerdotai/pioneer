@@ -163,7 +163,7 @@ impl PioneerDesktop {
         };
 
         self.startup
-            .begin(pioneer_observability::DesktopStartupStage::CliRuntimeLoad);
+            .begin(pioneer_observability::DesktopStartupStage::CliRuntimeRequest);
         self.providers.mark_cli_runtime_refresh_started(now_unix_ms);
 
         let ws_sender = self.gateway.ws_command_sender.clone();
@@ -181,18 +181,32 @@ impl PioneerDesktop {
                         connection_id,
                         view.gateway.ws_connection_id,
                     ) {
+                        view.startup
+                            .fail(pioneer_observability::DesktopStartupStage::CliRuntimeRequest);
                         return;
                     }
 
                     match result {
                         Ok(response) => {
+                            view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::CliRuntimeRequest,
+                            );
+                            view.startup.begin(
+                                pioneer_observability::DesktopStartupStage::CliRuntimeResponseApply,
+                            );
                             view.providers.apply_cli_runtime_refresh_response(
                                 response,
                                 provider_now_unix_ms(),
                             );
+                            view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::CliRuntimeResponseApply,
+                            );
+                            view.startup.begin(
+                                pioneer_observability::DesktopStartupStage::ComposerCapabilityTargetResolve,
+                            );
                             view.refresh_composer_capability_target_for_selected_provider();
                             view.startup.succeed(
-                                pioneer_observability::DesktopStartupStage::CliRuntimeLoad,
+                                pioneer_observability::DesktopStartupStage::ComposerCapabilityTargetResolve,
                             );
                         }
                         Err(error) => {
@@ -201,8 +215,9 @@ impl PioneerDesktop {
                                 provider_now_unix_ms(),
                             );
                             warn!(error = %format!("{error:#}"), "failed to fetch CLI runtimes");
-                            view.startup
-                                .fail(pioneer_observability::DesktopStartupStage::CliRuntimeLoad);
+                            view.startup.fail(
+                                pioneer_observability::DesktopStartupStage::CliRuntimeRequest,
+                            );
                         }
                     }
 

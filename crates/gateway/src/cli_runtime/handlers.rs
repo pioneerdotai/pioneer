@@ -47,6 +47,9 @@ use pioneer_config::{
     EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
 };
 use pioneer_crud::NewCliRuntimeNativeEvent;
+use pioneer_observability::{
+    GatewayCliRuntimeKind, GatewayCliRuntimeRefreshStage, GatewayCliRuntimeRefreshTrace,
+};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
@@ -415,7 +418,9 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeRefreshParams,
     ) {
+        let refresh_trace = GatewayCliRuntimeRefreshTrace::start();
         let connection_id = request_context.connection_id();
+        let workspace_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::WorkspaceValidate);
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -427,9 +432,14 @@ impl MessageProcessor {
         else {
             return;
         };
+        workspace_stage.succeed();
 
+        let catalog_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::CatalogLoad);
         let instances = match self.load_cli_runtime_instances() {
-            Ok(instances) => instances,
+            Ok(instances) => {
+                catalog_stage.succeed();
+                instances
+            }
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -444,6 +454,7 @@ impl MessageProcessor {
             }
         };
 
+        let instances_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::InstancesSelect);
         let instances = if let Some(runtime_id) = params.runtime_id {
             match find_cli_runtime_instance(instances, runtime_id.as_str()) {
                 Some(instance) => vec![instance],
@@ -465,26 +476,39 @@ impl MessageProcessor {
             )
         })
         .collect::<Vec<_>>();
+        instances_stage.succeed();
         let mut runtimes = Vec::with_capacity(instances.len());
         for instance in instances {
             runtimes.push(
-                self.cli_runtime_live_summary_from_instance(workspace_id.as_str(), instance)
-                    .await,
+                self.cli_runtime_live_summary_from_instance_with_trace(
+                    workspace_id.as_str(),
+                    instance,
+                    Some(&refresh_trace),
+                )
+                .await,
             );
         }
+        let disclosure_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::DisclosureApply);
         if Self::uses_collaborator_cli_disclosure(request_context) {
             runtimes = runtimes
                 .into_iter()
                 .map(collaborator_safe_runtime_summary)
                 .collect();
         }
-        self.send_cli_runtime_response(
-            connection_id,
-            request_id,
-            methods::CLI_RUNTIME_REFRESH,
-            &CLIRuntimeRefreshResponse { runtimes },
-        )
-        .await;
+        disclosure_stage.succeed();
+        let response_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::ResponseSend);
+        let response_sent = self
+            .send_cli_runtime_response(
+                connection_id,
+                request_id,
+                methods::CLI_RUNTIME_REFRESH,
+                &CLIRuntimeRefreshResponse { runtimes },
+            )
+            .await;
+        if response_sent {
+            response_stage.succeed();
+            refresh_trace.finish_success();
+        }
     }
 
     pub(super) async fn cli_runtime_list_models(
@@ -9539,9 +9563,32 @@ impl MessageProcessor {
         workspace_id: &str,
         instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
     ) -> RuntimeSummary {
+        self.cli_runtime_live_summary_from_instance_with_trace(workspace_id, instance, None)
+            .await
+    }
+
+    async fn cli_runtime_live_summary_from_instance_with_trace(
+        &self,
+        workspace_id: &str,
+        instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
+        refresh_trace: Option<&GatewayCliRuntimeRefreshTrace>,
+    ) -> RuntimeSummary {
+        let runtime_kind = match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => GatewayCliRuntimeKind::Codex,
+            GatewayCliAgentRuntimeKindConfig::Claude => GatewayCliRuntimeKind::Claude,
+        };
+        let proxy_stage = refresh_trace.map(|trace| {
+            trace.runtime_stage(
+                GatewayCliRuntimeRefreshStage::RuntimeProxyLoad,
+                runtime_kind,
+            )
+        });
         let proxy_url = self
             .cli_runtime_proxy_url(workspace_id, instance.id.as_str())
             .await;
+        if let Some(stage) = proxy_stage {
+            stage.succeed();
+        }
         let summary = cli_runtime_summary_from_instance(instance.clone(), proxy_url.clone());
         if !instance.enabled {
             return summary;
@@ -9549,12 +9596,21 @@ impl MessageProcessor {
 
         match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => {
+                let account_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                        runtime_kind,
+                    )
+                });
                 let probe =
                     CodexProbe::account_read(codex_account_probe_config_from_instance_with_proxy(
                         &instance,
                         proxy_url.as_deref(),
                     ))
                     .await;
+                if let Some(stage) = account_stage {
+                    stage.succeed();
+                }
                 let normal_runtime_ready = probe.status == CodexAccountProbeStatus::Ready;
                 let provider_version = probe.version.clone();
                 let mut summary = apply_codex_account_probe_to_summary(summary, probe);
@@ -9568,16 +9624,27 @@ impl MessageProcessor {
                 let readiness = match readiness_override {
                     Some(readiness) => readiness,
                     None => {
-                        crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
-                            &instance,
-                            self.artifact_runtime_home.as_path(),
-                            normal_runtime_ready,
-                            provider_version.as_deref(),
-                            proxy_url.as_deref(),
-                            max_tools,
-                            max_schema_bytes,
-                        )
-                        .await
+                        let mcp_stage = refresh_trace.map(|trace| {
+                            trace.runtime_stage(
+                                GatewayCliRuntimeRefreshStage::RuntimeMcpReadiness,
+                                runtime_kind,
+                            )
+                        });
+                        let readiness =
+                            crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
+                                &instance,
+                                self.artifact_runtime_home.as_path(),
+                                normal_runtime_ready,
+                                provider_version.as_deref(),
+                                proxy_url.as_deref(),
+                                max_tools,
+                                max_schema_bytes,
+                            )
+                            .await;
+                        if let Some(stage) = mcp_stage {
+                            stage.succeed();
+                        }
+                        readiness
                     }
                 };
                 let policy = CliRuntimeCapabilityPolicy::from_readiness(
@@ -9591,6 +9658,12 @@ impl MessageProcessor {
                 summary
             }
             GatewayCliAgentRuntimeKindConfig::Claude => {
+                let account_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                        runtime_kind,
+                    )
+                });
                 let probe = ClaudeProbe::account_read(
                     claude_account_probe_config_from_instance_with_proxy(
                         &instance,
@@ -9598,6 +9671,9 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                if let Some(stage) = account_stage {
+                    stage.succeed();
+                }
                 let normal_runtime_ready = probe.status == ClaudeAccountProbeStatus::Ready;
                 let provider_version = probe.version.clone();
                 let mut summary = apply_claude_account_probe_to_summary(summary, probe);
@@ -9611,16 +9687,27 @@ impl MessageProcessor {
                 let readiness = match readiness_override {
                     Some(readiness) => readiness,
                     None => {
-                        crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
-                            &instance,
-                            self.artifact_runtime_home.as_path(),
-                            normal_runtime_ready,
-                            provider_version.as_deref(),
-                            proxy_url.as_deref(),
-                            max_tools,
-                            max_schema_bytes,
-                        )
-                        .await
+                        let mcp_stage = refresh_trace.map(|trace| {
+                            trace.runtime_stage(
+                                GatewayCliRuntimeRefreshStage::RuntimeMcpReadiness,
+                                runtime_kind,
+                            )
+                        });
+                        let readiness =
+                            crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
+                                &instance,
+                                self.artifact_runtime_home.as_path(),
+                                normal_runtime_ready,
+                                provider_version.as_deref(),
+                                proxy_url.as_deref(),
+                                max_tools,
+                                max_schema_bytes,
+                            )
+                            .await;
+                        if let Some(stage) = mcp_stage {
+                            stage.succeed();
+                        }
+                        readiness
                     }
                 };
                 let policy = CliRuntimeCapabilityPolicy::from_readiness(
@@ -9727,7 +9814,7 @@ impl MessageProcessor {
         request_id: RequestId,
         method: &str,
         result: &T,
-    ) {
+    ) -> bool {
         let response = match JsonRpcResponse::from_result(request_id, result) {
             Ok(response) => response,
             Err(error) => {
@@ -9740,7 +9827,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
-                return;
+                return false;
             }
         };
 
@@ -9751,7 +9838,9 @@ impl MessageProcessor {
                 method,
                 "failed to send CLI runtime response"
             );
+            return false;
         }
+        true
     }
 }
 

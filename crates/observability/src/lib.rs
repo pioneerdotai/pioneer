@@ -22,12 +22,17 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
 mod metrics;
+mod operations;
 mod startup;
 mod telemetry;
 
 pub use metrics::{
     DatabaseOperation, DatabasePoolSnapshot, DatabaseRole, record_database_operation,
     register_database_pool_observer,
+};
+pub use operations::{
+    GatewayCliRuntimeKind, GatewayCliRuntimeRefreshStage, GatewayCliRuntimeRefreshStageGuard,
+    GatewayCliRuntimeRefreshTrace,
 };
 pub use startup::{
     DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,

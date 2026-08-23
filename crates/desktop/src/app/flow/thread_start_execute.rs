@@ -93,6 +93,8 @@ impl PioneerDesktop {
         let requested_thread_id = start_plan.requested_thread_id;
         let requested_workspace_id = start_plan.requested_workspace_id;
         let requested_visibility = self.pending_thread_create_visibility;
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::ActiveThreadBootstrap);
 
         let ws_sender = self.gateway.ws_command_sender.clone();
 
@@ -132,6 +134,8 @@ impl PioneerDesktop {
 
                 let _ = this.update(&mut cx, |app, cx| {
                     if app.gateway.ws_connection_id != Some(connection_id) {
+                        app.startup
+                            .fail(pioneer_observability::DesktopStartupStage::ActiveThreadBootstrap);
                         return;
                     }
 
@@ -146,6 +150,9 @@ impl PioneerDesktop {
                             );
                             app.apply_thread_start_bootstrap_reduction(reduction);
                             app.active_thread_resubscribe_pending = false;
+                            app.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::ActiveThreadBootstrap,
+                            );
                         }
                         Err(error) => {
                             let error_message = format!("{error:#}");
@@ -165,6 +172,9 @@ impl PioneerDesktop {
                                 }
                                 thread_start::ThreadStartBootstrapFailurePlan::Reset => {
                                     app.reset_thread_start_state();
+                                    app.startup.fail(
+                                        pioneer_observability::DesktopStartupStage::ActiveThreadBootstrap,
+                                    );
                                     warn!(
                                         error = %error_message,
                                         "failed to start thread after websocket connect"
