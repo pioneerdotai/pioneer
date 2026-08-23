@@ -79,6 +79,8 @@ impl PioneerDesktop {
         };
         let is_runtime_draft = self.draft_thread_id() == Some(thread_id.as_str());
 
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::ThreadCapabilitiesLoad);
         self.thread_scope_capabilities_refresh_generation = self
             .thread_scope_capabilities_refresh_generation
             .wrapping_add(1);
@@ -177,6 +179,9 @@ impl PioneerDesktop {
                                     view.thread_scope_capabilities_thread_id =
                                         Some(thread_id.clone());
                                     view.thread_scope_capabilities_loading_thread_id = None;
+                                    view.startup.succeed(
+                                        pioneer_observability::DesktopStartupStage::ThreadCapabilitiesLoad,
+                                    );
                                     cx.notify();
                                     ThreadCapabilityRefreshDecision::Complete
                                 }
@@ -212,6 +217,9 @@ impl PioneerDesktop {
                                         == Some(thread_id.as_str())
                                 {
                                     view.thread_scope_capabilities_loading_thread_id = None;
+                                    view.startup.fail(
+                                        pioneer_observability::DesktopStartupStage::ThreadCapabilitiesLoad,
+                                    );
                                 }
                             });
                             return;

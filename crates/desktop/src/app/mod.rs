@@ -13,6 +13,7 @@ mod root;
 mod settings;
 mod sidebar;
 mod skills;
+mod startup;
 mod task_notifications;
 mod thread;
 mod workspaces;

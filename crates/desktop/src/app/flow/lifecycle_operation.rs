@@ -58,6 +58,20 @@ impl PioneerDesktop {
             return;
         }
 
+        match result.as_ref() {
+            Ok(success) => {
+                self.startup
+                    .succeed(pioneer_observability::DesktopStartupStage::GatewayRuntimeLoad);
+                if success.ws_connection_id.is_some() {
+                    self.startup
+                        .begin(pioneer_observability::DesktopStartupStage::GatewaySessionConnect);
+                }
+            }
+            Err(_) => self
+                .startup
+                .fail(pioneer_observability::DesktopStartupStage::GatewayRuntimeLoad),
+        }
+
         let mut schedule_session_refresh = false;
         let outcome = match result {
             Ok(success) => {

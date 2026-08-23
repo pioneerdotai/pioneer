@@ -21,6 +21,7 @@ required-features = ["schema"]
 anyhow.workspace = true
 async-trait.workspace = true
 pioneer-client.workspace = true
+pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
 rustls.workspace = true
 schemars = { workspace = true, optional = true }

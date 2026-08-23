@@ -69,6 +69,8 @@ impl PioneerDesktop {
         if let Some(cx) = cx.as_deref_mut() {
             self.rebuild_sidebar_tree_state(cx);
             if self.gateway.connection_state == GatewayConnectionState::Connected {
+                self.startup
+                    .succeed(pioneer_observability::DesktopStartupStage::GatewaySessionConnect);
                 self.resolve_agent_avatar(cx);
                 self.refresh_current_principal(cx);
                 self.active_thread_resubscribe_pending = self.current_active_thread_id().is_some();

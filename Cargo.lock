@@ -8695,6 +8695,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "pioneer-client",
+ "pioneer-observability",
  "pioneer-protocol",
  "rustls",
  "schemars 1.2.2",

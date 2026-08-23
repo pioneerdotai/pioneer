@@ -191,6 +191,7 @@ impl PioneerDesktop {
     }
 
     pub(super) fn apply_telemetry_setting(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        pioneer_observability::set_telemetry_enabled(enabled);
         let Some(plan) = gateway_settings::telemetry_enabled_update_plan(
             self.gateway.settings.as_ref(),
             enabled,
@@ -487,6 +488,9 @@ impl PioneerDesktop {
         let connection_id = scope.connection_id;
         let connection_epoch = scope.connection_epoch;
 
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::GatewaySettingsLoad);
+
         gateway_settings::begin_gateway_settings_refresh(
             &mut self.gateway.settings_loading,
             &mut self.gateway.settings_error,
@@ -518,6 +522,14 @@ impl PioneerDesktop {
                                 &mut view.gateway.settings_error,
                                 response,
                             );
+                            if let Some(settings) = view.gateway.settings.as_ref() {
+                                pioneer_observability::set_telemetry_enabled(
+                                    settings.general.telemetry_enabled,
+                                );
+                            }
+                            view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::GatewaySettingsLoad,
+                            );
                         }
                         Err(error) => {
                             gateway_settings::apply_gateway_settings_get_error(
@@ -528,6 +540,9 @@ impl PioneerDesktop {
                             warn!(
                                 error = %format!("{error:#}"),
                                 "failed to fetch gateway settings"
+                            );
+                            view.startup.fail(
+                                pioneer_observability::DesktopStartupStage::GatewaySettingsLoad,
                             );
                         }
                     }

@@ -210,6 +210,7 @@ async fn run_gateway_until_shutdown_inner(
             traces_endpoint: config.gateway.telemetry.otlp_traces_endpoint.clone(),
             export_interval: Duration::from_millis(config.gateway.telemetry.export_interval_ms),
             export_timeout: Duration::from_millis(config.gateway.telemetry.export_timeout_ms),
+            deployment_environment: None,
         },
     ) {
         Ok(()) => observability_stage.succeed(),

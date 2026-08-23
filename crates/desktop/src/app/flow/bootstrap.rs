@@ -2,6 +2,8 @@ use super::*;
 
 impl PioneerDesktop {
     pub(crate) fn bootstrap_gateway_runtime(&mut self, cx: &mut Context<Self>) {
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::GatewayRuntimeLoad);
         let operation_epoch = self.next_gateway_connection_epoch();
         self.gateway.connecting = true;
         self.gateway.setup_action = None;

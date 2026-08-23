@@ -1,4 +1,4 @@
-use crate::metrics::GatewayMetrics;
+use crate::metrics::{GatewayMetrics, StartupMetrics};
 use anyhow::{Context, Result, bail};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider as _;
@@ -17,9 +17,62 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use url::{Host, Url};
 
-const SERVICE_NAME: &str = "pioneer-gateway";
-const METER_NAME: &str = "pioneer.gateway";
-const TRACER_NAME: &str = "pioneer.gateway";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryTarget {
+    Gateway,
+    Desktop,
+    Mobile,
+}
+
+impl TelemetryTarget {
+    const fn service_name(self) -> &'static str {
+        match self {
+            Self::Gateway => "pioneer-gateway",
+            Self::Desktop => "pioneer-desktop",
+            Self::Mobile => "pioneer-mobile",
+        }
+    }
+
+    const fn instrumentation_name(self) -> &'static str {
+        match self {
+            Self::Gateway => "pioneer.gateway",
+            Self::Desktop => "pioneer.desktop",
+            Self::Mobile => "pioneer.mobile",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Gateway => "Gateway",
+            Self::Desktop => "Desktop",
+            Self::Mobile => "Mobile",
+        }
+    }
+
+    const fn startup_duration_name(self) -> &'static str {
+        match self {
+            Self::Gateway => "pioneer.gateway.startup.duration",
+            Self::Desktop => "pioneer.desktop.startup.duration",
+            Self::Mobile => "pioneer.mobile.startup.duration",
+        }
+    }
+
+    const fn startup_stage_duration_name(self) -> &'static str {
+        match self {
+            Self::Gateway => "pioneer.gateway.startup.stage.duration",
+            Self::Desktop => "pioneer.desktop.startup.stage.duration",
+            Self::Mobile => "pioneer.mobile.startup.stage.duration",
+        }
+    }
+
+    const fn startup_failures_name(self) -> &'static str {
+        match self {
+            Self::Gateway => "pioneer.gateway.startup.failures",
+            Self::Desktop => "pioneer.desktop.startup.failures",
+            Self::Mobile => "pioneer.mobile.startup.failures",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OtlpTelemetryConfig {
@@ -27,21 +80,37 @@ pub struct OtlpTelemetryConfig {
     pub traces_endpoint: String,
     pub export_interval: Duration,
     pub export_timeout: Duration,
+    pub deployment_environment: Option<String>,
 }
 
 pub(crate) struct ObservabilityState {
+    pub(crate) target: TelemetryTarget,
     meter_provider: SdkMeterProvider,
     tracer_provider: SdkTracerProvider,
     pub(crate) tracer: SdkTracer,
-    pub(crate) metrics: GatewayMetrics,
+    pub(crate) startup_metrics: StartupMetrics,
+    pub(crate) gateway_metrics: Option<GatewayMetrics>,
 }
 
 static OBSERVABILITY: OnceLock<ObservabilityState> = OnceLock::new();
 
 pub fn init_otlp_observability(config: OtlpTelemetryConfig) -> Result<()> {
+    init_otlp_observability_for(TelemetryTarget::Gateway, config)
+}
+
+pub fn init_otlp_observability_for(
+    target: TelemetryTarget,
+    config: OtlpTelemetryConfig,
+) -> Result<()> {
     validate_config(&config)?;
-    if OBSERVABILITY.get().is_some() {
-        return Ok(());
+    if let Some(state) = OBSERVABILITY.get() {
+        if state.target == target {
+            return Ok(());
+        }
+        bail!(
+            "OTLP observability pipeline is already initialized for {}",
+            state.target.service_name()
+        );
     }
 
     let metric_exporter = MetricExporter::builder()
@@ -64,7 +133,7 @@ pub fn init_otlp_observability(config: OtlpTelemetryConfig) -> Result<()> {
         .build()
         .context("failed to build OTLP/HTTP traces exporter")?;
 
-    let resource = gateway_resource();
+    let resource = resource(target, config.deployment_environment.as_deref());
     let meter_provider = SdkMeterProvider::builder()
         .with_resource(resource.clone())
         .with_reader(metric_reader)
@@ -75,15 +144,25 @@ pub fn init_otlp_observability(config: OtlpTelemetryConfig) -> Result<()> {
             inner: trace_exporter,
         })
         .build();
-    let metrics = GatewayMetrics::new(meter_provider.meter(METER_NAME));
-    let tracer = tracer_provider.tracer(TRACER_NAME);
+    let meter = meter_provider.meter(target.instrumentation_name());
+    let startup_metrics = StartupMetrics::new(
+        &meter,
+        target.startup_duration_name(),
+        target.startup_stage_duration_name(),
+        target.startup_failures_name(),
+        target.label(),
+    );
+    let gateway_metrics = (target == TelemetryTarget::Gateway).then(|| GatewayMetrics::new(meter));
+    let tracer = tracer_provider.tracer(target.instrumentation_name());
 
     OBSERVABILITY
         .set(ObservabilityState {
+            target,
             meter_provider,
             tracer_provider,
             tracer,
-            metrics,
+            startup_metrics,
+            gateway_metrics,
         })
         .map_err(|_| anyhow::anyhow!("OTLP observability pipeline was initialized concurrently"))
 }
@@ -116,17 +195,21 @@ pub(crate) fn state() -> Option<&'static ObservabilityState> {
     OBSERVABILITY.get()
 }
 
-fn gateway_resource() -> Resource {
-    let deployment_environment = if cfg!(debug_assertions) {
+fn resource(target: TelemetryTarget, deployment_environment: Option<&str>) -> Resource {
+    let deployment_environment = deployment_environment.unwrap_or(if cfg!(debug_assertions) {
         "development"
     } else {
         "production"
-    };
+    });
     Resource::builder_empty()
-        .with_service_name(SERVICE_NAME)
+        .with_service_name(target.service_name())
         .with_attributes([
             KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-            KeyValue::new("deployment.environment.name", deployment_environment),
+            KeyValue::new(
+                "deployment.environment.name",
+                deployment_environment.to_owned(),
+            ),
+            KeyValue::new("os.type", std::env::consts::OS),
         ])
         .build()
 }
@@ -139,6 +222,11 @@ fn validate_config(config: &OtlpTelemetryConfig) -> Result<()> {
     }
     if !(Duration::from_millis(100)..=Duration::from_secs(30)).contains(&config.export_timeout) {
         bail!("OTLP export timeout must be between 100 milliseconds and 30 seconds");
+    }
+    if let Some(environment) = config.deployment_environment.as_deref()
+        && !matches!(environment, "development" | "production")
+    {
+        bail!("OTLP deployment environment must be development or production");
     }
     Ok(())
 }
@@ -325,6 +413,7 @@ mod tests {
             traces_endpoint: traces_endpoint.to_owned(),
             export_interval: Duration::from_secs(30),
             export_timeout: Duration::from_secs(3),
+            deployment_environment: None,
         }
     }
 
@@ -381,6 +470,18 @@ mod tests {
         assert!(validate_config(&candidate).is_err());
         candidate.export_interval = Duration::from_secs(30);
         candidate.export_timeout = Duration::from_secs(31);
+        assert!(validate_config(&candidate).is_err());
+    }
+
+    #[test]
+    fn deployment_environment_is_bounded() {
+        let mut candidate = config(
+            "https://telemetry.example/v1/metrics",
+            "https://telemetry.example/v1/traces",
+        );
+        candidate.deployment_environment = Some("development".to_owned());
+        assert!(validate_config(&candidate).is_ok());
+        candidate.deployment_environment = Some("customer-provided".to_owned());
         assert!(validate_config(&candidate).is_err());
     }
 

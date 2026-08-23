@@ -73,6 +73,8 @@ impl PioneerDesktop {
             }
         };
 
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::ProviderLoad);
         self.providers.mark_refresh_started();
 
         let ws_sender = self.gateway.ws_command_sender.clone();
@@ -96,6 +98,9 @@ impl PioneerDesktop {
                     match result {
                         Ok(response) => {
                             view.providers.apply_refresh_response(response);
+                            view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::ProviderLoad,
+                            );
                         }
                         Err(error) => {
                             view.providers.apply_refresh_failed(format!(
@@ -103,6 +108,9 @@ impl PioneerDesktop {
                                 t!("providers.error.load_failed")
                             ));
                             warn!(error = %format!("{error:#}"), "failed to fetch configured providers");
+                            view.startup.fail(
+                                pioneer_observability::DesktopStartupStage::ProviderLoad,
+                            );
                         }
                     }
 
@@ -154,6 +162,8 @@ impl PioneerDesktop {
             }
         };
 
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::CliRuntimeLoad);
         self.providers.mark_cli_runtime_refresh_started(now_unix_ms);
 
         let ws_sender = self.gateway.ws_command_sender.clone();
@@ -181,6 +191,9 @@ impl PioneerDesktop {
                                 provider_now_unix_ms(),
                             );
                             view.refresh_composer_capability_target_for_selected_provider();
+                            view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::CliRuntimeLoad,
+                            );
                         }
                         Err(error) => {
                             view.providers.apply_cli_runtime_refresh_failed(
@@ -188,6 +201,8 @@ impl PioneerDesktop {
                                 provider_now_unix_ms(),
                             );
                             warn!(error = %format!("{error:#}"), "failed to fetch CLI runtimes");
+                            view.startup
+                                .fail(pioneer_observability::DesktopStartupStage::CliRuntimeLoad);
                         }
                     }
 

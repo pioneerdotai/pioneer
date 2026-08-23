@@ -8,7 +8,11 @@ use pioneer_client::composer::{
 };
 
 impl PioneerDesktop {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        startup_trace: pioneer_observability::DesktopStartupTrace,
+    ) -> Self {
         window::install_window_state_persistence(window, cx);
 
         let gateway_setup_form_state = cx.new(|cx| {
@@ -65,6 +69,7 @@ impl PioneerDesktop {
         let desktop_microphone_gate = DesktopMicrophoneGateReport::unknown();
 
         let mut view = Self {
+            startup: DesktopStartupCoordinator::new(startup_trace),
             invitation_join: None,
             invitation_join_input_subscriptions: Vec::new(),
             thread_coordinators: HashMap::new(),

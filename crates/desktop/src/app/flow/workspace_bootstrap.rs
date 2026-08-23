@@ -79,6 +79,9 @@ impl PioneerDesktop {
             return;
         };
 
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::WorkspaceLoad);
+
         self.set_workspaces_loading(true);
         self.set_workspaces_error(None);
 
@@ -131,6 +134,8 @@ impl PioneerDesktop {
                     match result {
                         Ok(reduction) => {
                             view.apply_workspace_bootstrap_success_reduction(reduction, cx);
+                            view.startup
+                                .succeed(pioneer_observability::DesktopStartupStage::WorkspaceLoad);
                         }
                         Err(error) => {
                             let message = format!("{error:#}");
@@ -139,6 +144,8 @@ impl PioneerDesktop {
                                 "failed to bootstrap workspace list"
                             );
                             view.set_workspaces_error(Some(message));
+                            view.startup
+                                .fail(pioneer_observability::DesktopStartupStage::WorkspaceLoad);
                         }
                     }
 

@@ -26,8 +26,10 @@ use gpui::*;
 use gpui_component::Root;
 use reqwest::header::HeaderValue;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::error;
 
+use pioneer_config::AppConfig;
 use pioneer_protocol::{InvitationPresentation, PioneerAppUrlScheme};
 
 use app::PioneerDesktop;
@@ -108,11 +110,51 @@ fn main() {
     }
     let initial_urls = invitation_urls_from_args(args);
 
+    let startup = pioneer_observability::DesktopStartupTrace::start();
+    pioneer_observability::set_telemetry_enabled(false);
+
+    let config_stage = startup.stage(pioneer_observability::DesktopStartupStage::ConfigLoad);
+    let startup_config = AppConfig::load().ok();
+    if startup_config.is_some() {
+        config_stage.succeed();
+    }
+
+    let consent_stage = startup.stage(pioneer_observability::DesktopStartupStage::ConsentLoad);
+    let telemetry_enabled = startup_config
+        .as_ref()
+        .map(desktop_telemetry_enabled)
+        .unwrap_or(true);
+    pioneer_observability::set_telemetry_enabled(telemetry_enabled);
+    consent_stage.succeed();
+
+    if let Some(config) = startup_config.as_ref() {
+        let observability_stage =
+            startup.stage(pioneer_observability::DesktopStartupStage::ObservabilityInit);
+        if pioneer_observability::init_otlp_observability_for(
+            pioneer_observability::TelemetryTarget::Desktop,
+            pioneer_observability::OtlpTelemetryConfig {
+                metrics_endpoint: config.gateway.telemetry.otlp_metrics_endpoint.clone(),
+                traces_endpoint: config.gateway.telemetry.otlp_traces_endpoint.clone(),
+                export_interval: Duration::from_millis(config.gateway.telemetry.export_interval_ms),
+                export_timeout: Duration::from_millis(config.gateway.telemetry.export_timeout_ms),
+                deployment_environment: None,
+            },
+        )
+        .is_ok()
+        {
+            observability_stage.succeed();
+        }
+    }
+
     let sentry_guard =
         pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Desktop);
     pioneer_observability::init_tracing(sentry_guard.is_some());
+    let locale_stage = startup.stage(pioneer_observability::DesktopStartupStage::LocaleInitialize);
     init_locale();
+    locale_stage.succeed();
 
+    let runtime_home_stage =
+        startup.stage(pioneer_observability::DesktopStartupStage::RuntimeHomePrepare);
     if let Err(error) = gateway::ensure_runtime_home_dir() {
         pioneer_observability::capture_anyhow(&error);
         error!(
@@ -122,26 +164,40 @@ fn main() {
         drop(sentry_guard);
         std::process::exit(1);
     }
+    runtime_home_stage.succeed();
 
+    let http_client_stage =
+        startup.stage(pioneer_observability::DesktopStartupStage::HttpClientInitialize);
     let http_client = DesktopHttpClient::new("pioneer-desktop")
         .expect("failed to initialize HTTP client for remote assets");
+    http_client_stage.succeed();
 
     let (url_sender, mut url_receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    let ui_runtime_stage =
+        startup.stage(pioneer_observability::DesktopStartupStage::UiRuntimeInitialize);
     let app = gpui_platform::application()
         .with_assets(PioneerAssetsSource)
         .with_http_client(Arc::new(http_client));
+    ui_runtime_stage.succeed();
     app.on_open_urls(move |urls| {
         let _ = url_sender.send(urls);
     });
 
+    let startup_for_app = startup.clone();
     app.run(move |cx| {
+        let ui_components_stage = startup_for_app
+            .stage(pioneer_observability::DesktopStartupStage::UiComponentsInitialize);
         gpui_component::init(cx);
         theme::init(cx);
         menu::init_system_menus(cx);
 
         let initial_window_bounds = window::initial_window_bounds(cx);
+        ui_components_stage.succeed();
 
+        let startup = startup_for_app.clone();
         cx.spawn(async move |cx| {
+            let window_stage =
+                startup.stage(pioneer_observability::DesktopStartupStage::WindowOpen);
             let window_options = WindowOptions {
                 titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 window_bounds: Some(initial_window_bounds),
@@ -151,11 +207,12 @@ fn main() {
             let mut desktop = None;
             let window_handle = cx
                 .open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| PioneerDesktop::new(window, cx));
+                    let view = cx.new(|cx| PioneerDesktop::new(window, cx, startup.clone()));
                     desktop = Some(view.clone());
                     cx.new(|cx| Root::new(view, window, cx))
                 })
                 .context(t!("errors.window.open_failed").to_string())?;
+            window_stage.succeed();
             let desktop = desktop.context("desktop view was not created")?;
 
             for url in initial_urls {
@@ -182,6 +239,26 @@ fn main() {
         })
         .detach();
     });
+
+    let _ = pioneer_observability::shutdown_observability(Duration::from_secs(3));
+}
+
+fn desktop_telemetry_enabled(config: &AppConfig) -> bool {
+    let Ok(runtime_home) = config.runtime_home_dir() else {
+        return config.gateway.telemetry.enabled;
+    };
+    let settings_path = runtime_home.join(config.gateway.settings_file_name.as_str());
+    let Ok(contents) = std::fs::read_to_string(settings_path) else {
+        return config.gateway.telemetry.enabled;
+    };
+    let Ok(settings) = contents.parse::<toml::Value>() else {
+        return config.gateway.telemetry.enabled;
+    };
+    settings
+        .get("general")
+        .and_then(|general| general.get("telemetry_enabled"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(config.gateway.telemetry.enabled)
 }
 
 fn invitation_urls_from_args(args: impl IntoIterator<Item = String>) -> Vec<String> {

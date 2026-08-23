@@ -15,6 +15,7 @@ use crate::{
         member_avatars::DesktopMemberAvatarState,
         settings::ProfileEditorState,
         skills::details::table::SkillDiagnosticsTableDelegate,
+        startup::DesktopStartupCoordinator,
         thread::{
             ThreadCoordinator,
             message_revisions::DesktopMessageRevisionDialogState,
@@ -352,6 +353,7 @@ pub(super) struct DesktopComposerEditTarget {
 }
 
 pub struct PioneerDesktop {
+    pub(super) startup: DesktopStartupCoordinator,
     pub(super) invitation_join: Option<Entity<DesktopInvitationJoinState>>,
     pub(super) invitation_join_input_subscriptions: Vec<Subscription>,
     pub(super) thread_coordinators: HashMap<String, ThreadCoordinator>,

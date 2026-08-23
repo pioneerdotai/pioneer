@@ -243,6 +243,10 @@ impl PioneerDesktop {
             return;
         };
 
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::ThreadTreeLoad);
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::ActiveThreadPrepare);
         self.thread_list_loading = true;
         let ws_sender = self.gateway.ws_command_sender.clone();
 
@@ -316,6 +320,9 @@ impl PioneerDesktop {
                                 connection_id,
                                 cx,
                             );
+                            view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::ThreadTreeLoad,
+                            );
                             if let Some(thread_id) =
                                 view.current_active_thread_id().map(str::to_owned)
                                 && view.draft_thread_id() != Some(thread_id.as_str())
@@ -354,6 +361,8 @@ impl PioneerDesktop {
                                 },
                             );
                             view.apply_thread_tree_refresh_failure_reduction(reduction, cx);
+                            view.startup
+                                .fail(pioneer_observability::DesktopStartupStage::ThreadTreeLoad);
                         }
                     }
 

@@ -66,6 +66,8 @@ impl PioneerDesktop {
             self.sync_administration_sidebar_tree_state(cx);
             return;
         }
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::AuthorizationLoad);
         let generation = self.gateway.current_principal_refresh_generation;
         let connection_id = self.gateway.ws_connection_id;
         let sender = self.gateway.ws_command_sender.clone();
@@ -169,6 +171,9 @@ impl PioneerDesktop {
                                                 .authorization_projections
                                                 .snapshot(None, None)
                                         });
+                                    view.startup.succeed(
+                                        pioneer_observability::DesktopStartupStage::AuthorizationLoad,
+                                    );
                                     view.reconcile_composer_permission_mode_with_capabilities();
 
                                     let capabilities =
@@ -243,7 +248,14 @@ impl PioneerDesktop {
                                 .timer(CURRENT_PRINCIPAL_REFRESH_RETRY_DELAYS[attempt])
                                 .await;
                         }
-                        CurrentPrincipalRefreshDecision::Retry => return,
+                        CurrentPrincipalRefreshDecision::Retry => {
+                            let _ = this.update(&mut cx, |view, _| {
+                                view.startup.fail(
+                                    pioneer_observability::DesktopStartupStage::AuthorizationLoad,
+                                );
+                            });
+                            return;
+                        }
                     }
                 }
             }

@@ -17,6 +17,7 @@ mod presentation;
 #[cfg(feature = "schema")]
 pub mod schema;
 mod skills;
+mod telemetry;
 mod threads;
 mod timeline;
 mod workspaces;
@@ -362,6 +363,14 @@ impl ClientFfiRuntime {
             .map_err(|_| "client ffi config lock is poisoned".to_owned())? = Some(config);
 
         Ok(ClientFfiInitializeResult { initialized: true })
+    }
+
+    fn mobile_startup_record(
+        &self,
+        input_json: &str,
+    ) -> Result<telemetry::ClientMobileStartupRecordResult, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        telemetry::record_mobile_startup(input_json)
     }
 
     fn gateway_validate_remote(&self, input_json: &str) -> Result<RemoteGatewayValidation, String> {
@@ -2831,6 +2840,10 @@ pub unsafe extern "C" fn pioneer_client_ffi_client_destroy(ptr: *mut PioneerClie
 }
 
 ffi_client_json_method!(pioneer_client_ffi_client_initialize, initialize);
+ffi_client_json_method!(
+    pioneer_client_ffi_mobile_startup_record,
+    mobile_startup_record
+);
 ffi_client_json_method!(
     pioneer_client_ffi_gateway_validate_remote,
     gateway_validate_remote

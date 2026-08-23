@@ -75,9 +75,6 @@ pub(crate) struct GatewayMetrics {
     pub(crate) database_operations: Counter<u64>,
     pub(crate) database_operation_duration: Histogram<f64>,
     pub(crate) database_pool_acquire_duration: Histogram<f64>,
-    pub(crate) startup_duration: Histogram<f64>,
-    pub(crate) startup_stage_duration: Histogram<f64>,
-    pub(crate) startup_failures: Counter<u64>,
 }
 
 impl GatewayMetrics {
@@ -105,32 +102,57 @@ impl GatewayMetrics {
                 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
             ])
             .build();
-        let startup_duration = meter
-            .f64_histogram("pioneer.gateway.startup.duration")
-            .with_description("Time from Gateway process entry until the Gateway is ready")
-            .with_unit("ms")
-            .with_boundaries(startup_duration_boundaries())
-            .build();
-        let startup_stage_duration = meter
-            .f64_histogram("pioneer.gateway.startup.stage.duration")
-            .with_description("Duration of a stable, low-cardinality Gateway startup stage")
-            .with_unit("ms")
-            .with_boundaries(startup_duration_boundaries())
-            .build();
-        let startup_failures = meter
-            .u64_counter("pioneer.gateway.startup.failures")
-            .with_description("Number of Gateway startups that failed before readiness")
-            .with_unit("{failure}")
-            .build();
-
         Self {
             meter,
             database_operations,
             database_operation_duration,
             database_pool_acquire_duration,
-            startup_duration,
-            startup_stage_duration,
-            startup_failures,
+        }
+    }
+}
+
+pub(crate) struct StartupMetrics {
+    pub(crate) duration: Histogram<f64>,
+    pub(crate) stage_duration: Histogram<f64>,
+    pub(crate) failures: Counter<u64>,
+}
+
+impl StartupMetrics {
+    pub(crate) fn new(
+        meter: &Meter,
+        duration_name: &'static str,
+        stage_duration_name: &'static str,
+        failures_name: &'static str,
+        target_label: &'static str,
+    ) -> Self {
+        let duration = meter
+            .f64_histogram(duration_name)
+            .with_description(format!(
+                "Time from {target_label} process entry until the app is operational"
+            ))
+            .with_unit("ms")
+            .with_boundaries(startup_duration_boundaries())
+            .build();
+        let stage_duration = meter
+            .f64_histogram(stage_duration_name)
+            .with_description(format!(
+                "Duration of a stable, low-cardinality {target_label} startup stage"
+            ))
+            .with_unit("ms")
+            .with_boundaries(startup_duration_boundaries())
+            .build();
+        let failures = meter
+            .u64_counter(failures_name)
+            .with_description(format!(
+                "Number of {target_label} startups that failed before an operational state"
+            ))
+            .with_unit("{failure}")
+            .build();
+
+        Self {
+            duration,
+            stage_duration,
+            failures,
         }
     }
 }
@@ -149,7 +171,10 @@ fn record_database_pool_acquire(role: DatabaseRole, elapsed: Duration) {
     let Some(state) = super::telemetry::state() else {
         return;
     };
-    state.metrics.database_pool_acquire_duration.record(
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return;
+    };
+    metrics.database_pool_acquire_duration.record(
         elapsed.as_secs_f64() * 1_000.0,
         &[
             KeyValue::new("db.system.name", "sqlite"),
@@ -214,9 +239,11 @@ pub fn record_database_operation(
         KeyValue::new("db.operation.type", operation.kind()),
         KeyValue::new("outcome", if failed { "error" } else { "ok" }),
     ];
-    state.metrics.database_operations.add(1, &attributes);
-    state
-        .metrics
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return;
+    };
+    metrics.database_operations.add(1, &attributes);
+    metrics
         .database_operation_duration
         .record(elapsed.as_secs_f64() * 1_000.0, &attributes);
 }
@@ -232,8 +259,10 @@ where
     let Some(state) = super::telemetry::state() else {
         return false;
     };
-    state
-        .metrics
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return false;
+    };
+    metrics
         .meter
         .u64_observable_gauge("pioneer.gateway.db.pool.connections")
         .with_description("Current and configured SQLite connection pool size")

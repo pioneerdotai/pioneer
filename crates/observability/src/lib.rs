@@ -29,8 +29,15 @@ pub use metrics::{
     DatabaseOperation, DatabasePoolSnapshot, DatabaseRole, record_database_operation,
     register_database_pool_observer,
 };
-pub use startup::{GatewayStartupStage, GatewayStartupStageGuard, GatewayStartupTrace};
-pub use telemetry::{OtlpTelemetryConfig, init_otlp_observability, shutdown_observability};
+pub use startup::{
+    DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
+    GatewayStartupStage, GatewayStartupStageGuard, GatewayStartupTrace, MobileStartupOutcome,
+    MobileStartupReport, MobileStartupStage, MobileStartupStageTiming, record_mobile_startup,
+};
+pub use telemetry::{
+    OtlpTelemetryConfig, TelemetryTarget, init_otlp_observability, init_otlp_observability_for,
+    shutdown_observability,
+};
 
 /// DSN for non-desktop runtime binaries.
 pub const SENTRY_DSN_ENV: &str = "PIONEER_SENTRY_DSN";
