@@ -4,6 +4,7 @@ use crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection;
 use crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection;
 use crate::cli_runtime::continuation::CliMcpSessionLaunch;
 use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
+use crate::cli_runtime::opencode_mcp::build_opencode_mcp_session_launch_projection;
 use crate::turn_mcp::invoker::{
     TurnMcpInvocationErrorCode, TurnMcpRuntimeView, validate_frozen_identity,
 };
@@ -17,6 +18,7 @@ use pioneer_protocol::CLIAgentRuntimeKind;
 
 const CODEX_MCP_ADAPTER_KIND: &str = "codex_synthetic_mcp";
 const CLAUDE_MCP_ADAPTER_KIND: &str = "claude_strict_mcp";
+const OPENCODE_MCP_ADAPTER_KIND: &str = "opencode_dynamic_mcp";
 
 #[derive(Debug)]
 pub(crate) enum CliMcpSessionLaunchRestoreError {
@@ -201,6 +203,7 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             .map_err(invalid)?;
             validate_provider_bindings(
                 bindings.as_slice(),
+                "mcp__pioneer__",
                 launch.preflight.tools.iter().map(|tool| {
                     (
                         tool.canonical_callable_name.as_str(),
@@ -237,6 +240,7 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             .map_err(invalid)?;
             validate_provider_bindings(
                 bindings.as_slice(),
+                "mcp__pioneer__",
                 launch.preflight.tools.iter().map(|tool| {
                     (
                         tool.canonical_callable_name.as_str(),
@@ -246,6 +250,42 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             )
             .map_err(invalid)?;
             Ok(CliMcpSessionLaunch::Claude(launch))
+        }
+        CLIAgentRuntimeKind::OpenCode => {
+            if metadata.adapter_kind != OPENCODE_MCP_ADAPTER_KIND {
+                return Err(invalid(anyhow!(
+                    "frozen MCP adapter is not an OpenCode adapter"
+                )));
+            }
+            let launch = build_opencode_mcp_session_launch_projection(
+                projection,
+                metadata.provider_contract_fingerprint.clone(),
+            )
+            .context("failed to rebuild frozen OpenCode MCP launch projection")
+            .map_err(invalid)?;
+            let facade = launch
+                .facade_projection(facade_limits)
+                .map_err(|error| invalid(anyhow!(error)))?;
+            validate_provider_projection(
+                launch.canonical_projection.manifest_hash.as_str(),
+                launch.provider_contract_fingerprint.as_str(),
+                launch.semantic_restart_fingerprint(),
+                facade.fingerprint().as_str(),
+                metadata,
+            )
+            .map_err(invalid)?;
+            validate_provider_bindings(
+                bindings.as_slice(),
+                "pioneer_",
+                launch.canonical_projection.tools.iter().map(|tool| {
+                    (
+                        tool.canonical_callable_name.as_str(),
+                        tool.schema_fingerprint.as_str(),
+                    )
+                }),
+            )
+            .map_err(invalid)?;
+            Ok(CliMcpSessionLaunch::OpenCode(launch))
         }
     }
 }
@@ -290,6 +330,7 @@ fn validate_provider_projection(
 
 fn validate_provider_bindings<'a>(
     bindings: &[TurnMcpBindingRecord],
+    provider_prefix: &str,
     transformed: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> Result<()> {
     let transformed = transformed.collect::<std::collections::HashMap<_, _>>();
@@ -297,7 +338,8 @@ fn validate_provider_bindings<'a>(
         bail!("reconstructed MCP provider projection is not exact");
     }
     for binding in bindings {
-        let expected_provider_name = format!("mcp__pioneer__{}", binding.canonical_callable_name);
+        let expected_provider_name =
+            format!("{provider_prefix}{}", binding.canonical_callable_name);
         if binding.provider_callable_name != expected_provider_name
             || transformed
                 .get(binding.canonical_callable_name.as_str())

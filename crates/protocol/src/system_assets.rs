@@ -13,3 +13,7 @@ pub const CODEX_AGENT_AVATAR_REVISION: &str =
 /// SHA-256 revision of the canonical Claude CLI Agent avatar served by Gateway.
 pub const CLAUDE_AGENT_AVATAR_REVISION: &str =
     "84646b62063741db93e9f1bd8fd80520f8439d41a3e2e8c6a08b83469f8f16ff";
+
+/// SHA-256 revision of the canonical OpenCode CLI Agent avatar served by Gateway.
+pub const OPENCODE_AGENT_AVATAR_REVISION: &str =
+    "0628d0293245bf3611ddfc2cd3900b2c9d9ebb1cbfb36d22a26a59fd86b8072a";

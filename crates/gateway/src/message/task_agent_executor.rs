@@ -1580,6 +1580,9 @@ impl TaskAgentExecutor {
                     pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
                         CLIAgentRuntimeKind::Claude
                     }
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                        CLIAgentRuntimeKind::OpenCode
+                    }
                 };
                 (
                     Some((runtime_instance_id.clone(), runtime_kind)),
@@ -3624,6 +3627,7 @@ impl TaskAgentExecutor {
                     let runtime_kind = match binding.runtime_kind.as_str() {
                         "codex" => CLIAgentRuntimeKind::Codex,
                         "claude" => CLIAgentRuntimeKind::Claude,
+                        "opencode" => CLIAgentRuntimeKind::OpenCode,
                         _ => {
                             return Err(anyhow!(
                                 "unknown CLI runtime kind `{}` during task recovery",
@@ -4982,6 +4986,7 @@ impl TaskAgentExecutor {
                                     == match runtime_kind {
                                         CLIAgentRuntimeKind::Codex => "codex",
                                         CLIAgentRuntimeKind::Claude => "claude",
+                                        CLIAgentRuntimeKind::OpenCode => "opencode",
                                     } => {}
                         (None, None) => {}
                         _ => bail!(
@@ -7664,6 +7669,9 @@ async fn resolved_task_execution_turn_settings(
                 pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
                     CLIAgentRuntimeKind::Claude
                 }
+                pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                    CLIAgentRuntimeKind::OpenCode
+                }
             };
             (
                 AgentExecutionBackend::CLIAgentRuntime {
@@ -7831,6 +7839,11 @@ async fn resolve_task_child_cli_execution_security_snapshot(
         }
         CLIAgentRuntimeKind::Claude => {
             crate::turn_security::TurnSecurityResolverExecutionBackend::ClaudeCli {
+                runtime_id: runtime_id.to_owned(),
+            }
+        }
+        CLIAgentRuntimeKind::OpenCode => {
+            crate::turn_security::TurnSecurityResolverExecutionBackend::OpenCodeCli {
                 runtime_id: runtime_id.to_owned(),
             }
         }

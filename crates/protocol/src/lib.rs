@@ -308,7 +308,8 @@ pub use skills::{
     SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse,
 };
 pub use system_assets::{
-    CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, PIONEER_AGENT_AVATAR_REVISION,
+    CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, OPENCODE_AGENT_AVATAR_REVISION,
+    PIONEER_AGENT_AVATAR_REVISION,
 };
 pub use task::{
     PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse, PublicTaskAgentConfiguration,

@@ -367,6 +367,7 @@ impl PioneerDesktop {
             pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION,
             pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
             pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
+            pioneer_protocol::OPENCODE_AGENT_AVATAR_REVISION,
         ] {
             let Some(generation) = self
                 .member_avatar_state

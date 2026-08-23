@@ -3,7 +3,7 @@ use pioneer_cli_agent_runtime::claude::ClaudeAccountProbeConfig;
 use pioneer_cli_agent_runtime::codex::CodexAccountProbeConfig;
 use pioneer_cli_agent_runtime::process::{SecretString, SensitiveEnvironment};
 use pioneer_cli_agent_runtime::reserved_args::{
-    validate_claude_custom_args, validate_codex_custom_args,
+    validate_claude_custom_args, validate_codex_custom_args, validate_opencode_custom_args,
 };
 use pioneer_config::{
     AppConfig, EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
@@ -67,6 +67,9 @@ pub(crate) fn validate_instance_launch_args(
         }
         GatewayCliAgentRuntimeKindConfig::Claude => {
             validate_claude_custom_args(&instance.app_server_args)?;
+        }
+        GatewayCliAgentRuntimeKindConfig::OpenCode => {
+            validate_opencode_custom_args(&instance.app_server_args)?;
         }
     }
     Ok(())

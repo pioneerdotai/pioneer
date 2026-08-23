@@ -959,6 +959,7 @@ fn cli_runtime_provider_logo(kind: CLIAgentRuntimeKind) -> (&'static str, &'stat
     match kind {
         CLIAgentRuntimeKind::Codex => ("openai", "logos/providers/openai.svg"),
         CLIAgentRuntimeKind::Claude => ("claude", "logos/providers/claude.svg"),
+        CLIAgentRuntimeKind::OpenCode => ("opencode", "logos/providers/opencode.svg"),
     }
 }
 
@@ -1013,6 +1014,7 @@ fn cli_runtime_default_display_order(runtime_id: &str) -> usize {
     match runtime_id {
         "codex" => 0,
         "claude" => 1,
+        "opencode" => 2,
         _ => usize::MAX,
     }
 }

@@ -436,6 +436,7 @@ impl Default for GatewayCliRuntimeSettings {
             instances: vec![
                 GatewayCliRuntimeInstanceSettings::default_codex(),
                 GatewayCliRuntimeInstanceSettings::default_claude(),
+                GatewayCliRuntimeInstanceSettings::default_opencode(),
             ],
         }
     }
@@ -481,6 +482,19 @@ impl GatewayCliRuntimeInstanceSettings {
             enabled: true,
             binary_path: "claude".to_owned(),
             home_path: "~/.claude".to_owned(),
+            shadow_home_path: None,
+        }
+    }
+
+    pub fn default_opencode() -> Self {
+        Self {
+            id: "opencode".to_owned(),
+            kind: CLIAgentRuntimeKind::OpenCode,
+            display_name: "OpenCode".to_owned(),
+            nickname: "opencode".to_owned(),
+            enabled: true,
+            binary_path: "opencode".to_owned(),
+            home_path: "~/.config/opencode".to_owned(),
             shadow_home_path: None,
         }
     }

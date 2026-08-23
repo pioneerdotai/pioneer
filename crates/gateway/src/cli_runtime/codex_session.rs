@@ -538,6 +538,16 @@ impl CLIAgentRuntimeSessionFactory for DispatchingCLIAgentRuntimeSessionFactory 
                 .start_session_with_launch_spec(process_instance, launch_spec)
                 .await
             }
+            GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                crate::cli_runtime::opencode_session::OpenCodeCLIAgentRuntimeSessionFactory::new(
+                    self.runtime_home.clone(),
+                    self.bridge_supervisor.clone(),
+                    self.mcp_limits,
+                    self.turn_mcp_invoker.clone(),
+                )
+                .start_session_with_launch_spec(process_instance, launch_spec)
+                .await
+            }
         }
     }
 }
@@ -1140,15 +1150,16 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 native_thread_id.clone()
             }
             CliProviderContinuation::ClaudeNew { .. }
-            | CliProviderContinuation::ClaudeResume { .. } => {
+            | CliProviderContinuation::ClaudeResume { .. }
+            | CliProviderContinuation::OpenCodeServerSession { .. } => {
                 bail!("Codex CLI runtime requires a typed Codex thread continuation")
             }
         };
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
             CliMcpSessionLaunch::Codex(projection) => Some(projection),
-            CliMcpSessionLaunch::Claude(_) => {
-                bail!("Codex CLI runtime cannot consume a Claude MCP launch projection")
+            CliMcpSessionLaunch::Claude(_) | CliMcpSessionLaunch::OpenCode(_) => {
+                bail!("Codex CLI runtime cannot consume another provider's MCP launch projection")
             }
         };
         let mcp_launch_projection = launch_projection.cloned();

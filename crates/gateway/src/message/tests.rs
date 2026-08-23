@@ -443,6 +443,7 @@ async fn persist_test_cli_execution_authorization_context(
     let runtime_kind = match runtime_kind {
         "codex" => CLIAgentRuntimeKind::Codex,
         "claude" => CLIAgentRuntimeKind::Claude,
+        "opencode" => CLIAgentRuntimeKind::OpenCode,
         other => panic!("unsupported test CLI runtime kind `{other}`"),
     };
     let execution_backend = AgentExecutionBackend::CLIAgentRuntime {
@@ -506,6 +507,10 @@ async fn persist_test_cli_instruction_projection(
         CLIAgentRuntimeKind::Claude => (
             "claude",
             CLIRuntimeElevatedInstructionTransport::ClaudeAppendSystemPromptFile,
+        ),
+        CLIAgentRuntimeKind::OpenCode => (
+            "opencode",
+            CLIRuntimeElevatedInstructionTransport::OpenCodeSystemPrompt,
         ),
     };
     let now = chrono::Utc::now().fixed_offset();
@@ -962,6 +967,10 @@ fn supported_test_cli_mcp_readiness(
         CLIAgentRuntimeKind::Claude => (
             pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp,
             pioneer_protocol::CliMcpProjectionUpdateKind::ClaudeRestartProcessResumeSession,
+        ),
+        CLIAgentRuntimeKind::OpenCode => (
+            pioneer_protocol::CliMcpInjectionKind::OpenCodeDynamicStdioMcp,
+            pioneer_protocol::CliMcpProjectionUpdateKind::OpenCodeRestartServerResumeSession,
         ),
     };
     pioneer_protocol::CliMcpAdapterReadiness {
@@ -1423,6 +1432,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     let runtime_id = match runtime_kind {
         CLIAgentRuntimeKind::Codex => "codex_proposal_51",
         CLIAgentRuntimeKind::Claude => "claude_proposal_51",
+        CLIAgentRuntimeKind::OpenCode => "opencode_proposal_51",
     }
     .to_owned();
     settings
@@ -1620,6 +1630,7 @@ async fn seed_cli_runtime_skill_preflight_thread(
                     match harness.runtime_kind {
                         CLIAgentRuntimeKind::Codex => "o4-mini",
                         CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                        CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
                     }
                     .to_owned(),
                 ),
@@ -1679,7 +1690,11 @@ where
 }
 
 async fn capability_persistence_order_impl() {
-    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+    for runtime_kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let alpha_path = write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
         let beta_path = write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
@@ -1717,6 +1732,7 @@ async fn capability_persistence_order_impl() {
             match runtime_kind {
                 CLIAgentRuntimeKind::Codex => "codex",
                 CLIAgentRuntimeKind::Claude => "claude",
+                CLIAgentRuntimeKind::OpenCode => "opencode",
             },
         );
         let request = cli_runtime_turn_start_request_with_capabilities(
@@ -1822,7 +1838,10 @@ async fn capability_persistence_order_impl() {
                 ..
             } if committed_turn_id == turn_id && bindings.len() == 2
         ));
-        if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+        if matches!(
+            runtime_kind,
+            CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
+        ) {
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
@@ -1845,19 +1864,29 @@ async fn capability_persistence_order_impl() {
                 ]
             );
             let instructions = native_turn.elevated_instructions.text();
-            assert!(instructions.contains("native Codex skill"));
+            let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    ("native Codex skill", "- $beta", "- $alpha", "Codex")
+                }
+                CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
+                CLIAgentRuntimeKind::Claude => unreachable!(),
+            };
+            assert!(instructions.contains(directive));
             let beta = instructions
-                .find("- $beta")
-                .expect("Codex elevated instructions should include beta");
+                .find(beta_label)
+                .unwrap_or_else(|| panic!("{runtime_label} instructions should include beta"));
             let alpha = instructions
-                .find("- $alpha")
-                .expect("Codex elevated instructions should include alpha");
-            assert!(beta < alpha, "selected Codex skill order must be preserved");
+                .find(alpha_label)
+                .unwrap_or_else(|| panic!("{runtime_label} instructions should include alpha"));
+            assert!(
+                beta < alpha,
+                "selected {runtime_label} skill order must be preserved"
+            );
             assert!(input.iter().all(|item| {
                 item["type"] != "text"
                     || item["text"]
                         .as_str()
-                        .is_none_or(|text| !text.contains("native Codex skill"))
+                        .is_none_or(|text| !text.contains(directive))
             }));
         } else {
             let input = native_turn.input.as_array().unwrap();
@@ -1893,7 +1922,11 @@ fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
 }
 
 async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_impl() {
-    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+    for runtime_kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
         let lifecycle_id = seed_cli_runtime_skill_installation(
@@ -20807,6 +20840,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 }
                 CLIAgentRuntimeKind::Claude => {
                     pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
+                }
+                CLIAgentRuntimeKind::OpenCode => {
+                    pioneer_protocol::TurnSecurityExecutionBackendKind::OpenCodeCli
                 }
             }
         );

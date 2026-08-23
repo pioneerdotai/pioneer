@@ -374,6 +374,7 @@ fn cli_agent_runtime_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
 

@@ -17,6 +17,11 @@ use crate::cli_runtime::manager::{
     CLIAgentRuntimeTurnLivenessProbe, CLIAgentRuntimeTurnSteerRequest,
 };
 use crate::cli_runtime::mcp::readiness::CliRuntimeCapabilityPolicy;
+use crate::cli_runtime::opencode_session::{
+    OpenCodeAccountSnapshot, OpenCodeModelSnapshot, OpenCodeProbeDiagnostic,
+    OpenCodeProbeDiagnosticLevel, OpenCodeProbeSnapshot, OpenCodeProbeStatus,
+    probe_opencode_instance,
+};
 use crate::cli_runtime::session_instance::{CliSessionInstanceId, CliSessionInstanceOrigin};
 use crate::thread::ThreadSubscriptionIdentity;
 use anyhow::Context as AnyhowContext;
@@ -564,6 +569,20 @@ impl MessageProcessor {
                     )
                     .await,
                 ),
+                GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                    let proxy_url = self
+                        .cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
+                        .await;
+                    runtime_model_list_from_opencode_probe(
+                        probe_opencode_instance(
+                            &instance,
+                            self.artifact_runtime_home.as_path(),
+                            &crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+                        )
+                        .await,
+                        &instance.custom_models,
+                    )
+                }
             }
         } else {
             RuntimeModelListResult {
@@ -9237,6 +9256,9 @@ impl MessageProcessor {
                         CLIRuntimeRequestKind::Other => return Ok(()),
                     }
                 }
+                Some(GatewayCliAgentRuntimeKindConfig::OpenCode) => {
+                    opencode_request_response_from_resolution(request, resolution)?
+                }
                 None => {
                     anyhow::bail!(
                         "unsupported CLI runtime kind `{}` for request `{}`",
@@ -9576,6 +9598,7 @@ impl MessageProcessor {
         let runtime_kind = match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => GatewayCliRuntimeKind::Codex,
             GatewayCliAgentRuntimeKindConfig::Claude => GatewayCliRuntimeKind::Claude,
+            GatewayCliAgentRuntimeKindConfig::OpenCode => GatewayCliRuntimeKind::OpenCode,
         };
         let proxy_stage = refresh_trace.map(|trace| {
             trace.runtime_stage(
@@ -9704,6 +9727,65 @@ impl MessageProcessor {
                                 max_schema_bytes,
                             )
                             .await;
+                        if let Some(stage) = mcp_stage {
+                            stage.succeed();
+                        }
+                        readiness
+                    }
+                };
+                let policy = CliRuntimeCapabilityPolicy::from_readiness(
+                    true,
+                    normal_runtime_ready,
+                    Some(&readiness),
+                );
+                summary.capabilities =
+                    cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
+                summary.diagnostics.extend(readiness.diagnostics);
+                summary
+            }
+            GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                let account_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(
+                        GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                        runtime_kind,
+                    )
+                });
+                let probe = probe_opencode_instance(
+                    &instance,
+                    self.artifact_runtime_home.as_path(),
+                    &crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+                )
+                .await;
+                if let Some(stage) = account_stage {
+                    stage.succeed();
+                }
+                let normal_runtime_ready = probe.status == OpenCodeProbeStatus::Ready;
+                let provider_version = probe.version.clone();
+                let mut summary = apply_opencode_probe_to_summary(summary, probe);
+                let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
+                #[cfg(test)]
+                let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                #[cfg(not(test))]
+                let readiness_override: Option<
+                    pioneer_protocol::CliMcpAdapterReadiness,
+                > = None;
+                let readiness = match readiness_override {
+                    Some(readiness) => readiness,
+                    None => {
+                        let mcp_stage = refresh_trace.map(|trace| {
+                            trace.runtime_stage(
+                                GatewayCliRuntimeRefreshStage::RuntimeMcpReadiness,
+                                runtime_kind,
+                            )
+                        });
+                        let readiness = crate::cli_runtime::mcp::readiness::opencode_mcp_readiness_for_instance(
+                            &instance,
+                            normal_runtime_ready,
+                            provider_version.as_deref(),
+                            max_tools,
+                            max_schema_bytes,
+                        )
+                        .await;
                         if let Some(stage) = mcp_stage {
                             stage.succeed();
                         }
@@ -9868,6 +9950,7 @@ fn cli_runtime_thread_binding_from_record(
     let runtime_kind = match binding.runtime_kind.as_str() {
         "codex" => CLIAgentRuntimeKind::Codex,
         "claude" => CLIAgentRuntimeKind::Claude,
+        "opencode" => CLIAgentRuntimeKind::OpenCode,
         other => anyhow::bail!("unknown CLI runtime kind `{other}`"),
     };
 
@@ -10029,6 +10112,7 @@ fn cli_runtime_default_display_order(runtime_id: &str) -> usize {
     match runtime_id {
         "codex" => 0,
         "claude" => 1,
+        "opencode" => 2,
         _ => usize::MAX,
     }
 }
@@ -10090,6 +10174,7 @@ fn cli_runtime_kind_from_config(kind: GatewayCliAgentRuntimeKindConfig) -> CLIAg
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => CLIAgentRuntimeKind::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => CLIAgentRuntimeKind::Claude,
+        GatewayCliAgentRuntimeKindConfig::OpenCode => CLIAgentRuntimeKind::OpenCode,
     }
 }
 
@@ -10097,6 +10182,7 @@ fn cli_runtime_protocol_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
 
@@ -10110,6 +10196,7 @@ fn cli_runtime_kind_config_from_stored_kind(
     match kind {
         "codex" => Some(GatewayCliAgentRuntimeKindConfig::Codex),
         "claude" => Some(GatewayCliAgentRuntimeKindConfig::Claude),
+        "opencode" => Some(GatewayCliAgentRuntimeKindConfig::OpenCode),
         _ => None,
     }
 }
@@ -10174,6 +10261,29 @@ fn cli_runtime_capabilities_for_kind_with_policy(
             supports_auth_management: false,
             supports_generated_schema_probe: false,
         },
+        GatewayCliAgentRuntimeKindConfig::OpenCode => RuntimeCapabilities {
+            supports_skills: capability_policy.supports_skills(),
+            supports_mcp_tools: capability_policy.supports_mcp_tools(),
+            supports_threads: true,
+            supports_resume: true,
+            supports_fork: true,
+            supports_steer: false,
+            supports_interrupt: true,
+            supports_approvals: true,
+            supports_file_change_approvals: true,
+            supports_command_approvals: true,
+            supports_user_input_requests: true,
+            supports_model_list: true,
+            supports_apps: false,
+            supports_review: false,
+            supports_compaction: true,
+            supports_goal: false,
+            supports_diff_updates: true,
+            supports_history_read: true,
+            supports_thread_archive: false,
+            supports_auth_management: false,
+            supports_generated_schema_probe: false,
+        },
     }
 }
 
@@ -10213,6 +10323,44 @@ fn apply_claude_account_probe_to_summary(
         .diagnostics
         .iter()
         .map(runtime_diagnostic_from_claude_probe)
+        .collect();
+    summary.recent_stderr = sanitize_runtime_diagnostic_lines(probe.stderr);
+    summary
+}
+
+fn apply_opencode_probe_to_summary(
+    mut summary: RuntimeSummary,
+    probe: OpenCodeProbeSnapshot,
+) -> RuntimeSummary {
+    summary.status = match probe.status {
+        OpenCodeProbeStatus::Ready => RuntimeStatus::Ready,
+        OpenCodeProbeStatus::NeedsAuth => RuntimeStatus::NeedsAuth,
+        OpenCodeProbeStatus::MissingBinary => RuntimeStatus::MissingBinary {
+            binary_path: summary.binary_path.clone(),
+        },
+        OpenCodeProbeStatus::SpawnFailed => RuntimeStatus::SpawnFailed {
+            message: probe
+                .message
+                .clone()
+                .unwrap_or_else(|| "failed to spawn OpenCode server".to_owned()),
+        },
+        OpenCodeProbeStatus::UnsupportedVersion => RuntimeStatus::UnsupportedVersion {
+            version: probe.version.clone(),
+            minimum_version: Some("1.0.0".to_owned()),
+        },
+        OpenCodeProbeStatus::Error => RuntimeStatus::Error {
+            message: probe
+                .message
+                .clone()
+                .unwrap_or_else(|| "OpenCode server probe failed".to_owned()),
+        },
+    };
+    summary.version = probe.version.clone();
+    summary.account = probe.account.as_ref().map(runtime_account_from_opencode);
+    summary.diagnostics = probe
+        .diagnostics
+        .iter()
+        .map(runtime_diagnostic_from_opencode_probe)
         .collect();
     summary.recent_stderr = sanitize_runtime_diagnostic_lines(probe.stderr);
     summary
@@ -10294,6 +10442,17 @@ fn runtime_account_from_claude_account(account: &ClaudeAccountSnapshot) -> Runti
     }
 }
 
+fn runtime_account_from_opencode(account: &OpenCodeAccountSnapshot) -> RuntimeAccountSnapshot {
+    RuntimeAccountSnapshot {
+        authenticated: account.authenticated,
+        account_id: None,
+        email: None,
+        display_name: account.display_name.clone(),
+        plan: None,
+        auth_method: account.auth_method.clone(),
+    }
+}
+
 fn runtime_diagnostic_from_codex_probe(diagnostic: &CodexProbeDiagnostic) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         level: match diagnostic.level {
@@ -10312,6 +10471,20 @@ fn runtime_diagnostic_from_claude_probe(diagnostic: &ClaudeProbeDiagnostic) -> R
             ClaudeProbeDiagnosticLevel::Info => RuntimeDiagnosticLevel::Info,
             ClaudeProbeDiagnosticLevel::Warning => RuntimeDiagnosticLevel::Warning,
             ClaudeProbeDiagnosticLevel::Error => RuntimeDiagnosticLevel::Error,
+        },
+        code: sanitize_runtime_diagnostic_line(diagnostic.code.as_str()),
+        message: sanitize_runtime_diagnostic_line(diagnostic.message.as_str()),
+    }
+}
+
+fn runtime_diagnostic_from_opencode_probe(
+    diagnostic: &OpenCodeProbeDiagnostic,
+) -> RuntimeDiagnostic {
+    RuntimeDiagnostic {
+        level: match diagnostic.level {
+            OpenCodeProbeDiagnosticLevel::Info => RuntimeDiagnosticLevel::Info,
+            OpenCodeProbeDiagnosticLevel::Warning => RuntimeDiagnosticLevel::Warning,
+            OpenCodeProbeDiagnosticLevel::Error => RuntimeDiagnosticLevel::Error,
         },
         code: sanitize_runtime_diagnostic_line(diagnostic.code.as_str()),
         message: sanitize_runtime_diagnostic_line(diagnostic.message.as_str()),
@@ -10398,6 +10571,53 @@ fn runtime_model_list_from_claude_probe(probe: ClaudeModelListSnapshot) -> Runti
     }
 }
 
+fn runtime_model_list_from_opencode_probe(
+    probe: OpenCodeProbeSnapshot,
+    custom_models: &[String],
+) -> RuntimeModelListResult {
+    let status = probe.status;
+    let message = probe.message.clone();
+    let diagnostics = probe
+        .diagnostics
+        .iter()
+        .map(runtime_diagnostic_from_opencode_probe)
+        .collect::<Vec<_>>();
+    let models = runtime_models_with_custom_models(
+        probe
+            .models
+            .into_iter()
+            .map(runtime_model_from_opencode_model)
+            .collect(),
+        custom_models,
+    );
+    let error_message = match status {
+        OpenCodeProbeStatus::Ready if models.is_empty() => {
+            Some("OpenCode provider API returned no models".to_owned())
+        }
+        OpenCodeProbeStatus::Ready => None,
+        OpenCodeProbeStatus::NeedsAuth => Some(
+            message.unwrap_or_else(|| "OpenCode has no authenticated model provider".to_owned()),
+        ),
+        OpenCodeProbeStatus::MissingBinary => {
+            Some(message.unwrap_or_else(|| "OpenCode CLI binary was not found".to_owned()))
+        }
+        OpenCodeProbeStatus::SpawnFailed => {
+            Some(message.unwrap_or_else(|| "failed to spawn OpenCode server".to_owned()))
+        }
+        OpenCodeProbeStatus::UnsupportedVersion => Some(
+            message.unwrap_or_else(|| "OpenCode server API v1 or newer is required".to_owned()),
+        ),
+        OpenCodeProbeStatus::Error => {
+            Some(message.unwrap_or_else(|| "OpenCode server model probe failed".to_owned()))
+        }
+    };
+    RuntimeModelListResult {
+        models,
+        diagnostics,
+        error_message,
+    }
+}
+
 fn runtime_model_from_codex_model(model: CodexModelSnapshot) -> RuntimeModelInfo {
     RuntimeModelInfo {
         id: model.id,
@@ -10423,6 +10643,24 @@ fn runtime_model_from_claude_model(model: ClaudeModelSnapshot) -> RuntimeModelIn
         description: model.description,
         family: model.family,
         is_custom: false,
+        active: model.active,
+        effort_options: model.effort_options,
+        input_modalities: model.input_modalities,
+        output_modalities: model.output_modalities,
+        supports_reasoning: model.supports_reasoning,
+        supports_vision: model.supports_vision,
+        max_input_tokens: model.max_input_tokens,
+        max_output_tokens: model.max_output_tokens,
+    }
+}
+
+fn runtime_model_from_opencode_model(model: OpenCodeModelSnapshot) -> RuntimeModelInfo {
+    RuntimeModelInfo {
+        id: model.id,
+        name: model.name,
+        description: model.description,
+        family: model.family,
+        is_custom: model.is_custom,
         active: model.active,
         effort_options: model.effort_options,
         input_modalities: model.input_modalities,
@@ -10864,6 +11102,10 @@ fn validate_cli_runtime_native_request_resolution(
             let _ = claude_permission_response_from_resolution(record, resolution)?;
             return Ok(());
         }
+        Some(GatewayCliAgentRuntimeKindConfig::OpenCode) => {
+            let _ = opencode_request_response_from_resolution(record, resolution)?;
+            return Ok(());
+        }
         Some(GatewayCliAgentRuntimeKindConfig::Codex) => {}
         None => {
             anyhow::bail!(
@@ -11045,6 +11287,81 @@ fn claude_permission_response_from_resolution(
     };
     let should_interrupt = matches!(resolution, CLIRuntimeRequestResolution::Cancelled);
     Ok((response, should_interrupt))
+}
+
+fn opencode_request_response_from_resolution(
+    request: &CliRuntimePendingRequestRecord,
+    resolution: &CLIRuntimeRequestResolution,
+) -> anyhow::Result<(JsonValue, bool)> {
+    match cli_runtime_request_kind_from_stored(request.request_kind.as_str()) {
+        CLIRuntimeRequestKind::UserInput => {
+            let response = match resolution {
+                CLIRuntimeRequestResolution::Answered { response } => {
+                    let question_ids = cli_runtime_user_input_question_ids_from_record(request)?;
+                    let response = response.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "answered OpenCode question request did not include answers"
+                        )
+                    })?;
+                    let answers =
+                        codex_user_input_answers_from_value(response, question_ids.as_slice())?;
+                    let ordered = question_ids
+                        .iter()
+                        .map(|question_id| {
+                            answers.get(question_id).cloned().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing OpenCode answer for question `{question_id}`"
+                                )
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    json!({ "kind": "question", "answers": ordered })
+                }
+                CLIRuntimeRequestResolution::Cancelled
+                | CLIRuntimeRequestResolution::Expired
+                | CLIRuntimeRequestResolution::Error { .. } => {
+                    json!({ "kind": "question", "reject": true })
+                }
+                CLIRuntimeRequestResolution::Approved
+                | CLIRuntimeRequestResolution::Denied { .. } => {
+                    anyhow::bail!("OpenCode question requests must be answered or cancelled")
+                }
+            };
+            Ok((
+                response,
+                matches!(resolution, CLIRuntimeRequestResolution::Cancelled),
+            ))
+        }
+        CLIRuntimeRequestKind::CommandApproval
+        | CLIRuntimeRequestKind::FileChangeApproval
+        | CLIRuntimeRequestKind::Other => {
+            let (reply, message) = match resolution {
+                CLIRuntimeRequestResolution::Approved => ("once", None),
+                CLIRuntimeRequestResolution::Denied { reason } => (
+                    "reject",
+                    reason.clone().or_else(|| Some("Denied by user".to_owned())),
+                ),
+                CLIRuntimeRequestResolution::Cancelled => ("reject", Some("Cancelled".to_owned())),
+                CLIRuntimeRequestResolution::Expired => {
+                    ("reject", Some("User response deadline expired".to_owned()))
+                }
+                CLIRuntimeRequestResolution::Error { message } => ("reject", Some(message.clone())),
+                CLIRuntimeRequestResolution::Answered { .. } => {
+                    anyhow::bail!(
+                        "OpenCode permission requests accept only approve, deny, or cancel decisions"
+                    )
+                }
+            };
+            Ok((
+                json!({
+                    "kind": "permission",
+                    "reply": reply,
+                    "message": message,
+                }),
+                matches!(resolution, CLIRuntimeRequestResolution::Cancelled),
+            ))
+        }
+    }
 }
 
 fn file_change_approval_timeline_status_for_resolution(

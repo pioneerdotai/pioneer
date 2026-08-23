@@ -7,8 +7,8 @@ use pioneer_cli_agent_runtime::claude::{
 use pioneer_cli_agent_runtime::codex::CODEX_MCP_SCHEMA_TRANSFORM_CONTRACT_VERSION;
 use pioneer_cli_agent_runtime::codex_attestation::{
     CodexExecutableAttestation, CodexExecutableCacheIdentity, attest_codex_executable_identity,
-    codex_executable_cache_identity, sha256_json, validate_recorded_codex_mcp_decoder_fixtures,
-    validate_unknown_codex_request_response,
+    codex_executable_cache_identity, sha256_file_contents, sha256_json,
+    validate_recorded_codex_mcp_decoder_fixtures, validate_unknown_codex_request_response,
 };
 use pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig;
 use pioneer_protocol::{
@@ -1157,6 +1157,114 @@ async fn build_or_load_claude_local_attestation(
         global_claude_mcp_readiness_cache().insert(attestation.clone());
     }
     Some(attestation)
+}
+
+/// OpenCode's authenticated server is already exercised by the account probe.
+/// MCP readiness additionally pins the exact executable and adapter contract;
+/// session startup then verifies dynamic MCP registration and the private
+/// helper list barrier before admitting a turn.
+pub(crate) async fn opencode_mcp_readiness_for_instance(
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    normal_runtime_ready: bool,
+    provider_version: Option<&str>,
+    max_tools: usize,
+    max_schema_bytes: usize,
+) -> CliMcpAdapterReadiness {
+    let mut diagnostics = Vec::new();
+    if !instance.enabled {
+        diagnostics.push(diagnostic(
+            RuntimeDiagnosticLevel::Info,
+            "cli_runtime.mcp.runtime_not_ready",
+            "The OpenCode runtime is disabled",
+        ));
+    }
+    if !normal_runtime_ready {
+        diagnostics.push(diagnostic(
+            RuntimeDiagnosticLevel::Warning,
+            "cli_runtime.mcp.runtime_not_ready",
+            "The OpenCode runtime is not ready for MCP tools",
+        ));
+    }
+    if !cfg!(any(unix, windows)) {
+        diagnostics.push(diagnostic(
+            RuntimeDiagnosticLevel::Error,
+            "cli_runtime.mcp.bridge_unavailable",
+            "Private MCP bridge IPC is unavailable on this platform",
+        ));
+    }
+
+    let version = provider_version
+        .map(str::trim)
+        .filter(|version| !version.is_empty());
+    let configured_binary = instance.binary_path.clone();
+    let version_for_attestation = version.map(str::to_owned);
+    let fingerprints = if instance.enabled && normal_runtime_ready {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+            let version = version_for_attestation
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("OpenCode server version is unavailable"))?;
+            let base_contract =
+                crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint(Some(
+                    version,
+                ));
+            let identity =
+                codex_executable_cache_identity(&configured_binary, version, &base_contract)?;
+            let binary_sha256 = sha256_file_contents(identity.realpath.as_path())?;
+            let local_executable_fingerprint = sha256_json(&json!({
+                "provider": "opencode",
+                "realpath": identity.realpath,
+                "size": identity.size,
+                "modifiedUnixNanos": identity.modified_unix_nanos,
+                "providerVersion": identity.provider_version,
+                "binarySha256": binary_sha256,
+            }))?;
+            let adapter_contract_fingerprint = sha256_json(&json!({
+                "baseContract": base_contract,
+                "localExecutableFingerprint": local_executable_fingerprint,
+                "strictIsolation": "disconnect_unmanaged_mcp_and_exact_prompt_tool_map",
+                "dynamicMcpServer": "pioneer",
+                "projectionUpdate": "restart_server_resume_session",
+            }))?;
+            Ok((adapter_contract_fingerprint, local_executable_fingerprint))
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+    } else {
+        None
+    };
+    if fingerprints.is_none() && instance.enabled && normal_runtime_ready {
+        diagnostics.push(diagnostic(
+            RuntimeDiagnosticLevel::Error,
+            "cli_runtime.mcp.provider_probe_failed",
+            "OpenCode executable attestation is unavailable",
+        ));
+    }
+    let supported = instance.enabled
+        && normal_runtime_ready
+        && cfg!(any(unix, windows))
+        && version.is_some()
+        && fingerprints.is_some();
+    if supported {
+        diagnostics.push(diagnostic(
+            RuntimeDiagnosticLevel::Info,
+            "cli_runtime.mcp.ready",
+            "OpenCode MCP tools passed authenticated server and executable readiness checks",
+        ));
+    }
+    let (contract_fingerprint, local_executable_fingerprint) = fingerprints.unwrap_or_default();
+    CliMcpAdapterReadiness {
+        supported,
+        injection: CliMcpInjectionKind::OpenCodeDynamicStdioMcp,
+        projection_update: CliMcpProjectionUpdateKind::OpenCodeRestartServerResumeSession,
+        strict_isolation: supported,
+        contract_fingerprint,
+        local_executable_fingerprint,
+        provider_version: version.map(str::to_owned),
+        max_tools,
+        max_schema_bytes,
+        diagnostics,
+    }
 }
 
 fn diagnostic(level: RuntimeDiagnosticLevel, code: &str, message: &str) -> RuntimeDiagnostic {

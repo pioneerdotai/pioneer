@@ -233,27 +233,41 @@ impl PioneerDesktop {
 fn timeline_agent_default_avatar_revision(
     agent: &pioneer_protocol::AgentPresentationSnapshot,
 ) -> Option<&'static str> {
-    let runtime_kind = agent
-        .role_label
-        .as_deref()
-        .unwrap_or(agent.nickname.as_str());
     match agent.identity_source_kind {
         pioneer_protocol::AgentIdentitySourceKind::NativeAgent => {
             Some(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION)
         }
         pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
-            if runtime_kind.eq_ignore_ascii_case("codex") =>
+            if cli_runtime_identity_matches(agent, "codex") =>
         {
             Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION)
         }
         pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
-            if runtime_kind.eq_ignore_ascii_case("claude") =>
+            if cli_runtime_identity_matches(agent, "claude") =>
         {
             Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION)
         }
         pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+            if cli_runtime_identity_matches(agent, "opencode") =>
+        {
+            Some(pioneer_protocol::OPENCODE_AGENT_AVATAR_REVISION)
+        }
+        pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
         | pioneer_protocol::AgentIdentitySourceKind::Ephemeral => None,
     }
+}
+
+fn cli_runtime_identity_matches(
+    agent: &pioneer_protocol::AgentPresentationSnapshot,
+    expected: &str,
+) -> bool {
+    agent.nickname.eq_ignore_ascii_case(expected)
+        || agent.role_label.as_deref().is_some_and(|role_label| {
+            role_label.eq_ignore_ascii_case(expected)
+                || role_label
+                    .strip_suffix(" CLI")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case(expected))
+        })
 }
 
 fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {

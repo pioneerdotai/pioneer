@@ -3,6 +3,7 @@
 use crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection;
 use crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection;
 use crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions;
+use crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection;
 use std::fmt;
 use uuid::Uuid;
 
@@ -18,6 +19,7 @@ pub(crate) enum CliMcpSessionLaunch {
     ManagementOnly,
     Codex(CodexMcpSessionLaunchProjection),
     Claude(ClaudeMcpSessionLaunchProjection),
+    OpenCode(OpenCodeMcpSessionLaunchProjection),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -25,6 +27,7 @@ pub(crate) enum CliProviderContinuation {
     CodexRpcThread { native_thread_id: Option<String> },
     ClaudeNew { provider_session_id: Uuid },
     ClaudeResume { provider_session_id: Uuid },
+    OpenCodeServerSession { native_session_id: Option<String> },
 }
 
 impl fmt::Debug for CliProviderContinuation {
@@ -42,6 +45,10 @@ impl fmt::Debug for CliProviderContinuation {
                 .debug_struct("ClaudeResume")
                 .field("provider_session_id", &"<redacted>")
                 .finish(),
+            Self::OpenCodeServerSession { native_session_id } => formatter
+                .debug_struct("OpenCodeServerSession")
+                .field("native_session_id", native_session_id)
+                .finish(),
         }
     }
 }
@@ -56,6 +63,7 @@ impl CliProviderContinuation {
                 provider_session_id,
             } => Some(*provider_session_id),
             Self::CodexRpcThread { .. } => None,
+            Self::OpenCodeServerSession { .. } => None,
         }
     }
 }
@@ -117,6 +125,19 @@ impl CliSessionLaunchSpec {
             continuation: CliProviderContinuation::ClaudeResume {
                 provider_session_id,
             },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
+        }
+    }
+
+    pub(crate) fn opencode(
+        options: CLIAgentRuntimeSessionStartOptions,
+        mcp: CliMcpSessionLaunch,
+        native_session_id: Option<String>,
+    ) -> Self {
+        Self {
+            options,
+            mcp,
+            continuation: CliProviderContinuation::OpenCodeServerSession { native_session_id },
             native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
         }
     }
@@ -184,6 +205,10 @@ fn continuation_identity_changed(
                 provider_session_id: new,
             },
         ) => old != new,
+        (
+            CliProviderContinuation::OpenCodeServerSession { .. },
+            CliProviderContinuation::OpenCodeServerSession { .. },
+        ) => false,
         _ => true,
     }
 }

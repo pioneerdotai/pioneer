@@ -1973,6 +1973,9 @@ fn cli_runtime_kind_to_protocol(
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => pioneer_protocol::CLIAgentRuntimeKind::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => pioneer_protocol::CLIAgentRuntimeKind::Claude,
+        GatewayCliAgentRuntimeKindConfig::OpenCode => {
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode
+        }
     }
 }
 
@@ -1983,6 +1986,9 @@ fn cli_runtime_kind_from_protocol(
         pioneer_protocol::CLIAgentRuntimeKind::Codex => Ok(GatewayCliAgentRuntimeKindConfig::Codex),
         pioneer_protocol::CLIAgentRuntimeKind::Claude => {
             Ok(GatewayCliAgentRuntimeKindConfig::Claude)
+        }
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => {
+            Ok(GatewayCliAgentRuntimeKindConfig::OpenCode)
         }
     }
 }
