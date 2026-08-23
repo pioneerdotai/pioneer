@@ -979,8 +979,8 @@ description = "网关运行时，防止系统因空闲进入睡眠。合上笔�
 tooltip = "仅防止空闲睡眠。合盖运行需要闭盖模式或常开机器。"
 
 [settings.option.telemetry]
-label = "共享 Gateway 遥测数据"
-description = "向 Pioneer 发送 Gateway 性能指标、启动追踪和错误报告。启动追踪仅包含固定的阶段名称、结果和耗时。数据库指标仅包含操作类别、耗时和连接池状态。遥测还包含应用版本和运行环境；不会发送 SQL 文本、数据库内容、文件路径或用户内容。你可以随时关闭此选项。"
+label = "发送遥测数据"
+description = "允许收集诊断和性能数据。"
 
 [settings.general.preflight_model]
 label = "Preflight 模型"

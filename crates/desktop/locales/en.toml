@@ -1271,8 +1271,8 @@ description = "Prevents idle sleep while the gateway is running. Closing a lapto
 tooltip = "Prevents idle sleep only. Closing a laptop lid requires closed-display mode or an always-on machine."
 
 [settings.option.telemetry]
-label = "Share gateway telemetry"
-description = "Send gateway performance metrics, startup traces, and error reports to Pioneer. Startup traces contain only fixed stage names, outcomes, and timings. Database metrics contain only operation categories, timings, and pool state. Telemetry also includes the app version and environment; SQL text, database contents, file paths, and user content are not sent. You can turn this off at any time."
+label = "Send telemetry"
+description = "Allow diagnostic and performance data to be collected."
 
 [settings.general.preflight_model]
 label = "Preflight model"

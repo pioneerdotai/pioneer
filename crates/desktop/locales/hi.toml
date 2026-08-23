@@ -979,8 +979,8 @@ description = "जब gateway चल रहा हो, तो सिस्टम
 tooltip = "सिर्फ idle sleep रोकता है। Lid बंद रखने के लिए clamshell mode या always-on machine चाहिए."
 
 [settings.option.telemetry]
-label = "Gateway telemetry साझा करें"
-description = "Pioneer को Gateway performance metrics, startup traces और error reports भेजें। Startup traces में केवल तय stage names, outcomes और timings होते हैं। Database metrics में केवल operation categories, timings और pool state शामिल होते हैं। Telemetry में app version और environment भी शामिल होते हैं; SQL text, database contents, file paths और user content नहीं भेजे जाते। इसे कभी भी बंद किया जा सकता है।"
+label = "टेलीमेट्री भेजें"
+description = "निदान और प्रदर्शन डेटा एकत्र करने की अनुमति दें।"
 
 [settings.general.preflight_model]
 label = "Preflight मॉडल"

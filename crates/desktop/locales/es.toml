@@ -979,8 +979,8 @@ description = "Evita que el equipo entre en reposo por inactividad mientras el g
 tooltip = "Solo evita el reposo por inactividad. Con la tapa cerrada necesitas modo clamshell o una máquina siempre encendida."
 
 [settings.option.telemetry]
-label = "Compartir telemetría del gateway"
-description = "Envía a Pioneer métricas de rendimiento del gateway, trazas de inicio e informes de errores. Las trazas de inicio solo contienen nombres de etapas fijos, resultados y tiempos. Las métricas de la base de datos solo contienen categorías de operaciones, tiempos y estado del pool. La telemetría también incluye la versión de la app y el entorno; no se envían texto SQL, contenido de la base de datos, rutas de archivos ni contenido del usuario. Puedes desactivarlo en cualquier momento."
+label = "Enviar telemetría"
+description = "Permitir recopilar datos de diagnóstico y rendimiento."
 
 [settings.general.preflight_model]
 label = "Modelo de preflight"

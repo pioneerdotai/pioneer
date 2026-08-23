@@ -122,12 +122,6 @@ impl PioneerDesktop {
                         cx,
                     ))
                     .child(Self::render_settings_divider(cx))
-                    .child(Self::render_telemetry_setting(
-                        settings.general.telemetry_enabled,
-                        desktop_entity.clone(),
-                        cx,
-                    ))
-                    .child(Self::render_settings_divider(cx))
                     .child(Self::render_preflight_model_setting(
                         settings.general.preflight_model.clone(),
                         desktop_entity.clone(),
@@ -146,8 +140,14 @@ impl PioneerDesktop {
                         settings.remote_access.clone(),
                         self.remote_access_settings_expanded,
                         self.remote_access_key_input_revision,
-                        desktop_entity,
+                        desktop_entity.clone(),
                         window,
+                        cx,
+                    ))
+                    .child(Self::render_settings_divider(cx))
+                    .child(Self::render_telemetry_setting(
+                        settings.general.telemetry_enabled,
+                        desktop_entity,
                         cx,
                     )),
                 None => general_settings
@@ -2288,6 +2288,15 @@ mod tests {
         assert!(general_view.contains("render_remote_access_setting"));
         assert!(general_view.contains("settings.general.preflight_model"));
         assert!(general_view.contains("settings.remote_access"));
+        assert!(
+            general_view
+                .find("render_telemetry_setting")
+                .expect("telemetry setting is rendered")
+                > general_view
+                    .find("render_remote_access_setting")
+                    .expect("remote access setting is rendered"),
+            "telemetry must remain the final General setting"
+        );
         assert!(!general_view.contains("\"settings-general-thread-context\""));
         assert!(!general_view.contains("settings.general.thread_context"));
         assert!(source.contains("\"settings-preflight-model\""));
