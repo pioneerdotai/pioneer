@@ -4,11 +4,6 @@ use crate::authorization::{
     AuthorizationExternalError, AuthorizationService, AuthorizedTurn,
     ExecutionAuthorizationAdmission, RuntimeDraftCreator, RuntimeDraftMaterialization,
 };
-use crate::cli_runtime::config::{
-    claude_account_probe_config_from_instance, codex_account_probe_config_from_instance,
-};
-use pioneer_cli_agent_runtime::claude::{ClaudeModelSnapshot, ClaudeProbe};
-use pioneer_cli_agent_runtime::codex::{CodexModelListProbeStatus, CodexModelSnapshot, CodexProbe};
 use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, UserInput, VoiceError, VoiceErrorKind,
     VoiceSessionOutcome, VoiceSessionResultNotification,
@@ -3492,6 +3487,28 @@ impl MessageProcessor {
         provider_claim_matches: bool,
     ) -> MessageFuture<'a, Result<PreparedCliRuntimeCombinedPreflight, TurnStartFailure>> {
         message_future(async move {
+            let readiness_snapshot = self
+                .cli_runtime_probe_snapshot(thread.workspace_id.as_str(), runtime_id)
+                .await
+                .map_err(|error| {
+                    TurnStartFailure::internal(format!(
+                        "failed to load CLI runtime readiness snapshot: {error:#}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    TurnStartFailure::internal(format!(
+                        "CLI runtime `{runtime_id}` is absent from the readiness snapshot"
+                    ))
+                })?;
+            let readiness_summary = readiness_snapshot.summary;
+            let cached_mcp_readiness = readiness_snapshot.mcp_readiness;
+            if !matches!(readiness_summary.status, RuntimeStatus::Ready) {
+                return Err(TurnStartFailure::invalid_input(format!(
+                    "CLI runtime `{runtime_id}` is not ready: {}",
+                    cli_runtime_unavailable_reason(&readiness_summary.status)
+                )));
+            }
+
             let mcp_projection = match self
                 .mcp_service
                 .resolve_mcp_turn_projection(&pioneer_agent::AgentMcpMaterializationRequest {
@@ -3665,12 +3682,6 @@ impl MessageProcessor {
             if let Some(projection) = plan.mcp_projection.as_ref() {
                 let has_mcp_projection = requested_mcp || !projection.tools.is_empty();
                 if has_mcp_projection {
-                    let readiness_summary = self
-                        .cli_runtime_live_summary_from_instance(
-                            thread.workspace_id.as_str(),
-                            runtime_config.clone(),
-                        )
-                        .await;
                     let validation =
                         crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
                             &self.crud_store,
@@ -3684,10 +3695,7 @@ impl MessageProcessor {
                                 target: cli_mcp_client_target(runtime_kind),
                                 has_mcp_projection,
                                 provider_claim_matches,
-                                runtime_snapshot_current: matches!(
-                                    readiness_summary.status,
-                                    RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
-                                ),
+                                runtime_snapshot_current: true,
                                 runtime_supports_mcp_tools: readiness_summary
                                     .capabilities
                                     .supports_mcp_tools,
@@ -3723,42 +3731,27 @@ impl MessageProcessor {
                         );
                         return Err(TurnStartFailure::internal(format!("{code}: {message}")));
                     }
-                    let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                    #[cfg(test)]
-                    let readiness_override = self.cli_mcp_readiness_override_for_tests();
-                    #[cfg(not(test))]
-                    let readiness_override: Option<
-                        pioneer_protocol::CliMcpAdapterReadiness,
-                    > = None;
+                    let readiness = cached_mcp_readiness.clone().ok_or_else(|| {
+                        TurnStartFailure::unavailable(
+                            "cli_runtime.mcp.readiness_unavailable: Gateway MCP readiness snapshot is not available",
+                        )
+                    })?;
+                    if !readiness.supported {
+                        let diagnostic = readiness
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                        return Err(TurnStartFailure::unavailable(format!(
+                            "{}: {}",
+                            diagnostic
+                                .map(|diagnostic| diagnostic.code.as_str())
+                                .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
+                            diagnostic
+                                .map(|diagnostic| diagnostic.message.as_str())
+                                .unwrap_or("MCP tool readiness is not available")
+                        )));
+                    }
                     if runtime_kind == CLIAgentRuntimeKind::Codex {
-                        let readiness = match readiness_override {
-                            Some(readiness) => readiness,
-                            None => crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
-                                runtime_config,
-                                self.artifact_runtime_home.as_path(),
-                                matches!(readiness_summary.status, RuntimeStatus::Ready),
-                                readiness_summary.version.as_deref(),
-                                readiness_summary.proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await,
-                        };
-                        if !readiness.supported {
-                            let diagnostic = readiness
-                                .diagnostics
-                                .iter()
-                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            return Err(TurnStartFailure::unavailable(format!(
-                                "{}: {}",
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.code.as_str())
-                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.message.as_str())
-                                    .unwrap_or("MCP tool readiness is not available")
-                            )));
-                        }
                         codex_mcp_launch_projection = Some(
                             crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
                                 projection.clone(),
@@ -3771,34 +3764,6 @@ impl MessageProcessor {
                             })?,
                         );
                     } else if runtime_kind == CLIAgentRuntimeKind::Claude {
-                        let readiness = match readiness_override {
-                            Some(readiness) => readiness,
-                            None => crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
-                                runtime_config,
-                                self.artifact_runtime_home.as_path(),
-                                matches!(readiness_summary.status, RuntimeStatus::Ready),
-                                readiness_summary.version.as_deref(),
-                                readiness_summary.proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await,
-                        };
-                        if !readiness.supported {
-                            let diagnostic = readiness
-                                .diagnostics
-                                .iter()
-                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            return Err(TurnStartFailure::unavailable(format!(
-                                "{}: {}",
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.code.as_str())
-                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.message.as_str())
-                                    .unwrap_or("MCP tool readiness is not available")
-                            )));
-                        }
                         claude_mcp_launch_projection = Some(
                             crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection(
                                 projection.clone(),
@@ -8663,98 +8628,54 @@ impl MessageProcessor {
         runtime_kind: CLIAgentRuntimeKind,
         model_id: &str,
     ) -> Option<ProviderModelInfo> {
-        let instances = match self.load_cli_runtime_instances() {
-            Ok(instances) => instances,
+        let runtime_snapshot = match self
+            .cli_runtime_probe_snapshot(workspace_id, runtime_id)
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                debug!(
+                    workspace_id,
+                    runtime_id, model_id, "CLI runtime readiness is absent for reasoning lookup"
+                );
+                return None;
+            }
             Err(error) => {
                 debug!(
                     workspace_id,
                     runtime_id,
                     model_id,
                     error = %format!("{error:#}"),
-                    "failed to load CLI runtime config for reasoning capability lookup"
+                    "failed to read CLI runtime readiness for reasoning lookup"
                 );
                 return None;
             }
         };
-
-        let Some(instance) = instances
-            .into_iter()
-            .find(|instance| instance.id == runtime_id)
-        else {
-            debug!(
-                workspace_id,
-                runtime_id, model_id, "CLI runtime not found for reasoning capability lookup"
-            );
-            return None;
-        };
-
-        if !cli_runtime_kind_matches_config(runtime_kind, instance.kind) {
+        if runtime_snapshot.summary.kind != runtime_kind
+            || !matches!(runtime_snapshot.summary.status, RuntimeStatus::Ready)
+        {
             debug!(
                 workspace_id,
                 runtime_id,
                 requested_kind = cli_runtime_protocol_kind_label(runtime_kind),
-                configured_kind = cli_runtime_config_kind_label(instance.kind),
+                cached_kind = cli_runtime_protocol_kind_label(runtime_snapshot.summary.kind),
                 model_id,
-                "CLI runtime kind mismatch for reasoning capability lookup"
+                "CLI runtime readiness does not permit reasoning metadata lookup"
             );
             return None;
         }
 
-        let mut models = if instance.enabled {
-            match instance.kind {
-                pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
-                    let probe =
-                        CodexProbe::model_list(codex_account_probe_config_from_instance(&instance))
-                            .await;
-                    if probe.status == CodexModelListProbeStatus::Ready {
-                        probe
-                            .models
-                            .into_iter()
-                            .map(runtime_model_from_codex_snapshot_for_reasoning_lookup)
-                            .collect::<Vec<_>>()
-                    } else {
-                        debug!(
-                            workspace_id,
-                            runtime_id,
-                            model_id,
-                            status = ?probe.status,
-                            "Codex CLI model metadata is unavailable for reasoning lookup"
-                        );
-                        Vec::new()
-                    }
-                }
-                pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
-                    let probe = ClaudeProbe::model_list(
-                        claude_account_probe_config_from_instance(&instance),
-                        &instance.custom_models,
-                    )
-                    .await;
-                    if let Some(error_message) = probe.error_message.as_deref() {
-                        debug!(
-                            workspace_id,
-                            runtime_id,
-                            model_id,
-                            error = error_message,
-                            "Claude CLI model metadata returned diagnostics for reasoning lookup"
-                        );
-                    }
-                    probe
-                        .models
-                        .into_iter()
-                        .map(runtime_model_from_claude_snapshot_for_reasoning_lookup)
-                        .collect::<Vec<_>>()
-                }
-            }
-        } else {
+        let Some(model_snapshot) = runtime_snapshot.models else {
             debug!(
                 workspace_id,
-                runtime_id, model_id, "CLI runtime is disabled for reasoning capability lookup"
+                runtime_id, model_id, "Gateway CLI model cache is unavailable for reasoning lookup"
             );
-            Vec::new()
+            return None;
         };
-        append_cli_runtime_custom_models_for_reasoning_lookup(&mut models, &instance.custom_models);
 
-        models
+        model_snapshot
+            .result
+            .models
             .into_iter()
             .find(|model| model.id == model_id)
             .map(|model| {
@@ -8996,81 +8917,6 @@ fn normalized_reasoning_effort_for_comparison(value: &str) -> String {
     reasoning_effort_comparison_key(value)
 }
 
-fn runtime_model_from_codex_snapshot_for_reasoning_lookup(
-    model: CodexModelSnapshot,
-) -> RuntimeModelInfo {
-    RuntimeModelInfo {
-        id: model.id,
-        name: model.name,
-        description: model.description,
-        family: model.family,
-        is_custom: false,
-        active: model.active,
-        effort_options: model.effort_options,
-        input_modalities: model.input_modalities,
-        output_modalities: model.output_modalities,
-        supports_reasoning: model.supports_reasoning,
-        supports_vision: model.supports_vision,
-        max_input_tokens: model.max_input_tokens,
-        max_output_tokens: model.max_output_tokens,
-    }
-}
-
-fn runtime_model_from_claude_snapshot_for_reasoning_lookup(
-    model: ClaudeModelSnapshot,
-) -> RuntimeModelInfo {
-    RuntimeModelInfo {
-        id: model.id,
-        name: model.name,
-        description: model.description,
-        family: model.family,
-        is_custom: false,
-        active: model.active,
-        effort_options: model.effort_options,
-        input_modalities: model.input_modalities,
-        output_modalities: model.output_modalities,
-        supports_reasoning: model.supports_reasoning,
-        supports_vision: model.supports_vision,
-        max_input_tokens: model.max_input_tokens,
-        max_output_tokens: model.max_output_tokens,
-    }
-}
-
-fn append_cli_runtime_custom_models_for_reasoning_lookup(
-    models: &mut Vec<RuntimeModelInfo>,
-    custom_models: &[String],
-) {
-    let mut seen = models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<HashSet<_>>();
-    for raw_model in custom_models {
-        let model_id = raw_model.trim();
-        if model_id.is_empty() || !seen.insert(model_id.to_owned()) {
-            continue;
-        }
-
-        models.push(RuntimeModelInfo {
-            id: model_id.to_owned(),
-            name: Some(model_id.to_owned()),
-            description: Some(
-                "Configured custom CLI runtime model; capability metadata was not reported by the runtime"
-                    .to_owned(),
-            ),
-            family: None,
-            is_custom: true,
-            active: None,
-            effort_options: Vec::new(),
-            input_modalities: Vec::new(),
-            output_modalities: Vec::new(),
-            supports_reasoning: None,
-            supports_vision: None,
-            max_input_tokens: None,
-            max_output_tokens: None,
-        });
-    }
-}
-
 fn provider_model_from_runtime_model_for_reasoning_lookup(
     provider_key: &str,
     model: RuntimeModelInfo,
@@ -9256,6 +9102,20 @@ fn cli_runtime_binding_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
         .timestamp_opt(now_timestamp_secs(), 0)
         .single()
         .expect("current timestamp should be valid")
+}
+
+fn cli_runtime_unavailable_reason(status: &RuntimeStatus) -> &'static str {
+    match status {
+        RuntimeStatus::Disabled => "runtime is disabled",
+        RuntimeStatus::MissingBinary { .. } => "runtime binary is unavailable",
+        RuntimeStatus::SpawnFailed { .. } => "runtime failed to start",
+        RuntimeStatus::Initializing => "Gateway readiness check is still running",
+        RuntimeStatus::NeedsAuth => "runtime authentication is required",
+        RuntimeStatus::Ready => "runtime is ready",
+        RuntimeStatus::Degraded { .. } => "runtime readiness is degraded",
+        RuntimeStatus::UnsupportedVersion { .. } => "runtime version is unsupported",
+        RuntimeStatus::Error { .. } => "runtime readiness check failed",
+    }
 }
 
 #[cfg(test)]

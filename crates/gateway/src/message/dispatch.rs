@@ -7296,6 +7296,16 @@ impl MessageProcessor {
             info!(telemetry_enabled, "gateway telemetry preference updated");
         }
 
+        if changes.cli_runtimes {
+            match workspace_id.as_deref() {
+                Some(workspace_id) => {
+                    self.invalidate_and_request_cli_runtime_warmup(workspace_id.to_owned())
+                        .await;
+                }
+                None => self.invalidate_and_request_all_cli_runtime_warmup().await,
+            }
+        }
+
         if changes.self_improvement {
             if let Some(supervisor) = self.self_improvement_supervisor.as_ref() {
                 let workspace_id = changes

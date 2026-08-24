@@ -507,6 +507,16 @@ impl Provider for LocalProvider {
             "provider '{LOCAL_PROVIDER_ID}' uses the gateway local embedding runtime for embedding execution"
         )
     }
+
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        // The local adapter has no paid or remote health endpoint. Its
+        // readiness contract is the deterministic availability of both
+        // built-in catalogs; actual model artifact installation remains a
+        // separate runtime concern owned by the corresponding supervisors.
+        self.list_embedding_models().await?;
+        self.list_transcription_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
 }
 
 fn local_embedding_model_to_provider_model(model: &LocalEmbeddingModelInfo) -> ProviderModelInfo {
@@ -758,5 +768,13 @@ mod tests {
                 "trusted catalog value leaked: {trusted_value}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn local_provider_warmup_verifies_both_static_catalogs() {
+        assert_eq!(
+            LocalProvider::new().warmup().await.expect("local warmup"),
+            crate::ProviderWarmupOutcome::Completed
+        );
     }
 }

@@ -91,6 +91,7 @@ impl PioneerDesktop {
             thread_scope_pending: ThreadScopePendingAction::Idle,
             thread_scope_error: None,
             message_revision_dialog: None,
+            open_model_selector_cli_runtime_binding: None,
             message_revision_loading: false,
             message_mutation_pending: false,
             invitations_loading: false,

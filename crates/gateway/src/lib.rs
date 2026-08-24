@@ -202,6 +202,7 @@ async fn run_gateway_until_shutdown_inner(
     config = gateway_settings.apply_to_app_config(config);
     settings_stage.succeed();
     pioneer_observability::set_telemetry_enabled(config.gateway.telemetry.enabled);
+    startup.bind_consent();
     let observability_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ObservabilityInit);
     match pioneer_observability::init_otlp_observability(
@@ -211,6 +212,7 @@ async fn run_gateway_until_shutdown_inner(
             export_interval: Duration::from_millis(config.gateway.telemetry.export_interval_ms),
             export_timeout: Duration::from_millis(config.gateway.telemetry.export_timeout_ms),
             deployment_environment: None,
+            service_version: None,
         },
     ) {
         Ok(()) => observability_stage.succeed(),
@@ -863,6 +865,9 @@ async fn run_gateway_until_shutdown_inner(
         Ok(()) => {
             services_start_stage.succeed();
             startup.finish_success();
+            message_processor
+                .start_provider_readiness_supervisor()
+                .await;
             info!(listen_addr = %handle.local_addr(), "gateway daemon started");
             wait_for_shutdown_signal().await
         }
@@ -874,6 +879,9 @@ async fn run_gateway_until_shutdown_inner(
     };
 
     info!("gateway daemon stopping with telemetry snapshot");
+    message_processor
+        .shutdown_provider_readiness_supervisor()
+        .await;
     message_processor.shutdown_remote_access_supervisor().await;
     let server_shutdown_result = handle.shutdown().await;
     message_processor.shutdown_cli_runtime_manager().await;

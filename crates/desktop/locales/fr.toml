@@ -533,11 +533,8 @@ delete_failed = "Échec de la suppression de la clé API"
 
 [providers.cli]
 title = "CLI Providers"
+description = "Gateway vérifie et actualise l’état de disponibilité."
 refreshing = "Refreshing"
-updated = "Updated"
-stale = "Stale"
-refresh_failed = "Refresh failed"
-not_refreshed = "Not refreshed"
 empty = "No CLI providers configured"
 diagnostics = "Diagnostics"
 native_events = "Native events"
@@ -546,8 +543,6 @@ copied_diagnostics = "Copied diagnostics for"
 login_code = "Code"
 login_open = "Open"
 login_started = "CLI login started"
-refresh_already_running = "CLI provider refresh is already running."
-refresh_wait = "CLI provider refresh is waiting for the refresh policy."
 
 [providers.cli.mcp]
 runtime_not_ready = "Runtime is not ready"

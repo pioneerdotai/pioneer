@@ -10,22 +10,21 @@ use crate::{
 use pioneer_protocol::{
     ArtifactCreatedNotification, ArtifactDeletedNotification, ArtifactSummary,
     ArtifactUpdatedNotification, CLIRuntimeAccountUpdatedNotification,
-    CLIRuntimeAppsChangedNotification, CLIRuntimeRequestOpenedNotification,
-    CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
+    CLIRuntimeAppsChangedNotification, CLIRuntimeStatusChangedNotification,
     ItemCompletedNotification, ItemDeltaNotification, ItemRecoveryAttachedNotification,
     ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
     ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
     ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
     ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, ItemUpdatedNotification, SkillsChangedNotification, Thread,
-    ThreadAgentsDocChangedNotification, ThreadArtifactsChangedNotification,
-    ThreadClosedNotification, ThreadPlacement, ThreadStartedNotification, ThreadStatus,
-    ThreadTreeChangedNotification, ThreadUpdatedNotification, TurnBlockedNotification,
-    TurnCompletedNotification, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
-    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification,
-    TurnFailedNotification, TurnKind, TurnStartedNotification,
-    TurnToolLoopBudgetExceededNotification,
+    ItemToolRetryScheduledNotification, ItemUpdatedNotification, RuntimeSummary,
+    SkillsChangedNotification, Thread, ThreadAgentsDocChangedNotification,
+    ThreadArtifactsChangedNotification, ThreadClosedNotification, ThreadPlacement,
+    ThreadStartedNotification, ThreadStatus, ThreadTreeChangedNotification,
+    ThreadUpdatedNotification, TurnBlockedNotification, TurnCompletedNotification,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
+    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
+    TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnKind,
+    TurnStartedNotification, TurnToolLoopBudgetExceededNotification,
 };
 
 pub use crate::mcp::notifications::{
@@ -117,12 +116,19 @@ pub struct SkillsRefreshReduction {
     pub queue_skills_refresh: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CLIRuntimeRefreshReduction {
-    pub workspace_id: String,
-    pub runtime_id: Option<String>,
-    pub workspace_matches: bool,
-    pub queue_runtime_refresh: bool,
+#[derive(Clone, Debug, PartialEq)]
+pub enum CLIRuntimeSnapshotReduction {
+    Upsert {
+        workspace_id: String,
+        revision: u64,
+        runtime: Box<RuntimeSummary>,
+        removed: bool,
+        workspace_matches: bool,
+    },
+    Reload {
+        workspace_id: String,
+        workspace_matches: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -768,71 +774,41 @@ pub fn reduce_skills_changed_notification(
 pub fn reduce_cli_runtime_status_changed_notification(
     notification: CLIRuntimeStatusChangedNotification,
     active_workspace: Option<&str>,
-) -> CLIRuntimeRefreshReduction {
-    let runtime_id = notification.runtime.runtime_id;
-    reduce_cli_runtime_workspace_notification(
-        notification.workspace_id,
-        Some(runtime_id),
-        active_workspace,
-    )
+) -> CLIRuntimeSnapshotReduction {
+    let workspace_matches =
+        should_refresh_workspace_bound_data(active_workspace, notification.workspace_id.as_str());
+    CLIRuntimeSnapshotReduction::Upsert {
+        workspace_id: notification.workspace_id,
+        revision: notification.revision,
+        runtime: Box::new(notification.runtime),
+        removed: notification.removed,
+        workspace_matches,
+    }
 }
 
 pub fn reduce_cli_runtime_account_updated_notification(
     notification: CLIRuntimeAccountUpdatedNotification,
     active_workspace: Option<&str>,
-) -> CLIRuntimeRefreshReduction {
-    reduce_cli_runtime_workspace_notification(
-        notification.workspace_id,
-        Some(notification.runtime_id),
-        active_workspace,
-    )
-}
-
-pub fn reduce_cli_runtime_request_opened_notification(
-    notification: CLIRuntimeRequestOpenedNotification,
-    active_workspace: Option<&str>,
-) -> CLIRuntimeRefreshReduction {
-    reduce_cli_runtime_workspace_notification(
-        notification.workspace_id,
-        Some(notification.runtime_id),
-        active_workspace,
-    )
-}
-
-pub fn reduce_cli_runtime_request_resolved_notification(
-    notification: CLIRuntimeRequestResolvedNotification,
-    active_workspace: Option<&str>,
-) -> CLIRuntimeRefreshReduction {
-    reduce_cli_runtime_workspace_notification(
-        notification.workspace_id,
-        Some(notification.runtime_id),
-        active_workspace,
-    )
+) -> CLIRuntimeSnapshotReduction {
+    reduce_cli_runtime_workspace_notification(notification.workspace_id, active_workspace)
 }
 
 pub fn reduce_cli_runtime_apps_changed_notification(
     notification: CLIRuntimeAppsChangedNotification,
     active_workspace: Option<&str>,
-) -> CLIRuntimeRefreshReduction {
-    reduce_cli_runtime_workspace_notification(
-        notification.workspace_id,
-        Some(notification.runtime_id),
-        active_workspace,
-    )
+) -> CLIRuntimeSnapshotReduction {
+    reduce_cli_runtime_workspace_notification(notification.workspace_id, active_workspace)
 }
 
 fn reduce_cli_runtime_workspace_notification(
     workspace_id: String,
-    runtime_id: Option<String>,
     active_workspace: Option<&str>,
-) -> CLIRuntimeRefreshReduction {
+) -> CLIRuntimeSnapshotReduction {
     let workspace_matches =
         should_refresh_workspace_bound_data(active_workspace, workspace_id.as_str());
-    CLIRuntimeRefreshReduction {
+    CLIRuntimeSnapshotReduction::Reload {
         workspace_id,
-        runtime_id,
         workspace_matches,
-        queue_runtime_refresh: workspace_matches,
     }
 }
 
@@ -915,9 +891,7 @@ mod tests {
         ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactDeletedNotification,
         ArtifactKind, ArtifactRef, ArtifactStatus, ArtifactSummary, ArtifactUpdatedNotification,
         CLIAgentRuntimeKind, CLIRuntimeAccountUpdatedNotification,
-        CLIRuntimeAppsChangedNotification, CLIRuntimePendingRequest, CLIRuntimeRequestKind,
-        CLIRuntimeRequestOpenedNotification, CLIRuntimeRequestResolution,
-        CLIRuntimeRequestResolvedNotification, CLIRuntimeStatusChangedNotification,
+        CLIRuntimeAppsChangedNotification, CLIRuntimeStatusChangedNotification,
         ExecutionWindowStatus, ItemDeltaStream, McpChangedNotification, McpListItem,
         McpManagementDetails, McpPolicyState, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
         McpServerCatalogChangedNotification, McpServerCatalogDetails, McpServerDetailsResponse,
@@ -1619,17 +1593,24 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_refresh_reductions_match_workspace_scope() {
+    fn cli_runtime_snapshot_reductions_apply_gateway_state_without_probe_requests() {
         let status = reduce_cli_runtime_status_changed_notification(
             CLIRuntimeStatusChangedNotification {
                 workspace_id: "ws_a".to_owned(),
+                revision: 2,
+                removed: false,
                 runtime: runtime_summary("codex_personal"),
             },
             Some("ws_a"),
         );
-        assert!(status.workspace_matches);
-        assert!(status.queue_runtime_refresh);
-        assert_eq!(status.runtime_id.as_deref(), Some("codex_personal"));
+        assert!(matches!(
+            status,
+            CLIRuntimeSnapshotReduction::Upsert {
+                workspace_matches: true,
+                ref runtime,
+                ..
+            } if runtime.runtime_id == "codex_personal"
+        ));
 
         let account = reduce_cli_runtime_account_updated_notification(
             CLIRuntimeAccountUpdatedNotification {
@@ -1641,41 +1622,13 @@ mod tests {
             },
             Some("ws_a"),
         );
-        assert!(account.queue_runtime_refresh);
-
-        let opened = reduce_cli_runtime_request_opened_notification(
-            CLIRuntimeRequestOpenedNotification {
-                workspace_id: "ws_a".to_owned(),
-                runtime_id: "codex_personal".to_owned(),
-                request_id: "req_1".to_owned(),
-                thread_id: Some("thread_1".to_owned()),
-                turn_id: Some("turn_1".to_owned()),
-                item_id: None,
-                request: CLIRuntimePendingRequest {
-                    kind: CLIRuntimeRequestKind::CommandApproval,
-                    title: Some("Run command".to_owned()),
-                    message: None,
-                    native_request_id: None,
-                    payload: None,
-                },
-            },
-            Some("ws_a"),
-        );
-        assert!(opened.queue_runtime_refresh);
-
-        let resolved = reduce_cli_runtime_request_resolved_notification(
-            CLIRuntimeRequestResolvedNotification {
-                workspace_id: "ws_a".to_owned(),
-                runtime_id: "codex_personal".to_owned(),
-                request_id: "req_1".to_owned(),
-                thread_id: Some("thread_1".to_owned()),
-                turn_id: Some("turn_1".to_owned()),
-                item_id: None,
-                resolution: CLIRuntimeRequestResolution::Approved,
-            },
-            Some("ws_a"),
-        );
-        assert!(resolved.queue_runtime_refresh);
+        assert!(matches!(
+            account,
+            CLIRuntimeSnapshotReduction::Reload {
+                workspace_matches: true,
+                ..
+            }
+        ));
 
         let apps = reduce_cli_runtime_apps_changed_notification(
             CLIRuntimeAppsChangedNotification {
@@ -1686,7 +1639,13 @@ mod tests {
             },
             Some("ws_a"),
         );
-        assert!(apps.queue_runtime_refresh);
+        assert!(matches!(
+            apps,
+            CLIRuntimeSnapshotReduction::Reload {
+                workspace_matches: true,
+                ..
+            }
+        ));
 
         let foreign = reduce_cli_runtime_apps_changed_notification(
             CLIRuntimeAppsChangedNotification {
@@ -1697,8 +1656,13 @@ mod tests {
             },
             Some("ws_a"),
         );
-        assert!(!foreign.workspace_matches);
-        assert!(!foreign.queue_runtime_refresh);
+        assert!(matches!(
+            foreign,
+            CLIRuntimeSnapshotReduction::Reload {
+                workspace_matches: false,
+                ..
+            }
+        ));
     }
 
     #[test]

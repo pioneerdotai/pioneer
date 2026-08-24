@@ -21,12 +21,12 @@ use pioneer_client::providers::list::{
     self as provider_list, ProviderModelSelectorMode, ProviderModelSelectorState,
 };
 use pioneer_client::providers::presentation as provider_presentation;
-use pioneer_protocol::ProviderModelInfo;
+use pioneer_protocol::{ProviderModelInfo, RuntimeSummary};
 use std::{
     cell::RefCell,
     collections::HashMap,
     hash::{Hash, Hasher},
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 /// Minimum height of a model row in the virtual list (in pixels).
@@ -69,6 +69,34 @@ struct ModelSelectorDialogState {
     model_trigger_width_px: Rc<RefCell<f32>>,
     reasoning_trigger_width_px: Rc<RefCell<f32>>,
     model_row_layout_cache: Rc<RefCell<HashMap<String, CachedModelRowLayout>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct OpenModelSelectorCliRuntimeBinding {
+    workspace_id: String,
+    selector: Weak<RefCell<ProviderModelSelectorState>>,
+}
+
+impl OpenModelSelectorCliRuntimeBinding {
+    fn new(workspace_id: String, selector: &Rc<RefCell<ProviderModelSelectorState>>) -> Self {
+        Self {
+            workspace_id,
+            selector: Rc::downgrade(selector),
+        }
+    }
+
+    fn sync(&self, active_workspace_id: Option<&str>, runtimes: &[RuntimeSummary]) -> bool {
+        let Some(selector) = self.selector.upgrade() else {
+            return false;
+        };
+        let runtimes = if active_workspace_id == Some(self.workspace_id.as_str()) {
+            runtimes.to_vec()
+        } else {
+            Vec::new()
+        };
+        selector.borrow_mut().sync_cli_runtime_snapshot(runtimes);
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -197,6 +225,15 @@ impl PioneerDesktop {
             options.mode,
         )));
         selector.borrow_mut().mark_providers_loading();
+        if options.mode == ProviderModelSelectorMode::Chat {
+            selector
+                .borrow_mut()
+                .sync_cli_runtime_snapshot(self.model_selector_cli_runtimes().to_vec());
+        }
+        self.open_model_selector_cli_runtime_binding =
+            (options.mode == ProviderModelSelectorMode::Chat).then(|| {
+                OpenModelSelectorCliRuntimeBinding::new(options.workspace_id.clone(), &selector)
+            });
 
         let provider_search_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -235,9 +272,6 @@ impl PioneerDesktop {
         };
 
         Self::load_providers_async(cx, &state);
-        if state.mode == ProviderModelSelectorMode::Chat {
-            Self::load_cli_runtimes_async(cx, &state);
-        }
         Self::preload_selected_provider_models_async(cx, &state, options.selected_provider);
         Self::show_model_selector_dialog(window, cx, state);
     }
@@ -264,40 +298,6 @@ impl PioneerDesktop {
                             selector
                                 .borrow_mut()
                                 .apply_provider_list_error(format!("{error:#}"));
-                        }
-                    }
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn load_cli_runtimes_async(cx: &mut Context<Self>, state: &ModelSelectorDialogState) {
-        let selector = state.selector.clone();
-        let ws_sender = state.ws_sender.clone();
-        let workspace_id = state.workspace_id.clone();
-
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                let result = cx
-                    .background_spawn(async move {
-                        ws_sender
-                            .cli_runtime_list(provider_list::cli_runtime_list_params(workspace_id))
-                    })
-                    .await;
-                let _ = this.update(&mut cx, |_view, cx| {
-                    match result {
-                        Ok(response) => {
-                            selector
-                                .borrow_mut()
-                                .apply_cli_runtime_list_success(response);
-                        }
-                        Err(error) => {
-                            selector
-                                .borrow_mut()
-                                .apply_cli_runtime_list_error(format!("{error:#}"));
                         }
                     }
                     cx.notify();
@@ -472,6 +472,16 @@ impl PioneerDesktop {
                     }
                 }))
         });
+    }
+
+    pub(crate) fn sync_open_model_selector_cli_runtime_snapshot(&mut self) {
+        let Some(binding) = self.open_model_selector_cli_runtime_binding.clone() else {
+            return;
+        };
+        let runtimes = self.model_selector_cli_runtimes().to_vec();
+        if !binding.sync(self.active_workspace_id(), runtimes.as_slice()) {
+            self.open_model_selector_cli_runtime_binding = None;
+        }
     }
 
     fn save_model_selector_selection(
@@ -1387,5 +1397,37 @@ mod tests {
 
         assert!(source.contains("settings.voice_input.recommended"));
         assert!(!source.contains(".child(\"Recommended\")"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn model_selector_dialog_render_never_reenters_the_desktop_entity() {
+        let source = include_str!("model_selector.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source exists");
+        let render = source
+            .split("fn show_model_selector_dialog")
+            .nth(1)
+            .expect("dialog render exists")
+            .split("pub(crate) fn sync_open_model_selector_cli_runtime_snapshot")
+            .next()
+            .expect("dialog render has a boundary");
+
+        assert!(!render.contains("desktop_entity"));
+        assert!(!render.contains(".read(cx)"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn model_selector_cli_runtime_binding_does_not_retain_a_closed_dialog() {
+        let selector = Rc::new(RefCell::new(ProviderModelSelectorState::new_with_mode(
+            None,
+            None,
+            ProviderModelSelectorMode::Chat,
+        )));
+        let binding = OpenModelSelectorCliRuntimeBinding::new("workspace".to_owned(), &selector);
+
+        assert!(binding.sync(Some("workspace"), &[]));
+        drop(selector);
+        assert!(!binding.sync(Some("workspace"), &[]));
     }
 }

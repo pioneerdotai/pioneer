@@ -63,6 +63,9 @@ impl PioneerDesktop {
         has_complete_composer_model_selection(
             self.composer_selected_provider.as_deref(),
             self.composer_selected_model.as_deref(),
+        ) && provider_list::provider_ready_for_model_selector(
+            self.composer_selected_provider.as_deref(),
+            self.model_selector_cli_runtimes(),
         )
     }
 
@@ -132,6 +135,12 @@ impl PioneerDesktop {
     }
 
     fn composer_model_display_key(&self) -> Option<ProviderModelDisplayKey> {
+        if !provider_list::provider_ready_for_model_selector(
+            self.composer_selected_provider.as_deref(),
+            self.model_selector_cli_runtimes(),
+        ) {
+            return None;
+        }
         let workspace_id = self.model_selector_workspace_id();
         provider_model_display_key(
             Some(workspace_id.as_str()),

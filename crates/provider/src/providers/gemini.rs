@@ -881,6 +881,11 @@ impl crate::traits::Provider for GeminiProvider {
             .map(provider_model_from_gemini_model_entry)
             .collect())
     }
+
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        self.list_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
 }
 
 fn provider_model_from_gemini_model_entry(m: GeminiModelEntry) -> ProviderModelInfo {

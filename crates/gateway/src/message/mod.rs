@@ -23,6 +23,7 @@ mod message_turn;
 mod notifications;
 mod permission_handlers;
 mod provider_handlers;
+mod provider_readiness;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
@@ -104,8 +105,8 @@ use pioneer_protocol::{
     CLIRuntimeRefreshResponse, CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification,
     CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
     CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams,
-    CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBinding,
-    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    CLIRuntimeStatusChangedNotification, CLIRuntimeStatusParams, CLIRuntimeStatusResponse,
+    CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
     CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
     ContextCompressedNotification, ContextCompressingNotification,
@@ -458,6 +459,7 @@ pub struct MessageProcessor {
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnServerRequest>>>>,
     cli_runtime_machine_requests: Arc<Mutex<CLIRuntimeMachineRequestRegistry>>,
     cli_runtime_proxy_cache: Arc<Mutex<HashMap<(String, String), Option<String>>>>,
+    provider_readiness: Arc<provider_readiness::ProviderReadinessSupervisor>,
     cli_runtime_pending_turn_activity_sequence: Arc<AtomicU64>,
     cli_runtime_event_hubs:
         Arc<Mutex<HashMap<crate::cli_runtime::session_instance::CliSessionInstanceId, Arc<ExecutionEventHub>>>>,
@@ -807,6 +809,7 @@ impl MessageProcessor {
                 CLIRuntimeMachineRequestRegistry::default(),
             )),
             cli_runtime_proxy_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_readiness: Arc::new(provider_readiness::ProviderReadinessSupervisor::default()),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_turn_binding_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -3678,6 +3681,7 @@ impl MessageProcessor {
                 CLIRuntimeMachineRequestRegistry::default(),
             )),
             cli_runtime_proxy_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_readiness: Arc::new(provider_readiness::ProviderReadinessSupervisor::default()),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_turn_binding_cache: Arc::new(Mutex::new(HashMap::new())),

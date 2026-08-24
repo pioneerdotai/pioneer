@@ -1108,6 +1108,11 @@ impl crate::traits::Provider for OpenAiProvider {
             .collect())
     }
 
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        self.list_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
+
     async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
         Ok(OPENAI_EMBEDDING_MODELS
             .iter()

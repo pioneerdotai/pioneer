@@ -39,7 +39,7 @@ impl ClientEffectSink for DesktopClientEffectSink<'_, '_> {
             return;
         }
         self.app.refresh_configured_providers(self.cx);
-        self.app.refresh_cli_providers_auto(self.cx);
+        self.app.load_cli_provider_snapshot(self.cx);
     }
 
     fn queue_skills_refresh(&mut self) {

@@ -75,9 +75,10 @@ pub(crate) struct GatewayMetrics {
     pub(crate) database_operations: Counter<u64>,
     pub(crate) database_operation_duration: Histogram<f64>,
     pub(crate) database_pool_acquire_duration: Histogram<f64>,
-    pub(crate) cli_runtime_refresh_duration: Histogram<f64>,
-    pub(crate) cli_runtime_refresh_stage_duration: Histogram<f64>,
-    pub(crate) cli_runtime_refresh_failures: Counter<u64>,
+    pub(crate) provider_warmup_duration: Histogram<f64>,
+    pub(crate) provider_warmup_stage_duration: Histogram<f64>,
+    pub(crate) provider_warmup_failures: Counter<u64>,
+    pub(crate) provider_readiness_checks: Counter<u64>,
 }
 
 impl GatewayMetrics {
@@ -105,31 +106,39 @@ impl GatewayMetrics {
                 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
             ])
             .build();
-        let cli_runtime_refresh_duration = meter
-            .f64_histogram("pioneer.gateway.cli_runtime.refresh.duration")
-            .with_description("End-to-end duration of a Gateway CLI runtime refresh")
+        let provider_warmup_duration = meter
+            .f64_histogram("pioneer.gateway.providers.warmup.duration")
+            .with_description("End-to-end duration of Gateway-owned provider warm-up")
             .with_unit("ms")
             .with_boundaries(operation_duration_boundaries())
             .build();
-        let cli_runtime_refresh_stage_duration = meter
-            .f64_histogram("pioneer.gateway.cli_runtime.refresh.stage.duration")
-            .with_description("Duration of a stable CLI runtime refresh stage")
+        let provider_warmup_stage_duration = meter
+            .f64_histogram("pioneer.gateway.providers.warmup.stage.duration")
+            .with_description("Duration of a stable Gateway provider warm-up stage")
             .with_unit("ms")
             .with_boundaries(operation_duration_boundaries())
             .build();
-        let cli_runtime_refresh_failures = meter
-            .u64_counter("pioneer.gateway.cli_runtime.refresh.failures")
-            .with_description("Number of failed Gateway CLI runtime refreshes")
+        let provider_warmup_failures = meter
+            .u64_counter("pioneer.gateway.providers.warmup.failures")
+            .with_description("Number of failed Gateway provider warm-ups")
             .with_unit("{failure}")
+            .build();
+        let provider_readiness_checks = meter
+            .u64_counter("pioneer.gateway.providers.readiness.checks")
+            .with_description(
+                "Number of Gateway-owned provider readiness checks by bounded result state",
+            )
+            .with_unit("{check}")
             .build();
         Self {
             meter,
             database_operations,
             database_operation_duration,
             database_pool_acquire_duration,
-            cli_runtime_refresh_duration,
-            cli_runtime_refresh_stage_duration,
-            cli_runtime_refresh_failures,
+            provider_warmup_duration,
+            provider_warmup_stage_duration,
+            provider_warmup_failures,
+            provider_readiness_checks,
         }
     }
 }

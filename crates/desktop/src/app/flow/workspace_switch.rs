@@ -31,8 +31,9 @@ impl PioneerDesktop {
             self.refresh_thread_list(cx);
         }
         self.providers.clear_for_workspace_switch();
+        self.sync_open_model_selector_cli_runtime_snapshot();
         self.refresh_configured_providers(cx);
-        self.refresh_cli_providers_auto(cx);
+        self.load_cli_provider_snapshot(cx);
         if reduction.refresh_workspace_bound_screens {
             self.refresh_workspace_bound_screens_after_switch(cx);
         }

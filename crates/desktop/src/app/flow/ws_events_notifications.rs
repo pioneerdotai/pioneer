@@ -6,11 +6,12 @@ use pioneer_client::authorization::{
     AccessChangedPlan, ThreadAuthorizationScope, plan_access_changed,
 };
 use pioneer_client::notifications::router::{
-    ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, CLIRuntimeRefreshReduction,
+    ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, CLIRuntimeSnapshotReduction,
     ConversationEventReduction, SkillsRefreshReduction, ThreadArtifactsRefreshReduction,
     ThreadClosedReduction, ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
     WorkspacePreferenceReduction, WorkspaceRefreshReduction, apply_workspace_changed_to_catalog,
 };
+use pioneer_client::providers::list::CliRuntimeSnapshotUpdate;
 use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificationContext};
 use pioneer_client::voice::{VoiceFinalizeUiAction, VoiceSessionResultReduction};
 use pioneer_client::workspaces::selectors as workspace_selectors;
@@ -162,12 +163,11 @@ impl PioneerDesktop {
             ClientRuntimeNotification::VoiceSessionResult(reduction) => {
                 self.apply_voice_session_result_reduction(reduction, cx);
             }
-            ClientRuntimeNotification::CLIRuntimeRefresh(reduction) => {
-                self.apply_cli_runtime_refresh_reduction(reduction, cx);
+            ClientRuntimeNotification::CLIRuntimeSnapshot(reduction) => {
+                self.apply_cli_runtime_snapshot_reduction(reduction, cx);
             }
-            ClientRuntimeNotification::CLIRuntimePendingRequests { refresh, reduction } => {
+            ClientRuntimeNotification::CLIRuntimePendingRequests(reduction) => {
                 self.apply_pending_requests_reduction(reduction, cx);
-                self.apply_cli_runtime_refresh_reduction(refresh, cx);
             }
             ClientRuntimeNotification::PendingRequests { reduction } => {
                 self.apply_pending_requests_reduction(reduction, cx);
@@ -321,6 +321,13 @@ impl PioneerDesktop {
         let workspace_wide = plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
         let workspace_access_lost = workspace_wide
             && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
+        if workspace_wide && active_workspace_id.as_deref() == Some(plan.workspace_id.as_str()) {
+            // Membership/role changes fence every provider projection from
+            // the previous authorization generation. The shared client
+            // effect below reloads both catalogs through current-ACL APIs.
+            self.providers.clear_for_workspace_switch();
+            self.sync_open_model_selector_cli_runtime_snapshot();
+        }
         self.task_thread_navigation_stack.retain(|entry| {
             !(workspace_access_lost && entry.workspace_id == plan.workspace_id)
                 && !invalidated_thread_ids.contains(entry.parent_thread_id.as_str())
@@ -797,13 +804,40 @@ impl PioneerDesktop {
             .unwrap_or(false)
     }
 
-    fn apply_cli_runtime_refresh_reduction(
+    fn apply_cli_runtime_snapshot_reduction(
         &mut self,
-        reduction: CLIRuntimeRefreshReduction,
+        reduction: CLIRuntimeSnapshotReduction,
         cx: &mut Context<Self>,
     ) {
-        if reduction.queue_runtime_refresh {
-            self.refresh_cli_providers_auto(cx);
+        match reduction {
+            CLIRuntimeSnapshotReduction::Upsert {
+                revision,
+                runtime,
+                removed,
+                workspace_matches: true,
+                ..
+            } => {
+                match self
+                    .providers
+                    .apply_cli_runtime_snapshot_update(revision, *runtime, removed)
+                {
+                    CliRuntimeSnapshotUpdate::Applied => {
+                        self.refresh_composer_capability_target_for_selected_provider();
+                        self.sync_open_model_selector_cli_runtime_snapshot();
+                        cx.notify();
+                    }
+                    CliRuntimeSnapshotUpdate::ReloadRequired => {
+                        self.load_cli_provider_snapshot(cx);
+                    }
+                    CliRuntimeSnapshotUpdate::Stale => {}
+                }
+            }
+            CLIRuntimeSnapshotReduction::Reload {
+                workspace_matches: true,
+                ..
+            } => self.load_cli_provider_snapshot(cx),
+            CLIRuntimeSnapshotReduction::Upsert { .. }
+            | CLIRuntimeSnapshotReduction::Reload { .. } => {}
         }
     }
 

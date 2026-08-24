@@ -5,7 +5,6 @@ use crate::app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, 
 use gpui::{prelude::*, *};
 use gpui_component::tree::TreeItem;
 use pioneer_client::providers::{list as provider_list, selectors};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 impl PioneerDesktop {
@@ -18,7 +17,7 @@ impl PioneerDesktop {
         self.refresh_configured_providers(cx);
         if can_manage {
             self.refresh_gateway_settings(cx);
-            self.refresh_cli_providers_auto(cx);
+            self.load_cli_provider_snapshot(cx);
         }
     }
 
@@ -78,6 +77,7 @@ impl PioneerDesktop {
         self.providers.mark_refresh_started();
 
         let ws_sender = self.gateway.ws_command_sender.clone();
+        let workspace_id = request.params.workspace_id.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let connection_id = request.connection_id;
@@ -91,7 +91,8 @@ impl PioneerDesktop {
                     if !provider_list::provider_list_refresh_matches_connection(
                         connection_id,
                         view.gateway.ws_connection_id,
-                    ) {
+                    ) || view.active_workspace_id() != Some(workspace_id.as_str())
+                    {
                         return;
                     }
 
@@ -121,186 +122,6 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(in crate::app) fn refresh_cli_providers(&mut self, cx: &mut Context<Self>) {
-        self.refresh_cli_providers_with_trigger(
-            provider_list::CLIRuntimeRefreshTrigger::Manual,
-            cx,
-        );
-    }
-
-    pub(in crate::app) fn refresh_cli_providers_auto(&mut self, cx: &mut Context<Self>) {
-        self.refresh_cli_providers_with_trigger(provider_list::CLIRuntimeRefreshTrigger::Auto, cx);
-    }
-
-    fn refresh_cli_providers_with_trigger(
-        &mut self,
-        trigger: provider_list::CLIRuntimeRefreshTrigger,
-        cx: &mut Context<Self>,
-    ) {
-        let now_unix_ms = provider_now_unix_ms();
-        let plan = provider_list::plan_cli_runtime_refresh_with_policy(
-            self.gateway.connection_state == GatewayConnectionState::Connected,
-            self.gateway.ws_connection_id,
-            self.active_workspace_id().map(str::to_owned),
-            self.providers.cli_refresh_status(),
-            trigger,
-            now_unix_ms,
-        );
-        let request = match plan {
-            provider_list::CLIRuntimeRefreshPlan::Send(request) => request,
-            provider_list::CLIRuntimeRefreshPlan::Skip(reason) => {
-                if trigger == provider_list::CLIRuntimeRefreshTrigger::Manual {
-                    self.providers
-                        .apply_cli_runtime_login_message(cli_runtime_refresh_skip_message(reason));
-                    cx.notify();
-                }
-                return;
-            }
-            provider_list::CLIRuntimeRefreshPlan::Unavailable(reason) => {
-                self.apply_cli_provider_refresh_unavailable(reason);
-                return;
-            }
-        };
-
-        self.startup
-            .begin(pioneer_observability::DesktopStartupStage::CliRuntimeRequest);
-        self.providers.mark_cli_runtime_refresh_started(now_unix_ms);
-
-        let ws_sender = self.gateway.ws_command_sender.clone();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            let connection_id = request.connection_id;
-            let params = request.params;
-            async move {
-                let result = cx
-                    .background_spawn(async move { ws_sender.cli_runtime_refresh(params) })
-                    .await;
-
-                let _ = this.update(&mut cx, |view, cx| {
-                    if !provider_list::provider_list_refresh_matches_connection(
-                        connection_id,
-                        view.gateway.ws_connection_id,
-                    ) {
-                        view.startup
-                            .fail(pioneer_observability::DesktopStartupStage::CliRuntimeRequest);
-                        return;
-                    }
-
-                    match result {
-                        Ok(response) => {
-                            view.startup.succeed(
-                                pioneer_observability::DesktopStartupStage::CliRuntimeRequest,
-                            );
-                            view.startup.begin(
-                                pioneer_observability::DesktopStartupStage::CliRuntimeResponseApply,
-                            );
-                            view.providers.apply_cli_runtime_refresh_response(
-                                response,
-                                provider_now_unix_ms(),
-                            );
-                            view.startup.succeed(
-                                pioneer_observability::DesktopStartupStage::CliRuntimeResponseApply,
-                            );
-                            view.startup.begin(
-                                pioneer_observability::DesktopStartupStage::ComposerCapabilityTargetResolve,
-                            );
-                            view.refresh_composer_capability_target_for_selected_provider();
-                            view.startup.succeed(
-                                pioneer_observability::DesktopStartupStage::ComposerCapabilityTargetResolve,
-                            );
-                        }
-                        Err(error) => {
-                            view.providers.apply_cli_runtime_refresh_failed(
-                                format!("{}: {error:#}", t!("providers.error.load_failed")),
-                                provider_now_unix_ms(),
-                            );
-                            warn!(error = %format!("{error:#}"), "failed to fetch CLI runtimes");
-                            view.startup.fail(
-                                pioneer_observability::DesktopStartupStage::CliRuntimeRequest,
-                            );
-                        }
-                    }
-
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    pub(in crate::app) fn refresh_cli_provider(
-        &mut self,
-        runtime_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let now_unix_ms = provider_now_unix_ms();
-        let plan = provider_list::plan_cli_runtime_instance_refresh_with_policy(
-            self.gateway.connection_state == GatewayConnectionState::Connected,
-            self.gateway.ws_connection_id,
-            self.active_workspace_id().map(str::to_owned),
-            runtime_id,
-            self.providers.cli_refresh_status(),
-            provider_list::CLIRuntimeRefreshTrigger::Manual,
-            now_unix_ms,
-        );
-        let request = match plan {
-            provider_list::CLIRuntimeRefreshPlan::Send(request) => request,
-            provider_list::CLIRuntimeRefreshPlan::Skip(reason) => {
-                self.providers
-                    .apply_cli_runtime_login_message(cli_runtime_refresh_skip_message(reason));
-                cx.notify();
-                return;
-            }
-            provider_list::CLIRuntimeRefreshPlan::Unavailable(reason) => {
-                self.apply_cli_provider_refresh_unavailable(reason);
-                return;
-            }
-        };
-
-        self.providers.mark_cli_runtime_refresh_started(now_unix_ms);
-
-        let ws_sender = self.gateway.ws_command_sender.clone();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            let connection_id = request.connection_id;
-            let params = request.params;
-            async move {
-                let result = cx
-                    .background_spawn(async move { ws_sender.cli_runtime_refresh(params) })
-                    .await;
-
-                let _ = this.update(&mut cx, |view, cx| {
-                    if !provider_list::provider_list_refresh_matches_connection(
-                        connection_id,
-                        view.gateway.ws_connection_id,
-                    ) {
-                        return;
-                    }
-
-                    match result {
-                        Ok(response) => {
-                            view.providers.apply_cli_runtime_instance_refresh_response(
-                                response,
-                                provider_now_unix_ms(),
-                            );
-                            view.refresh_composer_capability_target_for_selected_provider();
-                        }
-                        Err(error) => {
-                            view.providers.apply_cli_runtime_refresh_failed(
-                                format!("{}: {error:#}", t!("providers.error.load_failed")),
-                                provider_now_unix_ms(),
-                            );
-                            warn!(error = %format!("{error:#}"), "failed to fetch CLI runtime");
-                        }
-                    }
-
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
     fn apply_provider_list_refresh_unavailable(
         &mut self,
         reason: provider_list::ProviderListRefreshUnavailable,
@@ -316,7 +137,68 @@ impl PioneerDesktop {
         self.providers.apply_unavailable(error);
     }
 
-    fn apply_cli_provider_refresh_unavailable(
+    pub(in crate::app) fn load_cli_provider_snapshot(&mut self, cx: &mut Context<Self>) {
+        if self.providers.cli_loading() {
+            return;
+        }
+        let plan = provider_list::plan_cli_runtime_list(
+            self.gateway.connection_state == GatewayConnectionState::Connected,
+            self.gateway.ws_connection_id,
+            self.active_workspace_id().map(str::to_owned),
+        );
+        let request = match plan {
+            provider_list::CLIRuntimeListPlan::Send(request) => request,
+            provider_list::CLIRuntimeListPlan::Unavailable(reason) => {
+                self.apply_cli_provider_snapshot_load_unavailable(reason);
+                return;
+            }
+        };
+
+        self.providers.mark_cli_runtime_snapshot_load_started();
+        let ws_sender = self.gateway.ws_command_sender.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            let workspace_id = request.params.workspace_id.clone();
+            async move {
+                let result = cx
+                    .background_spawn(async move { ws_sender.cli_runtime_list(request.params) })
+                    .await;
+                let _ = this.update(&mut cx, |view, cx| {
+                    if !provider_list::provider_list_refresh_matches_connection(
+                        request.connection_id,
+                        view.gateway.ws_connection_id,
+                    ) || view.active_workspace_id() != Some(workspace_id.as_str())
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(response) => {
+                            match view.providers.apply_cli_runtime_snapshot_response(response) {
+                                provider_list::CliRuntimeSnapshotLoad::Applied => {
+                                    view.refresh_composer_capability_target_for_selected_provider();
+                                    view.sync_open_model_selector_cli_runtime_snapshot();
+                                }
+                                provider_list::CliRuntimeSnapshotLoad::RetryRequired => {
+                                    view.load_cli_provider_snapshot(cx);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            view.providers
+                                .apply_cli_runtime_snapshot_load_failed(format!(
+                                    "{}: {error:#}",
+                                    t!("providers.error.load_failed")
+                                ))
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn apply_cli_provider_snapshot_load_unavailable(
         &mut self,
         reason: provider_list::ProviderListRefreshUnavailable,
     ) {
@@ -328,26 +210,6 @@ impl PioneerDesktop {
                 t!("providers.error.workspace_not_selected").to_string()
             }
         };
-        self.providers
-            .apply_cli_runtime_refresh_failed(error, provider_now_unix_ms());
-    }
-}
-
-fn provider_now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or_default()
-}
-
-fn cli_runtime_refresh_skip_message(reason: provider_list::CLIRuntimeRefreshSkipReason) -> String {
-    match reason {
-        provider_list::CLIRuntimeRefreshSkipReason::AlreadyRefreshing => {
-            t!("providers.cli.refresh_already_running").to_string()
-        }
-        provider_list::CLIRuntimeRefreshSkipReason::Throttled { .. }
-        | provider_list::CLIRuntimeRefreshSkipReason::BackingOff { .. } => {
-            t!("providers.cli.refresh_wait").to_string()
-        }
+        self.providers.apply_cli_runtime_snapshot_load_failed(error);
     }
 }

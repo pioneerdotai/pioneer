@@ -1039,6 +1039,10 @@ async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
     sync_test_cli_runtime_identities(&processor)
         .await
         .expect("CLI runtime security harness should project agent domain identities");
+    processor
+        .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+        .await
+        .expect("recording CLI runtimes should seed authoritative readiness");
 
     CliRuntimeSecurityHarness {
         rx,
@@ -1470,6 +1474,10 @@ async fn setup_cli_runtime_skill_preflight_harness(
     sync_test_cli_runtime_identities(&processor)
         .await
         .expect("CLI runtime skill harness should materialize its Agent identities");
+    processor
+        .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+        .await
+        .expect("recording CLI runtimes should seed authoritative readiness");
     let event_log = processor.cli_runtime_skill_preflight_test_events();
     cli_session.set_event_log(event_log.clone()).await;
 
@@ -20156,6 +20164,10 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 supported_test_cli_mcp_readiness(runtime_kind),
             ),
         ));
+        processor
+            .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+            .await
+            .expect("recording CLI runtimes should seed authoritative readiness");
         processor.bind_task_bridge().await;
         processor.start_task_event_listener().await;
         seed_ready_fake_mcp_server(
@@ -20667,6 +20679,10 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             )
             .with_cli_runtime_manager_for_tests(cli_manager.clone()),
         ));
+        processor
+            .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+            .await
+            .expect("recording CLI runtimes should seed authoritative readiness");
         processor.bind_task_bridge().await;
         processor.start_task_event_listener().await;
 
@@ -20877,6 +20893,10 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
     ));
+    processor
+        .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+        .await
+        .expect("recording CLI runtimes should seed authoritative readiness");
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
 
@@ -21041,6 +21061,10 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
     ));
+    processor
+        .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+        .await
+        .expect("recording CLI runtimes should seed authoritative readiness");
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
 
@@ -21206,6 +21230,10 @@ async fn assert_detached_native_child_turn_cancellation() {
         )
         .with_cli_runtime_manager_for_tests(cli_manager),
     ));
+    processor
+        .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+        .await
+        .expect("recording CLI runtimes should seed authoritative readiness");
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
 
@@ -33066,8 +33094,15 @@ async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_stale_silent_running_binding_schedules_recovery() {
+#[test]
+fn cli_runtime_stale_silent_running_binding_schedules_recovery() {
+    run_standard_stack_message_test(
+        "cli_runtime_stale_silent_running_binding_schedules_recovery",
+        cli_runtime_stale_silent_running_binding_schedules_recovery_impl(),
+    );
+}
+
+async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;

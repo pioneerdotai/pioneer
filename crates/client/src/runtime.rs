@@ -16,7 +16,7 @@ use crate::{
     },
     notifications::router::{
         ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction,
-        CLIRuntimeRefreshReduction, ConversationEventReduction, McpRefreshReduction,
+        CLIRuntimeSnapshotReduction, ConversationEventReduction, McpRefreshReduction,
         McpServerCatalogChangedReduction, McpServerStatusChangedReduction, SkillsRefreshReduction,
         ThreadArtifactsRefreshReduction, ThreadClosedReduction, ThreadStartedContext,
         ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
@@ -25,8 +25,6 @@ use crate::{
         reduce_artifact_deleted_notification, reduce_artifact_updated_notification,
         reduce_cli_runtime_account_updated_notification,
         reduce_cli_runtime_apps_changed_notification,
-        reduce_cli_runtime_request_opened_notification as reduce_cli_runtime_request_opened_refresh,
-        reduce_cli_runtime_request_resolved_notification as reduce_cli_runtime_request_resolved_refresh,
         reduce_cli_runtime_status_changed_notification, reduce_item_completed_notification,
         reduce_item_delta_notification, reduce_item_recovery_attached_notification,
         reduce_item_recovery_exhausted_notification, reduce_item_recovery_opened_notification,
@@ -134,11 +132,8 @@ pub enum ClientRuntimeNotification {
     ThreadArtifactsRefresh(ThreadArtifactsRefreshReduction),
     ArtifactThreadRefresh(ArtifactThreadRefreshReduction),
     ArtifactDeletedRefresh(ArtifactDeletedRefreshReduction),
-    CLIRuntimeRefresh(CLIRuntimeRefreshReduction),
-    CLIRuntimePendingRequests {
-        refresh: CLIRuntimeRefreshReduction,
-        reduction: PendingRequestsReduction,
-    },
+    CLIRuntimeSnapshot(CLIRuntimeSnapshotReduction),
+    CLIRuntimePendingRequests(PendingRequestsReduction),
     PendingRequests {
         reduction: PendingRequestsReduction,
     },
@@ -604,7 +599,7 @@ pub fn reduce_gateway_notification(
             })
         }
         GatewayNotification::CLIRuntimeStatusChanged(notification) => {
-            Some(ClientRuntimeNotification::CLIRuntimeRefresh(
+            Some(ClientRuntimeNotification::CLIRuntimeSnapshot(
                 reduce_cli_runtime_status_changed_notification(
                     notification,
                     context.active_workspace_id,
@@ -612,7 +607,7 @@ pub fn reduce_gateway_notification(
             ))
         }
         GatewayNotification::CLIRuntimeAccountUpdated(notification) => {
-            Some(ClientRuntimeNotification::CLIRuntimeRefresh(
+            Some(ClientRuntimeNotification::CLIRuntimeSnapshot(
                 reduce_cli_runtime_account_updated_notification(
                     notification,
                     context.active_workspace_id,
@@ -620,20 +615,16 @@ pub fn reduce_gateway_notification(
             ))
         }
         GatewayNotification::CLIRuntimeRequestOpened(notification) => {
-            let refresh = reduce_cli_runtime_request_opened_refresh(
-                notification.clone(),
-                context.active_workspace_id,
-            );
             let reduction = reduce_cli_runtime_request_opened_notification(notification);
-            Some(ClientRuntimeNotification::CLIRuntimePendingRequests { refresh, reduction })
+            Some(ClientRuntimeNotification::CLIRuntimePendingRequests(
+                reduction,
+            ))
         }
         GatewayNotification::CLIRuntimeRequestResolved(notification) => {
-            let refresh = reduce_cli_runtime_request_resolved_refresh(
-                notification.clone(),
-                context.active_workspace_id,
-            );
             let reduction = reduce_cli_runtime_request_resolved_notification(notification);
-            Some(ClientRuntimeNotification::CLIRuntimePendingRequests { refresh, reduction })
+            Some(ClientRuntimeNotification::CLIRuntimePendingRequests(
+                reduction,
+            ))
         }
         GatewayNotification::TurnPermissionRequestOpened(notification) => {
             Some(ClientRuntimeNotification::PendingRequests {
@@ -646,7 +637,7 @@ pub fn reduce_gateway_notification(
             })
         }
         GatewayNotification::CLIRuntimeAppsChanged(notification) => {
-            Some(ClientRuntimeNotification::CLIRuntimeRefresh(
+            Some(ClientRuntimeNotification::CLIRuntimeSnapshot(
                 reduce_cli_runtime_apps_changed_notification(
                     notification,
                     context.active_workspace_id,

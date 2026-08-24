@@ -795,6 +795,11 @@ impl crate::traits::Provider for TelnyxProvider {
             })
             .collect())
     }
+
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        self.list_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
 }
 
 #[cfg(test)]

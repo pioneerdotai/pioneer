@@ -12,8 +12,10 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 use opentelemetry_sdk::trace::{
     SdkTracer, SdkTracerProvider, SpanData, SpanExporter as SdkSpanExporter,
 };
-use std::future::Future;
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use url::{Host, Url};
 
@@ -81,6 +83,11 @@ pub struct OtlpTelemetryConfig {
     pub export_interval: Duration,
     pub export_timeout: Duration,
     pub deployment_environment: Option<String>,
+    /// Version of the executable application that owns this telemetry
+    /// pipeline. Mobile embeds observability through `pioneer-client-ffi`, so
+    /// its application version cannot be inferred from this crate's package
+    /// version.
+    pub service_version: Option<String>,
 }
 
 pub(crate) struct ObservabilityState {
@@ -93,6 +100,7 @@ pub(crate) struct ObservabilityState {
 }
 
 static OBSERVABILITY: OnceLock<ObservabilityState> = OnceLock::new();
+static OBSERVABILITY_FLUSH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 pub fn init_otlp_observability(config: OtlpTelemetryConfig) -> Result<()> {
     init_otlp_observability_for(TelemetryTarget::Gateway, config)
@@ -133,7 +141,11 @@ pub fn init_otlp_observability_for(
         .build()
         .context("failed to build OTLP/HTTP traces exporter")?;
 
-    let resource = resource(target, config.deployment_environment.as_deref());
+    let resource = resource(
+        target,
+        config.deployment_environment.as_deref(),
+        config.service_version.as_deref(),
+    );
     let meter_provider = SdkMeterProvider::builder()
         .with_resource(resource.clone())
         .with_reader(metric_reader)
@@ -191,20 +203,89 @@ pub fn shutdown_observability(timeout: Duration) -> Result<()> {
     }
 }
 
+/// Flushes all currently recorded signals without shutting the pipeline down.
+///
+/// This is primarily used by short-lived/mobile lifecycle boundaries where
+/// waiting for the periodic metrics reader would risk losing the only startup
+/// sample. Callers that run on a UI thread must execute it in the background.
+pub fn force_flush_observability() -> Result<()> {
+    let Some(state) = OBSERVABILITY.get() else {
+        return Ok(());
+    };
+
+    let trace_result = state
+        .tracer_provider
+        .force_flush()
+        .context("failed to flush OTLP traces pipeline");
+    let metrics_result = state
+        .meter_provider
+        .force_flush()
+        .context("failed to flush OTLP metrics pipeline");
+
+    match (trace_result, metrics_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(trace_error), Ok(())) => Err(trace_error),
+        (Ok(()), Err(metrics_error)) => Err(metrics_error),
+        (Err(trace_error), Err(metrics_error)) => Err(anyhow::anyhow!(
+            "{trace_error:#}; additionally, {metrics_error:#}"
+        )),
+    }
+}
+
+/// Schedules a best-effort flush without blocking an application/UI thread.
+///
+/// Startup is recorded only once per process and can otherwise remain in the
+/// periodic metrics buffer for tens of seconds. A shared singleflight guard
+/// keeps Desktop and Mobile lifecycle boundaries from creating redundant
+/// exporter threads.
+pub fn schedule_observability_flush() {
+    if OBSERVABILITY.get().is_none()
+        || !super::telemetry_enabled()
+        || OBSERVABILITY_FLUSH_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+
+    if std::thread::Builder::new()
+        .name("pioneer-telemetry-flush".to_owned())
+        .spawn(|| {
+            if let Err(error) = force_flush_observability() {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "failed to flush observability pipeline"
+                );
+            }
+            OBSERVABILITY_FLUSH_IN_FLIGHT.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        OBSERVABILITY_FLUSH_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
 pub(crate) fn state() -> Option<&'static ObservabilityState> {
     OBSERVABILITY.get()
 }
 
-fn resource(target: TelemetryTarget, deployment_environment: Option<&str>) -> Resource {
+fn resource(
+    target: TelemetryTarget,
+    deployment_environment: Option<&str>,
+    service_version: Option<&str>,
+) -> Resource {
     let deployment_environment = deployment_environment.unwrap_or(if cfg!(debug_assertions) {
         "development"
     } else {
         "production"
     });
+    let service_version = service_version
+        .map(str::trim)
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
     Resource::builder_empty()
         .with_service_name(target.service_name())
         .with_attributes([
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            KeyValue::new("service.version", service_version.to_owned()),
             KeyValue::new(
                 "deployment.environment.name",
                 deployment_environment.to_owned(),
@@ -227,6 +308,11 @@ fn validate_config(config: &OtlpTelemetryConfig) -> Result<()> {
         && !matches!(environment, "development" | "production")
     {
         bail!("OTLP deployment environment must be development or production");
+    }
+    if let Some(version) = config.service_version.as_deref()
+        && (version.trim().is_empty() || version.len() > 128)
+    {
+        bail!("OTLP service version must contain between 1 and 128 bytes");
     }
     Ok(())
 }
@@ -265,13 +351,11 @@ impl<E> PushMetricExporter for ConsentGatedMetricExporter<E>
 where
     E: PushMetricExporter,
 {
-    fn export(&self, metrics: &ResourceMetrics) -> impl Future<Output = OTelSdkResult> + Send {
-        async move {
-            if !super::telemetry_enabled() {
-                return Ok(());
-            }
-            self.inner.export(metrics).await
+    async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+        if !super::telemetry_enabled() {
+            return Ok(());
         }
+        self.inner.export(metrics).await
     }
 
     fn force_flush(&self) -> OTelSdkResult {
@@ -300,13 +384,11 @@ impl<E> SdkSpanExporter for ConsentGatedSpanExporter<E>
 where
     E: SdkSpanExporter,
 {
-    fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> + Send {
-        async move {
-            if !super::telemetry_enabled() {
-                return Ok(());
-            }
-            self.inner.export(batch).await
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        if !super::telemetry_enabled() {
+            return Ok(());
         }
+        self.inner.export(batch).await
     }
 
     fn force_flush(&self) -> OTelSdkResult {
@@ -359,12 +441,10 @@ mod tests {
     }
 
     impl PushMetricExporter for CountingMetricExporter {
-        fn export(&self, _metrics: &ResourceMetrics) -> impl Future<Output = OTelSdkResult> + Send {
+        async fn export(&self, _metrics: &ResourceMetrics) -> OTelSdkResult {
             let exports = self.exports.clone();
-            async move {
-                exports.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
+            exports.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
         fn force_flush(&self) -> OTelSdkResult {
@@ -386,12 +466,10 @@ mod tests {
     }
 
     impl SpanExporter for CountingSpanExporter {
-        fn export(&self, _batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> + Send {
+        async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
             let exports = self.exports.clone();
-            async move {
-                exports.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
+            exports.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
         fn set_resource(&mut self, _resource: &Resource) {}
@@ -414,6 +492,7 @@ mod tests {
             export_interval: Duration::from_secs(30),
             export_timeout: Duration::from_secs(3),
             deployment_environment: None,
+            service_version: None,
         }
     }
 
@@ -440,6 +519,22 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn service_version_is_bounded_and_non_empty_when_overridden() {
+        let mut valid = config(
+            "https://telemetry.example/v1/metrics",
+            "https://telemetry.example/v1/traces",
+        );
+        valid.service_version = Some("1.2.3+456".to_owned());
+        assert!(validate_config(&valid).is_ok());
+
+        valid.service_version = Some("   ".to_owned());
+        assert!(validate_config(&valid).is_err());
+
+        valid.service_version = Some("v".repeat(129));
+        assert!(validate_config(&valid).is_err());
     }
 
     #[test]

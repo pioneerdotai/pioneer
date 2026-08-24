@@ -16,6 +16,8 @@ struct ClientMobileStartupRecordRequest {
     export_interval_ms: u64,
     export_timeout_ms: u64,
     deployment_environment: String,
+    #[serde(default)]
+    service_version: Option<String>,
     started_at_unix_ms: u64,
     duration_ms: f64,
     outcome: String,
@@ -30,6 +32,8 @@ struct ClientMobileStartupStageTiming {
     duration_ms: f64,
     #[serde(default)]
     failed: bool,
+    #[serde(default)]
+    cancelled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -42,22 +46,10 @@ pub(crate) fn record_mobile_startup(
 ) -> Result<ClientMobileStartupRecordResult, String> {
     let request = serde_json::from_str::<ClientMobileStartupRecordRequest>(input_json)
         .map_err(|error| format!("invalid mobile startup report: {error}"))?;
-    pioneer_observability::set_telemetry_enabled(request.enabled);
     if !request.enabled {
+        pioneer_observability::set_telemetry_enabled(false);
         return Ok(ClientMobileStartupRecordResult { recorded: false });
     }
-
-    pioneer_observability::init_otlp_observability_for(
-        TelemetryTarget::Mobile,
-        OtlpTelemetryConfig {
-            metrics_endpoint: request.metrics_endpoint,
-            traces_endpoint: request.traces_endpoint,
-            export_interval: Duration::from_millis(request.export_interval_ms),
-            export_timeout: Duration::from_millis(request.export_timeout_ms),
-            deployment_environment: Some(request.deployment_environment),
-        },
-    )
-    .map_err(|error| format!("failed to initialize mobile observability: {error:#}"))?;
 
     let duration = duration_from_millis(request.duration_ms, "duration_ms")?;
     let outcome = MobileStartupOutcome::parse(request.outcome.as_str())
@@ -79,14 +71,33 @@ pub(crate) fn record_mobile_startup(
             {
                 return Err("mobile startup stage is outside the startup timeline".to_owned());
             }
+            validate_stage_outcome(stage.failed, stage.cancelled)?;
             Ok(MobileStartupStageTiming {
                 stage: parsed,
                 start_offset,
                 duration: stage_duration,
                 failed: stage.failed,
+                cancelled: stage.cancelled,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+
+    // Validate the complete FFI payload before initializing the process-wide
+    // telemetry pipeline. A malformed first report must not permanently claim
+    // the OnceLock with an unusable configuration and no recorded event.
+    pioneer_observability::set_telemetry_enabled(true);
+    pioneer_observability::init_otlp_observability_for(
+        TelemetryTarget::Mobile,
+        OtlpTelemetryConfig {
+            metrics_endpoint: request.metrics_endpoint,
+            traces_endpoint: request.traces_endpoint,
+            export_interval: Duration::from_millis(request.export_interval_ms),
+            export_timeout: Duration::from_millis(request.export_timeout_ms),
+            deployment_environment: Some(request.deployment_environment),
+            service_version: request.service_version,
+        },
+    )
+    .map_err(|error| format!("failed to initialize mobile observability: {error:#}"))?;
 
     pioneer_observability::record_mobile_startup(MobileStartupReport {
         started_at: UNIX_EPOCH + Duration::from_millis(request.started_at_unix_ms),
@@ -94,7 +105,18 @@ pub(crate) fn record_mobile_startup(
         outcome,
         stages,
     });
+    // The mobile app may move to the background before the periodic metrics
+    // interval elapses. Flush this single lifecycle sample immediately, but
+    // never block the JavaScript/UI thread on telemetry network I/O.
+    pioneer_observability::schedule_observability_flush();
     Ok(ClientMobileStartupRecordResult { recorded: true })
+}
+
+fn validate_stage_outcome(failed: bool, cancelled: bool) -> Result<(), String> {
+    if failed && cancelled {
+        return Err("mobile startup stage cannot be both failed and cancelled".to_owned());
+    }
+    Ok(())
 }
 
 fn duration_from_millis(value: f64, field: &str) -> Result<Duration, String> {
@@ -106,12 +128,20 @@ fn duration_from_millis(value: f64, field: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::duration_from_millis;
+    use super::{duration_from_millis, validate_stage_outcome};
 
     #[test]
     fn startup_durations_are_finite_and_bounded() {
         assert!(duration_from_millis(250.0, "duration").is_ok());
         assert!(duration_from_millis(f64::NAN, "duration").is_err());
         assert!(duration_from_millis(700_000.0, "duration").is_err());
+    }
+
+    #[test]
+    fn mobile_stage_outcomes_are_unambiguous() {
+        assert!(validate_stage_outcome(false, false).is_ok());
+        assert!(validate_stage_outcome(true, false).is_ok());
+        assert!(validate_stage_outcome(false, true).is_ok());
+        assert!(validate_stage_outcome(true, true).is_err());
     }
 }

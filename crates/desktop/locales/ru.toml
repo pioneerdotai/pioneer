@@ -533,11 +533,8 @@ delete_failed = "Не удалось удалить API ключ"
 
 [providers.cli]
 title = "CLI провайдеры"
+description = "Готовность проверяется и обновляется Gateway."
 refreshing = "Обновление"
-updated = "Обновлено"
-stale = "Данные устарели"
-refresh_failed = "Ошибка обновления"
-not_refreshed = "Еще не обновлялось"
 empty = "CLI провайдеры не настроены"
 diagnostics = "Диагностика"
 native_events = "Нативные события"
@@ -546,8 +543,6 @@ copied_diagnostics = "Скопирована диагностика для"
 login_code = "Код"
 login_open = "Открыть"
 login_started = "Вход CLI запущен"
-refresh_already_running = "Обновление CLI провайдеров уже выполняется."
-refresh_wait = "Обновление CLI провайдеров ожидает согласно политике обновления."
 
 [providers.cli.mcp]
 runtime_not_ready = "Runtime не готов"

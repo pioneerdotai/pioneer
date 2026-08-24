@@ -440,6 +440,11 @@ pub struct CLIRuntimeListParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct CLIRuntimeListResponse {
+    /// Monotonic revision of the authoritative Gateway snapshot for this
+    /// workspace. Clients use it to reject late list responses that would
+    /// otherwise overwrite newer status notifications.
+    #[serde(default)]
+    pub revision: u64,
     pub runtimes: Vec<RuntimeSummary>,
 }
 
@@ -465,15 +470,28 @@ pub struct CLIRuntimeStatusResponse {
     pub runtime: RuntimeSummary,
 }
 
+/// Legacy protocol-v1 alias for reading the Gateway-owned readiness snapshot.
+///
+/// Despite the method's historical `refresh` name, this request never starts
+/// provider work. The Gateway supervisor owns probing and publishes newer
+/// snapshots asynchronously through `cli_runtime/status_changed`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CLIRuntimeRefreshParams {
     pub workspace_id: String,
+    /// Optional legacy validation target. Gateway readiness is maintained as
+    /// one atomic workspace snapshot, so the response still contains every
+    /// authorized runtime in the workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct CLIRuntimeRefreshResponse {
+    /// Revision of the complete cached workspace snapshot. A later
+    /// Gateway-owned reconciliation may publish a newer revision through
+    /// `cli_runtime/status_changed`.
+    #[serde(default)]
+    pub revision: u64,
     pub runtimes: Vec<RuntimeSummary>,
 }
 
@@ -736,6 +754,16 @@ pub struct CLIRuntimeRequestRespondResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct CLIRuntimeStatusChangedNotification {
     pub workspace_id: String,
+    /// Monotonic workspace change revision. Every emitted delta has a distinct
+    /// revision, so clients can detect a dropped notification and reload the
+    /// complete authoritative snapshot.
+    #[serde(default)]
+    pub revision: u64,
+    /// Removes `runtime` from the client snapshot. The runtime payload remains
+    /// present so older clients safely render it as disabled instead of
+    /// retaining a stale ready entry.
+    #[serde(default)]
+    pub removed: bool,
     pub runtime: RuntimeSummary,
 }
 

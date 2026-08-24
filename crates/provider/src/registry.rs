@@ -7,7 +7,7 @@ use futures_util::stream::BoxStream;
 use sha2::{Digest, Sha256};
 
 use crate::factory::create_provider_with_timeout_policy_and_proxy_and_authority;
-use crate::traits::Provider;
+use crate::traits::{Provider, ProviderWarmupOutcome};
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
     ProviderFailureClassification, ProviderTimeoutPolicy, StreamChunk,
@@ -104,7 +104,7 @@ impl Provider for AuthorityBoundProvider {
         self.inner.embed(request).await
     }
 
-    async fn warmup(&self) -> Result<()> {
+    async fn warmup(&self) -> Result<ProviderWarmupOutcome> {
         self.inner.warmup().await
     }
 }

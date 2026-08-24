@@ -125,6 +125,7 @@ fn main() {
         .map(desktop_telemetry_enabled)
         .unwrap_or(true);
     pioneer_observability::set_telemetry_enabled(telemetry_enabled);
+    startup.bind_consent();
     consent_stage.succeed();
 
     if let Some(config) = startup_config.as_ref() {
@@ -138,6 +139,7 @@ fn main() {
                 export_interval: Duration::from_millis(config.gateway.telemetry.export_interval_ms),
                 export_timeout: Duration::from_millis(config.gateway.telemetry.export_timeout_ms),
                 deployment_environment: None,
+                service_version: None,
             },
         )
         .is_ok()

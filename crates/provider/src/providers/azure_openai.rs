@@ -933,6 +933,11 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             })
             .collect())
     }
+
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        self.list_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
 }
 
 fn apply_azure_openai_reasoning_capabilities(

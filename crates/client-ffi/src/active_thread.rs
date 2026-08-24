@@ -1394,7 +1394,7 @@ impl ClientFfiActiveThreadState {
             | ClientRuntimeNotification::ArtifactThreadRefresh(_)
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_)
             | ClientRuntimeNotification::ThreadParticipantsChanged(_)
-            | ClientRuntimeNotification::CLIRuntimeRefresh(_)
+            | ClientRuntimeNotification::CLIRuntimeSnapshot(_)
             | ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
             | ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(_)
             | ClientRuntimeNotification::GatewayVoiceInputStatusChanged(_)
@@ -1420,7 +1420,7 @@ impl ClientFfiActiveThreadState {
                 self.reconcile_semantic_timeline(runtime, reconcile_requests);
                 patch
             }
-            ClientRuntimeNotification::CLIRuntimePendingRequests { reduction, .. }
+            ClientRuntimeNotification::CLIRuntimePendingRequests(reduction)
             | ClientRuntimeNotification::PendingRequests { reduction } => {
                 let mut inner = self
                     .inner
@@ -2081,9 +2081,8 @@ fn selected_execution_target_from_runtimes(
         });
     };
 
-    let execution_backend =
-        resolve_cli_runtime_execution_backend(Some(provider_key), runtimes, None)
-            .map_err(anyhow::Error::msg)?;
+    let execution_backend = resolve_cli_runtime_execution_backend(Some(provider_key), runtimes)
+        .map_err(anyhow::Error::msg)?;
     Ok(SelectedExecutionTarget { execution_backend })
 }
 
@@ -2618,7 +2617,7 @@ mod tests {
     }
 
     #[test]
-    fn text_and_voice_submission_preserves_capabilities_across_catalog_readiness_states() {
+    fn text_and_voice_submission_preserves_capabilities_but_requires_ready_cli_runtime() {
         let capabilities = vec![
             capability("user", "user"),
             mcp_capability(),
@@ -2641,15 +2640,8 @@ mod tests {
                 runtime_summary("mcp", false, true, RuntimeStatus::Ready),
             ),
             (
-                "live-degraded",
-                runtime_summary(
-                    "combined",
-                    true,
-                    true,
-                    RuntimeStatus::Degraded {
-                        message: "non-MCP diagnostic".to_owned(),
-                    },
-                ),
+                "combined-catalog",
+                runtime_summary("combined", true, true, RuntimeStatus::Ready),
             ),
         ];
         let expected_ids = [0, 1, 2, 3, 5]
@@ -2698,44 +2690,49 @@ mod tests {
             );
         }
 
-        let stale_runtime = runtime_summary(
-            "stale",
-            true,
-            true,
-            RuntimeStatus::Error {
-                message: "probe stale".to_owned(),
-            },
-        );
-        let stale = selected_execution_target_from_runtimes(
-            Some("cli_runtime:stale"),
-            std::slice::from_ref(&stale_runtime),
-        )
-        .expect("stale runtime still resolves its execution backend");
-        let stale_plan = plan_composer_submission(
-            Some("cli_runtime:stale"),
-            "typed",
-            false,
-            capabilities.as_slice(),
-        );
-        assert!(stale.execution_backend.is_some());
-        assert_eq!(
-            stale_plan
-                .capabilities
-                .iter()
-                .map(|capability| capability.id.clone())
-                .collect::<Vec<_>>(),
-            expected_ids
-        );
-        assert_eq!(
-            stale_plan
-                .removed
-                .iter()
-                .map(|removed| removed.reason)
-                .collect::<Vec<_>>(),
-            vec![
-                pioneer_client::composer::capabilities::ComposerCapabilityRemovalReason::SkillSourceNotExportable,
-            ]
-        );
+        for (case, status) in [
+            (
+                "degraded",
+                RuntimeStatus::Degraded {
+                    message: "probe degraded".to_owned(),
+                },
+            ),
+            (
+                "error",
+                RuntimeStatus::Error {
+                    message: "probe failed".to_owned(),
+                },
+            ),
+        ] {
+            let runtime = runtime_summary(case, true, true, status);
+            let provider = format!("cli_runtime:{case}");
+            assert!(
+                selected_execution_target_from_runtimes(
+                    Some(provider.as_str()),
+                    std::slice::from_ref(&runtime),
+                )
+                .is_err(),
+                "{case} runtime must not be used for execution"
+            );
+
+            // Catalog reconciliation is independent of readiness and must not
+            // destroy the user's capability selection while Gateway retries
+            // the provider in the background.
+            let plan = plan_composer_submission(
+                Some(provider.as_str()),
+                "typed",
+                false,
+                capabilities.as_slice(),
+            );
+            assert_eq!(
+                plan.capabilities
+                    .iter()
+                    .map(|capability| capability.id.clone())
+                    .collect::<Vec<_>>(),
+                expected_ids,
+                "{case}"
+            );
+        }
 
         let native = selected_execution_target_from_runtimes(Some("openai"), &[])
             .expect("native provider should resolve");

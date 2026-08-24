@@ -70,9 +70,6 @@ pub enum DesktopStartupStage {
     GatewaySettingsLoad,
     WorkspaceLoad,
     ProviderLoad,
-    CliRuntimeRequest,
-    CliRuntimeResponseApply,
-    ComposerCapabilityTargetResolve,
     ThreadTreeLoad,
     ActiveThreadResolve,
     ActiveThreadBootstrap,
@@ -101,9 +98,6 @@ impl DesktopStartupStage {
             Self::GatewaySettingsLoad => "gateway_settings.load",
             Self::WorkspaceLoad => "workspace.load",
             Self::ProviderLoad => "providers.load",
-            Self::CliRuntimeRequest => "cli_runtimes.request",
-            Self::CliRuntimeResponseApply => "cli_runtimes.response.apply",
-            Self::ComposerCapabilityTargetResolve => "composer.capability_target.resolve",
             Self::ThreadTreeLoad => "thread_tree.load",
             Self::ActiveThreadResolve => "active_thread.resolve",
             Self::ActiveThreadBootstrap => "active_thread.bootstrap",
@@ -234,6 +228,7 @@ pub struct MobileStartupStageTiming {
     pub start_offset: Duration,
     pub duration: Duration,
     pub failed: bool,
+    pub cancelled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +240,7 @@ pub struct MobileStartupReport {
 }
 
 pub fn record_mobile_startup(report: MobileStartupReport) {
+    let (telemetry_enabled, consent_generation) = super::telemetry_consent_snapshot();
     let stages = report
         .stages
         .into_iter()
@@ -252,16 +248,17 @@ pub fn record_mobile_startup(report: MobileStartupReport) {
             name: stage.stage.as_str(),
             started_at: end_timestamp(report.started_at, stage.start_offset),
             elapsed: stage.duration,
-            outcome: if stage.failed {
-                StageOutcome::Error
-            } else {
-                StageOutcome::Ok
+            outcome: match (stage.failed, stage.cancelled) {
+                (true, _) => StageOutcome::Error,
+                (false, true) => StageOutcome::Cancelled,
+                (false, false) => StageOutcome::Ok,
             },
         })
         .collect();
     emit_startup_observability(&StartupSnapshot {
         target: TelemetryTarget::Mobile,
         root_name: "mobile.startup",
+        consent_generation: telemetry_enabled.then_some(consent_generation),
         started_at: report.started_at,
         elapsed: report.duration,
         stages,
@@ -274,6 +271,7 @@ pub fn record_mobile_startup(report: MobileStartupReport) {
 enum StageOutcome {
     Ok,
     Error,
+    Cancelled,
 }
 
 impl StageOutcome {
@@ -281,6 +279,7 @@ impl StageOutcome {
         match self {
             Self::Ok => "ok",
             Self::Error => "error",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -290,6 +289,10 @@ impl StageOutcome {
             Self::Error => Status::Error {
                 description: std::borrow::Cow::Borrowed("startup stage failed"),
             },
+            // Cancellation means the application reached a valid terminal
+            // branch (for example setup UI) before this stage was required.
+            // It is observable, but it is not a failed operation.
+            Self::Cancelled => Status::Unset,
         }
     }
 }
@@ -304,6 +307,7 @@ struct StageRecord {
 
 #[derive(Debug)]
 struct StartupState {
+    consent_generation: Option<u64>,
     started_at: SystemTime,
     started_instant: Instant,
     stages: Vec<StageRecord>,
@@ -319,11 +323,23 @@ impl StartupTimeline {
     fn start() -> Self {
         Self {
             inner: Arc::new(Mutex::new(StartupState {
+                // Startup begins before the persisted preference is known.
+                // The application binds the timeline to the loaded consent
+                // generation before initializing the exporter.
+                consent_generation: None,
                 started_at: SystemTime::now(),
                 started_instant: Instant::now(),
                 stages: Vec::new(),
                 finalized: false,
             })),
+        }
+    }
+
+    fn bind_consent(&self) {
+        let (enabled, generation) = super::telemetry_consent_snapshot();
+        let mut state = self.lock();
+        if !state.finalized {
+            state.consent_generation = enabled.then_some(generation);
         }
     }
 
@@ -353,6 +369,7 @@ impl StartupTimeline {
             StartupSnapshot {
                 target,
                 root_name,
+                consent_generation: state.consent_generation,
                 started_at: state.started_at,
                 elapsed: state.started_instant.elapsed(),
                 stages: state.stages.clone(),
@@ -361,9 +378,7 @@ impl StartupTimeline {
             }
         };
 
-        if super::telemetry_enabled() {
-            emit_startup_observability(&snapshot);
-        }
+        emit_startup_observability(&snapshot);
     }
 
     fn record_stage(
@@ -402,6 +417,10 @@ struct StartupStageGuard {
 impl StartupStageGuard {
     fn succeed(mut self) {
         self.finish(StageOutcome::Ok);
+    }
+
+    fn cancel(mut self) {
+        self.finish(StageOutcome::Cancelled);
     }
 
     fn finish(&mut self, outcome: StageOutcome) {
@@ -443,9 +462,14 @@ impl GatewayStartupTrace {
         }
     }
 
-    #[must_use]
+    #[must_use = "the startup stage guard must be completed or deliberately dropped"]
     pub fn stage(&self, stage: GatewayStartupStage) -> GatewayStartupStageGuard {
         GatewayStartupStageGuard(self.timeline.stage(stage.as_str()))
+    }
+
+    /// Binds early startup timings to the persisted consent decision.
+    pub fn bind_consent(&self) {
+        self.timeline.bind_consent();
     }
 
     pub fn finish_success(&self) {
@@ -487,9 +511,14 @@ impl DesktopStartupTrace {
         }
     }
 
-    #[must_use]
+    #[must_use = "the startup stage guard must be completed or deliberately dropped"]
     pub fn stage(&self, stage: DesktopStartupStage) -> DesktopStartupStageGuard {
         DesktopStartupStageGuard(self.timeline.stage(stage.as_str()))
+    }
+
+    /// Binds early startup timings to the persisted consent decision.
+    pub fn bind_consent(&self) {
+        self.timeline.bind_consent();
     }
 
     pub fn finish(&self, outcome: DesktopStartupOutcome) {
@@ -509,11 +538,16 @@ impl DesktopStartupStageGuard {
     pub fn succeed(self) {
         self.0.succeed();
     }
+
+    pub fn cancel(self) {
+        self.0.cancel();
+    }
 }
 
 struct StartupSnapshot {
     target: TelemetryTarget,
     root_name: &'static str,
+    consent_generation: Option<u64>,
     started_at: SystemTime,
     elapsed: Duration,
     stages: Vec<StageRecord>,
@@ -533,7 +567,7 @@ impl StartupSnapshot {
 }
 
 fn emit_startup_observability(snapshot: &StartupSnapshot) {
-    if !super::telemetry_enabled() {
+    if !super::telemetry_sample_allowed(snapshot.consent_generation) {
         return;
     }
     let Some(state) = super::telemetry::state() else {
@@ -627,6 +661,17 @@ mod tests {
         assert_eq!(state.stages[0].outcome, StageOutcome::Ok);
         assert_eq!(state.stages[1].name, "settings.load");
         assert_eq!(state.stages[1].outcome, StageOutcome::Error);
+    }
+
+    #[test]
+    fn cancelled_stage_is_observable_without_becoming_an_error() {
+        let timeline = super::StartupTimeline::start();
+        timeline.stage("test.cancelled").cancel();
+
+        let state = timeline.lock();
+        assert_eq!(state.stages.len(), 1);
+        assert_eq!(state.stages[0].outcome, StageOutcome::Cancelled);
+        assert_eq!(state.stages[0].outcome.as_str(), "cancelled");
     }
 
     #[test]

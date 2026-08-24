@@ -48,7 +48,7 @@ use pioneer_config::{
 };
 use pioneer_crud::NewCliRuntimeNativeEvent;
 use pioneer_observability::{
-    GatewayCliRuntimeKind, GatewayCliRuntimeRefreshStage, GatewayCliRuntimeRefreshTrace,
+    GatewayCliRuntimeKind, GatewayProviderWarmupStage, GatewayProviderWarmupTrace,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -166,7 +166,7 @@ impl CLIRuntimeActivityEvidence {
 /// account identity and raw process output belong to Gateway management.
 /// Keep the capability/model metadata used by composers while returning a
 /// deliberately non-secret presentation of failures.
-fn collaborator_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
+pub(super) fn collaborator_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
     runtime.account = None;
     runtime.binary_path = None;
     runtime.home_path = None;
@@ -204,12 +204,41 @@ fn collaborator_safe_runtime_diagnostics(
         .collect()
 }
 
+fn cli_runtime_ready_for_model_discovery(runtime: &RuntimeSummary) -> bool {
+    runtime.enabled && matches!(runtime.status, RuntimeStatus::Ready)
+}
+
 impl MessageProcessor {
     fn uses_collaborator_cli_disclosure(request_context: &RequestContext) -> bool {
         crate::authorization::AuthorizationService::new().role_disclosure_policy(
             request_context.principal().kind,
             request_context.principal().role_key.as_ref(),
         ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator)
+    }
+
+    async fn ensure_cli_runtime_discovery_target_allowed(
+        &self,
+        request_context: &RequestContext,
+        request_id: &RequestId,
+        runtime_id: &str,
+    ) -> bool {
+        if AuthorizationService::new().cli_runtime_allowed(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            runtime_id,
+        ) {
+            return true;
+        }
+
+        // Use the same response as an unknown runtime so discovery endpoints
+        // cannot be used as an identifier oracle across role boundaries.
+        self.send_unknown_cli_runtime_error(
+            request_context.connection_id(),
+            request_id.clone(),
+            runtime_id,
+        )
+        .await;
+        false
     }
 
     async fn cli_binding_operator_details_allowed(
@@ -288,8 +317,11 @@ impl MessageProcessor {
             return;
         };
 
-        let mut runtimes = match self.load_cli_runtime_summaries(workspace_id.as_str()).await {
-            Ok(runtimes) => runtimes,
+        let snapshot = match self
+            .cli_runtime_readiness_snapshot_or_seed(workspace_id.as_str())
+            .await
+        {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -303,6 +335,8 @@ impl MessageProcessor {
                 return;
             }
         };
+        let revision = snapshot.revision;
+        let mut runtimes = snapshot.runtimes;
         runtimes.retain(|runtime| {
             crate::authorization::AuthorizationService::new().cli_runtime_allowed(
                 request_context.principal().kind,
@@ -321,7 +355,7 @@ impl MessageProcessor {
             connection_id,
             request_id,
             methods::CLI_RUNTIME_LIST,
-            &CLIRuntimeListResponse { runtimes },
+            &CLIRuntimeListResponse { revision, runtimes },
         )
         .await;
     }
@@ -344,9 +378,19 @@ impl MessageProcessor {
         else {
             return;
         };
+        if !self
+            .ensure_cli_runtime_discovery_target_allowed(
+                request_context,
+                &request_id,
+                params.runtime_id.as_str(),
+            )
+            .await
+        {
+            return;
+        }
 
         let Some(mut runtime) = self
-            .load_cli_runtime_live_summary_by_id(
+            .load_cli_runtime_summary_by_id(
                 connection_id,
                 request_id.clone(),
                 workspace_id.as_str(),
@@ -387,6 +431,16 @@ impl MessageProcessor {
         else {
             return;
         };
+        if !self
+            .ensure_cli_runtime_discovery_target_allowed(
+                request_context,
+                &request_id,
+                params.runtime_id.as_str(),
+            )
+            .await
+        {
+            return;
+        }
 
         let Some(mut runtime) = self
             .load_cli_runtime_summary_by_id(
@@ -418,9 +472,10 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeRefreshParams,
     ) {
-        let refresh_trace = GatewayCliRuntimeRefreshTrace::start();
+        // Protocol-v1 compatibility alias. Readiness is owned exclusively by
+        // the Gateway supervisor; this request only returns its current
+        // authoritative snapshot and must never schedule a provider probe.
         let connection_id = request_context.connection_id();
-        let workspace_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::WorkspaceValidate);
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -432,83 +487,63 @@ impl MessageProcessor {
         else {
             return;
         };
-        workspace_stage.succeed();
-
-        let catalog_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::CatalogLoad);
-        let instances = match self.load_cli_runtime_instances() {
-            Ok(instances) => {
-                catalog_stage.succeed();
-                instances
-            }
+        let snapshot = match self
+            .cli_runtime_readiness_snapshot_or_seed(workspace_id.as_str())
+            .await
+        {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.send_error(
                     connection_id,
                     cli_runtime_discovery_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to load CLI runtime catalog: {error:#}"),
+                        format!("failed to load CLI runtime snapshot: {error:#}"),
                     ),
                 )
                 .await;
                 return;
             }
         };
+        let revision = snapshot.revision;
+        let mut runtimes = snapshot.runtimes;
 
-        let instances_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::InstancesSelect);
-        let instances = if let Some(runtime_id) = params.runtime_id {
-            match find_cli_runtime_instance(instances, runtime_id.as_str()) {
-                Some(instance) => vec![instance],
-                None => {
-                    self.send_unknown_cli_runtime_error(connection_id, request_id, &runtime_id)
-                        .await;
-                    return;
-                }
-            }
-        } else {
-            instances
-        }
-        .into_iter()
-        .filter(|instance| {
+        // `revision` describes the complete workspace snapshot. Always return
+        // that complete snapshot even when a legacy caller supplies
+        // `runtime_id`; otherwise a partial payload could incorrectly advance
+        // a client's global revision and leave sibling runtimes stale.
+        runtimes.retain(|runtime| {
             crate::authorization::AuthorizationService::new().cli_runtime_allowed(
                 request_context.principal().kind,
                 request_context.principal().role_key.as_ref(),
-                instance.id.as_str(),
+                runtime.runtime_id.as_str(),
             )
-        })
-        .collect::<Vec<_>>();
-        instances_stage.succeed();
-        let mut runtimes = Vec::with_capacity(instances.len());
-        for instance in instances {
-            runtimes.push(
-                self.cli_runtime_live_summary_from_instance_with_trace(
-                    workspace_id.as_str(),
-                    instance,
-                    Some(&refresh_trace),
-                )
-                .await,
-            );
+        });
+        // Validate the legacy target only against the caller-visible catalog.
+        // Checking the unfiltered cache would turn this endpoint into an ACL
+        // oracle for runtime identifiers the principal is not allowed to see.
+        if let Some(runtime_id) = params.runtime_id.as_deref()
+            && !runtimes
+                .iter()
+                .any(|runtime| runtime.runtime_id == runtime_id)
+        {
+            self.send_unknown_cli_runtime_error(connection_id, request_id, runtime_id)
+                .await;
+            return;
         }
-        let disclosure_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::DisclosureApply);
         if Self::uses_collaborator_cli_disclosure(request_context) {
             runtimes = runtimes
                 .into_iter()
                 .map(collaborator_safe_runtime_summary)
                 .collect();
         }
-        disclosure_stage.succeed();
-        let response_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::ResponseSend);
-        let response_sent = self
-            .send_cli_runtime_response(
-                connection_id,
-                request_id,
-                methods::CLI_RUNTIME_REFRESH,
-                &CLIRuntimeRefreshResponse { runtimes },
-            )
-            .await;
-        if response_sent {
-            response_stage.succeed();
-            refresh_trace.finish_success();
-        }
+        self.send_cli_runtime_response(
+            connection_id,
+            request_id,
+            methods::CLI_RUNTIME_REFRESH,
+            &CLIRuntimeRefreshResponse { revision, runtimes },
+        )
+        .await;
     }
 
     pub(super) async fn cli_runtime_list_models(
@@ -529,49 +564,79 @@ impl MessageProcessor {
         else {
             return;
         };
-
-        let Some(instance) = self
-            .load_cli_runtime_instance_by_id(connection_id, request_id.clone(), &params.runtime_id)
+        if !self
+            .ensure_cli_runtime_discovery_target_allowed(
+                request_context,
+                &request_id,
+                params.runtime_id.as_str(),
+            )
             .await
-        else {
+        {
+            return;
+        }
+
+        let runtime_snapshot = match self
+            .cli_runtime_probe_snapshot(workspace_id.as_str(), params.runtime_id.as_str())
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                self.send_unknown_cli_runtime_error(
+                    connection_id,
+                    request_id,
+                    params.runtime_id.as_str(),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    cli_runtime_discovery_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load CLI runtime readiness: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        if !cli_runtime_ready_for_model_discovery(&runtime_snapshot.summary) {
+            self.send_error(
+                connection_id,
+                cli_runtime_discovery_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!(
+                        "CLI runtime `{}` is not ready to list models",
+                        params.runtime_id
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        // Model discovery is part of the Gateway-owned readiness probe. This
+        // endpoint must remain a cache read so any number of clients share the
+        // same bounded process/network work.
+        let Some(model_snapshot) = runtime_snapshot.models else {
+            self.send_error(
+                connection_id,
+                cli_runtime_discovery_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!(
+                        "CLI runtime `{}` model catalog is not ready",
+                        params.runtime_id
+                    ),
+                ),
+            )
+            .await;
             return;
         };
-
-        let mut model_list = if instance.enabled {
-            match instance.kind {
-                GatewayCliAgentRuntimeKindConfig::Codex => {
-                    let proxy_url = self
-                        .cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
-                        .await;
-                    let probe = CodexProbe::model_list(
-                        codex_account_probe_config_from_instance_with_proxy(
-                            &instance,
-                            proxy_url.as_deref(),
-                        ),
-                    )
-                    .await;
-                    runtime_model_list_from_codex_probe(probe, &instance.custom_models)
-                }
-                GatewayCliAgentRuntimeKindConfig::Claude => runtime_model_list_from_claude_probe(
-                    ClaudeProbe::model_list(
-                        claude_account_probe_config_from_instance_with_proxy(
-                            &instance,
-                            self.cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
-                                .await
-                                .as_deref(),
-                        ),
-                        &instance.custom_models,
-                    )
-                    .await,
-                ),
-            }
-        } else {
-            RuntimeModelListResult {
-                models: runtime_models_with_custom_models(Vec::new(), &instance.custom_models),
-                diagnostics: Vec::new(),
-                error_message: Some(format!("CLI runtime `{}` is disabled", instance.id)),
-            }
-        };
+        let mut model_list = model_snapshot.result;
         if Self::uses_collaborator_cli_disclosure(request_context) {
             model_list.diagnostics = collaborator_safe_runtime_diagnostics(model_list.diagnostics);
             if model_list.error_message.is_some() {
@@ -613,7 +678,7 @@ impl MessageProcessor {
                 runtime_id: params.runtime_id,
                 models: model_list.models,
                 diagnostics: model_list.diagnostics,
-                refreshed_at_unix_ms: Some(current_unix_ms()),
+                refreshed_at_unix_ms: Some(model_snapshot.refreshed_at_unix_ms),
             },
         )
         .await;
@@ -1802,6 +1867,8 @@ impl MessageProcessor {
             }
         };
 
+        self.invalidate_and_request_cli_runtime_warmup(workspace_id)
+            .await;
         self.send_cli_runtime_response(
             connection_id,
             request_id,
@@ -1875,6 +1942,8 @@ impl MessageProcessor {
             false
         };
 
+        self.invalidate_and_request_cli_runtime_warmup(workspace_id)
+            .await;
         self.send_cli_runtime_response(
             connection_id,
             request_id,
@@ -1959,6 +2028,8 @@ impl MessageProcessor {
             Some(proxy_url.clone()),
         )
         .await;
+        self.invalidate_and_request_cli_runtime_warmup(workspace_id.clone())
+            .await;
 
         self.send_cli_runtime_response(
             connection_id,
@@ -2018,6 +2089,8 @@ impl MessageProcessor {
             }
         };
         self.cache_cli_runtime_proxy_url(workspace_id.as_str(), runtime_id.as_str(), None)
+            .await;
+        self.invalidate_and_request_cli_runtime_warmup(workspace_id.clone())
             .await;
 
         self.send_cli_runtime_response(
@@ -4386,6 +4459,21 @@ impl MessageProcessor {
         let instance = origin.to_session_instance();
         let instance = &instance;
         match event {
+            RuntimeEvent::AccountUpdated(_) | RuntimeEvent::AppListUpdated(_) => {
+                if !self.cli_runtime_instance_is_current(instance).await {
+                    self.audit_stale_cli_runtime_process_activity(
+                        instance,
+                        cli_runtime_event_log_label(&event).as_str(),
+                    );
+                    return;
+                }
+                // External login or app/MCP state changed. Fail closed
+                // immediately and let the single Gateway supervisor perform
+                // one coalesced authoritative account/MCP/model probe for
+                // every connected client.
+                self.invalidate_and_request_cli_runtime_warmup(instance.key().workspace_id.clone())
+                    .await;
+            }
             RuntimeEvent::RequestOpened(request) => {
                 self.handle_cli_runtime_request_opened_event(instance, request)
                     .await;
@@ -9441,22 +9529,6 @@ impl MessageProcessor {
         )
     }
 
-    async fn load_cli_runtime_summaries(
-        &self,
-        workspace_id: &str,
-    ) -> anyhow::Result<Vec<RuntimeSummary>> {
-        let instances = self.load_cli_runtime_instances()?;
-        let mut summaries = Vec::with_capacity(instances.len());
-        for instance in instances {
-            let proxy_url = self
-                .prepare_cli_runtime_proxy_url(workspace_id, instance.id.as_str())
-                .await?;
-            summaries.push(cli_runtime_summary_from_instance(instance, proxy_url));
-        }
-        sort_cli_runtime_summary_display_order(summaries.as_mut_slice());
-        Ok(summaries)
-    }
-
     async fn load_cli_runtime_summary_by_id(
         &self,
         connection_id: ConnectionId,
@@ -9464,8 +9536,11 @@ impl MessageProcessor {
         workspace_id: &str,
         runtime_id: &str,
     ) -> Option<RuntimeSummary> {
-        let runtimes = match self.load_cli_runtime_summaries(workspace_id).await {
-            Ok(runtimes) => runtimes,
+        let snapshot = match self
+            .cli_runtime_readiness_snapshot_or_seed(workspace_id)
+            .await
+        {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -9480,7 +9555,7 @@ impl MessageProcessor {
             }
         };
 
-        match find_cli_runtime_summary(runtimes, runtime_id) {
+        match find_cli_runtime_summary(snapshot.runtimes, runtime_id) {
             Some(runtime) => Some(runtime),
             None => {
                 self.send_unknown_cli_runtime_error(connection_id, request_id, runtime_id)
@@ -9522,83 +9597,38 @@ impl MessageProcessor {
         }
     }
 
-    async fn load_cli_runtime_live_summary_by_id(
-        &self,
-        connection_id: ConnectionId,
-        request_id: RequestId,
-        workspace_id: &str,
-        runtime_id: &str,
-    ) -> Option<RuntimeSummary> {
-        let instances = match self.load_cli_runtime_instances() {
-            Ok(instances) => instances,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    cli_runtime_discovery_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to load CLI runtime catalog: {error:#}"),
-                    ),
-                )
-                .await;
-                return None;
-            }
-        };
-
-        match find_cli_runtime_instance(instances, runtime_id) {
-            Some(instance) => Some(
-                self.cli_runtime_live_summary_from_instance(workspace_id, instance)
-                    .await,
-            ),
-            None => {
-                self.send_unknown_cli_runtime_error(connection_id, request_id, runtime_id)
-                    .await;
-                None
-            }
-        }
-    }
-
-    pub(crate) async fn cli_runtime_live_summary_from_instance(
+    pub(super) async fn cli_runtime_live_summary_from_instance_with_trace(
         &self,
         workspace_id: &str,
         instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
-    ) -> RuntimeSummary {
-        self.cli_runtime_live_summary_from_instance_with_trace(workspace_id, instance, None)
-            .await
-    }
-
-    async fn cli_runtime_live_summary_from_instance_with_trace(
-        &self,
-        workspace_id: &str,
-        instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
-        refresh_trace: Option<&GatewayCliRuntimeRefreshTrace>,
-    ) -> RuntimeSummary {
+        refresh_trace: Option<&GatewayProviderWarmupTrace>,
+    ) -> anyhow::Result<CliRuntimeLiveReadiness> {
         let runtime_kind = match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => GatewayCliRuntimeKind::Codex,
             GatewayCliAgentRuntimeKindConfig::Claude => GatewayCliRuntimeKind::Claude,
         };
         let proxy_stage = refresh_trace.map(|trace| {
-            trace.runtime_stage(
-                GatewayCliRuntimeRefreshStage::RuntimeProxyLoad,
-                runtime_kind,
-            )
+            trace.runtime_stage(GatewayProviderWarmupStage::RuntimeProxyLoad, runtime_kind)
         });
         let proxy_url = self
-            .cli_runtime_proxy_url(workspace_id, instance.id.as_str())
-            .await;
+            .prepare_cli_runtime_proxy_url(workspace_id, instance.id.as_str())
+            .await?;
         if let Some(stage) = proxy_stage {
             stage.succeed();
         }
         let summary = cli_runtime_summary_from_instance(instance.clone(), proxy_url.clone());
         if !instance.enabled {
-            return summary;
+            return Ok(CliRuntimeLiveReadiness {
+                summary,
+                mcp_readiness: None,
+            });
         }
 
-        match instance.kind {
+        let (summary, mcp_readiness) = match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => {
                 let account_stage = refresh_trace.map(|trace| {
                     trace.runtime_stage(
-                        GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                        GatewayProviderWarmupStage::RuntimeAccountProbe,
                         runtime_kind,
                     )
                 });
@@ -9626,7 +9656,7 @@ impl MessageProcessor {
                     None => {
                         let mcp_stage = refresh_trace.map(|trace| {
                             trace.runtime_stage(
-                                GatewayCliRuntimeRefreshStage::RuntimeMcpReadiness,
+                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
                                 runtime_kind,
                             )
                         });
@@ -9654,13 +9684,13 @@ impl MessageProcessor {
                 );
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
-                summary.diagnostics.extend(readiness.diagnostics);
-                summary
+                summary.diagnostics.extend(readiness.diagnostics.clone());
+                (summary, readiness)
             }
             GatewayCliAgentRuntimeKindConfig::Claude => {
                 let account_stage = refresh_trace.map(|trace| {
                     trace.runtime_stage(
-                        GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                        GatewayProviderWarmupStage::RuntimeAccountProbe,
                         runtime_kind,
                     )
                 });
@@ -9689,7 +9719,7 @@ impl MessageProcessor {
                     None => {
                         let mcp_stage = refresh_trace.map(|trace| {
                             trace.runtime_stage(
-                                GatewayCliRuntimeRefreshStage::RuntimeMcpReadiness,
+                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
                                 runtime_kind,
                             )
                         });
@@ -9717,10 +9747,55 @@ impl MessageProcessor {
                 );
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
-                summary.diagnostics.extend(readiness.diagnostics);
-                summary
+                summary.diagnostics.extend(readiness.diagnostics.clone());
+                (summary, readiness)
             }
+        };
+        Ok(CliRuntimeLiveReadiness {
+            summary,
+            mcp_readiness: Some(mcp_readiness),
+        })
+    }
+
+    /// Probes one CLI runtime model catalog for the Gateway supervisor.
+    ///
+    /// Client RPC handlers must read the resulting supervisor cache rather
+    /// than calling this method directly.
+    pub(super) async fn cli_runtime_model_list_from_instance_with_trace(
+        &self,
+        instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+        proxy_url: Option<&str>,
+        trace: Option<&GatewayProviderWarmupTrace>,
+    ) -> RuntimeModelListResult {
+        let runtime_kind = match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => GatewayCliRuntimeKind::Codex,
+            GatewayCliAgentRuntimeKindConfig::Claude => GatewayCliRuntimeKind::Claude,
+        };
+        let model_stage = trace.map(|trace| {
+            trace.runtime_stage(GatewayProviderWarmupStage::RuntimeModelsLoad, runtime_kind)
+        });
+        let result = match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => {
+                let probe = CodexProbe::model_list(
+                    codex_account_probe_config_from_instance_with_proxy(instance, proxy_url),
+                )
+                .await;
+                runtime_model_list_from_codex_probe(probe, &instance.custom_models)
+            }
+            GatewayCliAgentRuntimeKindConfig::Claude => runtime_model_list_from_claude_probe(
+                ClaudeProbe::model_list(
+                    claude_account_probe_config_from_instance_with_proxy(instance, proxy_url),
+                    &instance.custom_models,
+                )
+                .await,
+            ),
+        };
+        if let Some(stage) = model_stage
+            && result.error_message.is_none()
+        {
+            stage.succeed();
         }
+        result
     }
 
     pub(super) async fn prepare_cli_runtime_proxy_url(
@@ -10011,7 +10086,7 @@ fn normalize_cli_runtime_optional_field(
     Ok(Some(trimmed.to_owned()))
 }
 
-fn sort_cli_runtime_summary_display_order(summaries: &mut [RuntimeSummary]) {
+pub(super) fn sort_cli_runtime_summary_display_order(summaries: &mut [RuntimeSummary]) {
     summaries.sort_by(|left, right| {
         let left_order = cli_runtime_default_display_order(left.runtime_id.as_str());
         let right_order = cli_runtime_default_display_order(right.runtime_id.as_str());
@@ -10033,15 +10108,13 @@ fn cli_runtime_default_display_order(runtime_id: &str) -> usize {
     }
 }
 
-fn cli_runtime_summary_from_instance(
+pub(super) fn cli_runtime_summary_from_instance(
     instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
     proxy_url: Option<String>,
 ) -> RuntimeSummary {
     let capability_policy = CliRuntimeCapabilityPolicy::phase_zero(true);
     let status = if instance.enabled {
-        RuntimeStatus::Degraded {
-            message: "CLI runtime has not been probed yet".to_owned(),
-        }
+        RuntimeStatus::Initializing
     } else {
         RuntimeStatus::Disabled
     };
@@ -10050,8 +10123,8 @@ fn cli_runtime_summary_from_instance(
         vec![
             RuntimeDiagnostic {
                 level: RuntimeDiagnosticLevel::Info,
-                code: "cli_runtime.unprobed".to_owned(),
-                message: "Runtime status will refresh after live probing is enabled".to_owned(),
+                code: "cli_runtime.initializing".to_owned(),
+                message: "Gateway is preparing runtime readiness".to_owned(),
             },
             RuntimeDiagnostic {
                 level: RuntimeDiagnosticLevel::Info,
@@ -10084,6 +10157,43 @@ fn cli_runtime_summary_from_instance(
         diagnostics,
         recent_stderr: Vec::new(),
     }
+}
+
+/// Removes every piece of live readiness evidence from a cached summary.
+///
+/// Configuration mutations use this transition before a replacement probe is
+/// scheduled. Keeping the static catalog fields lets clients render a stable
+/// provider row, while clearing account/version/MCP evidence ensures a stale
+/// `ready` result can never authorize a new turn during reconciliation.
+pub(super) fn cli_runtime_initializing_summary(mut summary: RuntimeSummary) -> RuntimeSummary {
+    let capability_policy = CliRuntimeCapabilityPolicy::phase_zero(true);
+    summary.account = None;
+    summary.version = None;
+    summary.models_refreshed_at_unix_ms = None;
+    summary.recent_stderr.clear();
+    summary.capabilities.supports_mcp_tools = capability_policy.supports_mcp_tools();
+
+    if summary.enabled {
+        let (mcp_code, mcp_message) = capability_policy.mcp_diagnostic();
+        summary.status = RuntimeStatus::Initializing;
+        summary.diagnostics = vec![
+            RuntimeDiagnostic {
+                level: RuntimeDiagnosticLevel::Info,
+                code: "cli_runtime.initializing".to_owned(),
+                message: "Gateway is preparing runtime readiness".to_owned(),
+            },
+            RuntimeDiagnostic {
+                level: RuntimeDiagnosticLevel::Info,
+                code: mcp_code.to_owned(),
+                message: mcp_message.to_owned(),
+            },
+        ];
+    } else {
+        summary.status = RuntimeStatus::Disabled;
+        summary.diagnostics.clear();
+    }
+
+    summary
 }
 
 fn cli_runtime_kind_from_config(kind: GatewayCliAgentRuntimeKindConfig) -> CLIAgentRuntimeKind {
@@ -10337,10 +10447,17 @@ fn runtime_models_from_codex_probe(
     runtime_models_with_custom_models(models, custom_models)
 }
 
-struct RuntimeModelListResult {
-    models: Vec<RuntimeModelInfo>,
-    diagnostics: Vec<RuntimeDiagnostic>,
-    error_message: Option<String>,
+#[derive(Clone, Debug)]
+pub(super) struct CliRuntimeLiveReadiness {
+    pub(super) summary: RuntimeSummary,
+    pub(super) mcp_readiness: Option<pioneer_protocol::CliMcpAdapterReadiness>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RuntimeModelListResult {
+    pub(super) models: Vec<RuntimeModelInfo>,
+    pub(super) diagnostics: Vec<RuntimeDiagnostic>,
+    pub(super) error_message: Option<String>,
 }
 
 fn runtime_model_list_from_codex_probe(
@@ -10387,14 +10504,20 @@ fn runtime_model_list_from_claude_probe(probe: ClaudeModelListSnapshot) -> Runti
         .iter()
         .map(runtime_diagnostic_from_claude_probe)
         .collect::<Vec<_>>();
+    let models = probe
+        .models
+        .into_iter()
+        .map(runtime_model_from_claude_model)
+        .collect::<Vec<_>>();
+    let error_message = probe.error_message.or_else(|| {
+        models
+            .is_empty()
+            .then(|| "Claude model discovery returned no models".to_owned())
+    });
     RuntimeModelListResult {
-        models: probe
-            .models
-            .into_iter()
-            .map(runtime_model_from_claude_model)
-            .collect(),
+        models,
         diagnostics,
-        error_message: probe.error_message,
+        error_message,
     }
 }
 
@@ -11503,13 +11626,6 @@ fn cli_runtime_request_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
     chrono::Utc::now().fixed_offset()
 }
 
-fn current_unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11589,6 +11705,22 @@ mod tests {
             stderr_ring_lines: 200,
             debug_native_events: false,
         }
+    }
+
+    #[test]
+    fn model_discovery_requires_authoritative_ready_snapshot() {
+        let mut runtime = cli_runtime_summary_from_instance(effective_instance("codex", true));
+        runtime.status = RuntimeStatus::Ready;
+        assert!(cli_runtime_ready_for_model_discovery(&runtime));
+
+        runtime.status = RuntimeStatus::Degraded {
+            message: "probe degraded".to_owned(),
+        };
+        assert!(!cli_runtime_ready_for_model_discovery(&runtime));
+
+        runtime.status = RuntimeStatus::Ready;
+        runtime.enabled = false;
+        assert!(!cli_runtime_ready_for_model_discovery(&runtime));
     }
 
     #[test]
@@ -11681,7 +11813,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_catalog_marks_enabled_instances_as_unprobed() {
+    fn cli_runtime_catalog_marks_enabled_instances_as_gateway_initializing() {
         let summaries =
             cli_runtime_summaries_from_instances(vec![effective_instance("codex", true)]);
 
@@ -11689,11 +11821,8 @@ mod tests {
         assert_eq!(summaries[0].runtime_id, "codex");
         assert_eq!(summaries[0].kind, CLIAgentRuntimeKind::Codex);
         assert!(summaries[0].enabled);
-        assert!(matches!(
-            summaries[0].status,
-            RuntimeStatus::Degraded { .. }
-        ));
-        assert_eq!(summaries[0].diagnostics[0].code, "cli_runtime.unprobed");
+        assert_eq!(summaries[0].status, RuntimeStatus::Initializing);
+        assert_eq!(summaries[0].diagnostics[0].code, "cli_runtime.initializing");
         assert!(summaries[0].capabilities.supports_threads);
         assert!(summaries[0].capabilities.supports_model_list);
     }
@@ -11815,7 +11944,7 @@ mod tests {
             !runtime
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "cli_runtime.unprobed")
+                .any(|diagnostic| diagnostic.code == "cli_runtime.initializing")
         );
     }
 

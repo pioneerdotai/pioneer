@@ -1317,6 +1317,10 @@ impl ClaudeProbe {
         command.env("CLAUDE_AGENT_SDK_CLIENT_APP", "pioneer");
         command.envs(config.env.expose_iter());
         command.env_remove("CLAUDECODE");
+        // Account probes are now owned by a cancellable Gateway supervisor.
+        // A timeout, shutdown, or superseding configuration generation must
+        // not leave a detached `claude --version` process behind.
+        command.kill_on_drop(true);
 
         let output = match timeout(config.request_timeout, command.output()).await {
             Ok(Ok(output)) => output,

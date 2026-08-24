@@ -1328,6 +1328,11 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             })
             .collect())
     }
+
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        self.list_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
 }
 
 #[cfg(test)]

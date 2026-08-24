@@ -1043,6 +1043,11 @@ impl crate::traits::Provider for BedrockProvider {
             .map(provider_model_from_bedrock_model_summary)
             .collect())
     }
+
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        self.list_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
 }
 
 fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> ProviderModelInfo {

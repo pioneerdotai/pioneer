@@ -22,28 +22,109 @@ impl GatewayCliRuntimeKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GatewayCliRuntimeRefreshStage {
-    WorkspaceValidate,
-    CatalogLoad,
-    InstancesSelect,
+pub enum GatewayProviderWarmupScope {
+    Api,
+    Cli,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayProviderType {
+    Api,
+    Cli,
+}
+
+impl GatewayProviderType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayProviderReadinessState {
+    Ready,
+    Unverified,
+    Disabled,
+    MissingBinary,
+    SpawnFailed,
+    Initializing,
+    NeedsAuth,
+    Degraded,
+    UnsupportedVersion,
+    Error,
+}
+
+impl GatewayProviderReadinessState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Unverified => "unverified",
+            Self::Disabled => "disabled",
+            Self::MissingBinary => "missing_binary",
+            Self::SpawnFailed => "spawn_failed",
+            Self::Initializing => "initializing",
+            Self::NeedsAuth => "needs_auth",
+            Self::Degraded => "degraded",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::Error => "error",
+        }
+    }
+
+    const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    const fn is_applicable(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    const fn is_unverified(self) -> bool {
+        matches!(self, Self::Unverified)
+    }
+}
+
+impl GatewayProviderWarmupScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Cli => "cli",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayProviderWarmupStage {
+    SchedulerQueueWait,
+    WorkspaceLoad,
+    ApiCatalogLoad,
+    ApiInstancesWarmup,
+    ApiInstanceWarmup,
+    CliCatalogLoad,
+    CliSnapshotPublish,
     RuntimeProxyLoad,
     RuntimeAccountProbe,
     RuntimeMcpReadiness,
-    DisclosureApply,
-    ResponseSend,
+    RuntimeModelsLoad,
 }
 
-impl GatewayCliRuntimeRefreshStage {
+impl GatewayProviderWarmupStage {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::WorkspaceValidate => "workspace.validate",
-            Self::CatalogLoad => "catalog.load",
-            Self::InstancesSelect => "instances.select",
+            Self::SchedulerQueueWait => "scheduler.queue_wait",
+            Self::WorkspaceLoad => "workspace.load",
+            Self::ApiCatalogLoad => "api.catalog.load",
+            Self::ApiInstancesWarmup => "api.instances.warmup",
+            Self::ApiInstanceWarmup => "api.instance.warmup",
+            Self::CliCatalogLoad => "cli.catalog.load",
+            Self::CliSnapshotPublish => "cli.snapshot.publish",
             Self::RuntimeProxyLoad => "runtime.proxy.load",
             Self::RuntimeAccountProbe => "runtime.account.probe",
             Self::RuntimeMcpReadiness => "runtime.mcp.readiness",
-            Self::DisclosureApply => "disclosure.apply",
-            Self::ResponseSend => "response.send",
+            Self::RuntimeModelsLoad => "runtime.models.load",
         }
     }
 }
@@ -52,6 +133,7 @@ impl GatewayCliRuntimeRefreshStage {
 enum OperationStageOutcome {
     Ok,
     Error,
+    Cancelled,
 }
 
 impl OperationStageOutcome {
@@ -59,6 +141,7 @@ impl OperationStageOutcome {
         match self {
             Self::Ok => "ok",
             Self::Error => "error",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -68,6 +151,7 @@ impl OperationStageOutcome {
             Self::Error => Status::Error {
                 description: std::borrow::Cow::Borrowed("operation stage failed"),
             },
+            Self::Cancelled => Status::Unset,
         }
     }
 }
@@ -76,31 +160,47 @@ impl OperationStageOutcome {
 struct OperationStageRecord {
     name: &'static str,
     runtime_kind: Option<GatewayCliRuntimeKind>,
+    provider_kind: Option<String>,
     started_at: SystemTime,
     elapsed: Duration,
     outcome: OperationStageOutcome,
 }
 
+#[derive(Clone, Debug)]
+struct ProviderReadinessRecord {
+    provider_type: GatewayProviderType,
+    runtime_kind: Option<GatewayCliRuntimeKind>,
+    provider_kind: Option<String>,
+    state: GatewayProviderReadinessState,
+}
+
 #[derive(Debug)]
-struct GatewayCliRuntimeRefreshState {
+struct GatewayProviderWarmupState {
+    scope: GatewayProviderWarmupScope,
+    consent_generation: Option<u64>,
     started_at: SystemTime,
     started_instant: Instant,
     stages: Vec<OperationStageRecord>,
+    readiness: Vec<ProviderReadinessRecord>,
     finalized: bool,
 }
 
 #[derive(Clone, Debug)]
-struct GatewayCliRuntimeRefreshTimeline {
-    inner: Arc<Mutex<GatewayCliRuntimeRefreshState>>,
+struct GatewayProviderWarmupTimeline {
+    inner: Arc<Mutex<GatewayProviderWarmupState>>,
 }
 
-impl GatewayCliRuntimeRefreshTimeline {
-    fn start() -> Self {
+impl GatewayProviderWarmupTimeline {
+    fn start(scope: GatewayProviderWarmupScope) -> Self {
+        let (telemetry_enabled, consent_generation) = super::telemetry_consent_snapshot();
         Self {
-            inner: Arc::new(Mutex::new(GatewayCliRuntimeRefreshState {
+            inner: Arc::new(Mutex::new(GatewayProviderWarmupState {
+                scope,
+                consent_generation: telemetry_enabled.then_some(consent_generation),
                 started_at: SystemTime::now(),
                 started_instant: Instant::now(),
                 stages: Vec::new(),
+                readiness: Vec::new(),
                 finalized: false,
             })),
         }
@@ -108,13 +208,15 @@ impl GatewayCliRuntimeRefreshTimeline {
 
     fn stage(
         &self,
-        stage: GatewayCliRuntimeRefreshStage,
+        stage: GatewayProviderWarmupStage,
         runtime_kind: Option<GatewayCliRuntimeKind>,
-    ) -> GatewayCliRuntimeRefreshStageGuard {
-        GatewayCliRuntimeRefreshStageGuard {
+        provider_kind: Option<String>,
+    ) -> GatewayProviderWarmupStageGuard {
+        GatewayProviderWarmupStageGuard {
             timeline: self.clone(),
             name: stage.as_str(),
             runtime_kind,
+            provider_kind,
             started_at: SystemTime::now(),
             started_instant: Instant::now(),
             finished: false,
@@ -125,6 +227,7 @@ impl GatewayCliRuntimeRefreshTimeline {
         &self,
         name: &'static str,
         runtime_kind: Option<GatewayCliRuntimeKind>,
+        provider_kind: Option<String>,
         started_at: SystemTime,
         elapsed: Duration,
         outcome: OperationStageOutcome,
@@ -134,9 +237,28 @@ impl GatewayCliRuntimeRefreshTimeline {
             state.stages.push(OperationStageRecord {
                 name,
                 runtime_kind,
+                provider_kind,
                 started_at,
                 elapsed,
                 outcome,
+            });
+        }
+    }
+
+    fn record_readiness(
+        &self,
+        provider_type: GatewayProviderType,
+        runtime_kind: Option<GatewayCliRuntimeKind>,
+        provider_kind: Option<String>,
+        readiness_state: GatewayProviderReadinessState,
+    ) {
+        let mut state = self.lock();
+        if !state.finalized {
+            state.readiness.push(ProviderReadinessRecord {
+                provider_type,
+                runtime_kind,
+                provider_kind,
+                state: readiness_state,
             });
         }
     }
@@ -148,88 +270,138 @@ impl GatewayCliRuntimeRefreshTimeline {
                 return;
             }
             state.finalized = true;
-            GatewayCliRuntimeRefreshSnapshot {
+            GatewayProviderWarmupSnapshot {
+                scope: state.scope,
+                consent_generation: state.consent_generation,
                 started_at: state.started_at,
                 elapsed: state.started_instant.elapsed(),
                 stages: state.stages.clone(),
+                readiness: state.readiness.clone(),
                 outcome,
                 failed,
             }
         };
-        emit_gateway_cli_runtime_refresh(&snapshot);
+        emit_gateway_provider_warmup(&snapshot);
     }
 
-    fn lock(&self) -> MutexGuard<'_, GatewayCliRuntimeRefreshState> {
+    fn lock(&self) -> MutexGuard<'_, GatewayProviderWarmupState> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
-/// Records one complete `cli_runtime.refresh` request inside the Gateway.
+/// Records one complete Gateway-owned provider warm-up.
 ///
 /// The trace intentionally contains only bounded attributes. Runtime and
-/// workspace identifiers are never exported; `runtime.kind` is limited to the
-/// stable `codex` and `claude` values supplied by the caller.
-#[must_use = "the CLI runtime refresh trace must be completed"]
-pub struct GatewayCliRuntimeRefreshTrace {
-    timeline: GatewayCliRuntimeRefreshTimeline,
+/// workspace identifiers are never exported; `runtime.kind` is limited to
+/// `codex` and `claude`, while `provider.kind` is the canonical adapter name
+/// produced by the fixed provider factory (or the bounded `unknown` fallback).
+#[must_use = "the provider warm-up trace must be completed"]
+pub struct GatewayProviderWarmupTrace {
+    timeline: GatewayProviderWarmupTimeline,
     finished: bool,
 }
 
-impl GatewayCliRuntimeRefreshTrace {
-    pub fn start() -> Self {
+impl GatewayProviderWarmupTrace {
+    pub fn start(scope: GatewayProviderWarmupScope) -> Self {
         Self {
-            timeline: GatewayCliRuntimeRefreshTimeline::start(),
+            timeline: GatewayProviderWarmupTimeline::start(scope),
             finished: false,
         }
     }
 
-    #[must_use]
-    pub fn stage(
-        &self,
-        stage: GatewayCliRuntimeRefreshStage,
-    ) -> GatewayCliRuntimeRefreshStageGuard {
-        self.timeline.stage(stage, None)
+    pub fn stage(&self, stage: GatewayProviderWarmupStage) -> GatewayProviderWarmupStageGuard {
+        self.timeline.stage(stage, None, None)
     }
 
-    #[must_use]
     pub fn runtime_stage(
         &self,
-        stage: GatewayCliRuntimeRefreshStage,
+        stage: GatewayProviderWarmupStage,
         runtime_kind: GatewayCliRuntimeKind,
-    ) -> GatewayCliRuntimeRefreshStageGuard {
-        self.timeline.stage(stage, Some(runtime_kind))
+    ) -> GatewayProviderWarmupStageGuard {
+        self.timeline.stage(stage, Some(runtime_kind), None)
+    }
+
+    pub fn api_provider_stage(
+        &self,
+        stage: GatewayProviderWarmupStage,
+        provider_kind: impl Into<String>,
+    ) -> GatewayProviderWarmupStageGuard {
+        self.timeline.stage(stage, None, Some(provider_kind.into()))
+    }
+
+    pub fn record_api_readiness(
+        &self,
+        provider_kind: impl Into<String>,
+        state: GatewayProviderReadinessState,
+    ) {
+        self.timeline.record_readiness(
+            GatewayProviderType::Api,
+            None,
+            Some(provider_kind.into()),
+            state,
+        );
+    }
+
+    pub fn record_cli_readiness(
+        &self,
+        runtime_kind: GatewayCliRuntimeKind,
+        state: GatewayProviderReadinessState,
+    ) {
+        self.timeline
+            .record_readiness(GatewayProviderType::Cli, Some(runtime_kind), None, state);
     }
 
     pub fn finish_success(mut self) {
         self.timeline.finish("ok", false);
         self.finished = true;
     }
+
+    /// Finishes a probe whose result was fenced because provider
+    /// configuration changed while it was running. A newer queued probe owns
+    /// the replacement result, so this is neither success nor failure.
+    pub fn finish_superseded(mut self) {
+        self.timeline.finish("superseded", false);
+        self.finished = true;
+    }
+
+    pub fn finish_failure(mut self) {
+        self.timeline.finish("error", true);
+        self.finished = true;
+    }
 }
 
-impl Drop for GatewayCliRuntimeRefreshTrace {
+impl Drop for GatewayProviderWarmupTrace {
     fn drop(&mut self) {
         if !self.finished {
-            self.timeline.finish("error", true);
+            // The supervisor aborts in-flight probes during normal Gateway
+            // shutdown. Actual probe errors and panics are finalized
+            // explicitly by the task owner through `finish_failure`.
+            self.timeline.finish("cancelled", false);
             self.finished = true;
         }
     }
 }
 
 #[must_use = "an operation stage must be marked successful; dropping it records a failure"]
-pub struct GatewayCliRuntimeRefreshStageGuard {
-    timeline: GatewayCliRuntimeRefreshTimeline,
+pub struct GatewayProviderWarmupStageGuard {
+    timeline: GatewayProviderWarmupTimeline,
     name: &'static str,
     runtime_kind: Option<GatewayCliRuntimeKind>,
+    provider_kind: Option<String>,
     started_at: SystemTime,
     started_instant: Instant,
     finished: bool,
 }
 
-impl GatewayCliRuntimeRefreshStageGuard {
+impl GatewayProviderWarmupStageGuard {
     pub fn succeed(mut self) {
         self.finish(OperationStageOutcome::Ok);
+    }
+
+    pub fn cancel(mut self) {
+        self.finish(OperationStageOutcome::Cancelled);
     }
 
     fn finish(&mut self, outcome: OperationStageOutcome) {
@@ -240,6 +412,7 @@ impl GatewayCliRuntimeRefreshStageGuard {
         self.timeline.record_stage(
             self.name,
             self.runtime_kind,
+            self.provider_kind.clone(),
             self.started_at,
             self.started_instant.elapsed(),
             outcome,
@@ -247,21 +420,24 @@ impl GatewayCliRuntimeRefreshStageGuard {
     }
 }
 
-impl Drop for GatewayCliRuntimeRefreshStageGuard {
+impl Drop for GatewayProviderWarmupStageGuard {
     fn drop(&mut self) {
         self.finish(OperationStageOutcome::Error);
     }
 }
 
-struct GatewayCliRuntimeRefreshSnapshot {
+struct GatewayProviderWarmupSnapshot {
+    scope: GatewayProviderWarmupScope,
+    consent_generation: Option<u64>,
     started_at: SystemTime,
     elapsed: Duration,
     stages: Vec<OperationStageRecord>,
+    readiness: Vec<ProviderReadinessRecord>,
     outcome: &'static str,
     failed: bool,
 }
 
-impl GatewayCliRuntimeRefreshSnapshot {
+impl GatewayProviderWarmupSnapshot {
     fn failed_stage(&self) -> &'static str {
         self.stages
             .iter()
@@ -270,10 +446,37 @@ impl GatewayCliRuntimeRefreshSnapshot {
             .map(|stage| stage.name)
             .unwrap_or("unknown")
     }
+
+    fn readiness_outcome(&self) -> &'static str {
+        if matches!(self.outcome, "superseded" | "cancelled") {
+            return self.outcome;
+        }
+        let applicable = self
+            .readiness
+            .iter()
+            .filter(|record| record.state.is_applicable())
+            .collect::<Vec<_>>();
+        let ready = applicable
+            .iter()
+            .filter(|record| record.state.is_ready())
+            .count();
+        let unverified = applicable
+            .iter()
+            .filter(|record| record.state.is_unverified())
+            .count();
+        let unavailable = applicable.len().saturating_sub(ready + unverified);
+        match (ready, unverified, unavailable) {
+            (_, _, _) if applicable.is_empty() => "not_applicable",
+            (_, 0, 0) => "ready",
+            (0, _, 0) => "unverified",
+            (0, 0, _) => "unavailable",
+            _ => "partial",
+        }
+    }
 }
 
-fn emit_gateway_cli_runtime_refresh(snapshot: &GatewayCliRuntimeRefreshSnapshot) {
-    if !super::telemetry_enabled() {
+fn emit_gateway_provider_warmup(snapshot: &GatewayProviderWarmupSnapshot) {
+    if !super::telemetry_sample_allowed(snapshot.consent_generation) {
         return;
     }
     let Some(state) = super::telemetry::state() else {
@@ -291,32 +494,65 @@ fn emit_gateway_cli_runtime_refresh(snapshot: &GatewayCliRuntimeRefreshSnapshot)
     } else {
         "none"
     };
-    let root_attributes = vec![
-        KeyValue::new("operation.name", "cli_runtime.refresh"),
+    let ready_count = snapshot
+        .readiness
+        .iter()
+        .filter(|record| record.state.is_ready())
+        .count();
+    let disabled_count = snapshot
+        .readiness
+        .iter()
+        .filter(|record| !record.state.is_applicable())
+        .count();
+    let unverified_count = snapshot
+        .readiness
+        .iter()
+        .filter(|record| record.state.is_unverified())
+        .count();
+    let unready_count = snapshot
+        .readiness
+        .len()
+        .saturating_sub(ready_count + disabled_count + unverified_count);
+    let metric_attributes = vec![
+        KeyValue::new("operation.name", "providers.warmup"),
+        KeyValue::new("provider.scope", snapshot.scope.as_str()),
         KeyValue::new("outcome", snapshot.outcome),
         KeyValue::new("operation.failed_stage", failed_stage),
+        KeyValue::new("provider.readiness.outcome", snapshot.readiness_outcome()),
     ];
-    metrics.cli_runtime_refresh_duration.record(
+    let mut trace_attributes = metric_attributes.clone();
+    trace_attributes.extend([
+        KeyValue::new("provider.ready_count", ready_count as i64),
+        KeyValue::new("provider.unready_count", unready_count as i64),
+        KeyValue::new("provider.unverified_count", unverified_count as i64),
+        KeyValue::new("provider.disabled_count", disabled_count as i64),
+    ]);
+    metrics.provider_warmup_duration.record(
         snapshot.elapsed.as_secs_f64() * 1_000.0,
-        root_attributes.as_slice(),
+        metric_attributes.as_slice(),
     );
     if snapshot.failed {
         metrics
-            .cli_runtime_refresh_failures
-            .add(1, root_attributes.as_slice());
+            .provider_warmup_failures
+            .add(1, metric_attributes.as_slice());
+    }
+    for readiness in &snapshot.readiness {
+        metrics
+            .provider_readiness_checks
+            .add(1, readiness_attributes(readiness).as_slice());
     }
 
     for stage in &snapshot.stages {
-        let attributes = stage_attributes(stage);
+        let attributes = stage_attributes(stage, snapshot.scope, snapshot.outcome);
         metrics
-            .cli_runtime_refresh_stage_duration
+            .provider_warmup_stage_duration
             .record(stage.elapsed.as_secs_f64() * 1_000.0, attributes.as_slice());
     }
 
-    let root_builder = SpanBuilder::from_name("gateway.cli_runtime.refresh")
-        .with_kind(SpanKind::Server)
+    let root_builder = SpanBuilder::from_name("gateway.providers.warmup")
+        .with_kind(SpanKind::Internal)
         .with_start_time(snapshot.started_at)
-        .with_attributes(root_attributes);
+        .with_attributes(trace_attributes);
     let root_span = state.tracer.build(root_builder);
     let root_context = Context::new().with_span(root_span);
 
@@ -324,16 +560,22 @@ fn emit_gateway_cli_runtime_refresh(snapshot: &GatewayCliRuntimeRefreshSnapshot)
         let builder = SpanBuilder::from_name(stage.name)
             .with_kind(SpanKind::Internal)
             .with_start_time(stage.started_at)
-            .with_attributes(stage_attributes(stage));
+            .with_attributes(stage_attributes(stage, snapshot.scope, snapshot.outcome));
         let mut span = state.tracer.build_with_context(builder, &root_context);
-        span.set_status(stage.outcome.status());
+        span.set_status(if matches!(snapshot.outcome, "superseded" | "cancelled") {
+            Status::Unset
+        } else {
+            stage.outcome.status()
+        });
         span.end_with_timestamp(end_timestamp(stage.started_at, stage.elapsed));
     }
 
     root_context.span().set_status(if snapshot.failed {
         Status::Error {
-            description: std::borrow::Cow::Borrowed("CLI runtime refresh failed"),
+            description: std::borrow::Cow::Borrowed("provider warm-up failed"),
         }
+    } else if matches!(snapshot.outcome, "superseded" | "cancelled") {
+        Status::Unset
     } else {
         Status::Ok
     });
@@ -342,14 +584,43 @@ fn emit_gateway_cli_runtime_refresh(snapshot: &GatewayCliRuntimeRefreshSnapshot)
         .end_with_timestamp(end_timestamp(snapshot.started_at, snapshot.elapsed));
 }
 
-fn stage_attributes(stage: &OperationStageRecord) -> Vec<KeyValue> {
+fn readiness_attributes(record: &ProviderReadinessRecord) -> Vec<KeyValue> {
     let mut attributes = vec![
-        KeyValue::new("operation.name", "cli_runtime.refresh"),
+        KeyValue::new("provider.type", record.provider_type.as_str()),
+        KeyValue::new("provider.readiness.state", record.state.as_str()),
+    ];
+    if let Some(runtime_kind) = record.runtime_kind {
+        attributes.push(KeyValue::new("runtime.kind", runtime_kind.as_str()));
+    }
+    if let Some(provider_kind) = record.provider_kind.as_deref() {
+        attributes.push(KeyValue::new("provider.kind", provider_kind.to_owned()));
+    }
+    attributes
+}
+
+fn stage_attributes(
+    stage: &OperationStageRecord,
+    scope: GatewayProviderWarmupScope,
+    operation_outcome: &'static str,
+) -> Vec<KeyValue> {
+    let mut attributes = vec![
+        KeyValue::new("operation.name", "providers.warmup"),
+        KeyValue::new("provider.scope", scope.as_str()),
         KeyValue::new("operation.stage", stage.name),
-        KeyValue::new("outcome", stage.outcome.as_str()),
+        KeyValue::new(
+            "outcome",
+            if matches!(operation_outcome, "superseded" | "cancelled") {
+                operation_outcome
+            } else {
+                stage.outcome.as_str()
+            },
+        ),
     ];
     if let Some(runtime_kind) = stage.runtime_kind {
         attributes.push(KeyValue::new("runtime.kind", runtime_kind.as_str()));
+    }
+    if let Some(provider_kind) = stage.provider_kind.as_deref() {
+        attributes.push(KeyValue::new("provider.kind", provider_kind.to_owned()));
     }
     attributes
 }
@@ -363,42 +634,208 @@ fn end_timestamp(started_at: SystemTime, elapsed: Duration) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayCliRuntimeKind, GatewayCliRuntimeRefreshStage, GatewayCliRuntimeRefreshTrace,
-        OperationStageOutcome,
+        GatewayCliRuntimeKind, GatewayProviderReadinessState, GatewayProviderWarmupScope,
+        GatewayProviderWarmupStage, GatewayProviderWarmupTrace, OperationStageOutcome,
     };
 
     #[test]
     fn stages_use_stable_names_and_bounded_runtime_kinds() {
-        let trace = GatewayCliRuntimeRefreshTrace::start();
+        let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::All);
         trace
-            .stage(GatewayCliRuntimeRefreshStage::WorkspaceValidate)
+            .stage(GatewayProviderWarmupStage::WorkspaceLoad)
             .succeed();
         trace
             .runtime_stage(
-                GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                GatewayProviderWarmupStage::RuntimeAccountProbe,
                 GatewayCliRuntimeKind::Codex,
             )
             .succeed();
+        trace
+            .runtime_stage(
+                GatewayProviderWarmupStage::RuntimeModelsLoad,
+                GatewayCliRuntimeKind::Codex,
+            )
+            .succeed();
+        trace
+            .api_provider_stage(GatewayProviderWarmupStage::ApiInstanceWarmup, "openai")
+            .succeed();
 
         let state = trace.timeline.lock();
-        assert_eq!(state.stages[0].name, "workspace.validate");
+        assert_eq!(state.stages[0].name, "workspace.load");
         assert_eq!(state.stages[0].runtime_kind, None);
         assert_eq!(state.stages[1].name, "runtime.account.probe");
         assert_eq!(
             state.stages[1].runtime_kind,
             Some(GatewayCliRuntimeKind::Codex)
         );
+        assert_eq!(state.stages[2].name, "runtime.models.load");
+        assert_eq!(
+            state.stages[2].runtime_kind,
+            Some(GatewayCliRuntimeKind::Codex)
+        );
+        assert_eq!(state.stages[3].name, "api.instance.warmup");
+        assert_eq!(state.stages[3].provider_kind.as_deref(), Some("openai"));
     }
 
     #[test]
-    fn dropped_stage_and_trace_are_fail_closed() {
-        let trace = GatewayCliRuntimeRefreshTrace::start();
-        drop(trace.stage(GatewayCliRuntimeRefreshStage::CatalogLoad));
+    fn a_provider_sample_cannot_cross_a_consent_generation() {
+        assert!(super::super::telemetry_sample_allowed_for_state(
+            Some(7),
+            true,
+            7
+        ));
+        assert!(!super::super::telemetry_sample_allowed_for_state(
+            None, true, 7
+        ));
+        assert!(!super::super::telemetry_sample_allowed_for_state(
+            Some(7),
+            false,
+            7
+        ));
+        assert!(!super::super::telemetry_sample_allowed_for_state(
+            Some(7),
+            true,
+            8
+        ));
+    }
+
+    #[test]
+    fn dropped_trace_is_a_cancellation_and_interrupted_stage_is_recorded() {
+        let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::Cli);
+        drop(trace.stage(GatewayProviderWarmupStage::CliCatalogLoad));
         let timeline = trace.timeline.clone();
         drop(trace);
 
         let state = timeline.lock();
         assert!(state.finalized);
         assert_eq!(state.stages[0].outcome, OperationStageOutcome::Error);
+    }
+
+    #[test]
+    fn cancelled_probe_has_an_explicit_non_failure_readiness_outcome() {
+        let snapshot = super::GatewayProviderWarmupSnapshot {
+            scope: GatewayProviderWarmupScope::Cli,
+            consent_generation: Some(0),
+            started_at: std::time::SystemTime::now(),
+            elapsed: std::time::Duration::ZERO,
+            stages: Vec::new(),
+            readiness: Vec::new(),
+            outcome: "cancelled",
+            failed: false,
+        };
+
+        assert_eq!(snapshot.readiness_outcome(), "cancelled");
+        assert!(!snapshot.failed);
+    }
+
+    #[test]
+    fn explicitly_cancelled_stage_is_not_recorded_as_an_error() {
+        let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::Cli);
+        trace
+            .stage(GatewayProviderWarmupStage::WorkspaceLoad)
+            .cancel();
+
+        let state = trace.timeline.lock();
+        assert_eq!(state.stages.len(), 1);
+        assert_eq!(state.stages[0].outcome, OperationStageOutcome::Cancelled);
+    }
+
+    #[test]
+    fn explicit_probe_failure_finalizes_the_trace() {
+        let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::Cli);
+        let timeline = trace.timeline.clone();
+
+        trace.finish_failure();
+
+        assert!(timeline.lock().finalized);
+    }
+
+    #[test]
+    fn readiness_distinguishes_probe_completion_from_provider_availability() {
+        let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::All);
+        trace.record_api_readiness("openai", GatewayProviderReadinessState::Ready);
+        trace.record_cli_readiness(
+            GatewayCliRuntimeKind::Codex,
+            GatewayProviderReadinessState::NeedsAuth,
+        );
+
+        let state = trace.timeline.lock();
+        assert_eq!(state.readiness.len(), 2);
+        assert_eq!(
+            state.readiness[0].state,
+            GatewayProviderReadinessState::Ready
+        );
+        assert_eq!(state.readiness[0].provider_kind.as_deref(), Some("openai"));
+        assert_eq!(
+            state.readiness[1].state,
+            GatewayProviderReadinessState::NeedsAuth
+        );
+    }
+
+    #[test]
+    fn disabled_providers_are_not_counted_as_unavailable() {
+        let snapshot = super::GatewayProviderWarmupSnapshot {
+            scope: GatewayProviderWarmupScope::Cli,
+            consent_generation: Some(0),
+            started_at: std::time::SystemTime::now(),
+            elapsed: std::time::Duration::ZERO,
+            stages: Vec::new(),
+            readiness: vec![super::ProviderReadinessRecord {
+                provider_type: super::GatewayProviderType::Cli,
+                runtime_kind: Some(GatewayCliRuntimeKind::Claude),
+                provider_kind: None,
+                state: GatewayProviderReadinessState::Disabled,
+            }],
+            outcome: "ok",
+            failed: false,
+        };
+
+        assert_eq!(snapshot.readiness_outcome(), "not_applicable");
+    }
+
+    #[test]
+    fn unsupported_safe_probe_is_reported_as_unverified_without_retry_failure() {
+        let snapshot = super::GatewayProviderWarmupSnapshot {
+            scope: GatewayProviderWarmupScope::Api,
+            consent_generation: Some(0),
+            started_at: std::time::SystemTime::now(),
+            elapsed: std::time::Duration::ZERO,
+            stages: Vec::new(),
+            readiness: vec![super::ProviderReadinessRecord {
+                provider_type: super::GatewayProviderType::Api,
+                runtime_kind: None,
+                provider_kind: Some("local".to_owned()),
+                state: GatewayProviderReadinessState::Unverified,
+            }],
+            outcome: "ok",
+            failed: false,
+        };
+
+        assert_eq!(snapshot.readiness_outcome(), "unverified");
+        assert!(!snapshot.failed);
+    }
+
+    #[test]
+    fn superseded_probe_has_an_explicit_non_failure_outcome() {
+        let trace = GatewayProviderWarmupTrace::start(GatewayProviderWarmupScope::Cli);
+        let timeline = trace.timeline.clone();
+
+        trace.finish_superseded();
+
+        let state = timeline.lock();
+        assert!(state.finalized);
+        drop(state);
+
+        let snapshot = super::GatewayProviderWarmupSnapshot {
+            scope: GatewayProviderWarmupScope::Cli,
+            consent_generation: Some(0),
+            started_at: std::time::SystemTime::now(),
+            elapsed: std::time::Duration::ZERO,
+            stages: Vec::new(),
+            readiness: Vec::new(),
+            outcome: "superseded",
+            failed: false,
+        };
+        assert_eq!(snapshot.readiness_outcome(), "superseded");
     }
 }

@@ -378,6 +378,8 @@ pub struct PioneerDesktop {
     pub(super) thread_scope_pending: ThreadScopePendingAction,
     pub(super) thread_scope_error: Option<String>,
     pub(super) message_revision_dialog: Option<Entity<DesktopMessageRevisionDialogState>>,
+    pub(crate) open_model_selector_cli_runtime_binding:
+        Option<crate::components::model_selector::OpenModelSelectorCliRuntimeBinding>,
     pub(super) message_revision_loading: bool,
     pub(super) message_mutation_pending: bool,
     pub(super) invitations_loading: bool,

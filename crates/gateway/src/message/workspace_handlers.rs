@@ -103,6 +103,7 @@ impl MessageProcessor {
         self.session_manager
             .set_connection_workspace(connection_id, Some(workspace.id.clone()))
             .await;
+        self.request_provider_warmup(workspace.id.clone());
 
         let response = WorkspaceCreateResponse {
             workspace: workspace.clone(),

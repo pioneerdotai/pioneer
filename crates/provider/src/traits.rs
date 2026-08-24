@@ -8,6 +8,17 @@ use futures_util::stream::BoxStream;
 
 use pioneer_protocol::ProviderModelInfo;
 
+/// Result of a safe, non-inference provider warm-up.
+///
+/// `NotSupported` is intentionally distinct from success: adapters that do
+/// not expose a harmless health/authentication endpoint must not be reported
+/// as verified merely because the default implementation did no work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderWarmupOutcome {
+    Completed,
+    NotSupported,
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Human-readable provider name (e.g. "openrouter", "anthropic").
@@ -79,10 +90,13 @@ pub trait Provider: Send + Sync {
         anyhow::bail!("provider '{}' does not support embeddings", self.name())
     }
 
-    /// Pre-warm the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
-    /// Default implementation is a no-op.
-    async fn warmup(&self) -> Result<()> {
-        Ok(())
+    /// Run a safe readiness probe without making a paid inference request.
+    ///
+    /// Adapters without a harmless health/authentication endpoint return
+    /// `NotSupported`; callers must preserve that distinction instead of
+    /// treating a no-op as proof of readiness.
+    async fn warmup(&self) -> Result<ProviderWarmupOutcome> {
+        Ok(ProviderWarmupOutcome::NotSupported)
     }
 }
 
@@ -223,6 +237,14 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "provider 'mock' does not support listing transcription models"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_default_warmup_is_explicitly_unverified() {
+        assert_eq!(
+            MockProvider.warmup().await.expect("default warm-up"),
+            ProviderWarmupOutcome::NotSupported
         );
     }
 }

@@ -15,7 +15,6 @@ use pioneer_client::state::selectors as client_selectors;
 use pioneer_client::state::snapshot::{ClientSnapshot, ClientSnapshotInput};
 use pioneer_client::threads::tree as thread_tree;
 use pioneer_client::workspaces::selectors as workspace_selectors;
-#[cfg(test)]
 use pioneer_protocol::RuntimeSummary;
 
 #[cfg(test)]
@@ -239,7 +238,7 @@ impl PioneerDesktop {
         workspace_selectors::workspace_by_id(self.workspaces(), workspace_id)
     }
 
-    pub(in crate::app) fn active_workspace_id(&self) -> Option<&str> {
+    pub(crate) fn active_workspace_id(&self) -> Option<&str> {
         workspace_selectors::resolve_active_workspace_id(
             self.preferred_workspace_id(),
             self.workspaces(),
@@ -322,6 +321,14 @@ impl PioneerDesktop {
             self.current_active_thread_id(),
             &self.thread_coordinators,
         )
+    }
+
+    pub(crate) fn model_selector_cli_runtimes(&self) -> &[RuntimeSummary] {
+        // A transient snapshot request error must not hide a previously
+        // confirmed Gateway revision. Workspace and Gateway switches clear
+        // this cache explicitly, so retaining it here is both safe and more
+        // resilient than treating transport health as provider readiness.
+        self.providers.cli_runtimes()
     }
 
     pub(in crate::app) fn thread_folder(&self, folder_id: &str) -> Option<&ThreadFolder> {

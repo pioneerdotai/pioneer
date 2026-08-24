@@ -563,6 +563,7 @@ impl PioneerDesktop {
         self.clear_thread_start_queue();
         self.clear_turn_resume_queue();
         self.providers.clear_for_workspace_switch();
+        self.sync_open_model_selector_cli_runtime_snapshot();
         self.mcp_servers.clear();
         self.mcp_selected_server_id = None;
         self.mcp_server_details = None;

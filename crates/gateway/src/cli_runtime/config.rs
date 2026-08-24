@@ -115,12 +115,6 @@ pub(crate) fn codex_account_probe_config_from_instance_with_proxy(
     }
 }
 
-pub(crate) fn claude_account_probe_config_from_instance(
-    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
-) -> ClaudeAccountProbeConfig {
-    claude_account_probe_config_from_instance_with_proxy(instance, None)
-}
-
 pub(crate) fn claude_account_probe_config_from_instance_with_proxy(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     proxy_url: Option<&str>,

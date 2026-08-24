@@ -279,10 +279,6 @@ impl PioneerDesktop {
             match provider_list::resolve_cli_runtime_execution_backend(
                 selected_provider.as_deref(),
                 self.providers.cli_runtimes(),
-                self.gateway
-                    .settings
-                    .as_ref()
-                    .map(|settings| &settings.cli_runtimes),
             ) {
                 Ok(backend) => backend,
                 Err(error) => {

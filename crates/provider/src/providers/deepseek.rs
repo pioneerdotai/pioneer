@@ -1,6 +1,6 @@
 use crate::{
     providers::compatible::{AuthStyle, OpenAiCompatibleProvider},
-    traits::Provider,
+    traits::{Provider, ProviderWarmupOutcome},
     types::{
         ChatRequest, ChatResponse, ProviderCapabilities, ProviderFailureClassification,
         ProviderInputCapabilities, ProviderReplayState, ProviderTimeoutPolicy, ReasoningConfig,
@@ -274,7 +274,7 @@ impl Provider for DeepSeekProvider {
         self.transport.list_models().await
     }
 
-    async fn warmup(&self) -> Result<()> {
+    async fn warmup(&self) -> Result<ProviderWarmupOutcome> {
         self.transport.warmup().await
     }
 }

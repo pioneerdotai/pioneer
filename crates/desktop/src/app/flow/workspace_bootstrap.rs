@@ -57,10 +57,10 @@ impl PioneerDesktop {
         self.set_preferred_workspace_id(Some(reduction.selected.set_preferred_workspace_id));
         self.clear_task_user_notification_inbox();
         self.refresh_current_principal(cx);
-        // The connection effect can run before workspace bootstrap establishes a scope,
-        // so ensure both API and CLI runtime summaries are loaded once that scope is available.
+        // Both calls only read Gateway-owned catalogs. Provider probing is
+        // performed by the Gateway supervisor and never by Desktop startup.
         self.refresh_configured_providers(cx);
-        self.refresh_cli_providers_auto(cx);
+        self.load_cli_provider_snapshot(cx);
         self.load_thread_folder_expansion_for_workspace(workspace_id.as_str(), cx);
         if reduction.selected.refresh_thread_list {
             self.refresh_thread_list(cx);

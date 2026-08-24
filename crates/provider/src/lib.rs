@@ -29,7 +29,7 @@ pub use attachments::{
 pub use factory::create_provider;
 pub use http::validate_proxy_url;
 pub use registry::{ProviderAuthorityFingerprint, ProviderRegistry};
-pub use traits::Provider;
+pub use traits::{Provider, ProviderWarmupOutcome};
 pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
     ChatRequest, ChatResponse, CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse,

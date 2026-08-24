@@ -775,7 +775,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         }
     }
 
-    async fn warmup(&self) -> Result<()> {
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
         let request_builder = Self::with_app_attribution(
             self.client
                 .get(self.auth_key_url())
@@ -785,7 +785,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             .send()
             .await?
             .error_for_status()?;
-        Ok(())
+        Ok(crate::ProviderWarmupOutcome::Completed)
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {

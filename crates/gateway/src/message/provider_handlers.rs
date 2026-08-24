@@ -812,6 +812,7 @@ impl MessageProcessor {
             }
             self.publish_resource_selector_change(workspace_id.as_str())
                 .await;
+            self.request_api_provider_warmup(workspace_id.clone());
         }
 
         let response = ProviderConfigureResponse {
@@ -945,6 +946,7 @@ impl MessageProcessor {
         }
         self.publish_resource_selector_change(workspace_id.as_str())
             .await;
+        self.request_api_provider_warmup(workspace_id.clone());
 
         let response = ProviderSetApiKeyResponse {
             provider: normalized_provider,
@@ -1057,6 +1059,7 @@ impl MessageProcessor {
             }
             self.publish_resource_selector_change(workspace_id.as_str())
                 .await;
+            self.request_api_provider_warmup(workspace_id.clone());
         }
 
         let response = ProviderDeleteApiKeyResponse {

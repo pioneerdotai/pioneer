@@ -148,12 +148,11 @@ impl ComposerCapabilityTarget {
     /// Structural capability target used at the CLI turn-submission boundary.
     ///
     /// Runtime summaries are suitable for presenting the composer picker, but
-    /// they are not authoritative at submission time: the phase-zero catalog
-    /// intentionally reports MCP as unavailable until a live readiness probe
-    /// has run. The Gateway performs that live, fail-closed validation while
-    /// preparing the turn, so clients must preserve an explicit selection on
-    /// the wire instead of silently reducing it from a stale catalog summary.
-    /// CLI-only source restrictions still apply to skills.
+    /// they are not authoritative at submission time. The Gateway owns and
+    /// validates its current readiness snapshot while preparing the turn, so
+    /// clients must preserve an explicit selection on the wire instead of
+    /// silently reducing it from a stale local snapshot. CLI-only source
+    /// restrictions still apply to skills.
     pub const fn cli_submission() -> Self {
         Self::cli(ComposerCapabilityPolicy::cli(true, true))
     }
@@ -246,10 +245,7 @@ pub fn composer_capability_target_for_provider(
     let Some(runtime) = runtimes.iter().find(|runtime| {
         runtime.runtime_id == runtime_id
             && runtime.enabled
-            && matches!(
-                runtime.status,
-                RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
-            )
+            && matches!(runtime.status, RuntimeStatus::Ready)
     }) else {
         return ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli());
     };
@@ -259,10 +255,10 @@ pub fn composer_capability_target_for_provider(
 
 /// Structural capability target used when a turn is submitted.
 ///
-/// Live runtime summaries are presentation evidence only. Submission keeps an
-/// explicit selection intact and lets Gateway perform the authoritative live
-/// readiness and projection validation. The only client-side reduction here
-/// is the stable source rule for skills exported to CLI runtimes.
+/// Gateway runtime summaries are presentation evidence only. Submission keeps
+/// an explicit selection intact and lets Gateway perform the authoritative
+/// cached-readiness and projection validation. The only client-side reduction
+/// here is the stable source rule for skills exported to CLI runtimes.
 pub fn composer_submission_target_for_provider(provider: Option<&str>) -> ComposerCapabilityTarget {
     if provider
         .map(str::trim)

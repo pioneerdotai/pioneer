@@ -18,18 +18,12 @@ use pioneer_client::providers::diagnostics::{
     CliRuntimeMcpReadinessReason, cli_runtime_mcp_readiness_reason,
     cli_runtime_mcp_readiness_reason_from_code,
 };
-use pioneer_client::providers::{
-    cli_runtime_settings as cli_provider_settings, list as provider_list, selectors,
-};
+use pioneer_client::providers::{cli_runtime_settings as cli_provider_settings, selectors};
 use pioneer_protocol::{
     CLIAgentRuntimeKind, GatewayCliRuntimeInstanceSettings, RuntimeCapabilities,
     RuntimeDiagnosticLevel, RuntimeStatus, RuntimeSummary,
 };
-use std::{
-    cmp::Ordering,
-    collections::HashSet,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{cmp::Ordering, collections::HashSet};
 
 impl PioneerDesktop {
     pub(crate) fn render_providers(
@@ -61,7 +55,6 @@ impl PioneerDesktop {
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
         let configured_provider_names = self.providers.configured_names().clone();
         let cli_runtimes = self.providers.cli_runtimes().to_vec();
-        let cli_refresh_status = self.providers.cli_refresh_status().clone();
         let expanded_cli_runtime_ids = self.providers.expanded_cli_runtime_ids().clone();
         let provider_filter = self.providers.filter();
         let show_api_providers = selectors::provider_filter_shows_api_providers(provider_filter);
@@ -72,7 +65,7 @@ impl PioneerDesktop {
             ProviderFilter::Cli => t!("providers.cli.title").to_string(),
         };
         let screen_description = if show_cli_providers {
-            cli_runtime_refresh_status_label(&cli_refresh_status)
+            t!("providers.cli.description").to_string()
         } else {
             t!("providers.screen.description").to_string()
         };
@@ -179,7 +172,7 @@ impl PioneerDesktop {
                             .loading(is_loading)
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.refresh_configured_providers(cx);
-                                view.refresh_cli_providers(cx);
+                                view.load_cli_provider_snapshot(cx);
                                 cx.notify();
                             }))
                             .into_any_element()
@@ -574,11 +567,10 @@ impl PioneerDesktop {
                         PopupMenuItem::new(t!("providers.cli.action.refresh").to_string())
                             .disabled(!is_connected || is_loading)
                             .on_click({
-                                let runtime_id = runtime_id.clone();
                                 let desktop_entity = desktop_entity.clone();
                                 move |_, _, cx| {
                                     let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.refresh_cli_provider(runtime_id.clone(), cx);
+                                        view.load_cli_provider_snapshot(cx);
                                         cx.notify();
                                     });
                                 }
@@ -1042,29 +1034,6 @@ fn cli_runtime_summary_from_settings(
         diagnostics: Vec::new(),
         recent_stderr: Vec::new(),
     }
-}
-
-fn cli_runtime_refresh_status_label(status: &provider_list::CLIRuntimeRefreshStatus) -> String {
-    if status.in_flight {
-        return t!("providers.cli.refreshing").to_string();
-    }
-    if status.is_stale(provider_view_now_unix_ms()) {
-        return t!("providers.cli.stale").to_string();
-    }
-    if status.last_success_at_unix_ms.is_some() {
-        return t!("providers.cli.updated").to_string();
-    }
-    if status.last_failure_at_unix_ms.is_some() {
-        return t!("providers.cli.refresh_failed").to_string();
-    }
-    t!("providers.cli.not_refreshed").to_string()
-}
-
-fn provider_view_now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or_default()
 }
 
 fn cli_runtime_status_label(status: &RuntimeStatus) -> String {

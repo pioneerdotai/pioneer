@@ -6,8 +6,8 @@
 //! and build-time values with the same names.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once};
 
 use sentry::integrations::tracing::{
     EventFilter, EventMapping, breadcrumb_from_event, event_from_event,
@@ -31,8 +31,9 @@ pub use metrics::{
     register_database_pool_observer,
 };
 pub use operations::{
-    GatewayCliRuntimeKind, GatewayCliRuntimeRefreshStage, GatewayCliRuntimeRefreshStageGuard,
-    GatewayCliRuntimeRefreshTrace,
+    GatewayCliRuntimeKind, GatewayProviderReadinessState, GatewayProviderType,
+    GatewayProviderWarmupScope, GatewayProviderWarmupStage, GatewayProviderWarmupStageGuard,
+    GatewayProviderWarmupTrace,
 };
 pub use startup::{
     DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
@@ -40,8 +41,8 @@ pub use startup::{
     MobileStartupReport, MobileStartupStage, MobileStartupStageTiming, record_mobile_startup,
 };
 pub use telemetry::{
-    OtlpTelemetryConfig, TelemetryTarget, init_otlp_observability, init_otlp_observability_for,
-    shutdown_observability,
+    OtlpTelemetryConfig, TelemetryTarget, force_flush_observability, init_otlp_observability,
+    init_otlp_observability_for, schedule_observability_flush, shutdown_observability,
 };
 
 /// DSN for non-desktop runtime binaries.
@@ -58,7 +59,24 @@ const BUILD_SENTRY_ENVIRONMENT: Option<&str> = option_env!("PIONEER_SENTRY_ENVIR
 static LOAD_DOTENV: Once = Once::new();
 // Runtime binaries participate by default. The gateway explicitly closes this
 // gate before Sentry initialization and reopens it only after loading consent.
-static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(true);
+// One atomic value keeps consent and its generation consistent. Bit zero is
+// the current gate; upper bits change on every actual opt-in/opt-out
+// transition so a long-running operation cannot be exported after consent was
+// revoked and later re-enabled.
+static TELEMETRY_CONSENT: AtomicU64 = AtomicU64::new(1);
+static TELEMETRY_CONSENT_TRANSITION: Mutex<TelemetryConsentTransition> =
+    Mutex::new(TelemetryConsentTransition {
+        desired_enabled: true,
+        revision: 0,
+        enable_worker_running: false,
+    });
+
+#[derive(Debug)]
+struct TelemetryConsentTransition {
+    desired_enabled: bool,
+    revision: u64,
+    enable_worker_running: bool,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum SentryTarget {
@@ -145,11 +163,132 @@ pub fn capture_anyhow(error: &anyhow::Error) {
 }
 
 pub fn set_telemetry_enabled(enabled: bool) {
-    TELEMETRY_ENABLED.store(enabled, Ordering::Release);
+    let mut transition = TELEMETRY_CONSENT_TRANSITION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if transition.desired_enabled != enabled {
+        transition.desired_enabled = enabled;
+        transition.revision = transition.revision.wrapping_add(1);
+    }
+
+    if !enabled {
+        set_telemetry_gate(false);
+        return;
+    }
+
+    if telemetry_enabled() {
+        return;
+    }
+
+    // During process startup no SDK buffers exist yet, so consent can be
+    // applied synchronously without delaying initialization. At runtime the
+    // old buffers must be drained while the exporter gate is still closed;
+    // do that in one coalesced worker so a settings UI or Gateway request is
+    // never blocked by an exporter timeout.
+    if telemetry::state().is_none() {
+        set_telemetry_gate(true);
+        return;
+    }
+
+    if transition.enable_worker_running {
+        return;
+    }
+    transition.enable_worker_running = true;
+    drop(transition);
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("pioneer-telemetry-consent".to_owned())
+        .spawn(enable_telemetry_after_buffer_discard)
+    {
+        let mut transition = TELEMETRY_CONSENT_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        transition.enable_worker_running = false;
+        tracing::error!(
+            error = %error,
+            "telemetry remains disabled because the consent transition worker could not start"
+        );
+    }
+}
+
+fn enable_telemetry_after_buffer_discard() {
+    loop {
+        let revision = {
+            let mut transition = TELEMETRY_CONSENT_TRANSITION
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !transition.desired_enabled {
+                transition.enable_worker_running = false;
+                return;
+            }
+            transition.revision
+        };
+
+        // Metrics and spans recorded before an opt-out can still be buffered
+        // by the SDK. Drain them through the closed exporter gate before
+        // reopening consent; otherwise a quick off -> on transition could
+        // export data that predates the new opt-in.
+        let flush_result = telemetry::force_flush_observability();
+
+        let mut transition = TELEMETRY_CONSENT_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !transition.desired_enabled {
+            transition.enable_worker_running = false;
+            return;
+        }
+        if transition.revision != revision {
+            // Consent changed while buffers were being discarded. Keep the
+            // gate closed and flush once more for the latest opt-in request.
+            continue;
+        }
+        if let Err(error) = flush_result {
+            transition.enable_worker_running = false;
+            drop(transition);
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "telemetry remains disabled because buffered signals could not be discarded"
+            );
+            return;
+        }
+
+        set_telemetry_gate(true);
+        transition.enable_worker_running = false;
+        return;
+    }
+}
+
+fn set_telemetry_gate(enabled: bool) {
+    let current = TELEMETRY_CONSENT.load(Ordering::Acquire);
+    if current & 1 == u64::from(enabled) {
+        return;
+    }
+    let generation = (current >> 1).wrapping_add(1);
+    let next = (generation << 1) | u64::from(enabled);
+    TELEMETRY_CONSENT.store(next, Ordering::Release);
 }
 
 pub fn telemetry_enabled() -> bool {
-    TELEMETRY_ENABLED.load(Ordering::Acquire)
+    TELEMETRY_CONSENT.load(Ordering::Acquire) & 1 == 1
+}
+
+pub(crate) fn telemetry_consent_snapshot() -> (bool, u64) {
+    let state = TELEMETRY_CONSENT.load(Ordering::Acquire);
+    (state & 1 == 1, state >> 1)
+}
+
+pub(crate) fn telemetry_sample_allowed(started_generation: Option<u64>) -> bool {
+    let (enabled, current_generation) = telemetry_consent_snapshot();
+    telemetry_sample_allowed_for_state(started_generation, enabled, current_generation)
+}
+
+fn telemetry_sample_allowed_for_state(
+    started_generation: Option<u64>,
+    enabled: bool,
+    current_generation: u64,
+) -> bool {
+    enabled && started_generation == Some(current_generation)
 }
 
 fn load_local_dotenv() {

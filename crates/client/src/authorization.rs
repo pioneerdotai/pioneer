@@ -503,6 +503,13 @@ pub fn plan_access_changed(
     }
     if workspace_wide {
         effects.push(ClientEffect::RefreshWorkspaceList);
+        if active_workspace_id == Some(notification.workspace_id.as_str()) {
+            // Workspace membership changes can also change provider and CLI
+            // runtime capabilities. Rebuild both catalogs from current-ACL
+            // endpoints instead of retaining a snapshot from the previous
+            // authorization generation.
+            effects.push(ClientEffect::RefreshProviderLists);
+        }
     }
 
     AccessChangedPlan {
@@ -570,13 +577,18 @@ pub fn apply_access_changed_to_client_state(
     let workspace_wide = plan.change == AccessChangeKind::WorkspaceMembership;
     let workspace_access_lost =
         workspace_wide && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
+    if workspace_wide && active_workspace_id.as_deref() == Some(plan.workspace_id.as_str()) {
+        // Provider paths, diagnostics, and readiness are protected workspace
+        // projections. Clear them before the asynchronous current-ACL reload.
+        state.providers.clear_for_workspace_switch();
+    }
     state
         .threads
         .coordinators
         .retain(|thread_id, _| !invalidated_thread_ids.contains(thread_id.as_str()));
     state.threads.placements.retain(|thread_id, placement| {
-        !invalidated_thread_ids.contains(thread_id.as_str())
-            && !(workspace_access_lost && placement.workspace_id == plan.workspace_id)
+        !(invalidated_thread_ids.contains(thread_id.as_str())
+            || workspace_access_lost && placement.workspace_id == plan.workspace_id)
     });
 
     if workspace_access_lost {
@@ -603,15 +615,15 @@ pub fn apply_access_changed_to_client_state(
         .threads
         .last_active_thread_by_workspace
         .retain(|workspace_id, thread_id| {
-            !(workspace_access_lost && workspace_id == &plan.workspace_id)
-                && !invalidated_thread_ids.contains(thread_id.as_str())
+            !(invalidated_thread_ids.contains(thread_id.as_str())
+                || workspace_access_lost && workspace_id == &plan.workspace_id)
         });
     state
         .threads
         .draft_thread_by_workspace
         .retain(|workspace_id, thread_id| {
-            !(workspace_access_lost && workspace_id == &plan.workspace_id)
-                && !invalidated_thread_ids.contains(thread_id.as_str())
+            !(invalidated_thread_ids.contains(thread_id.as_str())
+                || workspace_access_lost && workspace_id == &plan.workspace_id)
         });
 
     if plan.clear_active_thread {
@@ -1212,6 +1224,7 @@ mod tests {
         ]);
         state.gateway.ws_connection_id = Some(17);
         state.gateway.bootstrap_complete = true;
+        state.providers.insert_configured("openai".to_owned());
         state
             .semantic_timelines
             .thread_mut("thread_allowed".to_owned());
@@ -1248,6 +1261,7 @@ mod tests {
         assert_eq!(state.gateway.authorization_revision, Some(7));
         assert_eq!(state.gateway.ws_connection_id, Some(17));
         assert!(state.gateway.bootstrap_complete);
+        assert!(state.providers.configured_names().is_empty());
         assert_eq!(state.workspaces.workspaces, vec![workspace("ws_allowed")]);
         assert!(state.workspaces.preferred_workspace_id.is_none());
         assert!(state.threads.active_thread_id.is_none());
@@ -1277,6 +1291,7 @@ mod tests {
                     thread_ids: vec!["thread_revoked".to_owned()]
                 },
                 ClientEffect::RefreshWorkspaceList,
+                ClientEffect::RefreshProviderLists,
             ]
         );
     }

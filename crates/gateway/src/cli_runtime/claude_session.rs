@@ -3,9 +3,7 @@ use crate::cli_runtime::claude_mcp::{
     append_claude_exact_allowed_tools, is_claude_native_mcp_permission_candidate,
     materialize_claude_mcp_config, parse_claude_native_mcp_permission_request,
 };
-use crate::cli_runtime::config::{
-    claude_account_probe_config_from_instance, load_effective_cli_runtime_instances,
-};
+use crate::cli_runtime::config::load_effective_cli_runtime_instances;
 use crate::cli_runtime::continuation::{
     CliMcpSessionLaunch, CliProviderContinuation, CliSessionLaunchSpec,
 };
@@ -42,9 +40,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use pioneer_cli_agent_runtime::BoundedNativeEventCodec;
 use pioneer_cli_agent_runtime::claude::{
-    ClaudeAccountProbeStatus, ClaudeManagedMcpConfigDescriptor, ClaudeManagedMcpConfigIdentity,
-    ClaudeProbe, ClaudeProviderSessionLaunch, cleanup_claude_managed_mcp_config,
-    materialize_claude_system_prompt_extension,
+    ClaudeManagedMcpConfigDescriptor, ClaudeManagedMcpConfigIdentity, ClaudeProviderSessionLaunch,
+    cleanup_claude_managed_mcp_config, materialize_claude_system_prompt_extension,
 };
 use pioneer_cli_agent_runtime::event::{
     RuntimeAgentMessagePhase, RuntimeErrorEvent, RuntimeEvent, RuntimeItemCompleted,
@@ -684,39 +681,6 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
                 instance.id,
                 instance.kind
             );
-        }
-
-        let mut probe_config = claude_account_probe_config_from_instance(&instance);
-        probe_config.env.extend_from(&options.env);
-        let probe = ClaudeProbe::account_read(probe_config).await;
-        match probe.status {
-            ClaudeAccountProbeStatus::Ready => {}
-            ClaudeAccountProbeStatus::NeedsAuth => {
-                bail!(
-                    "{}",
-                    probe
-                        .message
-                        .unwrap_or_else(|| "Claude CLI authentication is required".to_owned())
-                );
-            }
-            ClaudeAccountProbeStatus::MissingBinary => {
-                bail!(
-                    "{}",
-                    probe
-                        .message
-                        .unwrap_or_else(|| "Claude CLI binary was not found".to_owned())
-                );
-            }
-            ClaudeAccountProbeStatus::SpawnFailed
-            | ClaudeAccountProbeStatus::UnsupportedVersion
-            | ClaudeAccountProbeStatus::Error => {
-                bail!(
-                    "{}",
-                    probe
-                        .message
-                        .unwrap_or_else(|| "Claude CLI probe failed".to_owned())
-                );
-            }
         }
 
         let managed_mcp_identity = ClaudeManagedMcpConfigIdentity::new(

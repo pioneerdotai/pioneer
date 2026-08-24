@@ -462,6 +462,13 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_gateway_settings(&mut self, cx: &mut Context<Self>) {
+        // The initial request is deliberately deferred until the first
+        // operational Desktop frame. Before then the principal capability
+        // snapshot may not exist yet, which used to turn the connection-time
+        // refresh into a no-op until the user opened Settings manually.
+        if !self.startup.has_presented_operational_frame() {
+            return;
+        }
         if !self
             .principal_presentation_capabilities()
             .can_manage_gateway_settings
@@ -487,9 +494,6 @@ impl PioneerDesktop {
         };
         let connection_id = scope.connection_id;
         let connection_epoch = scope.connection_epoch;
-
-        self.startup
-            .begin(pioneer_observability::DesktopStartupStage::GatewaySettingsLoad);
 
         gateway_settings::begin_gateway_settings_refresh(
             &mut self.gateway.settings_loading,
@@ -527,9 +531,6 @@ impl PioneerDesktop {
                                     settings.general.telemetry_enabled,
                                 );
                             }
-                            view.startup.succeed(
-                                pioneer_observability::DesktopStartupStage::GatewaySettingsLoad,
-                            );
                         }
                         Err(error) => {
                             gateway_settings::apply_gateway_settings_get_error(
@@ -540,9 +541,6 @@ impl PioneerDesktop {
                             warn!(
                                 error = %format!("{error:#}"),
                                 "failed to fetch gateway settings"
-                            );
-                            view.startup.fail(
-                                pioneer_observability::DesktopStartupStage::GatewaySettingsLoad,
                             );
                         }
                     }
@@ -692,7 +690,7 @@ impl PioneerDesktop {
         };
         let connection_id = scope.connection_id;
         let connection_epoch = scope.connection_epoch;
-        let refresh_cli_providers_after_update = update.cli_runtimes.is_some();
+        let reload_cli_provider_snapshot_after_update = update.cli_runtimes.is_some();
         let poll_remote_access_status_after_update = update.remote_access.is_some();
 
         gateway_settings::apply_optimistic_gateway_settings_update(
@@ -726,8 +724,8 @@ impl PioneerDesktop {
                                 &mut view.gateway.settings_error,
                                 response,
                             );
-                            if refresh_cli_providers_after_update {
-                                view.refresh_cli_providers(cx);
+                            if reload_cli_provider_snapshot_after_update {
+                                view.load_cli_provider_snapshot(cx);
                             }
                             if poll_remote_access_status_after_update {
                                 view.schedule_remote_access_status_poll(

@@ -1,6 +1,134 @@
 use super::*;
 
 impl MessageProcessor {
+    pub(super) async fn send_cli_runtime_status_changed_notification(
+        &self,
+        workspace_id: &str,
+        revision: u64,
+        runtime: RuntimeSummary,
+        removed: bool,
+    ) {
+        let candidates = self
+            .session_manager
+            .connection_ids_for_workspace(workspace_id)
+            .await;
+        if candidates.is_empty() {
+            return;
+        }
+
+        let notification = CLIRuntimeStatusChangedNotification {
+            workspace_id: workspace_id.to_owned(),
+            revision,
+            removed,
+            runtime: runtime.clone(),
+        };
+        self.send_cli_runtime_notification_to_reauthorized_connections(
+            workspace_id,
+            runtime.runtime_id.as_str(),
+            CliRuntimeNotificationDisclosure::Full,
+            events::CLI_RUNTIME_STATUS_CHANGED,
+            &notification,
+            candidates.clone(),
+        )
+        .await;
+
+        let collaborator_notification = CLIRuntimeStatusChangedNotification {
+            workspace_id: workspace_id.to_owned(),
+            revision,
+            removed,
+            runtime: super::cli_runtime::collaborator_safe_runtime_summary(runtime),
+        };
+        self.send_cli_runtime_notification_to_reauthorized_connections(
+            workspace_id,
+            collaborator_notification.runtime.runtime_id.as_str(),
+            CliRuntimeNotificationDisclosure::Collaborator,
+            events::CLI_RUNTIME_STATUS_CHANGED,
+            &collaborator_notification,
+            candidates,
+        )
+        .await;
+    }
+
+    async fn send_cli_runtime_notification_to_reauthorized_connections<T: Serialize>(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        disclosure: CliRuntimeNotificationDisclosure,
+        method: &str,
+        payload: &T,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) {
+        let serialization_connection_ids = self
+            .authorized_cli_runtime_notification_recipients(
+                workspace_id,
+                runtime_id,
+                disclosure,
+                candidate_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_cli_runtime_notification_recipients(
+                workspace_id,
+                runtime_id,
+                disclosure,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    async fn authorized_cli_runtime_notification_recipients(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        disclosure: CliRuntimeNotificationDisclosure,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        let candidates = self
+            .authorized_workspace_notification_recipients(workspace_id, candidate_connection_ids)
+            .await;
+        let authorization = crate::authorization::AuthorizationService::new();
+        let mut recipients = Vec::with_capacity(candidates.len());
+        for connection_id in candidates {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if !authorization.cli_runtime_allowed(
+                principal.kind,
+                principal.role_key.as_ref(),
+                runtime_id,
+            ) {
+                continue;
+            }
+            let current_disclosure = match authorization
+                .role_disclosure_policy(principal.kind, principal.role_key.as_ref())
+            {
+                Some(crate::authorization::RoleDisclosurePolicy::Administrative) => {
+                    CliRuntimeNotificationDisclosure::Full
+                }
+                Some(crate::authorization::RoleDisclosurePolicy::Collaborator) => {
+                    CliRuntimeNotificationDisclosure::Collaborator
+                }
+                None => continue,
+            };
+            if current_disclosure == disclosure {
+                recipients.push(connection_id);
+            }
+        }
+        recipients
+    }
+
     pub(super) async fn send_principal_owned_notification<T: Serialize>(
         &self,
         owner_principal_id: &str,
@@ -1670,6 +1798,12 @@ impl MessageProcessor {
         let payload = serde_json::to_string(value)?;
         self.session_manager.send_text(connection_id, payload).await
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliRuntimeNotificationDisclosure {
+    Full,
+    Collaborator,
 }
 
 fn retain_thread_subscribers(
