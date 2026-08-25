@@ -56,20 +56,24 @@ use pioneer_protocol::{
     TaskUserNotificationListParams, TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
     ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFolderCreateParams,
-    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
-    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadMoveParams, ThreadMoveResponse, ThreadParticipantMutationParams,
-    ThreadParticipantsListParams, ThreadParticipantsResponse, ThreadReadParams, ThreadReadResponse,
-    ThreadStartParams, ThreadStartResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse,
-    ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeParams, ThreadUnsubscribeResponse,
-    ThreadUpdateParams, ThreadUpdateResponse, TurnCancelParams, TurnCancelResponse, TurnGetParams,
-    TurnGetResponse, TurnItemsParams, TurnItemsResponse, TurnMessageDeleteParams,
-    TurnMessageDeleteResponse, TurnMessageEditParams, TurnMessageEditResponse,
-    TurnMessageErrorReason, TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
-    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse, TurnStartParams,
-    TurnStartResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams,
-    TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFilePatchHistoryPageParams,
+    ThreadFilePatchHistoryPageResponse, ThreadFolderCreateParams, ThreadFolderCreateResponse,
+    ThreadFolderDeleteParams, ThreadFolderDeleteResponse, ThreadFolderMoveParams,
+    ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse, ThreadMoveParams,
+    ThreadMoveResponse, ThreadParticipantMutationParams, ThreadParticipantsListParams,
+    ThreadParticipantsResponse, ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse,
+    ThreadReadParams, ThreadReadResponse, ThreadStartParams, ThreadStartResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse,
+    ThreadUnsubscribeParams, ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse,
+    TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams,
+    TurnItemsResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse, TurnMessageEditParams,
+    TurnMessageEditResponse, TurnMessageErrorReason, TurnMessageRevisionsPageParams,
+    TurnMessageRevisionsPageResponse, TurnPatchDiffGetParams, TurnPatchDiffGetResponse,
+    TurnPatchRecordGetParams, TurnPatchRecordGetResponse, TurnPatchStepsPageParams,
+    TurnPatchStepsPageResponse, TurnPermissionRequestRespondParams,
+    TurnPermissionRequestRespondResponse, TurnStartParams, TurnStartResponse,
+    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
     VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
     VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse, WorkspaceCreateParams,
     WorkspaceCreateResponse, WorkspaceDefaultParams, WorkspaceDefaultResponse, WorkspaceListParams,
@@ -592,6 +596,51 @@ where
     )
 }
 
+pub fn thread_patch_steps_page<TTransport>(
+    transport: &TTransport,
+    params: ThreadPatchStepsPageParams,
+) -> Result<ThreadPatchStepsPageResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::THREAD_PATCH_STEPS_PAGE,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::THREAD_PATCH_STEPS_PAGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn thread_file_patch_history_page<TTransport>(
+    transport: &TTransport,
+    params: ThreadFilePatchHistoryPageParams,
+) -> Result<ThreadFilePatchHistoryPageResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::THREAD_FILE_PATCH_HISTORY_PAGE,
+    )?;
+    require_non_empty_field(
+        params.path.as_str(),
+        "path",
+        methods::THREAD_FILE_PATCH_HISTORY_PAGE,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::THREAD_FILE_PATCH_HISTORY_PAGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
 pub fn thread_folder_create<TTransport>(
     transport: &TTransport,
     params: ThreadFolderCreateParams,
@@ -1028,6 +1077,81 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::TURN_ITEMS_PAGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn turn_patch_steps_page<TTransport>(
+    transport: &TTransport,
+    params: TurnPatchStepsPageParams,
+) -> Result<TurnPatchStepsPageResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::TURN_PATCH_STEPS_PAGE,
+    )?;
+    require_non_empty_field(
+        params.turn_id.as_str(),
+        "turn_id",
+        methods::TURN_PATCH_STEPS_PAGE,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_PATCH_STEPS_PAGE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn turn_patch_record_get<TTransport>(
+    transport: &TTransport,
+    params: TurnPatchRecordGetParams,
+) -> Result<TurnPatchRecordGetResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::TURN_PATCH_RECORD_GET,
+    )?;
+    require_non_empty_field(
+        params.turn_id.as_str(),
+        "turn_id",
+        methods::TURN_PATCH_RECORD_GET,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_PATCH_RECORD_GET,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn turn_patch_diff_get<TTransport>(
+    transport: &TTransport,
+    params: TurnPatchDiffGetParams,
+) -> Result<TurnPatchDiffGetResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    require_non_empty_field(
+        params.thread_id.as_str(),
+        "thread_id",
+        methods::TURN_PATCH_DIFF_GET,
+    )?;
+    require_non_empty_field(
+        params.turn_id.as_str(),
+        "turn_id",
+        methods::TURN_PATCH_DIFF_GET,
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::TURN_PATCH_DIFF_GET,
         &params,
         RPC_REQUEST_TIMEOUT,
     )

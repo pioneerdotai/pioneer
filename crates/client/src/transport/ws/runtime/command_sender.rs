@@ -6,9 +6,12 @@ use crate::{
     skills::catalog::SkillSnapshotTransport,
 };
 use pioneer_protocol::{
-    ThreadReadParams, ThreadReadResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
-    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageRevisionsPageParams,
-    TurnMessageRevisionsPageResponse,
+    ThreadFilePatchHistoryPageParams, ThreadFilePatchHistoryPageResponse,
+    ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse, ThreadReadParams, ThreadReadResponse,
+    TurnMessageDeleteParams, TurnMessageDeleteResponse, TurnMessageEditParams,
+    TurnMessageEditResponse, TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
+    TurnPatchDiffGetParams, TurnPatchDiffGetResponse, TurnPatchRecordGetParams,
+    TurnPatchRecordGetResponse, TurnPatchStepsPageParams, TurnPatchStepsPageResponse,
 };
 
 impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
@@ -378,6 +381,20 @@ impl GatewayWsCommandSender {
         client_ws_commands::thread_timeline_page(self, params)
     }
 
+    pub fn thread_patch_steps_page(
+        &self,
+        params: ThreadPatchStepsPageParams,
+    ) -> Result<ThreadPatchStepsPageResponse> {
+        client_ws_commands::thread_patch_steps_page(self, params)
+    }
+
+    pub fn thread_file_patch_history_page(
+        &self,
+        params: ThreadFilePatchHistoryPageParams,
+    ) -> Result<ThreadFilePatchHistoryPageResponse> {
+        client_ws_commands::thread_file_patch_history_page(self, params)
+    }
+
     pub fn workspace_default(&self) -> Result<WorkspaceDefaultResponse> {
         client_ws_commands::workspace_default(self)
     }
@@ -634,6 +651,27 @@ impl GatewayWsCommandSender {
 
     pub fn turn_items_page(&self, params: TurnItemsParams) -> Result<TurnItemsResponse> {
         client_ws_commands::turn_items_page(self, params)
+    }
+
+    pub fn turn_patch_steps_page(
+        &self,
+        params: TurnPatchStepsPageParams,
+    ) -> Result<TurnPatchStepsPageResponse> {
+        client_ws_commands::turn_patch_steps_page(self, params)
+    }
+
+    pub fn turn_patch_record_get(
+        &self,
+        params: TurnPatchRecordGetParams,
+    ) -> Result<TurnPatchRecordGetResponse> {
+        client_ws_commands::turn_patch_record_get(self, params)
+    }
+
+    pub fn turn_patch_diff_get(
+        &self,
+        params: TurnPatchDiffGetParams,
+    ) -> Result<TurnPatchDiffGetResponse> {
+        client_ws_commands::turn_patch_diff_get(self, params)
     }
 
     pub fn task_user_notification_list(
