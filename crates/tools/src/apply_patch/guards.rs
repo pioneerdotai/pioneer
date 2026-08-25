@@ -1,5 +1,5 @@
 use crate::apply_patch::file_mutation::FileVersionToken;
-use crate::apply_patch::{GuardSyntax, Operation, OperationBody, OperationKind, PatchDocument};
+use crate::apply_patch::{GuardSyntax, Operation, OperationKind, PatchDocument};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -30,15 +30,11 @@ impl ValidatedOperation {
         self.operation.move_to.is_some()
     }
 
-    /// A model-observed source token is mandatory only when planning proves
-    /// that this operation consumes a pre-existing workspace file. A source
-    /// produced earlier in the same patch is guarded by the planner-derived
-    /// predecessor instead, so syntax validation must not reject that case.
+    /// Version guards are an internal/advanced compatibility feature, not a
+    /// requirement of the model-facing patch syntax. The executor snapshots
+    /// and revalidates every source under the target locks before commit.
     pub const fn requires_real_source_guard(&self) -> bool {
-        matches!(
-            self.operation.kind,
-            OperationKind::Replace | OperationKind::Delete
-        ) || self.operation.move_to.is_some()
+        false
     }
 }
 
@@ -159,13 +155,6 @@ pub fn validate_guards(document: PatchDocument) -> Result<ValidatedPatchDocument
                         "If-Destination requires Move to",
                     ));
                 }
-                if is_move && matches!(&operation.body, OperationBody::Delete) {
-                    return Err(GuardError::new(
-                        GuardErrorCode::InapplicableGuard,
-                        operation_index,
-                        "move requires update hunks",
-                    ));
-                }
             }
         }
         operations.push(ValidatedOperation {
@@ -199,10 +188,10 @@ mod tests {
     }
 
     #[test]
-    fn destructive_operations_require_canonical_source_token() {
+    fn destructive_operations_do_not_require_a_model_source_token() {
         let missing =
             validate("*** Begin Patch\n*** Delete File: file.txt\n*** End Patch").unwrap();
-        assert!(missing.operations[0].requires_real_source_guard());
+        assert!(!missing.operations[0].requires_real_source_guard());
         let malformed = validate(
             "*** Begin Patch\n*** Delete File: file.txt\n*** If-Match: token\n*** End Patch",
         )
@@ -211,13 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn update_may_be_optimistic_but_move_requires_source_and_destination_policy() {
+    fn update_and_move_use_automatic_internal_preconditions() {
         let ordinary =
             validate("*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** End Patch")
                 .unwrap();
         assert!(ordinary.operations[0].source_guard.is_none());
-        let move_without_source = validate("*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n*** If-Destination: absent\n@@\n-old\n+new\n*** End Patch").unwrap();
-        assert!(move_without_source.operations[0].requires_real_source_guard());
+        let move_without_source = validate(
+            "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n*** End Patch",
+        )
+        .unwrap();
+        assert!(!move_without_source.operations[0].requires_real_source_guard());
+        assert!(move_without_source.operations[0].source_guard.is_none());
+        assert!(
+            move_without_source.operations[0]
+                .destination_guard
+                .is_none()
+        );
         let move_with_source = validate("*** Begin Patch\n*** Update File: old.txt\n*** If-Match: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:3\n*** Move to: new.txt\n*** If-Destination: absent\n@@\n-old\n+new\n*** End Patch").unwrap();
         assert_eq!(
             move_with_source.operations[0].destination_guard,

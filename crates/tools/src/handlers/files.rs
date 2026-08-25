@@ -5,7 +5,7 @@ use crate::apply_patch::file_mutation::{
 use crate::context::{FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
 use crate::error::ToolError;
 use crate::registry::ToolHandler;
-use crate::{FilePolicyChecker, FilePolicyDecision, FilePolicyOperation};
+use crate::{FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
@@ -116,24 +116,26 @@ impl ToolHandler for ReadFileHandler {
         _trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<ReadFileArgs>(invocation.payload)?;
-        let workspace_root = invocation
-            .workdir
-            .canonicalize()
-            .unwrap_or_else(|_| invocation.workdir.clone());
-        let mut file_path =
-            resolve_path_within_workdir(workspace_root.as_path(), args.path.as_str())?;
-        if let Some(allowed_path) = enforce_file_policy_for_tool(
+        let resolved = resolve_authorized_tool_path(
             invocation.execution_security_snapshot.as_ref(),
-            FilePolicyOperation::Read,
-            file_path.as_path(),
             invocation.workdir.as_path(),
-        )? {
-            file_path = allowed_path;
-        }
-
+            FilePolicyOperation::Read,
+            args.path.as_str(),
+        )?;
+        let file_path = resolved.absolute.clone();
+        let reader_root = if file_path.starts_with(resolved.authorized_root.as_path())
+            && file_path != resolved.authorized_root
+        {
+            resolved.authorized_root.clone()
+        } else {
+            file_path
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| ToolError::invalid_arguments("read_file path has no parent"))?
+        };
         let name = file_path
-            .strip_prefix(workspace_root.as_path())
-            .map_err(|_| ToolError::invalid_arguments("read_file path is outside the workspace"))?
+            .strip_prefix(reader_root.as_path())
+            .map_err(|_| ToolError::invalid_arguments("read_file path could not be resolved"))?
             .to_string_lossy()
             .into_owned();
         if name.is_empty() {
@@ -141,7 +143,7 @@ impl ToolHandler for ReadFileHandler {
                 "read_file path has no file name",
             ));
         }
-        let root = workspace_root;
+        let root = reader_root;
         let max_bytes = args
             .max_bytes
             .unwrap_or(DEFAULT_READ_MAX_BYTES)
@@ -185,15 +187,9 @@ impl ToolHandler for ReadFileHandler {
         })
         .await
         .map_err(|error| ToolError::execution_failed(format!("read worker failed: {error}")))?
-        .map_err(|error| {
-            map_read_error(
-                invocation.workdir.as_path(),
-                requested_path.as_path(),
-                error,
-            )
-        })?;
+        .map_err(|error| map_read_error(requested_path.as_path(), error))?;
 
-        let display_path = page.path.clone();
+        let display_path = display_absolute_path(file_path.as_path());
         let mut rendered = String::new();
         rendered.push_str(format!("File: {display_path}\n---\n").as_str());
         for (index, line) in split_lines_inclusive(page.content.as_str())
@@ -217,7 +213,10 @@ impl ToolHandler for ReadFileHandler {
         let selected_line_count = split_lines_inclusive(page.content.as_str()).len();
         let payload = serde_json::json!({
             "path": display_path,
-            "resolved_path": page.path,
+            "resolved_path": display_absolute_path(file_path.as_path()),
+            "relative_path": relative_path(resolved.cwd.as_path(), file_path.as_path()),
+            "cwd": display_absolute_path(resolved.cwd.as_path()),
+            "authorized_root": display_absolute_path(resolved.authorized_root.as_path()),
             "start_line": page.start_line.saturating_add(1),
             "start_byte": page.start_byte,
             "end_line": if page.content.is_empty() { JsonValue::Null } else { serde_json::json!(page.start_line.saturating_add(selected_line_count as u64)) },
@@ -273,10 +272,10 @@ fn split_lines_inclusive(text: &str) -> Vec<&str> {
     lines
 }
 
-fn map_read_error(workdir: &Path, path: &Path, error: ReadError) -> ToolError {
+fn map_read_error(path: &Path, error: ReadError) -> ToolError {
     let message = format!(
         "failed to read file `{}`: {error}",
-        safe_display_path(workdir, path)
+        display_absolute_path(path)
     );
     match error.code {
         ReadErrorCode::CursorInvalid
@@ -302,16 +301,13 @@ impl ToolHandler for ListDirHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<ListDirArgs>(invocation.payload)?;
         let base = args.path.unwrap_or_else(|| ".".to_owned());
-        let mut root = resolve_path_within_workdir(invocation.workdir.as_path(), base.as_str())?;
-        if let Some(allowed_path) = enforce_file_policy_for_tool(
+        let resolved = resolve_authorized_tool_path(
             invocation.execution_security_snapshot.as_ref(),
-            FilePolicyOperation::Read,
-            root.as_path(),
             invocation.workdir.as_path(),
-        )? {
-            root = allowed_path;
-        }
-        reject_symlink_components(invocation.workdir.as_path(), root.as_path())?;
+            FilePolicyOperation::Read,
+            base.as_str(),
+        )?;
+        let root = resolved.absolute.clone();
         let depth_limit = args
             .depth
             .unwrap_or(DEFAULT_LIST_DEPTH)
@@ -424,7 +420,7 @@ impl ToolHandler for ListDirHandler {
                 };
 
                 items.push(DirEntryView {
-                    path: display_workspace_path(invocation.workdir.as_path(), &entry_path),
+                    path: display_absolute_path(&entry_path),
                     kind: kind.clone(),
                     size,
                 });
@@ -444,8 +440,12 @@ impl ToolHandler for ListDirHandler {
         }
 
         let payload = serde_json::json!({
-            "root": display_workspace_path(invocation.workdir.as_path(), &root),
+            "root": display_absolute_path(&root),
+            "relative_root": relative_path(resolved.cwd.as_path(), root.as_path()),
+            "cwd": display_absolute_path(resolved.cwd.as_path()),
+            "authorized_root": display_absolute_path(resolved.authorized_root.as_path()),
             "truncated": truncated,
+            "has_more": truncated,
             "entries": items,
         });
         let body = serde_json::to_string_pretty(&payload).map_err(|error| {
@@ -467,15 +467,13 @@ impl ToolHandler for GrepHandler {
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<GrepArgs>(invocation.payload)?;
         let base = args.path.as_deref().unwrap_or(".");
-        let requested_path = resolve_path_within_workdir(invocation.workdir.as_path(), base)?;
-        let search_path = enforce_file_policy_for_tool(
+        let resolved = resolve_authorized_tool_path(
             invocation.execution_security_snapshot.as_ref(),
-            FilePolicyOperation::Read,
-            requested_path.as_path(),
             invocation.workdir.as_path(),
-        )?
-        .unwrap_or(requested_path);
-        reject_symlink_components(invocation.workdir.as_path(), search_path.as_path())?;
+            FilePolicyOperation::Read,
+            base,
+        )?;
+        let search_path = resolved.absolute;
 
         let max_results = args
             .max_results
@@ -490,10 +488,7 @@ impl ToolHandler for GrepHandler {
             .timeout_ms
             .unwrap_or(DEFAULT_GREP_TIMEOUT_MS)
             .clamp(1, HARD_MAX_GREP_TIMEOUT_MS);
-        let workspace_root = invocation
-            .workdir
-            .canonicalize()
-            .unwrap_or_else(|_| invocation.workdir.to_path_buf());
+        let workspace_root = resolved.cwd;
         let is_broad_workspace_search = args.glob.is_none()
             && (args.path.is_none()
                 || search_path
@@ -976,11 +971,18 @@ fn needs_narrowing_output(
     max_output_bytes: usize,
     reason: &str,
 ) -> Box<dyn ToolOutput> {
-    let suggestions = serde_json::json!([
-        {"path": "crates/tasks/src", "glob": "*.rs"},
-        {"path": "crates/gateway/src", "glob": "*.rs"},
-        {"path": "crates/desktop/src", "glob": "*.rs"}
-    ]);
+    let absolute_path = display_workspace_path(workdir, search_path);
+    let next_action = format!(
+        "Call list_dir for `{absolute_path}`, choose the smallest relevant returned directory, then call grep_files again with that absolute path and an appropriate glob. Do not repeat the same broad search."
+    );
+    let suggestions = serde_json::json!([{
+        "tool": "list_dir",
+        "arguments": {
+            "path": absolute_path,
+            "depth": 1,
+            "limit": 200
+        }
+    }]);
     let payload = serde_json::json!({
         "ok": false,
         "status": "needs_narrowing",
@@ -992,6 +994,7 @@ fn needs_narrowing_output(
         "maxResults": max_results,
         "maxOutputBytes": max_output_bytes,
         "suggestions": suggestions,
+        "next_action": next_action,
         "retryableByModel": true,
         "retrySameArguments": false,
     });
@@ -999,26 +1002,23 @@ fn needs_narrowing_output(
     Box::new(FunctionToolOutput::with_payload(body, false, payload))
 }
 
-fn command_path(workdir: &Path, path: &Path) -> PathBuf {
-    workspace_relative_path(workdir, path)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+fn command_path(_workdir: &Path, path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
-fn display_workspace_path(workdir: &Path, path: &Path) -> String {
-    workspace_relative_path(workdir, path).unwrap_or_else(|| ".".to_owned())
+fn display_workspace_path(_workdir: &Path, path: &Path) -> String {
+    display_absolute_path(path)
 }
 
-fn workspace_relative_path(workdir: &Path, path: &Path) -> Option<String> {
-    let root = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.to_path_buf());
+fn relative_path(root: &Path, path: &Path) -> Option<String> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let relative = candidate
-        .strip_prefix(root.as_path())
-        .ok()
-        .filter(|relative| !relative.as_os_str().is_empty())?;
-    Some(relative.to_string_lossy().replace('\\', "/"))
+    let relative = candidate.strip_prefix(root.as_path()).ok()?;
+    Some(if relative.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        relative.to_string_lossy().replace('\\', "/")
+    })
 }
 
 fn parse_json_args<T>(payload: ToolPayload) -> Result<T, ToolError>
@@ -1042,23 +1042,93 @@ where
         .map_err(|error| ToolError::invalid_arguments(format!("invalid arguments: {error}")))
 }
 
-fn enforce_file_policy_for_tool(
+#[derive(Debug)]
+struct ResolvedToolPath {
+    absolute: PathBuf,
+    cwd: PathBuf,
+    authorized_root: PathBuf,
+}
+
+fn resolve_authorized_tool_path(
     snapshot: Option<&pioneer_protocol::TurnExecutionSecuritySnapshot>,
+    fallback_workdir: &Path,
     operation: FilePolicyOperation,
-    requested_path: &Path,
-    workdir: &Path,
-) -> Result<Option<PathBuf>, ToolError> {
+    requested_path: &str,
+) -> Result<ResolvedToolPath, ToolError> {
     let Some(snapshot) = snapshot else {
-        return Ok(None);
+        let cwd = fallback_workdir
+            .canonicalize()
+            .unwrap_or_else(|_| fallback_workdir.to_path_buf());
+        let absolute = resolve_path_within_workdir(cwd.as_path(), requested_path)?;
+        return Ok(ResolvedToolPath {
+            absolute,
+            cwd: cwd.clone(),
+            authorized_root: cwd,
+        });
     };
 
-    match FilePolicyChecker::check(snapshot, operation, requested_path) {
-        FilePolicyDecision::Allowed(grant) => Ok(Some(grant.resolved_path)),
-        FilePolicyDecision::Denied(deny) => Err(ToolError::Rejected(format!(
-            "filesystem sandbox denied {operation:?} for `{}`: {}",
-            safe_display_path(workdir, deny.requested_path.as_path()),
-            deny.message
-        ))),
+    let cwd = PathBuf::from(snapshot.sandbox.cwd.as_str())
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path_lexically(PathBuf::from(&snapshot.sandbox.cwd)));
+    match FilePolicyChecker::check(snapshot, operation, Path::new(requested_path)) {
+        FilePolicyDecision::Allowed(grant) => {
+            let authorized_root = grant.matched_root.unwrap_or_else(|| {
+                if grant.resolved_path.starts_with(cwd.as_path()) {
+                    cwd.clone()
+                } else {
+                    grant
+                        .resolved_path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| cwd.clone())
+                }
+            });
+            Ok(ResolvedToolPath {
+                absolute: grant.resolved_path,
+                cwd,
+                authorized_root,
+            })
+        }
+        FilePolicyDecision::Denied(deny) => {
+            let roots = FilePolicyChecker::allowed_roots(snapshot, operation)
+                .into_iter()
+                .map(|root| display_absolute_path(root.as_path()))
+                .collect::<Vec<_>>();
+            let resolved = deny
+                .resolved_path
+                .as_deref()
+                .map(display_absolute_path)
+                .unwrap_or_else(|| display_absolute_path(deny.requested_path.as_path()));
+            let message = format!(
+                "filesystem {operation:?} denied for input `{requested_path}` (resolved `{resolved}`): {}. Current working directory: `{}`. Authorized roots for this operation: {}",
+                deny.message,
+                display_absolute_path(cwd.as_path()),
+                if roots.is_empty() {
+                    "none".to_owned()
+                } else {
+                    roots
+                        .iter()
+                        .map(|root| format!("`{root}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+            match deny.reason {
+                FilePolicyDenyReason::EmptyPath => Err(ToolError::invalid_arguments(format!(
+                    "{message}. Pass a non-empty relative path from the current working directory or an authorized absolute path."
+                ))),
+                FilePolicyDenyReason::MissingPath => Err(ToolError::invalid_arguments(format!(
+                    "{message}. Use list_dir on the nearest existing parent, then retry with the exact returned absolute path."
+                ))),
+                FilePolicyDenyReason::OutsideAllowedRoots
+                | FilePolicyDenyReason::SymlinkEscape
+                | FilePolicyDenyReason::WriteRequiresWritableRoot
+                | FilePolicyDenyReason::NoUsableRoots
+                | FilePolicyDenyReason::InvalidRoot => Err(ToolError::Rejected(format!(
+                    "{message}. Choose a path under an authorized root; do not repeat the same denied call."
+                ))),
+            }
+        }
     }
 }
 
@@ -1123,50 +1193,286 @@ fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
     normalized.is_absolute().then_some(normalized)
 }
 
-fn safe_display_path(workdir: &Path, path: &Path) -> String {
-    let root = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.to_path_buf());
-    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    candidate
-        .strip_prefix(root.as_path())
-        .ok()
-        .map(|relative| {
-            if relative.as_os_str().is_empty() {
-                ".".to_owned()
-            } else {
-                relative.to_string_lossy().replace('\\', "/")
-            }
-        })
-        .unwrap_or_else(|| "<outside-workspace>".to_owned())
+fn display_absolute_path(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| normalize_path_lexically(path.to_path_buf()))
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
-fn reject_symlink_components(workdir: &Path, candidate: &Path) -> Result<(), ToolError> {
-    let workdir = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.to_path_buf());
-    if !candidate.starts_with(&workdir) {
-        return Err(ToolError::invalid_arguments(
-            "filesystem path is outside the workspace",
-        ));
-    }
-    let relative = candidate
-        .strip_prefix(&workdir)
-        .map_err(|_| ToolError::invalid_arguments("filesystem path is outside the workspace"))?;
-    let mut current = workdir.clone();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            continue;
-        };
-        current.push(part);
-        if let Ok(metadata) = std::fs::symlink_metadata(&current)
-            && metadata.file_type().is_symlink()
-        {
-            return Err(ToolError::invalid_arguments(format!(
-                "filesystem path contains a symlink component: `{}`",
-                display_workspace_path(workdir.as_path(), current.as_path())
-            )));
+fn normalize_path_lexically(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            component => normalized.push(component.as_os_str()),
         }
     }
-    Ok(())
+    normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ToolCallSource;
+    use pioneer_protocol::{
+        TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
+        TurnFilesystemSandboxPath, TurnPermissionMode, TurnPermissionProfileSnapshot,
+        TurnPermissionProfileSource, TurnSecurityRuleProvenance,
+    };
+    use std::collections::BTreeMap;
+
+    fn invocation(
+        tool_name: &str,
+        payload: ToolPayload,
+        cwd: &Path,
+        snapshot: TurnExecutionSecuritySnapshot,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            call_id: format!("call_{tool_name}"),
+            tool_name: tool_name.to_owned(),
+            source: ToolCallSource::Model,
+            payload,
+            workdir: cwd.to_path_buf(),
+            environment: BTreeMap::new(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: crate::spec::ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: Some(snapshot),
+            apply_patch_preflight: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn snapshot(cwd: &Path, additional: &Path) -> TurnExecutionSecuritySnapshot {
+        TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            cwd.to_string_lossy(),
+            vec![
+                TurnFilesystemSandboxEntry::workspace_root(
+                    TurnFilesystemAccess::Write,
+                    cwd.to_string_lossy(),
+                ),
+                TurnFilesystemSandboxEntry {
+                    path: TurnFilesystemSandboxPath::ExplicitPath {
+                        path: additional.to_string_lossy().into_owned(),
+                    },
+                    access: TurnFilesystemAccess::Read,
+                    provenance: TurnSecurityRuleProvenance::Project,
+                    resolved_path: Some(additional.to_string_lossy().into_owned()),
+                },
+            ],
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn file_tools_use_dynamic_cwd_and_additional_roots_without_path_ambiguity() {
+        let cwd = tempfile::tempdir().unwrap();
+        let additional = tempfile::tempdir().unwrap();
+        let relative_file = cwd.path().join("relative.txt");
+        let absolute_file = additional.path().join("absolute.txt");
+        std::fs::write(&relative_file, "relative\n").unwrap();
+        std::fs::write(&absolute_file, "absolute\n").unwrap();
+        let security = snapshot(cwd.path(), additional.path());
+
+        let relative_read = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"path": "relative.txt"}),
+                    },
+                    cwd.path(),
+                    security.clone(),
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_files",
+                    "call_read_relative",
+                    "read_file",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            relative_read.raw_json()["path"],
+            relative_file
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+
+        let absolute_read = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"path": absolute_file}),
+                    },
+                    cwd.path(),
+                    security.clone(),
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_files",
+                    "call_read_absolute",
+                    "read_file",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            absolute_read.raw_json()["path"],
+            absolute_file
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            absolute_read.raw_json()["cwd"],
+            cwd.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            absolute_read.raw_json()["authorized_root"],
+            additional
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+
+        let listing = ListDirHandler
+            .handle(
+                invocation(
+                    "list_dir",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": additional.path(),
+                            "depth": 0,
+                            "limit": 10
+                        }),
+                    },
+                    cwd.path(),
+                    security,
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_files",
+                    "call_list_absolute",
+                    "list_dir",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            listing.raw_json()["root"],
+            additional
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            listing.raw_json()["entries"][0]["path"],
+            absolute_file
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slash_cwd_keeps_leading_slashes_in_reusable_file_tool_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file.txt");
+        std::fs::write(&file, "absolute\n").unwrap();
+        let security = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            "/",
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                "/",
+            )],
+            1,
+        );
+
+        let listing = ListDirHandler
+            .handle(
+                invocation(
+                    "list_dir",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": directory.path(),
+                            "depth": 0,
+                            "limit": 10
+                        }),
+                    },
+                    Path::new("/"),
+                    security.clone(),
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_slash_files",
+                    "call_list_slash",
+                    "list_dir",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            listing.raw_json()["root"],
+            directory
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        let listing_payload = listing.raw_json();
+        let listed_path = listing_payload["entries"][0]["path"].as_str().unwrap();
+        assert!(listed_path.starts_with('/'));
+
+        let read = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"path": listed_path}),
+                    },
+                    Path::new("/"),
+                    security,
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_slash_files",
+                    "call_read_slash",
+                    "read_file",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.raw_json()["path"], listed_path);
+        assert_eq!(read.raw_json()["text"], "absolute\n");
+    }
 }

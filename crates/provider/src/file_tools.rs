@@ -52,27 +52,6 @@ impl NativeFileToolCapability {
         }
     }
 
-    /// The catalog projection is derived from this same immutable decision;
-    /// callers must not independently infer file-tool visibility.
-    pub fn tool_definitions(&self) -> Vec<crate::types::ToolDefinition> {
-        if !self.is_supported() {
-            return Vec::new();
-        }
-        let read_schema = read_file_tool_schema();
-        vec![
-            crate::types::ToolDefinition {
-                name: "read_file".to_owned(),
-                description: "Read a text file and return its copyable version token.".to_owned(),
-                parameters: read_schema.get("input").cloned().unwrap_or(JsonValue::Null),
-            },
-            crate::types::ToolDefinition {
-                name: "apply_patch".to_owned(),
-                description: "Apply one bounded patch document to text files.".to_owned(),
-                parameters: apply_patch_tool_schema(self.patch_shape),
-            },
-        ]
-    }
-
     pub fn prompt_capability_metadata(&self) -> JsonValue {
         serde_json::json!({
             "schemaVersion": self.schema_version,
@@ -211,12 +190,12 @@ pub fn read_file_tool_schema() -> JsonValue {
         "input": {
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
+                "path": { "type": "string", "description": "Path relative to the turn cwd, or an authorized absolute file path." },
                 "start_line": { "type": "integer", "minimum": 1 },
                 "start_byte": { "type": "integer", "minimum": 0 },
                 "max_lines": { "type": "integer", "minimum": 1 },
                 "max_bytes": { "type": "integer", "minimum": 1 },
-                "cursor": { "type": "string", "minLength": 1, "maxLength": 16384 }
+                "cursor": { "type": "string", "minLength": 1, "maxLength": 16384, "description": "Opaque continuation returned by the preceding page of this same file." }
             },
             "required": ["path"],
             "additionalProperties": false
@@ -252,13 +231,13 @@ pub fn apply_patch_tool_schema(shape: NativePatchWireShape) -> JsonValue {
         NativePatchWireShape::Freeform => serde_json::json!({
             "schemaVersion": NATIVE_FILE_TOOL_SCHEMA_VERSION,
             "type": "string",
-            "description": "The complete apply_patch document"
+            "description": "Pass the complete patch document directly as the tool input. Do not wrap it in JSON."
         }),
         NativePatchWireShape::JsonFunction => serde_json::json!({
             "schemaVersion": NATIVE_FILE_TOOL_SCHEMA_VERSION,
             "type": "object",
             "properties": {
-                "patch": { "type": "string", "description": "The complete apply_patch document" }
+                "patch": { "type": "string", "description": "The complete patch document in the syntax defined by the apply_patch tool description." }
             },
             "required": ["patch"],
             "additionalProperties": false
@@ -283,5 +262,30 @@ mod tests {
         let capability = select_native_file_tool_capability("made-up", "model");
         assert_eq!(capability.patch_shape, NativePatchWireShape::Unavailable);
         assert!(!capability.apply_patch);
+    }
+
+    #[test]
+    fn apply_patch_schemas_describe_only_the_selected_input_transport() {
+        let freeform = apply_patch_tool_schema(NativePatchWireShape::Freeform);
+        assert_eq!(freeform["type"], serde_json::json!("string"));
+        assert!(
+            freeform["description"]
+                .as_str()
+                .expect("freeform description")
+                .contains("directly as the tool input")
+        );
+
+        let json = apply_patch_tool_schema(NativePatchWireShape::JsonFunction);
+        assert_eq!(json["type"], serde_json::json!("object"));
+        assert_eq!(json["required"], serde_json::json!(["patch"]));
+        assert_eq!(json["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            json["properties"]["patch"]["type"],
+            serde_json::json!("string")
+        );
+
+        let rendered = format!("{freeform}{json}").to_ascii_lowercase();
+        assert!(!rendered.contains("codex"));
+        assert!(!rendered.contains("proposal"));
     }
 }

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PrepareOptions {
@@ -80,6 +81,9 @@ pub struct ObservedDirectory {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PreparedPatch {
+    /// Dynamically selected technical root for this patch. It is derived from
+    /// the turn cwd and authorized filesystem roots, never from model input.
+    pub workspace_root: PathBuf,
     pub parser_schema_version: u16,
     pub payload_hash: [u8; 32],
     pub payload_bytes: u64,
@@ -109,6 +113,10 @@ pub struct PreparedPatch {
 }
 
 impl PreparedPatch {
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace_root.as_path()
+    }
+
     pub fn workspace(&self) -> &VirtualWorkspace {
         &self.planned.workspace
     }
@@ -125,6 +133,7 @@ impl PreparedPatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedPatch {
     options: PrepareOptions,
+    workspace_root: PathBuf,
     document: ValidatedPatchDocument,
     target_manifest: TargetManifest,
     source_targets: BTreeMap<String, CanonicalTarget>,
@@ -133,6 +142,10 @@ pub struct ResolvedPatch {
 }
 
 impl ResolvedPatch {
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace_root.as_path()
+    }
+
     pub fn document(&self) -> &ValidatedPatchDocument {
         &self.document
     }
@@ -354,6 +367,7 @@ pub fn resolve_patch(
 
     Ok(ResolvedPatch {
         options,
+        workspace_root: resolver.root().to_path_buf(),
         document: normalized,
         target_manifest,
         source_targets,
@@ -367,6 +381,7 @@ pub fn resolve_patch(
 pub fn prepare_resolved(resolved: ResolvedPatch) -> Result<PreparedPatch, PrepareError> {
     let ResolvedPatch {
         options,
+        workspace_root,
         document: normalized,
         target_manifest,
         source_targets,
@@ -425,6 +440,7 @@ pub fn prepare_resolved(resolved: ResolvedPatch) -> Result<PreparedPatch, Prepar
         options.snapshot_limits,
     );
     Ok(PreparedPatch {
+        workspace_root,
         parser_schema_version: normalized.schema_version,
         payload_hash: normalized.payload_hash,
         payload_bytes: normalized.input_bytes,

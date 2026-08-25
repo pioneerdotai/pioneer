@@ -785,6 +785,18 @@ impl ToolOrchestrator {
         let mut decision =
             self.permission_evaluator
                 .evaluate(permission_context, invocation, &intent);
+        // A rejected Apply Patch preflight is a sealed, non-mutating result.
+        // Preserve explicit policy denial, but do not interrupt the user with
+        // an approval dialog merely to return a syntax/path diagnostic.
+        if matches!(
+            apply_patch_preflight.as_ref(),
+            Some(ApplyPatchPreflight::Rejected(_))
+        ) && matches!(decision, PermissionDecision::Ask { .. })
+        {
+            decision = PermissionDecision::Allow {
+                reason: PermissionDecisionReason::PolicyAllowsAction,
+            };
+        }
         if let (Some(permission), PermissionDecision::Ask { key: _, reason }) =
             (&inherited_session_permission, decision.clone())
         {
@@ -3441,6 +3453,60 @@ mod tests {
         assert_eq!(payload["error"]["stage"], "authorize");
         assert_eq!(payload["error"]["code"], "permission_denied");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_apply_patch_preflight_does_not_request_useless_approval() {
+        let request_key = PermissionRequestKey {
+            profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
+            tool_name: "apply_patch".to_owned(),
+            action: PermissionActionKind::FileWrite,
+            normalized_scope_hash: "malformed_patch".to_owned(),
+            turn_id: "turn".to_owned(),
+        };
+        let broker_calls = Arc::new(AtomicUsize::new(0));
+        let orchestrator = ToolOrchestrator::with_permission_evaluator_and_approval_broker(
+            OrchestratorPolicy::default(),
+            PostExecutionPolicy::default(),
+            Arc::new(StaticEvaluator {
+                decision: PermissionDecision::Ask {
+                    key: request_key,
+                    reason: PermissionDecisionReason::PolicyRequiresApproval,
+                },
+            }),
+            Arc::new(CountingApprovalBroker {
+                calls: broker_calls.clone(),
+                resolution: PermissionApprovalResolution::AllowOnce,
+            }),
+        );
+        let invocation = with_execution_security_snapshot(
+            invocation_for_tool(
+                "apply_patch",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "patch": "*** Add File: invalid.txt\n+invalid"
+                    }),
+                },
+            ),
+            TurnExecutionSecuritySnapshot::unrestricted_full_access(".", 1),
+        );
+        let trace = crate::events::ToolEventBus::default().start_trace(
+            "turn",
+            "call_invalid_patch",
+            "apply_patch",
+        );
+
+        let grant = orchestrator
+            .evaluate_permission(&invocation, &default_test_permission_context(), &trace)
+            .await
+            .expect("a sealed rejected preflight needs no approval");
+
+        assert!(matches!(
+            grant.apply_patch_preflight,
+            Some(ApplyPatchPreflight::Rejected(_))
+        ));
+        assert_eq!(grant.intent.action, PermissionActionKind::FileWrite);
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

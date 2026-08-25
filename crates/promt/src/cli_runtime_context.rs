@@ -186,7 +186,7 @@ fn render_pioneer_runtime_instructions(runtime_kind: CLIAgentRuntimeKind) -> Str
     ];
     lines.push(match runtime_kind {
         CLIAgentRuntimeKind::Codex => {
-            "Codex provider capability facts may use its native file wire shape; follow the projected schema and preserve the returned version token."
+            "Follow each available filesystem tool's current description and input schema exactly; they define the complete call format for this turn."
         }
         CLIAgentRuntimeKind::Claude => {
             "Managed Claude projects Pioneer read_file and apply_patch capabilities; use the projected tools for text mutations and do not rely on provider-native writers for tracked changes."
@@ -230,7 +230,7 @@ fn render_selected_skills(input: &CliRuntimeSelectedSkillsInput) -> CliRuntimeCo
 
     let mut lines = match input.runtime_kind {
         CLIAgentRuntimeKind::Codex => vec![format!(
-            "Pioneer selected {} native Codex skill(s) for this turn. Apply every selected Skill input before completing the user's task.",
+            "Pioneer selected {} runtime skill(s) for this turn. Apply every selected Skill input before completing the user's task.",
             input.skill_names.len()
         )],
         CLIAgentRuntimeKind::Claude => vec![format!(
@@ -592,7 +592,7 @@ mod tests {
             codex_plan
                 .provider_instructions
                 .text
-                .contains("native file wire shape")
+                .contains("current description and input schema exactly")
         );
         assert!(
             codex_plan

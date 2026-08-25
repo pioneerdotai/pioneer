@@ -306,7 +306,7 @@ pub fn parse(request: &PatchRequest, limits: PatchLimits) -> Result<PatchDocumen
         let (body, next_index) = match kind {
             OperationKind::Add => parse_add(&lines, index, end)?,
             OperationKind::Replace => parse_replace(&lines, index, end)?,
-            OperationKind::Update => parse_update(&lines, index, end, limits)?,
+            OperationKind::Update => parse_update(&lines, index, end, limits, move_to.is_some())?,
             OperationKind::Delete => (OperationBody::Delete, index),
         };
         if let OperationBody::Update(update) = &body {
@@ -415,6 +415,7 @@ fn parse_update(
     mut index: usize,
     end: usize,
     limits: PatchLimits,
+    allow_empty_for_move: bool,
 ) -> Result<(OperationBody, usize), ParseError> {
     let mut hunks = Vec::new();
     while index < end && !lines[index].starts_with("*** ") {
@@ -473,11 +474,11 @@ fn parse_update(
             header_line,
         });
     }
-    if hunks.is_empty() {
+    if hunks.is_empty() && !allow_empty_for_move {
         return Err(ParseError::new(
             ParseErrorCode::MissingHunk,
             index + 1,
-            "Update File has no hunks",
+            "Update File needs an @@ hunk unless it is a pure Move to operation",
         ));
     }
     Ok((OperationBody::Update(UpdateFile { hunks }), index))

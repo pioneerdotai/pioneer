@@ -456,7 +456,7 @@ fn plan_update(
                             PlanErrorCode::DestinationExists,
                             operation_index,
                             &destination,
-                            "move destination exists without an explicit overwrite guard",
+                            "move destination already exists; choose a different destination or delete the existing file explicitly before moving",
                         ));
                     }
                     DestinationGuard::Exact(expected) if expected != existing.version => {
@@ -532,14 +532,6 @@ fn consume_source<'a>(
     };
     let is_real = matches!(source.origin, VirtualFileOrigin::Real);
     if is_real {
-        if operation.requires_real_source_guard() && operation.source_guard.is_none() {
-            return Err(PlanError::new(
-                PlanErrorCode::MissingSourceGuard,
-                operation_index,
-                path,
-                "operation consuming a pre-existing file requires If-Match",
-            ));
-        }
         if let Some(expected) = operation.source_guard
             && expected != source.version
         {

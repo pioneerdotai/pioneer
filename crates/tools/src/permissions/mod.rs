@@ -3,14 +3,15 @@ use crate::apply_patch::file_mutation::{
     Retryability, TargetResolver,
 };
 use crate::apply_patch::{
-    ExecutionReport, OperationKind, PrepareOptions, TelemetryStage, parse, patch_telemetry,
-    resolve_patch, validate_guards,
+    ExecutionReport, OperationKind, PrepareOptions, TelemetryStage, ValidatedPatchDocument, parse,
+    patch_telemetry, resolve_patch, validate_guards,
 };
 use crate::context::ToolPayload;
 use crate::context::{ApplyPatchPreflight, ExecCommandArgs, ToolInvocation, WriteStdinArgs};
 use crate::domain::{ARTIFACT_DOMAIN_TOOL_NAMES, MEMORY_DOMAIN_TOOL_NAMES, TASK_DOMAIN_TOOL_NAMES};
 use crate::handlers::apply_patch::extract_patch_input;
 use crate::spec::DynamicSkillPermissionKind;
+use crate::{FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation};
 use async_trait::async_trait;
 use pioneer_mcp::{McpToolPermissionClass, McpToolSafetyHints, classify_mcp_tool_policy};
 use pioneer_protocol::{
@@ -836,7 +837,7 @@ fn file_path_intent(
         .insert("operation".to_owned(), operation.to_owned());
     scope.entries.insert(
         "path".to_owned(),
-        resolve_requested_path(invocation.workdir.as_path(), raw_path),
+        resolve_requested_path(permission_resolution_cwd(invocation).as_path(), raw_path),
     );
 
     PermissionIntent {
@@ -857,7 +858,7 @@ fn grep_files_intent(invocation: &ToolInvocation) -> PermissionIntent {
         .insert("operation".to_owned(), "grep files".to_owned());
     scope.entries.insert(
         "path".to_owned(),
-        resolve_requested_path(invocation.workdir.as_path(), raw_path),
+        resolve_requested_path(permission_resolution_cwd(invocation).as_path(), raw_path),
     );
     if let Some(glob) = args.and_then(|arguments| string_field(arguments, "glob")) {
         scope.entries.insert("glob".to_owned(), glob.to_owned());
@@ -868,6 +869,14 @@ fn grep_files_intent(invocation: &ToolInvocation) -> PermissionIntent {
         scope,
         summary: Some("grep files via `grep_files`".to_owned()),
     }
+}
+
+fn permission_resolution_cwd(invocation: &ToolInvocation) -> PathBuf {
+    invocation
+        .execution_security_snapshot
+        .as_ref()
+        .map(|snapshot| PathBuf::from(snapshot.sandbox.cwd.as_str()))
+        .unwrap_or_else(|| invocation.workdir.clone())
 }
 
 fn apply_patch_intent(invocation: &ToolInvocation) -> PermissionIntent {
@@ -888,7 +897,7 @@ fn apply_patch_intent_with_preflight(
             .insert("parse_status".to_owned(), "missing_patch_input".to_owned());
         return (
             PermissionIntent {
-                action: PermissionActionKind::Unknown,
+                action: PermissionActionKind::FileWrite,
                 scope,
                 summary: Some("apply patch with unreadable patch input".to_owned()),
             },
@@ -957,8 +966,24 @@ fn apply_patch_intent_with_preflight(
     };
     patch_telemetry().record_stage_latency(TelemetryStage::Parse, parse_started.elapsed());
 
-    let resolver = match TargetResolver::new(&invocation.workdir) {
-        Ok(resolver) => resolver,
+    let (validated, patch_root) = match authorize_and_normalize_patch_paths(invocation, validated) {
+        Ok(result) => result,
+        Err(error) => {
+            scope.entries.insert(
+                "parse_status".to_owned(),
+                "unauthorized_target_manifest".to_owned(),
+            );
+            return (
+                invalid_patch_permission_intent(scope),
+                Some(ApplyPatchPreflight::Rejected(
+                    ExecutionReport::rejected_patch_error(&error),
+                )),
+            );
+        }
+    };
+
+    let resolver = match TargetResolver::new(&patch_root) {
+        Ok(resolver) => resolver.with_absolute_paths(true),
         Err(_) => {
             scope.entries.insert(
                 "parse_status".to_owned(),
@@ -970,7 +995,10 @@ fn apply_patch_intent_with_preflight(
                     ExecutionReport::rejected_patch_error(&PatchError::new(
                         PatchStage::Resolve,
                         PatchErrorCode::InvalidPath,
-                        "workspace root is invalid",
+                        format!(
+                            "the patch execution root `{}` is invalid; use a path under the current working directory or another authorized root",
+                            patch_root.display()
+                        ),
                         Retryability::Never,
                     )),
                 )),
@@ -1082,9 +1110,236 @@ fn apply_patch_intent_with_preflight(
 
 fn invalid_patch_permission_intent(scope: PermissionRequestScope) -> PermissionIntent {
     PermissionIntent {
-        action: PermissionActionKind::Unknown,
+        action: PermissionActionKind::FileWrite,
         scope,
         summary: Some("apply malformed patch".to_owned()),
+    }
+}
+
+#[derive(Debug)]
+struct AuthorizedPatchPath {
+    absolute: PathBuf,
+    matched_root: Option<PathBuf>,
+}
+
+/// Resolve every model path through the immutable turn filesystem policy
+/// before the patch engine sees it. Relative inputs use the Composer-selected
+/// cwd; absolute inputs may target any writable root authorized for the turn.
+/// The engine still operates below one technical root. For a restricted turn
+/// that root is derived from the complete Composer-authorized writable set, so
+/// it remains stable across every patch in the same security snapshot.
+fn authorize_and_normalize_patch_paths(
+    invocation: &ToolInvocation,
+    mut document: ValidatedPatchDocument,
+) -> Result<(ValidatedPatchDocument, PathBuf), PatchError> {
+    let Some(snapshot) = invocation.execution_security_snapshot.as_ref() else {
+        // Permission classification is also used before a runtime snapshot is
+        // attached. Build a bounded provisional manifest from workdir so the
+        // action remains FileWrite; the handler still fails closed if the
+        // authoritative snapshot is absent at execution time.
+        let cwd = std::fs::canonicalize(invocation.workdir.as_path())
+            .unwrap_or_else(|_| normalize_path_lexically(invocation.workdir.as_path()));
+        for (operation_index, operation) in document.operations.iter_mut().enumerate() {
+            operation.operation.path = provisional_patch_path(
+                cwd.as_path(),
+                operation.operation.path.as_str(),
+                operation_index,
+            )?
+            .to_string_lossy()
+            .into_owned();
+            if let Some(destination) = operation.operation.move_to.as_mut() {
+                *destination =
+                    provisional_patch_path(cwd.as_path(), destination.as_str(), operation_index)?
+                        .to_string_lossy()
+                        .into_owned();
+            }
+        }
+        return Ok((document, cwd));
+    };
+
+    let mut authorized_paths = Vec::new();
+    for (operation_index, operation) in document.operations.iter_mut().enumerate() {
+        let source =
+            authorize_patch_path(snapshot, operation.operation.path.as_str(), operation_index)?;
+        operation.operation.path = source.absolute.to_string_lossy().into_owned();
+        authorized_paths.push(source);
+
+        if let Some(destination) = operation.operation.move_to.as_mut() {
+            let authorized = authorize_patch_path(snapshot, destination.as_str(), operation_index)?;
+            *destination = authorized.absolute.to_string_lossy().into_owned();
+            authorized_paths.push(authorized);
+        }
+    }
+
+    let root = select_patch_execution_root(snapshot, authorized_paths.as_slice()).ok_or_else(|| {
+        PatchError::new(
+            PatchStage::Resolve,
+            PatchErrorCode::InvalidPath,
+            "apply_patch could not select a common existing directory for the authorized targets; split targets on different volumes into separate patches",
+            Retryability::Never,
+        )
+    })?;
+    Ok((document, root))
+}
+
+fn provisional_patch_path(
+    cwd: &Path,
+    input: &str,
+    operation_index: usize,
+) -> Result<PathBuf, PatchError> {
+    let input_path = Path::new(input);
+    let joined = if input_path.is_absolute() {
+        input_path.to_path_buf()
+    } else {
+        cwd.join(input_path)
+    };
+    let absolute = normalize_path_lexically(joined.as_path());
+    if !absolute.starts_with(cwd) {
+        let mut error = PatchError::new(
+            PatchStage::Resolve,
+            PatchErrorCode::PathOutsideAllowedRoot,
+            format!(
+                "relative patch path {input} resolves outside provisional working directory {}",
+                cwd.display()
+            ),
+            Retryability::Never,
+        );
+        error.diagnostic.operation_index = u32::try_from(operation_index).ok();
+        error.diagnostic.path = Some(absolute.to_string_lossy().into_owned());
+        return Err(error);
+    }
+    Ok(absolute)
+}
+
+fn authorize_patch_path(
+    snapshot: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+    input: &str,
+    operation_index: usize,
+) -> Result<AuthorizedPatchPath, PatchError> {
+    match FilePolicyChecker::check_write(snapshot, Path::new(input)) {
+        FilePolicyDecision::Allowed(grant) => Ok(AuthorizedPatchPath {
+            absolute: grant.resolved_path,
+            matched_root: grant.matched_root,
+        }),
+        FilePolicyDecision::Denied(deny) => {
+            let resolved = deny
+                .resolved_path
+                .as_deref()
+                .unwrap_or(deny.requested_path.as_path());
+            let roots = FilePolicyChecker::allowed_roots(snapshot, FilePolicyOperation::Write)
+                .into_iter()
+                .map(|root| format!("`{}`", root.display()))
+                .collect::<Vec<_>>();
+            let code = match deny.reason {
+                FilePolicyDenyReason::EmptyPath | FilePolicyDenyReason::MissingPath => {
+                    PatchErrorCode::InvalidPath
+                }
+                FilePolicyDenyReason::OutsideAllowedRoots => PatchErrorCode::PathOutsideAllowedRoot,
+                FilePolicyDenyReason::SymlinkEscape
+                | FilePolicyDenyReason::WriteRequiresWritableRoot
+                | FilePolicyDenyReason::NoUsableRoots
+                | FilePolicyDenyReason::InvalidRoot => PatchErrorCode::PermissionDenied,
+            };
+            let mut error = PatchError::new(
+                PatchStage::Authorize,
+                code,
+                format!(
+                    "patch path `{input}` resolves to `{}` but is not writable: {}. Current working directory: `{}`. Writable roots: {}. Use a relative path from the current working directory or an absolute path under one of those roots",
+                    resolved.display(),
+                    deny.message,
+                    snapshot.sandbox.cwd,
+                    if roots.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        roots.join(", ")
+                    }
+                ),
+                Retryability::Never,
+            );
+            error.diagnostic.operation_index = u32::try_from(operation_index).ok();
+            error.diagnostic.path = Some(resolved.to_string_lossy().into_owned());
+            Err(error)
+        }
+    }
+}
+
+fn select_patch_execution_root(
+    snapshot: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+    paths: &[AuthorizedPatchPath],
+) -> Option<PathBuf> {
+    let cwd = std::fs::canonicalize(snapshot.sandbox.cwd.as_str())
+        .unwrap_or_else(|_| normalize_path_lexically(Path::new(&snapshot.sandbox.cwd)));
+    let candidates = if snapshot.sandbox.filesystem.kind
+        == pioneer_protocol::TurnFilesystemSandboxKind::Unrestricted
+    {
+        // An unrestricted policy has no finite root list. Keep the namespace
+        // stable per filesystem volume instead of narrowing it to whichever
+        // directory happened to be touched by this patch.
+        let mut anchors = paths
+            .iter()
+            .filter_map(|path| filesystem_anchor(path.absolute.as_path()))
+            .collect::<Vec<_>>();
+        if anchors.is_empty()
+            && let Some(anchor) = filesystem_anchor(cwd.as_path())
+        {
+            anchors.push(anchor);
+        }
+        anchors
+    } else {
+        let authorized_roots =
+            FilePolicyChecker::allowed_roots(snapshot, FilePolicyOperation::Write);
+        if authorized_roots.is_empty() {
+            // Defensive fallback: authorization normally cannot have produced
+            // `paths` without at least one usable root.
+            paths
+                .iter()
+                .filter_map(|path| {
+                    path.matched_root
+                        .clone()
+                        .or_else(|| path.absolute.parent().map(Path::to_path_buf))
+                })
+                .collect()
+        } else {
+            authorized_roots
+        }
+    };
+    common_ancestor(candidates.as_slice()).and_then(existing_directory)
+}
+
+fn filesystem_anchor(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut anchor = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            Component::RootDir => anchor.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            Component::Normal(_) => break,
+        }
+    }
+    (!anchor.as_os_str().is_empty()).then_some(anchor)
+}
+
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut common = paths.first()?.clone();
+    while !paths.iter().all(|path| path.starts_with(common.as_path())) {
+        if !common.pop() {
+            return None;
+        }
+    }
+    Some(common)
+}
+
+fn existing_directory(mut path: PathBuf) -> Option<PathBuf> {
+    loop {
+        match std::fs::canonicalize(path.as_path()) {
+            Ok(canonical) if canonical.is_dir() => return Some(canonical),
+            _ if path.pop() => {}
+            _ => return None,
+        }
     }
 }
 
@@ -1761,6 +2016,38 @@ mod tests {
     }
 
     #[test]
+    fn file_permission_scope_uses_the_dynamic_security_snapshot_cwd() {
+        let dynamic_cwd = tempfile::tempdir().unwrap();
+        let stale_workdir = tempfile::tempdir().unwrap();
+        let mut invocation = invocation_for_tool(
+            "read_file",
+            ToolPayload::Function {
+                arguments: serde_json::json!({ "path": "src/lib.rs" }),
+            },
+        );
+        invocation.workdir = stale_workdir.path().to_path_buf();
+        invocation.execution_security_snapshot = Some(
+            pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                dynamic_cwd.path().to_string_lossy(),
+                1,
+            ),
+        );
+
+        let intent = extract_permission_intent(&invocation);
+
+        assert_eq!(
+            intent.scope.entries.get("path"),
+            Some(
+                &dynamic_cwd
+                    .path()
+                    .join("src/lib.rs")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+    }
+
+    #[test]
     fn extractor_classifies_task_create_as_internal_task_management() {
         let invocation = invocation_for_tool(
             "task_create",
@@ -1895,7 +2182,7 @@ mod tests {
     }
 
     #[test]
-    fn extractor_keeps_malformed_apply_patch_approval_gated() {
+    fn extractor_keeps_malformed_apply_patch_in_the_known_file_write_capability() {
         let invocation = invocation_for_tool(
             "apply_patch",
             ToolPayload::Function {
@@ -1905,7 +2192,7 @@ mod tests {
 
         let intent = extract_permission_intent(&invocation);
 
-        assert_eq!(intent.action, PermissionActionKind::Unknown);
+        assert_eq!(intent.action, PermissionActionKind::FileWrite);
         assert_eq!(
             intent.scope.entries.get("parse_status"),
             Some(&"invalid_patch_document".to_owned())

@@ -2,6 +2,7 @@ use pioneer_protocol::{
     TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
     TurnFilesystemSandboxKind, TurnFilesystemSandboxPath,
 };
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,40 @@ pub enum FilePolicyDenyReason {
 pub struct FilePolicyChecker;
 
 impl FilePolicyChecker {
+    /// Returns the concrete roots authorized for the requested operation in
+    /// this turn. Relative model paths always resolve from `sandbox.cwd`; the
+    /// roots are the additional boundaries selected by Composer/security.
+    pub fn allowed_roots(
+        snapshot: &TurnExecutionSecuritySnapshot,
+        operation: FilePolicyOperation,
+    ) -> Vec<PathBuf> {
+        if snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted {
+            return vec![normalize_lexically(PathBuf::from(
+                snapshot.sandbox.cwd.as_str(),
+            ))];
+        }
+
+        let mut roots = BTreeSet::new();
+        for entry in &snapshot.sandbox.filesystem.entries {
+            if !access_allows(entry.access, operation) {
+                continue;
+            }
+            let Some(path) = entry_root_path(snapshot, entry) else {
+                continue;
+            };
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                Path::new(snapshot.sandbox.cwd.as_str()).join(path)
+            };
+            roots.insert(
+                std::fs::canonicalize(absolute.as_path())
+                    .unwrap_or_else(|_| normalize_lexically(absolute)),
+            );
+        }
+        roots.into_iter().collect()
+    }
+
     pub fn check_read(
         snapshot: &TurnExecutionSecuritySnapshot,
         requested_path: impl AsRef<Path>,
@@ -122,7 +157,7 @@ impl FilePolicyChecker {
             } else {
                 Path::new(snapshot.sandbox.cwd.as_str()).join(root_path.as_path())
             });
-            let Ok(root_path) = std::fs::canonicalize(root_path.as_path()) else {
+            let Ok(root_path) = std::fs::canonicalize(lexical_root_path.as_path()) else {
                 invalid_root = true;
                 continue;
             };
@@ -370,8 +405,8 @@ fn deny_message(reason: FilePolicyDenyReason) -> String {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        TurnExecutionSecuritySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
-        TurnPermissionProfileSource,
+        TurnExecutionSecuritySnapshot, TurnFilesystemSandboxPath, TurnPermissionMode,
+        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSecurityRuleProvenance,
     };
 
     fn workspace_write_snapshot(root: &Path) -> TurnExecutionSecuritySnapshot {
@@ -438,6 +473,42 @@ mod tests {
 
         let grant = decision.grant().expect("new file write should be allowed");
         assert!(grant.resolved_path.ends_with("new.txt"));
+    }
+
+    #[test]
+    fn relative_composer_root_resolves_from_the_turn_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let allowed = temp.path().join("additional");
+        std::fs::create_dir_all(&allowed).expect("create additional root");
+        let file = allowed.join("file.txt");
+        std::fs::write(&file, "ok").expect("write test file");
+        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            temp.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry {
+                path: TurnFilesystemSandboxPath::ExplicitPath {
+                    path: "additional".to_owned(),
+                },
+                access: TurnFilesystemAccess::Write,
+                provenance: TurnSecurityRuleProvenance::ComposerSelection,
+                resolved_path: None,
+            }],
+            1,
+        );
+
+        let decision = FilePolicyChecker::check_read(&snapshot, "additional/file.txt");
+
+        let grant = decision
+            .grant()
+            .expect("relative Composer root should be allowed");
+        assert_eq!(grant.resolved_path, file.canonicalize().unwrap());
+        assert_eq!(
+            FilePolicyChecker::allowed_roots(&snapshot, FilePolicyOperation::Write),
+            vec![allowed.canonicalize().unwrap()]
+        );
     }
 
     #[test]

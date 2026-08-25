@@ -994,11 +994,14 @@ mod tests {
         assert!(
             compiled
                 .stable_system_text
-                .contains("exact version token returned by `read_file`")
+                .contains("complete Add/Update/Move/Delete syntax")
         );
+        assert!(compiled.stable_system_text.contains("A pure rename"));
+        assert!(compiled.stable_system_text.contains("authorized roots"));
         assert!(compiled.stable_system_text.contains("source code"));
         assert!(compiled.stable_system_text.contains("configs"));
-        assert!(compiled.stable_system_text.contains("If-Match"));
+        assert!(!compiled.stable_system_text.contains("If-Match"));
+        assert!(!compiled.stable_system_text.contains("If-Destination"));
         assert!(
             compiled
                 .stable_system_text

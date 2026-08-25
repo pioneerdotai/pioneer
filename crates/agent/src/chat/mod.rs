@@ -97,13 +97,13 @@ use pioneer_skills::{
     SkillResolvedReason,
 };
 use pioneer_tools::{
-    FinalToolVisibility, PermissionApprovalBroker, PermissionEvaluationContext, PreflightToolIndex,
-    REQUEST_TOOLS_TOOL_NAME, RawToolCall, RequestToolsResult, ToolErrorClass, ToolEventPayload,
-    ToolLoopBudgetExceeded, ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision,
-    ToolLoopRoundAction, ToolNoProgressGuard, ToolNoProgressGuardConfig,
-    ToolNoProgressPreflightDecision, ToolOutcome, ToolOutcomeStatus, ToolRecoveryView,
-    ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
-    ToolRetryObservation, build_builtin_tools_with_security_snapshot,
+    FilePolicyChecker, FilePolicyOperation, FinalToolVisibility, PermissionApprovalBroker,
+    PermissionEvaluationContext, PreflightToolIndex, REQUEST_TOOLS_TOOL_NAME, RawToolCall,
+    RequestToolsResult, ToolErrorClass, ToolEventPayload, ToolLoopBudgetExceeded,
+    ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction,
+    ToolNoProgressGuard, ToolNoProgressGuardConfig, ToolNoProgressPreflightDecision, ToolOutcome,
+    ToolOutcomeStatus, ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController,
+    ToolRetryDecision, ToolRetryObservation, build_builtin_tools_with_security_snapshot,
     build_tools_with_environment_and_security_snapshot, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
@@ -1797,6 +1797,7 @@ fn native_file_tool_blocked_names(capability: &NativeFileToolCapability) -> Vec<
 fn append_native_filesystem_capability_section(
     runtime_sections: Vec<PromptRuntimeSectionInput>,
     capability: &NativeFileToolCapability,
+    execution_security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
 ) -> Result<Vec<PromptRuntimeSectionInput>, ChatTurnError> {
     let id =
         PromptDynamicSectionId::new(FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID).map_err(|error| {
@@ -1805,23 +1806,28 @@ fn append_native_filesystem_capability_section(
             ))
         })?;
     let content = if capability.is_supported() {
-        let wire_shape = match capability.patch_shape {
-            NativePatchWireShape::Freeform => "a raw/free-form patch document",
-            NativePatchWireShape::JsonFunction => {
-                "a strict JSON object with exactly one `patch` string"
+        let apply_patch_input = match capability.patch_shape {
+            NativePatchWireShape::Freeform => {
+                "Call `apply_patch` with the complete patch document as raw text; do not wrap it in JSON."
             }
-            NativePatchWireShape::Unavailable => "no supported patch wire shape",
+            NativePatchWireShape::JsonFunction => {
+                "Call `apply_patch` with exactly one JSON field named `patch`; its string value is the complete patch document. Do not add other fields or nest another JSON object inside `patch`."
+            }
+            NativePatchWireShape::Unavailable => {
+                "The `apply_patch` input format is unavailable for this turn."
+            }
         };
+        let filesystem_scope = native_filesystem_scope(execution_security_snapshot);
         format!(
-            "The native provider projects this filesystem capability for the current turn. Use `read_file` for bounded, paginated UTF-8 text inspection, `list_dir` for directory discovery, and `grep_files` for scoped text search. Use `apply_patch` as the only general text mutator for source code, Markdown, JSON, YAML, configuration, notes, and ordinary UTF-8 text; it supports Add, Replace, Update, Delete, Move, and multi-file patches. Its wire shape is {wire_shape}. Copy the exact `read_file` version token into `If-Match` for destructive Replace/Delete/Move operations; use optional strict Update guards when whole-file correctness matters and use contextual Update for unrelated concurrent edits. A stale or ambiguous result requires re-reading and reasoning about the intervening change; never substitute a fresh token blindly or retry the same patch unchanged. `full access` removes approval dialogs only and never disables guards, sandbox/path checks, limits, cancellation, or filesystem permissions. Exact history covers committed `apply_patch` changes only; shell, formatter, generator, external-process, and manual-editor writes are outside that exact history. Use only tools present in the current catalog."
+            "The available filesystem tools for this turn are `read_file`, `list_dir`, `grep_files`, and `apply_patch`. Use `apply_patch` as the general UTF-8 text editor and follow its complete syntax and examples exactly. {apply_patch_input} {filesystem_scope} Read unfamiliar files before updating them. If a call fails, follow the returned error and next action instead of repeating the same call or switching to shell editing. Use only tools present in the current catalog."
         )
     } else {
         format!(
-            "The native provider does not project Pioneer `read_file` or `apply_patch` for this turn ({reason}). Do not infer unavailable filesystem tools or substitute another general text mutator. Use only the tools present in the current catalog; any external command or manual write is outside exact Pioneer Apply Patch history.",
+            "`read_file` and `apply_patch` are not available for this turn ({reason}). Do not invent unavailable filesystem tools or a replacement text editor; use only tools present in the current catalog.",
             reason = capability
                 .reason
                 .as_deref()
-                .unwrap_or("the provider/model has no registered native filesystem wire contract")
+                .unwrap_or("the selected model connection does not support them")
         )
     };
     let mut sections = runtime_sections
@@ -1830,12 +1836,53 @@ fn append_native_filesystem_capability_section(
         .collect::<Vec<_>>();
     sections.push(PromptRuntimeSectionInput {
         id: PromptRuntimeSectionId::Dynamic(id),
-        title: Some("Native Filesystem Capability".to_owned()),
+        title: Some("Filesystem Tools for This Turn".to_owned()),
         content,
         max_chars: None,
         truncated: false,
     });
     Ok(sections)
+}
+
+fn native_filesystem_scope(snapshot: Option<&TurnExecutionSecuritySnapshot>) -> String {
+    let Some(snapshot) = snapshot else {
+        return "The trusted turn filesystem scope is unavailable; do not attempt filesystem operations.".to_owned();
+    };
+    let cwd = snapshot.sandbox.cwd.as_str();
+    if snapshot.sandbox.filesystem.kind == pioneer_protocol::TurnFilesystemSandboxKind::Unrestricted
+    {
+        return format!(
+            "The current working directory is `{cwd}`; relative paths resolve from it. Filesystem access is unrestricted for this turn, so absolute paths are accepted."
+        );
+    }
+
+    let writable = FilePolicyChecker::allowed_roots(snapshot, FilePolicyOperation::Write)
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    let readable = FilePolicyChecker::allowed_roots(snapshot, FilePolicyOperation::Read)
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    let read_only = readable.difference(&writable).cloned().collect::<Vec<_>>();
+    let writable = writable.into_iter().collect::<Vec<_>>();
+    format!(
+        "The current working directory is `{cwd}`; relative paths resolve from it. Writable roots: {}. Additional read-only roots: {}. Absolute paths are accepted only under a root authorized for that operation.",
+        display_prompt_roots(writable.as_slice()),
+        display_prompt_roots(read_only.as_slice()),
+    )
+}
+
+fn display_prompt_roots(roots: &[String]) -> String {
+    if roots.is_empty() {
+        "none".to_owned()
+    } else {
+        roots
+            .iter()
+            .map(|root| format!("`{root}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn native_provider_tool_definition(
@@ -1849,17 +1896,20 @@ fn native_provider_tool_definition(
             parameters: spec.parameters,
         };
     }
-    let shape_description = match capability.patch_shape {
-        NativePatchWireShape::Freeform => "raw patch text",
-        NativePatchWireShape::JsonFunction => "a strict `{patch}` JSON object",
-        NativePatchWireShape::Unavailable => "an unavailable provider capability",
+    let input_instruction = match capability.patch_shape {
+        NativePatchWireShape::Freeform => {
+            "Pass the complete patch document directly as raw text without a JSON wrapper."
+        }
+        NativePatchWireShape::JsonFunction => {
+            "Pass exactly one JSON field named `patch`, containing the complete patch document as a string."
+        }
+        NativePatchWireShape::Unavailable => {
+            "This tool has no supported input format for the selected model connection."
+        }
     };
     ToolDefinition {
         name: spec.name,
-        description: format!(
-            "{} The frozen provider wire shape is {shape_description}.",
-            spec.description
-        ),
+        description: format!("{} {input_instruction}", spec.description),
         parameters: pioneer_provider::apply_patch_tool_schema(capability.patch_shape),
     }
 }
@@ -3317,6 +3367,7 @@ async fn execute_agent_provider_response(
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
     let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot.as_ref())?;
+    let filesystem_prompt_snapshot = execution_security_snapshot.clone();
 
     let tool_loop_config = tool_loop_config.normalized();
     let provider_tool_calling = provider.capabilities().tool_calling && !disable_tool_calling;
@@ -3766,6 +3817,7 @@ async fn execute_agent_provider_response(
         let prompt_runtime_sections = append_native_filesystem_capability_section(
             prompt_runtime_sections,
             &native_file_tool_capability,
+            filesystem_prompt_snapshot.as_ref(),
         )?;
 
         let initial_instruction_plan = compile_agent_instruction_delivery_plan(
@@ -4180,6 +4232,7 @@ async fn execute_agent_provider_response(
     let prompt_runtime_sections = append_native_filesystem_capability_section(
         prompt_runtime_sections,
         &native_file_tool_capability,
+        filesystem_prompt_snapshot.as_ref(),
     )?;
 
     let initial_instruction_plan = compile_agent_instruction_delivery_plan(
@@ -6689,13 +6742,13 @@ mod tests {
     use super::{
         ChatExecutionWindowStats, ExecutedToolResult, TURN_ITEM_ID_LEN,
         TaskMutationFinalizationGuard, agent_skill_cards_have_read_path,
-        append_recovered_provider_history, apply_request_tools_results_to_visible_tools,
-        apply_request_tools_visibility_expansion, apply_review_required_tools_to_visible_tools,
-        build_execution_window_continuation, build_user_message,
-        compile_agent_instruction_delivery_plan_with_prompt_root,
+        append_native_filesystem_capability_section, append_recovered_provider_history,
+        apply_request_tools_results_to_visible_tools, apply_request_tools_visibility_expansion,
+        apply_review_required_tools_to_visible_tools, build_execution_window_continuation,
+        build_user_message, compile_agent_instruction_delivery_plan_with_prompt_root,
         compiled_prompt_payload_from_delivery_plan, deterministic_final_message_item_id,
-        deterministic_tool_item_id, materialize_mcp_tooling, native_provider_tool_definition,
-        normalize_turn_capabilities, readable_agent_skill_overlay,
+        deterministic_tool_item_id, materialize_mcp_tooling, native_filesystem_scope,
+        native_provider_tool_definition, normalize_turn_capabilities, readable_agent_skill_overlay,
         resolve_skill_capability_summary, retain_agent_attachment_messages,
         retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
         review_required_observation_payload, review_required_observation_signature,
@@ -6716,7 +6769,7 @@ mod tests {
     };
 
     #[test]
-    fn provider_tool_definition_uses_only_the_frozen_patch_wire_shape() {
+    fn provider_tool_definition_uses_only_the_selected_input_form() {
         let spec = pioneer_tools::ToolSpec::new(
             "apply_patch",
             "Apply patch.",
@@ -6728,13 +6781,55 @@ mod tests {
         let json = native_provider_tool_definition(spec.clone(), &capability);
         assert_eq!(json.parameters["type"], "object");
         assert_eq!(json.parameters["required"], serde_json::json!(["patch"]));
-        assert!(json.description.contains("strict `{patch}` JSON object"));
+        assert!(
+            json.description
+                .contains("exactly one JSON field named `patch`")
+        );
+        assert!(json.description.contains("Apply patch."));
 
         capability.patch_shape = pioneer_provider::NativePatchWireShape::Freeform;
         let raw = native_provider_tool_definition(spec, &capability);
         assert_eq!(raw.parameters["type"], "string");
-        assert!(raw.description.contains("raw patch text"));
-        assert!(!raw.description.contains("strict `{patch}` JSON object"));
+        assert!(raw.description.contains("directly as raw text"));
+        assert!(!raw.description.contains("JSON field named `patch`"));
+        assert!(!raw.description.to_ascii_lowercase().contains("codex"));
+    }
+
+    #[test]
+    fn projected_apply_patch_definition_is_self_contained_for_each_input_form() {
+        let spec = pioneer_tools::builtin_tool_specs()
+            .into_iter()
+            .find(|configured| configured.spec.name == "apply_patch")
+            .expect("apply_patch builtin spec")
+            .spec;
+        let mut capability =
+            pioneer_provider::select_native_file_tool_capability("openai", "gpt-5");
+
+        for shape in [
+            pioneer_provider::NativePatchWireShape::JsonFunction,
+            pioneer_provider::NativePatchWireShape::Freeform,
+        ] {
+            capability.patch_shape = shape;
+            let definition = native_provider_tool_definition(spec.clone(), &capability);
+            for required in [
+                "*** Begin Patch",
+                "*** Add File:",
+                "*** Update File:",
+                "*** Move to:",
+                "*** Delete File:",
+                "*** End Patch",
+                "current working directory",
+            ] {
+                assert!(
+                    definition.description.contains(required),
+                    "projected definition is missing {required} for {shape:?}"
+                );
+            }
+            let lowered = definition.description.to_ascii_lowercase();
+            assert!(!lowered.contains("codex"));
+            assert!(!lowered.contains("proposal"));
+            assert!(!lowered.contains("wire shape"));
+        }
     }
 
     #[test]
@@ -6940,6 +7035,76 @@ mod tests {
             workdir,
             std::path::PathBuf::from("/tmp/pioneer-snapshot-cwd")
         );
+    }
+
+    #[test]
+    fn native_filesystem_prompt_uses_dynamic_cwd_and_authorized_roots() {
+        let cwd = temp_dir("filesystem_prompt_cwd");
+        let additional = temp_dir("filesystem_prompt_additional");
+        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+            cwd.to_string_lossy(),
+            vec![
+                pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                    pioneer_protocol::TurnFilesystemAccess::Write,
+                    cwd.to_string_lossy(),
+                ),
+                pioneer_protocol::TurnFilesystemSandboxEntry {
+                    path: pioneer_protocol::TurnFilesystemSandboxPath::ExplicitPath {
+                        path: additional.to_string_lossy().into_owned(),
+                    },
+                    access: pioneer_protocol::TurnFilesystemAccess::Write,
+                    provenance: pioneer_protocol::TurnSecurityRuleProvenance::ComposerSelection,
+                    resolved_path: Some(additional.to_string_lossy().into_owned()),
+                },
+            ],
+            1,
+        );
+
+        let scope = native_filesystem_scope(Some(&snapshot));
+
+        assert!(scope.contains(cwd.to_string_lossy().as_ref()));
+        assert!(
+            scope.contains(
+                additional
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(scope.contains("Writable roots"));
+        assert!(scope.contains("relative paths resolve from it"));
+    }
+
+    #[test]
+    fn native_filesystem_prompt_explains_the_selected_input_form_directly() {
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            "/tmp/pioneer-filesystem-prompt",
+            1,
+        );
+        let capability = pioneer_provider::select_native_file_tool_capability("openai", "gpt-5");
+
+        let sections =
+            append_native_filesystem_capability_section(Vec::new(), &capability, Some(&snapshot))
+                .expect("filesystem capability section should compile");
+        let content = sections
+            .last()
+            .expect("filesystem capability section")
+            .content
+            .as_str();
+
+        assert!(content.contains("exactly one JSON field named `patch`"));
+        assert!(content.contains("current working directory is `/tmp/pioneer-filesystem-prompt`"));
+        assert!(content.contains("returned error and next action"));
+        let lowered = content.to_ascii_lowercase();
+        assert!(!lowered.contains("codex"));
+        assert!(!lowered.contains("wire shape"));
+        assert!(!lowered.contains("proposal"));
+        assert!(!lowered.contains("if-match"));
     }
 
     fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {

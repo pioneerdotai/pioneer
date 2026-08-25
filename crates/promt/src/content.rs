@@ -35,15 +35,15 @@ pub const TOOL_RECOVERY_POLICY_PROMPT: &str = "When a tool result indicates fail
 
 pub const TOOL_USAGE_POLICY_PROMPT: &str = concat!(
     "- The filesystem hierarchy is: `read_file` for bounded/paginated text inspection, `list_dir` for directory discovery, `grep_files` for scoped text search, and `apply_patch` as the only general text mutator.\n",
-    "- Use `apply_patch` for source code, Markdown, JSON, YAML, configs, notes, and ordinary UTF-8 text. It supports Add File, Replace File, Update File, Delete File, Move File, and multi-file patches; do not look for a second general writer.\n",
-    "- Use the exact version token returned by `read_file` as `If-Match` for destructive Replace/Delete/Move operations; ordinary Update uses supplied context and fails safely when it is ambiguous or stale.\n",
-    "- If a patch result reports a stale or ambiguous context, re-read the affected file, reason about the intervening change, and prepare a new patch. Never substitute a freshly read token blindly and never retry the same patch unchanged.\n",
-    "- `full access` removes approval dialogs only. It does not disable version guards, path/sandbox checks, parser limits, cancellation, or filesystem permissions.\n",
-    "- Formatter, generator, compiler, or migration commands may rewrite generated outputs when the task requires it; those shell/external writes are not represented as exact `AppliedPatchLog` steps.\n",
-    "- The exact history covers changes committed by `apply_patch`; do not claim that arbitrary shell, formatter, external-process, or manual-editor writes are tracked.\n",
+    "- Use `apply_patch` for source code, Markdown, JSON, YAML, configs, notes, and ordinary UTF-8 text. Its current description and input schema contain the complete Add/Update/Move/Delete syntax, call format, and examples; follow them exactly and do not invent directives or look for a second general writer.\n",
+    "- Filesystem paths may be relative to the current working directory or absolute when they are inside a root authorized for this turn. The current directory and authorized roots are supplied for each turn and can differ between turns.\n",
+    "- Read unfamiliar files before updating them and include enough unchanged context for a unique match. A pure rename is `Update File` followed by `Move to` with no hunk.\n",
+    "- If a patch fails, follow its concrete diagnostic and corrected example. Re-read after stale or ambiguous context, and never retry the same failed patch unchanged.\n",
+    "- `full access` removes approval dialogs only. It does not disable path/sandbox checks, parser limits, cancellation, or filesystem permissions.\n",
+    "- Use the appropriate formatter, generator, compiler, or migration command when it owns the output; do not hand-edit generated files merely to force a desired result.\n",
     "- Use `write_stdin` only to send input to an already-running `exec_command` session; do not use it to create or edit files.\n",
     "- Do not use `exec_command`, sed, perl, or shell heredocs for ordinary file edits when `apply_patch` is available.\n",
-    "- Review the structured patch result and retry only with corrected context or explicit preconditions; never assume a failed or partial patch was fully applied.",
+    "- Review the structured patch result; never assume a failed or partial patch was fully applied.",
 );
 
 pub const ARTIFACT_OUTPUT_CONTRACT_PROMPT: &str = concat!(
@@ -230,7 +230,9 @@ mod tests {
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`read_file`"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("source code"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("configs"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("If-Match"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("complete Add/Update/Move/Delete syntax"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("A pure rename"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("authorized roots"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`write_stdin` only"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`exec_command`, sed, perl"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("ordinary file edits"));
@@ -238,5 +240,18 @@ mod tests {
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("structured patch result"));
         assert!(!TOOL_USAGE_POLICY_PROMPT.contains("write_file"));
         assert!(!TOOL_USAGE_POLICY_PROMPT.contains("edit_file"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("If-Match"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("If-Destination"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("AppliedPatchLog"));
+        assert!(
+            !TOOL_USAGE_POLICY_PROMPT
+                .to_ascii_lowercase()
+                .contains("codex")
+        );
+        assert!(
+            !TOOL_USAGE_POLICY_PROMPT
+                .to_ascii_lowercase()
+                .contains("proposal")
+        );
     }
 }

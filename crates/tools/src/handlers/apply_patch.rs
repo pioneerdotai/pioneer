@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use pioneer_observability::{PatchOperationMetric, record_patch_operation};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -68,7 +68,7 @@ impl ApplyPatchHandler {
         operation_metric.tracking = "not_applicable";
         patch_telemetry().record_report(&report, std::time::Duration::ZERO);
         patch_telemetry().record_authority(authority_name(source));
-        canonical_patch_output(report, false)
+        canonical_patch_output(report, false, None)
     }
 
     /// Executes the canonical patch pipeline for a provider adapter.  The
@@ -161,7 +161,7 @@ impl ApplyPatchHandler {
                 patch_telemetry().record_report(&report, elapsed);
                 patch_telemetry().record_authority(authority_name(source));
                 operation_metric.tracking = "not_applicable";
-                return canonical_patch_output(report, false);
+                return canonical_patch_output(report, false, None);
             }
         };
         let patch = extract_patch_input(&invocation.payload)?;
@@ -182,13 +182,12 @@ impl ApplyPatchHandler {
             .iter()
             .map(|target| PatchTarget {
                 operation: FilePolicyOperation::Write,
-                path: target.relative().to_string_lossy().into_owned(),
+                path: target.absolute().to_path_buf(),
                 parent: target.role == TargetRole::Parent,
             })
             .collect::<Vec<_>>();
         if let Err(error) = enforce_patch_targets(
             invocation.execution_security_snapshot.as_ref(),
-            invocation.workdir.as_path(),
             preflight_targets.as_slice(),
         ) {
             let report = error.into_report()?;
@@ -197,8 +196,9 @@ impl ApplyPatchHandler {
             patch_telemetry().record_report(&report, elapsed);
             patch_telemetry().record_authority(authority_name(source));
             operation_metric.tracking = "not_applicable";
-            return canonical_patch_output(report, false);
+            return canonical_patch_output(report, false, Some(resolved.workspace_root()));
         }
+        let projection_root = resolved.workspace_root().to_path_buf();
         let plan_started = Instant::now();
         let prepared = match prepare_resolved(resolved) {
             Ok(prepared) => prepared,
@@ -210,7 +210,7 @@ impl ApplyPatchHandler {
                 patch_telemetry().record_report(&report, plan_started.elapsed());
                 patch_telemetry().record_authority(authority_name(source));
                 operation_metric.tracking = "not_applicable";
-                return canonical_patch_output(report, false);
+                return canonical_patch_output(report, false, Some(&projection_root));
             }
         };
         patch_telemetry().record_stage_latency(TelemetryStage::Plan, plan_started.elapsed());
@@ -224,13 +224,12 @@ impl ApplyPatchHandler {
             .iter()
             .map(|target| PatchTarget {
                 operation: FilePolicyOperation::Write,
-                path: target.relative().to_string_lossy().into_owned(),
+                path: target.absolute().to_path_buf(),
                 parent: target.role == TargetRole::Parent,
             })
             .collect::<Vec<_>>();
         if let Err(error) = enforce_patch_targets(
             invocation.execution_security_snapshot.as_ref(),
-            invocation.workdir.as_path(),
             policy_targets.as_slice(),
         ) {
             let report = error.into_report()?;
@@ -239,7 +238,7 @@ impl ApplyPatchHandler {
             patch_telemetry().record_report(&report, elapsed);
             patch_telemetry().record_authority(authority_name(source));
             operation_metric.tracking = "not_applicable";
-            return canonical_patch_output(report, false);
+            return canonical_patch_output(report, false, Some(&projection_root));
         }
         let admission = if observer.is_some() {
             // `for_planned` replaces operation fingerprints and recovery
@@ -259,14 +258,19 @@ impl ApplyPatchHandler {
                     // absolute workdir here would violate the safe-disclosure
                     // boundary even though the recovery plan still keeps the
                     // trusted root privately for reconciliation.
-                    let normalized = invocation.workdir.to_string_lossy().replace('\\', "/");
+                    let dynamic_cwd = invocation
+                        .execution_security_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.sandbox.cwd.clone())
+                        .unwrap_or_else(|| invocation.workdir.to_string_lossy().into_owned())
+                        .replace('\\', "/");
                     format!(
                         "workspace:{}",
-                        hex::encode(Sha256::digest(normalized.as_bytes()))
+                        hex::encode(Sha256::digest(dynamic_cwd.as_bytes()))
                     )
                 });
             admission.recovery_plan.workspace_root =
-                invocation.workdir.to_string_lossy().into_owned();
+                prepared.workspace_root().to_string_lossy().into_owned();
             admission.recovery_plan.authority = match source {
                 PatchRequestSource::NativeFreeform | PatchRequestSource::NativeFunction => {
                     TurnDiffAuthority::NativePatchEngine
@@ -314,7 +318,8 @@ impl ApplyPatchHandler {
         operation_metric.set_report(&report, committed_hunks);
         let outcome = report.into_outcome();
         patch_telemetry().record_authority(authority_name(source));
-        let parity = crate::apply_patch::project_apply_patch_outcome(&outcome);
+        let mut parity = crate::apply_patch::project_apply_patch_outcome(&outcome);
+        parity.make_paths_absolute(&projection_root);
         // Serialize the canonical provider-neutral projection itself. Manual
         // reconstruction previously omitted its required v1 schema_version.
         let payload = serde_json::to_value(&parity).map_err(|error| {
@@ -414,9 +419,13 @@ impl ApplyPatchHandler {
 fn canonical_patch_output(
     report: ExecutionReport,
     history_bearing: bool,
+    execution_root: Option<&Path>,
 ) -> Result<Box<dyn ToolOutput>, ToolError> {
     let status = report.status;
-    let parity = crate::apply_patch::project_apply_patch_outcome(&report.into_outcome());
+    let mut parity = crate::apply_patch::project_apply_patch_outcome(&report.into_outcome());
+    if let Some(execution_root) = execution_root {
+        parity.make_paths_absolute(execution_root);
+    }
     debug_assert_eq!(parity.history_bearing, history_bearing);
     let payload = serde_json::to_value(&parity).map_err(|error| {
         ToolError::internal(format!(
@@ -756,7 +765,7 @@ fn authority_name(source: PatchRequestSource) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PatchTarget {
     operation: FilePolicyOperation,
-    path: String,
+    path: PathBuf,
     parent: bool,
 }
 
@@ -788,32 +797,31 @@ impl PatchTargetPolicyError {
 
 fn enforce_patch_targets(
     snapshot: Option<&pioneer_protocol::TurnExecutionSecuritySnapshot>,
-    workdir: &Path,
     targets: &[PatchTarget],
 ) -> Result<(), PatchTargetPolicyError> {
     let Some(snapshot) = snapshot else {
         return Err(PatchTargetPolicyError::MissingSecuritySnapshot);
     };
 
-    // Report a denied model-declared source/destination before an auxiliary
-    // parent authorization target. The complete manifest is still checked
-    // before preparation or mutation, but the canonical diagnostic points at
-    // the actionable patch path instead of `.` for a root-level add.
-    for target in targets
-        .iter()
-        .filter(|target| !target.parent)
-        .chain(targets.iter().filter(|target| target.parent))
-    {
-        let requested_path = resolve_patch_target_path(workdir, target.path.as_str());
-        match FilePolicyChecker::check(snapshot, target.operation, requested_path.as_path()) {
+    // Source and destination authorization implies traversal of their parent
+    // chain. Parent entries in the manifest are technical lock/revalidation
+    // targets and may sit above two independently authorized roots; treating
+    // those existing ancestors as write destinations would falsely reject a
+    // legitimate multi-root patch.
+    for target in targets.iter().filter(|target| !target.parent) {
+        match FilePolicyChecker::check(snapshot, target.operation, target.path.as_path()) {
             FilePolicyDecision::Allowed(_) => {}
             FilePolicyDecision::Denied(deny) => {
                 return Err(PatchTargetPolicyError::Denied {
-                    path: target.path.clone(),
+                    path: target.path.to_string_lossy().into_owned(),
                     message: format!(
-                        "filesystem sandbox denied {:?} for patch target `{}`: {}",
+                        "filesystem sandbox denied {:?} for patch target `{}` (resolved `{}`): {}",
                         deny.operation,
-                        safe_display_path(workdir, deny.requested_path.as_path()),
+                        target.path.display(),
+                        deny.resolved_path
+                            .as_deref()
+                            .unwrap_or(deny.requested_path.as_path())
+                            .display(),
                         deny.message
                     ),
                 });
@@ -821,54 +829,6 @@ fn enforce_patch_targets(
         }
     }
     Ok(())
-}
-
-fn safe_display_path(workdir: &Path, path: &Path) -> String {
-    let root = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.to_path_buf());
-    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    candidate
-        .strip_prefix(root.as_path())
-        .ok()
-        .map(|relative| {
-            if relative.as_os_str().is_empty() {
-                ".".to_owned()
-            } else {
-                relative.to_string_lossy().replace('\\', "/")
-            }
-        })
-        .unwrap_or_else(|| "<outside-workspace>".to_owned())
-}
-
-fn resolve_patch_target_path(workdir: &Path, path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        workdir.join(path)
-    };
-    normalize_path_lexically(path)
-}
-
-fn normalize_path_lexically(path: PathBuf) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !matches!(
-                    normalized.components().next_back(),
-                    Some(Component::RootDir | Component::Prefix(_))
-                ) {
-                    normalized.pop();
-                }
-            }
-            Component::Normal(value) => normalized.push(value),
-            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
 }
 
 #[cfg(test)]
@@ -879,9 +839,11 @@ mod tests {
     use crate::permissions::extract_permission_intent_with_preflight;
     use pioneer_protocol::{
         TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
-        TurnPermissionMode, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
+        TurnFilesystemSandboxPath, TurnPermissionMode, TurnPermissionProfileSnapshot,
+        TurnPermissionProfileSource, TurnSecurityRuleProvenance,
     };
     use std::collections::BTreeMap;
+    use std::path::Path;
     use std::sync::Arc;
 
     fn invocation(root: &Path, patch: &str) -> ToolInvocation {
@@ -995,7 +957,15 @@ mod tests {
         assert_eq!(payload["changed_files"], serde_json::json!([]));
         assert_eq!(payload["error"]["code"], "stale_file");
         assert_eq!(payload["error"]["operation_index"], 0);
-        assert_eq!(payload["error"]["path"], "file.txt");
+        assert_eq!(
+            payload["error"]["path"],
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join("file.txt")
+                .to_string_lossy()
+                .as_ref()
+        );
         assert_eq!(payload["error"]["guard_horizon"], "observed");
         let rendered = output.raw_text();
         assert!(!rendered.contains("current private bytes"));
@@ -1071,6 +1041,19 @@ mod tests {
         let traversal_patch =
             "*** Begin Patch\n*** Add File: ../escape.txt\n+escape\n*** End Patch";
         let mut traversal = invocation(traversal_root.path(), traversal_patch);
+        traversal.execution_security_snapshot =
+            Some(TurnExecutionSecuritySnapshot::workspace_write(
+                TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::AutoAcceptEdits,
+                    TurnPermissionProfileSource::Composer,
+                ),
+                traversal_root.path().to_string_lossy(),
+                vec![TurnFilesystemSandboxEntry::workspace_root(
+                    TurnFilesystemAccess::Write,
+                    traversal_root.path().to_string_lossy(),
+                )],
+                1,
+            ));
         let (_, preflight) = extract_permission_intent_with_preflight(&traversal);
         traversal.apply_patch_preflight = preflight;
         let traversal_identity =
@@ -1269,8 +1252,398 @@ mod tests {
         assert_eq!(payload["changed_files"], serde_json::json!([]));
         assert_eq!(payload["error"]["stage"], "authorize");
         assert_eq!(payload["error"]["code"], "permission_denied");
-        assert_eq!(payload["error"]["path"], "denied.txt");
+        assert_eq!(
+            payload["error"]["path"],
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join("denied.txt")
+                .to_string_lossy()
+                .as_ref()
+        );
         assert!(!root.path().join("denied.txt").exists());
         assert!(observer.record(&identity).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pure_move_uses_the_public_facade_without_guards_or_hunks() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("old.txt"), "unchanged\n").unwrap();
+        let patch =
+            "*** Begin Patch\n*** Update File: old.txt\n*** Move to: nested/new.txt\n*** End Patch";
+        let mut invocation = invocation(root.path(), patch);
+        let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
+        invocation.apply_patch_preflight = preflight;
+        let identity = InvocationIdentity::new("thread_move", "turn_move", "call_move").unwrap();
+        let observer = InMemoryCommitObserver::new();
+        let trace = crate::events::ToolEventBus::default().start_trace(
+            "turn_move",
+            "call_move",
+            "apply_patch",
+        );
+
+        let output = ApplyPatchHandler
+            .handle_with_source_and_observer(
+                invocation,
+                trace,
+                PatchRequestSource::ManagedClaude,
+                &identity,
+                &observer,
+            )
+            .await
+            .unwrap();
+
+        assert!(output.success());
+        assert!(!root.path().join("old.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("nested/new.txt")).unwrap(),
+            "unchanged\n"
+        );
+        assert_eq!(output.raw_json()["changes"][0]["kind"], "move");
+        assert_eq!(
+            output.raw_json()["changes"][0]["source_path"],
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join("old.txt")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            output.raw_json()["changes"][0]["destination_path"],
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join("nested/new.txt")
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_patch_can_use_cwd_and_an_additional_authorized_root() {
+        let cwd = tempfile::tempdir().unwrap();
+        let additional = tempfile::tempdir().unwrap();
+        let additional_file = additional.path().join("nested/absolute.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: relative.txt\n+from cwd\n*** Add File: {}\n+from additional root\n*** End Patch",
+            additional_file.display()
+        );
+        let mut invocation = invocation(cwd.path(), patch.as_str());
+        invocation.execution_security_snapshot =
+            Some(TurnExecutionSecuritySnapshot::workspace_write(
+                TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::AutoAcceptEdits,
+                    TurnPermissionProfileSource::Composer,
+                ),
+                cwd.path().to_string_lossy(),
+                vec![
+                    TurnFilesystemSandboxEntry::workspace_root(
+                        TurnFilesystemAccess::Write,
+                        cwd.path().to_string_lossy(),
+                    ),
+                    TurnFilesystemSandboxEntry {
+                        path: TurnFilesystemSandboxPath::ExplicitPath {
+                            path: additional.path().to_string_lossy().into_owned(),
+                        },
+                        access: TurnFilesystemAccess::Write,
+                        provenance: TurnSecurityRuleProvenance::Project,
+                        resolved_path: Some(additional.path().to_string_lossy().into_owned()),
+                    },
+                ],
+                1,
+            ));
+        let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
+        let ready = match preflight.as_ref().unwrap() {
+            ApplyPatchPreflight::Ready(ready) => ready,
+            ApplyPatchPreflight::Rejected(report) => {
+                panic!("dynamic roots should resolve, got {report:?}")
+            }
+        };
+        assert!(ready.workspace_root().is_absolute());
+        assert_ne!(ready.workspace_root(), Path::new("/"));
+        invocation.apply_patch_preflight = preflight;
+        let identity = InvocationIdentity::new("thread_roots", "turn_roots", "call_roots").unwrap();
+        let observer = InMemoryCommitObserver::new();
+        let trace = crate::events::ToolEventBus::default().start_trace(
+            "turn_roots",
+            "call_roots",
+            "apply_patch",
+        );
+
+        let output = ApplyPatchHandler
+            .handle_with_source_and_observer(
+                invocation,
+                trace,
+                PatchRequestSource::ManagedClaude,
+                &identity,
+                &observer,
+            )
+            .await
+            .unwrap();
+
+        assert!(output.success(), "{}", output.raw_text());
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("relative.txt")).unwrap(),
+            "from cwd"
+        );
+        assert_eq!(
+            std::fs::read_to_string(additional_file).unwrap(),
+            "from additional root"
+        );
+        let mut expected_paths = vec![
+            additional
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("nested/absolute.txt")
+                .to_string_lossy()
+                .into_owned(),
+            cwd.path()
+                .canonicalize()
+                .unwrap()
+                .join("relative.txt")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        expected_paths.sort();
+        let returned_paths = output.raw_json()["changed_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(returned_paths, expected_paths);
+    }
+
+    #[test]
+    fn composer_writable_roots_define_one_stable_patch_namespace() {
+        let cwd = tempfile::tempdir().unwrap();
+        let additional = tempfile::tempdir().unwrap();
+        let security = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            cwd.path().to_string_lossy(),
+            vec![
+                TurnFilesystemSandboxEntry::workspace_root(
+                    TurnFilesystemAccess::Write,
+                    cwd.path().to_string_lossy(),
+                ),
+                TurnFilesystemSandboxEntry {
+                    path: TurnFilesystemSandboxPath::ExplicitPath {
+                        path: additional.path().to_string_lossy().into_owned(),
+                    },
+                    access: TurnFilesystemAccess::Write,
+                    provenance: TurnSecurityRuleProvenance::Project,
+                    resolved_path: Some(additional.path().to_string_lossy().into_owned()),
+                },
+            ],
+            1,
+        );
+
+        let mut cwd_invocation = invocation(
+            cwd.path(),
+            "*** Begin Patch\n*** Add File: cwd.txt\n+cwd\n*** End Patch",
+        );
+        cwd_invocation.execution_security_snapshot = Some(security.clone());
+        let (_, cwd_preflight) = extract_permission_intent_with_preflight(&cwd_invocation);
+        let cwd_root = match cwd_preflight.unwrap() {
+            ApplyPatchPreflight::Ready(ready) => ready.workspace_root().to_path_buf(),
+            ApplyPatchPreflight::Rejected(report) => {
+                panic!("cwd patch should resolve: {report:?}")
+            }
+        };
+
+        let additional_target = additional.path().join("additional.txt");
+        let additional_patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+additional\n*** End Patch",
+            additional_target.display()
+        );
+        let mut additional_invocation = invocation(cwd.path(), additional_patch.as_str());
+        additional_invocation.execution_security_snapshot = Some(security);
+        let (_, additional_preflight) =
+            extract_permission_intent_with_preflight(&additional_invocation);
+        let additional_root = match additional_preflight.unwrap() {
+            ApplyPatchPreflight::Ready(ready) => ready.workspace_root().to_path_buf(),
+            ApplyPatchPreflight::Rejected(report) => {
+                panic!("additional-root patch should resolve: {report:?}")
+            }
+        };
+
+        assert_eq!(cwd_root, additional_root);
+        assert!(cwd.path().canonicalize().unwrap().starts_with(&cwd_root));
+        assert!(
+            additional
+                .path()
+                .canonicalize()
+                .unwrap()
+                .starts_with(&additional_root)
+        );
+    }
+
+    #[tokio::test]
+    async fn realistic_two_stage_edit_succeeds_first_try_with_dynamic_absolute_paths() {
+        let container = tempfile::tempdir().unwrap();
+        let cwd = container.path().join("workspace");
+        let downloads = container.path().join("Downloads");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+        let trip = downloads.join("weekend-trip-plan");
+        let readme = trip.join("README.md");
+        let itinerary = trip.join("itinerary.md");
+        let notes = trip.join("notes.txt");
+        let plan = trip.join("plan.md");
+        let budget = trip.join("budget.md");
+        let security = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            cwd.to_string_lossy(),
+            vec![
+                TurnFilesystemSandboxEntry::workspace_root(
+                    TurnFilesystemAccess::Write,
+                    cwd.to_string_lossy(),
+                ),
+                TurnFilesystemSandboxEntry {
+                    path: TurnFilesystemSandboxPath::ExplicitPath {
+                        path: downloads.to_string_lossy().into_owned(),
+                    },
+                    access: TurnFilesystemAccess::Write,
+                    provenance: TurnSecurityRuleProvenance::ComposerSelection,
+                    resolved_path: Some(downloads.to_string_lossy().into_owned()),
+                },
+            ],
+            1,
+        );
+        let draft = format!(
+            "*** Begin Patch\n*** Add File: {}\n+# Weekend Trip Plan\n+Status: Draft\n+See [itinerary](itinerary.md).\n*** Add File: {}\n+# Weekend Itinerary\n+- Saturday: breakfast, city walk, dinner\n+- Sunday: museum, lunch, departure\n*** Add File: {}\n+Remember to add a budget.\n*** End Patch",
+            readme.display(),
+            itinerary.display(),
+            notes.display(),
+        );
+        let final_edit = format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n # Weekend Trip Plan\n-Status: Draft\n-See [itinerary](itinerary.md).\n+Status: Final\n+See [plan](plan.md).\n*** Update File: {}\n*** Move to: {}\n@@\n-# Weekend Itinerary\n-- Saturday: breakfast, city walk, dinner\n-- Sunday: museum, lunch, departure\n+# Final Weekend Plan\n+- Saturday 09:00: breakfast\n+- Saturday 11:00: city walk\n+- Saturday 19:00: dinner\n+- Sunday 10:00: museum\n+- Sunday 13:00: lunch\n+- Sunday 17:00: departure\n*** Delete File: {}\n*** Add File: {}\n+# Budget\n+- Food: 120\n+- Tickets: 60\n*** End Patch",
+            readme.display(),
+            itinerary.display(),
+            plan.display(),
+            notes.display(),
+            budget.display(),
+        );
+        let observer = InMemoryCommitObserver::new();
+
+        for (call, patch) in [("draft", draft), ("final", final_edit)] {
+            let mut invocation = invocation(cwd.as_path(), patch.as_str());
+            invocation.call_id = format!("call_{call}");
+            invocation.idempotency_key = Some(format!("call_{call}"));
+            invocation.execution_security_snapshot = Some(security.clone());
+            let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
+            invocation.apply_patch_preflight = preflight;
+            let identity = InvocationIdentity::new(
+                "thread_realistic",
+                "turn_realistic",
+                format!("call_{call}"),
+            )
+            .unwrap();
+            let trace = crate::events::ToolEventBus::default().start_trace(
+                "turn_realistic",
+                format!("call_{call}"),
+                "apply_patch",
+            );
+
+            let output = ApplyPatchHandler
+                .handle_with_source_and_observer(
+                    invocation,
+                    trace,
+                    PatchRequestSource::ManagedClaude,
+                    &identity,
+                    &observer,
+                )
+                .await
+                .unwrap();
+
+            assert!(output.success(), "{call}: {}", output.raw_text());
+            assert_eq!(output.raw_json()["status"], "applied");
+            assert!(
+                observer
+                    .committed_changes(&identity)
+                    .is_some_and(|changes| !changes.is_empty())
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&readme).unwrap(),
+            "# Weekend Trip Plan\nStatus: Final\nSee [plan](plan.md)."
+        );
+        assert!(!itinerary.exists());
+        assert!(!notes.exists());
+        assert_eq!(
+            std::fs::read_to_string(&plan).unwrap(),
+            "# Final Weekend Plan\n- Saturday 09:00: breakfast\n- Saturday 11:00: city walk\n- Saturday 19:00: dinner\n- Sunday 10:00: museum\n- Sunday 13:00: lunch\n- Sunday 17:00: departure"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&budget).unwrap(),
+            "# Budget\n- Food: 120\n- Tickets: 60"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slash_workspace_accepts_an_absolute_path_inside_its_dynamic_root() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("absolute.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+absolute path works\n*** End Patch",
+            target.display()
+        );
+        let mut invocation = invocation(Path::new("/"), patch.as_str());
+        invocation.execution_security_snapshot =
+            Some(TurnExecutionSecuritySnapshot::workspace_write(
+                TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::AutoAcceptEdits,
+                    TurnPermissionProfileSource::Composer,
+                ),
+                "/",
+                vec![TurnFilesystemSandboxEntry::workspace_root(
+                    TurnFilesystemAccess::Write,
+                    "/",
+                )],
+                1,
+            ));
+        let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
+        let ready = match preflight.as_ref().unwrap() {
+            ApplyPatchPreflight::Ready(ready) => ready,
+            ApplyPatchPreflight::Rejected(report) => {
+                panic!("absolute path under slash root should resolve: {report:?}")
+            }
+        };
+        assert_eq!(ready.workspace_root(), Path::new("/"));
+        invocation.apply_patch_preflight = preflight;
+        let identity = InvocationIdentity::new("thread_slash", "turn_slash", "call_slash").unwrap();
+        let observer = InMemoryCommitObserver::new();
+        let trace = crate::events::ToolEventBus::default().start_trace(
+            "turn_slash",
+            "call_slash",
+            "apply_patch",
+        );
+
+        let output = ApplyPatchHandler
+            .handle_with_source_and_observer(
+                invocation,
+                trace,
+                PatchRequestSource::ManagedClaude,
+                &identity,
+                &observer,
+            )
+            .await
+            .unwrap();
+
+        assert!(output.success(), "{}", output.raw_text());
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "absolute path works"
+        );
     }
 }

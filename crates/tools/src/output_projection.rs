@@ -388,7 +388,123 @@ fn file_change_title(tool_name: &str, file_count: usize) -> String {
 }
 
 fn file_change_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
-    llm_view_for_policy(input)
+    let raw = input.raw_output_json;
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "status".to_owned(),
+        raw.get("status").cloned().unwrap_or_else(|| {
+            JsonValue::String(if input.success { "applied" } else { "failed" }.to_owned())
+        }),
+    );
+    value.insert("success".to_owned(), JsonValue::Bool(input.success));
+    value.insert(
+        "changed_files".to_owned(),
+        raw.get("changed_files")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    );
+
+    let changes = raw
+        .get("changes")
+        .and_then(JsonValue::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(compact_file_change)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    value.insert("changes".to_owned(), JsonValue::Array(changes));
+
+    if let Some(error) = raw.get("error").and_then(compact_file_change_error) {
+        value.insert("error".to_owned(), error);
+    } else if input.success {
+        value.insert(
+            "message".to_owned(),
+            JsonValue::String("Patch applied successfully.".to_owned()),
+        );
+    }
+
+    if let Some(side_effects) = raw.get("side_effects").and_then(compact_file_side_effects) {
+        value.insert("side_effects".to_owned(), side_effects);
+    }
+
+    bounded_model_json(input, JsonValue::Object(value))
+}
+
+fn bounded_model_json(input: &ToolProjectionInput<'_>, value: JsonValue) -> ToolResultView {
+    let view = ToolResultView::Json {
+        value,
+        truncated: false,
+    };
+    match input.output_policy.llm {
+        LlmOutputPolicy::Full { max_bytes } | LlmOutputPolicy::Structured { max_bytes } => {
+            view.bounded_to_bytes(max_bytes)
+        }
+        LlmOutputPolicy::SummaryOnly => view,
+    }
+}
+
+fn compact_file_change(change: &JsonValue) -> Option<JsonValue> {
+    let object = change.as_object()?;
+    let mut compact = serde_json::Map::new();
+    for key in ["operation_index", "kind", "source_path", "destination_path"] {
+        if let Some(value) = object.get(key)
+            && !value.is_null()
+        {
+            compact.insert(key.to_owned(), value.clone());
+        }
+    }
+    (!compact.is_empty()).then_some(JsonValue::Object(compact))
+}
+
+fn compact_file_change_error(error: &JsonValue) -> Option<JsonValue> {
+    let object = error.as_object()?;
+    let mut compact = serde_json::Map::new();
+    for key in [
+        "code",
+        "stage",
+        "message",
+        "operation_index",
+        "path",
+        "retryability",
+        "next_action",
+        "retry_same_patch",
+    ] {
+        if let Some(value) = object.get(key)
+            && !value.is_null()
+        {
+            compact.insert(key.to_owned(), value.clone());
+        }
+    }
+    (!compact.is_empty()).then_some(JsonValue::Object(compact))
+}
+
+fn compact_file_side_effects(side_effects: &JsonValue) -> Option<JsonValue> {
+    let object = side_effects.as_object()?;
+    let residual = object
+        .get("residual_directories")
+        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()));
+    let warnings = object
+        .get("metadata_warnings")
+        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()));
+    let exact = object
+        .get("exact")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true);
+    if residual.is_none() && warnings.is_none() && exact {
+        return None;
+    }
+
+    let mut compact = serde_json::Map::new();
+    if let Some(residual) = residual {
+        compact.insert("residual_directories".to_owned(), residual.clone());
+    }
+    if let Some(warnings) = warnings {
+        compact.insert("metadata_warnings".to_owned(), warnings.clone());
+    }
+    compact.insert("exact".to_owned(), JsonValue::Bool(exact));
+    Some(JsonValue::Object(compact))
 }
 
 fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
@@ -432,12 +548,28 @@ fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     );
     envelope(
         &input,
-        llm_view_for_policy(&input),
+        read_file_llm_view(&input),
         ToolDisplayPayload::Summary(summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
         },
         recovery_view(&input),
+    )
+}
+
+fn read_file_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
+    let raw = input.raw_output_json;
+    bounded_model_json(
+        input,
+        serde_json::json!({
+            "path": raw.get("path").cloned().unwrap_or(JsonValue::Null),
+            "text": raw.get("text").or_else(|| raw.get("output")).cloned().unwrap_or_else(|| JsonValue::String(input.raw_output_text.to_owned())),
+            "start_line": raw.get("start_line").cloned().unwrap_or(JsonValue::Null),
+            "end_line": raw.get("end_line").cloned().unwrap_or(JsonValue::Null),
+            "truncated": raw.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
+            "continuation": raw.get("continuation").cloned().unwrap_or(JsonValue::Null),
+            "next_line": raw.get("next_line").cloned().unwrap_or(JsonValue::Null),
+        }),
     )
 }
 
@@ -481,6 +613,19 @@ fn project_read_skill(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     )
 }
 
+fn list_dir_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
+    let raw = input.raw_output_json;
+    bounded_model_json(
+        input,
+        serde_json::json!({
+            "root": raw.get("root").cloned().unwrap_or(JsonValue::Null),
+            "entries": raw.get("entries").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "truncated": raw.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
+            "has_more": raw.get("has_more").cloned().unwrap_or(JsonValue::Bool(false)),
+        }),
+    )
+}
+
 fn project_list_dir(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     let entries = input
         .raw_output_json
@@ -509,13 +654,48 @@ fn project_list_dir(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     );
     envelope(
         &input,
-        llm_view_for_policy(&input),
+        list_dir_llm_view(&input),
         ToolDisplayPayload::Summary(summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
         },
         recovery_view(&input),
     )
+}
+
+fn grep_files_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
+    let raw = input.raw_output_json;
+    let mut value = serde_json::Map::new();
+    for key in [
+        "status",
+        "path",
+        "engine",
+        "output",
+        "truncated",
+        "message",
+        "reason",
+        "next_action",
+        "suggestions",
+        "retryableByModel",
+        "retrySameArguments",
+    ] {
+        if let Some(field) = raw.get(key)
+            && !field.is_null()
+        {
+            value.insert(key.to_owned(), field.clone());
+        }
+    }
+    if !value.contains_key("output") {
+        let output = raw
+            .get("stdout")
+            .or_else(|| raw.get("stderr"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or(input.raw_output_text);
+        if !output.is_empty() {
+            value.insert("output".to_owned(), JsonValue::String(output.to_owned()));
+        }
+    }
+    bounded_model_json(input, JsonValue::Object(value))
 }
 
 fn project_grep_files(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
@@ -548,7 +728,7 @@ fn project_grep_files(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     );
     envelope(
         &input,
-        llm_view_for_policy(&input),
+        grep_files_llm_view(&input),
         ToolDisplayPayload::Summary(summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
@@ -1488,6 +1668,223 @@ mod tests {
                 .unwrap()
                 .contains("SECRET_PAGE_BODY_SENTINEL")
         );
+    }
+
+    #[test]
+    fn apply_patch_projection_keeps_the_model_facade_small_and_history_internal() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "status": "applied",
+            "success": true,
+            "exact": true,
+            "history_bearing": true,
+            "changed_files": ["/workspace/src/main.rs"],
+            "changes": [{
+                "operation_index": 0,
+                "commit_step": 1,
+                "sequence": 0,
+                "kind": "modify",
+                "source_path": "/workspace/src/main.rs",
+                "before_hash": "SECRET_BEFORE_HASH",
+                "after_hash": "SECRET_AFTER_HASH",
+                "before_bytes": 10,
+                "after_bytes": 12
+            }],
+            "side_effects": {
+                "created_directories": [],
+                "residual_directories": [],
+                "metadata_warnings": [],
+                "exact": true
+            },
+            "failed_stage": null,
+            "error": null,
+            "tracking": {
+                "status": "recorded_and_projected",
+                "authority": "native_patch_engine",
+                "record_id": "SECRET_RECORD_ID"
+            },
+            "history": {
+                "authority": "native_patch_engine",
+                "record_id": "SECRET_RECORD_ID",
+                "plan_fingerprint": "SECRET_PLAN_FINGERPRINT"
+            }
+        });
+        let raw = payload.to_string();
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_apply_patch",
+            tool_name: "apply_patch",
+            arguments: &serde_json::json!({"patch": "*** Begin Patch\n*** End Patch"}),
+            raw_output_text: &raw,
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let model = serde_json::to_string(&envelope.llm_view).unwrap();
+        assert!(model.contains("Patch applied successfully"));
+        assert!(model.contains("/workspace/src/main.rs"));
+        for internal in [
+            "history",
+            "tracking",
+            "SECRET_RECORD_ID",
+            "SECRET_PLAN_FINGERPRINT",
+            "SECRET_BEFORE_HASH",
+            "SECRET_AFTER_HASH",
+            "commit_step",
+        ] {
+            assert!(
+                !model.contains(internal),
+                "model facade leaked internal field `{internal}`"
+            );
+        }
+
+        let storage = serde_json::to_string(&envelope.storage).unwrap();
+        assert!(storage.contains("patchHistory"));
+        assert!(storage.contains("SECRET_PLAN_FINGERPRINT"));
+    }
+
+    #[test]
+    fn apply_patch_projection_exposes_the_concrete_recovery_action() {
+        let payload = serde_json::json!({
+            "status": "rejected",
+            "success": false,
+            "changed_files": [],
+            "changes": [],
+            "error": {
+                "code": "source_missing",
+                "stage": "resolve",
+                "message": "source `/workspace/missing.txt` does not exist",
+                "operation_index": 0,
+                "path": "/workspace/missing.txt",
+                "retryability": "never",
+                "next_action": "Read or list `/workspace` and submit a new patch with the exact existing path.",
+                "retry_same_patch": false,
+                "guard_horizon": "source"
+            },
+            "tracking": { "authority": "untracked" }
+        });
+        let raw = payload.to_string();
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "Read or list `/workspace` and submit a new patch with the exact existing path.",
+            false,
+            None,
+        );
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_apply_patch_error",
+            tool_name: "apply_patch",
+            arguments: &serde_json::json!({"patch": "invalid"}),
+            raw_output_text: &raw,
+            raw_output_json: &payload,
+            success: false,
+            outcome: &outcome,
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let model = serde_json::to_string(&envelope.llm_view).unwrap();
+        assert!(model.contains("source_missing"));
+        assert!(model.contains("/workspace/missing.txt"));
+        assert!(model.contains("Read or list"));
+        assert!(model.contains("retry_same_patch"));
+        assert!(!model.contains("guard_horizon"));
+        assert!(!model.contains("tracking"));
+    }
+
+    #[test]
+    fn native_file_read_projection_keeps_content_but_hides_internal_tokens_and_duplicates() {
+        let payload = serde_json::json!({
+            "path": "/workspace/src/main.rs",
+            "resolved_path": "/workspace/src/main.rs",
+            "relative_path": "src/main.rs",
+            "cwd": "/workspace",
+            "authorized_root": "/workspace",
+            "start_line": 1,
+            "end_line": 1,
+            "next_line": null,
+            "continuation": null,
+            "truncated": false,
+            "version": "SECRET_VERSION_TOKEN",
+            "text": "fn main() {}\n",
+            "output": "SECRET_DUPLICATE_RENDERING"
+        });
+        let raw = payload.to_string();
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_read_file",
+            tool_name: "read_file",
+            arguments: &serde_json::json!({"path": "src/main.rs"}),
+            raw_output_text: &raw,
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("read_file"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let model = serde_json::to_string(&envelope.llm_view).unwrap();
+        assert!(model.contains("/workspace/src/main.rs"));
+        assert!(model.contains("fn main()"));
+        assert!(!model.contains("SECRET_VERSION_TOKEN"));
+        assert!(!model.contains("SECRET_DUPLICATE_RENDERING"));
+        assert!(!model.contains("authorized_root"));
+    }
+
+    #[test]
+    fn native_list_and_grep_projections_return_only_actionable_model_fields() {
+        let list_payload = serde_json::json!({
+            "root": "/workspace",
+            "relative_root": ".",
+            "cwd": "/workspace",
+            "authorized_root": "/workspace",
+            "truncated": true,
+            "has_more": true,
+            "entries": [{"path": "/workspace/src", "kind": "dir"}]
+        });
+        let list_raw = list_payload.to_string();
+        let list = project_tool_result(ToolProjectionInput {
+            call_id: "call_list_dir",
+            tool_name: "list_dir",
+            arguments: &serde_json::json!({"path": "."}),
+            raw_output_text: &list_raw,
+            raw_output_json: &list_payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("list_dir"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let list_model = serde_json::to_string(&list.llm_view).unwrap();
+        assert!(list_model.contains("/workspace/src"));
+        assert!(list_model.contains("has_more"));
+        assert!(!list_model.contains("authorized_root"));
+        assert!(!list_model.contains("relative_root"));
+
+        let grep_payload = serde_json::json!({
+            "status": "ok",
+            "engine": "rg",
+            "path": "/workspace/src",
+            "truncated": false,
+            "stdout": "SECRET_DUPLICATE_STDOUT",
+            "stderr": "SECRET_INTERNAL_STDERR",
+            "output": "/workspace/src/main.rs:1:fn main() {}"
+        });
+        let grep_raw = grep_payload.to_string();
+        let grep = project_tool_result(ToolProjectionInput {
+            call_id: "call_grep_files",
+            tool_name: "grep_files",
+            arguments: &serde_json::json!({"pattern": "main", "path": "/workspace/src"}),
+            raw_output_text: &grep_raw,
+            raw_output_json: &grep_payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("grep_files"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let grep_model = serde_json::to_string(&grep.llm_view).unwrap();
+        assert!(grep_model.contains("/workspace/src/main.rs"));
+        assert!(!grep_model.contains("SECRET_DUPLICATE_STDOUT"));
+        assert!(!grep_model.contains("SECRET_INTERNAL_STDERR"));
     }
 
     #[test]

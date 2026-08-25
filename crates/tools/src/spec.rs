@@ -5,6 +5,27 @@ use serde_json::Value as JsonValue;
 use crate::domain::{REQUEST_TOOLS_DOMAIN_VALUES, REQUEST_TOOLS_REASON_MAX_CHARS};
 use crate::output_policy::{ToolOutputPolicy, ToolOutputProjectionKind, builtin_output_policy};
 
+const APPLY_PATCH_MODEL_EXAMPLE: &str = concat!(
+    "*** Begin Patch\n",
+    "*** Add File: notes/new.txt\n",
+    "+first line\n",
+    "+second line\n",
+    "*** Update File: src/old_name.rs\n",
+    "*** Move to: src/new_name.rs\n",
+    "@@ nearby_function\n",
+    " unchanged context\n",
+    "-old text\n",
+    "+new text\n",
+    "*** Delete File: notes/obsolete.txt\n",
+    "*** End Patch"
+);
+
+fn apply_patch_model_description() -> String {
+    format!(
+        "Edit one or more UTF-8 text files with one patch document. Pass the document in the exact input form shown by this tool's current schema. Use this exact line-oriented syntax:\n{APPLY_PATCH_MODEL_EXAMPLE}\n\nRules:\n- Put one or more file operations between `*** Begin Patch` and `*** End Patch`; one document may change multiple files.\n- `*** Add File: path` creates a file. Every content line must start with `+`; use a line containing only `+` to add a blank line.\n- `*** Update File: path` edits an existing file. Start every hunk with `@@` or `@@ nearby context`. In a hunk, prefix unchanged lines with one space, removed lines with `-`, and added lines with `+`. Include enough unchanged context to match exactly one location.\n- `*** Update File: old-path` followed immediately by `*** Move to: new-path` renames a file. For a rename without content changes, end that operation after `Move to`; to edit and rename together, put the update hunks after `Move to`.\n- `*** Delete File: path` deletes an existing file and has no body.\n- Paths may be relative to the current working directory or absolute when authorized for this turn. Add and Move create missing parent directories. Move never overwrites an existing destination.\n- Read unfamiliar files before updating them. Do not add unsupported directives or Markdown fences. If the call fails, correct the document using the returned error and next action; do not repeat the same failed document unchanged."
+    )
+}
+
 pub const REQUEST_TOOLS_TOOL_NAME: &str = "request_tools";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -264,7 +285,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "read_file",
-            "Read bounded, paginated UTF-8 text and return the exact version token for safe later mutations.",
+            "Read exact UTF-8 text without changing it. `path` may be relative to the turn cwd or an authorized absolute path. The result returns the resolved absolute path and one bounded text page; when `truncated` is true, pass its `continuation` back as `cursor` to read the next page.",
             read_file_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -278,7 +299,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "list_dir",
-            "Discover files and directories without changing the workspace.",
+            "List files and directories without changing them. Omit `path` to list the turn cwd, or pass a cwd-relative or authorized absolute directory. Returned entry paths are absolute and can be copied directly into read_file, grep_files, or apply_patch. A successful result with `truncated: true` is a valid bounded listing; list a returned child directory to continue discovery.",
             list_dir_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -292,7 +313,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "grep_files",
-            "Search text within a scoped path or glob. Always pass the narrowest path and glob you can infer; do not repeat broad workspace searches after a needs_narrowing result.",
+            "Search UTF-8 text under a scoped directory or file. `path` may be cwd-relative or an authorized absolute path; use the narrowest path and optional glob you can infer. Results use reusable absolute paths. If the result says `needs_narrowing`, follow its `next_action` and do not repeat the same broad search.",
             grep_files_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -306,7 +327,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "apply_patch",
-            "Apply the only general bounded text mutation: add, replace, update, delete, move, or change multiple UTF-8 files, using the immutable wire shape declared for this turn.",
+            apply_patch_model_description(),
             apply_patch_schema(),
             PayloadKind::Custom,
             ExecutionClass::MutationScoped,
@@ -462,12 +483,12 @@ fn read_file_schema() -> JsonValue {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string" },
+            "path": { "type": "string", "description": "Path relative to the turn cwd, or an authorized absolute file path." },
             "start_line": { "type": "integer", "minimum": 1 },
             "start_byte": { "type": "integer", "minimum": 0 },
             "max_lines": { "type": "integer", "minimum": 1 },
             "max_bytes": { "type": "integer", "minimum": 1 },
-            "cursor": { "type": "string", "minLength": 1, "maxLength": 16384 }
+            "cursor": { "type": "string", "minLength": 1, "maxLength": 16384, "description": "Opaque continuation returned by the preceding page of this same file." }
         },
         "required": ["path"],
         "additionalProperties": false
@@ -478,9 +499,9 @@ fn list_dir_schema() -> JsonValue {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string" },
-            "depth": { "type": "integer", "minimum": 0 },
-            "limit": { "type": "integer", "minimum": 1 },
+            "path": { "type": "string", "description": "Directory relative to the turn cwd, or an authorized absolute directory. Defaults to the turn cwd." },
+            "depth": { "type": "integer", "minimum": 0, "description": "Maximum descendant depth. Use 0 for direct children only." },
+            "limit": { "type": "integer", "minimum": 1, "description": "Maximum returned entries. Truncation is reported explicitly." },
             "include_hidden": { "type": "boolean" }
         },
         "additionalProperties": false
@@ -491,9 +512,9 @@ fn grep_files_schema() -> JsonValue {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "pattern": { "type": "string" },
-            "path": { "type": "string" },
-            "glob": { "type": "string" },
+            "pattern": { "type": "string", "description": "Literal or regular-expression pattern accepted by the scoped search backend." },
+            "path": { "type": "string", "description": "Narrow cwd-relative or authorized absolute file/directory to search. Defaults to the turn cwd." },
+            "glob": { "type": "string", "description": "Optional file glob such as `*.rs` or `**/*.md`." },
             "max_results": { "type": "integer", "minimum": 1 },
             "max_output_bytes": { "type": "integer", "minimum": 1 },
             "case_sensitive": { "type": "boolean" },
@@ -505,10 +526,11 @@ fn grep_files_schema() -> JsonValue {
 }
 
 fn apply_patch_schema() -> JsonValue {
+    let description = apply_patch_model_description();
     serde_json::json!({
         "type": "object",
         "properties": {
-            "patch": { "type": "string", "description": "The complete apply_patch document" }
+            "patch": { "type": "string", "description": description }
         },
         "required": ["patch"],
         "additionalProperties": false
@@ -1008,6 +1030,51 @@ mod tests {
         ] {
             assert!(!names.iter().any(|name| name == removed));
         }
+    }
+
+    #[test]
+    fn apply_patch_model_contract_is_complete_self_contained_and_parseable() {
+        let description = apply_patch_model_description();
+        for required in [
+            "*** Begin Patch",
+            "*** Add File:",
+            "*** Update File:",
+            "*** Move to:",
+            "*** Delete File:",
+            "*** End Patch",
+            "current working directory",
+            "absolute when authorized",
+            "returned error and next action",
+        ] {
+            assert!(
+                description.contains(required),
+                "missing model contract: {required}"
+            );
+        }
+        let lowered = description.to_ascii_lowercase();
+        for forbidden in [
+            "codex",
+            "proposal",
+            "if-match",
+            "if-destination",
+            "replace file",
+        ] {
+            assert!(
+                !lowered.contains(forbidden),
+                "model contract exposes internal or external term: {forbidden}"
+            );
+        }
+
+        let limits = crate::apply_patch::file_mutation::PatchLimits::default();
+        let request = crate::apply_patch::file_mutation::PatchRequest::from_provider_text(
+            APPLY_PATCH_MODEL_EXAMPLE,
+            crate::apply_patch::file_mutation::PatchRequestSource::NativeFunction,
+            limits,
+        )
+        .expect("documented example should normalize");
+        let parsed =
+            crate::apply_patch::parse(&request, limits).expect("documented example should parse");
+        assert_eq!(parsed.operations.len(), 3);
     }
 
     #[test]

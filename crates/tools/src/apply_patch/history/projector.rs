@@ -505,9 +505,6 @@ fn apply_change(
         }
         lineage.current_path = destination.clone();
         lineage.kind = ChangeKind::Move;
-        if lineage.before.is_none() {
-            lineage.before = change.before.clone();
-        }
         lineage.after = change.after.clone();
         lineages.insert(destination_key, lineage);
         return continuity;
@@ -530,9 +527,6 @@ fn apply_change(
         continuity = false;
         lineage.before = change.before.clone();
     }
-    if lineage.before.is_none() {
-        lineage.before = change.before.clone();
-    }
     lineage.after = change.after.clone();
     lineage.kind = change.kind;
     lineage.overwritten_destination = change
@@ -543,29 +537,43 @@ fn apply_change(
 }
 
 fn finalize_lineage(lineage: Lineage) -> Option<AggregateFileChange> {
+    if lineage.before.is_none()
+        && lineage.after.is_none()
+        && lineage.overwritten_destination.is_none()
+    {
+        return None;
+    }
     if lineage.before == lineage.after
         && lineage.original_path == lineage.current_path
         && lineage.overwritten_destination.is_none()
     {
         return None;
     }
-    let kind = if lineage.original_path != lineage.current_path {
-        ChangeKind::Move
-    } else if lineage.before.is_none() {
-        ChangeKind::Add
+    let (kind, source_path, destination_path) = if lineage.before.is_none() {
+        (ChangeKind::Add, lineage.current_path.clone(), None)
+    } else if lineage.original_path != lineage.current_path {
+        (
+            ChangeKind::Move,
+            lineage.original_path.clone(),
+            Some(lineage.current_path.clone()),
+        )
     } else if lineage.after.is_none() {
-        ChangeKind::Delete
+        (ChangeKind::Delete, lineage.original_path.clone(), None)
     } else {
-        match lineage.kind {
-            ChangeKind::Add | ChangeKind::Delete | ChangeKind::Move => ChangeKind::Replace,
-            other => other,
-        }
+        (
+            match lineage.kind {
+                ChangeKind::Add | ChangeKind::Delete | ChangeKind::Move => ChangeKind::Replace,
+                other => other,
+            },
+            lineage.original_path.clone(),
+            None,
+        )
     };
     Some(AggregateFileChange {
         environment_id: lineage.environment_id,
         kind,
-        source_path: lineage.original_path,
-        destination_path: (kind == ChangeKind::Move).then_some(lineage.current_path),
+        source_path,
+        destination_path,
         before: lineage.before,
         after: lineage.after,
         overwritten_destination: lineage.overwritten_destination,
@@ -714,6 +722,76 @@ mod tests {
         assert_eq!(aggregate.changes.len(), 1);
         assert_eq!(aggregate.changes[0].before, Some(snapshot(b"a")));
         assert_eq!(aggregate.changes[0].after, Some(snapshot(b"c")));
+    }
+
+    #[test]
+    fn add_then_update_remains_one_add_with_final_bytes() {
+        let records = vec![
+            stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
+            stored(
+                1,
+                "update",
+                ChangeKind::Update,
+                "a.txt",
+                Some(b"a"),
+                Some(b"b"),
+                None,
+            ),
+        ];
+
+        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
+
+        assert_eq!(aggregate.changes.len(), 1);
+        assert_eq!(aggregate.changes[0].kind, ChangeKind::Add);
+        assert_eq!(aggregate.changes[0].source_path, "a.txt");
+        assert_eq!(aggregate.changes[0].before, None);
+        assert_eq!(aggregate.changes[0].after, Some(snapshot(b"b")));
+    }
+
+    #[test]
+    fn add_then_delete_is_net_zero() {
+        let records = vec![
+            stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
+            stored(
+                1,
+                "delete",
+                ChangeKind::Delete,
+                "a.txt",
+                Some(b"a"),
+                None,
+                None,
+            ),
+        ];
+
+        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
+
+        assert!(aggregate.changes.is_empty());
+        assert_eq!(aggregate.record_count, 2);
+    }
+
+    #[test]
+    fn add_then_move_is_an_add_at_the_final_path() {
+        let records = vec![
+            stored(0, "add", ChangeKind::Add, "a.txt", None, Some(b"a"), None),
+            stored(
+                1,
+                "move",
+                ChangeKind::Move,
+                "a.txt",
+                Some(b"a"),
+                Some(b"a"),
+                Some("b.txt"),
+            ),
+        ];
+
+        let aggregate = project_turn_records("thread", "turn", &records).unwrap();
+
+        assert_eq!(aggregate.changes.len(), 1);
+        assert_eq!(aggregate.changes[0].kind, ChangeKind::Add);
+        assert_eq!(aggregate.changes[0].source_path, "b.txt");
+        assert_eq!(aggregate.changes[0].destination_path, None);
+        assert_eq!(aggregate.changes[0].before, None);
+        assert_eq!(aggregate.changes[0].after, Some(snapshot(b"a")));
     }
 
     #[test]

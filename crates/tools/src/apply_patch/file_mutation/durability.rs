@@ -182,7 +182,9 @@ pub fn apply_safe_add_mode(path: &Path) -> Result<Vec<MetadataWarning>, io::Erro
     }
     #[cfg(not(unix))]
     let _ = path;
-    Ok(metadata_warnings())
+    // A newly created file has no prior ACLs, xattrs, or alternate streams to
+    // preserve. Reporting their absence as data-loss warnings is misleading.
+    Ok(Vec::new())
 }
 
 pub(crate) fn apply_safe_add_mode_to_file(
@@ -196,7 +198,7 @@ pub(crate) fn apply_safe_add_mode_to_file(
     }
     #[cfg(not(unix))]
     let _ = file;
-    Ok(metadata_warnings())
+    Ok(Vec::new())
 }
 
 pub fn supported_mode(path: &Path) -> Result<Option<u32>, io::Error> {
@@ -302,6 +304,6 @@ mod tests {
         let warnings = preserve_supported_mode(&source, &destination).unwrap();
         assert!(warnings.contains(&MetadataWarning::AclNotPreserved));
         let warnings = apply_safe_add_mode(&destination).unwrap();
-        assert!(!warnings.is_empty());
+        assert!(warnings.is_empty());
     }
 }

@@ -87,6 +87,17 @@ impl ErrorClassifier for DefaultErrorClassifier {
             );
         }
 
+        if invocation.tool_name == "apply_patch" {
+            return classify_apply_patch_result(raw_output_json, success);
+        }
+
+        // A bounded directory page is a successful discovery result. The
+        // truncated/has_more fields tell the model to narrow or continue;
+        // they must not turn a valid list_dir call into a failed tool attempt.
+        if invocation.tool_name == "list_dir" && success {
+            return ToolOutcome::ok();
+        }
+
         if is_mcp_invocation(invocation) {
             return classify_mcp_result(raw_output_json, success);
         }
@@ -111,6 +122,10 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 
     fn classify_error(&self, invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
+        if is_native_file_tool(invocation.tool_name.as_str()) {
+            return classify_native_file_tool_error(invocation.tool_name.as_str(), error);
+        }
+
         if error_is_permission_denied(error) {
             return permission_denied_outcome();
         }
@@ -169,6 +184,140 @@ impl ErrorClassifier for DefaultErrorClassifier {
             ),
         }
     }
+}
+
+fn is_native_file_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file" | "list_dir" | "grep_files" | "apply_patch"
+    )
+}
+
+fn classify_native_file_tool_error(tool_name: &str, error: &ToolError) -> ToolOutcome {
+    if let ToolError::ExecutionFailed(message) = error
+        && message_indicates_permission_denied(message)
+    {
+        return ToolOutcome::fatal(
+            ToolErrorClass::PermissionDenied,
+            Some(format!(
+                "{tool_name} was denied by the filesystem: {message} Do not retry the same denied path; use an authorized path or report the blocker."
+            )),
+        );
+    }
+
+    match error {
+        ToolError::InvalidArguments(message) => ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            format!(
+                "{tool_name} rejected the input: {message} Follow that diagnostic and submit corrected arguments; do not repeat the same call unchanged."
+            ),
+            false,
+            None,
+        ),
+        ToolError::NotFound(message) => ToolOutcome::recoverable(
+            ToolErrorClass::NotFound,
+            format!(
+                "{tool_name} could not find the requested path: {message} Use list_dir on the nearest existing parent and retry with an exact returned path."
+            ),
+            false,
+            None,
+        ),
+        ToolError::Rejected(message) => ToolOutcome::fatal(
+            ToolErrorClass::PermissionDenied,
+            Some(format!(
+                "{tool_name} was rejected: {message} Use only the current working directory and authorized roots reported by the tool; do not repeat the denied call unchanged."
+            )),
+        ),
+        ToolError::ExecutionFailed(message) => ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            format!(
+                "{tool_name} failed: {message} Fix the reported filesystem condition or path, then submit a corrected call."
+            ),
+            false,
+            None,
+        ),
+        ToolError::Cancelled(message) => ToolOutcome::recoverable(
+            ToolErrorClass::Cancelled,
+            format!(
+                "{tool_name} was cancelled: {message} Retry only if the operation is still needed."
+            ),
+            false,
+            None,
+        ),
+        ToolError::NotVisible(message) => ToolOutcome::recoverable(
+            ToolErrorClass::ToolNotVisible,
+            format!("{tool_name} is not visible: {message} Use a currently visible tool."),
+            false,
+            None,
+        ),
+        ToolError::Internal(message) => ToolOutcome::fatal(
+            ToolErrorClass::Internal,
+            Some(format!(
+                "{tool_name} failed internally: {message} Do not retry the same call; report the blocker."
+            )),
+        ),
+    }
+}
+
+fn classify_apply_patch_result(raw_output_json: &JsonValue, success: bool) -> ToolOutcome {
+    if success {
+        return ToolOutcome::ok();
+    }
+
+    let status = raw_output_json
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("failed");
+    let error = raw_output_json.get("error");
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("unknown");
+    let next_action = error
+        .and_then(|error| error.get("next_action"))
+        .and_then(JsonValue::as_str)
+        .filter(|action| !action.trim().is_empty())
+        .unwrap_or(
+            "Inspect the reported failure, read the affected path if necessary, and submit a corrected new patch. Do not repeat the same patch unchanged.",
+        )
+        .to_owned();
+
+    if matches!(status, "partial" | "commit_state_uncertain") {
+        return ToolOutcome {
+            status: ToolOutcomeStatus::PartialSuccess,
+            error_class: Some(ToolErrorClass::ExecutionFailed),
+            should_retry: false,
+            retry_hint: Some(next_action),
+            incomplete: true,
+            incomplete_reason: Some(format!("apply_patch finished with status `{status}`")),
+        };
+    }
+
+    if code == "permission_denied" {
+        return ToolOutcome::fatal(ToolErrorClass::PermissionDenied, Some(next_action));
+    }
+
+    let class = if matches!(
+        code,
+        "patch_syntax_error"
+            | "patch_empty"
+            | "invalid_payload"
+            | "invalid_request"
+            | "invalid_path"
+            | "path_outside_allowed_root"
+            | "unauthorized_path"
+            | "context_not_found"
+            | "ambiguous_context"
+            | "source_missing"
+            | "destination_exists"
+            | "destination_missing"
+            | "stale_file"
+    ) {
+        ToolErrorClass::InvalidArguments
+    } else {
+        ToolErrorClass::ExecutionFailed
+    };
+    ToolOutcome::recoverable(class, next_action, false, None)
 }
 
 pub fn classify_tool_error(tool_name: &str, error: &ToolError) -> ToolOutcome {
@@ -1123,6 +1272,94 @@ mod tests {
         assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
         assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
         assert!(!outcome.should_retry);
+    }
+
+    #[test]
+    fn bounded_list_dir_page_is_success_even_when_more_entries_exist() {
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("list_dir"),
+            &serde_json::json!({
+                "root": "/workspace",
+                "truncated": true,
+                "has_more": true,
+                "entries": []
+            }),
+            true,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::Ok);
+        assert!(!outcome.should_retry);
+        assert!(!outcome.incomplete);
+    }
+
+    #[test]
+    fn apply_patch_retry_uses_the_concrete_next_action() {
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "rejected",
+                "success": false,
+                "error": {
+                    "code": "context_not_found",
+                    "next_action": "Read `/workspace/file.txt` and build a new hunk from its current contents.",
+                    "retry_same_patch": false
+                }
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert_eq!(
+            outcome.retry_hint.as_deref(),
+            Some("Read `/workspace/file.txt` and build a new hunk from its current contents.")
+        );
+        assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn partial_apply_patch_never_schedules_an_automatic_retry() {
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "partial",
+                "success": false,
+                "changed_files": ["/workspace/committed.txt"],
+                "error": {
+                    "code": "partial_commit",
+                    "next_action": "Inspect changed_files before making only the remaining changes.",
+                    "retry_same_patch": false
+                }
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::PartialSuccess);
+        assert!(!outcome.should_retry);
+        assert!(outcome.incomplete);
+        assert_eq!(
+            outcome.retry_hint.as_deref(),
+            Some("Inspect changed_files before making only the remaining changes.")
+        );
+    }
+
+    #[test]
+    fn native_file_tool_errors_preserve_the_actionable_diagnostic() {
+        let outcome = DefaultErrorClassifier.classify_error(
+            &invocation_for("read_file"),
+            &ToolError::InvalidArguments(
+                "input `Downloads/file.txt` resolved to `/Downloads/file.txt`; cwd is `/Users/alexander`"
+                    .to_owned(),
+            ),
+        );
+
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.unwrap();
+        assert!(hint.contains("Downloads/file.txt"));
+        assert!(hint.contains("/Downloads/file.txt"));
+        assert!(hint.contains("/Users/alexander"));
+        assert!(hint.contains("do not repeat"));
     }
 
     #[test]

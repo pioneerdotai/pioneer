@@ -1,13 +1,14 @@
 //! Provider-wire normalization and stable Apply Patch result projection.
 
 use crate::apply_patch::file_mutation::{
-    PatchError, PatchLimits, PatchRequest, PatchRequestSource,
+    PatchDiagnostic, PatchError, PatchErrorCode, PatchLimits, PatchRequest, PatchRequestSource,
 };
 use crate::apply_patch::history::{ApplyPatchOutcome, ChangeKind, PatchSideEffects};
 use pioneer_provider::{NATIVE_FILE_TOOL_SCHEMA_VERSION, NativePatchPayload, NativePatchWireShape};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
 use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativePatchAdapterError {
@@ -107,6 +108,70 @@ pub struct NativePatchOutcome {
     pub tracking: NativePatchTracking,
 }
 
+impl NativePatchOutcome {
+    /// Present paths to the model without requiring it to know the private
+    /// execution root selected for a single- or multi-root patch. Internal
+    /// history remains paired with that root; the tool result is deliberately
+    /// unambiguous and directly reusable by read/list/apply_patch.
+    pub fn make_paths_absolute(&mut self, execution_root: &Path) {
+        for path in &mut self.changed_files {
+            *path = absolute_display_path(execution_root, path);
+        }
+        self.changed_files.sort();
+        self.changed_files.dedup();
+
+        for change in &mut self.changes {
+            change.source_path = absolute_display_path(execution_root, &change.source_path);
+            if let Some(destination) = &mut change.destination_path {
+                *destination = absolute_display_path(execution_root, destination);
+            }
+        }
+
+        if let Some(error) = self.error.as_mut()
+            && let Some(old_path) = error.path.clone()
+        {
+            let absolute_path = absolute_display_path(execution_root, old_path.as_str());
+            if old_path != absolute_path {
+                error.message = error
+                    .message
+                    .replace(old_path.as_str(), absolute_path.as_str());
+                error.next_action = error
+                    .next_action
+                    .replace(old_path.as_str(), absolute_path.as_str());
+            }
+            error.path = Some(absolute_path);
+        }
+    }
+}
+
+fn absolute_display_path(execution_root: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        execution_root.join(path)
+    };
+    lexical_normalize(&absolute)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativePatchChange {
     pub operation_index: u32,
@@ -134,6 +199,9 @@ pub struct NativePatchError {
     pub operation_index: Option<u32>,
     pub path: Option<String>,
     pub guard_horizon: Option<String>,
+    pub retryability: String,
+    pub next_action: String,
+    pub retry_same_patch: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -243,8 +311,89 @@ pub fn project_apply_patch_outcome(outcome: &ApplyPatchOutcome) -> NativePatchOu
             operation_index: diagnostic.operation_index,
             path: diagnostic.path.clone(),
             guard_horizon: diagnostic.guard_horizon.map(enum_name),
+            retryability: enum_name(diagnostic.retryability),
+            next_action: next_action_for(diagnostic),
+            retry_same_patch: false,
         }),
         tracking: NativePatchTracking::default(),
+    }
+}
+
+fn next_action_for(diagnostic: &PatchDiagnostic) -> String {
+    let path = diagnostic
+        .path
+        .as_deref()
+        .map(|path| format!("`{path}`"))
+        .unwrap_or_else(|| "the reported path".to_owned());
+    let parent = diagnostic
+        .path
+        .as_deref()
+        .and_then(|path| Path::new(path).parent())
+        .map(|path| format!("`{}`", path.display()))
+        .unwrap_or_else(|| "its nearest existing parent".to_owned());
+    match diagnostic.code {
+        PatchErrorCode::PatchSyntaxError
+        | PatchErrorCode::PatchEmpty
+        | PatchErrorCode::InvalidPayload
+        | PatchErrorCode::InvalidRequest => {
+            "Submit a new patch from Begin Patch through End Patch. Use Add File with + lines, Update File with @@ context hunks, Update File followed by Move to with no hunk for a pure rename, or Delete File. Do not repeat the invalid patch.".to_owned()
+        }
+        PatchErrorCode::InvalidVersionToken | PatchErrorCode::PreconditionRequired => {
+            "Remove If-Match and If-Destination directives and use the ordinary Add/Update/Move/Delete syntax; concurrency checks are automatic.".to_owned()
+        }
+        PatchErrorCode::InvalidPath
+        | PatchErrorCode::PathOutsideAllowedRoot
+        | PatchErrorCode::UnauthorizedPath
+        | PatchErrorCode::PermissionDenied => {
+            format!("The input resolved to {path}. Use the current working directory and writable roots shown in the error: pass a path relative to that cwd or an authorized absolute path.")
+        }
+        PatchErrorCode::ContextNotFound | PatchErrorCode::AmbiguousContext => {
+            format!("Read {path} again, then build a new Update hunk with enough unchanged context to match exactly one location.")
+        }
+        PatchErrorCode::SourceMissing => {
+            format!("Call list_dir for {parent}, select the exact returned absolute source path for {path}, and submit a new patch.")
+        }
+        PatchErrorCode::DestinationExists => {
+            format!("The move destination {path} already exists. Choose a different destination, or explicitly delete that file before moving; Move never overwrites implicitly.")
+        }
+        PatchErrorCode::DestinationMissing => {
+            format!("Call list_dir for {parent}, correct the destination {path}, and submit a new patch.")
+        }
+        PatchErrorCode::StaleFile => {
+            format!("Read {path} again and construct a new patch from its current contents.")
+        }
+        PatchErrorCode::IoCreateFailed
+        | PatchErrorCode::IoWriteFailed
+        | PatchErrorCode::IoSyncFailed
+        | PatchErrorCode::IoRenameFailed
+        | PatchErrorCode::IoDeleteFailed
+        | PatchErrorCode::Io => {
+            format!("Inspect the operating-system cause reported for {path}. Correct that exact path, ancestor permissions, disk state, or conflicting file, then submit a new patch.")
+        }
+        PatchErrorCode::UnsupportedFileType
+        | PatchErrorCode::InvalidUtf8
+        | PatchErrorCode::UnsupportedContent
+        | PatchErrorCode::FileTooLarge => {
+            format!("{path} is not a supported bounded regular UTF-8 text target. Use an appropriate non-text or large-file workflow instead of retrying this patch.")
+        }
+        PatchErrorCode::LockTimeout | PatchErrorCode::HistoryCapacity => {
+            "Wait briefly and retry only after the transient contention or history-capacity condition has cleared.".to_owned()
+        }
+        PatchErrorCode::PartialCommit
+        | PatchErrorCode::CommitStateUncertain
+        | PatchErrorCode::TrackerPublishFailed => {
+            "Do not retry automatically. Inspect changed_files and the workspace first, then make only the remaining changes in a new patch.".to_owned()
+        }
+        PatchErrorCode::CrossDeviceMove => {
+            format!("The move involving {path} crosses filesystems. Move within one filesystem, or create the destination and delete the source as separate explicit operations.")
+        }
+        PatchErrorCode::InvalidLimits
+        | PatchErrorCode::InputTooLarge
+        | PatchErrorCode::TooManyOperations
+        | PatchErrorCode::TooManyFiles
+        | PatchErrorCode::TooManyHunks => {
+            "Split the work into smaller valid patches and submit the first one.".to_owned()
+        }
     }
 }
 
@@ -332,7 +481,23 @@ mod tests {
                 guard_horizon: None::<GuardHorizon>,
             },
         };
-        let projected = project_apply_patch_outcome(&outcome);
+        let mut projected = project_apply_patch_outcome(&outcome);
+        assert!(
+            projected
+                .error
+                .as_ref()
+                .unwrap()
+                .next_action
+                .contains("`file.txt`")
+        );
+        projected.make_paths_absolute(Path::new("/workspace"));
+        let projected_error = projected.error.as_ref().unwrap();
+        assert_eq!(projected_error.path.as_deref(), Some("/workspace/file.txt"));
+        assert!(
+            projected_error
+                .next_action
+                .contains("`/workspace/file.txt`")
+        );
         let value = serde_json::to_value(&projected).unwrap();
         let object = value.as_object().unwrap();
 

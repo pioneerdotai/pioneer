@@ -27,10 +27,10 @@ pub const PREFLIGHT_CORE_TOOL_NAMES: &[&str] = &[
 /// this semantic hierarchy and its single general text mutator.
 pub fn filesystem_catalog_snapshot() -> serde_json::Value {
     serde_json::json!({
-        "read_file": "bounded_paginated_text_with_version_token",
+        "read_file": "bounded_paginated_utf8_text",
         "list_dir": "directory_discovery",
         "grep_files": "scoped_text_search",
-        "apply_patch": "add_replace_update_delete_move_and_multi_file_text_mutation"
+        "apply_patch": "add_update_move_delete_multi_file_utf8_text_mutation"
     })
 }
 
@@ -283,7 +283,7 @@ mod tests {
         );
         assert_eq!(
             snapshot["apply_patch"],
-            "add_replace_update_delete_move_and_multi_file_text_mutation"
+            "add_update_move_delete_multi_file_utf8_text_mutation"
         );
     }
 

@@ -19,8 +19,9 @@ use crate::apply_patch::{
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -121,7 +122,10 @@ impl ExecutionReport {
             failure: Some(diagnostic_at(
                 PatchStage::Parse,
                 code,
-                &error.to_string(),
+                &format!(
+                    "{}. Valid form: *** Begin Patch, then one or more Add File, Update File, optional Move to, or Delete File operations, then *** End Patch. Add lines start with +; Update hunk lines start with space, -, or +",
+                    error
+                ),
                 None,
                 None,
                 None,
@@ -443,7 +447,12 @@ impl PatchExecutor {
                     return ExecutionReport {
                         status: ExecutionStatus::Failed,
                         delta,
-                        failure: Some(mutation_diagnostic(PatchStage::Stage, planned, error)),
+                        failure: Some(mutation_diagnostic(
+                            PatchStage::Stage,
+                            prepared.workspace_root(),
+                            planned,
+                            error,
+                        )),
                     };
                 }
             };
@@ -514,7 +523,12 @@ impl PatchExecutor {
                             delta.changes.push(committed);
                         }
                         merge_delta_side_effects(&mut delta, &error_side_effects);
-                        let failure = mutation_diagnostic(PatchStage::Commit, planned, error);
+                        let failure = mutation_diagnostic(
+                            PatchStage::Commit,
+                            prepared.workspace_root(),
+                            planned,
+                            error,
+                        );
                         return if delta.is_empty() {
                             ExecutionReport {
                                 status: ExecutionStatus::Failed,
@@ -552,7 +566,12 @@ impl PatchExecutor {
                         return ExecutionReport {
                             status: ExecutionStatus::CommitStateUncertain,
                             delta: delta.with_exactness(false),
-                            failure: Some(mutation_diagnostic(PatchStage::Commit, planned, error)),
+                            failure: Some(mutation_diagnostic(
+                                PatchStage::Commit,
+                                prepared.workspace_root(),
+                                planned,
+                                error,
+                            )),
                         };
                     }
                 }
@@ -608,8 +627,8 @@ impl PatchExecutor {
                 });
             }
         }
-        let mut changed = false;
-        for (_path, observed) in &prepared.observed {
+        let mut changed_paths = BTreeSet::new();
+        for (path, observed) in &prepared.observed {
             let current = match version_on_disk(&observed.target, prepared.snapshot_limits) {
                 Ok(current) => current,
                 Err(_) => {
@@ -621,19 +640,51 @@ impl PatchExecutor {
             };
             let expected = observed.state.as_ref().map(|state| state.token);
             if current != expected {
-                changed = true;
+                changed_paths.insert(path.clone());
             }
         }
-        if !changed {
+        if changed_paths.is_empty() {
             return Ok(Cow::Borrowed(&prepared.planned));
+        }
+
+        // The model-facing grammar deliberately does not expose version
+        // tokens. Preserve strict CAS for destructive operations internally:
+        // a delete, replacement, or move prepared from one snapshot must not
+        // consume different bytes that appeared before the commit lock was
+        // acquired. Ordinary contextual Update remains the only operation
+        // that may be replanned over an unrelated concurrent edit.
+        if let Some(change) = prepared.planned.operations.iter().find(|change| {
+            changed_paths.contains(&change.source)
+                && (matches!(
+                    change.kind,
+                    operation_kind::Delete | operation_kind::Replace
+                ) || change.destination.is_some()
+                    || prepared
+                        .document
+                        .operations
+                        .get(change.operation_index)
+                        .is_some_and(|operation| operation.source_guard.is_some()))
+        }) {
+            return Err(ExecutionReport {
+                status: ExecutionStatus::Rejected,
+                delta: AppliedPatchDelta::empty(),
+                failure: Some(diagnostic_at(
+                    PatchStage::Prepare,
+                    PatchErrorCode::StaleFile,
+                    "a destructive patch source changed after it was read; read the current file and submit a new patch",
+                    Some(change.operation_index.try_into().unwrap_or(u32::MAX)),
+                    Some(change.source.clone()),
+                    Some(GuardHorizon::Prepared),
+                )),
+            });
         }
 
         // Ordinary Update operations are optimistic: when a file changed
         // after prepare, match the patch hunk against the current contents
         // while the complete lock set is held. This preserves unrelated
-        // external edits and rejects overlapping/ambiguous context. Replace,
-        // Delete and Move (and explicitly guarded Update) remain strict because
-        // the planner rechecks their If-Match token against this same snapshot.
+        // external edits and rejects overlapping/ambiguous context. The
+        // destructive cases above remain strict without exposing CAS syntax
+        // to the model.
         let mut current_files = BTreeMap::new();
         let mut current_snapshot_bytes = 0u64;
         for (path, observed) in &prepared.observed {
@@ -1188,6 +1239,7 @@ fn rejected(stage: PatchStage, message: &str) -> ExecutionReport {
 
 fn mutation_diagnostic(
     stage: PatchStage,
+    workspace_root: &Path,
     planned: &PlannedChange,
     error: crate::apply_patch::file_mutation::MutationError,
 ) -> PatchDiagnostic {
@@ -1228,17 +1280,43 @@ fn mutation_diagnostic(
             }
         )
     };
+    let source_path = absolute_patch_path(workspace_root, planned.source.as_str());
+    let destination_note = planned
+        .destination
+        .as_deref()
+        .map(|destination| {
+            format!(
+                " to '{}'",
+                absolute_patch_path(workspace_root, destination).display()
+            )
+        })
+        .unwrap_or_default();
+    let cause = error
+        .source
+        .as_ref()
+        .map(|source| format!(": {source} (I/O kind: {:?})", source.kind()))
+        .unwrap_or_else(|| format!(": filesystem condition {:?}", error.code));
     diagnostic_at(
         stage,
         code,
         &format!(
-            "operation {} could not be committed{}",
-            planned.operation_index, side_effect_note
+            "operation {} failed at {stage:?} for '{}'{destination_note}{cause}{side_effect_note}",
+            planned.operation_index,
+            source_path.display(),
         ),
         Some(planned.operation_index.try_into().unwrap_or(u32::MAX)),
-        Some(planned.source.clone()),
+        Some(source_path.to_string_lossy().into_owned()),
         (code == PatchErrorCode::StaleFile).then_some(GuardHorizon::Commit),
     )
+}
+
+fn absolute_patch_path(workspace_root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    }
 }
 
 fn synthetic_error(code: MutationErrorCode) -> crate::apply_patch::file_mutation::MutationError {
@@ -1370,11 +1448,10 @@ fn plan_rejection(error: PlanError, fallback: &str) -> ExecutionReport {
         PlanErrorCode::UnsupportedContent => PatchErrorCode::UnsupportedContent,
         PlanErrorCode::OutputTooLarge => PatchErrorCode::InvalidRequest,
         PlanErrorCode::MissingSourceGuard => PatchErrorCode::PreconditionRequired,
-        PlanErrorCode::StaleSource
-        | PlanErrorCode::SourceMissing
-        | PlanErrorCode::DestinationExists
-        | PlanErrorCode::DestinationMissing
-        | PlanErrorCode::StaleDestination => PatchErrorCode::StaleFile,
+        PlanErrorCode::SourceMissing => PatchErrorCode::SourceMissing,
+        PlanErrorCode::DestinationExists => PatchErrorCode::DestinationExists,
+        PlanErrorCode::DestinationMissing => PatchErrorCode::DestinationMissing,
+        PlanErrorCode::StaleSource | PlanErrorCode::StaleDestination => PatchErrorCode::StaleFile,
         _ => PatchErrorCode::InvalidRequest,
     };
     ExecutionReport {
@@ -1694,6 +1771,60 @@ mod tests {
         assert_eq!(report.status, ExecutionStatus::Rejected);
         assert!(report.delta.is_empty());
         assert_eq!(fs::read(&path).unwrap(), b"external");
+    }
+
+    #[test]
+    fn unguarded_delete_uses_internal_cas_and_preserves_an_external_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        fs::write(&path, b"old").unwrap();
+        let auth = authorized(
+            root.path(),
+            "*** Begin Patch\n*** Delete File: file.txt\n*** End Patch",
+        );
+
+        fs::write(&path, b"external").unwrap();
+        let report = PatchExecutor::new(FileMutationEngine::new(Default::default())).execute(
+            &auth,
+            ExecuteOptions::default(),
+            &NeverCancel,
+        );
+
+        assert_eq!(report.status, ExecutionStatus::Rejected);
+        assert_eq!(
+            report.failure.as_ref().map(|failure| failure.code),
+            Some(PatchErrorCode::StaleFile)
+        );
+        assert!(report.delta.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), b"external");
+    }
+
+    #[test]
+    fn unguarded_move_uses_internal_cas_and_preserves_an_external_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("old.txt");
+        let destination = root.path().join("new.txt");
+        fs::write(&source, b"old").unwrap();
+        let auth = authorized(
+            root.path(),
+            "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n*** End Patch",
+        );
+
+        fs::write(&source, b"external").unwrap();
+        let report = PatchExecutor::new(FileMutationEngine::new(Default::default())).execute(
+            &auth,
+            ExecuteOptions::default(),
+            &NeverCancel,
+        );
+
+        assert_eq!(report.status, ExecutionStatus::Rejected);
+        assert_eq!(
+            report.failure.as_ref().map(|failure| failure.code),
+            Some(PatchErrorCode::StaleFile)
+        );
+        assert!(report.delta.is_empty());
+        assert_eq!(fs::read(&source).unwrap(), b"external");
+        assert!(!destination.exists());
     }
 
     #[cfg(unix)]
