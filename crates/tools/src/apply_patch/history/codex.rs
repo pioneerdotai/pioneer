@@ -548,10 +548,15 @@ pub fn parse_changed_files(diff: &str) -> Vec<CodexAggregateFile> {
                     files.insert(old, CodexAggregateFileKind::Rename { destination: new });
                 }
                 (Some(None), Some(path)) => {
-                    files.entry(path).or_insert(CodexAggregateFileKind::Add);
+                    // `diff --git a/path b/path` cannot distinguish an add
+                    // from a modification, so the authoritative `/dev/null`
+                    // marker must replace the provisional `Modify` kind.
+                    files.insert(path, CodexAggregateFileKind::Add);
                 }
                 (Some(Some(path)), None) => {
-                    files.entry(path).or_insert(CodexAggregateFileKind::Delete);
+                    // As with additions, the structural marker is more
+                    // specific than the provisional `diff --git` entry.
+                    files.insert(path, CodexAggregateFileKind::Delete);
                 }
                 _ => {}
             }
@@ -865,6 +870,51 @@ mod tests {
         .unwrap();
         assert_eq!(normalized.files[0].path, "src/lib.rs");
         assert_eq!(normalized.event_id, "event-1");
+    }
+
+    #[test]
+    fn changed_file_parser_classifies_structural_file_operations() {
+        let files = parse_changed_files(
+            "diff --git a/added.txt b/added.txt\n\
+             new file mode 100644\n\
+             --- /dev/null\n\
+             +++ b/added.txt\n\
+             diff --git a/deleted.txt b/deleted.txt\n\
+             deleted file mode 100644\n\
+             --- a/deleted.txt\n\
+             +++ /dev/null\n\
+             diff --git a/modified.txt b/modified.txt\n\
+             --- a/modified.txt\n\
+             +++ b/modified.txt\n\
+             diff --git a/old.txt b/new.txt\n\
+             similarity index 100%\n\
+             rename from old.txt\n\
+             rename to new.txt\n",
+        );
+
+        assert_eq!(
+            files,
+            vec![
+                CodexAggregateFile {
+                    path: "added.txt".to_owned(),
+                    kind: CodexAggregateFileKind::Add,
+                },
+                CodexAggregateFile {
+                    path: "deleted.txt".to_owned(),
+                    kind: CodexAggregateFileKind::Delete,
+                },
+                CodexAggregateFile {
+                    path: "modified.txt".to_owned(),
+                    kind: CodexAggregateFileKind::Modify,
+                },
+                CodexAggregateFile {
+                    path: "old.txt".to_owned(),
+                    kind: CodexAggregateFileKind::Rename {
+                        destination: "new.txt".to_owned(),
+                    },
+                },
+            ]
+        );
     }
 
     #[test]
