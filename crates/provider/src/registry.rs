@@ -65,6 +65,13 @@ impl Provider for AuthorityBoundProvider {
         self.inner.capabilities()
     }
 
+    fn native_file_tool_capability(
+        &self,
+        model: &str,
+    ) -> crate::file_tools::NativeFileToolCapability {
+        self.inner.native_file_tool_capability(model)
+    }
+
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
         self.inner.classify_failure(error)
     }

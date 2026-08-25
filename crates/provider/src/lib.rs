@@ -7,6 +7,7 @@
 
 pub mod attachments;
 pub mod factory;
+pub mod file_tools;
 mod http;
 pub mod providers;
 pub mod reasoning_registry;
@@ -27,6 +28,11 @@ pub use attachments::{
     upload_registry_key_for_authority,
 };
 pub use factory::create_provider;
+pub use file_tools::{
+    NATIVE_FILE_TOOL_SCHEMA_VERSION, NativeFileToolCapability, NativePatchPayload,
+    NativePatchWireShape, apply_patch_tool_schema, read_file_tool_schema,
+    select_native_file_tool_capability,
+};
 pub use http::validate_proxy_url;
 pub use registry::{ProviderAuthorityFingerprint, ProviderRegistry};
 pub use traits::{Provider, ProviderWarmupOutcome};

@@ -1,3 +1,4 @@
+use crate::file_tools::NativeFileToolCapability;
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
     ProviderFailureClassification, StreamChunk,
@@ -34,6 +35,13 @@ pub trait Provider: Send + Sync {
     /// Declares what features this provider supports.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
+    }
+
+    /// Selects the native file-tool wire contract for this provider/model.
+    /// The decision is provider-owned and fail-closed for unknown families;
+    /// callers must use the same result for both catalog and prompt output.
+    fn native_file_tool_capability(&self, model: &str) -> NativeFileToolCapability {
+        crate::file_tools::select_native_file_tool_capability(self.name(), model)
     }
 
     /// Classify a provider-owned error when the adapter has structured
