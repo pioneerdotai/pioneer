@@ -526,7 +526,7 @@ struct SequencedTextProvider {
     next_index: AtomicUsize,
 }
 
-const TOOL_SCHEMA_DUMP_RESPONSE: &str = r#"{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}"#;
+const TOOL_SCHEMA_DUMP_RESPONSE: &str = r#"{"name":"apply_patch","description":"Apply a patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"],"additionalProperties":false}}"#;
 const RAW_TOOL_CALL_MARKUP_RESPONSE: &str = concat!(
     "][transport][<tool_call>\n",
     "][transport][<invoke name=\"exec_command\">][transport][<command>]",
@@ -3066,6 +3066,16 @@ impl Provider for ProviderRecoveryBoundaryProvider {
 impl Provider for CaptureAgentProvider {
     fn name(&self) -> &str {
         "capture"
+    }
+
+    fn native_file_tool_capability(
+        &self,
+        model: &str,
+    ) -> pioneer_provider::NativeFileToolCapability {
+        // The capture double models a JSON-function provider. Keep its
+        // externally visible name stable while opting into the native
+        // filesystem capability contract used by apply-patch flows.
+        pioneer_provider::select_native_file_tool_capability("openai", model)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -6712,8 +6722,6 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
         "exec_command",
         "write_stdin",
         "apply_patch",
-        "write_file",
-        "edit_file",
         "request_tools",
     ] {
         assert!(

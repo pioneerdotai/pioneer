@@ -59,12 +59,12 @@ use pioneer_memory::hooks::{
 };
 use pioneer_promt::{
     CompiledInstructionDeliveryPlan, CompiledPromptBundle, ExecutionContinuationRuntimeFactsInput,
-    PromptCompileInput, PromptDiagnosticCode, PromptDynamicSectionId, PromptLimits, PromptProfile,
-    PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
-    ToolRetryInstructionKind, compile_instruction_delivery_plan, compile_prompt,
-    current_permission_guidance, execution_continuation_section_with_runtime_facts,
-    render_tool_retry_instruction, runtime_sections_with_request_tools_catalog,
-    tool_loop_final_answer_instruction,
+    FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID, PromptCompileInput, PromptDiagnosticCode,
+    PromptDynamicSectionId, PromptLimits, PromptProfile, PromptRuntimeBuiltInSectionId,
+    PromptRuntimeSectionId, PromptRuntimeSectionInput, ToolRetryInstructionKind,
+    compile_instruction_delivery_plan, compile_prompt, current_permission_guidance,
+    execution_continuation_section_with_runtime_facts, render_tool_retry_instruction,
+    runtime_sections_with_request_tools_catalog, tool_loop_final_answer_instruction,
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT,
@@ -87,9 +87,10 @@ use pioneer_protocol::{
 };
 use pioneer_provider::{
     AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest,
-    CompiledPromptPayload, InputContentType, MessageAttachment, MessageContentPart, Provider,
-    ProviderCallIdentity, ProviderRegistry, ProviderTimeoutPolicy, ProviderToolCall,
-    ReasoningConfig, ToolDefinition, infer_mime_from_reference,
+    CompiledPromptPayload, InputContentType, MessageAttachment, MessageContentPart,
+    NativeFileToolCapability, NativePatchWireShape, Provider, ProviderCallIdentity,
+    ProviderRegistry, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ToolDefinition,
+    infer_mime_from_reference,
 };
 use pioneer_skills::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
@@ -1770,6 +1771,99 @@ fn runtime_sections_with_artifact_reference_policy(
     Ok(sections)
 }
 
+fn native_file_tool_blocked_names(capability: &NativeFileToolCapability) -> Vec<(String, String)> {
+    let mut blocked = Vec::new();
+    if !capability.read_file {
+        blocked.push((
+            "read_file".to_owned(),
+            capability
+                .reason
+                .clone()
+                .unwrap_or_else(|| "native provider does not project read_file".to_owned()),
+        ));
+    }
+    if !capability.apply_patch {
+        blocked.push((
+            "apply_patch".to_owned(),
+            capability
+                .reason
+                .clone()
+                .unwrap_or_else(|| "native provider does not project apply_patch".to_owned()),
+        ));
+    }
+    blocked
+}
+
+fn append_native_filesystem_capability_section(
+    runtime_sections: Vec<PromptRuntimeSectionInput>,
+    capability: &NativeFileToolCapability,
+) -> Result<Vec<PromptRuntimeSectionInput>, ChatTurnError> {
+    let id =
+        PromptDynamicSectionId::new(FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID).map_err(|error| {
+            ChatTurnError::Terminal(format!(
+                "failed to create native filesystem capability prompt section: {error}"
+            ))
+        })?;
+    let content = if capability.is_supported() {
+        let wire_shape = match capability.patch_shape {
+            NativePatchWireShape::Freeform => "a raw/free-form patch document",
+            NativePatchWireShape::JsonFunction => {
+                "a strict JSON object with exactly one `patch` string"
+            }
+            NativePatchWireShape::Unavailable => "no supported patch wire shape",
+        };
+        format!(
+            "The native provider projects this filesystem capability for the current turn. Use `read_file` for bounded, paginated UTF-8 text inspection, `list_dir` for directory discovery, and `grep_files` for scoped text search. Use `apply_patch` as the only general text mutator for source code, Markdown, JSON, YAML, configuration, notes, and ordinary UTF-8 text; it supports Add, Replace, Update, Delete, Move, and multi-file patches. Its wire shape is {wire_shape}. Copy the exact `read_file` version token into `If-Match` for destructive Replace/Delete/Move operations; use optional strict Update guards when whole-file correctness matters and use contextual Update for unrelated concurrent edits. A stale or ambiguous result requires re-reading and reasoning about the intervening change; never substitute a fresh token blindly or retry the same patch unchanged. `full access` removes approval dialogs only and never disables guards, sandbox/path checks, limits, cancellation, or filesystem permissions. Exact history covers committed `apply_patch` changes only; shell, formatter, generator, external-process, and manual-editor writes are outside that exact history. Use only tools present in the current catalog."
+        )
+    } else {
+        format!(
+            "The native provider does not project Pioneer `read_file` or `apply_patch` for this turn ({reason}). Do not infer unavailable filesystem tools or substitute another general text mutator. Use only the tools present in the current catalog; any external command or manual write is outside exact Pioneer Apply Patch history.",
+            reason = capability
+                .reason
+                .as_deref()
+                .unwrap_or("the provider/model has no registered native filesystem wire contract")
+        )
+    };
+    let mut sections = runtime_sections
+        .into_iter()
+        .filter(|section| section.id.manifest_id() != FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID)
+        .collect::<Vec<_>>();
+    sections.push(PromptRuntimeSectionInput {
+        id: PromptRuntimeSectionId::Dynamic(id),
+        title: Some("Native Filesystem Capability".to_owned()),
+        content,
+        max_chars: None,
+        truncated: false,
+    });
+    Ok(sections)
+}
+
+fn native_provider_tool_definition(
+    spec: pioneer_tools::ToolSpec,
+    capability: &NativeFileToolCapability,
+) -> ToolDefinition {
+    if spec.name != "apply_patch" {
+        return ToolDefinition {
+            name: spec.name,
+            description: spec.description,
+            parameters: spec.parameters,
+        };
+    }
+    let shape_description = match capability.patch_shape {
+        NativePatchWireShape::Freeform => "raw patch text",
+        NativePatchWireShape::JsonFunction => "a strict `{patch}` JSON object",
+        NativePatchWireShape::Unavailable => "an unavailable provider capability",
+    };
+    ToolDefinition {
+        name: spec.name,
+        description: format!(
+            "{} The frozen provider wire shape is {shape_description}.",
+            spec.description
+        ),
+        parameters: pioneer_provider::apply_patch_tool_schema(capability.patch_shape),
+    }
+}
+
 fn history_or_prompt_context_has_artifact_refs(
     history: &[ChatMessage],
     effective_prompt_context_set: &EffectiveTurnPromptContextSet,
@@ -3226,6 +3320,15 @@ async fn execute_agent_provider_response(
 
     let tool_loop_config = tool_loop_config.normalized();
     let provider_tool_calling = provider.capabilities().tool_calling && !disable_tool_calling;
+    let native_file_tool_capability = if provider_tool_calling {
+        provider.native_file_tool_capability(model.as_str())
+    } else {
+        NativeFileToolCapability::unavailable(
+            provider.name(),
+            model.as_str(),
+            "provider tool calling is disabled for this turn",
+        )
+    };
     let post_turn_model = model.clone();
     let post_turn_model_provider = provider.name().to_owned();
     let hook_context = AgentTurnHookContext::with_runtime_context(
@@ -3660,6 +3763,10 @@ async fn execute_agent_provider_response(
                 &effective_prompt_context_set,
             ),
         )?;
+        let prompt_runtime_sections = append_native_filesystem_capability_section(
+            prompt_runtime_sections,
+            &native_file_tool_capability,
+        )?;
 
         let initial_instruction_plan = compile_agent_instruction_delivery_plan(
             skills_prompt.clone(),
@@ -3874,6 +3981,16 @@ async fn execute_agent_provider_response(
     }
     .with_permission_approval_broker(permission_approval_broker);
 
+    // One trusted provider capability decision owns native filesystem-tool
+    // visibility for this turn.  Apply it before preflight so the core index,
+    // request_tools catalog and final provider schema cannot diverge.
+    tools
+        .router
+        .set_blocked_tool_names(native_file_tool_blocked_names(&native_file_tool_capability));
+    tools
+        .router
+        .set_native_patch_wire_shape(native_file_tool_capability.patch_shape);
+
     skill_tool_materialization
         .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
         .await;
@@ -4059,6 +4176,10 @@ async fn execute_agent_provider_response(
             history.as_slice(),
             &effective_prompt_context_set,
         ),
+    )?;
+    let prompt_runtime_sections = append_native_filesystem_capability_section(
+        prompt_runtime_sections,
+        &native_file_tool_capability,
     )?;
 
     let initial_instruction_plan = compile_agent_instruction_delivery_plan(
@@ -4473,10 +4594,8 @@ async fn execute_agent_provider_response(
                         .model_visible_specs()
                         .await
                         .into_iter()
-                        .map(|spec| ToolDefinition {
-                            name: spec.name,
-                            description: spec.description,
-                            parameters: spec.parameters,
+                        .map(|spec| {
+                            native_provider_tool_definition(spec, &native_file_tool_capability)
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -6575,11 +6694,12 @@ mod tests {
         build_execution_window_continuation, build_user_message,
         compile_agent_instruction_delivery_plan_with_prompt_root,
         compiled_prompt_payload_from_delivery_plan, deterministic_final_message_item_id,
-        deterministic_tool_item_id, materialize_mcp_tooling, normalize_turn_capabilities,
-        readable_agent_skill_overlay, resolve_skill_capability_summary,
-        retain_agent_attachment_messages, retain_agent_attachment_messages_with_budget,
-        retain_chat_mode_attachment_messages, review_required_observation_payload,
-        review_required_observation_signature, runtime_sections_with_artifact_reference_policy,
+        deterministic_tool_item_id, materialize_mcp_tooling, native_provider_tool_definition,
+        normalize_turn_capabilities, readable_agent_skill_overlay,
+        resolve_skill_capability_summary, retain_agent_attachment_messages,
+        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
+        review_required_observation_payload, review_required_observation_signature,
+        runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
     };
@@ -6594,6 +6714,28 @@ mod tests {
         PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
         PromptSectionId,
     };
+
+    #[test]
+    fn provider_tool_definition_uses_only_the_frozen_patch_wire_shape() {
+        let spec = pioneer_tools::ToolSpec::new(
+            "apply_patch",
+            "Apply patch.",
+            serde_json::json!({"type": "object"}),
+            pioneer_tools::PayloadKind::Custom,
+        );
+        let mut capability =
+            pioneer_provider::select_native_file_tool_capability("openai", "gpt-5");
+        let json = native_provider_tool_definition(spec.clone(), &capability);
+        assert_eq!(json.parameters["type"], "object");
+        assert_eq!(json.parameters["required"], serde_json::json!(["patch"]));
+        assert!(json.description.contains("strict `{patch}` JSON object"));
+
+        capability.patch_shape = pioneer_provider::NativePatchWireShape::Freeform;
+        let raw = native_provider_tool_definition(spec, &capability);
+        assert_eq!(raw.parameters["type"], "string");
+        assert!(raw.description.contains("raw patch text"));
+        assert!(!raw.description.contains("strict `{patch}` JSON object"));
+    }
 
     #[test]
     fn native_final_message_identity_is_stable_per_turn_and_generation() {

@@ -206,6 +206,11 @@ pub(super) async fn forward_tool_event_to_agent(
             }
 
             let outcome = protocol_outcome_from_tool_outcome(&completed.outcome);
+            let storage = storage_with_native_patch_history(
+                event.tool_name.as_str(),
+                &completed.llm_view,
+                completed.storage,
+            );
 
             event_tx
                 .publish_durable_and_wait(AgentDurableEvent::ItemCompleted {
@@ -224,7 +229,7 @@ pub(super) async fn forward_tool_event_to_agent(
                             recovery_policy,
                             turn_item_execution_class,
                             display: completed.display,
-                            storage: completed.storage,
+                            storage,
                             recovery: completed.recovery,
                             observation: state_observation,
                         }),
@@ -315,6 +320,47 @@ pub(super) async fn forward_tool_event_to_agent(
     Ok(())
 }
 
+/// The native patch executor includes a typed, trusted history envelope in
+/// the structured tool result. Keep that envelope on the durable file-change
+/// item even when the normal tool output policy is metadata-only; the gateway
+/// consumes it to append the immutable record and then projects the aggregate.
+fn storage_with_native_patch_history(
+    tool_name: &str,
+    llm_view: &ToolResultView,
+    storage: ToolStoragePayload,
+) -> ToolStoragePayload {
+    if tool_name != "apply_patch" {
+        return storage;
+    }
+    let history_from_storage = match &storage {
+        ToolStoragePayload::Metadata { metadata } => {
+            metadata.to_json().get("patchHistory").cloned()
+        }
+        ToolStoragePayload::Summary(summary) => {
+            summary.metadata.to_json().get("patchHistory").cloned()
+        }
+        ToolStoragePayload::Shell { .. } | ToolStoragePayload::None => None,
+    };
+    let history = history_from_storage.or_else(|| match llm_view {
+        ToolResultView::Json { value, .. } => value.get("history").cloned(),
+        ToolResultView::Text { text, .. } => serde_json::from_str::<JsonValue>(text)
+            .ok()
+            .and_then(|value| value.get("history").cloned()),
+        ToolResultView::Empty => None,
+    });
+    let Some(history) = history else {
+        return storage;
+    };
+
+    let mut metadata = match storage {
+        ToolStoragePayload::Summary(summary) => summary.metadata,
+        ToolStoragePayload::Metadata { metadata } => metadata,
+        ToolStoragePayload::Shell { .. } | ToolStoragePayload::None => ToolMetadata::empty(),
+    };
+    metadata.insert("patchHistory", ToolMetadataValue::from_json(history));
+    ToolStoragePayload::Metadata { metadata }
+}
+
 fn protocol_observation(
     observation: pioneer_tools::ObservationContext,
 ) -> pioneer_protocol::ToolObservation {
@@ -389,7 +435,7 @@ fn protocol_delta_from_tool_delta(
 pub(super) fn tool_item_type_from_name(tool_name: &str) -> TurnItemType {
     match tool_name {
         "exec_command" | "write_stdin" => TurnItemType::CommandExecution,
-        "apply_patch" | "write_file" | "edit_file" => TurnItemType::FileChange,
+        "apply_patch" => TurnItemType::FileChange,
         "web_search" => TurnItemType::WebSearch,
         "web_fetch" => TurnItemType::WebFetch,
         "download_url" => TurnItemType::Download,
@@ -1390,17 +1436,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_item_type_maps_write_file_to_file_change() {
-        assert_eq!(
-            tool_item_type_from_name("write_file"),
-            TurnItemType::FileChange
-        );
+    fn tool_item_type_maps_apply_patch_to_file_change() {
         assert_eq!(
             tool_item_type_from_name("apply_patch"),
-            TurnItemType::FileChange
-        );
-        assert_eq!(
-            tool_item_type_from_name("edit_file"),
             TurnItemType::FileChange
         );
         assert_eq!(
@@ -1420,16 +1458,8 @@ mod tests {
     #[test]
     fn file_change_title_uses_operation_when_available() {
         assert_eq!(
-            file_change_title("write_file", Some("created"), 1),
-            "write_file created 1 file(s)"
-        );
-        assert_eq!(
-            file_change_title("write_file", Some("overwritten"), 1),
-            "write_file overwrote 1 file(s)"
-        );
-        assert_eq!(
-            file_change_title("edit_file", Some("edited"), 1),
-            "edit_file edited 1 file(s)"
+            file_change_title("apply_patch", Some("update"), 1),
+            "apply_patch changed 1 file(s)"
         );
         assert_eq!(
             file_change_title("apply_patch", None, 2),
