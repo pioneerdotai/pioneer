@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublicTaskReviewContentFormat",
+  "description": "Reviewer-facing content extracted from one immutable result candidate.\n\nThis is deliberately separate from `TaskResult::data`: the persisted value\nmay also contain extraction diagnostics and source-runtime identifiers that\nare not part of the child-authored result.",
+  "type": "string",
+  "enum": [
+    "text",
+    "json"
+  ]
+}

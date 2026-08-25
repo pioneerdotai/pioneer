@@ -1,9 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CLIRuntimeRefreshParams",
+  "description": "Legacy protocol-v1 alias for reading the Gateway-owned readiness snapshot.\n\nDespite the method's historical `refresh` name, this request never starts\nprovider work. The Gateway supervisor owns probing and publishes newer\nsnapshots asynchronously through `cli_runtime/status_changed`.",
   "type": "object",
   "properties": {
     "runtime_id": {
+      "description": "Optional legacy validation target. Gateway readiness is maintained as\none atomic workspace snapshot, so the response still contains every\nauthorized runtime in the workspace.",
       "type": [
         "string",
         "null"

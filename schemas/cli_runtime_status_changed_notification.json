@@ -3,6 +3,18 @@
   "title": "CLIRuntimeStatusChangedNotification",
   "type": "object",
   "properties": {
+    "removed": {
+      "description": "Removes `runtime` from the client snapshot. The runtime payload remains\npresent so older clients safely render it as disabled instead of\nretaining a stale ready entry.",
+      "type": "boolean",
+      "default": false
+    },
+    "revision": {
+      "description": "Monotonic workspace change revision. Every emitted delta has a distinct\nrevision, so clients can detect a dropped notification and reload the\ncomplete authoritative snapshot.",
+      "type": "integer",
+      "format": "uint64",
+      "default": 0,
+      "minimum": 0
+    },
     "runtime": {
       "$ref": "#/$defs/RuntimeSummary"
     },

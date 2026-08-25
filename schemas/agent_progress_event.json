@@ -31,6 +31,10 @@
           "type": "string",
           "const": "item_heartbeat"
         },
+        "source": {
+          "$ref": "#/$defs/ItemHeartbeatSource",
+          "default": "owner_lease"
+        },
         "thread_id": {
           "type": "string"
         },
@@ -197,6 +201,13 @@
         "tool_progress",
         "file_change",
         "generic"
+      ]
+    },
+    "ItemHeartbeatSource": {
+      "type": "string",
+      "enum": [
+        "owner_lease",
+        "confirmed_external_activity"
       ]
     },
     "MarkdownBlock": {

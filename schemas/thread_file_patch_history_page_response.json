@@ -1,0 +1,448 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadFilePatchHistoryPageResponse",
+  "type": "object",
+  "properties": {
+    "coverage": {
+      "$ref": "#/$defs/PatchHistoryQueryCoverage"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PatchFileHistoryEntry"
+      }
+    },
+    "nextCursor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PatchFileHistoryCursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "path": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "threadId",
+    "path",
+    "items",
+    "coverage"
+  ],
+  "$defs": {
+    "PatchFileHistoryCursor": {
+      "type": "object",
+      "properties": {
+        "environmentId": {
+          "type": "string"
+        },
+        "ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "environmentId",
+        "turnId",
+        "ordinal",
+        "sequence"
+      ]
+    },
+    "PatchFileHistoryEntry": {
+      "type": "object",
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/PatchHistoryChange"
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "invocationId": {
+          "type": "string"
+        },
+        "ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "environmentId",
+        "turnId",
+        "ordinal",
+        "invocationId",
+        "change"
+      ]
+    },
+    "PatchHistoryChange": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatchHistorySnapshotRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatchHistorySnapshotRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "commitStep": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "destinationPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/PatchHistoryChangeKind"
+        },
+        "operationIndex": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "overwrittenDestination": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatchHistorySnapshotRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sideEffects": {
+          "$ref": "#/$defs/PatchHistorySideEffects"
+        },
+        "sourcePath": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operationIndex",
+        "commitStep",
+        "sequence",
+        "kind",
+        "sourcePath",
+        "sideEffects"
+      ]
+    },
+    "PatchHistoryChangeKind": {
+      "type": "string",
+      "enum": [
+        "add",
+        "replace",
+        "update",
+        "delete",
+        "move"
+      ]
+    },
+    "PatchHistoryCoverageView": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "engine_verified_steps"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "provider_reported_steps"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "protocol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "aggregate_only"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "protocol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "incomplete"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "untracked"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "PatchHistoryLineEnding": {
+      "type": "string",
+      "enum": [
+        "lf",
+        "crlf",
+        "mixed",
+        "none"
+      ]
+    },
+    "PatchHistoryLineEndingMetadata": {
+      "type": "object",
+      "properties": {
+        "dominant": {
+          "$ref": "#/$defs/PatchHistoryLineEnding"
+        },
+        "finalNewline": {
+          "type": "boolean"
+        },
+        "mixed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "dominant",
+        "mixed",
+        "finalNewline"
+      ]
+    },
+    "PatchHistoryQueryCoverage": {
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/PatchHistoryCoverageView"
+        },
+        "exact": {
+          "description": "Derived machine-friendly flag. It must agree with `exactness`; it is\nnot an alternate protocol representation.",
+          "type": "boolean"
+        },
+        "exactness": {
+          "$ref": "#/$defs/TurnDiffExactnessView"
+        },
+        "firstMissingOrdinal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "exactness",
+        "exact",
+        "coverage"
+      ]
+    },
+    "PatchHistorySideEffects": {
+      "type": "object",
+      "properties": {
+        "createdDirectories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exact": {
+          "type": "boolean"
+        },
+        "metadataWarnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "residualDirectories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "createdDirectories",
+        "residualDirectories",
+        "metadataWarnings",
+        "exact"
+      ]
+    },
+    "PatchHistorySnapshotRef": {
+      "type": "object",
+      "properties": {
+        "byteLen": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "contentHash": {
+          "description": "Lowercase SHA-256 hex. Snapshot bytes are resolved only by an\nauthorized diff request and are never read from the live workspace.",
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PatchHistoryTextEncoding"
+        },
+        "lineEndings": {
+          "$ref": "#/$defs/PatchHistoryLineEndingMetadata"
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "contentHash",
+        "byteLen",
+        "encoding",
+        "lineEndings"
+      ]
+    },
+    "PatchHistoryTextEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "utf8_bom"
+      ]
+    },
+    "TurnDiffExactnessView": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "engine_verified"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "provider_reported"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "protocol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "incomplete"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ]
+        }
+      ]
+    }
+  }
+}

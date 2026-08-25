@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPatchDiffGetResponse",
+  "type": "object",
+  "properties": {
+    "afterOrdinal": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "coverage": {
+      "$ref": "#/$defs/PatchHistoryCoverageView"
+    },
+    "exactness": {
+      "$ref": "#/$defs/TurnDiffExactnessView"
+    },
+    "recordsRendered": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "throughOrdinal": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "unifiedPatch": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "threadId",
+    "turnId",
+    "exactness",
+    "coverage",
+    "unifiedPatch",
+    "recordsRendered"
+  ],
+  "$defs": {
+    "PatchHistoryCoverageView": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "engine_verified_steps"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "provider_reported_steps"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "protocol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "aggregate_only"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "protocol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "incomplete"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "untracked"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "TurnDiffExactnessView": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "engine_verified"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "provider_reported"
+            },
+            "protocol": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "protocol"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "incomplete"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ]
+        }
+      ]
+    }
+  }
+}

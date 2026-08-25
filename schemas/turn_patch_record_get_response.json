@@ -1,0 +1,420 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPatchRecordGetResponse",
+  "type": "object",
+  "properties": {
+    "record": {
+      "$ref": "#/$defs/PatchHistoryRecord"
+    }
+  },
+  "required": [
+    "record"
+  ],
+  "$defs": {
+    "PatchHistoryAuthorityView": {
+      "type": "string",
+      "enum": [
+        "native_patch_engine",
+        "codex_aggregate_event",
+        "managed_claude_patch_engine",
+        "unsupported"
+      ]
+    },
+    "PatchHistoryChange": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatchHistorySnapshotRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatchHistorySnapshotRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "commitStep": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "destinationPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/PatchHistoryChangeKind"
+        },
+        "operationIndex": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "overwrittenDestination": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PatchHistorySnapshotRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sideEffects": {
+          "$ref": "#/$defs/PatchHistorySideEffects"
+        },
+        "sourcePath": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operationIndex",
+        "commitStep",
+        "sequence",
+        "kind",
+        "sourcePath",
+        "sideEffects"
+      ]
+    },
+    "PatchHistoryChangeKind": {
+      "type": "string",
+      "enum": [
+        "add",
+        "replace",
+        "update",
+        "delete",
+        "move"
+      ]
+    },
+    "PatchHistoryErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_limits",
+        "invalid_payload",
+        "patch_syntax_error",
+        "patch_empty",
+        "input_too_large",
+        "invalid_version_token",
+        "invalid_request",
+        "too_many_operations",
+        "too_many_files",
+        "too_many_hunks",
+        "invalid_path",
+        "path_outside_allowed_root",
+        "unauthorized_path",
+        "permission_denied",
+        "context_not_found",
+        "ambiguous_context",
+        "precondition_required",
+        "source_missing",
+        "destination_exists",
+        "destination_missing",
+        "stale_file",
+        "cross_device_move",
+        "unsupported_file_type",
+        "invalid_utf8",
+        "file_too_large",
+        "unsupported_content",
+        "lock_timeout",
+        "io_create_failed",
+        "io_write_failed",
+        "io_sync_failed",
+        "io_rename_failed",
+        "io_delete_failed",
+        "io",
+        "partial_commit",
+        "commit_state_uncertain",
+        "tracker_publish_failed",
+        "history_capacity"
+      ]
+    },
+    "PatchHistoryLineEnding": {
+      "type": "string",
+      "enum": [
+        "lf",
+        "crlf",
+        "mixed",
+        "none"
+      ]
+    },
+    "PatchHistoryLineEndingMetadata": {
+      "type": "object",
+      "properties": {
+        "dominant": {
+          "$ref": "#/$defs/PatchHistoryLineEnding"
+        },
+        "finalNewline": {
+          "type": "boolean"
+        },
+        "mixed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "dominant",
+        "mixed",
+        "finalNewline"
+      ]
+    },
+    "PatchHistoryProvenanceView": {
+      "type": "string",
+      "enum": [
+        "native_engine",
+        "managed_claude",
+        "recovery",
+        "provider_aggregate",
+        "unknown"
+      ]
+    },
+    "PatchHistoryRecord": {
+      "type": "object",
+      "properties": {
+        "authority": {
+          "$ref": "#/$defs/PatchHistoryAuthorityView"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PatchHistoryChange"
+          }
+        },
+        "commitOrdinal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "committedAtUnixMs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "exactness": {
+          "$ref": "#/$defs/PatchRecordExactnessView"
+        },
+        "invocationId": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/PatchHistoryRecordOutcome"
+        },
+        "provenance": {
+          "$ref": "#/$defs/PatchHistoryProvenanceView"
+        },
+        "recordId": {
+          "type": "string"
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "sideEffects": {
+          "description": "Durable filesystem effects that are not representable as file-content\nchanges, such as a residual parent directory after failed cleanup.",
+          "$ref": "#/$defs/PatchHistorySideEffects"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "recordId",
+        "threadId",
+        "turnId",
+        "invocationId",
+        "environmentId",
+        "commitOrdinal",
+        "authority",
+        "provenance",
+        "exactness",
+        "committedAtUnixMs",
+        "outcome",
+        "changes",
+        "sideEffects"
+      ]
+    },
+    "PatchHistoryRecordOutcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "applied"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "errorCode": {
+              "$ref": "#/$defs/PatchHistoryErrorCode"
+            },
+            "failedStage": {
+              "$ref": "#/$defs/PatchHistoryStage"
+            },
+            "status": {
+              "type": "string",
+              "const": "partial"
+            }
+          },
+          "required": [
+            "status",
+            "failedStage",
+            "errorCode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "commit_state_uncertain"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "const": "gap"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "PatchHistorySideEffects": {
+      "type": "object",
+      "properties": {
+        "createdDirectories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exact": {
+          "type": "boolean"
+        },
+        "metadataWarnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "residualDirectories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "createdDirectories",
+        "residualDirectories",
+        "metadataWarnings",
+        "exact"
+      ]
+    },
+    "PatchHistorySnapshotRef": {
+      "type": "object",
+      "properties": {
+        "byteLen": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "contentHash": {
+          "description": "Lowercase SHA-256 hex. Snapshot bytes are resolved only by an\nauthorized diff request and are never read from the live workspace.",
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/PatchHistoryTextEncoding"
+        },
+        "lineEndings": {
+          "$ref": "#/$defs/PatchHistoryLineEndingMetadata"
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "contentHash",
+        "byteLen",
+        "encoding",
+        "lineEndings"
+      ]
+    },
+    "PatchHistoryStage": {
+      "type": "string",
+      "enum": [
+        "normalize",
+        "parse",
+        "resolve",
+        "authorize",
+        "prepare",
+        "lock",
+        "stage",
+        "commit",
+        "record",
+        "recover"
+      ]
+    },
+    "PatchHistoryTextEncoding": {
+      "type": "string",
+      "enum": [
+        "utf8",
+        "utf8_bom"
+      ]
+    },
+    "PatchRecordExactnessView": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "partial",
+        "uncertain"
+      ]
+    }
+  }
+}

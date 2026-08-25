@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadFilePatchHistoryPageParams",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PatchFileHistoryCursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "path": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "threadId",
+    "path"
+  ],
+  "$defs": {
+    "PatchFileHistoryCursor": {
+      "type": "object",
+      "properties": {
+        "environmentId": {
+          "type": "string"
+        },
+        "ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "environmentId",
+        "turnId",
+        "ordinal",
+        "sequence"
+      ]
+    }
+  }
+}

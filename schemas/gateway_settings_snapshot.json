@@ -9,7 +9,7 @@
         "instances": [
           {
             "binary_path": "codex",
-            "display_name": "Codex CLI",
+            "display_name": "Codex",
             "enabled": true,
             "home_path": "~/.codex",
             "id": "codex",
@@ -18,7 +18,7 @@
           },
           {
             "binary_path": "claude",
-            "display_name": "Claude CLI",
+            "display_name": "Claude",
             "enabled": true,
             "home_path": "~/.claude",
             "id": "claude",

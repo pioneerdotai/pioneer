@@ -391,6 +391,49 @@
         "updatedAt"
       ]
     },
+    "PublicTaskReviewContent": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "contentSha256": {
+          "type": "string"
+        },
+        "format": {
+          "$ref": "#/$defs/PublicTaskReviewContentFormat"
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "totalBytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "format",
+        "content",
+        "totalBytes",
+        "contentSha256",
+        "truncated"
+      ]
+    },
+    "PublicTaskReviewContentFormat": {
+      "description": "Reviewer-facing content extracted from one immutable result candidate.\n\nThis is deliberately separate from `TaskResult::data`: the persisted value\nmay also contain extraction diagnostics and source-runtime identifiers that\nare not part of the child-authored result.",
+      "type": "string",
+      "enum": [
+        "text",
+        "json"
+      ]
+    },
     "PublicTaskRun": {
       "type": "object",
       "properties": {
@@ -533,6 +576,16 @@
           "format": "uint32",
           "default": 0,
           "minimum": 0
+        },
+        "reviewContent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicTaskReviewContent"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "revisionBlockedReason": {
           "anyOf": [

@@ -4497,6 +4497,10 @@
             "display": {
               "$ref": "#/$defs/ToolDisplayPayload"
             },
+            "executionClass": {
+              "description": "Operational supervision semantics declared by the tool contract.\nThis is independent from the presentation-level item type.",
+              "$ref": "#/$defs/TurnItemExecutionClass"
+            },
             "id": {
               "type": "string"
             },
@@ -4573,6 +4577,23 @@
             "display",
             "storage"
           ]
+        }
+      ]
+    },
+    "TurnItemExecutionClass": {
+      "description": "Operational execution semantics persisted with a turn-item attempt.\n\nThis is intentionally independent from [`TurnItemType`]: multiple runtime\noperations may project to the same presentation item while requiring\ndifferent supervision policies.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "standard",
+            "context_compaction"
+          ]
+        },
+        {
+          "description": "A durable observation whose lifetime is renewed only by confirmed\nactivity from the external execution it is joining.",
+          "type": "string",
+          "const": "durable_wait"
         }
       ]
     },
