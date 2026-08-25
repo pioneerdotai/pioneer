@@ -398,6 +398,14 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     ),
     method_entry(THREAD_GET, ThreadRead, Thread, NotFound, Read),
     method_entry(THREAD_TIMELINE_PAGE, ThreadRead, Thread, NotFound, Read),
+    method_entry(THREAD_PATCH_STEPS_PAGE, ThreadRead, Thread, NotFound, Read),
+    method_entry(
+        THREAD_FILE_PATCH_HISTORY_PAGE,
+        ThreadRead,
+        Thread,
+        NotFound,
+        Read,
+    ),
     method_entry(THREAD_READ, ThreadRead, Thread, NotFound, Mutation),
     method_entry(THREAD_UNSUBSCRIBE, ThreadRead, Thread, NotFound, Mutation),
     dynamic_method_entry(
@@ -427,6 +435,27 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     method_entry(TURN_RESUME, AgentExecutionResume, Turn, NotFound, Execution),
     method_entry(TURN_GET, AgentExecutionObserve, Turn, NotFound, Read),
     method_entry(TURN_ITEMS_PAGE, AgentExecutionObserve, Turn, NotFound, Read),
+    method_entry(
+        TURN_PATCH_STEPS_PAGE,
+        AgentExecutionObserve,
+        Turn,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        TURN_PATCH_RECORD_GET,
+        AgentExecutionObserve,
+        Turn,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        TURN_PATCH_DIFF_GET,
+        AgentExecutionObserve,
+        Turn,
+        NotFound,
+        Read,
+    ),
     method_entry(TURN_WORK_PAGE, AgentExecutionObserve, Turn, NotFound, Read),
     method_entry(
         TURN_WORK_ITEMS_GET,
@@ -1056,7 +1085,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 145);
+        assert_eq!(registry.len(), 150);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());

@@ -17,6 +17,8 @@ use crate::authorization::{
     ExecutionAuthorizationContext, ExecutionLeaseRegistry, ProofResolution, ResourceAction,
 };
 
+const FIRST_PARTY_FILE_SERVER_ID: &str = "pioneer-file-tools-v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TurnMcpInvocationOrigin {
@@ -390,6 +392,18 @@ impl GatewayTurnMcpInvoker {
                 "frozen MCP projection contains duplicate callable bindings",
             ));
         }
+        if binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID
+            && (!matches!(invocation.origin, TurnMcpInvocationOrigin::CliFacade)
+                || !invocation
+                    .runtime_id
+                    .as_deref()
+                    .is_some_and(|runtime| runtime.to_ascii_lowercase().contains("claude")))
+        {
+            return Err(invocation_error(
+                TurnMcpInvocationErrorCode::PermissionDenied,
+                "first-party filesystem tools are available only through managed Claude",
+            ));
+        }
 
         let invocation_limits = self
             .revalidate_execution_authorization(&invocation, &projection, &binding)
@@ -478,27 +492,29 @@ impl GatewayTurnMcpInvoker {
                 )
             })?;
 
-        let action_gate = AuthorizationService::new().authorize_action(
-            revalidated.principal().kind,
-            revalidated.principal().role_key.as_ref(),
-            ResourceAction::McpUse,
-        );
-        let capability = AuthorizationResolver::new(self.crud_store.as_ref().clone())
-            .authorize_persisted_capability(
-                revalidated.principal(),
-                &action_gate,
+        if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID {
+            let action_gate = AuthorizationService::new().authorize_action(
+                revalidated.principal().kind,
+                revalidated.principal().role_key.as_ref(),
                 ResourceAction::McpUse,
-                invocation.workspace_id.as_str(),
-                CapabilityKind::McpServer,
-                binding.server_name.as_str(),
-            )
-            .await
-            .map_err(|_| internal_error("failed to revalidate current MCP workspace policy"))?;
-        if !matches!(capability, ProofResolution::Authorized(_)) {
-            return Err(invocation_error(
-                TurnMcpInvocationErrorCode::PermissionDenied,
-                "current MCP workspace policy no longer permits this server",
-            ));
+            );
+            let capability = AuthorizationResolver::new(self.crud_store.as_ref().clone())
+                .authorize_persisted_capability(
+                    revalidated.principal(),
+                    &action_gate,
+                    ResourceAction::McpUse,
+                    invocation.workspace_id.as_str(),
+                    CapabilityKind::McpServer,
+                    binding.server_name.as_str(),
+                )
+                .await
+                .map_err(|_| internal_error("failed to revalidate current MCP workspace policy"))?;
+            if !matches!(capability, ProofResolution::Authorized(_)) {
+                return Err(invocation_error(
+                    TurnMcpInvocationErrorCode::PermissionDenied,
+                    "current MCP workspace policy no longer permits this server",
+                ));
+            }
         }
         let admitted_limits = context
             .effective_mcp_invocation_resource_limits()

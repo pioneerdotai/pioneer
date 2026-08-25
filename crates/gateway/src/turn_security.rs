@@ -713,7 +713,12 @@ fn normalize_path_lexically(path: PathBuf) -> PathBuf {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                normalized.pop();
+                if !matches!(
+                    normalized.components().next_back(),
+                    Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
+                ) {
+                    normalized.pop();
+                }
             }
             component => normalized.push(component.as_os_str()),
         }
@@ -1564,6 +1569,7 @@ mod tests {
             recovery: pioneer_tools::ToolRecoveryMetadata::default(),
             permission_metadata: pioneer_tools::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1583,6 +1589,7 @@ mod tests {
             recovery: pioneer_tools::ToolRecoveryMetadata::default(),
             permission_metadata: pioneer_tools::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }

@@ -28,9 +28,11 @@ use pioneer_protocol::{
     TaskTreeParams as TaskTreeTaskParams, TaskUserNotificationAcknowledgeParams,
     TaskUserNotificationListParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
-    ThreadReadParams, ThreadTimelinePageParams, TurnCancelParams, TurnMessageDeleteParams,
-    TurnMessageEditParams, TurnMessageRevisionsPageParams, TurnPermissionRequestRespondParams,
-    TurnResumeParams, TurnWorkItemsGetParams, TurnWorkPageParams, VoiceSessionCancelParams,
+    ThreadFilePatchHistoryPageParams, ThreadPatchStepsPageParams, ThreadReadParams,
+    ThreadTimelinePageParams, TurnCancelParams, TurnMessageDeleteParams, TurnMessageEditParams,
+    TurnMessageRevisionsPageParams, TurnPatchDiffGetParams, TurnPatchRecordGetParams,
+    TurnPatchStepsPageParams, TurnPermissionRequestRespondParams, TurnResumeParams,
+    TurnWorkItemsGetParams, TurnWorkPageParams, VoiceSessionCancelParams,
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
     WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
 };
@@ -1742,6 +1744,8 @@ impl MessageProcessor {
                     request.method.as_str(),
                     methods::THREAD_GET
                         | methods::THREAD_TIMELINE_PAGE
+                        | methods::THREAD_PATCH_STEPS_PAGE
+                        | methods::THREAD_FILE_PATCH_HISTORY_PAGE
                         | methods::THREAD_READ
                         | methods::THREAD_UNSUBSCRIBE
                         | methods::TURN_START
@@ -4670,6 +4674,65 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::THREAD_PATCH_STEPS_PAGE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<ThreadPatchStepsPageParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .thread()
+                                .expect("central admission supplies thread proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            self.thread_patch_steps_page(&context, proof, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::THREAD_PATCH_STEPS_PAGE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::THREAD_FILE_PATCH_HISTORY_PAGE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<ThreadFilePatchHistoryPageParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .thread()
+                                .expect("central admission supplies thread proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            self.thread_file_patch_history_page(
+                                &context,
+                                proof,
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::THREAD_FILE_PATCH_HISTORY_PAGE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 methods::THREAD_READ => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadReadParams>(params_value) {
@@ -4949,6 +5012,90 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::TURN_ITEMS_PAGE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_PATCH_STEPS_PAGE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnPatchStepsPageParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_patch_steps_page(&context, proof, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_PATCH_STEPS_PAGE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_PATCH_RECORD_GET => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnPatchRecordGetParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_patch_record_get(&context, proof, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_PATCH_RECORD_GET
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::TURN_PATCH_DIFF_GET => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<TurnPatchDiffGetParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .turn()
+                                .expect("central admission supplies turn proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            debug_assert_eq!(proof.turn_id(), params.turn_id.trim());
+                            self.turn_patch_diff_get(&context, proof, request.id, params)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::TURN_PATCH_DIFF_GET
                                     ),
                                 ),
                             )

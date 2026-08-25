@@ -1,3 +1,4 @@
+use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result};
 use pioneer_agent::{
     AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
@@ -22,6 +23,8 @@ use pioneer_protocol::{
     McpServerStatusItem, TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityKind,
     TurnCapabilityRejectedReason, TurnRejectedCapability, constants::events,
 };
+use pioneer_tools::ToolHandler;
+use pioneer_tools::apply_patch::history::InvocationIdentity;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -58,6 +61,12 @@ use crate::{
         ExecutionLeaseRegistry, ResourceAction,
     },
 };
+
+const FIRST_PARTY_FILE_SERVER_ID: &str = "pioneer-file-tools-v1";
+const FIRST_PARTY_FILE_SERVER_NAME: &str = "pioneer_files";
+const FIRST_PARTY_FILE_CATALOG: &str = "pioneer-file-tools-v1";
+const FIRST_PARTY_READ_FILE: &str = "read_file";
+const FIRST_PARTY_APPLY_PATCH: &str = "apply_patch";
 
 #[derive(Clone)]
 pub(crate) struct McpService {
@@ -2211,6 +2220,9 @@ impl TurnMcpRuntimeView for McpService {
         workspace_id: &str,
         binding: &pioneer_crud::TurnMcpBindingRecord,
     ) -> Result<CurrentMcpToolIdentity, TurnMcpInvocationError> {
+        if binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
+            return first_party_file_tool_identity(workspace_id, binding);
+        }
         let row = self
             .inner
             .crud_store
@@ -2332,6 +2344,115 @@ impl TurnMcpRuntimeView for McpService {
     }
 }
 
+fn first_party_file_tool_identity(
+    workspace_id: &str,
+    binding: &pioneer_crud::TurnMcpBindingRecord,
+) -> Result<CurrentMcpToolIdentity, TurnMcpInvocationError> {
+    // The first-party binding is a reserved capability, not an ordinary
+    // database-backed MCP installation.  Do not let a stale or corrupted
+    // durable row define its server/name/catalog identity and then validate
+    // that self-consistent corruption as if it were the canonical facade.
+    if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
+        || binding.server_name != FIRST_PARTY_FILE_SERVER_NAME
+        || binding.catalog_version != FIRST_PARTY_FILE_CATALOG
+        || binding.fingerprint != FIRST_PARTY_FILE_SERVER_ID
+        || binding.raw_tool_name != binding.canonical_callable_name
+        || binding.annotations_json != "{}"
+        || binding.annotations_digest != crate::turn_mcp::projection::sha256_hex(b"{}")
+        || binding.runtime_generation <= 0
+        || binding.effective_timeout_ms <= 0
+    {
+        return Err(TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::ToolDrift,
+            "reserved first-party file binding has a non-canonical identity",
+        ));
+    }
+    let canonical_schema = match binding.canonical_callable_name.as_str() {
+        FIRST_PARTY_READ_FILE => pioneer_provider::read_file_tool_schema()
+            .get("input")
+            .cloned()
+            .ok_or_else(|| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::Internal,
+                    "reserved read_file schema is unavailable",
+                )
+            })?,
+        FIRST_PARTY_APPLY_PATCH => json!({
+            "type": "object",
+            "properties": {"patch": {"type": "string"}},
+            "required": ["patch"],
+            "additionalProperties": false
+        }),
+        _ => {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::ToolUnbound,
+                "unknown first-party file callable",
+            ));
+        }
+    };
+    let (canonical_schema, schema_fingerprint, _) =
+        crate::turn_mcp::projection::canonical_schema_identity(&canonical_schema).map_err(
+            |_| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::Internal,
+                    "reserved file schema could not be canonicalized",
+                )
+            },
+        )?;
+    if schema_fingerprint != binding.canonical_schema_fingerprint || workspace_id.trim().is_empty()
+    {
+        return Err(TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::ToolDrift,
+            "reserved first-party file binding no longer matches its canonical schema",
+        ));
+    }
+    let runtime_generation = u64::try_from(binding.runtime_generation).map_err(|_| {
+        TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::ToolDrift,
+            "reserved first-party file runtime generation is invalid",
+        )
+    })?;
+    let effective_timeout_ms = u64::try_from(binding.effective_timeout_ms).map_err(|_| {
+        TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::ToolDrift,
+            "reserved first-party file timeout is invalid",
+        )
+    })?;
+    Ok(CurrentMcpToolIdentity {
+        server_installation_id: FIRST_PARTY_FILE_SERVER_ID.to_owned(),
+        server_name: FIRST_PARTY_FILE_SERVER_NAME.to_owned(),
+        raw_tool_name: binding.canonical_callable_name.clone(),
+        description: Some(match binding.canonical_callable_name.as_str() {
+            FIRST_PARTY_READ_FILE => {
+                "Read a text file and return the exact version token used by Apply Patch."
+                    .to_owned()
+            }
+            _ => "Apply one bounded text patch. The input must be the complete patch document."
+                .to_owned(),
+        }),
+        catalog_version: FIRST_PARTY_FILE_CATALOG.to_owned(),
+        installation_fingerprint: FIRST_PARTY_FILE_SERVER_ID.to_owned(),
+        canonical_schema_fingerprint: schema_fingerprint,
+        canonical_schema,
+        annotations_json: binding.annotations_json.clone(),
+        annotations_digest: binding.annotations_digest.clone(),
+        effective_timeout_ms,
+        runtime_generation,
+    })
+}
+
+fn managed_history_coverage(value: &JsonValue) -> &'static str {
+    match value
+        .pointer("/tracking/status")
+        .and_then(JsonValue::as_str)
+    {
+        Some("recorded_and_projected") => "engine_verified_steps",
+        Some("recorded_projection_pending") | Some("pending") | Some("incomplete") => "incomplete",
+        Some("not_applicable") => "not_applicable",
+        _ => "incomplete",
+    }
+}
+
 #[async_trait::async_trait]
 impl TurnMcpValidatedExecution for McpService {
     async fn execute(
@@ -2363,6 +2484,11 @@ impl TurnMcpValidatedExecution for McpService {
                         "turn execution security snapshot is unavailable",
                     )
                 })?;
+            if validated.binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
+                return self
+                    .execute_first_party_file_tool(&validated, &security, cancellation.clone())
+                    .await;
+            }
             let annotations = serde_json::from_str::<pioneer_tools::McpDynamicToolAnnotations>(
                 validated.binding.annotations_json.as_str(),
             )
@@ -2469,6 +2595,164 @@ impl TurnMcpValidatedExecution for McpService {
 }
 
 impl McpService {
+    async fn execute_first_party_file_tool(
+        &self,
+        validated: &ValidatedTurnMcpInvocation,
+        security: &pioneer_crud::TurnExecutionSecuritySnapshotRecord,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
+        if cancellation.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "managed file invocation was cancelled before execution",
+            ));
+        }
+        let tool_name = validated.invocation.canonical_callable_name.as_str();
+        let payload = match tool_name {
+            FIRST_PARTY_READ_FILE | FIRST_PARTY_APPLY_PATCH => {
+                pioneer_tools::ToolPayload::Function {
+                    arguments: validated.invocation.arguments.clone(),
+                }
+            }
+            _ => {
+                return Err(TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ToolUnbound,
+                    "unknown first-party file callable",
+                ));
+            }
+        };
+        let mut invocation = pioneer_tools::ToolInvocation {
+            call_id: validated.invocation.provider_call_id.clone(),
+            tool_name: tool_name.to_owned(),
+            source: pioneer_tools::ToolCallSource::Model,
+            payload,
+            workdir: std::path::PathBuf::from(security.snapshot.sandbox.cwd.clone()),
+            environment: std::collections::BTreeMap::new(),
+            attempt_id: 1,
+            idempotency_key: Some(validated.invocation.provider_call_id.clone()),
+            recovery: pioneer_tools::ToolRecoveryMetadata::default(),
+            permission_metadata: pioneer_tools::ToolPermissionMetadata::default(),
+            execution_security_snapshot: Some(security.snapshot.clone()),
+            apply_patch_preflight: None,
+            cancellation: cancellation.clone(),
+        };
+        let trace = pioneer_tools::ToolEventBus::default().start_trace(
+            validated.invocation.turn_id.clone(),
+            validated.invocation.provider_call_id.clone(),
+            tool_name.to_owned(),
+        );
+        let permission_context = pioneer_tools::PermissionEvaluationContext::for_turn(
+            validated.invocation.workspace_id.clone(),
+            validated.invocation.thread_id.clone(),
+            validated.invocation.turn_id.clone(),
+            security.snapshot.permission_profile.clone(),
+        );
+        let direct_orchestrator = pioneer_tools::ToolOrchestrator::with_approval_broker(
+            pioneer_tools::OrchestratorPolicy::default(),
+            self.inner.permission_approval_broker.read().await.clone(),
+        );
+        if let Err(error) = direct_orchestrator
+            .authorize_direct_invocation(&mut invocation, &trace, &permission_context)
+            .await
+        {
+            return match error {
+                pioneer_tools::ToolError::Rejected(message)
+                    if tool_name == FIRST_PARTY_APPLY_PATCH =>
+                {
+                    canonical_apply_patch_permission_denied_result(
+                        message.as_str(),
+                        security.snapshot.permission_profile.mode.as_str(),
+                    )
+                }
+                pioneer_tools::ToolError::Rejected(message) => {
+                    Ok(canonical_permission_denied_result(message.as_str()))
+                }
+                other => Err(map_shared_tool_error(other)),
+            };
+        }
+        let patch_identity = if tool_name == FIRST_PARTY_APPLY_PATCH {
+            Some(
+                InvocationIdentity::new(
+                    validated.invocation.thread_id.clone(),
+                    validated.invocation.turn_id.clone(),
+                    validated.invocation.provider_call_id.clone(),
+                )
+                .map_err(|error| {
+                    TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::InvalidRequest,
+                        format!("managed patch identity is invalid: {error}"),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let history_observer = if let Some(identity) = patch_identity.as_ref() {
+            let admission_permit = match reserve_patch_history_capacity().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "managed patch history admission capacity is unavailable"
+                    );
+                    return canonical_apply_patch_history_capacity_result(
+                        security.snapshot.permission_profile.mode.as_str(),
+                    );
+                }
+            };
+            Some(SqlitePatchObserver::new(
+                self.inner.crud_store.database_connection(),
+                identity.clone(),
+                admission_permit,
+            ))
+        } else {
+            None
+        };
+        let output_result = if tool_name == FIRST_PARTY_READ_FILE {
+            pioneer_tools::handlers::ReadFileHandler
+                .handle(invocation, trace)
+                .await
+        } else {
+            let identity = patch_identity
+                .as_ref()
+                .expect("managed apply_patch identity should be present");
+            let observer = history_observer
+                .as_ref()
+                .expect("managed apply_patch observer should be present");
+            pioneer_tools::handlers::ApplyPatchHandler
+                .handle_with_source_and_observer(
+                    invocation,
+                    trace,
+                    pioneer_tools::apply_patch::file_mutation::PatchRequestSource::ManagedClaude,
+                    identity,
+                    observer,
+                )
+                .await
+        };
+        let output = match output_result {
+            Ok(output) => output,
+            Err(error) => return Err(map_shared_tool_error(error)),
+        };
+        let is_error = !output.success();
+        let structured_content = output.raw_json();
+        let history_coverage = managed_history_coverage(&structured_content);
+        Ok(CanonicalMcpToolResult {
+            content: json!([{"type": "text", "text": output.raw_text()}]),
+            structured_content: Some(structured_content),
+            is_error,
+            duration_ms: 0,
+            meta: Some(json!({
+                "pioneer": {
+                    "authority": "managed_claude_patch_engine",
+                    "historyCoverage": history_coverage,
+                    "canonicalTool": tool_name,
+                }
+            })),
+        })
+    }
+}
+
+impl McpService {
     async fn audit_turn_mcp_invocation_outcome(
         &self,
         validated: &ValidatedTurnMcpInvocation,
@@ -2485,6 +2769,8 @@ impl McpService {
                 let decision =
                     if reason_code == TurnMcpInvocationErrorCode::PermissionDenied.as_str() {
                         "blocked"
+                    } else if reason_code == "history_capacity" {
+                        "failed"
                     } else {
                         "allowed"
                     };
@@ -2608,6 +2894,64 @@ fn canonical_permission_denied_result(message: &str) -> CanonicalMcpToolResult {
             }
         })),
     }
+}
+
+fn canonical_apply_patch_permission_denied_result(
+    message: &str,
+    profile: &'static str,
+) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
+    canonical_apply_patch_rejection_result(
+        pioneer_tools::apply_patch::file_mutation::PatchStage::Authorize,
+        pioneer_tools::apply_patch::file_mutation::PatchErrorCode::PermissionDenied,
+        bounded_invocation_diagnostic(message),
+        TurnMcpInvocationErrorCode::PermissionDenied.as_str(),
+        profile,
+    )
+}
+
+fn canonical_apply_patch_history_capacity_result(
+    profile: &'static str,
+) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
+    canonical_apply_patch_rejection_result(
+        pioneer_tools::apply_patch::file_mutation::PatchStage::Record,
+        pioneer_tools::apply_patch::file_mutation::PatchErrorCode::HistoryCapacity,
+        "patch history capacity is unavailable; retry after a delay".to_owned(),
+        "history_capacity",
+        profile,
+    )
+}
+
+fn canonical_apply_patch_rejection_result(
+    stage: pioneer_tools::apply_patch::file_mutation::PatchStage,
+    code: pioneer_tools::apply_patch::file_mutation::PatchErrorCode,
+    message: String,
+    reason_code: &str,
+    profile: &'static str,
+) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
+    let output = pioneer_tools::handlers::ApplyPatchHandler::canonical_rejection_output(
+        pioneer_tools::apply_patch::file_mutation::PatchRequestSource::ManagedClaude,
+        profile,
+        stage,
+        code,
+        message,
+        None,
+    )
+    .map_err(map_shared_tool_error)?;
+    let structured_content = output.raw_json();
+    Ok(CanonicalMcpToolResult {
+        content: json!([{"type": "text", "text": output.raw_text()}]),
+        structured_content: Some(structured_content.clone()),
+        is_error: true,
+        duration_ms: 0,
+        meta: Some(json!({
+            "pioneer": {
+                "authority": "managed_claude_patch_engine",
+                "historyCoverage": managed_history_coverage(&structured_content),
+                "canonicalTool": FIRST_PARTY_APPLY_PATCH,
+                "reasonCode": reason_code,
+            }
+        })),
+    })
 }
 
 fn canonical_result_from_tool_output(
@@ -4689,6 +5033,52 @@ mod tests {
             TurnMcpInvocationErrorCode::SessionGenerationStale
         );
         assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn managed_apply_patch_permission_denial_keeps_the_canonical_v1_shape() {
+        let output =
+            canonical_apply_patch_permission_denied_result("denied by policy", "supervised")
+                .expect("canonical permission result");
+        let structured = output
+            .structured_content
+            .as_ref()
+            .expect("apply_patch denials must retain structured content");
+
+        assert!(output.is_error);
+        assert_eq!(structured["schema_version"], 1);
+        assert_eq!(structured["status"], "rejected");
+        assert_eq!(structured["success"], false);
+        assert_eq!(structured["exact"], true);
+        assert_eq!(structured["changed_files"], json!([]));
+        assert_eq!(structured["error"]["stage"], "authorize");
+        assert_eq!(structured["error"]["code"], "permission_denied");
+        assert_eq!(
+            output
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.pointer("/pioneer/reasonCode"))
+                .and_then(JsonValue::as_str),
+            Some("permission_denied")
+        );
+
+        let capacity = canonical_apply_patch_history_capacity_result("supervised")
+            .expect("canonical history-capacity result");
+        let structured = capacity.structured_content.as_ref().unwrap();
+        assert!(capacity.is_error);
+        assert_eq!(structured["schema_version"], 1);
+        assert_eq!(structured["status"], "rejected");
+        assert_eq!(structured["exact"], true);
+        assert_eq!(structured["error"]["stage"], "record");
+        assert_eq!(structured["error"]["code"], "history_capacity");
+        assert_eq!(
+            capacity
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.pointer("/pioneer/reasonCode"))
+                .and_then(JsonValue::as_str),
+            Some("history_capacity")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

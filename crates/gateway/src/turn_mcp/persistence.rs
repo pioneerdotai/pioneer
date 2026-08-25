@@ -1,4 +1,6 @@
-use super::projection::{ResolvedMcpTurnProjection, canonical_annotations_identity};
+use super::projection::{
+    ResolvedMcpTurnProjection, canonical_annotations_identity, canonical_schema_identity,
+};
 use pioneer_agent::{
     AgentMcpPersistedProjection, AgentMcpProjectionBinding, AgentMcpProjectionPersistenceError,
     AgentMcpProjectionPersistenceRequest,
@@ -7,6 +9,13 @@ use pioneer_crud::{
     CrudStore, TurnMcpBindingRecord, TurnMcpProjectionRecord, TurnMcpProjectionReplacement,
 };
 use std::sync::Arc;
+
+const FIRST_PARTY_FILE_SERVER_ID: &str = "pioneer-file-tools-v1";
+const FIRST_PARTY_FILE_SERVER_NAME: &str = "pioneer_files";
+const FIRST_PARTY_FILE_CATALOG: &str = "pioneer-file-tools-v1";
+const FIRST_PARTY_FILE_SELECTION: &str = "first_party_filesystem";
+const FIRST_PARTY_READ_FILE: &str = "read_file";
+const FIRST_PARTY_APPLY_PATCH: &str = "apply_patch";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TurnMcpProviderBindingIdentity {
@@ -86,6 +95,13 @@ impl TurnMcpPersistenceCoordinator {
         let server_names = request
             .bindings
             .iter()
+            // The managed Claude filesystem facade is a Pioneer-owned
+            // capability. It is persisted as a frozen binding so invocation
+            // validation and drift checks remain exact, but it is not an
+            // external MCP server that must appear in the user's immutable
+            // MCP server admission. External MCP names remain the only names
+            // bound to role/capability grants here.
+            .filter(|binding| binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID)
             .map(|binding| binding.server_name.clone())
             .collect::<Vec<_>>();
         context
@@ -119,13 +135,41 @@ pub(crate) fn persistence_request_from_projection_with_provider(
     projection: &ResolvedMcpTurnProjection,
     provider_bindings: &[TurnMcpProviderBindingIdentity],
 ) -> Result<AgentMcpProjectionPersistenceRequest, String> {
-    let provider_bindings = provider_bindings
+    let mut provider_bindings_by_name = std::collections::HashMap::new();
+    for binding in provider_bindings {
+        if provider_bindings_by_name
+            .insert(binding.canonical_callable_name.as_str(), binding)
+            .is_some()
+        {
+            return Err(format!(
+                "provider MCP binding projection repeats canonical callable `{}`",
+                binding.canonical_callable_name
+            ));
+        }
+    }
+    let provider_bindings = provider_bindings_by_name;
+    let projection_names = projection
+        .tools
         .iter()
-        .map(|binding| (binding.canonical_callable_name.as_str(), binding))
-        .collect::<std::collections::HashMap<_, _>>();
-    if !provider_bindings.is_empty() && provider_bindings.len() != projection.tools.len() {
+        .map(|tool| tool.canonical_callable_name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if !provider_bindings.is_empty()
+        && projection
+            .tools
+            .iter()
+            .any(|tool| !provider_bindings.contains_key(tool.canonical_callable_name.as_str()))
+    {
+        return Err("provider MCP binding projection is missing a canonical callable".to_owned());
+    }
+    if provider_bindings.values().any(|binding| {
+        !projection_names.contains(binding.canonical_callable_name.as_str())
+            && !matches!(
+                binding.canonical_callable_name.as_str(),
+                FIRST_PARTY_READ_FILE | FIRST_PARTY_APPLY_PATCH
+            )
+    }) {
         return Err(
-            "provider MCP binding projection is not an exact canonical projection".to_owned(),
+            "provider MCP binding projection contains an unknown extra callable".to_owned(),
         );
     }
     let bindings = projection
@@ -166,6 +210,38 @@ pub(crate) fn persistence_request_from_projection_with_provider(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let mut bindings = bindings;
+    for name in [FIRST_PARTY_READ_FILE, FIRST_PARTY_APPLY_PATCH] {
+        let Some(provider) = provider_bindings.get(name) else {
+            continue;
+        };
+        if projection_names.contains(name) {
+            return Err(format!(
+                "first-party callable `{name}` collides with a canonical MCP projection tool"
+            ));
+        }
+        let schema = first_party_file_schema(name)?;
+        let (_, canonical_schema_fingerprint, _) = canonical_schema_identity(&schema)?;
+        bindings.push(AgentMcpProjectionBinding {
+            server_installation_id: FIRST_PARTY_FILE_SERVER_ID.to_owned(),
+            server_name: FIRST_PARTY_FILE_SERVER_NAME.to_owned(),
+            raw_tool_name: name.to_owned(),
+            callable_name: name.to_owned(),
+            canonical_callable_name: name.to_owned(),
+            provider_callable_name: provider.provider_callable_name.clone(),
+            catalog_version: FIRST_PARTY_FILE_CATALOG.to_owned(),
+            installation_fingerprint: FIRST_PARTY_FILE_SERVER_ID.to_owned(),
+            canonical_schema_fingerprint,
+            provider_schema_fingerprint: provider.provider_schema_fingerprint.clone(),
+            annotations_json: "{}".to_owned(),
+            annotations_digest: crate::turn_mcp::projection::sha256_hex(b"{}"),
+            effective_timeout_ms: crate::turn_mcp::DEFAULT_MCP_TURN_TOOL_TIMEOUT_MS,
+            runtime_generation: 1,
+            projection_activation_generation: 0,
+            selection_reason: FIRST_PARTY_FILE_SELECTION.to_owned(),
+            capability_id: Some(FIRST_PARTY_FILE_CATALOG.to_owned()),
+        });
+    }
     Ok(AgentMcpProjectionPersistenceRequest {
         workspace_id: projection.workspace_id.clone(),
         turn_id: projection.turn_id.clone(),
@@ -178,6 +254,22 @@ pub(crate) fn persistence_request_from_projection_with_provider(
         },
         bindings,
     })
+}
+
+fn first_party_file_schema(name: &str) -> Result<serde_json::Value, String> {
+    match name {
+        FIRST_PARTY_READ_FILE => Ok(pioneer_provider::read_file_tool_schema()
+            .get("input")
+            .cloned()
+            .ok_or_else(|| "read_file schema has no input object".to_owned())?),
+        FIRST_PARTY_APPLY_PATCH => Ok(serde_json::json!({
+            "type": "object",
+            "properties": {"patch": {"type": "string"}},
+            "required": ["patch"],
+            "additionalProperties": false
+        })),
+        _ => Err(format!("unknown first-party file callable `{name}`")),
+    }
 }
 
 fn durable_binding(

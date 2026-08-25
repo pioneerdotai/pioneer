@@ -16,7 +16,7 @@ async fn claude_projection_permissions_and_lifecycle_are_deterministic() {
     assert!(evidence.changed_projection_requires_restart);
     assert!(evidence.provider_session_identity_preserved);
     assert!(evidence.concurrent_projections_isolated);
-    assert!(evidence.empty_projection_is_empty);
+    assert!(evidence.empty_projection_keeps_native_file_tools);
     assert!(evidence.strict_managed_config_isolated);
     assert!(evidence.mixed_skill_server_preflight_preserved);
     assert!(evidence.mixed_skill_tool_preflight_preserved);

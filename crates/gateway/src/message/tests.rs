@@ -992,7 +992,9 @@ struct CliRuntimeSecurityHarness {
     processor: Arc<MessageProcessor>,
 }
 
-async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
+async fn setup_cli_runtime_security_harness(
+    runtime_kind: Option<CLIAgentRuntimeKind>,
+) -> CliRuntimeSecurityHarness {
     // Security tests normally consume each response immediately, while the
     // self-improvement vertical E2E intentionally leaves several real
     // Composer children running at once. Keep the test transport bounded but
@@ -1020,22 +1022,33 @@ async fn setup_cli_runtime_security_harness() -> CliRuntimeSecurityHarness {
     let runtime_home = unique_temp_dir("cli_runtime_security");
     std::fs::create_dir_all(&runtime_home).expect("CLI runtime test home must exist");
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = with_enabled_test_cli_runtime_catalog(
-        MessageProcessor::new(
-            thread_manager.clone(),
-            provider_registry.clone(),
-            session_manager,
-            workspace_manager.clone(),
-            crud_store.clone(),
-            test_gateway_secrets(),
-            test_summary_config(),
-            test_context_budget(),
-            test_tool_loop_config(),
-        )
-        .with_cli_runtime_manager_for_tests(cli_manager.clone())
-        .with_runtime_home_for_tests(runtime_home)
-        .with_self_improvement_supervisor(self_improvement_supervisor.clone()),
-    );
+    let processor = MessageProcessor::new(
+        thread_manager.clone(),
+        provider_registry.clone(),
+        session_manager,
+        workspace_manager.clone(),
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    )
+    .with_cli_runtime_manager_for_tests(cli_manager.clone())
+    .with_runtime_home_for_tests(runtime_home)
+    .with_self_improvement_supervisor(self_improvement_supervisor.clone());
+    let processor = match runtime_kind {
+        Some(runtime_kind) => processor.with_cli_mcp_readiness_override_for_tests(
+            supported_test_cli_mcp_readiness(runtime_kind),
+        ),
+        None => processor
+            .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+                CLIAgentRuntimeKind::Codex,
+            ))
+            .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+                CLIAgentRuntimeKind::Claude,
+            )),
+    };
+    let processor = with_enabled_test_cli_runtime_catalog(processor);
     sync_test_cli_runtime_identities(&processor)
         .await
         .expect("CLI runtime security harness should project agent domain identities");
@@ -1065,7 +1078,7 @@ fn skill_pack_turn_normalization_is_authoritative_ordered_and_fail_closed() {
         .build()
         .expect("skill pack normalization runtime")
         .block_on(async {
-            let harness = setup_cli_runtime_security_harness().await;
+            let harness = setup_cli_runtime_security_harness(None).await;
             let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
             let other_pack_id =
                 pioneer_protocol::SkillPackId::new("Q".repeat(21)).expect("other pack id");
@@ -1470,7 +1483,8 @@ async fn setup_cli_runtime_skill_preflight_harness(
         tool_loop_config,
     )
     .with_runtime_home_for_tests(runtime_home.clone())
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    .with_cli_runtime_manager_for_tests(cli_manager.clone())
+    .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(runtime_kind));
     sync_test_cli_runtime_identities(&processor)
         .await
         .expect("CLI runtime skill harness should materialize its Agent identities");
@@ -9213,217 +9227,6 @@ async fn ingest_user_test_artifact_for_thread(
         .artifact
 }
 
-async fn setup_write_file_artifact_registration_gateway(
-    case_id: &str,
-) -> (MessageProcessor, Arc<CrudStore>, String, String, String) {
-    let session_manager = Arc::new(SessionManager::new());
-    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
-    let agent_manager = Arc::new(AgentManager::new(test_provider(), test_tool_loop_config()));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let processor = MessageProcessor::with_agent_manager(
-        thread_manager.clone(),
-        agent_manager.clone(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-    );
-    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
-    let principal = authenticated_test_superuser();
-    let thread_id = generate_test_request_id("wfat", case_id);
-    let turn_id = generate_test_request_id("wfaturn", case_id);
-    let thread_start = thread_manager
-        .system_thread_start_seeded(
-            workspace_id.clone(),
-            pioneer_protocol::ThreadStartParams {
-                thread_id: thread_id.clone(),
-                workspace_id: workspace_id.clone(),
-                name: None,
-                model: None,
-                model_provider: None,
-                sandbox: Some(SandboxMode::FullAccess),
-                mode: None,
-                origin_kind: None,
-                sidebar_visibility: None,
-                visibility: None,
-                agent_nickname: None,
-                agent_role: None,
-            },
-            None,
-            None,
-        )
-        .await
-        .expect("write_file artifact registration thread should start");
-    crud_store
-        .materialize_turn_start(
-            &thread_start.started_notification.thread,
-            SandboxMode::FullAccess,
-            &Turn {
-                id: turn_id.clone(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
-            &[],
-            pioneer_protocol::PersistedActorRef::Principal(principal.principal_id.clone()),
-        )
-        .await
-        .expect("write_file artifact registration turn should persist");
-    ensure_test_superuser_execution_turn(
-        &processor,
-        workspace_id.as_str(),
-        thread_id.as_str(),
-        turn_id.as_str(),
-    )
-    .await;
-    agent_manager
-        .ensure_thread(thread_id.as_str(), workspace_id.as_str())
-        .await
-        .expect("write_file artifact registration agent thread should register");
-
-    (processor, crud_store, workspace_id, thread_id, turn_id)
-}
-
-fn write_file_artifact_test_path(case_id: &str, file_name: &str) -> std::path::PathBuf {
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let root = std::env::current_dir()
-        .expect("current dir should resolve")
-        .join("target")
-        .join("pioneer-gateway-write-file-artifacts")
-        .join(format!("{}_{}_{}", case_id, std::process::id(), now_nanos));
-    std::fs::create_dir_all(root.as_path())
-        .expect("write_file artifact test directory should exist");
-    root.join(file_name)
-}
-
-fn write_file_completed_notification(
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    item_id: &str,
-    path: &std::path::Path,
-    operation: &str,
-    bytes: &[u8],
-) -> ItemCompletedNotification {
-    let path = path.display().to_string();
-    let sha256 = hex::encode(Sha256::digest(bytes));
-    ItemCompletedNotification {
-        workspace_id: workspace_id.to_owned(),
-        thread_id: thread_id.to_owned(),
-        turn_id: turn_id.to_owned(),
-        item: TurnItem::FileChange {
-            id: item_id.to_owned(),
-            tool_name: "write_file".to_owned(),
-            arguments: json!({"path": path.clone()}),
-            status: ToolCallStatus::Completed,
-            recovery_policy: None,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("write_file"),
-            display: Default::default(),
-            storage: ToolStoragePayload::Metadata {
-                metadata: ToolMetadata::from_json(json!({
-                    "changedFiles": [path.clone()],
-                    "operation": operation,
-                    "bytesWritten": bytes.len(),
-                    "sha256": sha256
-                })),
-            },
-            recovery: None,
-            changed_files: vec![path],
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        },
-    }
-}
-
-fn edit_file_completed_notification(
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    item_id: &str,
-    path: &std::path::Path,
-    before_bytes: &[u8],
-    after_bytes: &[u8],
-) -> ItemCompletedNotification {
-    let path = path.display().to_string();
-    let sha256_before = hex::encode(Sha256::digest(before_bytes));
-    let sha256_after = hex::encode(Sha256::digest(after_bytes));
-    ItemCompletedNotification {
-        workspace_id: workspace_id.to_owned(),
-        thread_id: thread_id.to_owned(),
-        turn_id: turn_id.to_owned(),
-        item: TurnItem::FileChange {
-            id: item_id.to_owned(),
-            tool_name: "edit_file".to_owned(),
-            arguments: json!({
-                "path": path.clone(),
-                "old_string": "old",
-                "new_string": "new"
-            }),
-            status: ToolCallStatus::Completed,
-            recovery_policy: None,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("edit_file"),
-            display: Default::default(),
-            storage: ToolStoragePayload::Metadata {
-                metadata: ToolMetadata::from_json(json!({
-                    "changedFiles": [path.clone()],
-                    "operation": "edited",
-                    "matchesReplaced": 1,
-                    "replaceAll": false,
-                    "bytesBefore": before_bytes.len(),
-                    "bytesAfter": after_bytes.len(),
-                    "bytesWritten": after_bytes.len(),
-                    "sha256Before": sha256_before,
-                    "sha256": sha256_after,
-                    "lineEndingMode": "lf"
-                })),
-            },
-            recovery: None,
-            changed_files: vec![path],
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        },
-    }
-}
-
-async fn assert_persisted_completed_item(
-    crud_store: &CrudStore,
-    thread_id: &str,
-    turn_id: &str,
-    item_id: &str,
-) {
-    let item_events = crud_store
-        .get_turn_item_events(thread_id, turn_id)
-        .await
-        .expect("turn item events should be readable")
-        .expect("turn item events should exist");
-    assert!(
-        item_events.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::ItemCompleted { item, .. } if item.item_id() == item_id
-        )),
-        "completed item {item_id} should be persisted before artifact registration assertions"
-    );
-}
-
 async fn materialize_artifact_api_thread(
     crud_store: &CrudStore,
     workspace_id: &str,
@@ -10041,184 +9844,6 @@ async fn followup_turn_history_includes_inline_assistant_artifact_ref() {
     );
     assert!(!assistant_history_message.content.contains("artifact_read"));
     assert!(assistant_history_message.content_parts.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_file_created_completed_item_does_not_register_artifact() {
-    let (processor, crud_store, workspace_id, thread_id, turn_id) =
-        setup_write_file_artifact_registration_gateway("created").await;
-    let item_id = "write_created_art";
-    let bytes = b"# Created\n";
-    let path = write_file_artifact_test_path("created", "created.md");
-    std::fs::write(path.as_path(), bytes).expect("write_file artifact test file should exist");
-
-    let notification = write_file_completed_notification(
-        workspace_id.as_str(),
-        thread_id.as_str(),
-        turn_id.as_str(),
-        item_id,
-        path.as_path(),
-        "created",
-        bytes,
-    );
-    processor
-        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted { notification })
-        .await;
-    assert_persisted_completed_item(
-        crud_store.as_ref(),
-        thread_id.as_str(),
-        turn_id.as_str(),
-        item_id,
-    )
-    .await;
-
-    let page = processor
-        .artifact_service
-        .list_thread_artifacts(
-            workspace_id.as_str(),
-            thread_id.as_str(),
-            pioneer_artifacts::ArtifactListFilter::default(),
-        )
-        .await
-        .expect("thread artifacts should remain listable after write_file create");
-
-    assert!(page.items.is_empty());
-    assert_eq!(
-        crud_store
-            .count_artifacts_by_workspace(workspace_id.as_str())
-            .await
-            .expect("artifact count should be readable after write_file create"),
-        0
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_file_overwrite_completed_item_does_not_register_artifact() {
-    let (processor, crud_store, workspace_id, thread_id, turn_id) =
-        setup_write_file_artifact_registration_gateway("overwrite").await;
-    let path = write_file_artifact_test_path("overwrite", "existing.md");
-    let initial_bytes = b"initial\n";
-    std::fs::write(path.as_path(), initial_bytes)
-        .expect("write_file created artifact test file should exist");
-
-    processor
-        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
-            notification: write_file_completed_notification(
-                workspace_id.as_str(),
-                thread_id.as_str(),
-                turn_id.as_str(),
-                "write_created_once",
-                path.as_path(),
-                "created",
-                initial_bytes,
-            ),
-        })
-        .await;
-    assert_persisted_completed_item(
-        crud_store.as_ref(),
-        thread_id.as_str(),
-        turn_id.as_str(),
-        "write_created_once",
-    )
-    .await;
-    assert_eq!(
-        crud_store
-            .count_artifacts_by_workspace(workspace_id.as_str())
-            .await
-            .expect("artifact count should be readable after create"),
-        0
-    );
-
-    let overwritten_bytes = b"overwritten\n";
-    std::fs::write(path.as_path(), overwritten_bytes)
-        .expect("write_file overwritten artifact test file should update");
-    processor
-        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted {
-            notification: write_file_completed_notification(
-                workspace_id.as_str(),
-                thread_id.as_str(),
-                turn_id.as_str(),
-                "write_overwrite_one",
-                path.as_path(),
-                "overwritten",
-                overwritten_bytes,
-            ),
-        })
-        .await;
-    assert_persisted_completed_item(
-        crud_store.as_ref(),
-        thread_id.as_str(),
-        turn_id.as_str(),
-        "write_overwrite_one",
-    )
-    .await;
-
-    let page = processor
-        .artifact_service
-        .list_thread_artifacts(
-            workspace_id.as_str(),
-            thread_id.as_str(),
-            pioneer_artifacts::ArtifactListFilter::default(),
-        )
-        .await
-        .expect("thread artifacts should remain listable after overwrite");
-    assert!(page.items.is_empty());
-    assert_eq!(
-        crud_store
-            .count_artifacts_by_workspace(workspace_id.as_str())
-            .await
-            .expect("artifact count should be readable after overwrite"),
-        0
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn edit_file_completed_item_does_not_register_artifact() {
-    let (processor, crud_store, workspace_id, thread_id, turn_id) =
-        setup_write_file_artifact_registration_gateway("edit").await;
-    let item_id = "edit_file_art";
-    let before_bytes = b"old\n";
-    let after_bytes = b"new\n";
-    let path = write_file_artifact_test_path("edit", "existing.md");
-    std::fs::write(path.as_path(), after_bytes).expect("edit_file artifact test file should exist");
-
-    let notification = edit_file_completed_notification(
-        workspace_id.as_str(),
-        thread_id.as_str(),
-        turn_id.as_str(),
-        item_id,
-        path.as_path(),
-        before_bytes,
-        after_bytes,
-    );
-    processor
-        .handle_durable_agent_event(AgentDurableEvent::ItemCompleted { notification })
-        .await;
-    assert_persisted_completed_item(
-        crud_store.as_ref(),
-        thread_id.as_str(),
-        turn_id.as_str(),
-        item_id,
-    )
-    .await;
-
-    let page = processor
-        .artifact_service
-        .list_thread_artifacts(
-            workspace_id.as_str(),
-            thread_id.as_str(),
-            pioneer_artifacts::ArtifactListFilter::default(),
-        )
-        .await
-        .expect("thread artifacts should remain listable after edit_file");
-    assert!(page.items.is_empty());
-    assert_eq!(
-        crud_store
-            .count_artifacts_by_workspace(workspace_id.as_str())
-            .await
-            .expect("artifact count should be readable after edit_file"),
-        0
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -20677,7 +20302,10 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 test_context_budget(),
                 test_tool_loop_config(),
             )
-            .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+            .with_cli_runtime_manager_for_tests(cli_manager.clone())
+            .with_cli_mcp_readiness_override_for_tests(
+                supported_test_cli_mcp_readiness(runtime_kind),
+            ),
         ));
         processor
             .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
@@ -21059,7 +20687,10 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
             test_context_budget(),
             test_tool_loop_config(),
         )
-        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+        .with_cli_runtime_manager_for_tests(cli_manager.clone())
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+            CLIAgentRuntimeKind::Claude,
+        )),
     ));
     processor
         .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
@@ -21228,7 +20859,10 @@ async fn assert_detached_native_child_turn_cancellation() {
             test_context_budget(),
             test_tool_loop_config(),
         )
-        .with_cli_runtime_manager_for_tests(cli_manager),
+        .with_cli_runtime_manager_for_tests(cli_manager)
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+            CLIAgentRuntimeKind::Claude,
+        )),
     ));
     processor
         .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
@@ -26721,6 +26355,48 @@ async fn start_terminal_test_execution_window(
         .await;
 }
 
+fn apply_patch_completed_notification(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    path: &std::path::Path,
+    operation: &str,
+    bytes: &[u8],
+) -> ItemCompletedNotification {
+    let path = path.display().to_string();
+    ItemCompletedNotification {
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        item: TurnItem::FileChange {
+            id: item_id.to_owned(),
+            tool_name: "apply_patch".to_owned(),
+            arguments: json!({"input": "*** Begin Patch\n*** End Patch"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            display: Default::default(),
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(json!({
+                    "changedFiles": [path.clone()],
+                    "operation": operation,
+                    "bytesWritten": bytes.len(),
+                    "sha256": hex::encode(Sha256::digest(bytes))
+                })),
+            },
+            recovery: None,
+            changed_files: vec![path],
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        },
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_turn_completion_closes_running_execution_window() {
     let thread_id = "thr_window_terminal_complete";
@@ -26754,7 +26430,7 @@ async fn terminal_turn_completion_closes_running_execution_window() {
         .expect("reasoning item should persist");
     crud_store
         .materialize_item_completed(
-            write_file_completed_notification(
+            apply_patch_completed_notification(
                 workspace_id.as_str(),
                 thread_id,
                 turn_id,
@@ -30486,7 +30162,7 @@ fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile() {
 }
 
 async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile_impl() {
-    let mut harness = setup_cli_runtime_security_harness().await;
+    let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
     seed_cli_runtime_security_thread(
         &harness,
         "thread_codex_full_access",
@@ -30725,7 +30401,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
     const SKILL_BODY: &str =
         "Before publishing a release, calculate and verify the artifact checksum.";
 
-    let mut harness = setup_cli_runtime_security_harness().await;
+    let mut harness = setup_cli_runtime_security_harness(None).await;
     let learning_provider = Arc::new(VerticalSelfImprovementProvider::new());
     harness
         .provider_registry
@@ -31502,7 +31178,7 @@ fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
 }
 
 async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl() {
-    let mut harness = setup_cli_runtime_security_harness().await;
+    let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
     seed_cli_runtime_security_thread(
         &harness,
         "thread_codex_supervised",
@@ -31590,7 +31266,7 @@ fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_ca
 }
 
 async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call_impl() {
-    let mut harness = setup_cli_runtime_security_harness().await;
+    let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Claude)).await;
     seed_cli_runtime_security_thread(
         &harness,
         "thread_claude_supervised",
@@ -31647,7 +31323,7 @@ fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
 }
 
 async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl() {
-    let mut harness = setup_cli_runtime_security_harness().await;
+    let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Claude)).await;
     seed_cli_runtime_security_thread(
         &harness,
         "thread_claude_legacy_sandbox",
@@ -31716,7 +31392,7 @@ fn turn_start_unavailable_sandbox_is_rejected_before_canonical_writes() {
 }
 
 async fn turn_start_unavailable_sandbox_is_rejected_before_canonical_writes_impl() {
-    let mut harness = setup_cli_runtime_security_harness().await;
+    let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Claude)).await;
     let thread_id = "thread_security_audit_claude";
     let turn_id = "turn_security_audit_claude";
     seed_cli_runtime_security_thread(
@@ -43219,6 +42895,237 @@ async fn thread_history_is_not_a_reachable_timeline_api() {
             .contains("thread/history"),
         "unmapped methods must use the same bounded non-reflecting response"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_history_rpc_reads_persisted_steps_records_files_and_diffs() {
+    let thread_id = "thr_patch_history_rpc";
+    let turn_id = "turn_patch_history_rpc";
+    let (processor, crud_store, _workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    let (tx, mut rx) = mpsc::channel(16);
+    let connection_id =
+        register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
+
+    let before = pioneer_tools::apply_patch::history::CommittedTextSnapshot::from_bytes(
+        b"before\n".to_vec(),
+        pioneer_tools::apply_patch::history::TextEncoding::Utf8,
+        pioneer_tools::apply_patch::history::LineEndingMetadata {
+            dominant: pioneer_tools::apply_patch::history::LineEnding::Lf,
+            mixed: false,
+            final_newline: true,
+        },
+    );
+    let after = pioneer_tools::apply_patch::history::CommittedTextSnapshot::from_bytes(
+        b"after\n".to_vec(),
+        pioneer_tools::apply_patch::history::TextEncoding::Utf8,
+        pioneer_tools::apply_patch::history::LineEndingMetadata {
+            dominant: pioneer_tools::apply_patch::history::LineEnding::Lf,
+            mixed: false,
+            final_newline: true,
+        },
+    );
+    let committed_change = pioneer_tools::apply_patch::history::CommittedPatchChange {
+        operation_index: 0,
+        commit_step: 0,
+        sequence: 0,
+        kind: pioneer_tools::apply_patch::history::ChangeKind::Update,
+        source_path: "src/lib.rs".to_owned(),
+        destination_path: None,
+        before: Some(before.clone()),
+        after: Some(after.clone()),
+        overwritten_destination: None,
+        side_effects: pioneer_tools::apply_patch::history::PatchSideEffects::default(),
+    };
+    let identity = pioneer_tools::apply_patch::history::InvocationIdentity::new(
+        thread_id,
+        turn_id,
+        "inv_patch_history_rpc",
+    )
+    .unwrap();
+    let mut record = pioneer_tools::apply_patch::history::AppliedPatchRecord::new(
+        identity.clone(),
+        pioneer_tools::apply_patch::history::CommitOrdinal(0),
+        pioneer_tools::apply_patch::history::AppliedPatchRecordOutcome::Applied,
+        vec![pioneer_tools::apply_patch::history::DurablePatchChange::from(&committed_change)],
+    );
+    record.environment_id = "workspace".to_owned();
+    record.committed_at_unix_ms = 1_700_000_000_000;
+    record.side_effects.residual_directories = vec!["residual-parent".to_owned()];
+    let records = pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(
+        crud_store.database_connection(),
+    );
+    records
+        .insert_with_snapshots(
+            record,
+            [7; 32],
+            &pioneer_tools::apply_patch::history::SnapshotDomain::new(
+                format!("thread:{thread_id}"),
+                "pioneer",
+                "thread_history",
+            ),
+            &[before, after],
+        )
+        .await
+        .expect("persist test patch record and snapshots");
+    let record_id = pioneer_tools::apply_patch::history::applied_patch_record_id(&identity, 0);
+
+    let requests = [
+        json!({
+            "jsonrpc": "2.0", "id": "patchstepsrpc00000001", "method": "turn/patch_steps/page",
+            "params": {"threadId": thread_id, "turnId": turn_id}
+        }),
+        json!({
+            "jsonrpc": "2.0", "id": "patchrecordrpc0000001", "method": "turn/patch_record/get",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "selector": {"kind": "record_id", "recordId": record_id}
+        }}),
+        json!({
+            "jsonrpc": "2.0", "id": "patchdiffrpc000000001", "method": "turn/patch_diff/get",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "selection": {"kind": "record", "selector": {"kind": "invocation", "invocationId": "inv_patch_history_rpc"}}
+        }}),
+        json!({
+            "jsonrpc": "2.0", "id": "patchfilerpc000000001", "method": "thread/file_patch_history/page",
+            "params": {"threadId": thread_id, "path": "src/lib.rs"}
+        }),
+        json!({
+            "jsonrpc": "2.0", "id": "patchthreadrpc0000001", "method": "thread/patch_steps/page",
+            "params": {"threadId": thread_id}
+        }),
+    ];
+    for request in requests {
+        processor
+            .process_request_for_connection(connection_id, &request.to_string())
+            .await;
+    }
+
+    let steps = recv_response_by_id(&mut rx, "patchstepsrpc00000001").await;
+    let steps: pioneer_protocol::TurnPatchStepsPageResponse =
+        serde_json::from_value(steps.result).expect("turn patch steps response");
+    assert_eq!(steps.items.len(), 1);
+    assert!(steps.coverage.exact);
+    assert!(matches!(
+        steps.coverage.exactness,
+        pioneer_protocol::TurnDiffExactnessView::EngineVerified
+    ));
+
+    let record_response = recv_response_by_id(&mut rx, "patchrecordrpc0000001").await;
+    let record_response: pioneer_protocol::TurnPatchRecordGetResponse =
+        serde_json::from_value(record_response.result).expect("patch record response");
+    assert_eq!(record_response.record.record_id, record_id);
+    assert_eq!(record_response.record.changes.len(), 1);
+    assert_eq!(
+        record_response.record.side_effects.residual_directories,
+        vec!["residual-parent"]
+    );
+
+    let diff = recv_response_by_id(&mut rx, "patchdiffrpc000000001").await;
+    let diff: pioneer_protocol::TurnPatchDiffGetResponse =
+        serde_json::from_value(diff.result).expect("patch diff response");
+    assert!(diff.unified_patch.contains("-before\n"));
+    assert!(diff.unified_patch.contains("+after\n"));
+    assert_eq!(diff.records_rendered, 1);
+
+    let file = recv_response_by_id(&mut rx, "patchfilerpc000000001").await;
+    let file: pioneer_protocol::ThreadFilePatchHistoryPageResponse =
+        serde_json::from_value(file.result).expect("file patch history response");
+    assert_eq!(file.items.len(), 1);
+    assert_eq!(file.items[0].change.source_path, "src/lib.rs");
+
+    let thread = recv_response_by_id(&mut rx, "patchthreadrpc0000001").await;
+    let thread: pioneer_protocol::ThreadPatchStepsPageResponse =
+        serde_json::from_value(thread.result).expect("thread patch steps response");
+    assert_eq!(thread.items.len(), 1);
+
+    let foreign_request = json!({
+        "jsonrpc": "2.0",
+        "id": "patchforeignrpc000001",
+        "method": "turn/patch_record/get",
+        "params": {
+            "threadId": thread_id,
+            "turnId": "turn_not_owned",
+            "selector": {"kind": "record_id", "recordId": record_id}
+        }
+    });
+    processor
+        .process_request_for_connection(connection_id, &foreign_request.to_string())
+        .await;
+    let foreign = recv_error_by_id(&mut rx, "patchforeignrpc000001").await;
+    assert_eq!(foreign.error.code, pioneer_protocol::NOT_FOUND_CODE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_history_rpc_keeps_codex_aggregate_only_provenance() {
+    let thread_id = "thr_patch_history_codex";
+    let turn_id = "turn_patch_history_codex";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let connection_id =
+        register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
+    let event = pioneer_tools::apply_patch::history::normalize_codex_diff_updated(
+        pioneer_tools::apply_patch::history::CodexAggregateEventContext {
+            workspace_id,
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            protocol_revision:
+                pioneer_tools::apply_patch::history::CODEX_TURN_DIFF_PROTOCOL_REVISION.to_owned(),
+            event_id: Some("codex-history-event".to_owned()),
+            revision: Some(1),
+        },
+        &json!({
+            "diff": "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+            "exact": true
+        }),
+    )
+    .expect("normalize Codex aggregate");
+    pioneer_tools::apply_patch::history::SqliteCodexAggregateStore::new(
+        crud_store.database_connection(),
+    )
+    .ingest_event(&event)
+    .await
+    .expect("persist Codex aggregate");
+
+    let steps_request = json!({
+        "jsonrpc": "2.0", "id": "codexstepsrpc00000001", "method": "turn/patch_steps/page",
+        "params": {"threadId": thread_id, "turnId": turn_id}
+    });
+    processor
+        .process_request_for_connection(connection_id, &steps_request.to_string())
+        .await;
+    let steps = recv_response_by_id(&mut rx, "codexstepsrpc00000001").await;
+    let steps: pioneer_protocol::TurnPatchStepsPageResponse =
+        serde_json::from_value(steps.result).expect("Codex step response");
+    assert!(steps.items.is_empty());
+    assert!(matches!(
+        steps.coverage.coverage,
+        pioneer_protocol::PatchHistoryCoverageView::AggregateOnly { ref provider, ref protocol }
+            if provider == "codex"
+                && protocol == pioneer_tools::apply_patch::history::CODEX_TURN_DIFF_PROTOCOL_REVISION
+    ));
+    assert!(matches!(
+        steps.coverage.exactness,
+        pioneer_protocol::TurnDiffExactnessView::ProviderReported { ref provider, .. }
+            if provider == "codex"
+    ));
+
+    let diff_request = json!({
+        "jsonrpc": "2.0", "id": "codexdiffrpc000000001", "method": "turn/patch_diff/get",
+        "params": {"threadId": thread_id, "turnId": turn_id, "selection": {"kind": "boundary"}}
+    });
+    processor
+        .process_request_for_connection(connection_id, &diff_request.to_string())
+        .await;
+    let diff = recv_response_by_id(&mut rx, "codexdiffrpc000000001").await;
+    let diff: pioneer_protocol::TurnPatchDiffGetResponse =
+        serde_json::from_value(diff.result).expect("Codex aggregate diff response");
+    assert_eq!(diff.records_rendered, 0);
+    assert!(diff.unified_patch.contains("+new"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

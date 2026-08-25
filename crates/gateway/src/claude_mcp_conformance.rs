@@ -48,7 +48,7 @@ pub struct ClaudeMcpDeterministicEvidence {
     pub changed_projection_requires_restart: bool,
     pub provider_session_identity_preserved: bool,
     pub concurrent_projections_isolated: bool,
-    pub empty_projection_is_empty: bool,
+    pub empty_projection_keeps_native_file_tools: bool,
     pub strict_managed_config_isolated: bool,
     pub mixed_skill_server_preflight_preserved: bool,
     pub mixed_skill_tool_preflight_preserved: bool,
@@ -97,26 +97,40 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
     let empty_launch =
         build_claude_mcp_session_launch_projection(empty_projection, provider_contract.clone())?;
 
-    let qualified_a = launch_a.preflight.allowed_tool_names[0].clone();
-    let qualified_b = launch_b.preflight.allowed_tool_names[0].clone();
+    let qualified_a = format!("mcp__pioneer__{callable_a}");
+    let qualified_b = format!("mcp__pioneer__{callable_b}");
     ensure!(
-        qualified_a == format!("mcp__pioneer__{callable_a}")
-            && qualified_b == format!("mcp__pioneer__{callable_b}"),
+        launch_a.preflight.allowed_tool_names.contains(&qualified_a)
+            && launch_b.preflight.allowed_tool_names.contains(&qualified_b)
+            && launch_a
+                .preflight
+                .allowed_tool_names
+                .contains(&"mcp__pioneer__apply_patch".to_owned())
+            && launch_a
+                .preflight
+                .allowed_tool_names
+                .contains(&"mcp__pioneer__read_file".to_owned()),
         "Claude exact preallow names drifted"
     );
 
     let facade_limits =
-        crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(1);
+        crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits::transport_bounded(8);
     let facade_a = launch_a.facade_projection(facade_limits)?;
     let facade_b = launch_b.facade_projection(facade_limits)?;
     let empty_facade = empty_launch.facade_projection(facade_limits)?;
     ensure!(
-        facade_a.tools().len() == 1 && facade_a.contains_tool(callable_a.as_str()),
-        "Claude A projection must expose exactly A"
+        facade_a.tools().len() == 3
+            && facade_a.contains_tool(callable_a.as_str())
+            && facade_a.contains_tool("read_file")
+            && facade_a.contains_tool("apply_patch"),
+        "Claude A projection must expose A and the two native file tools"
     );
     ensure!(
-        facade_b.tools().len() == 1 && facade_b.contains_tool(callable_b.as_str()),
-        "Claude B projection must expose exactly B"
+        facade_b.tools().len() == 3
+            && facade_b.contains_tool(callable_b.as_str())
+            && facade_b.contains_tool("read_file")
+            && facade_b.contains_tool("apply_patch"),
+        "Claude B projection must expose B and the two native file tools"
     );
     let concurrent_projections_isolated = !facade_a.contains_tool(callable_b.as_str())
         && !facade_b.contains_tool(callable_a.as_str());
@@ -124,11 +138,17 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
         concurrent_projections_isolated,
         "parallel Claude projections must remain disjoint"
     );
-    let empty_projection_is_empty =
-        empty_facade.tools().is_empty() && empty_launch.preflight.allowed_tool_names.is_empty();
+    let empty_projection_keeps_native_file_tools = empty_facade.tools().len() == 2
+        && empty_facade.contains_tool("read_file")
+        && empty_facade.contains_tool("apply_patch")
+        && empty_launch.preflight.allowed_tool_names
+            == [
+                "mcp__pioneer__apply_patch".to_owned(),
+                "mcp__pioneer__read_file".to_owned(),
+            ];
     ensure!(
-        empty_projection_is_empty,
-        "empty Claude projection exposed a tool"
+        empty_projection_keeps_native_file_tools,
+        "empty Claude external projection must retain native file tools"
     );
 
     let temporary = tempfile::tempdir().context("create Claude conformance root")?;
@@ -167,6 +187,9 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
         &exact_descriptor,
         &launch_a.preflight.allowed_tool_names,
     )?;
+    let expected_exact_args = std::iter::once("--allowedTools".to_owned())
+        .chain(launch_a.preflight.allowed_tool_names.clone())
+        .collect::<Vec<_>>();
     let strict_managed_config_isolated =
         exact_document["mcpServers"]
             .as_object()
@@ -176,7 +199,7 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
                     && !servers.contains_key("unmanaged_pioneer_sentinel")
             })
             && empty_document == json!({"mcpServers": {}})
-            && exact_args == ["--allowedTools", qualified_a.as_str()]
+            && exact_args == expected_exact_args
             && !exact_document.to_string().contains("malicious_sentinel");
     ensure!(
         strict_managed_config_isolated,
@@ -386,7 +409,7 @@ pub async fn run_claude_mcp_deterministic_conformance() -> Result<ClaudeMcpDeter
         provider_session_identity_preserved,
         concurrent_projections_isolated: concurrent_projections_isolated
             && bridge.concurrent_isolation_observed,
-        empty_projection_is_empty,
+        empty_projection_keeps_native_file_tools,
         strict_managed_config_isolated,
         mixed_skill_server_preflight_preserved,
         mixed_skill_tool_preflight_preserved,

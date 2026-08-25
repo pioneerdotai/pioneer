@@ -3680,7 +3680,13 @@ impl MessageProcessor {
             let mut codex_mcp_launch_projection = None;
             let mut claude_mcp_launch_projection = None;
             if let Some(projection) = plan.mcp_projection.as_ref() {
-                let has_mcp_projection = requested_mcp || !projection.tools.is_empty();
+                // Managed Claude always receives the reserved first-party
+                // filesystem facade, even when the user selected no external
+                // MCP server.  Codex keeps its provider-owned aggregate path
+                // and therefore retains the old requested/selected gate.
+                let has_mcp_projection = requested_mcp
+                    || !projection.tools.is_empty()
+                    || runtime_kind == CLIAgentRuntimeKind::Claude;
                 if has_mcp_projection {
                     let validation =
                         crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
@@ -4789,7 +4795,7 @@ impl MessageProcessor {
                 };
                 if persisted.turn_id != outcome.started_notification.turn.id
                     || persisted.manifest_hash != projection.manifest_hash
-                    || persisted.tool_count != projection.tools.len()
+                    || persisted.tool_count != provider_bindings.len().max(projection.tools.len())
                 {
                     self.mark_turn_blocked(
                         outcome.started_notification.thread_id.clone(),

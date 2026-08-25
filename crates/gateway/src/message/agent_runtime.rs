@@ -1,10 +1,16 @@
 use super::cli_runtime::CLIRuntimeObservationGapReconciliation;
 use super::turn_handlers::CliRuntimeRecoveryStartFailure;
 use super::*;
+use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt};
+use pioneer_tools::apply_patch::history::{
+    AppliedPatchDelta, AppliedPatchRecord, PatchHistoryProvenance, SnapshotDomain,
+    SqliteAppliedPatchStore, SqliteCommitIntentStore, StoredPatchRecord, TurnDiffAuthority,
+};
 use sha2::{Digest, Sha256};
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
@@ -73,6 +79,74 @@ fn turn_llm_context_delivery_key(parts: &[&str]) -> String {
         hasher.update([0]);
     }
     hex::encode(hasher.finalize())
+}
+
+fn native_patch_history_from_item(
+    item: &pioneer_protocol::TurnItem,
+) -> Result<Option<(AppliedPatchRecord, [u8; 32], AppliedPatchDelta)>> {
+    let pioneer_protocol::TurnItem::FileChange {
+        tool_name,
+        storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
+        ..
+    } = item
+    else {
+        return Ok(None);
+    };
+    if tool_name != "apply_patch" {
+        return Ok(None);
+    }
+    let metadata_json = metadata.to_json();
+    let Some(history) = metadata_json.get("patchHistory") else {
+        return Ok(None);
+    };
+    let Some(record) = history.get("record") else {
+        return Err(anyhow::anyhow!(
+            "native apply_patch history metadata is missing its record"
+        ));
+    };
+    let record: AppliedPatchRecord =
+        serde_json::from_value(record.clone()).context("decode native applied patch record")?;
+    let fingerprint_text = history
+        .get("plan_fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("native apply_patch history is missing plan fingerprint"))?;
+    let fingerprint_bytes =
+        hex::decode(fingerprint_text).context("decode native apply_patch plan fingerprint")?;
+    let plan_fingerprint: [u8; 32] = fingerprint_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("native apply_patch plan fingerprint must be 32 bytes"))?;
+    // Exact committed bytes are never copied into the model-visible tool
+    // result or the durable turn item.  The gateway reads the durable intent
+    // progress below; older/in-process envelopes may still carry a delta, so
+    // accept it when present and otherwise use an empty marker for fallback.
+    let mut delta = history
+        .get("delta")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decode native applied patch delta")?
+        .unwrap_or_else(AppliedPatchDelta::empty);
+    // The durable record intentionally contains only content-addressed
+    // references.  During the same process, the tool runtime can hand the
+    // exact committed prefix to the lifecycle consumer through its bounded
+    // registry; this avoids copying source bytes through protocol items while
+    // still preserving partial-step history.  After restart the SQLite intent
+    // recovery plan remains the authoritative fallback.
+    if let Some((_, committed_changes)) =
+        pioneer_tools::native_patch_history_record(&record.identity)
+    {
+        if !committed_changes.is_empty() {
+            delta = AppliedPatchDelta::from_changes(committed_changes);
+        }
+    }
+    Ok(Some((record, plan_fingerprint, delta)))
+}
+
+fn native_patch_call_id(item: &pioneer_protocol::TurnItem) -> Option<&str> {
+    let pioneer_protocol::TurnItem::FileChange { id, tool_name, .. } = item else {
+        return None;
+    };
+    (tool_name == "apply_patch").then_some(id.as_str())
 }
 
 fn execution_window_started_metadata(runtime_window_id: &str) -> serde_json::Value {
@@ -1747,6 +1821,272 @@ impl MessageProcessor {
         });
     }
 
+    async fn persist_native_patch_history(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item: &pioneer_protocol::TurnItem,
+    ) -> Result<()> {
+        let parsed = native_patch_history_from_item(item)?;
+        let Some((record, plan_fingerprint, delta)) = parsed else {
+            // If terminal observer publication failed after the durable record
+            // was inserted, the model-visible item may not contain a history
+            // envelope.  Reconcile the aggregate from that existing record;
+            // never execute the patch again and never fabricate a record.
+            let Some(call_id) = native_patch_call_id(item) else {
+                return Ok(());
+            };
+            let identity = pioneer_tools::apply_patch::history::InvocationIdentity::new(
+                thread_id.to_owned(),
+                turn_id.to_owned(),
+                call_id.to_owned(),
+            )
+            .map_err(|error| anyhow::anyhow!("invalid native patch identity: {error}"))?;
+            let store = SqliteAppliedPatchStore::new(self.crud_store.database_connection());
+            if store.get(&identity).await?.is_some() {
+                self.project_native_patch_projection(&thread_id, &turn_id, false)
+                    .await?;
+            }
+            return Ok(());
+        };
+        let call_id = native_patch_call_id(item)
+            .ok_or_else(|| anyhow::anyhow!("native apply_patch item is missing its call id"))?;
+        if record.identity.thread_id != thread_id
+            || record.identity.turn_id != turn_id
+            || record.identity.invocation_id != call_id
+        {
+            bail!("native apply_patch history identity does not match the owning turn item");
+        }
+        let thread_id = record.identity.thread_id.clone();
+        let turn_id = record.identity.turn_id.clone();
+        let store = SqliteAppliedPatchStore::new(self.crud_store.database_connection());
+        let intent_store = SqliteCommitIntentStore::new(self.crud_store.database_connection());
+        // Lifecycle delivery is at-least-once.  A repeated ItemCompleted
+        // notification must reuse the immutable record that was already
+        // promoted instead of minting a new timestamp/metadata tuple and
+        // turning an otherwise harmless replay into a conflicting duplicate.
+        if let Some(existing) = store.get(&record.identity).await? {
+            if existing.plan_fingerprint != plan_fingerprint {
+                bail!("native apply_patch invocation was replayed with a different immutable plan");
+            }
+            // The operational intent may already have been compacted into its
+            // terminal marker.  In that case there is deliberately no row to
+            // update; the immutable record is the idempotency authority.
+            if let Some(mut promoted) = intent_store.get(&record.identity).await?
+                && matches!(
+                    promoted.status,
+                    pioneer_tools::apply_patch::history::IntentStatus::Pending
+                )
+            {
+                promoted.status = pioneer_tools::apply_patch::history::IntentStatus::Promoted;
+                intent_store.update_progress(&promoted).await?;
+                intent_store.compact_terminal(&record.identity).await?;
+            }
+            // Promotion and live projection are separate durable steps.  A
+            // crash or projection error may leave the record visible while
+            // the aggregate row is absent; repair it from the immutable log.
+            self.project_native_patch_projection(&thread_id, &turn_id, false)
+                .await?;
+            // A duplicated item/completed delivery is not a turn terminal
+            // event.  It must not freeze the live projection while later
+            // patch invocations in the same turn are still allowed to append.
+            // The dedicated TurnCompleted/TurnFailed/TurnBlocked handlers
+            // perform finalization once the whole turn is terminal.
+            return Ok(());
+        }
+        let intent = intent_store
+            .get(&record.identity)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("native apply_patch durable intent is missing"))?;
+        let mut record = record;
+        // The durable observer allocates the ordinal only after the executor
+        // has acquired and revalidated its complete target lock set.  The
+        // persisted intent remains authoritative across restart and replay.
+        record.commit_ordinal = intent.commit_ordinal;
+        if let Some(plan) = intent.recovery_plan.as_ref() {
+            record.environment_id = plan.environment_id.clone();
+            record.authority = plan.authority;
+        }
+        record.provenance = PatchHistoryProvenance::NativeEngine;
+        record.committed_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let delta = if !delta.is_empty() {
+            delta
+        } else if !intent.committed_changes.is_empty() {
+            AppliedPatchDelta {
+                changes: intent.committed_changes.clone(),
+                exact: record.exactness.is_exact(),
+                side_effects: pioneer_tools::apply_patch::history::PatchSideEffects {
+                    exact: record.exactness.is_exact(),
+                    ..Default::default()
+                },
+            }
+        } else {
+            // If the process-local observer has a record but its SQLite
+            // promotion was interrupted, recover the exact snapshots from
+            // content-addressed storage. Never substitute the pre-mutation
+            // recovery plan: contextual Update may have been replanned against
+            // unrelated edits, so that plan can describe different bytes.
+            store
+                .materialize_delta(&StoredPatchRecord {
+                    record: record.clone(),
+                    plan_fingerprint,
+                })
+                .await?
+        };
+        let domain =
+            SnapshotDomain::new(format!("thread:{thread_id}"), "pioneer", "thread_history");
+        let snapshots = delta
+            .changes
+            .iter()
+            .flat_map(|change| {
+                [
+                    change.before.as_ref(),
+                    change.after.as_ref(),
+                    change.overwritten_destination.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .cloned()
+            })
+            .collect::<Vec<_>>();
+        let _inserted = store
+            .insert_with_snapshots(
+                record.clone(),
+                plan_fingerprint,
+                &domain,
+                snapshots.as_slice(),
+            )
+            .await?;
+        let mut promoted = intent;
+        promoted.committed_changes = delta.changes.clone();
+        promoted.status = pioneer_tools::apply_patch::history::IntentStatus::Promoted;
+        intent_store.update_progress(&promoted).await?;
+        self.project_native_patch_projection(&thread_id, &turn_id, false)
+            .await?;
+        intent_store.compact_terminal(&record.identity).await?;
+        Ok(())
+    }
+
+    async fn project_native_patch_projection(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        final_state: bool,
+    ) -> Result<()> {
+        let db = self.crud_store.database_connection();
+        let records = SqliteAppliedPatchStore::new(db.clone());
+        let intent_store = SqliteCommitIntentStore::new(self.crud_store.database_connection());
+        let existing_projection =
+            pioneer_tools::apply_patch::history::SqliteTurnDiffStore::new(db.clone())
+                .get(thread_id, turn_id)
+                .await?;
+        let (record_count, _) = records.record_summary_for_turn(thread_id, turn_id).await?;
+        let status_ordinal = intent_store
+            .max_ordinal_for_turn(thread_id, turn_id)
+            .await?;
+        // Terminal Agent events are shared by native and CLI-provider turns.
+        // A Codex turn has its own AggregateOnly store and no native records or
+        // intents; manufacturing an empty NativePatchEngine row here would
+        // create two competing diff authorities for the same turn.
+        if !has_native_patch_projection_source(
+            existing_projection.is_some(),
+            record_count,
+            status_ordinal,
+        ) {
+            return Ok(());
+        }
+        let authority = intent_store
+            .authority_for_turn(thread_id, turn_id)
+            .await?
+            .unwrap_or(TurnDiffAuthority::NativePatchEngine);
+        let state = crate::patch_history_observer::SqlitePatchObserver::project_live(
+            db,
+            thread_id.to_owned(),
+            turn_id.to_owned(),
+            authority,
+            final_state,
+        )
+        .await?;
+        self.publish_native_patch_projection(&state).await
+    }
+
+    async fn publish_native_patch_projection(
+        &self,
+        state: &pioneer_tools::apply_patch::history::TurnDiffState,
+    ) -> Result<()> {
+        let Some((stored_thread_id, workspace_id)) = self
+            .crud_store
+            .get_turn_location(state.turn_id.as_str())
+            .await?
+        else {
+            bail!("native patch projection turn is missing");
+        };
+        if stored_thread_id != state.thread_id {
+            bail!("native patch projection turn belongs to a different thread");
+        }
+        let payload = pioneer_tools::apply_patch::history::AgentDiffUpdatedProjection::from(state);
+        let item = pioneer_protocol::TurnItem::SystemEvent {
+            id: crate::cli_runtime::projector::agent_diff_item_id_for_native_turn_id(
+                state.turn_id.as_str(),
+            ),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Diff updated".to_owned(),
+            code: Some("agent_diff_updated".to_owned()),
+            details: Some(serde_json::json!({
+                "status": if state.final_state { "final" } else { "updated" },
+                "nativeItemKind": "turn/diff/updated",
+                "payload": payload,
+            })),
+        };
+        self.handle_snapshot_agent_event(
+            crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated {
+                notification: pioneer_protocol::ItemUpdatedNotification {
+                    workspace_id,
+                    thread_id: state.thread_id.clone(),
+                    turn_id: state.turn_id.clone(),
+                    item,
+                },
+            },
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn finalize_native_patch_projection(&self, thread_id: &str, turn_id: &str) -> Result<()> {
+        self.project_native_patch_projection(thread_id, turn_id, true)
+            .await
+    }
+
+    async fn admit_native_patch_intent(
+        &self,
+        notification: &pioneer_protocol::ItemStartedNotification,
+    ) -> Result<()> {
+        let Some(call_id) = native_patch_call_id(&notification.item) else {
+            return Ok(());
+        };
+        let identity = pioneer_tools::apply_patch::history::InvocationIdentity::new(
+            notification.thread_id.clone(),
+            notification.turn_id.clone(),
+            call_id.to_owned(),
+        )
+        .map_err(|error| anyhow::anyhow!("invalid native patch identity: {error}"))?;
+        // ItemStarted delivery is at-least-once.  Do not reject a replay just
+        // because the durable record or intent already exists: the canonical
+        // apply_patch observer performs the immutable-plan check and returns
+        // the existing result (or a fail-closed recovery error) without
+        // touching the workspace.
+        let admission_permit = reserve_patch_history_capacity().await?;
+        let observer = Arc::new(SqlitePatchObserver::new(
+            self.crud_store.database_connection(),
+            identity.clone(),
+            admission_permit,
+        ));
+        if !pioneer_tools::register_native_patch_observer(&identity, observer) {
+            bail!("native apply_patch observer admission capacity is exhausted");
+        }
+        Ok(())
+    }
+
     async fn materialize_native_agent_turn_event(
         &self,
         event: pioneer_crud::CanonicalTurnEventPayload,
@@ -2440,6 +2780,15 @@ impl MessageProcessor {
                 self.enrich_item_started_markdown(&mut notification).await;
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
+                if let Err(error) = self.admit_native_patch_intent(&notification).await {
+                    self.report_legacy_turn_failure(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to admit native patch intent: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
                 let event_timestamp = now_timestamp_secs();
                 let item_id = notification.item.item_id().to_owned();
                 let deadlines = self
@@ -2474,6 +2823,33 @@ impl MessageProcessor {
                 self.enrich_item_completed_markdown(&mut notification).await;
                 let thread_id = notification.thread_id.clone();
                 let turn_id = notification.turn_id.clone();
+                if let Err(error) = self
+                    .persist_native_patch_history(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        &notification.item,
+                    )
+                    .await
+                {
+                    self.report_legacy_turn_failure(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to persist native patch history: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                if let Some(call_id) = native_patch_call_id(&notification.item) {
+                    if let Ok(identity) =
+                        pioneer_tools::apply_patch::history::InvocationIdentity::new(
+                            thread_id.clone(),
+                            turn_id.clone(),
+                            call_id.to_owned(),
+                        )
+                    {
+                        pioneer_tools::unregister_native_patch_observer(&identity);
+                    }
+                }
                 let event_timestamp = now_timestamp_secs();
                 if let Err(error) = message_future(self.materialize_native_agent_turn_event(
                     pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone()),
@@ -2890,9 +3266,26 @@ impl MessageProcessor {
                 turn_id,
                 recovery,
             } => message_future(async move {
+                if let Err(error) = self
+                    .finalize_native_patch_projection(thread_id.as_str(), turn_id.as_str())
+                    .await
+                {
+                    self.report_legacy_turn_failure(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to finalize native patch projection: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                pioneer_tools::unregister_native_patch_observers_for_turn(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                );
                 if !message_future(self.complete_native_turn(thread_id, turn_id, recovery)).await {
                     return false;
                 }
+                pioneer_tools::apply_patch::patch_telemetry().record_task_result(true);
                 true
             }),
             AgentDurableEvent::ProviderFailureDetected {
@@ -2922,6 +3315,22 @@ impl MessageProcessor {
                 error,
                 recovery,
             } => message_future(async move {
+                if let Err(finalize_error) = self
+                    .finalize_native_patch_projection(thread_id.as_str(), turn_id.as_str())
+                    .await
+                {
+                    self.report_legacy_turn_failure(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to finalize native patch projection: {finalize_error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                pioneer_tools::unregister_native_patch_observers_for_turn(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                );
                 if recovery.is_some() {
                     if !message_future(
                         self.mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery),
@@ -2940,6 +3349,7 @@ impl MessageProcessor {
                 {
                     return false;
                 }
+                pioneer_tools::apply_patch::patch_telemetry().record_task_result(false);
                 true
             }),
             AgentDurableEvent::TurnBlocked {
@@ -2948,6 +3358,22 @@ impl MessageProcessor {
                 reason,
                 recovery,
             } => message_future(async move {
+                if let Err(error) = self
+                    .finalize_native_patch_projection(thread_id.as_str(), turn_id.as_str())
+                    .await
+                {
+                    self.report_legacy_turn_failure(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to finalize native patch projection: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                pioneer_tools::unregister_native_patch_observers_for_turn(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                );
                 if recovery.is_none()
                     && reason.contains("execution window continuation could not resume")
                 {
@@ -2968,6 +3394,7 @@ impl MessageProcessor {
                 {
                     return false;
                 }
+                pioneer_tools::apply_patch::patch_telemetry().record_task_result(false);
                 true
             }),
             AgentDurableEvent::TurnInterrupted {
@@ -2976,6 +3403,22 @@ impl MessageProcessor {
                 reason,
                 recovery,
             } => message_future(async move {
+                if let Err(error) = self
+                    .finalize_native_patch_projection(thread_id.as_str(), turn_id.as_str())
+                    .await
+                {
+                    self.report_legacy_turn_failure(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        format!("failed to finalize native patch projection: {error:#}"),
+                    )
+                    .await;
+                    return false;
+                }
+                pioneer_tools::unregister_native_patch_observers_for_turn(
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                );
                 if !message_future(
                     self.mark_turn_interrupted_with_recovery(thread_id, turn_id, reason, recovery),
                 )
@@ -2983,6 +3426,7 @@ impl MessageProcessor {
                 {
                     return false;
                 }
+                pioneer_tools::apply_patch::patch_telemetry().record_task_result(false);
                 true
             }),
             AgentDurableEvent::TaskEvent { .. }
@@ -7486,6 +7930,32 @@ fn capability_label(label: Option<&str>, fallback: &str) -> String {
         .filter(|label| !label.is_empty())
         .unwrap_or(fallback)
         .to_owned()
+}
+
+fn has_native_patch_projection_source(
+    existing_projection: bool,
+    record_count: u64,
+    status_ordinal: Option<pioneer_tools::apply_patch::history::CommitOrdinal>,
+) -> bool {
+    existing_projection || record_count != 0 || status_ordinal.is_some()
+}
+
+#[cfg(test)]
+mod native_patch_projection_tests {
+    use super::has_native_patch_projection_source;
+    use pioneer_tools::apply_patch::history::CommitOrdinal;
+
+    #[test]
+    fn provider_only_turn_does_not_gain_a_native_diff_authority() {
+        assert!(!has_native_patch_projection_source(false, 0, None));
+        assert!(has_native_patch_projection_source(true, 0, None));
+        assert!(has_native_patch_projection_source(false, 1, None));
+        assert!(has_native_patch_projection_source(
+            false,
+            0,
+            Some(CommitOrdinal(0))
+        ));
+    }
 }
 
 #[cfg(test)]

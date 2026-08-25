@@ -11,6 +11,39 @@ use tracing::info;
 use crate::workspace::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
 pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
+    let patch_intents =
+        pioneer_tools::apply_patch::history::SqliteCommitIntentStore::new(connection.clone());
+    let patch_records =
+        pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(connection.clone());
+    let terminalized_patch_intents = patch_intents
+        .terminalize_pending_gaps(&patch_records)
+        .await
+        .context("failed to reconcile pending patch commit intents")?;
+    if terminalized_patch_intents > 0 {
+        tracing::warn!(
+            count = terminalized_patch_intents,
+            "terminalized pending patch commit intents as explicit history gaps"
+        );
+    }
+    let repaired_patch_projections = repair_patch_history_projections(connection).await?;
+    let patch_snapshot_reconciliation =
+        pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(connection.clone())
+            .reconcile_references()
+            .await
+            .context("failed to reconcile patch snapshot references")?;
+    let snapshot_metrics =
+        pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(connection.clone())
+            .metrics()
+            .await
+            .context("failed to read patch snapshot metrics")?;
+    pioneer_tools::apply_patch::patch_telemetry().record_snapshot_metrics(
+        snapshot_metrics.logical_bytes,
+        snapshot_metrics.physical_bytes,
+        snapshot_metrics.references,
+        snapshot_metrics.referenced_logical_bytes,
+        patch_snapshot_reconciliation.collected_blobs,
+        patch_snapshot_reconciliation.collected_bytes,
+    );
     let created_default_workspace = ensure_default_workspace_exists(connection).await?;
     let reconciled_prepared_turn_finalizations =
         reconcile_prepared_turn_finalizations(connection).await?;
@@ -28,6 +61,10 @@ pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
 
     info!(
         created_default_workspace,
+        repaired_patch_projections,
+        repaired_patch_snapshot_references = patch_snapshot_reconciliation.repaired_references,
+        collected_patch_snapshot_blobs = patch_snapshot_reconciliation.collected_blobs,
+        collected_patch_snapshot_bytes = patch_snapshot_reconciliation.collected_bytes,
         reconciled_prepared_turn_finalizations,
         reconciled_recovery_terminalizations,
         repaired_completed_turn_rows,
@@ -39,6 +76,88 @@ pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
         "gateway bootstrap completed"
     );
     Ok(())
+}
+
+async fn repair_patch_history_projections(connection: &DatabaseConnection) -> Result<u64> {
+    const REPLAY_PAGE_SIZE: usize = 256;
+    let records_store =
+        pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(connection.clone());
+    let intent_store =
+        pioneer_tools::apply_patch::history::SqliteCommitIntentStore::new(connection.clone());
+    let projection_store =
+        pioneer_tools::apply_patch::history::SqliteTurnDiffStore::new(connection.clone());
+    let mut repaired = 0u64;
+    let mut turn_cursor = None::<(String, String)>;
+    loop {
+        let after = turn_cursor
+            .as_ref()
+            .map(|(thread_id, turn_id)| (thread_id.as_str(), turn_id.as_str()));
+        let turn_keys = records_store
+            .turn_keys_page(after, REPLAY_PAGE_SIZE)
+            .await
+            .context("failed to load applied patch turn keys for projection repair")?;
+        if turn_keys.is_empty() {
+            break;
+        }
+        for (thread_id, turn_id) in &turn_keys {
+            if repair_patch_history_turn(
+                &records_store,
+                &intent_store,
+                &projection_store,
+                thread_id,
+                turn_id,
+                REPLAY_PAGE_SIZE,
+            )
+            .await?
+            {
+                repaired = repaired.saturating_add(1);
+            }
+        }
+        turn_cursor = turn_keys.last().cloned();
+        if turn_keys.len() < REPLAY_PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(repaired)
+}
+
+async fn repair_patch_history_turn(
+    records_store: &pioneer_tools::apply_patch::history::SqliteAppliedPatchStore,
+    intent_store: &pioneer_tools::apply_patch::history::SqliteCommitIntentStore,
+    projection_store: &pioneer_tools::apply_patch::history::SqliteTurnDiffStore,
+    thread_id: &str,
+    turn_id: &str,
+    replay_page_size: usize,
+) -> Result<bool> {
+    if projection_store
+        .get(thread_id, turn_id)
+        .await?
+        .is_some_and(|state| state.final_state)
+    {
+        return Ok(false);
+    }
+    let authority = intent_store
+        .authority_for_turn(thread_id, turn_id)
+        .await?
+        .unwrap_or(pioneer_tools::apply_patch::history::TurnDiffAuthority::NativePatchEngine);
+    let replay = pioneer_tools::apply_patch::history::replay_turn_pages(
+        records_store,
+        intent_store,
+        thread_id,
+        turn_id,
+        replay_page_size,
+    )
+    .await
+    .with_context(|| {
+        format!("failed to replay applied patch history for turn {thread_id}:{turn_id}")
+    })?;
+    let state = pioneer_tools::apply_patch::history::TurnDiffState::from_aggregate(
+        replay.aggregate,
+        authority,
+        replay.revision,
+        false,
+    );
+    projection_store.repair_live(&state).await
 }
 
 async fn reconcile_recovery_terminalization_outbox(connection: &DatabaseConnection) -> Result<u64> {

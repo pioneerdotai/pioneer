@@ -1034,6 +1034,18 @@ fn claude_process_config_from_instance_with_managed_mcp(
         "--input-format".to_owned(),
         "stream-json".to_owned(),
     ]);
+    if managed_mcp_config.has_pioneer_server {
+        // A tracked profile has exactly one mutation authority.  Claude's
+        // built-in writers remain unavailable even in full-access mode; the
+        // permission mode controls approvals, not history ownership.
+        args.extend([
+            "--disallowedTools".to_owned(),
+            "Edit".to_owned(),
+            "Write".to_owned(),
+            "MultiEdit".to_owned(),
+            "NotebookEdit".to_owned(),
+        ]);
+    }
     if !options.enable_user_skills
         && !managed_mcp_config.has_pioneer_server
         && permission_mode != "bypassPermissions"

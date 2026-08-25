@@ -6647,6 +6647,7 @@ mod tests {
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: pioneer_tools::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }

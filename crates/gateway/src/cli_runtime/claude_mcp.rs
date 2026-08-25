@@ -5,7 +5,7 @@ use crate::cli_runtime::mcp::facade::{
     CliMcpFacadeBuildError, CliMcpFacadeProjection, CliMcpFacadeTool,
 };
 use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
-use crate::turn_mcp::projection::ResolvedMcpTurnProjection;
+use crate::turn_mcp::projection::{ResolvedMcpTurnProjection, canonical_schema_identity};
 use anyhow::{Context, Result};
 use pioneer_cli_agent_runtime::claude::{
     ClaudeManagedMcpConfigDescriptor, ClaudeManagedMcpConfigIdentity, ClaudeManagedMcpConfigInput,
@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 const CLAUDE_QUALIFIED_TOOL_PREFIX: &str = "mcp__pioneer__";
 const CLAUDE_SYNTHETIC_SERVER_NAME: &str = "mcp__pioneer";
 const CLAUDE_ALLOWED_TOOLS_FLAG: &str = "--allowedTools";
+const CLAUDE_RESERVED_READ_FILE: &str = "read_file";
+const CLAUDE_RESERVED_APPLY_PATCH: &str = "apply_patch";
 const CLAUDE_NON_EMPTY_CONFIG_UPPER_BOUND_BYTES: usize = 17_408;
 const CLAUDE_EMPTY_CONFIG_BYTES: usize = 18;
 
@@ -96,20 +98,27 @@ impl ClaudeMcpSessionLaunchProjection {
             .tools
             .iter()
             .map(|transformed| {
-                let canonical = self
-                    .canonical_projection
-                    .tools
-                    .iter()
-                    .find(|tool| {
-                        tool.canonical_callable_name == transformed.canonical_callable_name
-                    })
-                    .ok_or(CliMcpFacadeBuildError::InvalidToolName)?;
+                let canonical = self.canonical_projection.tools.iter().find(|tool| {
+                    tool.canonical_callable_name == transformed.canonical_callable_name
+                });
+                let (description, annotations) = if let Some(canonical) = canonical {
+                    (
+                        canonical.description.clone(),
+                        serde_json::to_value(canonical.annotations.clone().unwrap_or_default())
+                            .map_err(|_| CliMcpFacadeBuildError::Serialization)?,
+                    )
+                } else if let Some((description, _schema)) =
+                    reserved_file_tool_definition(transformed.canonical_callable_name.as_str())
+                {
+                    (Some(description.to_owned()), serde_json::json!({}))
+                } else {
+                    return Err(CliMcpFacadeBuildError::InvalidToolName);
+                };
                 CliMcpFacadeTool::new(
                     transformed.canonical_callable_name.clone(),
-                    canonical.description.clone(),
+                    description,
                     transformed.transformed_schema.clone(),
-                    serde_json::to_value(canonical.annotations.clone().unwrap_or_default())
-                        .map_err(|_| CliMcpFacadeBuildError::Serialization)?,
+                    annotations,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -141,8 +150,39 @@ impl ClaudeMcpSessionLaunchProjection {
             .canonical_projection
             .tools
             .iter()
-            .find(|tool| tool.canonical_callable_name == canonical_callable_name)
-            .ok_or(ClaudeNativeMcpEventError::ToolOutsideProjection)?;
+            .find(|tool| tool.canonical_callable_name == canonical_callable_name);
+        if tool.is_none() {
+            if reserved_file_tool_definition(canonical_callable_name).is_none() {
+                return Err(ClaudeNativeMcpEventError::ToolOutsideProjection);
+            }
+            validate_reserved_file_arguments(canonical_callable_name, arguments)?;
+        }
+        let (
+            canonical_name,
+            server_installation_id,
+            server_name,
+            raw_tool_name,
+            selection_reason,
+            capability_id,
+        ) = if let Some(tool) = tool {
+            (
+                tool.canonical_callable_name.clone(),
+                tool.server_installation_id.clone(),
+                tool.server_name.clone(),
+                tool.raw_tool_name.clone(),
+                tool.selection_reason.legacy_binding_value().to_owned(),
+                tool.capability_id.clone(),
+            )
+        } else {
+            (
+                canonical_callable_name.to_owned(),
+                "pioneer-file-tools-v1".to_owned(),
+                "pioneer_files".to_owned(),
+                canonical_callable_name.to_owned(),
+                "first_party_filesystem".to_owned(),
+                Some("pioneer-file-tools-v1".to_owned()),
+            )
+        };
         let arguments_fingerprint =
             crate::cli_runtime::codex_mcp::canonical_value_fingerprint(arguments)
                 .map_err(|_| ClaudeNativeMcpEventError::Serialization)?;
@@ -169,20 +209,14 @@ impl ClaudeMcpSessionLaunchProjection {
         );
         metadata.insert(
             "canonicalCallableName".to_owned(),
-            JsonValue::String(tool.canonical_callable_name.clone()),
+            JsonValue::String(canonical_name),
         );
         metadata.insert(
             "serverInstallationId".to_owned(),
-            JsonValue::String(tool.server_installation_id.clone()),
+            JsonValue::String(server_installation_id),
         );
-        metadata.insert(
-            "serverName".to_owned(),
-            JsonValue::String(tool.server_name.clone()),
-        );
-        metadata.insert(
-            "rawToolName".to_owned(),
-            JsonValue::String(tool.raw_tool_name.clone()),
-        );
+        metadata.insert("serverName".to_owned(), JsonValue::String(server_name));
+        metadata.insert("rawToolName".to_owned(), JsonValue::String(raw_tool_name));
         metadata.insert(
             "manifestHash".to_owned(),
             JsonValue::String(self.preflight.canonical_manifest_hash.clone()),
@@ -205,14 +239,14 @@ impl ClaudeMcpSessionLaunchProjection {
         );
         metadata.insert(
             "selectionReason".to_owned(),
-            JsonValue::String(tool.selection_reason.legacy_binding_value().to_owned()),
+            JsonValue::String(selection_reason),
         );
         metadata.insert("arguments".to_owned(), arguments.clone());
         metadata.insert(
             "status".to_owned(),
             JsonValue::String("inProgress".to_owned()),
         );
-        if let Some(capability_id) = tool.capability_id.as_ref() {
+        if let Some(capability_id) = capability_id.as_ref() {
             metadata.insert(
                 "capabilityId".to_owned(),
                 JsonValue::String(capability_id.clone()),
@@ -244,6 +278,7 @@ pub(crate) enum ClaudeNativeMcpEventError {
     MissingIdentity,
     UnmanagedTool,
     ToolOutsideProjection,
+    ReservedArguments,
     Serialization,
 }
 
@@ -253,12 +288,81 @@ impl fmt::Display for ClaudeNativeMcpEventError {
             Self::MissingIdentity => "Claude MCP item identity is incomplete",
             Self::UnmanagedTool => "Claude MCP item is outside the managed Pioneer namespace",
             Self::ToolOutsideProjection => "Claude MCP item tool is outside the frozen projection",
+            Self::ReservedArguments => "Claude Pioneer file-tool arguments are invalid or spoofed",
             Self::Serialization => "Claude MCP correlation identity could not be serialized",
         })
     }
 }
 
 impl Error for ClaudeNativeMcpEventError {}
+
+fn validate_reserved_file_arguments(
+    callable_name: &str,
+    arguments: &JsonValue,
+) -> Result<(), ClaudeNativeMcpEventError> {
+    let object = arguments
+        .as_object()
+        .ok_or(ClaudeNativeMcpEventError::ReservedArguments)?;
+    match callable_name {
+        CLAUDE_RESERVED_READ_FILE => {
+            let path = object
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(ClaudeNativeMcpEventError::ReservedArguments)?;
+            if path.len() > 4_096
+                || object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "path" | "start_line" | "start_byte" | "max_lines" | "max_bytes" | "cursor"
+                    )
+                })
+                || object
+                    .get("start_line")
+                    .is_some_and(|value| value.as_u64().is_none_or(|number| number == 0))
+                || object
+                    .get("start_byte")
+                    .is_some_and(|value| value.as_u64().is_none())
+                || (object.contains_key("start_line") && object.contains_key("start_byte"))
+                || object
+                    .get("max_lines")
+                    .is_some_and(|value| value.as_u64().is_none_or(|number| number == 0))
+                || object
+                    .get("max_bytes")
+                    .is_some_and(|value| value.as_u64().is_none_or(|number| number == 0))
+                || object.get("cursor").is_some_and(|value| {
+                    value
+                        .as_str()
+                        .is_none_or(|cursor| cursor.is_empty() || cursor.len() > 16 * 1024)
+                })
+            {
+                return Err(ClaudeNativeMcpEventError::ReservedArguments);
+            }
+            Ok(())
+        }
+        CLAUDE_RESERVED_APPLY_PATCH => {
+            let patch = object
+                .get("patch")
+                .and_then(JsonValue::as_str)
+                .ok_or(ClaudeNativeMcpEventError::ReservedArguments)?;
+            if object.len() != 1
+                || patch.len()
+                    > pioneer_tools::apply_patch::file_mutation::PatchLimits::default()
+                        .max_patch_bytes as usize
+            {
+                return Err(ClaudeNativeMcpEventError::ReservedArguments);
+            }
+            pioneer_tools::apply_patch::file_mutation::PatchRequest::from_provider_text(
+                patch,
+                pioneer_tools::apply_patch::file_mutation::PatchRequestSource::ManagedClaude,
+                pioneer_tools::apply_patch::file_mutation::PatchLimits::default(),
+            )
+            .map(|_| ())
+            .map_err(|_| ClaudeNativeMcpEventError::ReservedArguments)
+        }
+        _ => Err(ClaudeNativeMcpEventError::ToolOutsideProjection),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ClaudeNativeMcpPermissionRequest {
@@ -388,6 +492,9 @@ pub(crate) enum ClaudeMcpPreflightError {
     DuplicateCallableName {
         callable_name: String,
     },
+    ReservedCallableCollision {
+        callable_name: String,
+    },
     IncompatibleTool {
         callable_name: String,
         error: McpSchemaTransformError,
@@ -422,6 +529,10 @@ impl fmt::Display for ClaudeMcpPreflightError {
                     "duplicate Claude MCP callable name `{callable_name}`"
                 )
             }
+            Self::ReservedCallableCollision { callable_name } => write!(
+                formatter,
+                "installed Claude MCP tool collides with reserved Pioneer file tool `{callable_name}`"
+            ),
             Self::IncompatibleTool {
                 callable_name,
                 error,
@@ -500,6 +611,17 @@ fn preflight_claude_mcp_projection_with_budget(
     let mut canonical_names = HashSet::with_capacity(projection.tools.len());
     let mut tools = Vec::with_capacity(projection.tools.len());
     for tool in &projection.tools {
+        if is_reserved_file_callable(tool.canonical_callable_name.as_str())
+            || is_reserved_file_callable(tool.raw_tool_name.as_str())
+        {
+            return Err(ClaudeMcpPreflightError::ReservedCallableCollision {
+                callable_name: if tool.canonical_callable_name.trim().is_empty() {
+                    tool.raw_tool_name.clone()
+                } else {
+                    tool.canonical_callable_name.clone()
+                },
+            });
+        }
         if !canonical_names.insert(tool.canonical_callable_name.clone()) {
             return Err(ClaudeMcpPreflightError::DuplicateCallableName {
                 callable_name: tool.canonical_callable_name.clone(),
@@ -511,6 +633,14 @@ fn preflight_claude_mcp_projection_with_budget(
                 error,
             })?;
         tools.push(ClaudeMcpTransformedTool::from(transformed));
+    }
+    for reserved in reserved_managed_file_tools(provider_contract_fingerprint.as_str())? {
+        if !canonical_names.insert(reserved.canonical_callable_name.clone()) {
+            return Err(ClaudeMcpPreflightError::ReservedCallableCollision {
+                callable_name: reserved.canonical_callable_name,
+            });
+        }
+        tools.push(reserved);
     }
     tools.sort_by(|left, right| {
         left.canonical_callable_name
@@ -565,6 +695,85 @@ fn preflight_claude_mcp_projection_with_budget(
         encoded_allowed_tools_argv_bytes,
         encoded_managed_config_upper_bound,
     })
+}
+
+fn is_reserved_file_callable(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        CLAUDE_RESERVED_READ_FILE | CLAUDE_RESERVED_APPLY_PATCH
+    ) || normalized
+        .strip_prefix(CLAUDE_QUALIFIED_TOOL_PREFIX)
+        .is_some_and(|name| {
+            matches!(
+                name,
+                CLAUDE_RESERVED_READ_FILE | CLAUDE_RESERVED_APPLY_PATCH
+            )
+        })
+}
+
+fn reserved_file_tool_definition(name: &str) -> Option<(&'static str, JsonValue)> {
+    match name {
+        CLAUDE_RESERVED_READ_FILE => Some((
+            "Read a text file and return the exact version token used by Apply Patch.",
+            pioneer_provider::read_file_tool_schema()
+                .get("input")
+                .cloned()
+                .expect("canonical read_file schema has an input object"),
+        )),
+        CLAUDE_RESERVED_APPLY_PATCH => Some((
+            "Apply one bounded text patch. The input must be the complete patch document.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"patch": {"type": "string"}},
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+        )),
+        _ => None,
+    }
+}
+
+fn reserved_managed_file_tools(
+    provider_contract_fingerprint: &str,
+) -> Result<Vec<ClaudeMcpTransformedTool>, ClaudeMcpPreflightError> {
+    let transformer = ClaudeMcpSchemaTransformer::new(provider_contract_fingerprint.to_owned())
+        .map_err(|_| ClaudeMcpPreflightError::InvalidProviderContractFingerprint)?;
+    [
+        (
+            CLAUDE_RESERVED_READ_FILE,
+            "Read a text file and return the exact version token used by Apply Patch.",
+            reserved_file_tool_definition(CLAUDE_RESERVED_READ_FILE)
+                .expect("reserved read_file definition")
+                .1,
+        ),
+        (
+            CLAUDE_RESERVED_APPLY_PATCH,
+            "Apply one bounded text patch. The input must be the complete patch document.",
+            reserved_file_tool_definition(CLAUDE_RESERVED_APPLY_PATCH)
+                .expect("reserved apply_patch definition")
+                .1,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, _description, schema)| {
+        let (schema, schema_fingerprint, _) = canonical_schema_identity(&schema)
+            .map_err(|_| ClaudeMcpPreflightError::FingerprintSerialization)?;
+        let transformed = transform_mcp_tool_schema(
+            &pioneer_cli_agent_runtime::mcp::CanonicalMcpToolSchema {
+                canonical_callable_name: name.to_owned(),
+                canonical_schema: schema,
+                canonical_schema_fingerprint: schema_fingerprint,
+            },
+            &transformer,
+        )
+        .map_err(|error| ClaudeMcpPreflightError::IncompatibleTool {
+            callable_name: name.to_owned(),
+            error,
+        })?;
+        Ok(ClaudeMcpTransformedTool::from(transformed))
+    })
+    .collect()
 }
 
 pub(crate) fn build_claude_mcp_session_launch_projection(
@@ -902,8 +1111,10 @@ mod tests {
         assert_eq!(
             preflight.allowed_tool_names,
             [
+                "mcp__pioneer__apply_patch",
                 "mcp__pioneer__mcp_server_alpha",
                 "mcp__pioneer__mcp_server_zeta",
+                "mcp__pioneer__read_file",
             ]
         );
         assert!(preflight.allowed_tool_names.iter().all(|name| {
@@ -911,7 +1122,11 @@ mod tests {
                 && !name.contains('*')
                 && name != "mcp__pioneer"
         }));
-        assert_eq!(preflight.allowed_tool_names.len(), projection.tools.len());
+        assert_eq!(
+            preflight.allowed_tool_names.len(),
+            projection.tools.len() + 2,
+            "Claude projection includes the two reserved Pioneer file tools"
+        );
     }
 
     #[test]
@@ -977,10 +1192,15 @@ mod tests {
         let projection = projection_for_turn("turn", &["alpha"], schema.clone());
         let preflight = preflight_claude_mcp_projection(&projection, "a".repeat(64))
             .expect("opaque schema must reach provider");
-        assert_eq!(preflight.tools[0].transformed_schema, schema);
+        let alpha = preflight
+            .tools
+            .iter()
+            .find(|tool| tool.canonical_callable_name == "mcp_server_alpha")
+            .expect("canonical alpha tool");
+        assert_eq!(alpha.transformed_schema, schema);
         assert_eq!(
-            preflight.tools[0].canonical_schema_fingerprint,
-            preflight.tools[0].transformed_schema_fingerprint
+            alpha.canonical_schema_fingerprint,
+            alpha.transformed_schema_fingerprint
         );
     }
 
@@ -997,7 +1217,7 @@ mod tests {
         let facade = launch
             .facade_projection(runtime_limits.facade_projection_limits())
             .expect("306 tools must fit the configured Claude facade limit");
-        assert_eq!(facade.tools().len(), 306);
+        assert_eq!(facade.tools().len(), 308);
     }
 
     #[test]

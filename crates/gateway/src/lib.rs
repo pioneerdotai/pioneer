@@ -41,6 +41,7 @@ mod memory_runtime;
 mod memory_tools;
 mod message;
 mod operations;
+mod patch_history_observer;
 mod permissions;
 mod profile_avatar;
 mod prompt_hooks;
@@ -882,6 +883,23 @@ async fn run_gateway_until_shutdown_inner(
     message_processor
         .shutdown_provider_readiness_supervisor()
         .await;
+    let patch_telemetry = pioneer_tools::apply_patch::patch_telemetry().snapshot();
+    info!(
+        calls = patch_telemetry.calls,
+        applied = patch_telemetry.applied,
+        partial = patch_telemetry.partial,
+        rejected = patch_telemetry.rejected,
+        failed = patch_telemetry.failed,
+        uncertain = patch_telemetry.uncertain,
+        committed_changes = patch_telemetry.committed_changes,
+        committed_bytes = patch_telemetry.committed_bytes,
+        exact_reports = patch_telemetry.exact_reports,
+        inexact_reports = patch_telemetry.inexact_reports,
+        pending_tracking = patch_telemetry.pending_tracking,
+        tracker_publication_failures = patch_telemetry.tracker_publication_failures,
+        duplicate_suppressions = patch_telemetry.duplicate_suppressions,
+        "gateway daemon stopping with apply_patch telemetry snapshot"
+    );
     message_processor.shutdown_remote_access_supervisor().await;
     let server_shutdown_result = handle.shutdown().await;
     message_processor.shutdown_cli_runtime_manager().await;

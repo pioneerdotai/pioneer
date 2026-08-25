@@ -21,6 +21,7 @@ mod memory_handlers;
 mod message_mutations;
 mod message_turn;
 mod notifications;
+mod patch_history_handlers;
 mod permission_handlers;
 mod provider_handlers;
 mod provider_readiness;
@@ -502,7 +503,7 @@ pub struct MessageProcessor {
     #[cfg(test)]
     cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
     #[cfg(test)]
-    cli_mcp_readiness_override: Option<pioneer_protocol::CliMcpAdapterReadiness>,
+    cli_mcp_readiness_overrides: [Option<pioneer_protocol::CliMcpAdapterReadiness>; 2],
     skill_upload_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     skill_upload_owners: Arc<Mutex<HashMap<String, AuthenticatedTransferOwner>>>,
     pub(crate) task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
@@ -843,7 +844,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
-            cli_mcp_readiness_override: None,
+            cli_mcp_readiness_overrides: [None, None],
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
@@ -1278,15 +1279,24 @@ impl MessageProcessor {
         mut self,
         readiness: pioneer_protocol::CliMcpAdapterReadiness,
     ) -> Self {
-        self.cli_mcp_readiness_override = Some(readiness);
+        let slot = match readiness.injection {
+            pioneer_protocol::CliMcpInjectionKind::CodexManagedStdioMcp => 0,
+            pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp => 1,
+        };
+        self.cli_mcp_readiness_overrides[slot] = Some(readiness);
         self
     }
 
     #[cfg(test)]
     pub(crate) fn cli_mcp_readiness_override_for_tests(
         &self,
+        runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
     ) -> Option<pioneer_protocol::CliMcpAdapterReadiness> {
-        self.cli_mcp_readiness_override.clone()
+        let slot = match runtime_kind {
+            pioneer_protocol::CLIAgentRuntimeKind::Codex => 0,
+            pioneer_protocol::CLIAgentRuntimeKind::Claude => 1,
+        };
+        self.cli_mcp_readiness_overrides[slot].clone()
     }
 
     #[cfg(test)]
@@ -3719,7 +3729,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
-            cli_mcp_readiness_override: None,
+            cli_mcp_readiness_overrides: [None, None],
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,

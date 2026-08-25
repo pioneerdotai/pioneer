@@ -50,6 +50,10 @@ use pioneer_crud::NewCliRuntimeNativeEvent;
 use pioneer_observability::{
     GatewayCliRuntimeKind, GatewayProviderWarmupStage, GatewayProviderWarmupTrace,
 };
+use pioneer_tools::apply_patch::history::{
+    CODEX_TURN_DIFF_PROTOCOL_REVISION, CodexAggregateEventContext, SqliteCodexAggregateStore,
+    normalize_codex_diff_updated,
+};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
@@ -5122,6 +5126,20 @@ impl MessageProcessor {
             );
             return false;
         }
+        if turn_binding.runtime_kind == "codex"
+            && !self
+                .persist_codex_history_event(&turn_binding, &event)
+                .await
+        {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = turn_binding.thread_id.as_str(),
+                turn_id = turn_binding.turn_id.as_str(),
+                event = %event_label,
+                "Codex aggregate history event could not be durably applied"
+            );
+        }
         let recovery = if let Some(attempt) = turn_attempt {
             match self.cli_runtime_attempt_recovery_state(attempt).await {
                 Ok(CLIRuntimeAttemptRecoveryState::Normal) => None,
@@ -5594,6 +5612,11 @@ impl MessageProcessor {
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
     ) -> anyhow::Result<()> {
+        if binding.runtime_kind == "codex"
+            && !self.persist_codex_history_event(binding, &event).await
+        {
+            anyhow::bail!("failed to persist authoritative Codex aggregate event");
+        }
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: binding.workspace_id.clone(),
             thread_id: binding.thread_id.clone(),
@@ -6035,6 +6058,92 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to commit final CLI runtime diff snapshot"
                 );
+            }
+        }
+    }
+
+    /// Persist Codex's provider-owned aggregate stream without routing it
+    /// through Pioneer PatchEngine or synthesizing per-call records.
+    async fn persist_codex_history_event(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: &RuntimeEvent,
+    ) -> bool {
+        match event {
+            RuntimeEvent::DiffUpdated(diff) => {
+                let Some(diff_text) = diff.diff_text.as_deref() else {
+                    return true;
+                };
+                let normalized = match normalize_codex_diff_updated(
+                    CodexAggregateEventContext {
+                        workspace_id: binding.workspace_id.clone(),
+                        thread_id: binding.thread_id.clone(),
+                        turn_id: binding.turn_id.clone(),
+                        protocol_revision: CODEX_TURN_DIFF_PROTOCOL_REVISION.to_owned(),
+                        event_id: diff.event_id.clone(),
+                        revision: diff.revision,
+                    },
+                    &json!({
+                        "threadId": binding.thread_id,
+                        "turnId": binding.turn_id,
+                        "diff": diff_text,
+                        "exact": diff.provider_exact,
+                    }),
+                ) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        warn!(
+                            thread_id = binding.thread_id.as_str(),
+                            turn_id = binding.turn_id.as_str(),
+                            error = %error,
+                            "rejected malformed or unsupported Codex aggregate event"
+                        );
+                        return false;
+                    }
+                };
+                let store = SqliteCodexAggregateStore::new(self.crud_store.database_connection());
+                match store.ingest_event(&normalized).await {
+                    Ok(_) => true,
+                    Err(error) => {
+                        warn!(
+                            thread_id = binding.thread_id.as_str(),
+                            turn_id = binding.turn_id.as_str(),
+                            error = %format!("{error:#}"),
+                            "failed to persist Codex aggregate projection"
+                        );
+                        false
+                    }
+                }
+            }
+            RuntimeEvent::TurnCompleted(_)
+            | RuntimeEvent::TurnFailed(_)
+            | RuntimeEvent::TurnInterrupted(_)
+            | RuntimeEvent::Error(_) => self.finalize_codex_history(binding).await,
+            _ => true,
+        }
+    }
+
+    async fn finalize_codex_history(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> bool {
+        if binding.runtime_kind != "codex" {
+            return true;
+        }
+        let store = SqliteCodexAggregateStore::new(self.crud_store.database_connection());
+        match store
+            .finalize(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to finalize Codex aggregate projection"
+                );
+                false
             }
         }
     }
@@ -6579,6 +6688,12 @@ impl MessageProcessor {
                 i64::from(attempt.attempt_index),
             )
             .await?;
+            if !self.finalize_codex_history(binding).await {
+                anyhow::bail!(
+                    "completed Codex aggregate projection could not be finalized for turn `{}`",
+                    binding.turn_id
+                );
+            }
             if !self
                 .complete_native_turn(binding.thread_id.clone(), binding.turn_id.clone(), recovery)
                 .await
@@ -6667,6 +6782,9 @@ impl MessageProcessor {
         for event in observation.reconciliation_events.iter().cloned() {
             self.apply_authoritative_cli_runtime_snapshot_event(handle.instance(), binding, event)
                 .await?;
+        }
+        if !self.finalize_codex_history(binding).await {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
         }
         self.ensure_cli_runtime_turn_loaded_for_lifecycle(
             workspace_id,
@@ -8341,6 +8459,13 @@ impl MessageProcessor {
         status: TurnStatus,
         reason: &str,
     ) {
+        if status != TurnStatus::InProgress && !self.finalize_codex_history(binding).await {
+            warn!(
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                "Codex aggregate finalization will be retried by terminal reconciliation"
+            );
+        }
         if status != TurnStatus::InProgress {
             self.mcp_service
                 .cancel_turn_mcp_invocations(binding.turn_id.as_str());
@@ -9646,7 +9771,9 @@ impl MessageProcessor {
                 let mut summary = apply_codex_account_probe_to_summary(summary, probe);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
                 #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                let readiness_override = self.cli_mcp_readiness_override_for_tests(
+                    pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                );
                 #[cfg(not(test))]
                 let readiness_override: Option<
                     pioneer_protocol::CliMcpAdapterReadiness,
@@ -9709,7 +9836,9 @@ impl MessageProcessor {
                 let mut summary = apply_claude_account_probe_to_summary(summary, probe);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
                 #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                let readiness_override = self.cli_mcp_readiness_override_for_tests(
+                    pioneer_protocol::CLIAgentRuntimeKind::Claude,
+                );
                 #[cfg(not(test))]
                 let readiness_override: Option<
                     pioneer_protocol::CliMcpAdapterReadiness,

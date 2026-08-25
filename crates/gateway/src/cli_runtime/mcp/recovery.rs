@@ -17,6 +17,7 @@ use pioneer_protocol::CLIAgentRuntimeKind;
 
 const CODEX_MCP_ADAPTER_KIND: &str = "codex_synthetic_mcp";
 const CLAUDE_MCP_ADAPTER_KIND: &str = "claude_strict_mcp";
+const FIRST_PARTY_FILE_SERVER_ID: &str = "pioneer-file-tools-v1";
 
 #[derive(Debug)]
 pub(crate) enum CliMcpSessionLaunchRestoreError {
@@ -107,6 +108,14 @@ pub(crate) async fn restore_cli_mcp_session_launch(
         turn_binding.turn_id.clone(),
     );
     for binding in &bindings {
+        // First-party Claude file tools are provider facade entries, not
+        // upstream MCP installations.  They are re-added by the Claude
+        // adapter from its canonical reserved catalog below; reconstructing
+        // them as ordinary runtime tools would make the recovery manifest
+        // ambiguous and would ask the MCP runtime to execute them upstream.
+        if binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
+            continue;
+        }
         let current = runtime_view
             .current_tool_identity(turn_binding.workspace_id.as_str(), binding)
             .await
@@ -255,6 +264,9 @@ fn validate_canonical_callable_names(
     bindings: &[TurnMcpBindingRecord],
 ) -> Result<()> {
     for tool in tools {
+        if tool.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
+            continue;
+        }
         let binding = bindings
             .iter()
             .find(|binding| {

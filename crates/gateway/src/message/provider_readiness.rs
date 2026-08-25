@@ -756,12 +756,12 @@ impl MessageProcessor {
         workspace_id: &str,
     ) -> anyhow::Result<()> {
         let mut runtimes = self.initializing_cli_runtime_snapshot(workspace_id).await?;
-        let readiness_override = self.cli_mcp_readiness_override_for_tests();
-        let mcp_supported = readiness_override
-            .as_ref()
-            .is_some_and(|readiness| readiness.supported);
         for runtime in &mut runtimes {
             if runtime.enabled {
+                let mcp_supported = self
+                    .cli_mcp_readiness_override_for_tests(runtime.kind)
+                    .as_ref()
+                    .is_some_and(|readiness| readiness.supported);
                 runtime.status = RuntimeStatus::Ready;
                 runtime.capabilities.supports_mcp_tools = mcp_supported;
                 runtime.diagnostics.retain(|diagnostic| {
@@ -788,13 +788,14 @@ impl MessageProcessor {
                 )
             })
             .collect();
-        let mcp_snapshots = readiness_override.map_or_else(HashMap::new, |readiness| {
-            runtimes
-                .iter()
-                .filter(|runtime| runtime.enabled)
-                .map(|runtime| (runtime.runtime_id.clone(), readiness.clone()))
-                .collect()
-        });
+        let mcp_snapshots = runtimes
+            .iter()
+            .filter(|runtime| runtime.enabled)
+            .filter_map(|runtime| {
+                self.cli_mcp_readiness_override_for_tests(runtime.kind)
+                    .map(|readiness| (runtime.runtime_id.clone(), readiness))
+            })
+            .collect::<HashMap<_, _>>();
         let generation = self.provider_readiness.cli_generation(workspace_id).await;
         self.provider_readiness
             .replace_probe_results_if_generation(
