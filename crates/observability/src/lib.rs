@@ -23,11 +23,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod metrics;
 mod operations;
+mod patch_telemetry;
 mod startup;
 mod telemetry;
 
 pub use metrics::{
-    DatabaseOperation, DatabasePoolSnapshot, DatabaseRole, record_database_operation,
+    DatabaseOperation, DatabasePoolSnapshot, DatabaseRole, PatchOperationMetric,
+    record_database_operation, record_patch_mutation_fallback, record_patch_operation,
     register_database_pool_observer,
 };
 pub use operations::{
@@ -35,6 +37,7 @@ pub use operations::{
     GatewayProviderWarmupScope, GatewayProviderWarmupStage, GatewayProviderWarmupStageGuard,
     GatewayProviderWarmupTrace,
 };
+pub use patch_telemetry::{PatchTelemetrySnapshot, register_patch_telemetry_snapshot_provider};
 pub use startup::{
     DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
     GatewayStartupStage, GatewayStartupStageGuard, GatewayStartupTrace, MobileStartupOutcome,
