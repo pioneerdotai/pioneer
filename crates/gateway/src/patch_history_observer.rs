@@ -15,7 +15,7 @@ use pioneer_tools::apply_patch::history::{
     AppliedPatchDelta, AppliedPatchRecord, AppliedPatchRecordOutcome, CommitOrdinal,
     CommittedPatchChange, InvocationIdentity, PatchHistoryProvenance, SnapshotDomain,
     SqliteAppliedPatchStore, SqliteCommitIntentStore, SqliteTurnDiffStore, StoredPatchRecord,
-    TurnDiffAuthority, TurnDiffState,
+    TurnDiffAuthority, TurnDiffState, TurnFilesystemCoverage,
 };
 use pioneer_tools::apply_patch::{
     CommitAdmission, CommitObserver, DurableCommitObserver, ExecutionReport, ExecutionStatus,
@@ -139,6 +139,7 @@ impl SqlitePatchObserver {
         turn_id: String,
         authority: TurnDiffAuthority,
         final_state: bool,
+        filesystem_coverage: TurnFilesystemCoverage,
     ) -> Result<TurnDiffState> {
         let records_store = SqliteAppliedPatchStore::new(db.clone());
         let intents = SqliteCommitIntentStore::new(db.clone());
@@ -154,12 +155,13 @@ impl SqlitePatchObserver {
         for _ in 0..replay.pending_ordinals {
             patch_telemetry().record_pending_ordinal();
         }
-        let state = TurnDiffState::from_aggregate(
+        let mut state = TurnDiffState::from_aggregate(
             replay.aggregate,
             authority,
             replay.revision,
             final_state,
         );
+        state.filesystem_coverage = filesystem_coverage;
         SqliteTurnDiffStore::new(db)
             .repair_live(&state)
             .await
@@ -546,6 +548,7 @@ impl CommitObserver for SqlitePatchObserver {
                     identity_for_db.turn_id.clone(),
                     record.record.authority,
                     false,
+                    TurnFilesystemCoverage::Pending,
                 )
                 .await
                 .context("repair applied patch projection after durable retry")?;
@@ -653,6 +656,7 @@ impl CommitObserver for SqlitePatchObserver {
                 identity_for_db.turn_id.clone(),
                 record.authority,
                 false,
+                TurnFilesystemCoverage::Pending,
             )
             .await
             .context("project applied patch history")?;

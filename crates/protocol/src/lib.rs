@@ -266,14 +266,16 @@ pub use memory::{
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
 pub use patch_history::{
     PatchAppliedStep, PatchDiffSelection, PatchFileHistoryCursor, PatchFileHistoryEntry,
-    PatchHistoryAuthorityView, PatchHistoryChange, PatchHistoryChangeKind,
-    PatchHistoryCoverageView, PatchHistoryErrorCode, PatchHistoryLineEnding,
-    PatchHistoryLineEndingMetadata, PatchHistoryProvenanceView, PatchHistoryQueryCoverage,
+    PatchFilesystemMutationSourceView, PatchHistoryAuthorityView, PatchHistoryChange,
+    PatchHistoryChangeKind, PatchHistoryCoverageView, PatchHistoryErrorCode,
+    PatchHistoryExecutionContext, PatchHistoryLineEnding, PatchHistoryLineEndingMetadata,
+    PatchHistoryPathView, PatchHistoryProvenanceView, PatchHistoryQueryCoverage,
     PatchHistoryRecord, PatchHistoryRecordOutcome, PatchHistorySideEffects,
-    PatchHistorySnapshotRef, PatchHistoryStage, PatchHistoryTextEncoding, PatchRecordExactnessView,
-    PatchRecordSelector, PatchThreadHistoryCursor, ThreadFilePatchHistoryPageParams,
-    ThreadFilePatchHistoryPageResponse, ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse,
-    TurnDiffExactnessView, TurnPatchDiffGetParams, TurnPatchDiffGetResponse,
+    PatchHistorySnapshotRef, PatchHistoryStage, PatchHistoryTextEncoding, PatchHistoryViewKind,
+    PatchRecordExactnessView, PatchRecordSelector, PatchThreadHistoryCursor,
+    ThreadFilePatchHistoryPageParams, ThreadFilePatchHistoryPageResponse,
+    ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse, TurnDiffExactnessView,
+    TurnFilesystemCoverageView, TurnPatchDiffGetParams, TurnPatchDiffGetResponse,
     TurnPatchRecordGetParams, TurnPatchRecordGetResponse, TurnPatchStepsPageParams,
     TurnPatchStepsPageResponse,
 };

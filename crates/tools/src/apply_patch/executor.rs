@@ -836,6 +836,7 @@ impl PatchExecutor {
                     stages.push_back(Some(stage));
                 }
                 operation_kind::Replace | operation_kind::Update => {
+                    let source_metadata_path = source.absolute().to_path_buf();
                     let mode =
                         match virtual_source_mode(&mut virtual_modes, &change.source, &source) {
                             Ok(mode) => mode,
@@ -863,7 +864,10 @@ impl PatchExecutor {
                     let stage = match self.engine.prepare_file_stage_locked(
                         stage_target,
                         after.bytes.clone(),
-                        StageMetadata::PreserveSupportedMode(mode),
+                        StageMetadata::PreserveSupportedMode {
+                            mode,
+                            source_path: Some(source_metadata_path),
+                        },
                         lock,
                     ) {
                         Ok(stage) => stage,

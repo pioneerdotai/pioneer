@@ -623,6 +623,10 @@ impl CLIRuntimePendingRequestEntry {
     }
 
     pub fn to_pending_request(&self) -> PendingRequest {
+        if let Some(request) = self.native_permission_request() {
+            return PendingRequest::from_native_permission_request(request);
+        }
+
         PendingRequest {
             workspace_id: self.workspace_id.clone(),
             request_id: self.request_id.clone(),
@@ -643,6 +647,10 @@ impl CLIRuntimePendingRequestEntry {
     }
 
     pub fn into_pending_request(self) -> PendingRequest {
+        if let Some(request) = self.native_permission_request() {
+            return PendingRequest::from_native_permission_request(request);
+        }
+
         PendingRequest {
             workspace_id: self.workspace_id,
             request_id: self.request_id,
@@ -660,6 +668,21 @@ impl CLIRuntimePendingRequestEntry {
                 request: self.request,
             },
         }
+    }
+
+    fn native_permission_request(&self) -> Option<TurnPermissionApprovalRequest> {
+        if self.runtime_id != pioneer_protocol::constants::runtime_ids::NATIVE_PERMISSION
+            || self.request.kind != CLIRuntimeRequestKind::Other
+            || self.request.native_request_id.as_deref() != Some(self.request_id.as_str())
+        {
+            return None;
+        }
+
+        let request =
+            serde_json::from_value::<TurnPermissionApprovalRequest>(self.request.payload.clone()?)
+                .ok()?;
+        (request.request_id == self.request_id && request.workspace_id == self.workspace_id)
+            .then_some(request)
     }
 }
 
@@ -1214,6 +1237,38 @@ mod tests {
             pending.payload,
             PendingRequestPayload::NativePermissionGate { .. }
         ));
+    }
+
+    #[test]
+    fn durable_native_permission_envelope_uses_native_response_route() {
+        let mut native = native_permission_request("req_native");
+        native.thread_id = "child_thread".to_owned();
+        native.visible_thread_ids = vec!["parent_thread".to_owned()];
+        let pending = CLIRuntimePendingRequestEntry {
+            workspace_id: "ws".to_owned(),
+            runtime_id: pioneer_protocol::constants::runtime_ids::NATIVE_PERMISSION.to_owned(),
+            request_id: "req_native".to_owned(),
+            thread_id: Some("child_thread".to_owned()),
+            turn_id: Some("turn".to_owned()),
+            item_id: None,
+            request: CLIRuntimePendingRequest {
+                kind: CLIRuntimeRequestKind::Other,
+                title: Some("Tool permission requested".to_owned()),
+                message: Some("generic durable envelope".to_owned()),
+                native_request_id: Some("req_native".to_owned()),
+                payload: Some(serde_json::to_value(native).expect("serialize native request")),
+            },
+        }
+        .into_pending_request();
+
+        assert_eq!(pending.origin, PendingRequestOrigin::NativePermissionGate);
+        assert_eq!(pending.thread_id.as_deref(), Some("child_thread"));
+        assert_eq!(
+            plan_pending_request_response(&pending, PendingRequestResolution::Allow)
+                .expect("plan native response")
+                .method(),
+            pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND
+        );
     }
 
     #[test]

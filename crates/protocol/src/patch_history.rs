@@ -21,14 +21,74 @@ pub enum TurnDiffExactnessView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct PatchFilesystemMutationSourceView {
+    pub item_id: String,
+    pub tool_name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TurnFilesystemCoverageView {
+    Pending,
+    Complete,
+    Incomplete {
+        reason: String,
+        sources: Vec<PatchFilesystemMutationSourceView>,
+    },
+}
+
+impl Default for TurnFilesystemCoverageView {
+    fn default() -> Self {
+        Self::Incomplete {
+            reason: "turn-wide filesystem coverage was not recorded".to_owned(),
+            sources: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PatchHistoryQueryCoverage {
     pub exactness: TurnDiffExactnessView,
     /// Derived machine-friendly flag. It must agree with `exactness`; it is
     /// not an alternate protocol representation.
     pub exact: bool,
     pub coverage: PatchHistoryCoverageView,
+    /// Completeness across every filesystem-capable tool in the turn. This is
+    /// deliberately independent from exactness of the Apply Patch records.
+    #[serde(default)]
+    pub filesystem: TurnFilesystemCoverageView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_missing_ordinal: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchHistoryViewKind {
+    Timeline,
+    TurnAggregate,
+    RecordDiff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchHistoryExecutionContext {
+    pub source_thread_id: String,
+    pub source_turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub presented_thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchHistoryPathView {
+    pub relative_path: String,
+    pub workspace_root: String,
+    pub absolute_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -121,8 +181,11 @@ pub struct PatchHistoryChange {
     pub sequence: u32,
     pub kind: PatchHistoryChangeKind,
     pub source_path: String,
+    pub source_location: PatchHistoryPathView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_location: Option<PatchHistoryPathView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<PatchHistorySnapshotRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,6 +294,8 @@ pub struct PatchHistoryRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchAppliedStep {
+    pub view: PatchHistoryViewKind,
+    pub execution: PatchHistoryExecutionContext,
     pub record: PatchHistoryRecord,
     pub coverage: PatchHistoryQueryCoverage,
 }
@@ -238,6 +303,8 @@ pub struct PatchAppliedStep {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchFileHistoryEntry {
+    pub view: PatchHistoryViewKind,
+    pub execution: PatchHistoryExecutionContext,
     pub environment_id: String,
     pub turn_id: String,
     pub ordinal: u64,
@@ -250,6 +317,10 @@ pub struct PatchFileHistoryEntry {
 pub struct PatchThreadHistoryCursor {
     pub turn_id: String,
     pub ordinal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_at_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -259,6 +330,10 @@ pub struct PatchFileHistoryCursor {
     pub turn_id: String,
     pub ordinal: u64,
     pub sequence: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_at_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -275,6 +350,7 @@ pub struct TurnPatchStepsPageParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnPatchStepsPageResponse {
+    pub view: PatchHistoryViewKind,
     pub thread_id: String,
     pub turn_id: String,
     pub items: Vec<PatchAppliedStep>,
@@ -296,6 +372,7 @@ pub struct ThreadPatchStepsPageParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadPatchStepsPageResponse {
+    pub view: PatchHistoryViewKind,
     pub thread_id: String,
     pub items: Vec<PatchAppliedStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,6 +394,7 @@ pub struct ThreadFilePatchHistoryPageParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadFilePatchHistoryPageResponse {
+    pub view: PatchHistoryViewKind,
     pub thread_id: String,
     pub path: String,
     pub items: Vec<PatchFileHistoryEntry>,
@@ -381,10 +459,13 @@ pub struct TurnPatchDiffGetParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnPatchDiffGetResponse {
+    pub view: PatchHistoryViewKind,
     pub thread_id: String,
     pub turn_id: String,
     pub exactness: TurnDiffExactnessView,
     pub coverage: PatchHistoryCoverageView,
+    #[serde(default)]
+    pub filesystem: TurnFilesystemCoverageView,
     pub unified_patch: String,
     pub records_rendered: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -458,8 +539,10 @@ mod tests {
                 exactness: TurnDiffExactnessView::EngineVerified,
                 exact: true,
                 coverage: PatchHistoryCoverageView::EngineVerifiedSteps,
+                filesystem: TurnFilesystemCoverageView::Complete,
                 first_missing_ordinal: None,
             },
+            view: PatchHistoryViewKind::Timeline,
         };
         let mut missing_items = serde_json::to_value(response).unwrap();
         missing_items.as_object_mut().unwrap().remove("items");

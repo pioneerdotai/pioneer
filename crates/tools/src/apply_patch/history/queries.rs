@@ -75,6 +75,14 @@ pub struct ThreadHistoryCursor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionHistoryCursor {
+    pub committed_at_unix_ms: i64,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub ordinal: CommitOrdinal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileHistoryEntry {
     pub environment_id: String,
     pub turn_id: String,

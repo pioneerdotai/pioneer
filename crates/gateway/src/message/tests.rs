@@ -66,9 +66,9 @@ use pioneer_crud::{
     global_agent_memory_scope_key,
 };
 use pioneer_entity::{
-    cli_runtime_pending_request, thread, thread_sandox_policy, thread_timeline_block, turn,
-    turn_event_projection_state, turn_input, turn_item, turn_item_attempt, turn_status_history,
-    turn_work_item_projection, turn_work_projection,
+    cli_runtime_pending_request, thread, thread_lineage, thread_sandox_policy,
+    thread_timeline_block, turn, turn_event_projection_state, turn_input, turn_item,
+    turn_item_attempt, turn_status_history, turn_work_item_projection, turn_work_projection,
 };
 use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookDiagnosticCode,
@@ -19327,7 +19327,19 @@ fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
 }
 
 async fn assert_composer_work_replays_exact_launch_payload_in_hidden_task_child() {
-    let base_dir = unique_temp_dir("composer_work_exact_launch");
+    for permission_mode in [
+        pioneer_protocol::TurnPermissionMode::FullAccess,
+        pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+        pioneer_protocol::TurnPermissionMode::Supervised,
+    ] {
+        assert_composer_work_replays_exact_launch_payload_for_permission(permission_mode).await;
+    }
+}
+
+async fn assert_composer_work_replays_exact_launch_payload_for_permission(
+    permission_mode: pioneer_protocol::TurnPermissionMode,
+) {
+    let base_dir = unique_temp_dir(&format!("composer_work_exact_launch_{permission_mode:?}"));
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
     let workspace_root = base_dir.join("workspace");
@@ -19550,7 +19562,7 @@ async fn assert_composer_work_replays_exact_launch_payload_in_hidden_task_child(
     });
     exact_agent_launch.execution.permission_profile =
         Some(pioneer_protocol::TurnPermissionProfileSelection {
-            mode: pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+            mode: permission_mode,
         });
     exact_agent_launch.execution.skill_ids = vec![skill_id.clone()];
     let exact_launch = pioneer_protocol::TurnStartParams {
@@ -19575,7 +19587,7 @@ async fn assert_composer_work_replays_exact_launch_payload_in_hidden_task_child(
             effort: "high".to_owned(),
         }),
         permission_profile: Some(pioneer_protocol::TurnPermissionProfileSelection {
-            mode: pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+            mode: permission_mode,
         }),
         cli_runtime_options: None,
     };
@@ -19586,7 +19598,13 @@ async fn assert_composer_work_replays_exact_launch_payload_in_hidden_task_child(
         "Task prompt must not replace composer input",
         3,
     );
-    params.launch = Some(exact_agent_launch);
+    // This is the shape produced by an ordinary Composer launch: the durable
+    // actor selection pins the Agent/profile, while the per-turn permission is
+    // carried by `composer_work.launch`. An omitted actor field must not be
+    // interpreted as an explicit FullAccess selection.
+    let mut actor_launch = exact_agent_launch;
+    actor_launch.execution.permission_profile = None;
+    params.launch = Some(actor_launch);
     let agent_spec = params
         .agent_spec
         .as_mut()
@@ -19664,8 +19682,7 @@ async fn assert_composer_work_replays_exact_launch_payload_in_hidden_task_child(
         .expect("child turn should load")
         .expect("child turn should exist");
     assert_eq!(
-        child_turn.permission_profile.mode,
-        pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+        child_turn.permission_profile.mode, permission_mode,
         "composer permission selection must be intersected into the Task child"
     );
 
@@ -23260,6 +23277,121 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
         "system delivery must remain an explicit Chat projection even when the target thread defaults to Message"
     );
     assert_eq!(delivered_turn.origin, "task_delivery");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_delivery_reuses_pre_child_occurrence_without_lineage() {
+    let connection = Database::connect("sqlite::memory:")
+        .await
+        .expect("must connect to sqlite memory");
+    Migrator::up(&connection, None)
+        .await
+        .expect("migrations must succeed");
+    bootstrap(&connection)
+        .await
+        .expect("gateway bootstrap should create default workspace");
+
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let workspace_manager = Arc::new(WorkspaceManager::new(connection.clone()));
+    let workspace_id = workspace_manager
+        .list_workspaces()
+        .await
+        .expect("workspace/list should succeed")
+        .into_iter()
+        .find(|workspace| workspace.is_active && workspace.is_current)
+        .expect("default workspace should exist")
+        .id;
+    let crud_store = Arc::new(CrudStore::new(connection));
+    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
+    let processor = MessageProcessor::with_agent_manager(
+        thread_manager,
+        Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+    );
+
+    let thread_id = "thr_pre_child_delivery";
+    let run_id = "run_pre_child_delivery";
+    let thread = Thread {
+        workspace_id: workspace_id.clone(),
+        id: thread_id.to_owned(),
+        name: Some("Pre-child delivery".to_owned()),
+        preview: String::new(),
+        preview_author: None,
+        mode: ThreadMode::Agent,
+        model: "o4-mini".to_owned(),
+        model_provider: "openai".to_owned(),
+        reasoning_effort: None,
+        created_at: 1,
+        updated_at: 1,
+        status: ThreadStatus::Active,
+        origin_kind: ThreadOriginKind::User,
+        sidebar_visibility: ThreadSidebarVisibility::Visible,
+        agent_nickname: None,
+        agent_role: None,
+        visibility: None,
+        turns: Vec::new(),
+    };
+    crud_store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: run_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::TaskRun,
+                origin: TurnOrigin::DetachedTask,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: default_test_permission_profile(),
+            },
+            &[],
+            PersistedActorRef::Principal(authenticated_test_superuser().principal_id.clone()),
+        )
+        .await
+        .expect("task run occurrence should persist");
+
+    let delivery = pioneer_protocol::TaskDelivery {
+        id: "delivery_pre_child".to_owned(),
+        workspace_id,
+        task_id: "task_pre_child".to_owned(),
+        run_id: run_id.to_owned(),
+        delivery_key: "delivery-key-pre-child".to_owned(),
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread),
+        target_thread_id: Some(thread_id.to_owned()),
+        target_user_id: None,
+        webhook_url: None,
+        webhook_url_fingerprint: None,
+        status: TaskDeliveryStatus::Delivering,
+        next_attempt_at: None,
+        attempt_count: 1,
+        max_attempts: 1,
+        result_snapshot: None,
+        error_snapshot: None,
+        delivered_turn_id: None,
+        delivered_notification_id: None,
+        delivered_at: None,
+        last_error: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    assert_eq!(
+        processor
+            .lineage_parent_turn_for_origin_delivery(&delivery, thread_id)
+            .await
+            .expect("origin delivery target should resolve"),
+        Some(run_id.to_owned()),
+        "a pre-child failure must reuse its existing occurrence instead of materializing a duplicate delivery Turn"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -36887,6 +37019,38 @@ async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_sc
         serde_json::json!("perm-approval-grandchild-visible-1")
     );
 
+    let wrong_route_request_id = "permgrandwrongroute01";
+    processor
+        .process_request_for_connection(
+            replay_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": wrong_route_request_id,
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": pioneer_protocol::constants::runtime_ids::NATIVE_PERMISSION,
+                    "request_id": "perm-approval-grandchild-visible-1",
+                    "resolution": "approved"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let wrong_route_response = recv_error_by_id(&mut replay_rx, wrong_route_request_id).await;
+    assert_eq!(wrong_route_response.error.code, INVALID_PARAMS_CODE);
+    assert_eq!(
+        processor
+            .crud_store
+            .get_cli_runtime_pending_request("perm-approval-grandchild-visible-1")
+            .await
+            .expect("native permission lookup should succeed")
+            .expect("native permission should remain durable")
+            .status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending,
+        "the CLI response route must not expire a native permission"
+    );
+
     let respond_request_id = "permgranddeny00000001";
     message_future(
         processor.process_request_for_connection(
@@ -43057,6 +43221,333 @@ async fn patch_history_rpc_reads_persisted_steps_records_files_and_diffs() {
         .await;
     let foreign = recv_error_by_id(&mut rx, "patchforeignrpc000001").await;
     assert_eq!(foreign.error.code, pioneer_protocol::NOT_FOUND_CODE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_history_parent_scope_exposes_exact_child_timeline_and_aggregate() {
+    let parent_thread_id = "thr_patch_history_parent_scope";
+    let parent_turn_id = "turn_patch_history_parent_scope";
+    let child_thread_id = "thr_patch_history_child_scope";
+    let child_turn_id = "turn_patch_history_child_scope";
+    let (processor, crud_store, workspace_id) =
+        setup_execution_window_terminal_turn(parent_thread_id, parent_turn_id).await;
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        child_thread_id,
+        child_turn_id,
+    )
+    .await;
+    let database = crud_store.database_connection();
+    thread_lineage::Entity::insert(thread_lineage::ActiveModel {
+        child_thread_id: Set(child_thread_id.to_owned()),
+        parent_thread_id: Set(parent_thread_id.to_owned()),
+        root_thread_id: Set(parent_thread_id.to_owned()),
+        depth: Set(1),
+        created_at: Set(chrono::Utc::now().fixed_offset()),
+        origin_kind: Set(Some("task_run".to_owned())),
+        created_by_thread_id: Set(Some(parent_thread_id.to_owned())),
+        created_by_turn_id: Set(Some(parent_turn_id.to_owned())),
+    })
+    .exec(&database)
+    .await
+    .expect("persist child thread lineage");
+
+    let dynamic_root = tempfile::tempdir().expect("create dynamic patch root");
+    let dynamic_root = dynamic_root
+        .path()
+        .canonicalize()
+        .expect("canonical dynamic patch root");
+    crud_store
+        .set_turn_execution_security_snapshot(
+            child_turn_id,
+            &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                dynamic_root.to_string_lossy(),
+                1_700_000_000_000,
+            ),
+        )
+        .await
+        .expect("persist dynamic child security snapshot");
+
+    let draft = pioneer_tools::apply_patch::history::CommittedTextSnapshot::from_bytes(
+        b"draft\n".to_vec(),
+        pioneer_tools::apply_patch::history::TextEncoding::Utf8,
+        pioneer_tools::apply_patch::history::LineEndingMetadata {
+            dominant: pioneer_tools::apply_patch::history::LineEnding::Lf,
+            mixed: false,
+            final_newline: true,
+        },
+    );
+    let note = pioneer_tools::apply_patch::history::CommittedTextSnapshot::from_bytes(
+        b"remember budget\n".to_vec(),
+        pioneer_tools::apply_patch::history::TextEncoding::Utf8,
+        pioneer_tools::apply_patch::history::LineEndingMetadata {
+            dominant: pioneer_tools::apply_patch::history::LineEnding::Lf,
+            mixed: false,
+            final_newline: true,
+        },
+    );
+    let final_plan = pioneer_tools::apply_patch::history::CommittedTextSnapshot::from_bytes(
+        b"final plan\n".to_vec(),
+        pioneer_tools::apply_patch::history::TextEncoding::Utf8,
+        pioneer_tools::apply_patch::history::LineEndingMetadata {
+            dominant: pioneer_tools::apply_patch::history::LineEnding::Lf,
+            mixed: false,
+            final_newline: true,
+        },
+    );
+    let budget = pioneer_tools::apply_patch::history::CommittedTextSnapshot::from_bytes(
+        b"budget: 100\n".to_vec(),
+        pioneer_tools::apply_patch::history::TextEncoding::Utf8,
+        pioneer_tools::apply_patch::history::LineEndingMetadata {
+            dominant: pioneer_tools::apply_patch::history::LineEnding::Lf,
+            mixed: false,
+            final_newline: true,
+        },
+    );
+    let first_identity = pioneer_tools::apply_patch::history::InvocationIdentity::new(
+        child_thread_id,
+        child_turn_id,
+        "child_patch_first",
+    )
+    .unwrap();
+    let first_changes = vec![
+        pioneer_tools::apply_patch::history::CommittedPatchChange {
+            operation_index: 0,
+            commit_step: 0,
+            sequence: 0,
+            kind: pioneer_tools::apply_patch::history::ChangeKind::Add,
+            source_path: "trip/itinerary.md".to_owned(),
+            destination_path: None,
+            before: None,
+            after: Some(draft.clone()),
+            overwritten_destination: None,
+            side_effects: pioneer_tools::apply_patch::history::PatchSideEffects::default(),
+        },
+        pioneer_tools::apply_patch::history::CommittedPatchChange {
+            operation_index: 1,
+            commit_step: 1,
+            sequence: 1,
+            kind: pioneer_tools::apply_patch::history::ChangeKind::Add,
+            source_path: "trip/notes.txt".to_owned(),
+            destination_path: None,
+            before: None,
+            after: Some(note.clone()),
+            overwritten_destination: None,
+            side_effects: pioneer_tools::apply_patch::history::PatchSideEffects::default(),
+        },
+    ];
+    let mut first_record = pioneer_tools::apply_patch::history::AppliedPatchRecord::new(
+        first_identity,
+        pioneer_tools::apply_patch::history::CommitOrdinal(0),
+        pioneer_tools::apply_patch::history::AppliedPatchRecordOutcome::Applied,
+        first_changes
+            .iter()
+            .map(pioneer_tools::apply_patch::history::DurablePatchChange::from)
+            .collect(),
+    );
+    first_record.environment_id = "dynamic-workspace".to_owned();
+    first_record.committed_at_unix_ms = 1_700_000_000_100;
+
+    let second_identity = pioneer_tools::apply_patch::history::InvocationIdentity::new(
+        child_thread_id,
+        child_turn_id,
+        "child_patch_second",
+    )
+    .unwrap();
+    let second_changes = vec![
+        pioneer_tools::apply_patch::history::CommittedPatchChange {
+            operation_index: 0,
+            commit_step: 0,
+            sequence: 0,
+            kind: pioneer_tools::apply_patch::history::ChangeKind::Move,
+            source_path: "trip/itinerary.md".to_owned(),
+            destination_path: Some("trip/plan.md".to_owned()),
+            before: Some(draft.clone()),
+            after: Some(final_plan.clone()),
+            overwritten_destination: None,
+            side_effects: pioneer_tools::apply_patch::history::PatchSideEffects::default(),
+        },
+        pioneer_tools::apply_patch::history::CommittedPatchChange {
+            operation_index: 1,
+            commit_step: 1,
+            sequence: 1,
+            kind: pioneer_tools::apply_patch::history::ChangeKind::Delete,
+            source_path: "trip/notes.txt".to_owned(),
+            destination_path: None,
+            before: Some(note.clone()),
+            after: None,
+            overwritten_destination: None,
+            side_effects: pioneer_tools::apply_patch::history::PatchSideEffects::default(),
+        },
+        pioneer_tools::apply_patch::history::CommittedPatchChange {
+            operation_index: 2,
+            commit_step: 2,
+            sequence: 2,
+            kind: pioneer_tools::apply_patch::history::ChangeKind::Add,
+            source_path: "trip/budget.md".to_owned(),
+            destination_path: None,
+            before: None,
+            after: Some(budget.clone()),
+            overwritten_destination: None,
+            side_effects: pioneer_tools::apply_patch::history::PatchSideEffects::default(),
+        },
+    ];
+    let mut second_record = pioneer_tools::apply_patch::history::AppliedPatchRecord::new(
+        second_identity,
+        pioneer_tools::apply_patch::history::CommitOrdinal(1),
+        pioneer_tools::apply_patch::history::AppliedPatchRecordOutcome::Applied,
+        second_changes
+            .iter()
+            .map(pioneer_tools::apply_patch::history::DurablePatchChange::from)
+            .collect(),
+    );
+    second_record.environment_id = "dynamic-workspace".to_owned();
+    second_record.committed_at_unix_ms = 1_700_000_000_200;
+
+    let record_store = pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(
+        crud_store.database_connection(),
+    );
+    let domain = pioneer_tools::apply_patch::history::SnapshotDomain::new(
+        format!("thread:{child_thread_id}"),
+        "pioneer",
+        "thread_history",
+    );
+    record_store
+        .insert_with_snapshots(
+            first_record,
+            [1; 32],
+            &domain,
+            &[draft.clone(), note.clone()],
+        )
+        .await
+        .expect("persist first child patch");
+    record_store
+        .insert_with_snapshots(
+            second_record,
+            [2; 32],
+            &domain,
+            &[draft, final_plan, note, budget],
+        )
+        .await
+        .expect("persist second child patch");
+
+    crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: child_thread_id.to_owned(),
+                turn_id: child_turn_id.to_owned(),
+                item: pioneer_protocol::TurnItem::CommandExecution {
+                    id: "mkdir_outside_patch_history".to_owned(),
+                    tool_name: "exec_command".to_owned(),
+                    arguments: json!({"cmd": "mkdir -p trip"}),
+                    status: pioneer_protocol::ToolCallStatus::Completed,
+                    recovery_policy: None,
+                    output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                    display: ToolDisplayPayload::Hidden,
+                    storage: ToolStoragePayload::None,
+                    recovery: None,
+                    command: vec!["mkdir".to_owned(), "-p".to_owned(), "trip".to_owned()],
+                    cwd: Some(dynamic_root.to_string_lossy().into_owned()),
+                    success: Some(true),
+                    outcome: None,
+                    observation: None,
+                },
+            },
+            1_700_000_001,
+        )
+        .await
+        .expect("persist directory creation outside patch history");
+    processor
+        .project_native_patch_projection(child_thread_id, child_turn_id, true)
+        .await
+        .expect("finalize child patch projection");
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let connection_id =
+        register_authenticated_test_connection(processor.session_manager.as_ref(), tx).await;
+    for request in [
+        json!({
+            "jsonrpc": "2.0", "id": "lineagesteprpc0000001", "method": "thread/patch_steps/page",
+            "params": {"threadId": parent_thread_id}
+        }),
+        json!({
+            "jsonrpc": "2.0", "id": "lineagefilerpc0000001", "method": "thread/file_patch_history/page",
+            "params": {"threadId": parent_thread_id, "path": "trip/plan.md"}
+        }),
+        json!({
+            "jsonrpc": "2.0", "id": "lineagediffrpc0000001", "method": "turn/patch_diff/get",
+            "params": {"threadId": child_thread_id, "turnId": child_turn_id, "selection": {"kind": "boundary"}}
+        }),
+    ] {
+        processor
+            .process_request_for_connection(connection_id, &request.to_string())
+            .await;
+    }
+
+    let timeline = recv_response_by_id(&mut rx, "lineagesteprpc0000001").await;
+    let timeline: pioneer_protocol::ThreadPatchStepsPageResponse =
+        serde_json::from_value(timeline.result).expect("lineage timeline response");
+    assert_eq!(
+        timeline.view,
+        pioneer_protocol::PatchHistoryViewKind::Timeline
+    );
+    assert_eq!(timeline.items.len(), 2);
+    assert!(timeline.coverage.exact);
+    assert_eq!(
+        timeline.coverage.filesystem,
+        pioneer_protocol::TurnFilesystemCoverageView::Complete
+    );
+    for item in &timeline.items {
+        assert_eq!(item.execution.source_thread_id, child_thread_id);
+        assert_eq!(item.execution.source_turn_id, child_turn_id);
+        assert_eq!(item.execution.presented_thread_id, parent_thread_id);
+    }
+    let moved = timeline.items[1]
+        .record
+        .changes
+        .iter()
+        .find(|change| change.kind == pioneer_protocol::PatchHistoryChangeKind::Move)
+        .expect("timeline must retain rename operation");
+    assert_eq!(moved.source_path, "trip/itinerary.md");
+    assert_eq!(moved.destination_path.as_deref(), Some("trip/plan.md"));
+    assert_eq!(
+        moved.source_location.absolute_path,
+        dynamic_root.join("trip/itinerary.md").to_string_lossy()
+    );
+    assert_eq!(
+        moved
+            .destination_location
+            .as_ref()
+            .expect("move destination path projection")
+            .absolute_path,
+        dynamic_root.join("trip/plan.md").to_string_lossy()
+    );
+
+    let file_history = recv_response_by_id(&mut rx, "lineagefilerpc0000001").await;
+    let file_history: pioneer_protocol::ThreadFilePatchHistoryPageResponse =
+        serde_json::from_value(file_history.result).expect("lineage file history response");
+    assert_eq!(file_history.items.len(), 2);
+    assert!(file_history.items.iter().all(|item| {
+        item.execution.source_thread_id == child_thread_id
+            && item.execution.presented_thread_id == parent_thread_id
+    }));
+
+    let aggregate = recv_response_by_id(&mut rx, "lineagediffrpc0000001").await;
+    let aggregate: pioneer_protocol::TurnPatchDiffGetResponse =
+        serde_json::from_value(aggregate.result).expect("turn aggregate response");
+    assert_eq!(
+        aggregate.view,
+        pioneer_protocol::PatchHistoryViewKind::TurnAggregate
+    );
+    assert!(aggregate.unified_patch.contains("trip/plan.md"));
+    assert!(aggregate.unified_patch.contains("trip/budget.md"));
+    assert!(!aggregate.unified_patch.contains("remember budget"));
+    assert_eq!(
+        aggregate.filesystem,
+        pioneer_protocol::TurnFilesystemCoverageView::Complete
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

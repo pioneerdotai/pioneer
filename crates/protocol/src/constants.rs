@@ -1,3 +1,8 @@
+pub mod runtime_ids {
+    /// Durable runtime discriminator used for native tool permission requests.
+    pub const NATIVE_PERMISSION: &str = "__native_permission__";
+}
+
 pub mod methods {
     pub const AUTH_ME: &str = "auth/me";
     pub const AUTHORIZATION_CAPABILITIES: &str = "authorization/capabilities";

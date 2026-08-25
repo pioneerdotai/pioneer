@@ -695,6 +695,35 @@ impl SqliteAppliedPatchStore {
         rows.iter().map(decode_row).collect()
     }
 
+    pub async fn records_for_threads_page(
+        &self,
+        thread_ids: &[String],
+        after: Option<&crate::apply_patch::history::ExecutionHistoryCursor>,
+        limit: usize,
+    ) -> Result<Vec<StoredPatchRecord>> {
+        if thread_ids.is_empty() || limit == 0 || limit > MAX_REPLAY_PAGE_SIZE {
+            bail!("invalid patch execution-scope replay page")
+        }
+        let after = match after {
+            Some(cursor) => Some((
+                cursor.committed_at_unix_ms,
+                cursor.thread_id.as_str(),
+                cursor.turn_id.as_str(),
+                sqlite_ordinal(cursor.ordinal)?,
+            )),
+            None => None,
+        };
+        let rows = crud::list_applied_patch_records_for_threads(
+            &self.db,
+            thread_ids,
+            after,
+            u64::try_from(limit).map_err(|_| anyhow!("patch replay page size is out of range"))?,
+        )
+        .await
+        .context("query bounded applied patch execution-scope page")?;
+        rows.iter().map(decode_row).collect()
+    }
+
     /// Return only the immutable record count and highest ordinal for a turn.
     /// Projection-status checks use this summary instead of deserializing all
     /// change payloads merely to validate a live aggregate watermark.
@@ -1497,6 +1526,27 @@ impl SqliteAppliedPatchStore {
             combined_exact,
             combined_first_missing_ordinal,
         ))
+    }
+
+    pub async fn coverage_for_threads(
+        &self,
+        thread_ids: &[String],
+    ) -> Result<HistoryCoverage, HistoryQueryError> {
+        if thread_ids.is_empty() {
+            return Err(HistoryQueryError::InvalidArgument);
+        }
+        let mut exact = true;
+        let mut first_missing_ordinal = None;
+        for thread_id in thread_ids {
+            let coverage = self.coverage_for_thread_pages(thread_id).await?;
+            if !coverage.exact {
+                exact = false;
+                if first_missing_ordinal.is_none() {
+                    first_missing_ordinal = coverage.first_missing_ordinal;
+                }
+            }
+        }
+        Ok(combined_history_coverage(exact, first_missing_ordinal))
     }
 }
 

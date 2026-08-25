@@ -2163,6 +2163,29 @@ impl MessageProcessor {
             }
         };
 
+        // Native tool permissions share the durable pending-request table, but
+        // they have their own response protocol and in-process delivery lane.
+        // Treating one as a CLI runtime request can expire the durable row
+        // without waking the native tool call.
+        if pending.runtime_id == NATIVE_HUMAN_INTERACTION_RUNTIME_ID
+            && pending.request_kind == NATIVE_HUMAN_INTERACTION_REQUEST_KIND
+        {
+            self.send_error(
+                connection_id,
+                cli_runtime_public_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "native permission request `{}` must be answered with `{}`",
+                        pending.request_id,
+                        methods::TURN_PERMISSION_REQUEST_RESPOND
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
         if pending.workspace_id != workspace_id {
             self.send_error(
                 connection_id,

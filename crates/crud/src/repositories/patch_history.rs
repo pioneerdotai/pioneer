@@ -1444,6 +1444,55 @@ pub async fn list_applied_patch_records_for_thread<C: ConnectionTrait>(
         .context("failed to list applied patch records for thread")
 }
 
+/// Lists immutable patch records across an authorized execution-thread scope
+/// in true commit order. The owning thread remains part of the keyset so a
+/// visible parent can present child task-run history without copying rows.
+pub async fn list_applied_patch_records_for_threads<C: ConnectionTrait>(
+    db: &C,
+    thread_ids: &[String],
+    after: Option<(i64, &str, &str, i64)>,
+    limit: u64,
+) -> Result<Vec<AppliedPatchRecordRow>> {
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = applied_patch_record::Entity::find()
+        .filter(applied_patch_record::Column::ThreadId.is_in(thread_ids.iter().cloned()));
+    if let Some((committed_at, thread_id, turn_id, commit_ordinal)) = after {
+        query = query.filter(
+            Condition::any()
+                .add(applied_patch_record::Column::CommittedAtUnixMs.gt(committed_at))
+                .add(
+                    Condition::all()
+                        .add(applied_patch_record::Column::CommittedAtUnixMs.eq(committed_at))
+                        .add(applied_patch_record::Column::ThreadId.gt(thread_id.to_owned())),
+                )
+                .add(
+                    Condition::all()
+                        .add(applied_patch_record::Column::CommittedAtUnixMs.eq(committed_at))
+                        .add(applied_patch_record::Column::ThreadId.eq(thread_id.to_owned()))
+                        .add(applied_patch_record::Column::TurnId.gt(turn_id.to_owned())),
+                )
+                .add(
+                    Condition::all()
+                        .add(applied_patch_record::Column::CommittedAtUnixMs.eq(committed_at))
+                        .add(applied_patch_record::Column::ThreadId.eq(thread_id.to_owned()))
+                        .add(applied_patch_record::Column::TurnId.eq(turn_id.to_owned()))
+                        .add(applied_patch_record::Column::CommitOrdinal.gt(commit_ordinal)),
+                ),
+        );
+    }
+    query
+        .order_by_asc(applied_patch_record::Column::CommittedAtUnixMs)
+        .order_by_asc(applied_patch_record::Column::ThreadId)
+        .order_by_asc(applied_patch_record::Column::TurnId)
+        .order_by_asc(applied_patch_record::Column::CommitOrdinal)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("failed to list applied patch records for execution threads")
+}
+
 pub async fn list_applied_patch_records_after_id<C: ConnectionTrait>(
     db: &C,
     after_id: &str,
@@ -1899,6 +1948,22 @@ pub async fn find_turn_diff_state<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to load turn diff state")
+}
+
+pub async fn list_turn_diff_states_for_threads<C: ConnectionTrait>(
+    db: &C,
+    thread_ids: &[String],
+) -> Result<Vec<TurnDiffStateRow>> {
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    turn_diff_state::Entity::find()
+        .filter(turn_diff_state::Column::ThreadId.is_in(thread_ids.iter().cloned()))
+        .order_by_asc(turn_diff_state::Column::ThreadId)
+        .order_by_asc(turn_diff_state::Column::TurnId)
+        .all(db)
+        .await
+        .context("failed to list turn diff states for execution threads")
 }
 
 pub async fn delete_turn_diff_state<C: ConnectionTrait>(

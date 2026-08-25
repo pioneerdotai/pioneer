@@ -1663,11 +1663,15 @@ impl TaskAgentExecutor {
             .as_ref()
             .and_then(|launch| launch.mode)
             .unwrap_or(ThreadMode::Agent);
-        let selected_permission_profile = launch_selection.as_ref().map(|selection| {
-            pioneer_protocol::resolve_turn_permission_profile(
-                selection.execution.permission_profile.as_ref(),
-            )
-        });
+        // The actor launch selection describes the selected Agent/profile. Its
+        // per-turn permission is optional: ordinary Composer work persists that
+        // selection on `composer_work.launch` instead. Do not turn an omitted
+        // actor field into FullAccess, because that would manufacture a false
+        // conflict with Supervised or AutoAcceptEdits Composer launches.
+        let selected_permission_profile = launch_selection
+            .as_ref()
+            .and_then(|selection| selection.execution.permission_profile.as_ref())
+            .map(|selection| pioneer_protocol::resolve_turn_permission_profile(Some(selection)));
         let composer_permission_profile =
             composer_launch_permission_profile(composer_launch.as_ref());
         if let (Some(selected), Some(composer)) = (
@@ -1702,8 +1706,12 @@ impl TaskAgentExecutor {
         if let Some(launch) = composer_launch.as_mut()
             && let Some(selection) = launch_selection.as_ref()
         {
-            launch.reasoning = selection.execution.reasoning.clone();
-            launch.permission_profile = selection.execution.permission_profile.clone();
+            if let Some(reasoning) = selection.execution.reasoning.clone() {
+                launch.reasoning = Some(reasoning);
+            }
+            if let Some(permission_profile) = selection.execution.permission_profile.clone() {
+                launch.permission_profile = Some(permission_profile);
+            }
         }
         let sandbox_mode = match composer_launch
             .as_ref()

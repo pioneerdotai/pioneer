@@ -153,6 +153,7 @@ pub fn preserve_supported_mode(
     source: &Path,
     destination: &Path,
 ) -> Result<Vec<MetadataWarning>, io::Error> {
+    let warnings = metadata_warnings_for_source(source)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -168,7 +169,7 @@ pub fn preserve_supported_mode(
     }
     #[cfg(not(unix))]
     let _ = (source, destination);
-    Ok(metadata_warnings())
+    Ok(warnings)
 }
 
 /// Newly created temporary files remain private; this safe policy never
@@ -246,17 +247,154 @@ pub(crate) fn apply_supported_mode_to_file(
     Ok(())
 }
 
-fn metadata_warnings() -> Vec<MetadataWarning> {
+pub fn metadata_warnings_for_source(path: &Path) -> Result<Vec<MetadataWarning>, io::Error> {
     #[allow(unused_mut)]
-    let mut warnings = vec![
-        MetadataWarning::ExtendedAttributesNotPreserved,
-        MetadataWarning::AclNotPreserved,
-    ];
-    #[cfg(windows)]
-    warnings.push(MetadataWarning::WindowsAlternateStreamsNotPreserved);
+    let mut warnings = Vec::new();
+    let presence = unsupported_metadata_presence(path)?;
+    if presence.extended_attributes {
+        warnings.push(MetadataWarning::ExtendedAttributesNotPreserved);
+    }
+    if presence.acl {
+        warnings.push(MetadataWarning::AclNotPreserved);
+    }
     #[cfg(not(unix))]
     warnings.push(MetadataWarning::DirectoryDurabilityNotGuaranteed);
-    warnings
+    Ok(warnings)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct UnsupportedMetadataPresence {
+    extended_attributes: bool,
+    acl: bool,
+}
+
+fn unsupported_metadata_presence(path: &Path) -> Result<UnsupportedMetadataPresence, io::Error> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "metadata path contains NUL")
+        })?;
+        let names = list_extended_attributes(path.as_c_str())?;
+        let acl_xattr = names.iter().any(|name| is_acl_xattr(name));
+        return Ok(UnsupportedMetadataPresence {
+            extended_attributes: names
+                .iter()
+                .any(|name| is_preservation_relevant_extended_attribute(name)),
+            acl: acl_xattr || has_platform_acl(path.as_c_str())?,
+        });
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+        Ok(UnsupportedMetadataPresence::default())
+    }
+}
+
+fn is_acl_xattr(name: &[u8]) -> bool {
+    name == b"system.posix_acl_access" || name == b"system.posix_acl_default"
+}
+
+fn is_preservation_relevant_extended_attribute(name: &[u8]) -> bool {
+    if is_acl_xattr(name) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    if name == b"com.apple.provenance" {
+        // macOS attaches this process provenance marker to newly created
+        // files and recreates it after removal. It is system-managed rather
+        // than source content that Apply Patch could meaningfully preserve.
+        return false;
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn list_extended_attributes(path: &std::ffi::CStr) -> Result<Vec<Vec<u8>>, io::Error> {
+    let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buffer = vec![0_u8; usize::try_from(size).unwrap_or(0)];
+    let written =
+        unsafe { libc::listxattr(path.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(usize::try_from(written).unwrap_or(0));
+    Ok(buffer
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn list_extended_attributes(path: &std::ffi::CStr) -> Result<Vec<Vec<u8>>, io::Error> {
+    let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, 0) };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buffer = vec![0_u8; usize::try_from(size).unwrap_or(0)];
+    let written =
+        unsafe { libc::listxattr(path.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(usize::try_from(written).unwrap_or(0));
+    Ok(buffer
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn has_platform_acl(_path: &std::ffi::CStr) -> Result<bool, io::Error> {
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn has_platform_acl(path: &std::ffi::CStr) -> Result<bool, io::Error> {
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    unsafe extern "C" {
+        fn acl_get_file(path: *const libc::c_char, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+
+    let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(false),
+            _ => Err(error),
+        };
+    }
+    let mut entry = std::ptr::null_mut();
+    let result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+    let free_result = unsafe { acl_free(acl) };
+    if free_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match result {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
 }
 
 /// Reports the platform boundary for directory-entry durability. Unix can
@@ -275,7 +413,7 @@ pub fn directory_durability_warnings() -> Vec<MetadataWarning> {
 }
 
 pub fn unsupported_metadata_warnings() -> Vec<MetadataWarning> {
-    metadata_warnings()
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -302,8 +440,54 @@ mod tests {
         fs::write(&destination, b"data").unwrap();
         sync_parent_directory(&destination).unwrap();
         let warnings = preserve_supported_mode(&source, &destination).unwrap();
-        assert!(warnings.contains(&MetadataWarning::AclNotPreserved));
+        assert!(warnings.is_empty());
         let warnings = apply_safe_add_mode(&destination).unwrap();
         assert!(warnings.is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn metadata_warnings_are_emitted_only_for_metadata_that_exists() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::write(&source, b"data").unwrap();
+        let path = CString::new(source.as_os_str().as_bytes()).unwrap();
+        let initial_warnings = metadata_warnings_for_source(&source).unwrap();
+        assert!(initial_warnings.is_empty(), "{initial_warnings:?}");
+
+        #[cfg(target_os = "linux")]
+        let name = CString::new("user.pioneer_metadata_test").unwrap();
+        #[cfg(target_os = "macos")]
+        let name = CString::new("com.pioneer.metadata-test").unwrap();
+        let value = b"present";
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(result, 0, "set test xattr: {}", io::Error::last_os_error());
+        assert_eq!(
+            metadata_warnings_for_source(&source).unwrap(),
+            vec![MetadataWarning::ExtendedAttributesNotPreserved]
+        );
     }
 }

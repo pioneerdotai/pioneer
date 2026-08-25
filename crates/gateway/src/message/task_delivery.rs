@@ -839,7 +839,7 @@ impl MessageProcessor {
         self.deliver_to_thread(delivery).await
     }
 
-    async fn lineage_parent_turn_for_origin_delivery(
+    pub(super) async fn lineage_parent_turn_for_origin_delivery(
         &self,
         delivery: &TaskDelivery,
         target_thread_id: &str,
@@ -860,6 +860,21 @@ impl MessageProcessor {
             if parent_thread_id == target_thread_id {
                 return Ok(lineage.created_by_turn_id);
             }
+        }
+
+        // Agent runs materialize their visible TaskRun occurrence before the
+        // hidden child is admitted. If admission fails at that boundary there
+        // is deliberately no child lineage yet, but the occurrence is already
+        // the canonical error presentation in the parent thread. Reuse it so
+        // delivery does not add a second, generic failure Turn beside the card.
+        if let Some((workspace_id, occurrence)) = self
+            .crud_store
+            .get_turn(target_thread_id, delivery.run_id.as_str())
+            .await?
+            && workspace_id == delivery.workspace_id
+            && occurrence.turn_kind == pioneer_protocol::TurnKind::TaskRun
+        {
+            return Ok(Some(delivery.run_id.clone()));
         }
 
         Ok(None)

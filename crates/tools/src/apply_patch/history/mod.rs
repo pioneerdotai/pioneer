@@ -45,15 +45,15 @@ pub use db_store::SqliteAppliedPatchStore;
 pub use intent::{CommitIntentJournal, IntentError, IntentStatus, PatchCommitIntent};
 pub use projection::{
     AgentDiffUpdatedProjection, ProjectionError, TURN_DIFF_STATE_SCHEMA_VERSION,
-    TurnDiffProjectionStore, TurnDiffState,
+    TurnDiffProjectionStore, TurnDiffState, TurnFilesystemCoverage, TurnFilesystemMutationSource,
 };
 pub use projector::{
     AggregateFileChange, AggregateProjectionError, TurnAggregate, TurnRecordProjector,
     next_turn_projection_revision, project_turn_records, project_turn_records_with_ordinal_status,
 };
 pub use queries::{
-    AppliedStep, FileHistoryCursor, FileHistoryEntry, HistoryCoverage, HistoryPage,
-    HistoryQueryError, HistoryQueryLimits, HistoryRenderedDiff, ThreadHistoryCursor,
+    AppliedStep, ExecutionHistoryCursor, FileHistoryCursor, FileHistoryEntry, HistoryCoverage,
+    HistoryPage, HistoryQueryError, HistoryQueryLimits, HistoryRenderedDiff, ThreadHistoryCursor,
     aggregate_semantic_inputs, authorized_snapshot_reference, query_file_history,
     query_thread_steps, query_turn_steps,
 };

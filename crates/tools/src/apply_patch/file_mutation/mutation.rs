@@ -42,10 +42,13 @@ pub enum MutationKind {
 /// A patch executor can prepare every replacement before publishing any of
 /// them.  Keeping the intent with the stage prevents the later commit loop
 /// from silently choosing a different metadata policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StageMetadata {
     SafeAdd,
-    PreserveSupportedMode(Option<u32>),
+    PreserveSupportedMode {
+        mode: Option<u32>,
+        source_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -393,20 +396,24 @@ impl FileMutationEngine {
             Ok(staged) => staged,
             Err(error) => return Err(cleanup_error(error, parents)),
         };
-        let source_mode = match metadata {
-            StageMetadata::SafeAdd => None,
-            StageMetadata::PreserveSupportedMode(mode) => mode,
+        let (source_mode, source_path) = match metadata {
+            StageMetadata::SafeAdd => (None, None),
+            StageMetadata::PreserveSupportedMode { mode, source_path } => (mode, source_path),
         };
-        let metadata_warnings =
-            match apply_staged_metadata(&staged, source_mode, self.options.durability) {
-                Ok(warnings) => warnings,
-                Err(error) => {
-                    return Err(cleanup_error(
-                        cleanup_staged_error(error, staged, self.options.durability),
-                        parents,
-                    ));
-                }
-            };
+        let metadata_warnings = match apply_staged_metadata(
+            &staged,
+            source_path.as_deref(),
+            source_mode,
+            self.options.durability,
+        ) {
+            Ok(warnings) => warnings,
+            Err(error) => {
+                return Err(cleanup_error(
+                    cleanup_staged_error(error, staged, self.options.durability),
+                    parents,
+                ));
+            }
+        };
         // Applying mode metadata dirties the private inode after the initial
         // content sync. Flush once more so "prepared" means both bytes and the
         // supported metadata are durable before the first visible publish.
@@ -602,7 +609,10 @@ impl FileMutationEngine {
         let prepared = match self.prepare_file_stage_locked(
             target.clone(),
             bytes,
-            StageMetadata::PreserveSupportedMode(mode),
+            StageMetadata::PreserveSupportedMode {
+                mode,
+                source_path: Some(target.absolute().to_path_buf()),
+            },
             lock,
         ) {
             Ok(prepared) => prepared,
@@ -853,7 +863,10 @@ impl FileMutationEngine {
         let prepared = match self.prepare_file_stage_locked(
             destination.clone(),
             bytes,
-            StageMetadata::PreserveSupportedMode(mode),
+            StageMetadata::PreserveSupportedMode {
+                mode,
+                source_path: Some(source.absolute().to_path_buf()),
+            },
             lock,
         ) {
             Ok(prepared) => prepared,
@@ -1337,6 +1350,7 @@ fn stage_bytes(
 /// creation/umask behavior for them.
 fn apply_staged_metadata(
     staged: &StagedFile,
+    source_path: Option<&Path>,
     source_mode: Option<u32>,
     durability: crate::apply_patch::file_mutation::DurabilityOptions,
 ) -> Result<Vec<crate::apply_patch::file_mutation::MetadataWarning>, MutationError> {
@@ -1350,7 +1364,12 @@ fn apply_staged_metadata(
                 staged.file(),
                 Some(mode),
             )
-            .map(|_| crate::apply_patch::file_mutation::unsupported_metadata_warnings())
+            .and_then(|_| {
+                source_path.map_or_else(
+                    || Ok(Vec::new()),
+                    crate::apply_patch::file_mutation::durability::metadata_warnings_for_source,
+                )
+            })
         }
         (crate::apply_patch::file_mutation::MetadataPolicy::PreserveSupportedMode, None)
         | (crate::apply_patch::file_mutation::MetadataPolicy::SafeAddModeOnly, _) => {

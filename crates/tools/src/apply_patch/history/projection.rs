@@ -14,6 +14,34 @@ const MAX_PROJECTION_REASON_BYTES: usize = 4096;
 const MAX_PROJECTION_CHANGES: usize = 4096;
 const MAX_PROJECTION_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROJECTION_TOTAL_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_FILESYSTEM_COVERAGE_SOURCES: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TurnFilesystemMutationSource {
+    pub item_id: String,
+    pub tool_name: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TurnFilesystemCoverage {
+    Pending,
+    Complete,
+    Incomplete {
+        reason: String,
+        sources: Vec<TurnFilesystemMutationSource>,
+    },
+}
+
+impl Default for TurnFilesystemCoverage {
+    fn default() -> Self {
+        Self::Incomplete {
+            reason: "turn-wide filesystem coverage was not recorded".to_owned(),
+            sources: Vec::new(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TurnDiffState {
@@ -26,6 +54,8 @@ pub struct TurnDiffState {
     /// Derived machine-friendly flag validated against canonical `exactness`.
     pub exact: bool,
     pub coverage: PatchHistoryCoverage,
+    #[serde(default)]
+    pub filesystem_coverage: TurnFilesystemCoverage,
     pub applied_through_ordinal: Option<CommitOrdinal>,
     pub record_count: u64,
     pub final_state: bool,
@@ -39,6 +69,11 @@ impl TurnDiffState {
         revision: u64,
         final_state: bool,
     ) -> Self {
+        let filesystem_coverage = if final_state {
+            TurnFilesystemCoverage::Complete
+        } else {
+            TurnFilesystemCoverage::Pending
+        };
         Self {
             schema_version: TURN_DIFF_STATE_SCHEMA_VERSION,
             thread_id: aggregate.thread_id.clone(),
@@ -48,6 +83,7 @@ impl TurnDiffState {
             exactness: TurnDiffExactness::from_coverage(aggregate.exact, &aggregate.coverage),
             exact: aggregate.exact,
             coverage: aggregate.coverage.clone(),
+            filesystem_coverage,
             applied_through_ordinal: aggregate.applied_through,
             record_count: aggregate.record_count,
             final_state,
@@ -93,6 +129,7 @@ pub(crate) fn validate_turn_diff_state(state: &TurnDiffState) -> Result<(), Stri
         return Err("turn diff denormalized fields disagree with aggregate".to_owned());
     }
     validate_coverage(&state.coverage)?;
+    validate_filesystem_coverage(&state.filesystem_coverage, state.final_state)?;
     if state.aggregate.changes.len() > MAX_PROJECTION_CHANGES {
         return Err("turn diff aggregate contains too many changes".to_owned());
     }
@@ -101,6 +138,46 @@ pub(crate) fn validate_turn_diff_state(state: &TurnDiffState) -> Result<(), Stri
         validate_aggregate_change(change, &mut total_snapshot_bytes)?;
     }
     Ok(())
+}
+
+fn validate_filesystem_coverage(
+    coverage: &TurnFilesystemCoverage,
+    final_state: bool,
+) -> Result<(), String> {
+    match coverage {
+        TurnFilesystemCoverage::Pending if final_state => {
+            Err("final turn diff has pending filesystem coverage".to_owned())
+        }
+        TurnFilesystemCoverage::Pending | TurnFilesystemCoverage::Complete => Ok(()),
+        TurnFilesystemCoverage::Incomplete { reason, sources } => {
+            validate_non_empty_bounded(
+                reason,
+                MAX_PROJECTION_REASON_BYTES,
+                "filesystem coverage reason",
+            )?;
+            if sources.len() > MAX_FILESYSTEM_COVERAGE_SOURCES {
+                return Err("turn diff filesystem coverage has too many sources".to_owned());
+            }
+            for source in sources {
+                validate_non_empty_bounded(
+                    &source.item_id,
+                    MAX_PROJECTION_ID_BYTES,
+                    "filesystem source item id",
+                )?;
+                validate_non_empty_bounded(
+                    &source.tool_name,
+                    MAX_PROJECTION_ID_BYTES,
+                    "filesystem source tool name",
+                )?;
+                validate_non_empty_bounded(
+                    &source.reason,
+                    MAX_PROJECTION_REASON_BYTES,
+                    "filesystem source reason",
+                )?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_non_empty_bounded(value: &str, maximum: usize, label: &str) -> Result<(), String> {
@@ -265,7 +342,7 @@ impl TurnDiffProjectionStore {
                 }
                 if state.final_state
                     && !existing.final_state
-                    && same_projection_ignoring_final(existing, &state)
+                    && same_projection_ignoring_terminal(existing, &state)
                 {
                     validate_turn_diff_state(&state).map_err(ProjectionError::InvalidState)?;
                     states.insert(key, state);
@@ -345,9 +422,10 @@ impl TurnDiffProjectionStore {
     }
 }
 
-fn same_projection_ignoring_final(left: &TurnDiffState, right: &TurnDiffState) -> bool {
+fn same_projection_ignoring_terminal(left: &TurnDiffState, right: &TurnDiffState) -> bool {
     let mut left = left.clone();
     left.final_state = right.final_state;
+    left.filesystem_coverage = right.filesystem_coverage.clone();
     left == *right
 }
 
@@ -361,6 +439,7 @@ pub struct AgentDiffUpdatedProjection {
     /// Derived machine-friendly flag validated against canonical `exactness`.
     pub exact: bool,
     pub coverage: PatchHistoryCoverage,
+    pub filesystem_coverage: TurnFilesystemCoverage,
     pub changes: Vec<crate::apply_patch::history::AggregateFileChange>,
 }
 
@@ -374,6 +453,7 @@ impl From<&TurnDiffState> for AgentDiffUpdatedProjection {
             exactness: state.exactness.clone(),
             exact: state.exact,
             coverage: state.coverage.clone(),
+            filesystem_coverage: state.filesystem_coverage.clone(),
             changes: state.aggregate.changes.clone(),
         }
     }

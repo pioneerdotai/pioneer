@@ -4,7 +4,8 @@ use crate::apply_patch::history::TurnDiffState;
 use crate::apply_patch::history::projection::validate_turn_diff_state;
 use anyhow::{Context, Result, anyhow};
 use pioneer_crud::{
-    TurnDiffStateRow, TurnDiffStateWrite, find_turn_diff_state, upsert_turn_diff_state,
+    TurnDiffStateRow, TurnDiffStateWrite, find_turn_diff_state, list_turn_diff_states_for_threads,
+    upsert_turn_diff_state,
 };
 use sea_orm::{DatabaseConnection, TransactionTrait};
 
@@ -62,7 +63,7 @@ impl SqliteTurnDiffStore {
                 }
                 let finalization_only = state.final_state
                     && final_state == 0
-                    && same_projection_ignoring_final(&existing_state, state);
+                    && same_projection_ignoring_terminal(&existing_state, state);
                 if !finalization_only {
                     transaction.rollback().await.ok();
                     return Err(anyhow!("turn diff projection revision conflicts"));
@@ -125,7 +126,7 @@ impl SqliteTurnDiffStore {
             if state.revision == existing_revision && existing_json != payload {
                 let finalization_only = state.final_state
                     && final_state == 0
-                    && same_projection_ignoring_final(&existing_state, state);
+                    && same_projection_ignoring_terminal(&existing_state, state);
                 if !finalization_only {
                     transaction.rollback().await.ok();
                     return Err(anyhow!(
@@ -157,6 +158,25 @@ impl SqliteTurnDiffStore {
             Ok(state)
         })
         .transpose()
+    }
+
+    pub async fn list_for_threads(&self, thread_ids: &[String]) -> Result<Vec<TurnDiffState>> {
+        if thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        for thread_id in thread_ids {
+            validate_lookup_identity(thread_id, "thread_id")?;
+        }
+        list_turn_diff_states_for_threads(&self.db, thread_ids)
+            .await
+            .context("query turn diff projection states for execution threads")?
+            .into_iter()
+            .map(|row| {
+                let state = decode_state(&row.state_json, &row.thread_id, &row.turn_id)?;
+                validate_projection_row(&row, &state)?;
+                Ok(state)
+            })
+            .collect()
     }
 }
 
@@ -267,8 +287,9 @@ fn sqlite_i64(value: u64, label: &str) -> Result<i64> {
     i64::try_from(value).map_err(|_| anyhow!("{label} exceeds SQLite integer range"))
 }
 
-fn same_projection_ignoring_final(existing: &TurnDiffState, candidate: &TurnDiffState) -> bool {
+fn same_projection_ignoring_terminal(existing: &TurnDiffState, candidate: &TurnDiffState) -> bool {
     let mut existing = existing.clone();
     existing.final_state = candidate.final_state;
+    existing.filesystem_coverage = candidate.filesystem_coverage.clone();
     existing == *candidate
 }

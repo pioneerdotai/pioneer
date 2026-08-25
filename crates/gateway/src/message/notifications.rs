@@ -421,6 +421,48 @@ impl MessageProcessor {
         .await;
     }
 
+    pub(super) async fn send_execution_collaborator_notification_for_threads<T: Serialize>(
+        &self,
+        thread_ids: &[&str],
+        action: crate::authorization::ResourceAction,
+        method: &str,
+        payload: &T,
+    ) {
+        let candidate_connection_ids = self.session_manager.connection_ids().await;
+        let initially_authorized_connection_ids = self
+            .authorized_execution_collaborator_notification_recipients_for_threads(
+                thread_ids,
+                action,
+                candidate_connection_ids,
+            )
+            .await;
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_execution_collaborator_notification_recipients_for_threads(
+                thread_ids,
+                action,
+                initially_authorized_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_execution_collaborator_notification_recipients_for_threads(
+                thread_ids,
+                action,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
     async fn send_execution_scoped_notification<T: Serialize>(
         &self,
         thread_id: &str,
@@ -581,6 +623,31 @@ impl MessageProcessor {
                 }
                 ProofResolution::Denied(decision) => {
                     record_thread_notification_decision(action, &decision);
+                }
+            }
+        }
+        recipients
+    }
+
+    async fn authorized_execution_collaborator_notification_recipients_for_threads(
+        &self,
+        thread_ids: &[&str],
+        action: crate::authorization::ResourceAction,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        let mut recipients = Vec::new();
+        let mut seen = HashSet::new();
+        for thread_id in thread_ids {
+            for connection_id in self
+                .authorized_execution_collaborator_notification_recipients(
+                    thread_id,
+                    action,
+                    candidate_connection_ids.clone(),
+                )
+                .await
+            {
+                if seen.insert(connection_id) {
+                    recipients.push(connection_id);
                 }
             }
         }

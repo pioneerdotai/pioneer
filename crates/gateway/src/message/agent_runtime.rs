@@ -7,6 +7,7 @@ use futures_util::{FutureExt, StreamExt};
 use pioneer_tools::apply_patch::history::{
     AppliedPatchDelta, AppliedPatchRecord, PatchHistoryProvenance, SnapshotDomain,
     SqliteAppliedPatchStore, SqliteCommitIntentStore, StoredPatchRecord, TurnDiffAuthority,
+    TurnFilesystemCoverage, TurnFilesystemMutationSource,
 };
 use sha2::{Digest, Sha256};
 use std::panic::AssertUnwindSafe;
@@ -147,6 +148,13 @@ fn native_patch_call_id(item: &pioneer_protocol::TurnItem) -> Option<&str> {
         return None;
     };
     (tool_name == "apply_patch").then_some(id.as_str())
+}
+
+fn is_known_read_only_filesystem_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file" | "list_dir" | "grep" | "search_files" | "web_search" | "web_fetch"
+    )
 }
 
 fn execution_window_started_metadata(runtime_window_id: &str) -> serde_json::Value {
@@ -1967,7 +1975,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn project_native_patch_projection(
+    pub(super) async fn project_native_patch_projection(
         &self,
         thread_id: &str,
         turn_id: &str,
@@ -1999,12 +2007,18 @@ impl MessageProcessor {
             .authority_for_turn(thread_id, turn_id)
             .await?
             .unwrap_or(TurnDiffAuthority::NativePatchEngine);
+        let filesystem_coverage = if final_state {
+            self.native_turn_filesystem_coverage(turn_id).await?
+        } else {
+            TurnFilesystemCoverage::Pending
+        };
         let state = crate::patch_history_observer::SqlitePatchObserver::project_live(
             db,
             thread_id.to_owned(),
             turn_id.to_owned(),
             authority,
             final_state,
+            filesystem_coverage,
         )
         .await?;
         self.publish_native_patch_projection(&state).await
@@ -2055,6 +2069,89 @@ impl MessageProcessor {
     async fn finalize_native_patch_projection(&self, thread_id: &str, turn_id: &str) -> Result<()> {
         self.project_native_patch_projection(thread_id, turn_id, true)
             .await
+    }
+
+    async fn native_turn_filesystem_coverage(
+        &self,
+        turn_id: &str,
+    ) -> Result<TurnFilesystemCoverage> {
+        let mut sources = Vec::new();
+        for item_type in ["file_change", "download", "dynamic_tool_call"] {
+            for item in self
+                .crud_store
+                .list_turn_items_by_type(turn_id, item_type)
+                .await?
+            {
+                let source = match item {
+                    pioneer_protocol::TurnItem::FileChange {
+                        id,
+                        tool_name,
+                        status,
+                        ..
+                    } if tool_name != "apply_patch"
+                        && status != pioneer_protocol::ToolCallStatus::InProgress =>
+                    {
+                        Some(TurnFilesystemMutationSource {
+                            item_id: id,
+                            tool_name,
+                            reason: "a separate file mutation tool is not represented by Apply Patch records"
+                                .to_owned(),
+                        })
+                    }
+                    pioneer_protocol::TurnItem::Download {
+                        id,
+                        tool_name,
+                        status,
+                        ..
+                    } if status != pioneer_protocol::ToolCallStatus::InProgress => {
+                        Some(TurnFilesystemMutationSource {
+                            item_id: id,
+                            tool_name,
+                            reason: "a download may have written a file outside Apply Patch history"
+                                .to_owned(),
+                        })
+                    }
+                    pioneer_protocol::TurnItem::DynamicToolCall {
+                        id,
+                        tool_name,
+                        status,
+                        ..
+                    } if status != pioneer_protocol::ToolCallStatus::InProgress
+                        && !is_known_read_only_filesystem_tool(tool_name.as_str()) =>
+                    {
+                        Some(TurnFilesystemMutationSource {
+                            item_id: id,
+                            tool_name,
+                            reason: "a dynamic tool may have changed files outside Apply Patch history"
+                                .to_owned(),
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    sources.push(source);
+                }
+            }
+        }
+        if sources.is_empty() {
+            Ok(TurnFilesystemCoverage::Complete)
+        } else {
+            sources.sort_by(|left, right| {
+                left.item_id
+                    .cmp(&right.item_id)
+                    .then_with(|| left.tool_name.cmp(&right.tool_name))
+            });
+            sources.dedup_by(|left, right| {
+                left.item_id == right.item_id && left.tool_name == right.tool_name
+            });
+            sources.truncate(256);
+            Ok(TurnFilesystemCoverage::Incomplete {
+                reason:
+                    "the turn used filesystem-capable tools outside the native Apply Patch engine"
+                        .to_owned(),
+                sources,
+            })
+        }
     }
 
     async fn admit_native_patch_intent(

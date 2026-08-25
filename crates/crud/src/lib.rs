@@ -134,7 +134,7 @@ pub use repositories::patch_history::{
     CodexAggregateStateRow, CodexAggregateStateWrite, TurnDiffStateRow, TurnDiffStateWrite,
     finalize_codex_aggregate_state, find_codex_aggregate_state,
     find_first_codex_aggregate_state_for_thread, find_turn_diff_state,
-    upsert_codex_aggregate_state, upsert_turn_diff_state,
+    list_turn_diff_states_for_threads, upsert_codex_aggregate_state, upsert_turn_diff_state,
 };
 pub use repositories::policy_generation::{
     append_authorization_change, current_policy_generation, current_policy_generation_on,
