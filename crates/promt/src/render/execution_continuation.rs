@@ -337,7 +337,7 @@ mod tests {
             .details
             .push(pioneer_protocol::ExecutionCheckpointToolCallSummary {
                 item_id: "tool_1".to_owned(),
-                tool_name: "write_file".to_owned(),
+                tool_name: "apply_patch".to_owned(),
                 item_type: pioneer_protocol::TurnItemType::FileChange,
                 status: pioneer_protocol::ToolCallStatus::Failed,
                 success: Some(false),
@@ -358,7 +358,7 @@ mod tests {
         assert!(rendered.contains("Completed window: index=1"));
         assert!(rendered.contains("Window exhaustion reason: max_tool_calls_per_window"));
         assert!(rendered.contains("Tool summary: requested=4"));
-        assert!(rendered.contains("tool=write_file"));
+        assert!(rendered.contains("tool=apply_patch"));
         assert!(
             rendered
                 .contains("Strict unresolved obligations: none reported by runtime validators.")

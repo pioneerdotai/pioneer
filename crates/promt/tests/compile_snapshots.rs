@@ -172,8 +172,9 @@ fn assert_continuation_prompt_contract(compiled: &CompiledPromptBundle) {
             .contains("## Execution Continuation")
     );
     assert!(compiled.full_system_text.contains("## Tool Usage"));
-    assert!(compiled.full_system_text.contains("write_file"));
-    assert!(compiled.full_system_text.contains("edit_file"));
+    assert!(compiled.full_system_text.contains("apply_patch"));
+    assert!(!compiled.full_system_text.contains("write_file"));
+    assert!(!compiled.full_system_text.contains("edit_file"));
     assert!(compiled.full_system_text.contains("call request_tools"));
     assert!(
         !compiled
@@ -362,7 +363,7 @@ Some tool domains and their tools are hidden until requested. If you need a hidd
 
 Domains:
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: task_create, task_wait, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 
@@ -409,7 +410,7 @@ Some tool domains and their tools are hidden until requested. If you need a hidd
 
 Domains:
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: task_create, task_wait, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 

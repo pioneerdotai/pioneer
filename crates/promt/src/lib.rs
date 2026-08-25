@@ -73,7 +73,7 @@ pub use render::{
 };
 pub use runtime_files::{RuntimeIdentityFilesReport, ensure_runtime_identity_files};
 pub use section::{
-    DynamicPromptSectionInput, PromptDynamicSectionId, PromptRuntimeBuiltInSectionId,
-    PromptRuntimeSectionId, PromptRuntimeSectionInput, PromptSection, PromptSectionId,
-    PromptSectionIdError, PromptStability,
+    DynamicPromptSectionInput, FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID, PromptDynamicSectionId,
+    PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
+    PromptSection, PromptSectionId, PromptSectionIdError, PromptStability,
 };

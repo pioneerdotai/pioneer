@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Runtime section marker used when the native provider capability decision
+/// replaces the static tool-usage policy with the exact filesystem contract
+/// projected for this turn.
+pub const FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID: &str = "pioneer_filesystem_capability";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptStability {

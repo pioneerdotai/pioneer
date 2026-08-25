@@ -10,8 +10,9 @@ use crate::fingerprint::sha256_hex;
 use crate::profile::PromptProfile;
 use crate::render::text::render_sections;
 use crate::section::{
-    DynamicPromptSectionInput, PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId,
-    PromptRuntimeSectionInput, PromptSection, PromptSectionId, PromptStability,
+    DynamicPromptSectionInput, FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID,
+    PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
+    PromptSection, PromptSectionId, PromptStability,
 };
 use crate::sources::budget::{BudgetedBootstrapFile, apply_budgets};
 use crate::sources::files::load_bootstrap_files;
@@ -360,6 +361,11 @@ fn runtime_section_order(id: &PromptRuntimeSectionId) -> u8 {
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::SelectedCapabilities) => 6,
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::CurrentPermissions) => 7,
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation) => 8,
+        PromptRuntimeSectionId::Dynamic(dynamic_id)
+            if dynamic_id.as_str() == FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID =>
+        {
+            0
+        }
         PromptRuntimeSectionId::Dynamic(_) => 9,
     }
 }
@@ -517,7 +523,10 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
         sections.push(build_artifact_output_contract_section());
     }
 
-    if policy::include_tool_usage_policy(profile) {
+    let has_runtime_filesystem_capability = input.runtime_sections.iter().any(|section| {
+        section.id.manifest_id() == crate::section::FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID
+    });
+    if policy::include_tool_usage_policy(profile) && !has_runtime_filesystem_capability {
         sections.push(build_tool_usage_policy_section());
     }
 
@@ -644,13 +653,14 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
 
 #[cfg(test)]
 mod tests {
-    use super::compile_prompt;
+    use super::{DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_COUNT, compile_prompt};
     use crate::bundle::{PromptCompileInput, PromptLimits};
     use crate::diagnostics::PromptDiagnosticCode;
     use crate::profile::PromptProfile;
     use crate::section::{
-        DynamicPromptSectionInput, PromptDynamicSectionId, PromptRuntimeBuiltInSectionId,
-        PromptRuntimeSectionId, PromptRuntimeSectionInput, PromptSectionId, PromptStability,
+        DynamicPromptSectionInput, FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID,
+        PromptDynamicSectionId, PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId,
+        PromptRuntimeSectionInput, PromptSectionId, PromptStability,
     };
 
     fn temp_workspace(name: &str) -> std::path::PathBuf {
@@ -811,6 +821,72 @@ mod tests {
     }
 
     #[test]
+    fn native_filesystem_capability_replaces_static_tool_policy_and_is_prioritized() {
+        let root = temp_workspace("filesystem_capability");
+        let capability_id = PromptDynamicSectionId::new(FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID)
+            .expect("filesystem capability section id");
+        let mut runtime_sections = vec![
+            memory_recall_runtime_section("memory recall"),
+            PromptRuntimeSectionInput {
+                id: PromptRuntimeSectionId::Dynamic(capability_id),
+                title: Some("Native Filesystem Capability".to_owned()),
+                content: "capability-specific filesystem contract".to_owned(),
+                max_chars: None,
+                truncated: false,
+            },
+        ];
+        for index in 0..DEFAULT_DYNAMIC_PROMPT_SECTIONS_MAX_COUNT {
+            runtime_sections.push(PromptRuntimeSectionInput {
+                id: PromptRuntimeSectionId::Dynamic(
+                    PromptDynamicSectionId::new(format!("extra_{index}"))
+                        .expect("valid extra section id"),
+                ),
+                title: None,
+                content: "extra".to_owned(),
+                max_chars: None,
+                truncated: false,
+            });
+        }
+
+        let compiled = compile_prompt(PromptCompileInput {
+            workspace_root: root,
+            profile: PromptProfile::AssistantFull,
+            skills_prompt: None,
+            retry_instruction: None,
+            include_tool_recovery_policy: false,
+            include_task_orchestration_policy: false,
+            continue_generation_hint: false,
+            runtime_sections,
+            dynamic_sections: Vec::new(),
+            dynamic_context: None,
+            extra_system: None,
+            limits: PromptLimits::default(),
+        })
+        .expect("compile");
+
+        assert!(
+            compiled
+                .full_system_text
+                .contains("capability-specific filesystem contract")
+        );
+        assert!(
+            !compiled
+                .full_system_text
+                .contains(crate::content::TOOL_USAGE_POLICY_PROMPT)
+        );
+        assert_eq!(
+            compiled
+                .sections
+                .iter()
+                .filter(
+                    |section| section.id.manifest_id() == FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID
+                )
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn subagents_and_tasks_policies_are_dynamic_and_opt_in() {
         let root = temp_workspace("subagents_tasks_policies");
         std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
@@ -882,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_usage_policy_renders_write_file_guidance() {
+    fn tool_usage_policy_renders_apply_patch_guidance() {
         let root = temp_workspace("tool_usage_policy");
         std::fs::write(root.join("SOUL.md"), "Voice: direct and concise").expect("write SOUL");
         std::fs::write(root.join("IDENTITY.md"), "Name: Pioneer").expect("write IDENTITY");
@@ -913,24 +989,16 @@ mod tests {
         assert!(
             compiled
                 .stable_system_text
-                .contains("Use `write_file` to create a complete file from UTF-8 content")
+                .contains("`apply_patch` as the only general text mutator")
         );
         assert!(
             compiled
                 .stable_system_text
-                .contains("Before replacing an existing file, call `read_file`")
+                .contains("exact version token returned by `read_file`")
         );
-        assert!(compiled.stable_system_text.contains(
-            "Use `edit_file` for precise edits to an existing file whose contents are valid UTF-8"
-        ));
         assert!(compiled.stable_system_text.contains("source code"));
         assert!(compiled.stable_system_text.contains("configs"));
-        assert!(
-            compiled
-                .stable_system_text
-                .contains("without `read_file` line-number prefixes")
-        );
-        assert!(compiled.stable_system_text.contains("`replace_all` false"));
+        assert!(compiled.stable_system_text.contains("If-Match"));
         assert!(
             compiled
                 .stable_system_text
@@ -945,8 +1013,10 @@ mod tests {
         assert!(
             compiled
                 .stable_system_text
-                .contains("Use `apply_patch` for coordinated diff-style patches")
+                .contains("structured patch result")
         );
+        assert!(!compiled.stable_system_text.contains("write_file"));
+        assert!(!compiled.stable_system_text.contains("edit_file"));
         assert!(!compiled.stable_system_text.contains("partial edits"));
     }
 
