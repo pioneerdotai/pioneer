@@ -36761,6 +36761,19 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
         opened_params["request"]["action"],
         serde_json::json!("shell_command")
     );
+    let opened_blocks =
+        recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let opened_blocks: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+        serde_json::from_value(opened_blocks.params.expect("opened timeline block params"))
+            .expect("opened timeline block notification should decode");
+    assert_eq!(opened_blocks.thread_id, "thread_native_permission");
+    assert_eq!(
+        opened_blocks.changed_block_ids,
+        vec![
+            pioneer_crud::approval_block_id("turn_native_permission", "perm-approval-request-1"),
+            pioneer_crud::work_block_id("turn_native_permission"),
+        ]
+    );
     let foreign_opened =
         recv_notification_by_method(&mut foreign_rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
     let foreign_opened_params = foreign_opened
@@ -36806,7 +36819,6 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
         resolved_params["resolution"],
         serde_json::json!("allow_once")
     );
-
     let resolution = respond_rx
         .await
         .expect("native permission broker should receive response");
@@ -36830,6 +36842,27 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
             .as_ref()
             .expect("initiator resolved params")["request_id"],
         serde_json::json!("perm-approval-request-1")
+    );
+    let resolved_blocks =
+        recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let resolved_blocks: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
+        serde_json::from_value(
+            resolved_blocks
+                .params
+                .expect("resolved timeline block params"),
+        )
+        .expect("resolved timeline block notification should decode");
+    assert_eq!(resolved_blocks.thread_id, "thread_native_permission");
+    assert_eq!(
+        resolved_blocks.changed_block_ids,
+        vec![pioneer_crud::work_block_id("turn_native_permission")]
+    );
+    assert_eq!(
+        resolved_blocks.removed_block_ids,
+        vec![pioneer_crud::approval_block_id(
+            "turn_native_permission",
+            "perm-approval-request-1"
+        )]
     );
 }
 

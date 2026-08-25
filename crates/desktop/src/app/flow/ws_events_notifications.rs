@@ -841,12 +841,28 @@ impl PioneerDesktop {
         }
     }
 
-    fn apply_pending_requests_reduction(
+    pub(in crate::app) fn apply_pending_requests_reduction(
         &mut self,
         reduction: pioneer_client::cli_runtime::approvals::PendingRequestsReduction,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_requests.apply(reduction) {
+        let resolved_request_id = match &reduction {
+            pioneer_client::cli_runtime::approvals::PendingRequestsReduction::Resolved {
+                request_id,
+            } => Some(request_id.clone()),
+            _ => None,
+        };
+        let pending_changed = self.pending_requests.apply(reduction);
+        let semantic_changed = resolved_request_id.is_some_and(|request_id| {
+            pioneer_client::timeline::semantic::remove_pending_request_blocks(
+                &mut self.semantic_timelines,
+                request_id.as_str(),
+            )
+        });
+        if semantic_changed {
+            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
+        }
+        if pending_changed || semantic_changed {
             cx.notify();
         }
     }

@@ -129,11 +129,10 @@ impl PioneerDesktop {
         let force_follow = rows.iter().any(|row| {
             matches!(
                 row,
-                TimelineRenderRow::PendingRequest(_)
-                    | TimelineRenderRow::Timeline(TimelineRow {
-                        kind: TimelineRowKind::RunningTurn(_),
-                        ..
-                    })
+                TimelineRenderRow::Timeline(TimelineRow {
+                    kind: TimelineRowKind::RunningTurn(_),
+                    ..
+                })
             )
         });
 
@@ -311,8 +310,7 @@ impl PioneerDesktop {
             record_semantic_prefetch_scroll_intent(&mut state);
         }
 
-        let force_follow_active = self.semantic_timeline_has_running_turn_row()
-            || !self.active_thread_pending_requests().is_empty();
+        let force_follow_active = self.semantic_timeline_has_running_turn_row();
         if !force_follow_active {
             return;
         }

@@ -6,7 +6,8 @@ use pioneer_crud::{
 };
 use pioneer_protocol::{
     TaskAttachmentMode, ThreadTimelineBlocksChangedNotification, TimelineChangeReason, TurnKind,
-    TurnOrigin, TurnWorkItemsChangedNotification, TurnWorkStateChangedNotification,
+    TurnOrigin, TurnPermissionApprovalRequest, TurnWorkItemsChangedNotification,
+    TurnWorkStateChangedNotification,
 };
 
 impl MessageProcessor {
@@ -209,6 +210,62 @@ impl MessageProcessor {
         .await;
         self.notify_semantic_timeline_pending_request_changed_for_ancestors(request, turn_id)
             .await;
+    }
+
+    pub(super) async fn notify_semantic_timeline_native_permission_changed(
+        &self,
+        request: &TurnPermissionApprovalRequest,
+        is_pending: bool,
+    ) {
+        let approval_block_id =
+            approval_block_id(request.turn_id.as_str(), request.request_id.as_str());
+        let (changed_block_ids, removed_block_ids) = if is_pending {
+            (
+                vec![
+                    work_block_id(request.turn_id.as_str()),
+                    approval_block_id.clone(),
+                ],
+                Vec::new(),
+            )
+        } else {
+            (
+                vec![work_block_id(request.turn_id.as_str())],
+                vec![approval_block_id.clone()],
+            )
+        };
+        self.notify_semantic_timeline_blocks_changed(
+            request.workspace_id.as_str(),
+            request.thread_id.as_str(),
+            changed_block_ids,
+            removed_block_ids,
+        )
+        .await;
+        self.notify_semantic_turn_work_state_changed(
+            request.workspace_id.as_str(),
+            request.thread_id.as_str(),
+            request.turn_id.as_str(),
+        )
+        .await;
+
+        let mut notified_thread_ids = HashSet::new();
+        notified_thread_ids.insert(request.thread_id.as_str());
+        for visible_thread_id in &request.visible_thread_ids {
+            if !notified_thread_ids.insert(visible_thread_id.as_str()) {
+                continue;
+            }
+            let (changed_block_ids, removed_block_ids) = if is_pending {
+                (vec![approval_block_id.clone()], Vec::new())
+            } else {
+                (Vec::new(), vec![approval_block_id.clone()])
+            };
+            self.notify_semantic_timeline_blocks_changed(
+                request.workspace_id.as_str(),
+                visible_thread_id.as_str(),
+                changed_block_ids,
+                removed_block_ids,
+            )
+            .await;
+        }
     }
 
     async fn notify_semantic_timeline_pending_request_changed_for_ancestors(

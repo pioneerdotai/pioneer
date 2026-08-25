@@ -563,6 +563,49 @@ impl SemanticTimelineState {
     }
 }
 
+/// Removes every cached projection of a resolved pending request.
+///
+/// A single request can be projected into both its source thread and one or
+/// more visible ancestor threads. Shells use this reducer after a successful
+/// response so stale projections cannot remain interactive while the matching
+/// timeline invalidation is in flight.
+pub fn remove_pending_request_blocks(state: &mut SemanticTimelineState, request_id: &str) -> bool {
+    let mut changed = false;
+
+    for thread in state.threads_by_id.values_mut() {
+        let removed_block_ids = thread
+            .top_level
+            .blocks_by_id
+            .iter()
+            .filter_map(|(block_id, block)| match &block.kind {
+                TimelineBlockKind::PendingRequest {
+                    request_id: block_request_id,
+                    ..
+                } if block_request_id == request_id => Some(block_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if removed_block_ids.is_empty() {
+            continue;
+        }
+
+        for block_id in removed_block_ids {
+            changed |= thread
+                .top_level
+                .blocks_by_id
+                .remove(block_id.as_str())
+                .is_some();
+            thread.top_level.stale_block_ids.remove(block_id.as_str());
+        }
+        thread
+            .top_level
+            .ordered_block_ids
+            .retain(|block_id| thread.top_level.blocks_by_id.contains_key(block_id));
+    }
+
+    changed
+}
+
 pub fn top_level_cache_from_page(page: ThreadTimelinePageResponse) -> TopLevelTimelineCache {
     let mut blocks_by_id = HashMap::with_capacity(page.blocks.len());
     let mut ordered_block_ids = Vec::with_capacity(page.blocks.len());
@@ -3610,7 +3653,8 @@ mod tests {
     use super::*;
     use pioneer_protocol::{
         AgentExecutionId, AgentIdentityId, AgentIdentitySourceKind, AgentPresentationSnapshot,
-        ArtifactKind, ArtifactRef, ArtifactStatus, PersistedActorRef, PrincipalId,
+        ArtifactKind, ArtifactRef, ArtifactStatus, CLIRuntimePendingRequest,
+        CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind, PersistedActorRef, PrincipalId,
         SystemEventLevel, TaskAttachmentMode, TaskExecutorKind, TaskStatus, TaskTriggerKind,
         TaskTurnItem, ThreadMode, TimelineBlockKind, TimelineReplySummary, TurnAuthorSnapshot,
         TurnItem, TurnItemType, TurnMention, TurnWorkItemStatus, TurnWorkPresentation,
@@ -3681,6 +3725,69 @@ mod tests {
         ));
         let thread = state.thread("thread_a").expect("thread cache should exist");
         assert_eq!(thread.top_level.ordered_block_ids, vec!["block_b"]);
+    }
+
+    #[test]
+    fn resolving_pending_request_removes_source_and_ancestor_projections() {
+        let pending_block = |thread_id: &str, block_id: &str, request_id: &str| TimelineBlock {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: thread_id.to_owned(),
+            block_id: block_id.to_owned(),
+            turn_id: Some("turn_a".to_owned()),
+            sort_key: "002".to_owned(),
+            started_at_unix_ms: Some(1),
+            updated_at_unix_ms: Some(2),
+            kind: TimelineBlockKind::PendingRequest {
+                runtime_id: "native".to_owned(),
+                request_id: request_id.to_owned(),
+                status: CLIRuntimePendingRequestStatus::Pending,
+                item_id: None,
+                author: None,
+                request: CLIRuntimePendingRequest {
+                    kind: CLIRuntimeRequestKind::Other,
+                    title: None,
+                    message: None,
+                    native_request_id: Some(request_id.to_owned()),
+                    payload: None,
+                },
+            },
+        };
+        let mut state = SemanticTimelineState::default();
+        for (thread_id, block_id) in [
+            ("child", "turn:turn_a:approval:child"),
+            ("parent", "turn:turn_a:approval:parent"),
+        ] {
+            let block = pending_block(thread_id, block_id, "request_a");
+            let cache = &mut state.thread_mut(thread_id).top_level;
+            cache.ordered_block_ids.push(block_id.to_owned());
+            cache.stale_block_ids.insert(block_id.to_owned());
+            cache.blocks_by_id.insert(block_id.to_owned(), block);
+        }
+        let unrelated = pending_block("other", "unrelated", "request_b");
+        let other = &mut state.thread_mut("other").top_level;
+        other.ordered_block_ids.push("unrelated".to_owned());
+        other.blocks_by_id.insert("unrelated".to_owned(), unrelated);
+
+        assert!(remove_pending_request_blocks(&mut state, "request_a"));
+        assert!(state.thread("child").unwrap().top_level.is_empty());
+        assert!(state.thread("parent").unwrap().top_level.is_empty());
+        assert!(
+            state
+                .thread("child")
+                .unwrap()
+                .top_level
+                .stale_block_ids
+                .is_empty()
+        );
+        assert!(
+            state
+                .thread("other")
+                .unwrap()
+                .top_level
+                .blocks_by_id
+                .contains_key("unrelated")
+        );
+        assert!(!remove_pending_request_blocks(&mut state, "request_a"));
     }
 
     #[test]

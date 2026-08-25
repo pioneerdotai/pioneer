@@ -139,8 +139,7 @@ impl PioneerDesktop {
                                             resolution: response.resolution,
                                         },
                                     );
-                                view.pending_requests.apply(reduction);
-                                cx.notify();
+                                view.apply_pending_requests_reduction(reduction, cx);
                             }
                             Err(error) => {
                                 warn!(
@@ -162,12 +161,12 @@ impl PioneerDesktop {
 
                         let _ = this.update(&mut cx, |view, cx| match result {
                             Ok(response) => {
-                                view.pending_requests.apply(
+                                view.apply_pending_requests_reduction(
                                     PendingRequestsReduction::Resolved {
                                         request_id: response.request_id,
                                     },
+                                    cx,
                                 );
-                                cx.notify();
                             }
                             Err(error) => {
                                 warn!(

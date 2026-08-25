@@ -1288,6 +1288,18 @@ impl MessageProcessor {
             payload,
         )
         .await;
+
+        match method {
+            events::TURN_PERMISSION_REQUEST_OPENED => {
+                self.notify_semantic_timeline_native_permission_changed(request, true)
+                    .await;
+            }
+            events::TURN_PERMISSION_REQUEST_RESOLVED => {
+                self.notify_semantic_timeline_native_permission_changed(request, false)
+                    .await;
+            }
+            _ => {}
+        }
     }
 
     async fn native_permission_visible_thread_ids(&self, thread_id: &str) -> Vec<String> {
