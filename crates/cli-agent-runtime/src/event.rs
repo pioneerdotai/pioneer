@@ -474,6 +474,17 @@ pub struct RuntimeDiffUpdated {
     pub native_turn_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_redacted: Option<JsonValue>,
+    /// The provider aggregate is kept as text only; Pioneer must not turn it
+    /// into native per-call records. These fields are protocol metadata, not
+    /// model-controlled authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_exact: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<RuntimeNativeEvent>,
 }
@@ -1019,6 +1030,21 @@ fn map_codex_diff_updated(
         native_thread_id: string_path(params, &["threadId"]),
         native_turn_id: string_path(params, &["turnId"]).unwrap_or_default(),
         diff_redacted: params.get("diff").or_else(|| Some(params)).map(redact_json),
+        diff_text: params
+            .get("diff")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned),
+        revision: params
+            .get("revision")
+            .or_else(|| params.get("version"))
+            .or_else(|| params.get("sequence"))
+            .and_then(JsonValue::as_u64),
+        event_id: params
+            .get("eventId")
+            .or_else(|| params.get("event_id"))
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned),
+        provider_exact: params.get("exact").and_then(JsonValue::as_bool),
         native: native_notification(notification, options),
     })
 }
