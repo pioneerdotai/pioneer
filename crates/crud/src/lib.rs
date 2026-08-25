@@ -129,6 +129,13 @@ pub use repositories::membership::{
     list_workspace_memberships_for_workspace, persisted_thread_access_class_from_db,
     persisted_thread_access_class_to_db,
 };
+pub use repositories::patch_history;
+pub use repositories::patch_history::{
+    CodexAggregateStateRow, CodexAggregateStateWrite, TurnDiffStateRow, TurnDiffStateWrite,
+    finalize_codex_aggregate_state, find_codex_aggregate_state,
+    find_first_codex_aggregate_state_for_thread, find_turn_diff_state,
+    upsert_codex_aggregate_state, upsert_turn_diff_state,
+};
 pub use repositories::policy_generation::{
     append_authorization_change, current_policy_generation, current_policy_generation_on,
     ensure_code_policy_generation, list_authorization_changes_after,
