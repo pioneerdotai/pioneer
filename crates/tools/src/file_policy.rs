@@ -193,14 +193,12 @@ trait FilePolicyDecisionExt {
 }
 
 impl FilePolicyDecisionExt for FilePolicyDecision {
-    fn with_root(self, root: PathBuf) -> Self {
+    fn with_root(self, _root: PathBuf) -> Self {
         match self {
             Self::Denied(mut deny) => {
-                deny.message = format!(
-                    "{}; matched read-only root `{}`",
-                    deny.message,
-                    root.display()
-                );
+                // Canonical roots are internal paths and must not leak into
+                // model-visible diagnostics.
+                deny.message = format!("{}; matched read-only root", deny.message);
                 Self::Denied(deny)
             }
             allowed => allowed,
@@ -231,20 +229,44 @@ fn resolve_requested_path(
         Ok(path) => Ok(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if operation == FilePolicyOperation::Write {
-                let parent = absolute_path
-                    .parent()
-                    .ok_or(FilePolicyDenyReason::MissingPath)?;
-                let file_name = absolute_path
-                    .file_name()
-                    .ok_or(FilePolicyDenyReason::MissingPath)?;
-                let parent =
-                    std::fs::canonicalize(parent).map_err(|_| FilePolicyDenyReason::MissingPath)?;
-                Ok(parent.join(file_name))
+                resolve_missing_write_path(absolute_path)
             } else {
                 Err(FilePolicyDenyReason::MissingPath)
             }
         }
         Err(_) => Err(FilePolicyDenyReason::MissingPath),
+    }
+}
+
+fn resolve_missing_write_path(absolute_path: &Path) -> Result<PathBuf, FilePolicyDenyReason> {
+    let mut missing_components = Vec::new();
+    let mut current = absolute_path;
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(FilePolicyDenyReason::SymlinkEscape);
+                }
+                if !metadata.is_dir() {
+                    return Err(FilePolicyDenyReason::MissingPath);
+                }
+                let canonical = std::fs::canonicalize(current)
+                    .map_err(|_| FilePolicyDenyReason::MissingPath)?;
+                let mut resolved = canonical;
+                for component in missing_components.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = current
+                    .file_name()
+                    .ok_or(FilePolicyDenyReason::MissingPath)?;
+                missing_components.push(name.to_owned());
+                current = current.parent().ok_or(FilePolicyDenyReason::MissingPath)?;
+            }
+            Err(_) => return Err(FilePolicyDenyReason::MissingPath),
+        }
     }
 }
 
@@ -288,7 +310,17 @@ fn normalize_lexically(path: PathBuf) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                // Never pop a platform root/prefix.  Allowing `/../x` to
+                // become the relative path `x` would make the subsequent
+                // canonicalize call resolve against the process cwd rather
+                // than the sandbox cwd.
+                let can_pop = !matches!(
+                    normalized.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                );
+                if can_pop {
+                    normalized.pop();
+                }
             }
             Component::Normal(value) => normalized.push(value),
             Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
@@ -465,6 +497,22 @@ mod tests {
                 .expect("full access should allow traversal")
                 .resolved_path,
             std::fs::canonicalize(outside_file).unwrap()
+        );
+    }
+
+    #[test]
+    fn absolute_parent_traversal_keeps_the_path_absolute() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(root.as_path()).expect("create root");
+        let snapshot =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access(root.to_string_lossy(), 1);
+
+        let decision = FilePolicyChecker::check_read(&snapshot, Path::new("/../tmp"));
+
+        assert_eq!(
+            decision.grant().map(|grant| grant.requested_path.clone()),
+            Some(PathBuf::from("/tmp"))
         );
     }
 

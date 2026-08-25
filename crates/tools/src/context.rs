@@ -96,6 +96,12 @@ impl ToolPayload {
 }
 
 #[derive(Debug, Clone)]
+pub enum ApplyPatchPreflight {
+    Ready(crate::apply_patch::ResolvedPatch),
+    Rejected(crate::apply_patch::ExecutionReport),
+}
+
+#[derive(Debug, Clone)]
 pub struct ToolInvocation {
     pub call_id: String,
     pub tool_name: String,
@@ -108,6 +114,10 @@ pub struct ToolInvocation {
     pub recovery: ToolRecoveryMetadata,
     pub permission_metadata: ToolPermissionMetadata,
     pub execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
+    /// Canonical parse/resolve result or typed preflight rejection bound to
+    /// the permission decision. Only the orchestrator may populate it;
+    /// model/provider payloads cannot.
+    pub apply_patch_preflight: Option<ApplyPatchPreflight>,
     pub cancellation: CancellationToken,
 }
 

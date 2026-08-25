@@ -1369,6 +1369,7 @@ mod tests {
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: Some(snapshot),
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         };
 

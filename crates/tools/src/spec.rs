@@ -11,6 +11,10 @@ pub const REQUEST_TOOLS_TOOL_NAME: &str = "request_tools";
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionClass {
     Shared,
+    /// File mutations participate in the global read/barrier domain but use
+    /// canonical per-target locks inside the patch engine, so disjoint
+    /// invocations can run concurrently.
+    MutationScoped,
     Exclusive,
     SessionScoped,
 }
@@ -260,7 +264,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "read_file",
-            "Read file contents from disk.",
+            "Read bounded, paginated UTF-8 text and return the exact version token for safe later mutations.",
             read_file_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -273,36 +277,8 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
             },
         ),
         configured_builtin_spec(
-            "write_file",
-            "Create a file from complete UTF-8 content or fully overwrite an existing file after current-file state has been observed. Use this for writing complete file contents. Do not use exec_command, shell heredocs, or write_stdin to create ordinary files.",
-            write_file_schema(),
-            PayloadKind::Function,
-            ExecutionClass::Exclusive,
-            ToolRecoveryMetadata {
-                retry_class: ToolRetryClass::Arguments,
-                idempotency_mode: ToolIdempotencyMode::RequiresKey,
-                max_attempts: 2,
-                can_resume: false,
-                max_wall_clock_secs: None,
-            },
-        ),
-        configured_builtin_spec(
-            "edit_file",
-            "Edit an existing file whose contents are valid UTF-8, such as source code, config, Markdown, JSON, or YAML, by replacing an exact old_string with new_string after current-file state has been observed. Use write_file for file creation or full-file rewrites, and apply_patch for coordinated diff-style or multi-file patches.",
-            edit_file_schema(),
-            PayloadKind::Function,
-            ExecutionClass::Exclusive,
-            ToolRecoveryMetadata {
-                retry_class: ToolRetryClass::Arguments,
-                idempotency_mode: ToolIdempotencyMode::RequiresKey,
-                max_attempts: 2,
-                can_resume: false,
-                max_wall_clock_secs: None,
-            },
-        ),
-        configured_builtin_spec(
             "list_dir",
-            "List files/directories recursively.",
+            "Discover files and directories without changing the workspace.",
             list_dir_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -316,7 +292,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "grep_files",
-            "Search file contents by regex/text pattern. Always pass the narrowest path and glob you can infer for codebase searches; do not repeat broad workspace searches after a needs_narrowing result.",
+            "Search text within a scoped path or glob. Always pass the narrowest path and glob you can infer; do not repeat broad workspace searches after a needs_narrowing result.",
             grep_files_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -330,10 +306,10 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "apply_patch",
-            "Apply patch in apply_patch format or pass JSON with input/patch string.",
+            "Apply the only general bounded text mutation: add, replace, update, delete, move, or change multiple UTF-8 files, using the immutable wire shape declared for this turn.",
             apply_patch_schema(),
             PayloadKind::Custom,
-            ExecutionClass::Exclusive,
+            ExecutionClass::MutationScoped,
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Never,
                 idempotency_mode: ToolIdempotencyMode::RequiresKey,
@@ -488,86 +464,12 @@ fn read_file_schema() -> JsonValue {
         "properties": {
             "path": { "type": "string" },
             "start_line": { "type": "integer", "minimum": 1 },
-            "end_line": { "type": "integer", "minimum": 1 },
-            "max_bytes": { "type": "integer", "minimum": 1 }
+            "start_byte": { "type": "integer", "minimum": 0 },
+            "max_lines": { "type": "integer", "minimum": 1 },
+            "max_bytes": { "type": "integer", "minimum": 1 },
+            "cursor": { "type": "string", "minLength": 1, "maxLength": 16384 }
         },
         "required": ["path"],
-        "additionalProperties": false
-    })
-}
-
-fn write_file_schema() -> JsonValue {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Absolute path, or path relative to the tool invocation workdir."
-            },
-            "content": {
-                "type": "string",
-                "description": "Complete UTF-8 file contents to write."
-            },
-            "create_dirs": {
-                "type": "boolean",
-                "description": "Create missing parent directories. Defaults to true."
-            },
-            "overwrite": {
-                "type": "boolean",
-                "description": "Allow replacing an existing file. Defaults to true."
-            },
-            "read_observation_id": {
-                "type": "string",
-                "description": "Optional id from a prior complete read_file result for the same target path."
-            },
-            "expected_sha256": {
-                "type": "string",
-                "description": "Optional current file SHA-256 precondition for stale-write protection."
-            },
-            "expected_mtime_ms": {
-                "type": "integer",
-                "description": "Optional current file mtime precondition in Unix epoch milliseconds."
-            }
-        },
-        "required": ["path", "content"],
-        "additionalProperties": false
-    })
-}
-
-fn edit_file_schema() -> JsonValue {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Absolute path, or path relative to the tool invocation workdir."
-            },
-            "old_string": {
-                "type": "string",
-                "description": "Exact current text to replace. Must be non-empty."
-            },
-            "new_string": {
-                "type": "string",
-                "description": "Replacement text. May be empty to delete old_string."
-            },
-            "replace_all": {
-                "type": "boolean",
-                "description": "Replace every occurrence of old_string. Defaults to false."
-            },
-            "read_observation_id": {
-                "type": "string",
-                "description": "Optional id from a prior complete read_file result for the same target path."
-            },
-            "expected_sha256": {
-                "type": "string",
-                "description": "Optional current file SHA-256 precondition for stale-edit protection."
-            },
-            "expected_mtime_ms": {
-                "type": "integer",
-                "description": "Optional current file mtime precondition in Unix epoch milliseconds."
-            }
-        },
-        "required": ["path", "old_string", "new_string"],
         "additionalProperties": false
     })
 }
@@ -606,9 +508,9 @@ fn apply_patch_schema() -> JsonValue {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "input": { "type": "string", "description": "The full apply_patch payload" },
-            "patch": { "type": "string", "description": "Alias of input" }
+            "patch": { "type": "string", "description": "The complete apply_patch document" }
         },
+        "required": ["patch"],
         "additionalProperties": false
     })
 }
@@ -1082,6 +984,33 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_catalog_has_one_general_text_mutator() {
+        let names = builtin_tool_specs()
+            .into_iter()
+            .map(|configured| configured.spec.name)
+            .collect::<Vec<_>>();
+        for required in ["read_file", "list_dir", "grep_files", "apply_patch"] {
+            assert!(names.iter().any(|name| name == required));
+        }
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "apply_patch")
+                .count(),
+            1
+        );
+        for removed in [
+            "write_file",
+            "edit_file",
+            "create_file",
+            "delete_file",
+            "move_file",
+        ] {
+            assert!(!names.iter().any(|name| name == removed));
+        }
+    }
+
+    #[test]
     fn builtin_specs_include_expected_execution_classes() {
         let specs = builtin_tool_specs();
         let by_name = specs
@@ -1089,9 +1018,10 @@ mod tests {
             .map(|configured| (configured.spec.name, configured.execution_class))
             .collect::<std::collections::HashMap<_, _>>();
 
-        assert_eq!(by_name.get("apply_patch"), Some(&ExecutionClass::Exclusive));
-        assert_eq!(by_name.get("write_file"), Some(&ExecutionClass::Exclusive));
-        assert_eq!(by_name.get("edit_file"), Some(&ExecutionClass::Exclusive));
+        assert_eq!(
+            by_name.get("apply_patch"),
+            Some(&ExecutionClass::MutationScoped)
+        );
         assert_eq!(
             by_name.get("write_stdin"),
             Some(&ExecutionClass::SessionScoped)
@@ -1132,160 +1062,6 @@ mod tests {
         assert!(description.contains("larger timeout is not a new strategy"));
         assert!(timeout_description.contains("terminates the process"));
         assert!(timeout_description.contains("materially change the strategy"));
-    }
-
-    #[test]
-    fn write_file_schema_matches_contract() {
-        let schema = write_file_schema();
-        let properties = schema["properties"]
-            .as_object()
-            .expect("write_file properties should be an object");
-        let property_names = properties.keys().cloned().collect::<HashSet<_>>();
-
-        assert_eq!(schema["type"], serde_json::json!("object"));
-        assert_eq!(schema["required"], serde_json::json!(["path", "content"]));
-        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
-        assert_eq!(
-            property_names,
-            HashSet::from([
-                "path".to_owned(),
-                "content".to_owned(),
-                "create_dirs".to_owned(),
-                "overwrite".to_owned(),
-                "read_observation_id".to_owned(),
-                "expected_sha256".to_owned(),
-                "expected_mtime_ms".to_owned(),
-            ])
-        );
-        assert_eq!(properties["path"]["type"], serde_json::json!("string"));
-        assert_eq!(properties["content"]["type"], serde_json::json!("string"));
-        assert_eq!(
-            properties["create_dirs"]["type"],
-            serde_json::json!("boolean")
-        );
-        assert_eq!(
-            properties["overwrite"]["type"],
-            serde_json::json!("boolean")
-        );
-        assert_eq!(
-            properties["read_observation_id"]["type"],
-            serde_json::json!("string")
-        );
-        assert_eq!(
-            properties["expected_sha256"]["type"],
-            serde_json::json!("string")
-        );
-        assert_eq!(
-            properties["expected_mtime_ms"]["type"],
-            serde_json::json!("integer")
-        );
-    }
-
-    #[test]
-    fn edit_file_schema_matches_contract() {
-        let schema = edit_file_schema();
-        let properties = schema["properties"]
-            .as_object()
-            .expect("edit_file properties should be an object");
-        let property_names = properties.keys().cloned().collect::<HashSet<_>>();
-
-        assert_eq!(schema["type"], serde_json::json!("object"));
-        assert_eq!(
-            schema["required"],
-            serde_json::json!(["path", "old_string", "new_string"])
-        );
-        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
-        assert_eq!(
-            property_names,
-            HashSet::from([
-                "path".to_owned(),
-                "old_string".to_owned(),
-                "new_string".to_owned(),
-                "replace_all".to_owned(),
-                "read_observation_id".to_owned(),
-                "expected_sha256".to_owned(),
-                "expected_mtime_ms".to_owned(),
-            ])
-        );
-        assert_eq!(properties["path"]["type"], serde_json::json!("string"));
-        assert_eq!(
-            properties["old_string"]["type"],
-            serde_json::json!("string")
-        );
-        assert_eq!(
-            properties["new_string"]["type"],
-            serde_json::json!("string")
-        );
-        assert_eq!(
-            properties["replace_all"]["type"],
-            serde_json::json!("boolean")
-        );
-        assert_eq!(
-            properties["read_observation_id"]["type"],
-            serde_json::json!("string")
-        );
-        assert_eq!(
-            properties["expected_sha256"]["type"],
-            serde_json::json!("string")
-        );
-        assert_eq!(
-            properties["expected_mtime_ms"]["type"],
-            serde_json::json!("integer")
-        );
-        assert!(
-            properties["old_string"]["description"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("non-empty")
-        );
-    }
-
-    #[test]
-    fn write_file_builtin_spec_matches_contract() {
-        let specs = builtin_tool_specs();
-        let configured = specs
-            .iter()
-            .find(|configured| configured.spec.name == "write_file")
-            .expect("write_file spec should exist");
-
-        assert_eq!(configured.spec.payload_kind, PayloadKind::Function);
-        assert_eq!(configured.execution_class, ExecutionClass::Exclusive);
-        assert_eq!(
-            configured.spec.recovery.retry_class,
-            ToolRetryClass::Arguments
-        );
-        assert_eq!(
-            configured.spec.recovery.idempotency_mode,
-            ToolIdempotencyMode::RequiresKey
-        );
-        assert_eq!(configured.spec.recovery.max_attempts, 2);
-        assert!(!configured.spec.recovery.can_resume);
-        assert_eq!(configured.spec.recovery.max_wall_clock_secs, None);
-        assert_eq!(configured.spec.parameters, write_file_schema());
-    }
-
-    #[test]
-    fn edit_file_builtin_spec_matches_contract() {
-        let specs = builtin_tool_specs();
-        let configured = specs
-            .iter()
-            .find(|configured| configured.spec.name == "edit_file")
-            .expect("edit_file spec should exist");
-
-        assert_eq!(configured.spec.payload_kind, PayloadKind::Function);
-        assert_eq!(configured.execution_class, ExecutionClass::Exclusive);
-        assert_eq!(
-            configured.spec.recovery.retry_class,
-            ToolRetryClass::Arguments
-        );
-        assert_eq!(
-            configured.spec.recovery.idempotency_mode,
-            ToolIdempotencyMode::RequiresKey
-        );
-        assert_eq!(configured.spec.recovery.max_attempts, 2);
-        assert!(!configured.spec.recovery.can_resume);
-        assert_eq!(configured.spec.recovery.max_wall_clock_secs, None);
-        assert_eq!(configured.spec.parameters, edit_file_schema());
     }
 
     #[test]

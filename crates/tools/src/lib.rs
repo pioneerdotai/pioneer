@@ -1,3 +1,4 @@
+pub mod apply_patch;
 mod argument_normalizer;
 mod classifier;
 mod context;
@@ -49,7 +50,9 @@ pub use error::ToolError;
 pub use events::{
     DurableToolEventEnvelope, ObservationContext, ToolCallCompletedEvent, ToolCallFailedEvent,
     ToolCallStartedEvent, ToolDeltaPayload, ToolEvent, ToolEventBus, ToolEventKind,
-    ToolEventPayload, ToolEventTrace, ToolOutputDeltaEvent,
+    ToolEventPayload, ToolEventTrace, ToolOutputDeltaEvent, native_patch_history_record,
+    register_native_patch_observer, unregister_native_patch_observer,
+    unregister_native_patch_observers_for_turn,
 };
 pub use file_policy::{
     FilePolicyChecker, FilePolicyDecision, FilePolicyDeny, FilePolicyDenyReason, FilePolicyGrant,
@@ -128,7 +131,7 @@ pub use spec::{
 };
 pub use tool_index::{
     PREFLIGHT_CORE_FILE_TOOL_NAMES, PREFLIGHT_CORE_TOOL_NAMES, PreflightCandidateToolDescriptor,
-    PreflightToolIndex, build_preflight_tool_index,
+    PreflightToolIndex, build_preflight_tool_index, filesystem_catalog_snapshot,
 };
 pub use visibility::{
     FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilityDiagnostic,
@@ -149,10 +152,9 @@ pub use windows_restricted_token_backend::{
 #[cfg(feature = "computer-use")]
 use handlers::materialize_computer_use_domain_bundle;
 
-use handlers::FileObservationStore;
 use handlers::{
-    ApplyPatchHandler, DownloadUrlHandler, EditFileHandler, GrepHandler, ListDirHandler,
-    ReadFileHandler, UnifiedExecHandler, WebFetchHandler, WebSearchHandler, WriteFileHandler,
+    ApplyPatchHandler, DownloadUrlHandler, GrepHandler, ListDirHandler, ReadFileHandler,
+    UnifiedExecHandler, WebFetchHandler, WebSearchHandler,
 };
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use std::collections::{BTreeMap, HashSet};
@@ -555,21 +557,9 @@ pub fn build_tools_with_environment_and_security_snapshot(
     }
 
     let unified_exec_handler = Arc::new(UnifiedExecHandler::default());
-    let file_observation_store = Arc::new(FileObservationStore::default());
     builder.register_handler("exec_command", unified_exec_handler.clone());
     builder.register_handler("write_stdin", unified_exec_handler);
-    builder.register_handler(
-        "read_file",
-        Arc::new(ReadFileHandler::new(file_observation_store.clone())),
-    );
-    builder.register_handler(
-        "write_file",
-        Arc::new(WriteFileHandler::new(file_observation_store.clone())),
-    );
-    builder.register_handler(
-        "edit_file",
-        Arc::new(EditFileHandler::new(file_observation_store.clone())),
-    );
+    builder.register_handler("read_file", Arc::new(ReadFileHandler));
     builder.register_handler("list_dir", Arc::new(ListDirHandler));
     builder.register_handler("grep_files", Arc::new(GrepHandler));
     builder.register_handler("apply_patch", Arc::new(ApplyPatchHandler));
@@ -603,7 +593,13 @@ pub fn build_tools_with_environment_and_security_snapshot(
 
     let (configured_specs, registry) = builder.build();
 
-    let event_bus = ToolEventBus::default();
+    let event_bus = ToolEventBus::with_thread_id(
+        512,
+        permission_context
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| "unbound-thread".to_owned()),
+    );
 
     let router = Arc::new(ToolRouter::new_with_blocked_tool_names(
         configured_specs,
@@ -834,43 +830,6 @@ mod tests {
         )
     }
 
-    fn tools_runtime_temp_dir(prefix: &str) -> std::path::PathBuf {
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "pioneer_tools_{prefix}_{}_{}",
-            std::process::id(),
-            now_nanos
-        ));
-        std::fs::create_dir_all(path.as_path()).expect("tools runtime temp dir should exist");
-        path
-    }
-
-    async fn execute_builtin_json_call(
-        built: &BuiltinTools,
-        call_id: &str,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> crate::context::AnyToolResult {
-        let call = built
-            .router
-            .build_model_tool_call(RawToolCall {
-                call_id: call_id.to_owned(),
-                tool_name: tool_name.to_owned(),
-                arguments: arguments.to_string(),
-            })
-            .await
-            .expect("model tool call should build");
-
-        built
-            .runtime
-            .execute_tool_call(call)
-            .await
-            .expect("tool call should execute")
-    }
-
     #[test]
     fn computer_use_config_normalization_rejects_absolute_and_traversal_artifact_dirs() {
         for artifacts_subdir in ["/tmp/computer_use", "../computer_use", "tools/../x"] {
@@ -966,322 +925,38 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn write_file_has_builtin_spec_and_handler() {
+    #[test]
+    fn removed_file_mutators_are_absent_from_catalog_and_runtime() {
         let built = build_builtin_tools(
             ".",
-            "turn_write_file_registered",
-            test_permission_context("turn_write_file_registered"),
+            "turn_removed_file_mutators",
+            test_permission_context("turn_removed_file_mutators"),
             test_web_config(),
             test_computer_use_config(),
         );
 
-        assert!(built.router.find_spec("write_file").is_some());
-        assert!(
-            built.router.has_handler("write_file"),
-            "write_file must have a runtime handler"
-        );
-        assert!(
-            built
+        for tool_name in ["write_file", "edit_file"] {
+            assert!(
+                built.router.find_spec(tool_name).is_none(),
+                "removed tool {tool_name} must not have a visible schema"
+            );
+            assert!(
+                !built.router.has_handler(tool_name),
+                "removed tool {tool_name} must not have a runtime handler"
+            );
+            let error = built
                 .router
-                .preflight_tool_index()
-                .core_tools
-                .contains(&"write_file".to_owned()),
-            "write_file must be a core preflight-visible tool once its handler is registered"
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_file_has_builtin_spec_and_handler() {
-        let built = build_builtin_tools(
-            ".",
-            "turn_edit_file_registered",
-            test_permission_context("turn_edit_file_registered"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        assert!(built.router.find_spec("edit_file").is_some());
-        assert!(
-            built.router.has_handler("edit_file"),
-            "edit_file must have a runtime handler"
-        );
-        assert!(
-            built
-                .router
-                .preflight_tool_index()
-                .core_tools
-                .contains(&"edit_file".to_owned()),
-            "edit_file must be a core preflight-visible tool once its handler is registered"
-        );
-    }
-
-    #[tokio::test]
-    async fn write_file_runtime_read_then_write_flow_uses_shared_observation_store() {
-        let workdir = tools_runtime_temp_dir("write-file-runtime-flow");
-        let target = workdir.join("existing.txt");
-        std::fs::write(target.as_path(), "original\n").expect("seed existing file");
-        let built = build_builtin_tools(
-            workdir.as_path(),
-            "turn_write_file_runtime_flow",
-            test_permission_context("turn_write_file_runtime_flow"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        let before_read = execute_builtin_json_call(
-            &built,
-            "write_before_read",
-            "write_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "content": "updated\n",
-                "overwrite": true
-            }),
-        )
-        .await;
-        assert!(!before_read.success());
-        assert_eq!(
-            before_read.raw_output_json()["status"].as_str(),
-            Some("read_required")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should remain readable"),
-            "original\n"
-        );
-
-        let read = execute_builtin_json_call(
-            &built,
-            "read_existing_complete",
-            "read_file",
-            serde_json::json!({"path": "existing.txt"}),
-        )
-        .await;
-        assert!(read.success());
-        let read_json = read.raw_output_json();
-        assert_eq!(
-            read_json["file_observation"]["complete"].as_bool(),
-            Some(true)
-        );
-
-        let overwrite = execute_builtin_json_call(
-            &built,
-            "write_after_read",
-            "write_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "content": "updated\n",
-                "overwrite": true
-            }),
-        )
-        .await;
-        assert!(overwrite.success());
-        assert_eq!(
-            overwrite.raw_output_json()["operation"].as_str(),
-            Some("overwritten")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should update"),
-            "updated\n"
-        );
-
-        let fresh_read = execute_builtin_json_call(
-            &built,
-            "read_existing_for_stale_check",
-            "read_file",
-            serde_json::json!({"path": "existing.txt"}),
-        )
-        .await;
-        assert!(fresh_read.success());
-        std::fs::write(target.as_path(), "external mutation\n").expect("mutate target externally");
-
-        let stale_write = execute_builtin_json_call(
-            &built,
-            "write_after_external_mutation",
-            "write_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "content": "should not land\n",
-                "overwrite": true
-            }),
-        )
-        .await;
-        assert!(!stale_write.success());
-        assert_eq!(
-            stale_write.raw_output_json()["status"].as_str(),
-            Some("precondition_failed")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("stale write must not modify target"),
-            "external mutation\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_file_runtime_read_then_edit_flow_uses_shared_observation_store() {
-        let workdir = tools_runtime_temp_dir("edit-file-runtime-flow");
-        let target = workdir.join("existing.txt");
-        std::fs::write(target.as_path(), "alpha\nbeta\ngamma\n").expect("seed existing file");
-        let built = build_builtin_tools(
-            workdir.as_path(),
-            "turn_edit_file_runtime_flow",
-            test_permission_context("turn_edit_file_runtime_flow"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        let before_read = execute_builtin_json_call(
-            &built,
-            "edit_before_read",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "beta",
-                "new_string": "delta"
-            }),
-        )
-        .await;
-        assert!(!before_read.success());
-        assert_eq!(
-            before_read.raw_output_json()["status"].as_str(),
-            Some("read_required")
-        );
-
-        let read = execute_builtin_json_call(
-            &built,
-            "read_existing_for_edit",
-            "read_file",
-            serde_json::json!({"path": "existing.txt"}),
-        )
-        .await;
-        assert!(read.success());
-        assert_eq!(
-            read.raw_output_json()["file_observation"]["complete"].as_bool(),
-            Some(true)
-        );
-
-        let edit = execute_builtin_json_call(
-            &built,
-            "edit_after_read",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "alpha\nbeta\ngamma\n",
-                "new_string": "alpha\ndelta\ngamma\n"
-            }),
-        )
-        .await;
-        assert!(edit.success(), "edit failed: {}", edit.raw_output_json());
-        let edit_json = edit.raw_output_json();
-        assert_eq!(edit_json["operation"].as_str(), Some("edited"));
-        assert_eq!(edit_json["matches_replaced"].as_u64(), Some(1));
-        let expected_changed_file = std::fs::canonicalize(target.as_path())
-            .expect("target should canonicalize after edit")
-            .display()
-            .to_string();
-        assert_eq!(
-            edit_json["changed_files"][0].as_str(),
-            Some(expected_changed_file.as_str())
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should update"),
-            "alpha\ndelta\ngamma\n"
-        );
-
-        let _ = std::fs::remove_dir_all(workdir);
-    }
-
-    #[tokio::test]
-    async fn edit_file_runtime_observation_chain_authorizes_second_edit_and_catches_stale() {
-        let workdir = tools_runtime_temp_dir("edit-file-observation-chain");
-        let target = workdir.join("existing.txt");
-        std::fs::write(target.as_path(), "one\ntwo\nthree\n").expect("seed existing file");
-        let built = build_builtin_tools(
-            workdir.as_path(),
-            "turn_edit_file_chain",
-            test_permission_context("turn_edit_file_chain"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        let read = execute_builtin_json_call(
-            &built,
-            "read_existing_for_chain",
-            "read_file",
-            serde_json::json!({"path": "existing.txt"}),
-        )
-        .await;
-        assert!(read.success());
-
-        let first_edit = execute_builtin_json_call(
-            &built,
-            "edit_chain_first",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "two",
-                "new_string": "deux"
-            }),
-        )
-        .await;
-        assert!(
-            first_edit.success(),
-            "first edit failed: {}",
-            first_edit.raw_output_json()
-        );
-        assert_eq!(
-            first_edit.raw_output_json()["file_observation"]["id"].as_str(),
-            Some("edit_file:edit_chain_first")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should update"),
-            "one\ndeux\nthree\n"
-        );
-
-        let second_edit = execute_builtin_json_call(
-            &built,
-            "edit_chain_second",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "three",
-                "new_string": "trois"
-            }),
-        )
-        .await;
-        assert!(second_edit.success());
-        assert_eq!(
-            second_edit.raw_output_json()["file_observation"]["id"].as_str(),
-            Some("edit_file:edit_chain_second")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should update again"),
-            "one\ndeux\ntrois\n"
-        );
-
-        std::fs::write(target.as_path(), "external mutation\n").expect("mutate target externally");
-        let stale_edit = execute_builtin_json_call(
-            &built,
-            "edit_chain_after_external_mutation",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "external",
-                "new_string": "internal"
-            }),
-        )
-        .await;
-        assert!(!stale_edit.success());
-        assert_eq!(
-            stale_edit.raw_output_json()["status"].as_str(),
-            Some("precondition_failed")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("stale edit must not modify target"),
-            "external mutation\n"
-        );
-
-        let _ = std::fs::remove_dir_all(workdir);
+                .build_tool_call(RawToolCall {
+                    call_id: format!("call_{tool_name}"),
+                    tool_name: tool_name.to_owned(),
+                    arguments: "{}".to_owned(),
+                })
+                .expect_err("removed file mutators must be rejected as unknown tools");
+            assert!(
+                matches!(error, crate::ToolError::NotFound(_)),
+                "removed tool {tool_name} should fail before permission or handler dispatch"
+            );
+        }
     }
 
     #[tokio::test]

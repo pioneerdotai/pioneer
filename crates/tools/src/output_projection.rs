@@ -49,7 +49,7 @@ fn project_builtin(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         "web_fetch" => project_web_fetch(input),
         "web_search" => project_web_search(input),
         "download_url" | "download" => project_download(input),
-        "apply_patch" | "write_file" | "edit_file" => project_file_change(input),
+        "apply_patch" => project_file_change(input),
         "read_file" => project_read_file(input),
         "read_skill" => project_read_skill(input),
         "list_dir" => project_list_dir(input),
@@ -318,22 +318,15 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         .unwrap_or_default();
     let metadata = serde_json::json!({
         "changedFiles": changed_files,
-        "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
-        "matches": input.raw_output_json.get("matches").cloned().unwrap_or(JsonValue::Null),
-        "matchesReplaced": input.raw_output_json.get("matches_replaced").cloned().unwrap_or(JsonValue::Null),
-        "replaceAll": input.raw_output_json.get("replace_all").cloned().unwrap_or(JsonValue::Null),
-        "bytesBefore": input.raw_output_json.get("bytes_before").cloned().unwrap_or(JsonValue::Null),
-        "bytesAfter": input.raw_output_json.get("bytes_after").cloned().unwrap_or(JsonValue::Null),
-        "bytesWritten": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
-        "sha256Before": input.raw_output_json.get("sha256_before").cloned().unwrap_or(JsonValue::Null),
-        "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
-        "oldStringBytes": input.raw_output_json.get("old_string_bytes").cloned().unwrap_or(JsonValue::Null),
-        "newStringBytes": input.raw_output_json.get("new_string_bytes").cloned().unwrap_or(JsonValue::Null),
-        "oldStringSha256": input.raw_output_json.get("old_string_sha256").cloned().unwrap_or(JsonValue::Null),
-        "newStringSha256": input.raw_output_json.get("new_string_sha256").cloned().unwrap_or(JsonValue::Null),
-        "lineEndingMode": input.raw_output_json.get("line_ending_mode").cloned().unwrap_or(JsonValue::Null),
-        "exitCode": input.raw_output_json.get("exit_code").cloned().unwrap_or(JsonValue::Null),
-        "truncated": input.raw_output_json.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
+        "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
+        "success": input.raw_output_json.get("success").cloned().unwrap_or(JsonValue::Null),
+        "exact": input.raw_output_json.get("exact").cloned().unwrap_or(JsonValue::Null),
+        "historyBearing": input.raw_output_json.get("history_bearing").cloned().unwrap_or(JsonValue::Null),
+        "changes": input.raw_output_json.get("changes").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "sideEffects": input.raw_output_json.get("side_effects").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "failedStage": input.raw_output_json.get("failed_stage").cloned().unwrap_or(JsonValue::Null),
+        "error": input.raw_output_json.get("error").cloned().unwrap_or(JsonValue::Null),
+        "tracking": input.raw_output_json.get("tracking").cloned().unwrap_or_else(|| serde_json::json!({})),
         "outputHash": sha256_hex(input.raw_output_text.as_bytes()),
     });
     let file_count = metadata
@@ -345,11 +338,7 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         if file_count == 0 {
             format!("{} completed", input.tool_name)
         } else {
-            file_change_title(
-                input.tool_name,
-                metadata.get("operation").and_then(JsonValue::as_str),
-                file_count,
-            )
+            file_change_title(input.tool_name, file_count)
         },
         metadata
             .get("changedFiles")
@@ -363,80 +352,43 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
             })
             .unwrap_or_default(),
         metadata.clone(),
-        metadata
-            .get("truncated")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false),
+        false,
     );
+    // The native gateway needs the immutable record reference to finish its
+    // durable projection even when the model/storage policy is summary-only.
+    // This envelope contains hashes, paths and record identity only; exact
+    // source bytes never cross the model/event storage boundary.  Keep this
+    // small trusted control envelope in metadata for apply_patch, while all
+    // other file tools continue to obey their normal storage policy.
+    let storage =
+        if input.tool_name == "apply_patch" && input.raw_output_json.get("history").is_some() {
+            let mut metadata_with_history = metadata.clone();
+            if let Some(history) = input.raw_output_json.get("history")
+                && let Some(object) = metadata_with_history.as_object_mut()
+            {
+                object.insert("patchHistory".to_owned(), history.clone());
+            }
+            ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(metadata_with_history),
+            }
+        } else {
+            storage_for_policy(input.output_policy, summary.clone(), metadata)
+        };
     envelope(
         &input,
         file_change_llm_view(&input),
         display_for_policy(input.output_policy, summary.clone()),
-        storage_for_policy(input.output_policy, summary, metadata),
+        storage,
         recovery_view(&input),
     )
 }
 
-fn file_change_title(tool_name: &str, operation: Option<&str>, file_count: usize) -> String {
-    let verb = match operation {
-        Some("created") => "created",
-        Some("overwritten") => "overwrote",
-        Some("edited") => "edited",
-        _ => "changed",
-    };
-    format!("{tool_name} {verb} {file_count} file(s)")
+fn file_change_title(tool_name: &str, file_count: usize) -> String {
+    format!("{tool_name} changed {file_count} file(s)")
 }
 
 fn file_change_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
-    let value = match input.tool_name {
-        "write_file" => serde_json::json!({
-            "ok": input.raw_output_json.get("ok").cloned().unwrap_or(JsonValue::Bool(input.success)),
-            "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
-            "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
-            "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
-            "resolved_path": input.raw_output_json.get("resolved_path").cloned().unwrap_or(JsonValue::Null),
-            "bytes_written": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
-            "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
-            "file_observation": input.raw_output_json.get("file_observation").cloned().unwrap_or(JsonValue::Null),
-            "created_dirs": input.raw_output_json.get("created_dirs").cloned().unwrap_or_else(|| serde_json::json!([])),
-            "changed_files": input.raw_output_json.get("changed_files").cloned().unwrap_or_else(|| serde_json::json!([])),
-        }),
-        "edit_file" => serde_json::json!({
-            "ok": input.raw_output_json.get("ok").cloned().unwrap_or(JsonValue::Bool(input.success)),
-            "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
-            "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
-            "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
-            "resolved_path": input.raw_output_json.get("resolved_path").cloned().unwrap_or(JsonValue::Null),
-            "matches_replaced": input.raw_output_json.get("matches_replaced").cloned().unwrap_or(JsonValue::Null),
-            "replace_all": input.raw_output_json.get("replace_all").cloned().unwrap_or(JsonValue::Null),
-            "bytes_before": input.raw_output_json.get("bytes_before").cloned().unwrap_or(JsonValue::Null),
-            "bytes_after": input.raw_output_json.get("bytes_after").cloned().unwrap_or(JsonValue::Null),
-            "bytes_written": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
-            "sha256_before": input.raw_output_json.get("sha256_before").cloned().unwrap_or(JsonValue::Null),
-            "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
-            "old_string_bytes": input.raw_output_json.get("old_string_bytes").cloned().unwrap_or(JsonValue::Null),
-            "new_string_bytes": input.raw_output_json.get("new_string_bytes").cloned().unwrap_or(JsonValue::Null),
-            "old_string_sha256": input.raw_output_json.get("old_string_sha256").cloned().unwrap_or(JsonValue::Null),
-            "new_string_sha256": input.raw_output_json.get("new_string_sha256").cloned().unwrap_or(JsonValue::Null),
-            "line_ending_mode": input.raw_output_json.get("line_ending_mode").cloned().unwrap_or(JsonValue::Null),
-            "file_observation": input.raw_output_json.get("file_observation").cloned().unwrap_or(JsonValue::Null),
-            "changed_files": input.raw_output_json.get("changed_files").cloned().unwrap_or_else(|| serde_json::json!([])),
-        }),
-        _ => return llm_view_for_policy(input),
-    };
-    match input.output_policy.llm {
-        LlmOutputPolicy::Full { max_bytes } | LlmOutputPolicy::Structured { max_bytes } => {
-            ToolResultView::Json {
-                value,
-                truncated: false,
-            }
-            .bounded_to_bytes(max_bytes)
-        }
-        LlmOutputPolicy::SummaryOnly => ToolResultView::Json {
-            value,
-            truncated: false,
-        },
-    }
+    llm_view_for_policy(input)
 }
 
 fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
@@ -447,17 +399,23 @@ fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         .unwrap_or(JsonValue::Null);
     let content = input
         .raw_output_json
-        .get("output")
+        .get("text")
+        .or_else(|| input.raw_output_json.get("output"))
         .and_then(JsonValue::as_str)
         .unwrap_or(input.raw_output_text);
     let metadata = serde_json::json!({
         "path": path,
         "startLine": input.raw_output_json.get("start_line").cloned().unwrap_or(JsonValue::Null),
         "endLine": input.raw_output_json.get("end_line").cloned().unwrap_or(JsonValue::Null),
+        "nextLine": input.raw_output_json.get("next_line").cloned().unwrap_or(JsonValue::Null),
+        "cursor": input.raw_output_json.get("cursor").cloned().unwrap_or(JsonValue::Null),
+        "continuation": input.raw_output_json.get("continuation").cloned().unwrap_or(JsonValue::Null),
+        "range": input.raw_output_json.get("range").cloned().unwrap_or(JsonValue::Null),
         "maxBytes": input.raw_output_json.get("max_bytes").cloned().unwrap_or(JsonValue::Null),
         "truncated": input.raw_output_json.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
-        "contentHash": sha256_hex(content.as_bytes()),
-        "bytes": content.len(),
+        "version": input.raw_output_json.get("version").cloned().unwrap_or(JsonValue::Null),
+        "contentHash": input.raw_output_json.get("version").cloned().unwrap_or(JsonValue::Null),
+        "bytes": input.raw_output_json.get("bytes").cloned().unwrap_or_else(|| JsonValue::from(content.len())),
     });
     let summary = summary(
         metadata
@@ -1737,195 +1695,6 @@ mod tests {
         assert!(storage.contains("\"trace\""));
         assert!(storage.contains("element_stale"));
         assert!(storage.contains("suggested_fallbacks"));
-    }
-
-    #[test]
-    fn write_file_create_projection_uses_file_change_metadata() {
-        let payload = serde_json::json!({
-            "ok": true,
-            "status": "completed",
-            "operation": "created",
-            "path": "docs/example.md",
-            "resolved_path": "/tmp/project/docs/example.md",
-            "bytes_written": 5,
-            "sha256": "abc123",
-            "file_observation": {
-                "id": "write_file:call_write_create",
-                "path": "/tmp/project/docs/example.md",
-                "bytes": 5,
-                "sha256": "abc123",
-                "mtime_ms": 1234,
-                "complete": true,
-                "source_tool_call_id": "call_write_create"
-            },
-            "created_dirs": [],
-            "changed_files": ["/tmp/project/docs/example.md"],
-            "content": "SECRET_WRITE_FILE_CONTENT"
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_write_create",
-            tool_name: "write_file",
-            arguments: &serde_json::json!({"path": "docs/example.md"}),
-            raw_output_text: "write_file completed: created /tmp/project/docs/example.md, 5 bytes.",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("write_file"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-
-        let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
-            panic!("write_file should use summary display");
-        };
-        assert_eq!(display_summary.title, "write_file created 1 file(s)");
-        assert_eq!(
-            display_summary.lines,
-            vec!["/tmp/project/docs/example.md".to_owned()]
-        );
-        let metadata = display_summary.metadata.to_json();
-        assert_eq!(metadata["operation"], "created");
-        assert_eq!(metadata["bytesWritten"], 5);
-        assert_eq!(metadata["sha256"], "abc123");
-        assert_eq!(metadata["changedFiles"][0], "/tmp/project/docs/example.md");
-
-        assert!(
-            !serde_json::to_string(&envelope.llm_view)
-                .unwrap()
-                .contains("SECRET_WRITE_FILE_CONTENT")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains("SECRET_WRITE_FILE_CONTENT")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.storage)
-                .unwrap()
-                .contains("SECRET_WRITE_FILE_CONTENT")
-        );
-    }
-
-    #[test]
-    fn write_file_overwrite_projection_uses_operation_bytes_and_sha() {
-        let payload = serde_json::json!({
-            "ok": true,
-            "status": "completed",
-            "operation": "overwritten",
-            "path": "/tmp/project/src/lib.rs",
-            "resolved_path": "/tmp/project/src/lib.rs",
-            "bytes_written": 12,
-            "sha256": "def456",
-            "file_observation": {
-                "id": "write_file:call_write_overwrite",
-                "path": "/tmp/project/src/lib.rs",
-                "bytes": 12,
-                "sha256": "def456",
-                "mtime_ms": 5678,
-                "complete": true,
-                "source_tool_call_id": "call_write_overwrite"
-            },
-            "created_dirs": [],
-            "changed_files": ["/tmp/project/src/lib.rs"]
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_write_overwrite",
-            tool_name: "write_file",
-            arguments: &serde_json::json!({"path": "/tmp/project/src/lib.rs"}),
-            raw_output_text: "write_file completed: overwritten /tmp/project/src/lib.rs, 12 bytes.",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("write_file"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-
-        let ToolStoragePayload::Metadata { metadata } = &envelope.storage else {
-            panic!("write_file should use metadata-only storage");
-        };
-        let metadata = metadata.to_json();
-
-        let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
-            panic!("write_file overwrite should use summary display");
-        };
-        assert_eq!(display_summary.title, "write_file overwrote 1 file(s)");
-
-        assert_eq!(metadata["operation"], "overwritten");
-        assert_eq!(metadata["bytesWritten"], 12);
-        assert_eq!(metadata["sha256"], "def456");
-        assert_eq!(metadata["changedFiles"][0], "/tmp/project/src/lib.rs");
-    }
-
-    #[test]
-    fn edit_file_projection_does_not_echo_sensitive_strings() {
-        let payload = serde_json::json!({
-            "ok": true,
-            "status": "completed",
-            "operation": "edited",
-            "path": "/tmp/project/src/lib.rs",
-            "resolved_path": "/tmp/project/src/lib.rs",
-            "matches_replaced": 1,
-            "replace_all": false,
-            "bytes_before": 44,
-            "bytes_after": 45,
-            "bytes_written": 45,
-            "sha256_before": "before123",
-            "sha256": "after456",
-            "old_string_bytes": 31,
-            "new_string_bytes": 31,
-            "old_string_sha256": "oldhash",
-            "new_string_sha256": "newhash",
-            "line_ending_mode": "lf",
-            "changed_files": ["/tmp/project/src/lib.rs"],
-            "old_string": "SECRET_EDIT_OLD_SENTINEL",
-            "new_string": "SECRET_EDIT_NEW_SENTINEL",
-            "content": "SECRET_EDIT_FINAL_SENTINEL"
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_edit_projection",
-            tool_name: "edit_file",
-            arguments: &serde_json::json!({"path": "/tmp/project/src/lib.rs"}),
-            raw_output_text: "edit_file completed: edited /tmp/project/src/lib.rs, replaced 1 occurrence, 45 bytes.",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("edit_file"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-        let rendered = serde_json::to_string(&envelope).expect("envelope should serialize");
-
-        assert!(!rendered.contains("SECRET_EDIT_OLD_SENTINEL"));
-        assert!(!rendered.contains("SECRET_EDIT_NEW_SENTINEL"));
-        assert!(!rendered.contains("SECRET_EDIT_FINAL_SENTINEL"));
-        assert!(rendered.contains("matches_replaced"));
-        assert!(rendered.contains("old_string_sha256"));
-
-        let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
-            panic!("edit_file should use summary display");
-        };
-        assert_eq!(display_summary.title, "edit_file edited 1 file(s)");
-        assert_eq!(
-            display_summary.lines,
-            vec!["/tmp/project/src/lib.rs".to_owned()]
-        );
-
-        let ToolStoragePayload::Metadata { metadata } = &envelope.storage else {
-            panic!("edit_file should use metadata-only storage");
-        };
-        let metadata = metadata.to_json();
-        assert_eq!(metadata["operation"], "edited");
-        assert_eq!(metadata["matchesReplaced"], 1);
-        assert_eq!(metadata["replaceAll"], false);
-        assert_eq!(metadata["bytesBefore"], 44);
-        assert_eq!(metadata["bytesAfter"], 45);
-        assert_eq!(metadata["bytesWritten"], 45);
-        assert_eq!(metadata["sha256Before"], "before123");
-        assert_eq!(metadata["sha256"], "after456");
-        assert_eq!(metadata["oldStringBytes"], 31);
-        assert_eq!(metadata["newStringBytes"], 31);
-        assert_eq!(metadata["oldStringSha256"], "oldhash");
-        assert_eq!(metadata["newStringSha256"], "newhash");
-        assert_eq!(metadata["lineEndingMode"], "lf");
-        assert_eq!(metadata["changedFiles"][0], "/tmp/project/src/lib.rs");
     }
 
     #[test]

@@ -5,21 +5,13 @@ use std::collections::BTreeMap;
 
 const PREFLIGHT_SUMMARY_MAX_CHARS: usize = 160;
 
-pub const PREFLIGHT_CORE_FILE_TOOL_NAMES: &[&str] = &[
-    "read_file",
-    "write_file",
-    "edit_file",
-    "list_dir",
-    "grep_files",
-    "apply_patch",
-];
+pub const PREFLIGHT_CORE_FILE_TOOL_NAMES: &[&str] =
+    &["read_file", "list_dir", "grep_files", "apply_patch"];
 
 pub const PREFLIGHT_CORE_TOOL_NAMES: &[&str] = &[
     "exec_command",
     "write_stdin",
     "read_file",
-    "write_file",
-    "edit_file",
     "list_dir",
     "grep_files",
     "apply_patch",
@@ -29,6 +21,18 @@ pub const PREFLIGHT_CORE_TOOL_NAMES: &[&str] = &[
     "read_skill",
     "request_tools",
 ];
+
+/// Stable model-facing filesystem catalog used by prompt/evaluation snapshots.
+/// Provider adapters may transform the wire schema, but they must preserve
+/// this semantic hierarchy and its single general text mutator.
+pub fn filesystem_catalog_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "read_file": "bounded_paginated_text_with_version_token",
+        "list_dir": "directory_discovery",
+        "grep_files": "scoped_text_search",
+        "apply_patch": "add_replace_update_delete_move_and_multi_file_text_mutation"
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -236,8 +240,6 @@ mod tests {
             "exec_command",
             "write_stdin",
             "read_file",
-            "write_file",
-            "edit_file",
             "list_dir",
             "grep_files",
             "apply_patch",
@@ -249,14 +251,7 @@ mod tests {
 
         let index = build_preflight_tool_index(&specs);
 
-        for name in [
-            "read_file",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "grep_files",
-            "apply_patch",
-        ] {
+        for name in ["read_file", "list_dir", "grep_files", "apply_patch"] {
             assert!(
                 index.core_tools.contains(&name.to_owned()),
                 "core tools must include default-visible file tool `{name}`"
@@ -268,14 +263,27 @@ mod tests {
     fn tool_index_defines_core_file_tool_identity() {
         assert_eq!(
             PREFLIGHT_CORE_FILE_TOOL_NAMES,
-            [
-                "read_file",
-                "write_file",
-                "edit_file",
-                "list_dir",
-                "grep_files",
-                "apply_patch",
-            ]
+            ["read_file", "list_dir", "grep_files", "apply_patch",]
+        );
+    }
+
+    #[test]
+    fn filesystem_catalog_snapshot_is_semantic_and_single_writer() {
+        let snapshot = filesystem_catalog_snapshot();
+        let mut keys = snapshot
+            .as_object()
+            .expect("catalog object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["apply_patch", "grep_files", "list_dir", "read_file"]
+        );
+        assert_eq!(
+            snapshot["apply_patch"],
+            "add_replace_update_delete_move_and_multi_file_text_mutation"
         );
     }
 

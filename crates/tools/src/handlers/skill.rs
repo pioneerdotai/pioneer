@@ -342,7 +342,6 @@ fn builtin_target_policy(tool_name: &str) -> Option<ToolOutputPolicySnapshot> {
             | "list_dir"
             | "grep_files"
             | "apply_patch"
-            | "write_file"
             | "web_fetch"
             | "web_search"
             | "download_url"
@@ -928,6 +927,7 @@ mod tests {
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -991,6 +991,7 @@ mod tests {
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }

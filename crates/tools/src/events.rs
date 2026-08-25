@@ -1,3 +1,5 @@
+use crate::apply_patch::CommitObserver;
+use crate::apply_patch::history::{CommittedPatchChange, InvocationIdentity, StoredPatchRecord};
 use crate::context::ToolOutcome;
 use crate::error::ToolError;
 use crate::output_policy::{
@@ -18,6 +20,88 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, oneshot};
 use tracing::debug;
+
+type NativePatchIdentityKey = (String, String, String);
+
+static NATIVE_PATCH_OBSERVER_REGISTRY: OnceLock<
+    Mutex<HashMap<NativePatchIdentityKey, Arc<dyn CommitObserver>>>,
+> = OnceLock::new();
+
+fn native_patch_observer_registry()
+-> &'static Mutex<HashMap<NativePatchIdentityKey, Arc<dyn CommitObserver>>> {
+    NATIVE_PATCH_OBSERVER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Publishes the process-local observer only as a handoff between the tool
+/// executor and the gateway lifecycle consumer.  Durable recovery remains in
+/// SQLite; this registry is bounded and is never treated as the source of
+/// truth after restart.
+pub fn native_patch_history_record(
+    identity: &InvocationIdentity,
+) -> Option<(StoredPatchRecord, Vec<CommittedPatchChange>)> {
+    let key = (
+        identity.thread_id.clone(),
+        identity.turn_id.clone(),
+        identity.invocation_id.clone(),
+    );
+    let observer = native_patch_observer_registry()
+        .lock()
+        .ok()?
+        .get(&key)?
+        .clone();
+    observer.record(identity).ok().flatten()
+}
+
+pub fn register_native_patch_observer(
+    identity: &InvocationIdentity,
+    observer: Arc<dyn CommitObserver>,
+) -> bool {
+    let key = (
+        identity.thread_id.clone(),
+        identity.turn_id.clone(),
+        identity.invocation_id.clone(),
+    );
+    if let Ok(mut registry) = native_patch_observer_registry().lock() {
+        // A redelivered ItemStarted for the same invocation is an idempotent
+        // lifecycle event. Keep the original observer (and its admission
+        // permit) instead of replacing it with a second observer that could
+        // race the first executor or lose its durable hand-off state.
+        if registry.contains_key(&key) {
+            return true;
+        }
+        // Never evict an active observer to make room for a new invocation:
+        // eviction would orphan the bounded admission permit while its
+        // executor is still allowed to run.  Durable intent allocation happens
+        // later, under the executor's complete target lock set.
+        if registry.len() >= 4096 {
+            return false;
+        }
+        registry.insert(key, observer);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn unregister_native_patch_observer(identity: &InvocationIdentity) {
+    let key = (
+        identity.thread_id.clone(),
+        identity.turn_id.clone(),
+        identity.invocation_id.clone(),
+    );
+    if let Ok(mut registry) = native_patch_observer_registry().lock() {
+        registry.remove(&key);
+    }
+}
+
+/// Releases all process-local native patch observers for a terminal turn.
+/// SQLite intent/record rows remain the source of truth; this only drops the
+/// bounded in-process hand-off objects and their history-capacity permits.
+pub fn unregister_native_patch_observers_for_turn(thread_id: &str, turn_id: &str) {
+    if let Ok(mut registry) = native_patch_observer_registry().lock() {
+        registry.retain(|(thread, turn, _), _| thread != thread_id || turn != turn_id);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -186,6 +270,7 @@ pub struct ToolEventBus {
     durable_installed: Arc<AtomicBool>,
     durable_capacity: usize,
     trace_sequences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+    thread_id: Arc<String>,
 }
 
 #[derive(Clone)]
@@ -196,6 +281,7 @@ pub struct ToolEventTrace {
     tool_call_id: String,
     tool_name: String,
     sequence: Arc<AtomicU64>,
+    thread_id: Arc<String>,
 }
 
 impl ToolEventTrace {
@@ -213,6 +299,31 @@ impl ToolEventTrace {
 
     pub fn tool_name(&self) -> &str {
         self.tool_name.as_str()
+    }
+
+    /// Returns the trusted native patch identity and in-process observer for
+    /// this invocation. The model cannot supply any of these values: the
+    /// thread/turn/call identifiers come from the runtime trace.
+    pub fn native_patch_context(&self) -> Option<(InvocationIdentity, Arc<dyn CommitObserver>)> {
+        let identity = InvocationIdentity::new(
+            self.thread_id.as_str(),
+            self.turn_id.as_str(),
+            self.tool_call_id.as_str(),
+        )
+        .ok()?;
+        let observer = native_patch_observer_registry()
+            .lock()
+            .ok()
+            .and_then(|registry| {
+                registry
+                    .get(&(
+                        identity.thread_id.clone(),
+                        identity.turn_id.clone(),
+                        identity.invocation_id.clone(),
+                    ))
+                    .cloned()
+            })?;
+        Some((identity, observer))
     }
 
     fn next_context(&self, pipeline_stage: &str, attempt_id: u32) -> ObservationContext {
@@ -449,6 +560,13 @@ fn storage_for_policy(
 
 impl ToolEventBus {
     pub fn new(capacity: usize) -> Self {
+        Self::with_thread_id(capacity, "unbound-thread")
+    }
+
+    /// Constructs a tool event bus bound to one trusted gateway thread. The
+    /// binding is used only for native patch-history attribution; ordinary
+    /// event delivery remains independent of it.
+    pub fn with_thread_id(capacity: usize, thread_id: impl Into<String>) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         Self {
             tx,
@@ -456,6 +574,7 @@ impl ToolEventBus {
             durable_installed: Arc::new(AtomicBool::new(false)),
             durable_capacity: capacity.max(1),
             trace_sequences: Arc::new(Mutex::new(HashMap::new())),
+            thread_id: Arc::new(thread_id.into()),
         }
     }
 
@@ -514,6 +633,7 @@ impl ToolEventBus {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             sequence,
+            thread_id: self.thread_id.clone(),
         }
     }
 
@@ -807,178 +927,5 @@ mod tests {
             live.recv().await,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn write_file_completed_event_carries_file_change_metadata() {
-        let raw_output_json = serde_json::json!({
-            "ok": true,
-            "status": "completed",
-            "operation": "created",
-            "path": "docs/example.md",
-            "resolved_path": "/tmp/project/docs/example.md",
-            "bytes_written": 5,
-            "sha256": "abc123",
-            "file_observation": {
-                "id": "write_file:call_write",
-                "path": "/tmp/project/docs/example.md",
-                "bytes": 5,
-                "sha256": "abc123",
-                "mtime_ms": 1234,
-                "complete": true,
-                "source_tool_call_id": "call_write"
-            },
-            "created_dirs": [],
-            "changed_files": ["/tmp/project/docs/example.md"],
-            "content": "SECRET_WRITE_FILE_CONTENT"
-        });
-        let outcome = ToolOutcome::ok();
-        let output_policy = ToolOutputPolicySnapshot::for_tool_name("write_file");
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_write",
-            tool_name: "write_file",
-            arguments: &serde_json::json!({"path": "docs/example.md"}),
-            raw_output_text: "write_file completed: created /tmp/project/docs/example.md, 5 bytes.",
-            raw_output_json: &raw_output_json,
-            success: true,
-            outcome: &outcome,
-            output_policy: &output_policy,
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-        let bus = ToolEventBus::new(4);
-        let mut events = bus.subscribe();
-        let trace = bus.start_trace("turn_1", "call_write", "write_file");
-
-        trace
-            .emit_completed(1, &envelope)
-            .await
-            .expect("completed event should publish");
-
-        let event = timeout(Duration::from_millis(100), events.recv())
-            .await
-            .expect("event should arrive")
-            .expect("event should decode");
-        let ToolEventPayload::CallCompleted(completed) = event.payload else {
-            panic!("write_file completion should emit CallCompleted");
-        };
-        let ToolDisplayPayload::Summary(display_summary) = &completed.display else {
-            panic!("write_file display should be a summary");
-        };
-        let ToolStoragePayload::Metadata { metadata } = &completed.storage else {
-            panic!("write_file storage should be metadata-only");
-        };
-        let display_metadata = display_summary.metadata.to_json();
-        let storage_metadata = metadata.to_json();
-
-        assert_eq!(event.tool_name, "write_file");
-        assert_eq!(display_summary.title, "write_file created 1 file(s)");
-        assert_eq!(
-            display_metadata["changedFiles"][0],
-            "/tmp/project/docs/example.md"
-        );
-        assert_eq!(storage_metadata["operation"], "created");
-        assert_eq!(storage_metadata["bytesWritten"], 5);
-        assert_eq!(storage_metadata["sha256"], "abc123");
-        assert!(
-            !serde_json::to_string(&completed)
-                .unwrap()
-                .contains("SECRET_WRITE_FILE_CONTENT")
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_file_completed_event_carries_file_change_metadata() {
-        let raw_output_json = serde_json::json!({
-            "ok": true,
-            "status": "completed",
-            "operation": "edited",
-            "path": "src/lib.rs",
-            "resolved_path": "/tmp/project/src/lib.rs",
-            "matches": 1,
-            "matches_replaced": 1,
-            "replace_all": false,
-            "bytes_before": 44,
-            "bytes_after": 45,
-            "bytes_written": 45,
-            "sha256_before": "before123",
-            "sha256": "after456",
-            "old_string_bytes": 31,
-            "new_string_bytes": 31,
-            "old_string_sha256": "oldhash",
-            "new_string_sha256": "newhash",
-            "line_ending_mode": "lf",
-            "file_observation": {
-                "id": "edit_file:call_edit",
-                "path": "/tmp/project/src/lib.rs",
-                "bytes": 45,
-                "sha256": "after456",
-                "mtime_ms": 1234,
-                "complete": true,
-                "source_tool_call_id": "call_edit"
-            },
-            "changed_files": ["/tmp/project/src/lib.rs"],
-            "old_string": "SECRET_EDIT_OLD_SENTINEL",
-            "new_string": "SECRET_EDIT_NEW_SENTINEL",
-            "content": "SECRET_EDIT_FINAL_SENTINEL"
-        });
-        let outcome = ToolOutcome::ok();
-        let output_policy = ToolOutputPolicySnapshot::for_tool_name("edit_file");
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_edit",
-            tool_name: "edit_file",
-            arguments: &serde_json::json!({"path": "src/lib.rs"}),
-            raw_output_text: "edit_file completed: edited /tmp/project/src/lib.rs, replaced 1 occurrence, 45 bytes.",
-            raw_output_json: &raw_output_json,
-            success: true,
-            outcome: &outcome,
-            output_policy: &output_policy,
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-        let bus = ToolEventBus::new(4);
-        let mut events = bus.subscribe();
-        let trace = bus.start_trace("turn_1", "call_edit", "edit_file");
-
-        trace
-            .emit_completed(1, &envelope)
-            .await
-            .expect("completed event should publish");
-
-        let event = timeout(Duration::from_millis(100), events.recv())
-            .await
-            .expect("event should arrive")
-            .expect("event should decode");
-        let ToolEventPayload::CallCompleted(completed) = event.payload else {
-            panic!("edit_file completion should emit CallCompleted");
-        };
-        let ToolDisplayPayload::Summary(display_summary) = &completed.display else {
-            panic!("edit_file display should be a summary");
-        };
-        let ToolStoragePayload::Metadata { metadata } = &completed.storage else {
-            panic!("edit_file storage should be metadata-only");
-        };
-        let display_metadata = display_summary.metadata.to_json();
-        let storage_metadata = metadata.to_json();
-
-        assert_eq!(event.tool_name, "edit_file");
-        assert_eq!(display_summary.title, "edit_file edited 1 file(s)");
-        assert_eq!(
-            display_metadata["changedFiles"][0],
-            "/tmp/project/src/lib.rs"
-        );
-        assert_eq!(storage_metadata["operation"], "edited");
-        assert_eq!(storage_metadata["matchesReplaced"], 1);
-        assert_eq!(storage_metadata["replaceAll"], false);
-        assert_eq!(storage_metadata["bytesBefore"], 44);
-        assert_eq!(storage_metadata["bytesAfter"], 45);
-        assert_eq!(storage_metadata["bytesWritten"], 45);
-        assert_eq!(storage_metadata["sha256Before"], "before123");
-        assert_eq!(storage_metadata["sha256"], "after456");
-        assert_eq!(storage_metadata["oldStringSha256"], "oldhash");
-        assert_eq!(storage_metadata["newStringSha256"], "newhash");
-        assert_eq!(storage_metadata["lineEndingMode"], "lf");
-        let completed_json = serde_json::to_string(&completed).unwrap();
-        assert!(!completed_json.contains("SECRET_EDIT_OLD_SENTINEL"));
-        assert!(!completed_json.contains("SECRET_EDIT_NEW_SENTINEL"));
-        assert!(!completed_json.contains("SECRET_EDIT_FINAL_SENTINEL"));
     }
 }

@@ -1,7 +1,15 @@
+use crate::apply_patch::file_mutation::{
+    PatchError, PatchErrorCode, PatchLimits, PatchRequest, PatchRequestSource, PatchStage,
+    Retryability, TargetResolver,
+};
+use crate::apply_patch::{
+    ExecutionReport, OperationKind, PrepareOptions, TelemetryStage, parse, patch_telemetry,
+    resolve_patch, validate_guards,
+};
 use crate::context::ToolPayload;
-use crate::context::{ExecCommandArgs, ToolInvocation, WriteStdinArgs};
+use crate::context::{ApplyPatchPreflight, ExecCommandArgs, ToolInvocation, WriteStdinArgs};
 use crate::domain::{ARTIFACT_DOMAIN_TOOL_NAMES, MEMORY_DOMAIN_TOOL_NAMES, TASK_DOMAIN_TOOL_NAMES};
-use crate::handlers::apply_patch::{extract_patch_input, validate_patch_document};
+use crate::handlers::apply_patch::extract_patch_input;
 use crate::spec::DynamicSkillPermissionKind;
 use async_trait::async_trait;
 use pioneer_mcp::{McpToolPermissionClass, McpToolSafetyHints, classify_mcp_tool_policy};
@@ -14,6 +22,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 use url::Url;
 
 pub use pioneer_protocol::{
@@ -101,7 +110,16 @@ impl PermissionIntent {
 }
 
 pub fn extract_permission_intent(invocation: &ToolInvocation) -> PermissionIntent {
-    extract_shell_permission_intent(invocation)
+    extract_permission_intent_with_preflight(invocation).0
+}
+
+pub(crate) fn extract_permission_intent_with_preflight(
+    invocation: &ToolInvocation,
+) -> (PermissionIntent, Option<ApplyPatchPreflight>) {
+    if invocation.tool_name == "apply_patch" {
+        return apply_patch_intent_with_preflight(invocation);
+    }
+    let intent = extract_shell_permission_intent(invocation)
         .or_else(|| extract_network_permission_intent(invocation))
         .or_else(|| extract_mcp_permission_intent(invocation))
         .or_else(|| extract_dynamic_skill_permission_intent(invocation))
@@ -109,7 +127,8 @@ pub fn extract_permission_intent(invocation: &ToolInvocation) -> PermissionInten
         .or_else(|| extract_task_permission_intent(invocation))
         .or_else(|| extract_internal_permission_intent(invocation))
         .or_else(|| extract_file_permission_intent(invocation))
-        .unwrap_or_else(|| PermissionIntent::generic_for_invocation(invocation))
+        .unwrap_or_else(|| PermissionIntent::generic_for_invocation(invocation));
+    (intent, None)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,8 +176,6 @@ fn extract_file_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
             "path",
         )),
         "grep_files" => Some(grep_files_intent(invocation)),
-        "write_file" => Some(file_write_intent(invocation, "write_file")),
-        "edit_file" => Some(file_mutation_intent(invocation, "edit_file", "edit file")),
         "apply_patch" => Some(apply_patch_intent(invocation)),
         _ => None,
     }
@@ -853,41 +870,13 @@ fn grep_files_intent(invocation: &ToolInvocation) -> PermissionIntent {
     }
 }
 
-fn file_write_intent(invocation: &ToolInvocation, tool_name: &'static str) -> PermissionIntent {
-    let args = function_arguments(invocation);
-    let operation = match args.and_then(|arguments| bool_field(arguments, "overwrite")) {
-        Some(true) => "overwrite file",
-        Some(false) => "create file",
-        None => "write file",
-    };
-    file_mutation_intent(invocation, tool_name, operation)
-}
-
-fn file_mutation_intent(
-    invocation: &ToolInvocation,
-    tool_name: &'static str,
-    operation: &'static str,
-) -> PermissionIntent {
-    let args = function_arguments(invocation);
-    let mut scope = base_scope(invocation);
-    scope
-        .entries
-        .insert("operation".to_owned(), operation.to_owned());
-    if let Some(raw_path) = args.and_then(|arguments| string_field(arguments, "path")) {
-        scope.entries.insert(
-            "path".to_owned(),
-            resolve_requested_path(invocation.workdir.as_path(), raw_path),
-        );
-    }
-
-    PermissionIntent {
-        action: PermissionActionKind::FileWrite,
-        scope,
-        summary: Some(format!("{operation} via `{tool_name}`")),
-    }
-}
-
 fn apply_patch_intent(invocation: &ToolInvocation) -> PermissionIntent {
+    apply_patch_intent_with_preflight(invocation).0
+}
+
+fn apply_patch_intent_with_preflight(
+    invocation: &ToolInvocation,
+) -> (PermissionIntent, Option<ApplyPatchPreflight>) {
     let mut scope = base_scope(invocation);
     scope
         .entries
@@ -897,30 +886,140 @@ fn apply_patch_intent(invocation: &ToolInvocation) -> PermissionIntent {
         scope
             .entries
             .insert("parse_status".to_owned(), "missing_patch_input".to_owned());
-        return PermissionIntent {
-            action: PermissionActionKind::Unknown,
-            scope,
-            summary: Some("apply patch with unreadable patch input".to_owned()),
-        };
-    };
-
-    let Ok(changed_paths) = validate_patch_document(patch) else {
-        scope.entries.insert(
-            "parse_status".to_owned(),
-            "invalid_patch_document".to_owned(),
+        return (
+            PermissionIntent {
+                action: PermissionActionKind::Unknown,
+                scope,
+                summary: Some("apply patch with unreadable patch input".to_owned()),
+            },
+            Some(ApplyPatchPreflight::Rejected(
+                ExecutionReport::rejected_patch_error(&PatchError::new(
+                    PatchStage::Normalize,
+                    PatchErrorCode::InvalidPayload,
+                    "apply_patch expects exactly one patch string property",
+                    Retryability::Never,
+                )),
+            )),
         );
-        return PermissionIntent {
-            action: PermissionActionKind::Unknown,
-            scope,
-            summary: Some("apply malformed patch".to_owned()),
-        };
     };
 
-    let resolved_paths = changed_paths
+    let source = match &invocation.payload {
+        ToolPayload::Function { .. } => PatchRequestSource::NativeFunction,
+        _ => PatchRequestSource::NativeFreeform,
+    };
+    let request = match PatchRequest::from_provider_text(patch, source, PatchLimits::default()) {
+        Ok(request) => request,
+        Err(error) => {
+            scope.entries.insert(
+                "parse_status".to_owned(),
+                "invalid_patch_document".to_owned(),
+            );
+            return (
+                invalid_patch_permission_intent(scope),
+                Some(ApplyPatchPreflight::Rejected(
+                    ExecutionReport::rejected_patch_error(&error),
+                )),
+            );
+        }
+    };
+    let parse_started = Instant::now();
+    let document = match parse(&request, PatchLimits::default()) {
+        Ok(document) => document,
+        Err(error) => {
+            patch_telemetry().record_stage_latency(TelemetryStage::Parse, parse_started.elapsed());
+            scope.entries.insert(
+                "parse_status".to_owned(),
+                "invalid_patch_document".to_owned(),
+            );
+            return (
+                invalid_patch_permission_intent(scope),
+                Some(ApplyPatchPreflight::Rejected(
+                    ExecutionReport::rejected_parse_error(&error),
+                )),
+            );
+        }
+    };
+    let validated = match validate_guards(document) {
+        Ok(validated) => validated,
+        Err(error) => {
+            patch_telemetry().record_stage_latency(TelemetryStage::Parse, parse_started.elapsed());
+            scope.entries.insert(
+                "parse_status".to_owned(),
+                "invalid_patch_document".to_owned(),
+            );
+            return (
+                invalid_patch_permission_intent(scope),
+                Some(ApplyPatchPreflight::Rejected(
+                    ExecutionReport::rejected_guard_error(&error),
+                )),
+            );
+        }
+    };
+    patch_telemetry().record_stage_latency(TelemetryStage::Parse, parse_started.elapsed());
+
+    let resolver = match TargetResolver::new(&invocation.workdir) {
+        Ok(resolver) => resolver,
+        Err(_) => {
+            scope.entries.insert(
+                "parse_status".to_owned(),
+                "invalid_target_manifest".to_owned(),
+            );
+            return (
+                invalid_patch_permission_intent(scope),
+                Some(ApplyPatchPreflight::Rejected(
+                    ExecutionReport::rejected_patch_error(&PatchError::new(
+                        PatchStage::Resolve,
+                        PatchErrorCode::InvalidPath,
+                        "workspace root is invalid",
+                        Retryability::Never,
+                    )),
+                )),
+            );
+        }
+    };
+    let resolved = match resolve_patch(&validated, &resolver, PrepareOptions::default()) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            scope.entries.insert(
+                "parse_status".to_owned(),
+                "invalid_target_manifest".to_owned(),
+            );
+            return (
+                invalid_patch_permission_intent(scope),
+                Some(ApplyPatchPreflight::Rejected(
+                    ExecutionReport::rejected_resolve_error(&error),
+                )),
+            );
+        }
+    };
+
+    let mut resolved_paths = resolved
+        .target_manifest()
+        .targets()
         .iter()
-        .map(|path| resolve_requested_path(invocation.workdir.as_path(), path))
+        .map(|target| target.absolute().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let operations = patch_operation_kinds(patch);
+    let mut operations = BTreeMap::<&'static str, ()>::new();
+    for operation in &resolved.document().operations {
+        operations.insert(
+            match operation.kind() {
+                OperationKind::Add => "add",
+                OperationKind::Replace => "replace",
+                OperationKind::Update => "update",
+                OperationKind::Delete => "delete",
+            },
+            (),
+        );
+        if operation.operation.move_to.is_some() {
+            operations.insert("move", ());
+        }
+    }
+    resolved_paths.sort();
+    resolved_paths.dedup();
+    let operations = operations
+        .into_keys()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
 
     scope
         .entries
@@ -933,6 +1032,31 @@ fn apply_patch_intent(invocation: &ToolInvocation) -> PermissionIntent {
         "changed_paths".to_owned(),
         serde_json::to_string(&resolved_paths).unwrap_or_else(|_| "[]".to_owned()),
     );
+    scope.entries.insert(
+        "parser_schema_version".to_owned(),
+        resolved.document().schema_version.to_string(),
+    );
+    scope.entries.insert(
+        "payload_hash".to_owned(),
+        hex::encode(resolved.document().payload_hash),
+    );
+    scope.entries.insert(
+        "target_manifest".to_owned(),
+        serde_json::to_string(
+            &resolved
+                .target_manifest()
+                .targets()
+                .iter()
+                .map(|target| {
+                    serde_json::json!({
+                        "path": target.absolute().to_string_lossy(),
+                        "role": target.role,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_owned()),
+    );
     for (index, path) in resolved_paths.iter().take(20).enumerate() {
         scope.entries.insert(format!("path.{index}"), path.clone());
     }
@@ -943,33 +1067,25 @@ fn apply_patch_intent(invocation: &ToolInvocation) -> PermissionIntent {
         );
     }
 
-    PermissionIntent {
-        action: PermissionActionKind::FileWrite,
-        scope,
-        summary: Some(format!(
-            "apply patch touching {} path(s)",
-            resolved_paths.len()
-        )),
-    }
+    (
+        PermissionIntent {
+            action: PermissionActionKind::FileWrite,
+            scope,
+            summary: Some(format!(
+                "apply patch touching {} path(s)",
+                resolved_paths.len()
+            )),
+        },
+        Some(ApplyPatchPreflight::Ready(resolved)),
+    )
 }
 
-fn patch_operation_kinds(patch: &str) -> Vec<String> {
-    let mut operations = BTreeMap::<&'static str, ()>::new();
-    for line in patch.lines() {
-        if line.starts_with("*** Add File: ") {
-            operations.insert("add", ());
-        } else if line.starts_with("*** Update File: ") {
-            operations.insert("update", ());
-        } else if line.starts_with("*** Delete File: ") {
-            operations.insert("delete", ());
-        } else if line.starts_with("*** Move to: ") {
-            operations.insert("move", ());
-        }
+fn invalid_patch_permission_intent(scope: PermissionRequestScope) -> PermissionIntent {
+    PermissionIntent {
+        action: PermissionActionKind::Unknown,
+        scope,
+        summary: Some("apply malformed patch".to_owned()),
     }
-    operations
-        .into_keys()
-        .map(str::to_owned)
-        .collect::<Vec<_>>()
 }
 
 fn base_scope(invocation: &ToolInvocation) -> PermissionRequestScope {
@@ -988,10 +1104,6 @@ fn function_arguments(invocation: &ToolInvocation) -> Option<&JsonValue> {
 
 fn string_field<'a>(value: &'a JsonValue, key: &str) -> Option<&'a str> {
     value.as_object()?.get(key)?.as_str()
-}
-
-fn bool_field(value: &JsonValue, key: &str) -> Option<bool> {
-    value.as_object()?.get(key)?.as_bool()
 }
 
 fn u64_field(value: &JsonValue, key: &str) -> Option<u64> {
@@ -1029,7 +1141,12 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                if !matches!(
+                    normalized.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    normalized.pop();
+                }
             }
             Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
                 normalized.push(component.as_os_str());
@@ -1423,6 +1540,7 @@ mod tests {
             recovery: ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: CancellationToken::new(),
         }
     }
@@ -1704,94 +1822,6 @@ mod tests {
     }
 
     #[test]
-    fn extractor_classifies_write_file_operation_without_full_validation() {
-        let invocation = invocation_for_tool(
-            "write_file",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "path": "../README.md",
-                    "content": "updated",
-                    "overwrite": true
-                }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::FileWrite);
-        assert_eq!(
-            intent.scope.entries.get("path"),
-            Some(&"/README.md".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("operation"),
-            Some(&"overwrite file".to_owned())
-        );
-    }
-
-    #[test]
-    fn extractor_classifies_malformed_write_file_as_file_write() {
-        let invocation = invocation_for_tool(
-            "write_file",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "content": "missing path" }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::FileWrite);
-        assert!(!intent.scope.entries.contains_key("path"));
-    }
-
-    #[test]
-    fn extractor_classifies_edit_file_as_file_write() {
-        let invocation = invocation_for_tool(
-            "edit_file",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "path": "src/lib.rs",
-                    "old_string": "old",
-                    "new_string": "new"
-                }),
-            },
-        );
-        let intent = extract_permission_intent(&invocation);
-
-        assert_eq!(intent.action, PermissionActionKind::FileWrite);
-        assert_eq!(
-            intent.scope.entries.get("operation"),
-            Some(&"edit file".to_owned())
-        );
-    }
-
-    #[test]
-    fn supervised_profile_allows_file_read_and_asks_for_file_write() {
-        let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
-        let read_invocation = invocation();
-        let read_intent = extract_permission_intent(&read_invocation);
-        let write_invocation = invocation_for_tool(
-            "write_file",
-            ToolPayload::Function {
-                arguments: serde_json::json!({ "path": "src/lib.rs", "content": "updated" }),
-            },
-        );
-        let write_intent = extract_permission_intent(&write_invocation);
-
-        assert_eq!(
-            ProfileToolPermissionEvaluator.evaluate(&context, &read_invocation, &read_intent),
-            PermissionDecision::Allow {
-                reason: PermissionDecisionReason::PolicyAllowsAction
-            }
-        );
-        assert!(matches!(
-            ProfileToolPermissionEvaluator.evaluate(&context, &write_invocation, &write_intent),
-            PermissionDecision::Ask {
-                reason: PermissionDecisionReason::PolicyRequiresApproval,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn extractor_classifies_valid_apply_patch_as_file_write_with_changed_paths() {
         let patch = "\
 *** Begin Patch
@@ -1806,33 +1836,58 @@ mod tests {
         let invocation = invocation_for_tool(
             "apply_patch",
             ToolPayload::Function {
-                arguments: serde_json::json!({ "input": patch }),
+                arguments: serde_json::json!({ "patch": patch }),
             },
         );
 
-        let intent = extract_permission_intent(&invocation);
+        let (intent, preflight) = extract_permission_intent_with_preflight(&invocation);
 
         assert_eq!(intent.action, PermissionActionKind::FileWrite);
+        let preflight = preflight.expect("valid patch must carry its canonical preflight");
+        let ApplyPatchPreflight::Ready(preflight) = preflight else {
+            panic!("valid patch must not carry a rejection preflight");
+        };
+        let expected_payload_hash: [u8; 32] = Sha256::digest(patch.as_bytes()).into();
+        assert_eq!(preflight.document().payload_hash, expected_payload_hash);
+        assert_eq!(
+            preflight.target_manifest().targets().len(),
+            5,
+            "three files, the nested src parent, and the workspace root are authorized"
+        );
         assert_eq!(
             intent.scope.entries.get("parse_status"),
             Some(&"valid_patch_document".to_owned())
         );
         assert_eq!(
             intent.scope.entries.get("changed_path_count"),
-            Some(&"3".to_owned())
+            Some(&"5".to_owned())
         );
         assert_eq!(
             intent.scope.entries.get("path.0"),
-            Some(&"/workspace/a.txt".to_owned())
+            Some(&"/workspace".to_owned())
         );
         assert_eq!(
             intent.scope.entries.get("path.1"),
-            Some(&"/workspace/old.txt".to_owned())
+            Some(&"/workspace/a.txt".to_owned())
         );
         assert_eq!(
             intent.scope.entries.get("path.2"),
+            Some(&"/workspace/old.txt".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("path.3"),
+            Some(&"/workspace/src".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("path.4"),
             Some(&"/workspace/src/lib.rs".to_owned())
         );
+        assert_eq!(
+            intent.scope.entries.get("parser_schema_version"),
+            Some(&"1".to_owned())
+        );
+        assert!(intent.scope.entries.contains_key("payload_hash"));
+        assert!(intent.scope.entries.contains_key("target_manifest"));
         assert_eq!(
             intent.scope.entries.get("operations"),
             Some(&"[\"add\",\"delete\",\"update\"]".to_owned())
@@ -1844,7 +1899,7 @@ mod tests {
         let invocation = invocation_for_tool(
             "apply_patch",
             ToolPayload::Function {
-                arguments: serde_json::json!({ "input": "*** Add File: a.txt\n+hello" }),
+                arguments: serde_json::json!({ "patch": "*** Add File: a.txt\n+hello" }),
             },
         );
 
@@ -2228,7 +2283,7 @@ mod tests {
                 "mcp_repo_write",
                 ToolPayload::Mcp {
                     server: "srv_repo".to_owned(),
-                    tool: "write_file".to_owned(),
+                    tool: "repo_write".to_owned(),
                     arguments: serde_json::json!({ "path": "README.md" }),
                     read_only_hint,
                     destructive_hint,
@@ -2255,7 +2310,7 @@ mod tests {
             "mcp_repo_write",
             ToolPayload::Mcp {
                 server: "srv_repo".to_owned(),
-                tool: "write_file".to_owned(),
+                tool: "repo_write".to_owned(),
                 arguments: serde_json::json!({ "path": "README.md" }),
                 read_only_hint: None,
                 destructive_hint: None,
@@ -2657,30 +2712,5 @@ mod tests {
                 }
             );
         }
-    }
-
-    #[test]
-    fn system_source_file_writes_do_not_bypass_file_write_policy() {
-        let mut invocation = invocation_for_tool(
-            "write_file",
-            ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "path": "visible.txt",
-                    "content": "visible write"
-                }),
-            },
-        );
-        invocation.source = ToolCallSource::System;
-        let intent = extract_permission_intent(&invocation);
-        let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
-
-        assert_eq!(intent.action, PermissionActionKind::FileWrite);
-        assert!(matches!(
-            ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-            PermissionDecision::Ask {
-                reason: PermissionDecisionReason::PolicyRequiresApproval,
-                ..
-            }
-        ));
     }
 }

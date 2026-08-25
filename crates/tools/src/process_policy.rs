@@ -256,7 +256,11 @@ fn normalize_path_lexically(path: PathBuf) -> PathBuf {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if !normalized.pop() {
+                let rooted = matches!(
+                    normalized.components().next_back(),
+                    Some(std::path::Component::RootDir | std::path::Component::Prefix(_))
+                );
+                if !rooted && !normalized.pop() {
                     normalized.push(component.as_os_str());
                 }
             }

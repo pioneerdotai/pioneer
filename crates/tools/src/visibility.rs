@@ -351,8 +351,6 @@ mod tests {
         let snapshot = ToolVisibilitySnapshot::new(vec![
             spec("exec_command"),
             spec("read_file"),
-            spec("write_file"),
-            spec("edit_file"),
             spec("list_dir"),
             spec("grep_files"),
             spec("apply_patch"),
@@ -377,8 +375,6 @@ mod tests {
             vec![
                 "exec_command".to_owned(),
                 "read_file".to_owned(),
-                "write_file".to_owned(),
-                "edit_file".to_owned(),
                 "list_dir".to_owned(),
                 "grep_files".to_owned(),
                 "apply_patch".to_owned(),
@@ -388,14 +384,12 @@ mod tests {
             ]
         );
         assert!(snapshot.contains_name("request_tools").await);
-        assert!(snapshot.contains_name("write_file").await);
-        assert!(snapshot.contains_name("edit_file").await);
         assert!(snapshot.contains_name("skill.weather").await);
         assert!(!snapshot.contains_name("memory_search").await);
         assert!(!snapshot.contains_name("task_create").await);
         assert!(!snapshot.contains_name("artifact_prepare").await);
         assert!(!snapshot.contains_name("computer_use").await);
-        assert_eq!(snapshot.all_specs().len(), 14);
+        assert_eq!(snapshot.all_specs().len(), 12);
     }
 
     fn visibility_input() -> FinalToolVisibilityInput {
@@ -406,8 +400,6 @@ mod tests {
             dynamic_tool_names: Vec::new(),
             registered_tool_names: vec![
                 "exec_command".to_owned(),
-                "write_file".to_owned(),
-                "edit_file".to_owned(),
                 "request_tools".to_owned(),
                 "memory_search".to_owned(),
                 "memory_get".to_owned(),
@@ -548,15 +540,10 @@ mod tests {
                 "artifact_prepare".to_owned(),
                 "computer_use".to_owned(),
                 "read_skill".to_owned(),
-                "edit_file".to_owned(),
                 "skill.weather".to_owned(),
                 "mcp.browser.open".to_owned(),
             ],
-            [
-                "exec_command".to_owned(),
-                "write_file".to_owned(),
-                "request_tools".to_owned(),
-            ],
+            ["exec_command".to_owned(), "request_tools".to_owned()],
         );
 
         assert_eq!(

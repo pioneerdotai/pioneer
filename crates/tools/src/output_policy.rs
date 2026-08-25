@@ -372,8 +372,6 @@ mod tests {
             "list_dir",
             "grep_files",
             "apply_patch",
-            "write_file",
-            "edit_file",
         ] {
             let policy = builtin_output_policy(tool_name);
             assert!(!matches!(policy.storage, StorageOutputPolicy::Full { .. }));

@@ -1204,6 +1204,7 @@ mod tests {
                 TurnPermissionMode::FullAccess,
                 workdir.as_path(),
             )),
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }

@@ -14,8 +14,7 @@ mod web;
 pub use computer_use::{ComputerUseHandler, materialize_computer_use_domain_bundle};
 
 pub use apply_patch::ApplyPatchHandler;
-pub(crate) use files::FileObservationStore;
-pub use files::{EditFileHandler, GrepHandler, ListDirHandler, ReadFileHandler, WriteFileHandler};
+pub use files::{GrepHandler, ListDirHandler, ReadFileHandler};
 pub use mcp::{
     ExcludedMcpRuntimeTool, McpDynamicToolAnnotations, McpDynamicToolBinding,
     McpDynamicToolDescriptor, McpRuntimeToolMaterialization, McpToolCallOutput, McpToolCallRequest,

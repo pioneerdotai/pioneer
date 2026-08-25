@@ -1,0 +1,134 @@
+[
+  {
+    "id": "add_file_basic",
+    "category": "applied",
+    "initial": {},
+    "patch": "*** Begin Patch\n*** Add File: notes.txt\n+hello\n*** End Patch",
+    "expected": {
+      "operations": [{"kind": "add", "path": "notes.txt"}],
+      "final": {"notes.txt": "hello\n"},
+      "delta_exact": true
+    },
+    "references": ["codex:scenario/001_add_file", "opencode:patch.test/parses-add"]
+  },
+  {
+    "id": "update_context_basic",
+    "category": "applied",
+    "initial": {"app.txt": "alpha\nold\nomega\n"},
+    "patch": "*** Begin Patch\n*** Update File: app.txt\n@@\n-old\n+new\n*** End Patch",
+    "expected": {
+      "operations": [{"kind": "update", "path": "app.txt"}],
+      "final": {"app.txt": "alpha\nnew\nomega\n"},
+      "delta_exact": true
+    },
+    "references": ["codex:scenario/003_multiple_chunks", "opencode:patch.test/derive"]
+  },
+  {
+    "id": "delete_file_basic",
+    "category": "applied",
+    "initial": {"obsolete.txt": "remove me\n"},
+    "patch": "*** Begin Patch\n*** Delete File: obsolete.txt\n*** End Patch",
+    "expected": {
+      "operations": [{"kind": "delete", "path": "obsolete.txt"}],
+      "final": {},
+      "delta_exact": true
+    },
+    "references": ["codex:scenario/020_delete_file_success", "opencode:patch.test/parses-delete"]
+  },
+  {
+    "id": "move_file_basic",
+    "category": "applied",
+    "initial": {"old.txt": "content\n"},
+    "patch": "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n content\n*** End Patch",
+    "expected": {
+      "operations": [{"kind": "move", "from": "old.txt", "path": "new.txt"}],
+      "final": {"new.txt": "content\n"},
+      "delta_exact": true
+    },
+    "references": ["codex:scenario/004_move_to_new_directory", "opencode:patch.parse/movePath"],
+    "note": "OpenCode's current model-facing tool rejects parsed moves; Pioneer supports the logical operation in its engine."
+  },
+  {
+    "id": "multiple_operations_preserve_order",
+    "category": "applied",
+    "initial": {"existing.txt": "old\n"},
+    "patch": "*** Begin Patch\n*** Add File: created.txt\n+created\n*** Update File: existing.txt\n@@\n-old\n+new\n*** End Patch",
+    "expected": {
+      "operations": [
+        {"kind": "add", "path": "created.txt"},
+        {"kind": "update", "path": "existing.txt"}
+      ],
+      "final": {"created.txt": "created\n", "existing.txt": "new\n"},
+      "delta_exact": true
+    },
+    "references": ["codex:scenario/002_multiple_operations", "opencode:tool/apply-patch/sequential"]
+  },
+  {
+    "id": "partial_failure_keeps_committed_prefix",
+    "category": "partial_failure",
+    "initial": {"first.txt": "before\n"},
+    "patch": "*** Begin Patch\n*** Add File: first-created.txt\n+created\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch",
+    "expected": {
+      "operations": [{"kind": "add", "path": "first-created.txt"}],
+      "final": {"first-created.txt": "created\n", "first.txt": "before\n"},
+      "delta_exact": true,
+      "error": "missing.txt"
+    },
+    "references": ["codex:scenario/015_failure_after_partial_success_leaves_changes", "opencode:tool/apply-patch/failure-prefix"]
+  },
+  {
+    "id": "malformed_patch_rejected",
+    "category": "rejected",
+    "initial": {},
+    "patch": "*** Begin Patch\n*** Add File: broken.txt\nmissing plus\n*** End Patch",
+    "expected": {
+      "operations": [],
+      "final": {},
+      "error": "invalid add file line"
+    },
+    "references": ["codex:parser.rs/add_hunk-grammar", "opencode:patch.test/rejects-malformed"]
+  },
+  {
+    "id": "missing_context_rejected",
+    "category": "rejected",
+    "initial": {"app.txt": "actual\n"},
+    "patch": "*** Begin Patch\n*** Update File: app.txt\n@@\n-expected\n+new\n*** End Patch",
+    "expected": {
+      "operations": [],
+      "final": {"app.txt": "actual\n"},
+      "error": "expected lines not found"
+    },
+    "references": ["codex:scenario/006_rejects_missing_context", "opencode:patch.computeReplacements"]
+  },
+  {
+    "id": "bom_is_preserved",
+    "category": "applied",
+    "initial": {"bom.txt": "\ufeffold\n"},
+    "patch": "*** Begin Patch\n*** Update File: bom.txt\n@@\n-old\n+new\n*** End Patch",
+    "expected": {
+      "operations": [{"kind": "update", "path": "bom.txt"}],
+      "final": {"bom.txt": "\ufeffnew\n"},
+      "delta_exact": true
+    },
+    "references": ["opencode:patch.test/derive-preserves-bom", "codex:lib/line-ending-mode"]
+  },
+  {
+    "id": "net_noop_remains_in_history",
+    "category": "aggregate_net_noop",
+    "initial": {"cycle.txt": "one\n"},
+    "patches": [
+      "*** Begin Patch\n*** Update File: cycle.txt\n@@\n-one\n+two\n*** End Patch",
+      "*** Begin Patch\n*** Update File: cycle.txt\n@@\n-two\n+one\n*** End Patch"
+    ],
+    "expected": {
+      "per_call_operations": [
+        [{"kind": "update", "path": "cycle.txt"}],
+        [{"kind": "update", "path": "cycle.txt"}]
+      ],
+      "final": {"cycle.txt": "one\n"},
+      "aggregate_changed": false,
+      "history_records": 2
+    },
+    "references": ["codex:turn_diff_tracker/baseline-current", "pioneer:patch-history/applied-patch-log"]
+  }
+]

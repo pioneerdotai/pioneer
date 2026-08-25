@@ -10,9 +10,11 @@ use crate::router::{ToolCall, ToolRouter};
 use crate::spec::ExecutionClass;
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +33,7 @@ pub struct ToolCallRuntime {
     environment: BTreeMap<String, String>,
     global_lock: Arc<RwLock<()>>,
     session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    last_patch_failed: Arc<AtomicBool>,
 }
 
 impl ToolCallRuntime {
@@ -60,6 +63,7 @@ impl ToolCallRuntime {
             environment: BTreeMap::new(),
             global_lock: Arc::new(RwLock::new(())),
             session_locks: Arc::new(Mutex::new(HashMap::new())),
+            last_patch_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -138,6 +142,14 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         workdir: PathBuf,
     ) -> Result<AnyToolResult, ToolError> {
+        if take_patch_mutation_fallback(self.last_patch_failed.as_ref(), call.tool_name.as_str()) {
+            crate::apply_patch::patch_telemetry().record_shell_fallback();
+            pioneer_observability::record_patch_mutation_fallback(
+                "tool_runtime",
+                self.permission_context.permission_profile.mode.as_str(),
+                "shell_or_python",
+            );
+        }
         let trace = self.event_bus.trace_with_id(
             call.trace_id.clone(),
             self.turn_id.clone(),
@@ -147,7 +159,10 @@ impl ToolCallRuntime {
         trace
             .emit_started(
                 1,
-                Some(payload_arguments_json(&call.payload)),
+                Some(payload_arguments_json_for_event(
+                    call.tool_name.as_str(),
+                    &call.payload,
+                )),
                 None,
                 call.turn_item_execution_class,
                 call.output_policy.clone(),
@@ -179,6 +194,46 @@ impl ToolCallRuntime {
                             Some(serde_json::json!({
                                 "wait_ms": wait_started.elapsed().as_millis() as u64,
                                 "execution_class": "shared",
+                            })),
+                        );
+                        Ok(guard)
+                    },
+                }?;
+
+                let output = self
+                    .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                    .await;
+                drop(read_guard);
+                output
+            }
+            ExecutionClass::MutationScoped => {
+                trace.emit_stage(
+                    1,
+                    "runtime.lock_wait.started",
+                    None,
+                    Some(serde_json::json!({
+                        "execution_class": "mutation_scoped",
+                    })),
+                );
+                let wait_started = std::time::Instant::now();
+                // Mutation-scoped calls share the global barrier with ordinary
+                // reads, but do not take the exclusive write guard.  The
+                // patch engine's canonical target locks serialize only
+                // overlapping paths and allow disjoint patches to proceed.
+                let read_guard = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        let error = ToolError::cancelled("cancelled before mutation-scoped lock acquisition");
+                        trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
+                        Err(error)
+                    }
+                    guard = self.global_lock.read() => {
+                        trace.emit_stage(
+                            1,
+                            "runtime.lock_wait.completed",
+                            None,
+                            Some(serde_json::json!({
+                                "wait_ms": wait_started.elapsed().as_millis() as u64,
+                                "execution_class": "mutation_scoped",
                             })),
                         );
                         Ok(guard)
@@ -291,6 +346,11 @@ impl ToolCallRuntime {
 
         match result {
             Ok(mut output) => {
+                record_patch_result(
+                    self.last_patch_failed.as_ref(),
+                    call.tool_name.as_str(),
+                    output.success(),
+                );
                 let raw_output_text = output.raw_output_text();
                 let raw_output_json = output.raw_output_json();
                 let arguments = payload_arguments_json(&call.payload);
@@ -326,6 +386,11 @@ impl ToolCallRuntime {
                 Ok(output)
             }
             Err(error) => {
+                record_patch_result(
+                    self.last_patch_failed.as_ref(),
+                    call.tool_name.as_str(),
+                    false,
+                );
                 let outcome = classify_call_error(&call, &error, source, &workdir);
                 trace.emit_stage(1, "runtime.failed", Some(error.to_string()), None);
                 trace
@@ -380,6 +445,16 @@ impl ToolCallRuntime {
     }
 }
 
+fn take_patch_mutation_fallback(last_patch_failed: &AtomicBool, tool_name: &str) -> bool {
+    tool_name == "exec_command" && last_patch_failed.swap(false, Ordering::AcqRel)
+}
+
+fn record_patch_result(last_patch_failed: &AtomicBool, tool_name: &str, success: bool) {
+    if tool_name == "apply_patch" {
+        last_patch_failed.store(!success, Ordering::Release);
+    }
+}
+
 fn classify_call_error(
     call: &ToolCall,
     error: &ToolError,
@@ -398,6 +473,7 @@ fn classify_call_error(
         recovery: call.recovery,
         permission_metadata: call.permission_metadata.clone(),
         execution_security_snapshot: None,
+        apply_patch_preflight: None,
         cancellation: CancellationToken::new(),
     };
     DefaultErrorClassifier.classify_error(&invocation, error)
@@ -438,6 +514,23 @@ fn payload_arguments_json(payload: &ToolPayload) -> JsonValue {
         }),
         ToolPayload::Custom { input } => serde_json::json!({ "input": input }),
     }
+}
+
+/// Durable ordinary tool events must never carry patch source text.  Keep a
+/// bounded audit marker instead; the executor and model-facing result still
+/// use the original in-memory payload for the actual operation and its
+/// projection.
+fn payload_arguments_json_for_event(tool_name: &str, payload: &ToolPayload) -> JsonValue {
+    let arguments = payload_arguments_json(payload);
+    if tool_name != "apply_patch" {
+        return arguments;
+    }
+    let encoded = serde_json::to_vec(&arguments).unwrap_or_default();
+    serde_json::json!({
+        "redacted": true,
+        "input_sha256": hex::encode(Sha256::digest(&encoded)),
+        "input_bytes": encoded.len(),
+    })
 }
 
 fn output_delta_from_projection(
@@ -516,6 +609,19 @@ mod tests {
     }
 
     struct FailingHandler;
+
+    #[test]
+    fn shell_fallback_is_attributed_once_to_the_preceding_failed_patch() {
+        let state = AtomicBool::new(false);
+
+        record_patch_result(&state, "apply_patch", false);
+        assert!(!take_patch_mutation_fallback(&state, "read_file"));
+        assert!(take_patch_mutation_fallback(&state, "exec_command"));
+        assert!(!take_patch_mutation_fallback(&state, "exec_command"));
+
+        record_patch_result(&state, "apply_patch", true);
+        assert!(!take_patch_mutation_fallback(&state, "exec_command"));
+    }
 
     impl SleepHandler {
         fn observe_max(max: &AtomicUsize, value: usize) {
@@ -777,6 +883,38 @@ mod tests {
         assert!(
             max_active.load(Ordering::SeqCst) >= 2,
             "shared execution should overlap"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_scoped_calls_reach_target_locking_in_parallel() {
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(SleepHandler {
+            sleep_ms: 120,
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: max_active.clone(),
+        });
+        let runtime = build_runtime("mutation_tool", ExecutionClass::MutationScoped, handler);
+
+        let runtime_left = runtime.clone();
+        let runtime_right = runtime.clone();
+        let left = runtime_left.execute_tool_call(function_call(
+            "mutation_tool",
+            "call_left",
+            ExecutionClass::MutationScoped,
+        ));
+        let right = runtime_right.execute_tool_call(function_call(
+            "mutation_tool",
+            "call_right",
+            ExecutionClass::MutationScoped,
+        ));
+
+        let (left, right) = tokio::join!(left, right);
+        assert!(left.is_ok());
+        assert!(right.is_ok());
+        assert!(
+            max_active.load(Ordering::SeqCst) >= 2,
+            "runtime must not globally serialize mutation-scoped calls"
         );
     }
 
