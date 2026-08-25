@@ -209,9 +209,12 @@ async fn create_patch_snapshot(manager: &SchemaManager<'_>) -> Result<(), DbErr>
                 )
                 .check((
                     "ck_patch_snapshot_raw_byte_len",
-                    Expr::cust("raw_byte_len >= 0"),
+                    Expr::col(Alias::new("raw_byte_len")).gte(0),
                 ))
-                .check(("ck_patch_snapshot_ref_count", Expr::cust("ref_count >= 0")))
+                .check((
+                    "ck_patch_snapshot_ref_count",
+                    Expr::col(Alias::new("ref_count")).gte(0),
+                ))
                 .to_owned(),
         )
         .await
@@ -326,11 +329,11 @@ async fn create_patch_snapshot_reservation(manager: &SchemaManager<'_>) -> Resul
                 )
                 .check((
                     "ck_patch_snapshot_reservation_logical_bytes",
-                    Expr::cust("logical_bytes >= 0"),
+                    Expr::col(Alias::new("logical_bytes")).gte(0),
                 ))
                 .check((
                     "ck_patch_snapshot_reservation_physical_bytes",
-                    Expr::cust("physical_bytes >= 0"),
+                    Expr::col(Alias::new("physical_bytes")).gte(0),
                 ))
                 .to_owned(),
         )
@@ -360,10 +363,13 @@ async fn create_turn_diff_state(manager: &SchemaManager<'_>) -> Result<(), DbErr
                         .col(Alias::new("thread_id"))
                         .col(Alias::new("turn_id")),
                 )
-                .check(("ck_turn_diff_state_exact", Expr::cust("exact IN (0, 1)")))
+                .check((
+                    "ck_turn_diff_state_exact",
+                    Expr::col(Alias::new("exact")).is_in([0, 1]),
+                ))
                 .check((
                     "ck_turn_diff_state_final_state",
-                    Expr::cust("final_state IN (0, 1)"),
+                    Expr::col(Alias::new("final_state")).is_in([0, 1]),
                 ))
                 .to_owned(),
         )
@@ -390,7 +396,7 @@ async fn create_codex_aggregate_state(manager: &SchemaManager<'_>) -> Result<(),
                 )
                 .check((
                     "ck_codex_aggregate_state_final_state",
-                    Expr::cust("final_state IN (0, 1)"),
+                    Expr::col(Alias::new("final_state")).is_in([0, 1]),
                 ))
                 .to_owned(),
         )
