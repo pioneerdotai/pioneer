@@ -42,6 +42,8 @@ pub mod methods {
     pub const THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD: &str = "thread/agents_doc/resolve_for_thread";
     pub const THREAD_GET: &str = "thread/get";
     pub const THREAD_TIMELINE_PAGE: &str = "thread/timeline/page";
+    pub const THREAD_PATCH_STEPS_PAGE: &str = "thread/patch_steps/page";
+    pub const THREAD_FILE_PATCH_HISTORY_PAGE: &str = "thread/file_patch_history/page";
     pub const THREAD_READ: &str = "thread/read";
     pub const THREAD_UNSUBSCRIBE: &str = "thread/unsubscribe";
     pub const TURN_START: &str = "turn/start";
@@ -52,6 +54,9 @@ pub mod methods {
     pub const TURN_RESUME: &str = "turn/resume";
     pub const TURN_GET: &str = "turn/get";
     pub const TURN_ITEMS_PAGE: &str = "turn/items/page";
+    pub const TURN_PATCH_STEPS_PAGE: &str = "turn/patch_steps/page";
+    pub const TURN_PATCH_RECORD_GET: &str = "turn/patch_record/get";
+    pub const TURN_PATCH_DIFF_GET: &str = "turn/patch_diff/get";
     pub const TURN_WORK_PAGE: &str = "turn/work/page";
     pub const TURN_WORK_ITEMS_GET: &str = "turn/work/items/get";
     pub const TURN_PERMISSION_REQUEST_RESPOND: &str = "turn/permission/request/respond";
@@ -193,6 +198,8 @@ pub mod methods {
         THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD,
         THREAD_GET,
         THREAD_TIMELINE_PAGE,
+        THREAD_PATCH_STEPS_PAGE,
+        THREAD_FILE_PATCH_HISTORY_PAGE,
         THREAD_READ,
         THREAD_UNSUBSCRIBE,
         TURN_START,
@@ -203,6 +210,9 @@ pub mod methods {
         TURN_RESUME,
         TURN_GET,
         TURN_ITEMS_PAGE,
+        TURN_PATCH_STEPS_PAGE,
+        TURN_PATCH_RECORD_GET,
+        TURN_PATCH_DIFF_GET,
         TURN_WORK_PAGE,
         TURN_WORK_ITEMS_GET,
         TURN_PERMISSION_REQUEST_RESPOND,

@@ -3385,8 +3385,9 @@ impl ToolOutputPolicySnapshot {
             "download_url" | "download" => download_output_policy_snapshot(),
             "computer_use" => computer_use_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "read_skill" | "list_dir"
-            | "grep_files" | "apply_patch" | "write_file" | "edit_file" | "tool_search"
-            | "tool_suggest" => model_only_metadata_policy_snapshot(),
+            | "grep_files" | "apply_patch" | "tool_search" | "tool_suggest" => {
+                model_only_metadata_policy_snapshot()
+            }
             _ => dynamic_unknown_output_policy_snapshot(),
         }
     }
@@ -3399,7 +3400,7 @@ impl ToolOutputPolicySnapshot {
             "download_url" | "download" => download_output_policy_snapshot(),
             "computer_use" => computer_use_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "list_dir" | "grep_files"
-            | "apply_patch" | "write_file" | "edit_file" | "tool_search" | "tool_suggest" => {
+            | "apply_patch" | "tool_search" | "tool_suggest" => {
                 model_only_metadata_policy_snapshot()
             }
             _ => external_runtime_tool_output_policy_snapshot(),

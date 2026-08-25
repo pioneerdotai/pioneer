@@ -11,6 +11,13 @@ use crate::timeline::{
     TurnWorkStateChangedNotification,
 };
 
+use crate::patch_history::{
+    ThreadFilePatchHistoryPageParams, ThreadFilePatchHistoryPageResponse,
+    ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse, TurnPatchDiffGetParams,
+    TurnPatchDiffGetResponse, TurnPatchRecordGetParams, TurnPatchRecordGetResponse,
+    TurnPatchStepsPageParams, TurnPatchStepsPageResponse,
+};
+
 use crate::artifact::{
     ArtifactBindParams, ArtifactBindResponse, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactBindingSummary, ArtifactCapabilitiesParams, ArtifactCapabilitiesResponse,
@@ -1003,6 +1010,22 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             ThreadTimelinePageResponse
         ),
         schema_doc!(
+            "thread_patch_steps_page_params.json",
+            ThreadPatchStepsPageParams
+        ),
+        schema_doc!(
+            "thread_patch_steps_page_response.json",
+            ThreadPatchStepsPageResponse
+        ),
+        schema_doc!(
+            "thread_file_patch_history_page_params.json",
+            ThreadFilePatchHistoryPageParams
+        ),
+        schema_doc!(
+            "thread_file_patch_history_page_response.json",
+            ThreadFilePatchHistoryPageResponse
+        ),
+        schema_doc!(
             "thread_timeline_blocks_changed_notification.json",
             ThreadTimelineBlocksChangedNotification
         ),
@@ -1809,6 +1832,27 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("turn_item_event.json", TurnItemEvent),
         schema_doc!("turn_item_event_payload.json", TurnItemEventPayload),
         schema_doc!("turn_items_response.json", TurnItemsResponse),
+        schema_doc!(
+            "turn_patch_steps_page_params.json",
+            TurnPatchStepsPageParams
+        ),
+        schema_doc!(
+            "turn_patch_steps_page_response.json",
+            TurnPatchStepsPageResponse
+        ),
+        schema_doc!(
+            "turn_patch_record_get_params.json",
+            TurnPatchRecordGetParams
+        ),
+        schema_doc!(
+            "turn_patch_record_get_response.json",
+            TurnPatchRecordGetResponse
+        ),
+        schema_doc!("turn_patch_diff_get_params.json", TurnPatchDiffGetParams),
+        schema_doc!(
+            "turn_patch_diff_get_response.json",
+            TurnPatchDiffGetResponse
+        ),
         schema_doc!("timeline_cursor.json", TimelineCursor),
         schema_doc!("timeline_page_anchor.json", TimelinePageAnchor),
         schema_doc!("timeline_page_info.json", TimelinePageInfo),

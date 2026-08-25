@@ -24,6 +24,7 @@ mod mcp;
 mod member;
 mod memory;
 mod notification;
+mod patch_history;
 mod provider;
 mod public_error;
 mod schema;
@@ -263,6 +264,19 @@ pub use memory::{
     MemorySourceContextKind, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
 };
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
+pub use patch_history::{
+    PatchAppliedStep, PatchDiffSelection, PatchFileHistoryCursor, PatchFileHistoryEntry,
+    PatchHistoryAuthorityView, PatchHistoryChange, PatchHistoryChangeKind,
+    PatchHistoryCoverageView, PatchHistoryErrorCode, PatchHistoryLineEnding,
+    PatchHistoryLineEndingMetadata, PatchHistoryProvenanceView, PatchHistoryQueryCoverage,
+    PatchHistoryRecord, PatchHistoryRecordOutcome, PatchHistorySideEffects,
+    PatchHistorySnapshotRef, PatchHistoryStage, PatchHistoryTextEncoding, PatchRecordExactnessView,
+    PatchRecordSelector, PatchThreadHistoryCursor, ThreadFilePatchHistoryPageParams,
+    ThreadFilePatchHistoryPageResponse, ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse,
+    TurnDiffExactnessView, TurnPatchDiffGetParams, TurnPatchDiffGetResponse,
+    TurnPatchRecordGetParams, TurnPatchRecordGetResponse, TurnPatchStepsPageParams,
+    TurnPatchStepsPageResponse,
+};
 pub use provider::{
     ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
     ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
