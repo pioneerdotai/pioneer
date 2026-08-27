@@ -636,6 +636,7 @@ fn end_timestamp(started_at: SystemTime, elapsed: Duration) -> SystemTime {
 /// SQL, or other unbounded values from entering telemetry attributes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayOperation {
+    AuthRefresh,
     ResilienceInitialize,
     SelfImprovementInitialize,
     McpWorkspaceInitialize,
@@ -647,6 +648,7 @@ pub enum GatewayOperation {
 impl GatewayOperation {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::AuthRefresh => "auth.refresh",
             Self::ResilienceInitialize => "services.resilience.initialize",
             Self::SelfImprovementInitialize => "services.self_improvement.initialize",
             Self::McpWorkspaceInitialize => "services.mcp.initialize",
@@ -658,6 +660,7 @@ impl GatewayOperation {
 
     const fn span_name(self) -> &'static str {
         match self {
+            Self::AuthRefresh => "gateway.auth.refresh",
             Self::ResilienceInitialize => "gateway.services.resilience.initialize",
             Self::SelfImprovementInitialize => "gateway.services.self_improvement.initialize",
             Self::McpWorkspaceInitialize => "gateway.services.mcp.initialize",
@@ -673,6 +676,7 @@ impl GatewayOperation {
 /// because identifiers are intentionally excluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayOperationStage {
+    AuthRefreshDatabaseTransactionAcquire,
     ResilienceReadModelRepair,
     ResilienceDeadlineBackfill,
     ResilienceAdmissionLeaseReconcile,
@@ -712,6 +716,7 @@ pub enum GatewayOperationStage {
 impl GatewayOperationStage {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AuthRefreshDatabaseTransactionAcquire => "db.transaction.acquire",
             Self::ResilienceReadModelRepair => "read_model.repair",
             Self::ResilienceDeadlineBackfill => "deadlines.backfill",
             Self::ResilienceAdmissionLeaseReconcile => "admission_leases.reconcile",

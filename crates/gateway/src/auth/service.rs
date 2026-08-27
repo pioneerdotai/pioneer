@@ -207,7 +207,29 @@ impl GatewayAuthService {
     pub(crate) async fn exchange_refresh(
         &self,
         admission: RestrictedAdmission,
+        params: AuthRefreshParams,
+    ) -> Result<AuthRefreshGrant, AuthError> {
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::AuthRefresh,
+        );
+        let result = self.exchange_refresh_inner(admission, params, &trace).await;
+        match result {
+            Ok(grant) => {
+                trace.finish_success();
+                Ok(grant)
+            }
+            Err(error) => {
+                trace.finish_failure();
+                Err(error)
+            }
+        }
+    }
+
+    async fn exchange_refresh_inner(
+        &self,
+        admission: RestrictedAdmission,
         mut params: AuthRefreshParams,
+        trace: &pioneer_observability::GatewayOperationTrace,
     ) -> Result<AuthRefreshGrant, AuthError> {
         if !matches!(admission.context(), RestrictedAuthContext::Refresh(_)) {
             return Err(AuthError::new(AuthErrorCode::MethodNotAllowed));
@@ -236,6 +258,9 @@ impl GatewayAuthService {
             .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let access_jti = generate_id(AUTH_DOMAIN_ID_LEN);
 
+        let transaction_acquire_stage = trace.stage(
+            pioneer_observability::GatewayOperationStage::AuthRefreshDatabaseTransactionAcquire,
+        );
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -244,6 +269,7 @@ impl GatewayAuthService {
             })
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        transaction_acquire_stage.succeed();
         let session = match load_session(&transaction, &presented.session_id)
             .await
             .map_err(storage_error)?
