@@ -2985,6 +2985,7 @@ struct SequencedToolProvider {
     first_tool_calls: Vec<ProviderToolCall>,
     second_text: String,
     next_index: AtomicUsize,
+    native_file_provider: Option<String>,
 }
 
 struct DirectAgentSandboxProvider {
@@ -4735,7 +4736,13 @@ impl SequencedToolProvider {
             first_tool_calls,
             second_text: second_text.into(),
             next_index: AtomicUsize::new(0),
+            native_file_provider: None,
         }
+    }
+
+    fn with_native_file_provider(mut self, provider: impl Into<String>) -> Self {
+        self.native_file_provider = Some(provider.into());
+        self
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
@@ -5619,6 +5626,18 @@ fn is_child_task_main_request(request: &ChatRequest) -> bool {
 impl Provider for SequencedToolProvider {
     fn name(&self) -> &str {
         "sequenced-tools"
+    }
+
+    fn native_file_tool_capability(
+        &self,
+        model: &str,
+    ) -> pioneer_provider::NativeFileToolCapability {
+        pioneer_provider::select_native_file_tool_capability(
+            self.native_file_provider
+                .as_deref()
+                .unwrap_or_else(|| self.name()),
+            model,
+        )
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -22841,7 +22860,20 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "supervised-task-native"));
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let database_temp =
+        tempfile::tempdir().expect("supervised native Task database tempdir should exist");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        database_temp
+            .path()
+            .join("supervised-native-task.sqlite3")
+            .display()
+    );
+    let connection = Database::connect(database_url)
+        .await
+        .expect("supervised native Task database should connect");
+    let (workspace_manager, crud_store, workspace_id) =
+        setup_workspace_manager_with_connection(connection).await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
@@ -23095,6 +23127,277 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
                 && audit.decision
                     == Some(pioneer_protocol::TurnPermissionAuditDecision::AllowOnce)
     )));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn supervised_native_task_apply_patch_creates_approved_missing_destination_tree() {
+    run_standard_stack_message_test(
+        "supervised native Task Apply Patch missing destination grant",
+        supervised_native_task_apply_patch_creates_approved_missing_destination_tree_body(),
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn supervised_native_task_apply_patch_creates_approved_missing_destination_tree_body() {
+    let current = std::env::current_dir().expect("gateway test cwd should resolve");
+    let fixture = tempfile::tempdir_in(current).expect("Task patch fixture should create");
+    let workspace = fixture.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("Task patch workspace should create");
+    let destination_root = fixture.path().join("Downloads").join("weekend-trip-plan");
+    let readme = destination_root.join("README.md");
+    let itinerary = destination_root.join("itinerary.md");
+    let notes = destination_root.join("notes.txt");
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: {}\n+# Weekend Trip\n*** Add File: {}\n+- Saturday\n+- Sunday\n*** Add File: {}\n+Remember the tickets.\n*** End Patch",
+        readme.display(),
+        itinerary.display(),
+        notes.display(),
+    );
+    assert!(
+        !destination_root.exists(),
+        "the exact permission root must start missing"
+    );
+
+    let provider = Arc::new(
+        SequencedToolProvider::new(
+            vec![ProviderToolCall {
+                id: "call_supervised_task_apply_patch".to_owned(),
+                name: "apply_patch".to_owned(),
+                arguments: json!({"patch": patch}).to_string(),
+            }],
+            r#"<task_result>{"summary":"approved native Task patch completed"}</task_result>"#,
+        )
+        .with_native_file_provider("openai"),
+    );
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    // The Task and permission responder overlap on separate pool connections.
+    // A pooled `sqlite::memory:` URL can expose an unrelated empty database to
+    // either side, so keep one unique file-backed fixture for this concurrency
+    // contract.
+    let database_temp =
+        tempfile::tempdir().expect("Apply Patch Task database tempdir should exist");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        database_temp
+            .path()
+            .join("apply-patch-task.sqlite3")
+            .display()
+    );
+    let connection = Database::connect(database_url)
+        .await
+        .expect("Apply Patch Task database should connect");
+    let (workspace_manager, crud_store, workspace_id) =
+        setup_workspace_manager_with_connection(connection).await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_agent_tool_bridges().await;
+
+    let parent_thread_id = "thread_supervised_native_task_patch";
+    let parent_turn_id = "turn_supervised_native_task_patch";
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
+        processor.as_ref(),
+        connection_id,
+        workspace_id.as_str(),
+        parent_thread_id,
+    )
+    .await;
+
+    let supervised_profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+        pioneer_protocol::TurnPermissionMode::Supervised,
+        pioneer_protocol::TurnPermissionProfileSource::Composer,
+    );
+    let mut parent_security = pioneer_protocol::TurnExecutionSecuritySnapshot::read_only(
+        supervised_profile.clone(),
+        workspace.display().to_string(),
+        vec![
+            pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                pioneer_protocol::TurnFilesystemAccess::Read,
+                workspace.display().to_string(),
+            ),
+        ],
+        1,
+    );
+    parent_security.authority_cap.resource_binding_id = format!("workspace:{workspace_id}:agent");
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_security_snapshot(parent_turn_id, &parent_security)
+            .await
+            .expect("supervised parent security snapshot should persist")
+    );
+    persist_test_execution_authorization_context_for_principal_with_profile(
+        processor.as_ref(),
+        authenticated_test_superuser().as_ref(),
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        &supervised_profile,
+    )
+    .await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        "Create the approved missing destination tree with Apply Patch",
+        3,
+    );
+    let agent_spec = params
+        .agent_spec
+        .as_mut()
+        .expect("supervised Task should contain an Agent spec");
+    agent_spec.model_provider = Some("openai".to_owned());
+    agent_spec.permission_cap = Some(pioneer_protocol::task_permission_cap_from_snapshot(
+        &supervised_profile,
+    ));
+    agent_spec.security_cap = Some(crate::turn_security::task_security_cap_from_snapshot(
+        &parent_security,
+    ));
+
+    let task = create_task_for_test(&processor, params)
+        .await
+        .expect("supervised native patch Task should start");
+    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    let opened_request = opened
+        .params
+        .as_ref()
+        .and_then(|params| params.get("request"))
+        .expect("native Task Apply Patch permission request should be present");
+    assert_eq!(opened_request["tool_name"], json!("apply_patch"));
+    assert_eq!(opened_request["action"], json!("file_write"));
+    let permission_request_id = opened_request["request_id"]
+        .as_str()
+        .expect("native Task Apply Patch request id should be present")
+        .to_owned();
+    let run = task
+        .run
+        .as_ref()
+        .expect("supervised patch Task should have a run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    assert_eq!(
+        opened_request["thread_id"],
+        json!(lineage.child_thread_id.as_str())
+    );
+    assert_eq!(
+        opened_request["turn_id"],
+        json!(lineage.child_turn_id.as_str())
+    );
+
+    let respond_id = "rspnativepatchgrant01";
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": respond_id,
+                "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
+                "params": {
+                    "request_id": permission_request_id,
+                    "resolution": "allow_once"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (responded, _) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        respond_id,
+        events::TURN_PERMISSION_REQUEST_RESOLVED,
+    )
+    .await;
+    assert_eq!(responded.result["resolution"], json!("allow_once"));
+
+    let status = wait_for_task_status(
+        crud_store.clone(),
+        task.task.id.as_str(),
+        pioneer_protocol::TaskStatus::Completed,
+    )
+    .await;
+    if status != pioneer_protocol::TaskStatus::Completed {
+        let failed = crud_store
+            .get_task(task.task.id.as_str())
+            .await
+            .expect("failed supervised patch Task should reload");
+        panic!("supervised native patch Task did not complete: {failed:#?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(readme).expect("README should be created at requested path"),
+        "# Weekend Trip"
+    );
+    assert_eq!(
+        std::fs::read_to_string(itinerary).expect("itinerary should be created at requested path"),
+        "- Saturday\n- Sunday"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes).expect("notes should be created at requested path"),
+        "Remember the tickets."
+    );
+
+    let child_security = crud_store
+        .get_turn_execution_security_snapshot(lineage.child_turn_id.as_str())
+        .await
+        .expect("child security snapshot should load")
+        .expect("child security snapshot should exist")
+        .snapshot;
+    assert_eq!(
+        child_security.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::ReadOnly,
+        "allow_once must not persist the destination as ambient authority"
+    );
+    assert!(
+        child_security
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .all(|entry| entry.resolved_path.as_deref()
+                != Some(destination_root.to_string_lossy().as_ref())),
+        "the exact destination grant must remain invocation-scoped"
+    );
+    let permission_records = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            workspace_id: Some(workspace_id),
+            runtime_id: Some(
+                pioneer_protocol::constants::runtime_ids::NATIVE_PERMISSION.to_owned(),
+            ),
+            turn_id: Some(lineage.child_turn_id),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("native Task Apply Patch permission records should list");
+    assert_eq!(
+        permission_records.len(),
+        1,
+        "one Apply Patch approval must produce one execution and no mkdir workaround prompt"
+    );
+    assert!(permission_records[0].status.is_terminal());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -60788,13 +61091,16 @@ async fn wait_for_thread_manager_turn_status(
     turn_id: &str,
     expected_status: TurnStatus,
 ) -> Turn {
-    for _ in 0..100 {
+    // Full-suite SQLite, provider, and indexing work can delay an otherwise
+    // healthy provider completion beyond one second. Keep the oracle bounded
+    // while matching the contention budget used by the Task lifecycle waits.
+    for _ in 0..1_200 {
         if let Some((_workspace_id, turn)) = thread_manager.turn_get(thread_id, turn_id).await
             && turn.status == expected_status
         {
             return turn;
         }
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(25)).await;
     }
 
     let last = thread_manager

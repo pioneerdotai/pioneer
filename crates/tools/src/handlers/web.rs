@@ -390,22 +390,26 @@ impl ToolHandler for DownloadUrlHandler {
                     .to_owned(),
             )
             })?;
-        let (destination, authorized_root) =
-            match FilePolicyChecker::check_write(snapshot, requested_destination.as_path()) {
-                FilePolicyDecision::Allowed(grant) => {
-                    let authorized_root = grant
-                        .matched_root
-                        .unwrap_or_else(|| filesystem_volume_root(grant.resolved_path.as_path()));
-                    (grant.resolved_path, authorized_root)
-                }
-                FilePolicyDecision::Denied(deny) => {
-                    return Err(ToolError::Rejected(format!(
-                        "filesystem sandbox denied Write for download destination `{}`: {}",
-                        deny.requested_path.display(),
-                        deny.message
-                    )));
-                }
-            };
+        let (destination, authorized_root) = match FilePolicyChecker::check_write(
+            snapshot,
+            requested_destination.as_path(),
+        ) {
+            FilePolicyDecision::Allowed(grant) => {
+                let authorized_root = FilePolicyChecker::write_anchor(&grant).map_err(|reason| {
+                        ToolError::Rejected(format!(
+                            "download destination authorization has no safe existing anchor: {reason:?}"
+                        ))
+                    })?;
+                (grant.resolved_path, authorized_root)
+            }
+            FilePolicyDecision::Denied(deny) => {
+                return Err(ToolError::Rejected(format!(
+                    "filesystem sandbox denied Write for download destination `{}`: {}",
+                    deny.requested_path.display(),
+                    deny.message
+                )));
+            }
+        };
         let target = TargetResolver::new(authorized_root)
             .map_err(|error| {
                 ToolError::Rejected(format!(
@@ -1054,27 +1058,6 @@ async fn download_to_file(
     })
 }
 
-fn filesystem_volume_root(path: &Path) -> PathBuf {
-    let mut root = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                root.push(component.as_os_str());
-            }
-            std::path::Component::CurDir
-            | std::path::Component::ParentDir
-            | std::path::Component::Normal(_) => break,
-        }
-    }
-    if root.as_os_str().is_empty() {
-        path.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.to_path_buf())
-    } else {
-        root
-    }
-}
-
 fn extract_from_http(
     fetched: &HttpFetchResult,
     requested_mode: ExtractMode,
@@ -1531,6 +1514,85 @@ mod tests {
         assert_eq!(
             std::fs::read(destination).expect("preserved destination"),
             b"original"
+        );
+        server.await.expect("download server");
+    }
+
+    #[tokio::test]
+    async fn download_url_creates_an_approved_missing_destination_tree() {
+        let base = tempfile::tempdir().expect("download base");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let approved_root = base.path().join("downloads").join("nested");
+        let destination = approved_root.join("archive.bin");
+        let (url, server) = one_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload",
+        )
+        .await;
+        let mut snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+            workspace.to_string_lossy(),
+            vec![pioneer_protocol::TurnFilesystemSandboxEntry {
+                path: pioneer_protocol::TurnFilesystemSandboxPath::ExplicitPath {
+                    path: approved_root.display().to_string(),
+                },
+                access: pioneer_protocol::TurnFilesystemAccess::Write,
+                provenance: pioneer_protocol::TurnSecurityRuleProvenance::Runtime,
+                resolved_path: Some(approved_root.display().to_string()),
+            }],
+            1_700_000_000_000,
+        );
+        let mut network = pioneer_protocol::TurnNetworkPolicySnapshot::disabled();
+        network.mode = pioneer_protocol::TurnNetworkMode::Restricted;
+        network.allow_localhost = true;
+        network.allowed_domains = vec![format!("={url}")];
+        snapshot.network = network.clone();
+        snapshot.sandbox.network = network;
+
+        let mut config = test_web_config();
+        config.default_timeout_ms = 2_000;
+        config.hard_max_timeout_ms = 5_000;
+        let handler = DownloadUrlHandler::new(config);
+        let invocation = ToolInvocation {
+            call_id: "call_missing_download_root".to_owned(),
+            tool_name: "download_url".to_owned(),
+            source: crate::context::ToolCallSource::Model,
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "url": url,
+                    "destination": destination.display().to_string(),
+                    "create_dirs": true,
+                }),
+            },
+            workdir: workspace,
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: crate::spec::ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: Some(snapshot),
+            apply_patch_preflight: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        handler
+            .handle(
+                invocation,
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn",
+                    "call_missing_download_root",
+                    "download_url",
+                ),
+            )
+            .await
+            .expect("an approved download should create its missing destination tree");
+
+        assert_eq!(
+            std::fs::read(destination).expect("downloaded file"),
+            b"payload"
         );
         server.await.expect("download server");
     }

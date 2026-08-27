@@ -3082,10 +3082,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervised_apply_patch_prompts_then_executes_with_exact_write_grant() {
+    async fn supervised_apply_patch_prompts_then_creates_missing_grant_root() {
         let workspace = temp_path("supervised-apply-patch");
         std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
-        let target = workspace.join("approved.txt");
+        let target = workspace.join("new").join("nested").join("approved.txt");
         let registry = registry_with_named_handlers([(
             "apply_patch",
             Arc::new(crate::handlers::ApplyPatchHandler) as Arc<dyn ToolHandler>,
@@ -3112,7 +3112,7 @@ mod tests {
                 "apply_patch",
                 ToolPayload::Function {
                     arguments: serde_json::json!({
-                        "patch": "*** Begin Patch\n*** Add File: approved.txt\n+approved\n*** End Patch"
+                        "patch": "*** Begin Patch\n*** Add File: new/nested/approved.txt\n+approved\n*** End Patch"
                     }),
                 },
             ),
@@ -3344,7 +3344,6 @@ mod tests {
         let workspace = base.join("backend");
         let downloads = base.join("downloads");
         std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
-        std::fs::create_dir_all(downloads.as_path()).expect("downloads should create");
         let destination = downloads.join("archive.tgz");
 
         let handler_calls = Arc::new(AtomicUsize::new(0));

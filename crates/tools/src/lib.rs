@@ -1204,6 +1204,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_function_proxy_apply_patch_creates_an_approved_missing_root() {
+        let fixture = tempfile::tempdir().expect("dynamic patch proxy fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skill");
+        let target = fixture
+            .path()
+            .join("downloads")
+            .join("weekend-trip-plan")
+            .join("README.md");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+
+        let tool_name = "skill.SSSSSSSSSSSSSSSSSSSSS.patch_proxy";
+        let materialization = materialize_skill_runtime_tools(
+            &[dynamic_skill_descriptor(
+                tool_name,
+                skill_root.as_path(),
+                SkillDynamicToolKind::FunctionProxy,
+                serde_json::json!({"target_tool": "apply_patch"}),
+            )],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(materialization.excluded_tools.is_empty());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let turn_id = "turn_dynamic_patch_proxy_consent";
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            turn_id,
+            supervised_test_context(turn_id),
+            test_web_config(),
+            test_computer_use_config(),
+            materialization.bundles.clone(),
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("dynamic patch proxy tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+
+        let nested_call_id = "call_dynamic_patch_proxy::apply_patch";
+        let identity = crate::apply_patch::history::InvocationIdentity::new(
+            "thread_test",
+            turn_id,
+            nested_call_id,
+        )
+        .expect("nested patch identity");
+        assert!(crate::events::register_native_patch_observer(
+            &identity,
+            Arc::new(crate::apply_patch::DurableCommitObserver::default()),
+        ));
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+approved through proxy\n*** End Patch",
+            target.display()
+        );
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_patch_proxy".to_owned(),
+                tool_name: tool_name.to_owned(),
+                arguments: serde_json::json!({
+                    "arguments": {"patch": patch}
+                })
+                .to_string(),
+            })
+            .expect("dynamic patch proxy call");
+
+        let result = tools.runtime.execute_tool_call(call).await;
+        crate::events::unregister_native_patch_observer(&identity);
+        let result = result.expect("approved proxied patch should execute");
+
+        assert!(result.success(), "{}", result.raw_output_text());
+        assert_eq!(
+            std::fs::read_to_string(target).expect("proxied patch output"),
+            "approved through proxy"
+        );
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![PermissionActionKind::FileWrite],
+            "the proxy wrapper must defer to exactly one target-specific prompt"
+        );
+    }
+
+    #[tokio::test]
     async fn two_dynamic_function_proxies_prompt_only_for_the_final_target() {
         let fixture = tempfile::tempdir().expect("two-level dynamic proxy fixture");
         let workspace = fixture.path().join("workspace");

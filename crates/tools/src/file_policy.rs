@@ -95,12 +95,23 @@ impl FilePolicyChecker {
             } else {
                 Path::new(snapshot.sandbox.cwd.as_str()).join(path)
             };
-            roots.insert(
-                std::fs::canonicalize(absolute.as_path())
-                    .unwrap_or_else(|_| normalize_lexically(absolute)),
-            );
+            let absolute = normalize_lexically(absolute);
+            if let Ok(root) = resolve_policy_root(operation, absolute.as_path()) {
+                roots.insert(root);
+            }
         }
         roots.into_iter().collect()
+    }
+
+    /// Returns an already-existing directory from which a descriptor-anchored
+    /// writer can securely reach an authorized destination. The policy root
+    /// itself may be a future directory: exact write grants intentionally
+    /// authorize tools such as Apply Patch and download_url to create it.
+    pub fn write_anchor(grant: &FilePolicyGrant) -> Result<PathBuf, FilePolicyDenyReason> {
+        if grant.operation != FilePolicyOperation::Write {
+            return Err(FilePolicyDenyReason::InvalidRoot);
+        }
+        resolve_existing_write_anchor(grant.resolved_path.as_path())
     }
 
     pub fn check_read(
@@ -157,7 +168,7 @@ impl FilePolicyChecker {
             } else {
                 Path::new(snapshot.sandbox.cwd.as_str()).join(root_path.as_path())
             });
-            let Ok(root_path) = std::fs::canonicalize(lexical_root_path.as_path()) else {
+            let Ok(root_path) = resolve_policy_root(operation, lexical_root_path.as_path()) else {
                 invalid_root = true;
                 continue;
             };
@@ -273,6 +284,22 @@ fn resolve_requested_path(
     }
 }
 
+fn resolve_policy_root(
+    operation: FilePolicyOperation,
+    absolute_root: &Path,
+) -> Result<PathBuf, FilePolicyDenyReason> {
+    match std::fs::canonicalize(absolute_root) {
+        Ok(path) => Ok(path),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && operation == FilePolicyOperation::Write =>
+        {
+            resolve_missing_write_path(absolute_root)
+        }
+        Err(_) => Err(FilePolicyDenyReason::InvalidRoot),
+    }
+}
+
 fn resolve_missing_write_path(absolute_path: &Path) -> Result<PathBuf, FilePolicyDenyReason> {
     let mut missing_components = Vec::new();
     let mut current = absolute_path;
@@ -302,6 +329,33 @@ fn resolve_missing_write_path(absolute_path: &Path) -> Result<PathBuf, FilePolic
             }
             Err(_) => return Err(FilePolicyDenyReason::MissingPath),
         }
+    }
+}
+
+fn resolve_existing_write_anchor(
+    resolved_destination: &Path,
+) -> Result<PathBuf, FilePolicyDenyReason> {
+    let mut current = resolved_destination;
+    let mut is_destination = true;
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(FilePolicyDenyReason::SymlinkEscape);
+                }
+                if metadata.is_dir() {
+                    return std::fs::canonicalize(current)
+                        .map_err(|_| FilePolicyDenyReason::InvalidRoot);
+                }
+                if !is_destination {
+                    return Err(FilePolicyDenyReason::MissingPath);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(FilePolicyDenyReason::MissingPath),
+        }
+        current = current.parent().ok_or(FilePolicyDenyReason::MissingPath)?;
+        is_destination = false;
     }
 }
 
@@ -473,6 +527,91 @@ mod tests {
 
         let grant = decision.grant().expect("new file write should be allowed");
         assert!(grant.resolved_path.ends_with("new.txt"));
+    }
+
+    #[test]
+    fn file_policy_allows_write_when_the_exact_writable_root_is_not_created_yet() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let future_root = temp.path().join("new").join("nested");
+        let target = future_root.join("created.txt");
+        let sibling = temp.path().join("new").join("sibling.txt");
+        let expected_root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("new")
+            .join("nested");
+        let expected_target = expected_root.join("created.txt");
+        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            temp.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry {
+                path: TurnFilesystemSandboxPath::ExplicitPath {
+                    path: future_root.display().to_string(),
+                },
+                access: TurnFilesystemAccess::Write,
+                provenance: TurnSecurityRuleProvenance::Runtime,
+                resolved_path: Some(future_root.display().to_string()),
+            }],
+            1,
+        );
+
+        assert!(!future_root.exists(), "the grant root must start missing");
+        let grant = FilePolicyChecker::check_write(&snapshot, target.as_path())
+            .grant()
+            .expect("an exact future write root should authorize its descendant")
+            .clone();
+        assert_eq!(grant.resolved_path, expected_target);
+        assert_eq!(grant.matched_root.as_deref(), Some(expected_root.as_path()));
+        assert_eq!(
+            FilePolicyChecker::write_anchor(&grant).expect("existing secure anchor"),
+            temp.path().canonicalize().expect("canonical tempdir")
+        );
+        assert_eq!(
+            FilePolicyChecker::allowed_roots(&snapshot, FilePolicyOperation::Write),
+            vec![expected_root]
+        );
+
+        let sibling_decision = FilePolicyChecker::check_write(&snapshot, sibling);
+        let deny = sibling_decision
+            .deny()
+            .expect("a future root grant must not authorize its sibling");
+        assert_eq!(deny.reason, FilePolicyDenyReason::OutsideAllowedRoots);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_policy_denies_future_write_root_through_symlink_ancestor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let link = temp.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), link.as_path()).expect("symlink");
+        let future_root = link.join("new");
+        let snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            temp.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry {
+                path: TurnFilesystemSandboxPath::ExplicitPath {
+                    path: future_root.display().to_string(),
+                },
+                access: TurnFilesystemAccess::Write,
+                provenance: TurnSecurityRuleProvenance::Runtime,
+                resolved_path: Some(future_root.display().to_string()),
+            }],
+            1,
+        );
+
+        let decision = FilePolicyChecker::check_write(&snapshot, future_root.join("escaped.txt"));
+        let deny = decision
+            .deny()
+            .expect("a future root through a symlink must fail closed");
+        assert_eq!(deny.reason, FilePolicyDenyReason::SymlinkEscape);
     }
 
     #[test]
