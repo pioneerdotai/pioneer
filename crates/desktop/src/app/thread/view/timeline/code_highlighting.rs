@@ -1,13 +1,21 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gpui::{prelude::*, *};
 use gpui_component::theme::ActiveTheme as _;
+use pioneer_observability::{
+    DesktopCodeHighlightCacheStatus, DesktopCodeHighlightFallbackReason,
+    DesktopCodeHighlightMetric, DesktopCodeHighlightOutcome, DesktopCodeHighlightTheme,
+    record_desktop_code_highlight,
+};
 
 use crate::{
     app::PioneerDesktop,
     code_highlight::{
         CodeHighlightJob, CodeHighlightLookup, CodeThemeId, HighlightFallbackReason,
-        HighlightLimits, HighlightOutcome, Rgba8, highlight_code, normalize_language_hint,
+        HighlightLimits, HighlightOutcome, Rgba8, highlight_code,
     },
 };
 
@@ -31,36 +39,55 @@ impl PioneerDesktop {
         );
         if request.observe_immediate_fallback {
             let (outcome, fallback_reason) = match &request.lookup {
-                CodeHighlightLookup::Fallback(reason) => ("fallback", fallback_reason(*reason)),
-                CodeHighlightLookup::Unavailable => ("fallback", "cache_capacity"),
-                _ => ("error", "unexpected_immediate_state"),
+                CodeHighlightLookup::Fallback(reason) => (
+                    DesktopCodeHighlightOutcome::Fallback,
+                    fallback_reason(*reason),
+                ),
+                CodeHighlightLookup::Unavailable => (
+                    DesktopCodeHighlightOutcome::Fallback,
+                    DesktopCodeHighlightFallbackReason::CacheCapacity,
+                ),
+                _ => (
+                    DesktopCodeHighlightOutcome::Error,
+                    DesktopCodeHighlightFallbackReason::UnexpectedState,
+                ),
             };
-            log_code_highlight_observation(
-                normalize_language_hint(language_hint).cache_name(),
+            observe_code_highlight(
                 source.len(),
                 theme,
-                "miss",
+                DesktopCodeHighlightCacheStatus::Miss,
                 outcome,
                 fallback_reason,
                 0,
-                0,
+                None,
             );
         }
         if request.observe_cache_hit {
             let (outcome, fallback_reason, span_count) = match &request.lookup {
-                CodeHighlightLookup::Ready(code) => ("highlighted", "none", code.spans.len()),
-                CodeHighlightLookup::Fallback(reason) => ("fallback", fallback_reason(*reason), 0),
-                _ => ("error", "unexpected_cache_hit_state", 0),
+                CodeHighlightLookup::Ready(code) => (
+                    DesktopCodeHighlightOutcome::Highlighted,
+                    DesktopCodeHighlightFallbackReason::None,
+                    code.spans.len(),
+                ),
+                CodeHighlightLookup::Fallback(reason) => (
+                    DesktopCodeHighlightOutcome::Fallback,
+                    fallback_reason(*reason),
+                    0,
+                ),
+                _ => (
+                    DesktopCodeHighlightOutcome::Error,
+                    DesktopCodeHighlightFallbackReason::UnexpectedState,
+                    0,
+                ),
             };
-            log_code_highlight_observation(
-                normalize_language_hint(language_hint).cache_name(),
+            observe_code_highlight(
                 source.len(),
                 theme,
-                "hit",
+                DesktopCodeHighlightCacheStatus::Hit,
                 outcome,
                 fallback_reason,
                 span_count,
-                0,
+                None,
             );
         }
         for job in request.jobs {
@@ -103,7 +130,7 @@ impl PioneerDesktop {
                     })
                     .await;
                 let _ = this.update(&mut cx, |view, cx| {
-                    let duration_ms = started.elapsed().as_millis();
+                    let elapsed = started.elapsed();
                     let (mut outcome, mut fallback_reason, span_count) =
                         result_observation(&result);
                     let completion = view.code_highlight_cache.borrow_mut().complete(
@@ -112,18 +139,17 @@ impl PioneerDesktop {
                         result,
                     );
                     if !completion.accepted {
-                        outcome = "stale";
-                        fallback_reason = "none";
+                        outcome = DesktopCodeHighlightOutcome::Stale;
+                        fallback_reason = DesktopCodeHighlightFallbackReason::None;
                     }
-                    log_code_highlight_observation(
-                        completion_key.canonical_language.as_str(),
+                    observe_code_highlight(
                         source_bytes,
                         theme,
-                        "miss",
+                        DesktopCodeHighlightCacheStatus::Miss,
                         outcome,
                         fallback_reason,
                         span_count,
-                        duration_ms,
+                        Some(elapsed),
                     );
                     for queued_job in completion.jobs {
                         Self::spawn_code_highlight_job(queued_job, cx);
@@ -140,86 +166,67 @@ impl PioneerDesktop {
 
 fn result_observation(
     result: &Result<HighlightOutcome, crate::code_highlight::HighlightError>,
-) -> (&'static str, &'static str, usize) {
+) -> (
+    DesktopCodeHighlightOutcome,
+    DesktopCodeHighlightFallbackReason,
+    usize,
+) {
     match result {
-        Ok(HighlightOutcome::Highlighted(code)) => ("highlighted", "none", code.spans.len()),
-        Ok(HighlightOutcome::Fallback(reason)) => ("fallback", fallback_reason(*reason), 0),
-        Err(_) => ("error", "parser_error", 0),
+        Ok(HighlightOutcome::Highlighted(code)) => (
+            DesktopCodeHighlightOutcome::Highlighted,
+            DesktopCodeHighlightFallbackReason::None,
+            code.spans.len(),
+        ),
+        Ok(HighlightOutcome::Fallback(reason)) => (
+            DesktopCodeHighlightOutcome::Fallback,
+            fallback_reason(*reason),
+            0,
+        ),
+        Err(_) => (
+            DesktopCodeHighlightOutcome::Error,
+            DesktopCodeHighlightFallbackReason::ParserError,
+            0,
+        ),
     }
 }
 
-fn fallback_reason(reason: HighlightFallbackReason) -> &'static str {
+fn fallback_reason(reason: HighlightFallbackReason) -> DesktopCodeHighlightFallbackReason {
     match reason {
-        HighlightFallbackReason::Empty => "empty",
-        HighlightFallbackReason::Plaintext => "plaintext",
-        HighlightFallbackReason::UnknownLanguage => "unknown_language",
-        HighlightFallbackReason::SourceTooLarge => "source_too_large",
-        HighlightFallbackReason::SpanLimit => "span_limit",
-        HighlightFallbackReason::ParserError => "parser_error",
+        HighlightFallbackReason::Empty => DesktopCodeHighlightFallbackReason::Empty,
+        HighlightFallbackReason::Plaintext => DesktopCodeHighlightFallbackReason::Plaintext,
+        HighlightFallbackReason::UnknownLanguage => {
+            DesktopCodeHighlightFallbackReason::UnknownLanguage
+        }
+        HighlightFallbackReason::SourceTooLarge => {
+            DesktopCodeHighlightFallbackReason::SourceTooLarge
+        }
+        HighlightFallbackReason::SpanLimit => DesktopCodeHighlightFallbackReason::SpanLimit,
+        HighlightFallbackReason::ParserError => DesktopCodeHighlightFallbackReason::ParserError,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn log_code_highlight_observation(
-    language: &str,
+fn observe_code_highlight(
     source_bytes: usize,
     theme: CodeThemeId,
-    cache: &'static str,
-    outcome: &'static str,
-    fallback_reason: &'static str,
+    cache: DesktopCodeHighlightCacheStatus,
+    outcome: DesktopCodeHighlightOutcome,
+    fallback_reason: DesktopCodeHighlightFallbackReason,
     span_count: usize,
-    duration_ms: u128,
+    elapsed: Option<Duration>,
 ) {
-    tracing::debug!(
-        target: "pioneer.desktop.code_highlight",
-        surface = "desktop_timeline",
-        language,
-        source_size_bucket = source_size_bucket(source_bytes),
-        duration_ms_bucket = duration_ms_bucket(duration_ms),
+    record_desktop_code_highlight(DesktopCodeHighlightMetric {
         cache,
         outcome,
         fallback_reason,
-        span_count_bucket = span_count_bucket(span_count),
-        theme = theme_name(theme),
-        "timeline code highlighting completed"
-    );
-}
-
-fn source_size_bucket(source_bytes: usize) -> &'static str {
-    match source_bytes {
-        0 => "empty",
-        1..=4_096 => "1b_4kib",
-        4_097..=32_768 => "4kib_32kib",
-        32_769..=262_144 => "32kib_256kib",
-        _ => "over_256kib",
-    }
-}
-
-fn duration_ms_bucket(duration_ms: u128) -> &'static str {
-    match duration_ms {
-        0 => "under_1ms",
-        1..=8 => "1ms_8ms",
-        9..=32 => "9ms_32ms",
-        33..=100 => "33ms_100ms",
-        _ => "over_100ms",
-    }
-}
-
-fn span_count_bucket(span_count: usize) -> &'static str {
-    match span_count {
-        0 => "none",
-        1..=100 => "1_100",
-        101..=1_000 => "101_1000",
-        1_001..=10_000 => "1001_10000",
-        _ => "over_10000",
-    }
-}
-
-fn theme_name(theme: CodeThemeId) -> &'static str {
-    match theme {
-        CodeThemeId::Light => "light",
-        CodeThemeId::Dark => "dark",
-    }
+        theme: match theme {
+            CodeThemeId::Light => DesktopCodeHighlightTheme::Light,
+            CodeThemeId::Dark => DesktopCodeHighlightTheme::Dark,
+        },
+        source_bytes,
+        span_count,
+        elapsed,
+    });
 }
 
 fn gpui_color(color: Rgba8) -> Hsla {

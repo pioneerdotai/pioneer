@@ -12,6 +12,7 @@ use pioneer_client::{
 use pioneer_protocol::CLIRuntimePendingRequestStatus;
 use pioneer_protocol::{TimelineBlock, TimelineBlockKind};
 use std::rc::Rc;
+use std::time::Instant;
 
 pub(in crate::app::thread::view::timeline) const SEMANTIC_TURN_WORK_GROUP_PREFIX: &str =
     "semantic-turn-work-group::";
@@ -24,19 +25,45 @@ impl PioneerDesktop {
         let Some(active_thread_id) = active_thread_id else {
             return TimelineRenderModel::empty();
         };
+        let cache_lookup_started = Instant::now();
         {
             let state = self.thread_timeline_view_state.borrow();
             if state.cached_semantic_model_active_thread_id.as_deref() == Some(active_thread_id)
                 && state.cached_semantic_model_revision == self.semantic_timeline_revision
                 && let Some(model) = state.cached_semantic_model.as_ref()
             {
+                pioneer_observability::record_desktop_timeline_stage(
+                    pioneer_observability::DesktopTimelineStageMetric {
+                        stage: pioneer_observability::DesktopTimelineStage::SemanticModelBuild,
+                        cache: pioneer_observability::DesktopTimelineCacheStatus::Hit,
+                        content: pioneer_observability::DesktopTimelineContentKind::Mixed,
+                        outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                        elapsed: cache_lookup_started.elapsed(),
+                        input_bytes: None,
+                        block_count: None,
+                        row_count: Some(model.rows.len()),
+                    },
+                );
                 return model.clone();
             }
         }
 
+        let build_started = Instant::now();
         let Some(flattened) =
             semantic::flatten_semantic_timeline(&self.semantic_timelines, active_thread_id)
         else {
+            pioneer_observability::record_desktop_timeline_stage(
+                pioneer_observability::DesktopTimelineStageMetric {
+                    stage: pioneer_observability::DesktopTimelineStage::SemanticModelBuild,
+                    cache: pioneer_observability::DesktopTimelineCacheStatus::Miss,
+                    content: pioneer_observability::DesktopTimelineContentKind::Mixed,
+                    outcome: pioneer_observability::DesktopTimelineOutcome::Skipped,
+                    elapsed: build_started.elapsed(),
+                    input_bytes: None,
+                    block_count: None,
+                    row_count: Some(0),
+                },
+            );
             return TimelineRenderModel::empty();
         };
         let semantic_rows = Rc::new(flattened);
@@ -71,6 +98,19 @@ impl PioneerDesktop {
             state.cached_semantic_model_revision = self.semantic_timeline_revision;
             state.cached_semantic_model = Some(model.clone());
         }
+
+        pioneer_observability::record_desktop_timeline_stage(
+            pioneer_observability::DesktopTimelineStageMetric {
+                stage: pioneer_observability::DesktopTimelineStage::SemanticModelBuild,
+                cache: pioneer_observability::DesktopTimelineCacheStatus::Miss,
+                content: pioneer_observability::DesktopTimelineContentKind::Mixed,
+                outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                elapsed: build_started.elapsed(),
+                input_bytes: None,
+                block_count: None,
+                row_count: Some(model.rows.len()),
+            },
+        );
 
         model
     }

@@ -1,4 +1,5 @@
 use crate::metrics::{GatewayMetrics, StartupMetrics};
+use crate::performance::{DesktopTimelineMetrics, GatewayMarkdownMetrics};
 use anyhow::{Context, Result, bail};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider as _;
@@ -97,6 +98,8 @@ pub(crate) struct ObservabilityState {
     pub(crate) tracer: SdkTracer,
     pub(crate) startup_metrics: StartupMetrics,
     pub(crate) gateway_metrics: Option<GatewayMetrics>,
+    pub(crate) gateway_markdown_metrics: Option<GatewayMarkdownMetrics>,
+    pub(crate) desktop_timeline_metrics: Option<DesktopTimelineMetrics>,
 }
 
 static OBSERVABILITY: OnceLock<ObservabilityState> = OnceLock::new();
@@ -164,6 +167,10 @@ pub fn init_otlp_observability_for(
         target.startup_failures_name(),
         target.label(),
     );
+    let gateway_markdown_metrics = crate::performance::target_supports_gateway_markdown(target)
+        .then(|| GatewayMarkdownMetrics::new(&meter));
+    let desktop_timeline_metrics = crate::performance::target_supports_desktop_timeline(target)
+        .then(|| DesktopTimelineMetrics::new(&meter));
     let gateway_metrics = (target == TelemetryTarget::Gateway).then(|| GatewayMetrics::new(meter));
     let tracer = tracer_provider.tracer(target.instrumentation_name());
 
@@ -175,6 +182,8 @@ pub fn init_otlp_observability_for(
             tracer,
             startup_metrics,
             gateway_metrics,
+            gateway_markdown_metrics,
+            desktop_timeline_metrics,
         })
         .map_err(|_| anyhow::anyhow!("OTLP observability pipeline was initialized concurrently"))
 }

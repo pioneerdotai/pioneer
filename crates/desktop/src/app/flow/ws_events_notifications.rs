@@ -16,6 +16,7 @@ use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificati
 use pioneer_client::voice::{VoiceFinalizeUiAction, VoiceSessionResultReduction};
 use pioneer_client::workspaces::selectors as workspace_selectors;
 use pioneer_protocol::{VoiceError, VoiceSessionOutcome};
+use std::time::Instant;
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_notification(
@@ -23,6 +24,21 @@ impl PioneerDesktop {
         notification: GatewayNotification,
         cx: &mut Context<Self>,
     ) {
+        let timeline_input = match &notification {
+            GatewayNotification::ItemDelta(notification) => Some((
+                notification.delta.len(),
+                notification
+                    .markdown
+                    .as_ref()
+                    .map(|document| document.blocks.len()),
+                if notification.markdown.is_some() {
+                    pioneer_observability::DesktopTimelineContentKind::Markdown
+                } else {
+                    pioneer_observability::DesktopTimelineContentKind::PlainText
+                },
+            )),
+            _ => None,
+        };
         let active_workspace = self.active_workspace_scope_for_notifications();
         let mcp_workspace = self.mcp_workspace_scope();
         let notification_thread_workspace_matches =
@@ -39,14 +55,52 @@ impl PioneerDesktop {
             mcp_selected_server_id: self.mcp_selected_server_id.as_deref(),
             mcp_details_loaded: self.mcp_server_details.is_some(),
         };
-        let Some(reduction) = self
+        let reduce_started = timeline_input.map(|_| Instant::now());
+        let reduction = self
             .gateway
             .client_runtime
-            .reduce_gateway_notification(notification, context)
-        else {
+            .reduce_gateway_notification(notification, context);
+        if let (Some((input_bytes, block_count, content)), Some(started)) =
+            (timeline_input, reduce_started.as_ref())
+        {
+            pioneer_observability::record_desktop_timeline_stage(
+                pioneer_observability::DesktopTimelineStageMetric {
+                    stage: pioneer_observability::DesktopTimelineStage::NotificationReduce,
+                    cache: pioneer_observability::DesktopTimelineCacheStatus::NotApplicable,
+                    content,
+                    outcome: if reduction.is_some() {
+                        pioneer_observability::DesktopTimelineOutcome::Ok
+                    } else {
+                        pioneer_observability::DesktopTimelineOutcome::Skipped
+                    },
+                    elapsed: started.elapsed(),
+                    input_bytes: Some(input_bytes),
+                    block_count,
+                    row_count: None,
+                },
+            );
+        }
+        let Some(reduction) = reduction else {
             return;
         };
+        let apply_started = timeline_input.map(|_| Instant::now());
         self.apply_gateway_notification_reduction(reduction, cx);
+        if let (Some((input_bytes, block_count, content)), Some(started)) =
+            (timeline_input, apply_started.as_ref())
+        {
+            pioneer_observability::record_desktop_timeline_stage(
+                pioneer_observability::DesktopTimelineStageMetric {
+                    stage: pioneer_observability::DesktopTimelineStage::NotificationApply,
+                    cache: pioneer_observability::DesktopTimelineCacheStatus::NotApplicable,
+                    content,
+                    outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                    elapsed: started.elapsed(),
+                    input_bytes: Some(input_bytes),
+                    block_count,
+                    row_count: None,
+                },
+            );
+        }
     }
 
     fn apply_voice_session_result_reduction(

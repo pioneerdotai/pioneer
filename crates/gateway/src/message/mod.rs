@@ -450,7 +450,7 @@ pub struct MessageProcessor {
     summary_config: Arc<summary::SummaryConfig>,
     context_budget: ContextBudget,
     agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
-    agent_message_buffers: Arc<Mutex<HashMap<String, String>>>,
+    agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
     agent_action_bindings:
         Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
@@ -528,6 +528,53 @@ pub struct MessageProcessor {
     gateway_settings_update_lock: Arc<Mutex<()>>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
+}
+
+#[derive(Default)]
+struct AgentMarkdownBuffer {
+    text: String,
+    stats: Arc<AgentMarkdownBufferStats>,
+}
+
+impl AgentMarkdownBuffer {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            stats: Arc::new(AgentMarkdownBufferStats::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AgentMarkdownBufferStats {
+    delta_count: AtomicU64,
+    cumulative_parse_input_bytes: AtomicU64,
+    cumulative_parse_duration_ns: AtomicU64,
+}
+
+impl AgentMarkdownBufferStats {
+    fn record_input(&self, source_bytes: usize) {
+        self.delta_count.fetch_add(1, Ordering::Relaxed);
+        self.cumulative_parse_input_bytes.fetch_add(
+            u64::try_from(source_bytes).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_parse_duration(&self, elapsed: Duration) {
+        self.cumulative_parse_duration_ns.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn snapshot(&self) -> (u64, u64, Duration) {
+        (
+            self.delta_count.load(Ordering::Relaxed),
+            self.cumulative_parse_input_bytes.load(Ordering::Relaxed),
+            Duration::from_nanos(self.cumulative_parse_duration_ns.load(Ordering::Relaxed)),
+        )
+    }
 }
 
 #[derive(Clone)]

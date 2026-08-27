@@ -25,6 +25,7 @@ use crate::app::{
 };
 use gpui::{prelude::*, *};
 use pioneer_client::timeline::rows::UserMessagePresentation;
+use pioneer_observability::{DesktopTimelineCacheStatus, DesktopTimelineStage};
 use pioneer_protocol::{
     MemberSummary, PersistedActorRef, PrincipalId, TurnAuthorSnapshot, WorkspaceId,
 };
@@ -32,7 +33,77 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     rc::Rc,
+    time::{Duration, Instant},
 };
+
+#[derive(Default)]
+struct TimelineRowMeasurementStats {
+    cache_hits: usize,
+    cache_misses: usize,
+    cache_hit_lookup_elapsed: Duration,
+    cache_miss_lookup_elapsed: Duration,
+    element_build_elapsed: Duration,
+    layout_elapsed: Duration,
+    measured_input_bytes: usize,
+}
+
+impl TimelineRowMeasurementStats {
+    fn record_observability(&self) {
+        self.record_stage(
+            DesktopTimelineStage::RowCacheLookup,
+            DesktopTimelineCacheStatus::Hit,
+            self.cache_hit_lookup_elapsed,
+            self.cache_hits,
+            None,
+        );
+        self.record_stage(
+            DesktopTimelineStage::RowCacheLookup,
+            DesktopTimelineCacheStatus::Miss,
+            self.cache_miss_lookup_elapsed,
+            self.cache_misses,
+            None,
+        );
+        self.record_stage(
+            DesktopTimelineStage::RowElementBuild,
+            DesktopTimelineCacheStatus::Miss,
+            self.element_build_elapsed,
+            self.cache_misses,
+            Some(self.measured_input_bytes),
+        );
+        self.record_stage(
+            DesktopTimelineStage::RowLayout,
+            DesktopTimelineCacheStatus::Miss,
+            self.layout_elapsed,
+            self.cache_misses,
+            Some(self.measured_input_bytes),
+        );
+    }
+
+    fn record_stage(
+        &self,
+        stage: DesktopTimelineStage,
+        cache: DesktopTimelineCacheStatus,
+        elapsed: Duration,
+        row_count: usize,
+        input_bytes: Option<usize>,
+    ) {
+        if row_count == 0 {
+            return;
+        }
+        pioneer_observability::record_desktop_timeline_stage(
+            pioneer_observability::DesktopTimelineStageMetric {
+                stage,
+                cache,
+                content: pioneer_observability::DesktopTimelineContentKind::Mixed,
+                outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                elapsed,
+                input_bytes,
+                block_count: None,
+                row_count: Some(row_count),
+            },
+        );
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct TimelinePendingRequestRow {
@@ -358,9 +429,12 @@ impl PioneerDesktop {
         agent_group_author: Option<&TurnAuthorSnapshot>,
         row_width: Pixels,
         content_width: Pixels,
+        stats: &mut TimelineRowMeasurementStats,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Size<Pixels> {
+        let input_bytes = Self::timeline_render_row_text_len(projection, row);
+        let build_started = Instant::now();
         let mut row_element = self.render_timeline_row(
             projection,
             row,
@@ -370,6 +444,9 @@ impl PioneerDesktop {
             content_width,
             cx,
         );
+        stats.element_build_elapsed += build_started.elapsed();
+        stats.measured_input_bytes = stats.measured_input_bytes.saturating_add(input_bytes);
+        let layout_started = Instant::now();
         let measured = row_element.layout_as_root(
             size(
                 AvailableSpace::Definite(row_width),
@@ -378,6 +455,7 @@ impl PioneerDesktop {
             window,
             cx,
         );
+        stats.layout_elapsed += layout_started.elapsed();
 
         size(
             px(0.),
@@ -397,9 +475,11 @@ impl PioneerDesktop {
         content_width: Pixels,
         row_render_fingerprints: &HashMap<String, u64>,
         expanded: &HashSet<String>,
+        stats: &mut TimelineRowMeasurementStats,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Size<Pixels> {
+        let cache_lookup_started = Instant::now();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.timeline_row_render_fingerprint(projection, row, row_render_fingerprints, expanded)
             .hash(&mut hasher);
@@ -413,8 +493,13 @@ impl PioneerDesktop {
         if let Some(cached) = state.entry_layout_cache.get(row.key())
             && cached.render_fingerprint == render_fingerprint
         {
+            stats.cache_hits = stats.cache_hits.saturating_add(1);
+            stats.cache_hit_lookup_elapsed += cache_lookup_started.elapsed();
             return size(px(0.), cached.height.max(px(1.)));
         }
+
+        stats.cache_misses = stats.cache_misses.saturating_add(1);
+        stats.cache_miss_lookup_elapsed += cache_lookup_started.elapsed();
 
         let measured = self.measure_timeline_row_size(
             projection,
@@ -424,6 +509,7 @@ impl PioneerDesktop {
             agent_group_author,
             row_width,
             content_width,
+            stats,
             window,
             cx,
         );
@@ -451,27 +537,30 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> Rc<Vec<Size<Pixels>>> {
         let row_len = rows.len();
-        Rc::new(
-            rows.iter()
-                .enumerate()
-                .map(|(ix, row)| {
-                    self.cached_or_measure_timeline_row_size(
-                        state,
-                        projection,
-                        row,
-                        ix + 1 == row_len,
-                        grouping.row_layout(ix),
-                        grouping.agent_author_for_group_start(ix),
-                        row_width,
-                        content_width,
-                        row_render_fingerprints,
-                        expanded,
-                        window,
-                        cx,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
+        let mut stats = TimelineRowMeasurementStats::default();
+        let sizes = rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| {
+                self.cached_or_measure_timeline_row_size(
+                    state,
+                    projection,
+                    row,
+                    ix + 1 == row_len,
+                    grouping.row_layout(ix),
+                    grouping.agent_author_for_group_start(ix),
+                    row_width,
+                    content_width,
+                    row_render_fingerprints,
+                    expanded,
+                    &mut stats,
+                    window,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+        stats.record_observability();
+        Rc::new(sizes)
     }
 
     fn timeline_render_row_text_len(

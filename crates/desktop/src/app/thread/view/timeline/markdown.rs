@@ -5,7 +5,7 @@ use pioneer_client::conversation::TimelineEntryStatus;
 use pioneer_protocol::{
     MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList, MarkdownMark, MarkdownMarkKind,
 };
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc, time::Instant};
 
 use super::layout::TIMELINE_ROW_MEASUREMENT_GUARD;
 
@@ -68,14 +68,28 @@ impl PioneerDesktop {
     }
 
     pub(super) fn render_markdown_plain(&self, text: &str, _cx: &mut Context<Self>) -> AnyElement {
-        div()
+        let started = Instant::now();
+        let element = div()
             .w_full()
             .overflow_hidden()
             .whitespace_normal()
             .text_sm()
             .line_height(relative(1.65))
             .child(text.to_owned())
-            .into_any_element()
+            .into_any_element();
+        pioneer_observability::record_desktop_timeline_stage(
+            pioneer_observability::DesktopTimelineStageMetric {
+                stage: pioneer_observability::DesktopTimelineStage::MarkdownElementBuild,
+                cache: pioneer_observability::DesktopTimelineCacheStatus::NotApplicable,
+                content: pioneer_observability::DesktopTimelineContentKind::PlainText,
+                outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                elapsed: started.elapsed(),
+                input_bytes: Some(text.len()),
+                block_count: Some(0),
+                row_count: None,
+            },
+        );
+        element
     }
 
     pub(super) fn render_markdown_document(
@@ -84,12 +98,26 @@ impl PioneerDesktop {
         code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let started = Instant::now();
         if document.blocks.is_empty() {
-            return div()
+            let element = div()
                 .w_full()
                 .text_sm()
                 .line_height(relative(1.6))
                 .into_any_element();
+            pioneer_observability::record_desktop_timeline_stage(
+                pioneer_observability::DesktopTimelineStageMetric {
+                    stage: pioneer_observability::DesktopTimelineStage::MarkdownElementBuild,
+                    cache: pioneer_observability::DesktopTimelineCacheStatus::NotApplicable,
+                    content: pioneer_observability::DesktopTimelineContentKind::Markdown,
+                    outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                    elapsed: started.elapsed(),
+                    input_bytes: None,
+                    block_count: Some(0),
+                    row_count: None,
+                },
+            );
+            return element;
         }
 
         let mut content = v_flex().w_full().overflow_hidden().gap_0();
@@ -102,7 +130,20 @@ impl PioneerDesktop {
             content = content.child(self.render_markdown_block(block, code_highlight_policy, cx));
             previous_block = Some(block);
         }
-        content.into_any_element()
+        let element = content.into_any_element();
+        pioneer_observability::record_desktop_timeline_stage(
+            pioneer_observability::DesktopTimelineStageMetric {
+                stage: pioneer_observability::DesktopTimelineStage::MarkdownElementBuild,
+                cache: pioneer_observability::DesktopTimelineCacheStatus::NotApplicable,
+                content: pioneer_observability::DesktopTimelineContentKind::Markdown,
+                outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                elapsed: started.elapsed(),
+                input_bytes: None,
+                block_count: Some(document.blocks.len()),
+                row_count: None,
+            },
+        );
+        element
     }
 
     fn markdown_block_spacing(

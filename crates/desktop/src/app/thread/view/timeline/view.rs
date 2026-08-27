@@ -24,6 +24,7 @@ use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
     rc::Rc,
+    time::Instant,
 };
 
 impl PioneerDesktop {
@@ -66,11 +67,24 @@ impl PioneerDesktop {
             pending_requests,
         ));
         let expanded = self.thread_timeline_item_expanded.borrow().clone();
+        let render_fingerprint_started = Instant::now();
         let rows_render_fingerprint = timeline_render_rows_fingerprint(
             projection.as_ref(),
             rows.as_ref(),
             row_render_fingerprints.as_ref(),
             &expanded,
+        );
+        pioneer_observability::record_desktop_timeline_stage(
+            pioneer_observability::DesktopTimelineStageMetric {
+                stage: pioneer_observability::DesktopTimelineStage::RenderFingerprint,
+                cache: pioneer_observability::DesktopTimelineCacheStatus::NotApplicable,
+                content: pioneer_observability::DesktopTimelineContentKind::Mixed,
+                outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                elapsed: render_fingerprint_started.elapsed(),
+                input_bytes: None,
+                block_count: None,
+                row_count: Some(rows.len()),
+            },
         );
 
         let should_follow_bottom =
@@ -95,6 +109,7 @@ impl PioneerDesktop {
         let tail_row_key = rows.last().map(|row| row.key());
         let message_text_bottom_inset = timeline_message_text_bottom_inset(window);
 
+        let item_sizes_started = Instant::now();
         let (grouping, item_sizes, layout_index) = {
             let mut state = self.thread_timeline_view_state.borrow_mut();
 
@@ -109,6 +124,18 @@ impl PioneerDesktop {
                 && let Some(sizes) = state.cached_item_sizes.as_ref()
                 && let Some(layout_index) = state.cached_timeline_layout_index.as_ref()
             {
+                pioneer_observability::record_desktop_timeline_stage(
+                    pioneer_observability::DesktopTimelineStageMetric {
+                        stage: pioneer_observability::DesktopTimelineStage::ItemSizes,
+                        cache: pioneer_observability::DesktopTimelineCacheStatus::Hit,
+                        content: pioneer_observability::DesktopTimelineContentKind::Mixed,
+                        outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                        elapsed: item_sizes_started.elapsed(),
+                        input_bytes: None,
+                        block_count: None,
+                        row_count: Some(rows.len()),
+                    },
+                );
                 (
                     layout_index.grouping_rc(),
                     sizes.clone(),
@@ -146,6 +173,19 @@ impl PioneerDesktop {
                 state.cached_render_task_child_thread = presentation_context.task_child_thread;
                 state.cached_item_sizes = Some(item_sizes.clone());
                 state.cached_timeline_layout_index = Some(layout_index.clone());
+
+                pioneer_observability::record_desktop_timeline_stage(
+                    pioneer_observability::DesktopTimelineStageMetric {
+                        stage: pioneer_observability::DesktopTimelineStage::ItemSizes,
+                        cache: pioneer_observability::DesktopTimelineCacheStatus::Miss,
+                        content: pioneer_observability::DesktopTimelineContentKind::Mixed,
+                        outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
+                        elapsed: item_sizes_started.elapsed(),
+                        input_bytes: None,
+                        block_count: None,
+                        row_count: Some(rows.len()),
+                    },
+                );
 
                 (grouping, item_sizes, layout_index)
             }

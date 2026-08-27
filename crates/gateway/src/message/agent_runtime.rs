@@ -4,6 +4,11 @@ use super::*;
 use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt};
+use pioneer_observability::{
+    GatewayMarkdownMessageMetric, GatewayMarkdownMessageOutcome, GatewayMarkdownOutcome,
+    GatewayMarkdownStage, GatewayMarkdownStageMetric, GatewayMarkdownStreamKind,
+    record_gateway_markdown_message, record_gateway_markdown_stage,
+};
 use pioneer_tools::apply_patch::history::{
     AppliedPatchDelta, AppliedPatchRecord, PatchHistoryProvenance, SnapshotDomain,
     SqliteAppliedPatchStore, SqliteCommitIntentStore, StoredPatchRecord, TurnDiffAuthority,
@@ -12,6 +17,7 @@ use pioneer_tools::apply_patch::history::{
 use sha2::{Digest, Sha256};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Instant;
 const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
@@ -935,10 +941,26 @@ impl MessageProcessor {
         }
         self.agent_manager.remove_thread(thread_id).await;
         let prefix = format!("{thread_id}:");
-        self.agent_message_buffers
-            .lock()
-            .await
-            .retain(|key, _| !key.starts_with(prefix.as_str()));
+        let removed = {
+            let mut buffers = self.agent_message_buffers.lock().await;
+            let mut removed = Vec::new();
+            buffers.retain(|key, buffer| {
+                if key.starts_with(prefix.as_str()) {
+                    removed.push(std::mem::take(buffer));
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+        for buffer in removed {
+            Self::record_agent_markdown_buffer(
+                &buffer,
+                buffer.text.len(),
+                GatewayMarkdownMessageOutcome::Abandoned,
+            );
+        }
     }
 
     pub(super) async fn delete_turn_runtime_snapshot_for_closed_turn(
@@ -5746,31 +5768,98 @@ impl MessageProcessor {
         }
     }
 
+    fn markdown_stream_kind(stream: Option<ItemDeltaStream>) -> GatewayMarkdownStreamKind {
+        match stream.unwrap_or(ItemDeltaStream::AgentMessage) {
+            ItemDeltaStream::AgentMessage => GatewayMarkdownStreamKind::AgentMessage,
+            ItemDeltaStream::Generic => GatewayMarkdownStreamKind::Generic,
+            ItemDeltaStream::Stdout | ItemDeltaStream::Stderr => {
+                GatewayMarkdownStreamKind::CommandOutput
+            }
+            ItemDeltaStream::FileChange => GatewayMarkdownStreamKind::FileChange,
+            ItemDeltaStream::ToolProgress => GatewayMarkdownStreamKind::ToolProgress,
+        }
+    }
+
+    fn record_agent_markdown_buffer(
+        buffer: &AgentMarkdownBuffer,
+        final_source_bytes: usize,
+        outcome: GatewayMarkdownMessageOutcome,
+    ) {
+        let (delta_count, cumulative_parse_input_bytes, cumulative_parse_duration) =
+            buffer.stats.snapshot();
+        record_gateway_markdown_message(GatewayMarkdownMessageMetric {
+            outcome,
+            delta_count,
+            final_source_bytes,
+            cumulative_parse_input_bytes,
+            cumulative_parse_duration,
+        });
+    }
+
     pub(super) async fn enrich_item_started_markdown(
         &self,
         notification: &mut pioneer_protocol::ItemStartedNotification,
     ) {
         let (item_id, text) = Self::normalize_item_markdown(&mut notification.item);
         let key = Self::item_markdown_buffer_key(notification.thread_id.as_str(), item_id.as_str());
-        self.agent_message_buffers.lock().await.insert(key, text);
+        let replaced = self
+            .agent_message_buffers
+            .lock()
+            .await
+            .insert(key, AgentMarkdownBuffer::new(text));
+        if let Some(replaced) = replaced {
+            Self::record_agent_markdown_buffer(
+                &replaced,
+                replaced.text.len(),
+                GatewayMarkdownMessageOutcome::Replaced,
+            );
+        }
     }
 
     pub(super) async fn enrich_item_delta_markdown(
         &self,
         notification: &mut pioneer_protocol::ItemDeltaNotification,
     ) {
+        let stream = Self::markdown_stream_kind(notification.stream);
         let key = Self::item_markdown_buffer_key(
             notification.thread_id.as_str(),
             notification.item_id.as_str(),
         );
-        let full_text = {
+        let lock_started = Instant::now();
+        let (full_text, stats, lock_elapsed, update_elapsed) = {
             let mut buffers = self.agent_message_buffers.lock().await;
-            let text = buffers.entry(key).or_default();
-            text.push_str(notification.delta.as_str());
-            text.clone()
+            let lock_elapsed = lock_started.elapsed();
+            let update_started = Instant::now();
+            let buffer = buffers.entry(key).or_default();
+            buffer.text.push_str(notification.delta.as_str());
+            let full_text = buffer.text.clone();
+            let stats = buffer.stats.clone();
+            stats.record_input(full_text.len());
+            (full_text, stats, lock_elapsed, update_started.elapsed())
         };
 
-        notification.markdown = Some(markdown::parse_markdown_document(full_text.as_str()));
+        record_gateway_markdown_stage(GatewayMarkdownStageMetric {
+            stage: GatewayMarkdownStage::BufferLockWait,
+            stream,
+            outcome: GatewayMarkdownOutcome::Ok,
+            elapsed: lock_elapsed,
+            input_bytes: None,
+            output_bytes: None,
+            block_count: None,
+        });
+        record_gateway_markdown_stage(GatewayMarkdownStageMetric {
+            stage: GatewayMarkdownStage::BufferUpdate,
+            stream,
+            outcome: GatewayMarkdownOutcome::Ok,
+            elapsed: update_elapsed,
+            input_bytes: Some(full_text.len()),
+            output_bytes: None,
+            block_count: None,
+        });
+
+        let parsed = markdown::parse_streaming_markdown_document(full_text.as_str(), stream);
+        stats.record_parse_duration(parsed.elapsed);
+        notification.markdown = Some(parsed.document);
         notification.markdown_version = Some(MARKDOWN_AST_VERSION);
     }
 
@@ -5778,9 +5867,16 @@ impl MessageProcessor {
         &self,
         notification: &mut pioneer_protocol::ItemCompletedNotification,
     ) {
-        let (item_id, _) = Self::normalize_item_markdown(&mut notification.item);
+        let (item_id, final_text) = Self::normalize_item_markdown(&mut notification.item);
         let key = Self::item_markdown_buffer_key(notification.thread_id.as_str(), item_id.as_str());
-        self.agent_message_buffers.lock().await.remove(key.as_str());
+        let buffer = self.agent_message_buffers.lock().await.remove(key.as_str());
+        if let Some(buffer) = buffer {
+            Self::record_agent_markdown_buffer(
+                &buffer,
+                final_text.len().max(buffer.text.len()),
+                GatewayMarkdownMessageOutcome::Completed,
+            );
+        }
     }
 
     pub(super) fn notify_parent_timeline_changed_for_child_turn(

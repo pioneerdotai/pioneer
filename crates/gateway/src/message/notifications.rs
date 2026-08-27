@@ -1,4 +1,45 @@
 use super::*;
+use std::time::Instant;
+
+fn markdown_notification_stream(
+    method: &str,
+) -> Option<pioneer_observability::GatewayMarkdownStreamKind> {
+    match method {
+        events::ITEM_AGENT_MESSAGE_DELTA => {
+            Some(pioneer_observability::GatewayMarkdownStreamKind::AgentMessage)
+        }
+        events::ITEM_COMMAND_EXECUTION_OUTPUT_DELTA => {
+            Some(pioneer_observability::GatewayMarkdownStreamKind::CommandOutput)
+        }
+        events::ITEM_FILE_CHANGE_OUTPUT_DELTA => {
+            Some(pioneer_observability::GatewayMarkdownStreamKind::FileChange)
+        }
+        events::ITEM_TOOL_PROGRESS => {
+            Some(pioneer_observability::GatewayMarkdownStreamKind::ToolProgress)
+        }
+        _ => None,
+    }
+}
+
+fn record_markdown_notification_stage(
+    stage: pioneer_observability::GatewayMarkdownStage,
+    stream: pioneer_observability::GatewayMarkdownStreamKind,
+    outcome: pioneer_observability::GatewayMarkdownOutcome,
+    elapsed: std::time::Duration,
+    output_bytes: Option<usize>,
+) {
+    pioneer_observability::record_gateway_markdown_stage(
+        pioneer_observability::GatewayMarkdownStageMetric {
+            stage,
+            stream,
+            outcome,
+            elapsed,
+            input_bytes: None,
+            output_bytes,
+            block_count: None,
+        },
+    );
+}
 
 impl MessageProcessor {
     pub(super) async fn send_cli_runtime_status_changed_notification(
@@ -1789,9 +1830,31 @@ impl MessageProcessor {
     }
 
     fn serialize_notification<T: Serialize>(&self, method: &str, payload: &T) -> Option<String> {
+        let markdown_stream = markdown_notification_stream(method);
+        let encode_started = markdown_stream.map(|_| Instant::now());
         let notification = match JsonRpcNotification::from_params(method, payload) {
-            Ok(notification) => notification,
+            Ok(notification) => {
+                if let (Some(stream), Some(started)) = (markdown_stream, encode_started.as_ref()) {
+                    record_markdown_notification_stage(
+                        pioneer_observability::GatewayMarkdownStage::NotificationEncode,
+                        stream,
+                        pioneer_observability::GatewayMarkdownOutcome::Ok,
+                        started.elapsed(),
+                        None,
+                    );
+                }
+                notification
+            }
             Err(error) => {
+                if let (Some(stream), Some(started)) = (markdown_stream, encode_started.as_ref()) {
+                    record_markdown_notification_stage(
+                        pioneer_observability::GatewayMarkdownStage::NotificationEncode,
+                        stream,
+                        pioneer_observability::GatewayMarkdownOutcome::Error,
+                        started.elapsed(),
+                        None,
+                    );
+                }
                 crate::epic5_observability::record_outcome(
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
@@ -1801,9 +1864,32 @@ impl MessageProcessor {
             }
         };
 
+        let serialize_started = markdown_stream.map(|_| Instant::now());
         match serde_json::to_string(&notification) {
-            Ok(payload) => Some(payload),
+            Ok(payload) => {
+                if let (Some(stream), Some(started)) = (markdown_stream, serialize_started.as_ref())
+                {
+                    record_markdown_notification_stage(
+                        pioneer_observability::GatewayMarkdownStage::NotificationSerialize,
+                        stream,
+                        pioneer_observability::GatewayMarkdownOutcome::Ok,
+                        started.elapsed(),
+                        Some(payload.len()),
+                    );
+                }
+                Some(payload)
+            }
             Err(error) => {
+                if let (Some(stream), Some(started)) = (markdown_stream, serialize_started.as_ref())
+                {
+                    record_markdown_notification_stage(
+                        pioneer_observability::GatewayMarkdownStage::NotificationSerialize,
+                        stream,
+                        pioneer_observability::GatewayMarkdownOutcome::Error,
+                        started.elapsed(),
+                        None,
+                    );
+                }
                 crate::epic5_observability::record_outcome(
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,

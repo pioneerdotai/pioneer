@@ -24,6 +24,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 mod metrics;
 mod operations;
 mod patch_telemetry;
+mod performance;
 mod startup;
 mod telemetry;
 
@@ -39,6 +40,15 @@ pub use operations::{
     GatewayProviderWarmupTrace,
 };
 pub use patch_telemetry::{PatchTelemetrySnapshot, register_patch_telemetry_snapshot_provider};
+pub use performance::{
+    DesktopCodeHighlightCacheStatus, DesktopCodeHighlightFallbackReason,
+    DesktopCodeHighlightMetric, DesktopCodeHighlightOutcome, DesktopCodeHighlightTheme,
+    DesktopTimelineCacheStatus, DesktopTimelineContentKind, DesktopTimelineOutcome,
+    DesktopTimelineStage, DesktopTimelineStageMetric, GatewayMarkdownMessageMetric,
+    GatewayMarkdownMessageOutcome, GatewayMarkdownOutcome, GatewayMarkdownStage,
+    GatewayMarkdownStageMetric, GatewayMarkdownStreamKind, record_desktop_code_highlight,
+    record_desktop_timeline_stage, record_gateway_markdown_message, record_gateway_markdown_stage,
+};
 pub use startup::{
     DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
     GatewayStartupStage, GatewayStartupStageGuard, GatewayStartupTrace, MobileStartupOutcome,

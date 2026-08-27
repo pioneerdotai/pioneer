@@ -7,6 +7,12 @@ use pioneer_protocol::{
     MarkdownMarkKind,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::{Duration, Instant};
+
+pub(super) struct ProfiledMarkdownDocument {
+    pub(super) document: MarkdownDocument,
+    pub(super) elapsed: Duration,
+}
 
 #[derive(Debug, Clone, Default)]
 struct InlineStyle {
@@ -64,39 +70,98 @@ fn push_styled_text(out: &mut MarkdownInline, text: &str, style: &InlineStyle) {
 }
 
 pub(super) fn parse_markdown_document(source: &str) -> MarkdownDocument {
-    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
-    if normalized.trim().is_empty() {
-        return MarkdownDocument::default();
-    }
+    parse_markdown_document_profiled(
+        source,
+        pioneer_observability::GatewayMarkdownStreamKind::Snapshot,
+    )
+    .document
+}
 
-    match catch_markdown_unwind(|| parse_markdown_document_inner(normalized.as_str())) {
-        Some(document) => document,
-        None => {
-            tracing::warn!(
-                source_bytes = normalized.len(),
-                "markdown conversion panicked; preserving event content as plain text"
-            );
-            MarkdownDocument::from_plain_text(normalized)
+pub(super) fn parse_streaming_markdown_document(
+    source: &str,
+    stream: pioneer_observability::GatewayMarkdownStreamKind,
+) -> ProfiledMarkdownDocument {
+    parse_markdown_document_profiled(source, stream)
+}
+
+fn parse_markdown_document_profiled(
+    source: &str,
+    stream: pioneer_observability::GatewayMarkdownStreamKind,
+) -> ProfiledMarkdownDocument {
+    let started = Instant::now();
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    let (document, outcome) = if normalized.trim().is_empty() {
+        (
+            MarkdownDocument::default(),
+            pioneer_observability::GatewayMarkdownOutcome::Empty,
+        )
+    } else {
+        match catch_markdown_unwind(|| parse_markdown_document_inner(normalized.as_str())) {
+            Some(parsed) => parsed,
+            None => {
+                tracing::warn!(
+                    source_bytes = normalized.len(),
+                    "markdown conversion panicked; preserving event content as plain text"
+                );
+                (
+                    MarkdownDocument::from_plain_text(normalized),
+                    pioneer_observability::GatewayMarkdownOutcome::PanicFallback,
+                )
+            }
         }
-    }
+    };
+    let elapsed = started.elapsed();
+    pioneer_observability::record_gateway_markdown_stage(
+        pioneer_observability::GatewayMarkdownStageMetric {
+            stage: pioneer_observability::GatewayMarkdownStage::Parse,
+            stream,
+            outcome,
+            elapsed,
+            input_bytes: Some(source.len()),
+            output_bytes: None,
+            block_count: Some(document.blocks.len()),
+        },
+    );
+    ProfiledMarkdownDocument { document, elapsed }
 }
 
 fn catch_markdown_unwind<T>(convert: impl FnOnce() -> T) -> Option<T> {
     catch_unwind(AssertUnwindSafe(convert)).ok()
 }
 
-fn parse_markdown_document_inner(normalized: &str) -> MarkdownDocument {
+fn parse_markdown_document_inner(
+    normalized: &str,
+) -> (
+    MarkdownDocument,
+    pioneer_observability::GatewayMarkdownOutcome,
+) {
     let root = match markdown::to_mdast(normalized, &ParseOptions::gfm()) {
         Ok(Node::Root(root)) => root,
-        Ok(node) => return MarkdownDocument::from_plain_text(node.to_string()),
-        Err(_) => return MarkdownDocument::from_plain_text(normalized.to_owned()),
+        Ok(node) => {
+            return (
+                MarkdownDocument::from_plain_text(node.to_string()),
+                pioneer_observability::GatewayMarkdownOutcome::Fallback,
+            );
+        }
+        Err(_) => {
+            return (
+                MarkdownDocument::from_plain_text(normalized.to_owned()),
+                pioneer_observability::GatewayMarkdownOutcome::Fallback,
+            );
+        }
     };
 
     let blocks = parse_blocks(&root.children);
     if blocks.is_empty() {
-        MarkdownDocument::from_plain_text(normalized.to_owned())
+        (
+            MarkdownDocument::from_plain_text(normalized.to_owned()),
+            pioneer_observability::GatewayMarkdownOutcome::Fallback,
+        )
     } else {
-        MarkdownDocument { blocks }
+        (
+            MarkdownDocument { blocks },
+            pioneer_observability::GatewayMarkdownOutcome::Ok,
+        )
     }
 }
 
@@ -326,7 +391,32 @@ fn is_html_break(raw_html: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::catch_markdown_unwind;
+    use super::{
+        catch_markdown_unwind, parse_markdown_document, parse_streaming_markdown_document,
+    };
+
+    #[test]
+    fn profiled_streaming_parser_preserves_the_markdown_document() {
+        let source = "# Heading\n\nA **bold** paragraph.\n\n```rust\nlet answer = 42;\n```";
+
+        let expected = parse_markdown_document(source);
+        let profiled = parse_streaming_markdown_document(
+            source,
+            pioneer_observability::GatewayMarkdownStreamKind::AgentMessage,
+        );
+
+        assert_eq!(profiled.document, expected);
+    }
+
+    #[test]
+    fn profiled_streaming_parser_preserves_empty_documents() {
+        let profiled = parse_streaming_markdown_document(
+            " \r\n\t",
+            pioneer_observability::GatewayMarkdownStreamKind::AgentMessage,
+        );
+
+        assert!(profiled.document.blocks.is_empty());
+    }
 
     #[test]
     fn markdown_conversion_panic_is_contained() {
