@@ -289,8 +289,13 @@ pub(super) async fn run(
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<super::ThreadEpisodicWorkspaceRefillSupervisor>,
     interrupted_before_unix: Option<i64>,
+    owner: super::RefillOwner,
+    supervisor_cancellation: CancellationToken,
 ) {
-    let workspace_ids = match crud_store.list_thread_episodic_refill_workspace_ids().await {
+    let workspace_ids = match tokio::select! {
+        _ = supervisor_cancellation.cancelled() => return,
+        workspace_ids = crud_store.list_thread_episodic_refill_workspace_ids() => workspace_ids,
+    } {
         Ok(workspace_ids) => workspace_ids,
         Err(error) => {
             warn!(
@@ -300,12 +305,40 @@ pub(super) async fn run(
             return;
         }
     };
+    if matches!(owner, super::RefillOwner::Settings) {
+        // Claim the complete settings generation before processing its first
+        // workspace. Otherwise an older startup refill could begin workspace B
+        // while the settings task is still rebuilding workspace A.
+        refill_supervisor
+            .reserve_settings_workspaces(workspace_ids.as_slice())
+            .await;
+    }
     for workspace_id in workspace_ids {
-        let Some(refill_lease) = refill_supervisor.begin_startup(workspace_id.as_str()).await
-        else {
-            continue;
+        if supervisor_cancellation.is_cancelled() {
+            return;
+        }
+        let refill_lease = match owner {
+            super::RefillOwner::Startup => {
+                let Some(refill_lease) =
+                    refill_supervisor.begin_startup(workspace_id.as_str()).await
+                else {
+                    continue;
+                };
+                refill_lease
+            }
+            super::RefillOwner::Settings => {
+                refill_supervisor
+                    .begin_settings(workspace_id.as_str())
+                    .await
+            }
         };
-        let cancellation = refill_lease.cancellation();
+        let lease_cancellation = refill_lease.cancellation();
+        let cancellation = supervisor_cancellation.child_token();
+        let relay_cancellation = cancellation.clone();
+        let cancellation_relay = tokio::spawn(async move {
+            lease_cancellation.cancelled().await;
+            relay_cancellation.cancel();
+        });
         let workspace_vector_search_config = effective_workspace_vector_search_config(
             &vector_search_config,
             &workspace_vector_search_configs,
@@ -325,6 +358,8 @@ pub(super) async fn run(
             cancellation,
         )
         .await;
+        cancellation_relay.abort();
+        let _ = cancellation_relay.await;
         drop(refill_lease);
     }
 }

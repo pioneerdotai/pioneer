@@ -141,6 +141,21 @@ impl Drop for TaskRuntime {
     }
 }
 
+impl TaskRuntime {
+    pub async fn shutdown(&self) {
+        for worker in [
+            &self.scheduler_task,
+            &self.live_reconciliation_task,
+            &self.review_timeout_task,
+        ] {
+            if let Some(handle) = worker.lock().await.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRuntimeConfig {
     pub review: TaskReviewRuntimeConfig,

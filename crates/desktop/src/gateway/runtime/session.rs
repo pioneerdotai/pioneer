@@ -42,6 +42,11 @@ struct RefreshSlotKey {
 
 static REFRESH_SLOTS: OnceLock<Mutex<HashMap<RefreshSlotKey, Weak<Mutex<RefreshSlot>>>>> =
     OnceLock::new();
+const TRANSIENT_REFRESH_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+];
 
 #[derive(Default)]
 struct RefreshSlot {
@@ -186,7 +191,7 @@ impl GatewayRuntime {
         refresh: F,
     ) -> Result<DesktopSessionPreparation>
     where
-        F: FnOnce(
+        F: FnMut(
             &GatewayBaseUrl,
             &str,
             &str,
@@ -373,7 +378,7 @@ impl GatewayRuntime {
         cleanup_session: C,
     ) -> Result<DesktopSessionPreparation>
     where
-        F: FnOnce(
+        F: FnMut(
             &GatewayBaseUrl,
             &str,
             &str,
@@ -454,11 +459,11 @@ impl GatewayRuntime {
         endpoint: pioneer_client::gateway::types::GatewayEndpoint,
         session_ref: String,
         mut stored: DesktopGatewaySessionSecret,
-        refresh: F,
+        mut refresh: F,
         mut cleanup_session: C,
     ) -> Result<DesktopSessionPreparation>
     where
-        F: FnOnce(
+        F: FnMut(
             &GatewayBaseUrl,
             &str,
             &str,
@@ -491,12 +496,28 @@ impl GatewayRuntime {
                 return Ok(self.enter_terminal(endpoint_id, Some(metadata(&stored)), reason));
             }
         }
-        let refresh = match refresh(
-            &endpoint.gateway_base_url,
-            stored.refresh_token.expose_secret(),
-            refresh_request_id.as_str(),
-            self.timings.startup_timeout,
-        ) {
+        let refresh = match {
+            let mut attempt = 0_usize;
+            loop {
+                let result = refresh(
+                    &endpoint.gateway_base_url,
+                    stored.refresh_token.expose_secret(),
+                    refresh_request_id.as_str(),
+                    self.timings.startup_timeout,
+                );
+                let Err(error) = &result else {
+                    break result;
+                };
+                let Some(delay) = TRANSIENT_REFRESH_RETRY_DELAYS.get(attempt).copied() else {
+                    break result;
+                };
+                if !is_transient_refresh_error(error) {
+                    break result;
+                }
+                attempt = attempt.saturating_add(1);
+                std::thread::sleep(delay);
+            }
+        } {
             Ok(refresh) => refresh,
             Err(error) => {
                 let Some(reason) = terminal_reason_for_refresh_error(&error) else {
@@ -805,6 +826,9 @@ fn validate_gateway_session_identity(
 }
 
 fn terminal_reason_for_refresh_error(error: &AuthExchangeError) -> Option<SessionTerminalReason> {
+    if is_transient_refresh_error(error) {
+        return None;
+    }
     if let Some(reason) = error
         .code
         .as_deref()
@@ -824,6 +848,14 @@ fn terminal_reason_for_refresh_error(error: &AuthExchangeError) -> Option<Sessio
             Some(SessionTerminalReason::RefreshCredentialInvalid)
         }
     }
+}
+
+fn is_transient_refresh_error(error: &AuthExchangeError) -> bool {
+    error.kind == AuthExchangeErrorKind::Server
+        && matches!(
+            error.code.as_deref(),
+            Some("temporarily_unavailable" | "auth_not_ready")
+        )
 }
 
 fn refresh_slot(registry_path: &Path, endpoint_id: &str) -> Result<Arc<Mutex<RefreshSlot>>> {
@@ -1262,6 +1294,46 @@ mod tests {
             })
             .expect("the unchanged durable credential must be retryable");
         assert!(matches!(second, DesktopSessionPreparation::Ready(_)));
+    }
+
+    #[test]
+    fn transient_refresh_retries_reuse_the_durable_request_id() {
+        let (mut runtime, _, endpoint_id) = fixture();
+        let mut attempts = 0_usize;
+        let mut durable_request_id = None;
+
+        let prepared = runtime
+            .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, request_id, _| {
+                assert_eq!(raw, refresh_token(0));
+                if let Some(expected) = durable_request_id.as_deref() {
+                    assert_eq!(request_id, expected);
+                } else {
+                    durable_request_id = Some(request_id.to_owned());
+                }
+                attempts = attempts.saturating_add(1);
+                if attempts <= TRANSIENT_REFRESH_RETRY_DELAYS.len() {
+                    Err(AuthExchangeError {
+                        kind: AuthExchangeErrorKind::Server,
+                        code: Some("temporarily_unavailable".to_owned()),
+                        message: "Gateway database is busy".to_owned(),
+                    })
+                } else {
+                    Ok(refresh_grant(1))
+                }
+            })
+            .expect("transient Gateway backpressure should recover in place");
+
+        assert_eq!(attempts, TRANSIENT_REFRESH_RETRY_DELAYS.len() + 1);
+        assert!(matches!(prepared, DesktopSessionPreparation::Ready(_)));
+        assert!(
+            runtime
+                .secrets
+                .get_gateway_session(endpoint_id.as_str())
+                .unwrap()
+                .unwrap()
+                .pending_refresh_request_id
+                .is_none()
+        );
     }
 
     #[test]

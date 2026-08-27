@@ -167,9 +167,9 @@ pub use client_projection::{
     CrossThreadSourceVisibility, SafeExecutionProfileMetadata, SafeRouteProvenance,
 };
 pub use gateway_endpoint::{
-    DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError, GatewayTransportSecurity,
-    PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER, PIONEER_PROTOCOL_VERSION_NUMBER,
-    canonical_storage_path,
+    DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError, GatewayReadinessSnapshot,
+    GatewayReadinessStatus, GatewayTransportSecurity, PIONEER_PROTOCOL_VERSION,
+    PIONEER_PROTOCOL_VERSION_HEADER, PIONEER_PROTOCOL_VERSION_NUMBER, canonical_storage_path,
 };
 pub use id::{
     ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, AdministrationDomainIdError, AuditEventId,

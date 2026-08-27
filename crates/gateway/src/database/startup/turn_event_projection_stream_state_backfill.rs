@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 const PROJECTION_STREAM_STATE_BACKFILL_KEY: &str = "turn_event_projection_stream_state_backfill";
 const PROJECTION_STREAM_STATE_BACKFILL_VERSION: i64 = 1;
-const PROJECTION_STREAM_STATE_BACKFILL_BATCH_SIZE: u64 = 256;
+const PROJECTION_STREAM_STATE_BACKFILL_BATCH_SIZE: u64 = 32;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ProjectionStreamStateBackfillSummary {
@@ -19,7 +19,7 @@ pub(crate) struct ProjectionStreamStateBackfillSummary {
     pub(crate) streams_quarantined: u64,
 }
 
-pub(super) async fn run(crud_store: &CrudStore) {
+pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
     match backfill_once(crud_store).await {
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
@@ -35,8 +35,10 @@ pub(super) async fn run(crud_store: &CrudStore) {
                 error = %format!("{error:#}"),
                 "turn event projection stream state background backfill failed"
             );
+            return Err(error);
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn backfill_once(
@@ -112,7 +114,7 @@ async fn backfill_all_batches(
             .streams_quarantined
             .saturating_add(batch.streams_quarantined as u64);
         after_turn_id = Some(next_turn_id);
-        tokio::task::yield_now().await;
+        super::maintenance_checkpoint().await?;
     }
 
     Ok(summary)

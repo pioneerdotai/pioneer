@@ -26,15 +26,23 @@ mod restart;
 mod uninstall;
 
 impl MessageProcessor {
-    pub(crate) async fn start_mcp_workspace_supervisor(self: &std::sync::Arc<Self>) {
-        let this = self.clone();
-        let _handle = tokio::spawn(async move {
+    pub(crate) async fn initialize_mcp_workspaces_with_retry(
+        self: &std::sync::Arc<Self>,
+        cancellation: &tokio_util::sync::CancellationToken,
+        on_degraded: impl Fn(bool),
+    ) -> Result<()> {
+        let mut initialized = std::collections::HashSet::new();
+        let mut retry_delay = std::time::Duration::from_millis(250);
+        loop {
+            if cancellation.is_cancelled() {
+                anyhow::bail!("MCP workspace initialization cancelled");
+            }
             let trace = pioneer_observability::GatewayOperationTrace::start(
                 pioneer_observability::GatewayOperation::McpWorkspaceInitialize,
             );
             let workspaces_stage =
                 trace.stage(pioneer_observability::GatewayOperationStage::McpWorkspacesLoad);
-            let workspaces = match this.workspace_manager.list_workspaces().await {
+            let workspaces = match self.workspace_manager.list_workspaces().await {
                 Ok(workspaces) => {
                     workspaces_stage.succeed();
                     workspaces
@@ -44,41 +52,84 @@ impl MessageProcessor {
                 }
                 Err(error) => {
                     drop(workspaces_stage);
+                    on_degraded(true);
                     warn!(
                         error = %error,
                         "failed to list workspaces for MCP startup supervisor"
                     );
                     trace.finish_failure();
-                    return;
+                    tokio::select! {
+                        _ = cancellation.cancelled() => anyhow::bail!("MCP workspace initialization cancelled"),
+                        _ = tokio::time::sleep(retry_delay) => {}
+                    }
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(30));
+                    continue;
                 }
             };
 
-            let mut failed = false;
-            for workspace in workspaces {
+            let current_workspace_ids = workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            initialized.retain(|workspace_id| current_workspace_ids.contains(workspace_id));
+            let pending_workspaces = workspaces
+                .into_iter()
+                .filter(|workspace| !initialized.contains(&workspace.id))
+                .collect::<Vec<_>>();
+            let mut first_error = None;
+            for workspace in pending_workspaces {
+                if cancellation.is_cancelled() {
+                    trace.finish_cancelled();
+                    anyhow::bail!("MCP workspace initialization cancelled");
+                }
                 let reload_stage =
                     trace.stage(pioneer_observability::GatewayOperationStage::McpWorkspaceReload);
-                if let Err(error) = this
+                if let Err(error) = self
                     .mcp_service
                     .reload_workspace(workspace.id.as_str())
                     .await
                 {
                     drop(reload_stage);
-                    failed = true;
                     warn!(
                         workspace_id = workspace.id.as_str(),
                         error = %format!("{error:#}"),
                         "failed to start MCP workspace runtime"
                     );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 } else {
                     reload_stage.succeed();
+                    initialized.insert(workspace.id);
                 }
             }
-            if failed {
+            if let Some(error) = first_error {
+                on_degraded(true);
                 trace.finish_failure();
+                warn!(
+                    error = %format!("{error:#}"),
+                    retry_delay_ms = retry_delay.as_millis() as u64,
+                    "MCP workspace initialization incomplete; retrying"
+                );
+                tokio::select! {
+                    _ = cancellation.cancelled() => anyhow::bail!("MCP workspace initialization cancelled"),
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(30));
             } else {
+                if cancellation.is_cancelled() {
+                    trace.finish_cancelled();
+                    anyhow::bail!("MCP workspace initialization cancelled");
+                }
+                on_degraded(false);
                 trace.finish_success();
+                return Ok(());
             }
-        });
+        }
     }
 }
 

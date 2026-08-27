@@ -1883,12 +1883,10 @@ impl MessageProcessor {
         }
     }
 
-    async fn initialize_resilience_workers(self: &Arc<Self>) {
+    async fn initialize_resilience_workers(self: &Arc<Self>) -> anyhow::Result<()> {
         let trace = pioneer_observability::GatewayOperationTrace::start(
             pioneer_observability::GatewayOperation::ResilienceInitialize,
         );
-        let mut failed = false;
-
         let repair_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceReadModelRepair);
         match self
@@ -1915,11 +1913,12 @@ impl MessageProcessor {
             }
             Err(error) => {
                 drop(repair_stage);
-                failed = true;
                 warn!(
                     error = %format!("{error:#}"),
                     "read-model invariant verification failed at startup"
                 );
+                trace.finish_failure();
+                return Err(error).context("read-model invariant verification failed at startup");
             }
         }
 
@@ -1941,11 +1940,12 @@ impl MessageProcessor {
             }
             Err(error) => {
                 drop(deadline_stage);
-                failed = true;
                 warn!(
                     error = %format!("{error:#}"),
                     "failed to backfill missing running item deadlines during startup"
                 );
+                trace.finish_failure();
+                return Err(error).context("deadline backfill failed at startup");
             }
         }
 
@@ -1963,11 +1963,12 @@ impl MessageProcessor {
             }
             Err(error) => {
                 drop(admission_stage);
-                failed = true;
                 warn!(
                     error = %format!("{error:#}"),
                     "failed to reconcile execution admission quota leases at startup"
                 );
+                trace.finish_failure();
+                return Err(error).context("execution admission lease reconciliation failed");
             }
         }
 
@@ -1975,8 +1976,9 @@ impl MessageProcessor {
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
         if let Err(error) = self.task_runtime.start().await {
             drop(task_runtime_stage);
-            failed = true;
             error!(error = %format!("{error:#}"), "failed to start task runtime");
+            trace.finish_failure();
+            return Err(error).context("failed to start task runtime");
         } else {
             task_runtime_stage.succeed();
         }
@@ -1991,18 +1993,31 @@ impl MessageProcessor {
         self.start_hook_recovery_worker().await;
         hook_recovery_stage.succeed();
 
-        if failed {
-            trace.finish_failure();
-        } else {
-            trace.finish_success();
-        }
+        trace.finish_success();
+        Ok(())
     }
 
+    #[cfg(test)]
     pub async fn start_resilience_workers(self: &Arc<Self>) -> anyhow::Result<()> {
-        self.authorization_invalidation_hub
-            .current_generation()
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.start_resilience_workers_with_cancellation(&cancellation, |_| {})
             .await
-            .context("Gateway startup requires durable authorization policy generation")?;
+    }
+
+    pub(crate) async fn start_resilience_workers_with_cancellation<F>(
+        self: &Arc<Self>,
+        cancellation: &tokio_util::sync::CancellationToken,
+        on_degraded: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Fn(bool) + Send + Sync,
+    {
+        let mut guard = self.resilience_worker.lock().await;
+        if guard.is_some() {
+            on_degraded(false);
+            return Ok(());
+        }
+
         let processor = Arc::downgrade(self);
         self.recovery_coordinator
             .set_listener_starter(Arc::new(move |thread_id| {
@@ -2018,19 +2033,48 @@ impl MessageProcessor {
                 })
             }))
             .await;
-        let mut guard = self.resilience_worker.lock().await;
-        if guard.is_some() {
-            return Ok(());
+
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(anyhow::anyhow!("resilience initialization cancelled"));
+            }
+            let initialization = async {
+                self.authorization_invalidation_hub
+                    .current_generation()
+                    .await
+                    .context("Gateway startup requires durable authorization policy generation")?;
+                self.initialize_resilience_workers().await
+            }
+            .await;
+            match initialization {
+                Ok(()) => {
+                    on_degraded(false);
+                    break;
+                }
+                Err(error) => {
+                    on_degraded(true);
+                    warn!(
+                        error = %format!("{error:#}"),
+                        retry_delay_ms = retry_delay.as_millis() as u64,
+                        "resilience initialization failed; retrying independently"
+                    );
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            return Err(anyhow::anyhow!("resilience initialization cancelled"));
+                        }
+                        _ = sleep(retry_delay) => {}
+                    }
+                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+                }
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Err(anyhow::anyhow!("resilience initialization cancelled"));
         }
 
         let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
-            let Some(this) = processor.upgrade() else {
-                return;
-            };
-            this.initialize_resilience_workers().await;
-            drop(this);
-
             struct IsolatedWorkerGuard(Vec<JoinHandle<()>>);
 
             impl Drop for IsolatedWorkerGuard {
@@ -2279,6 +2323,20 @@ impl MessageProcessor {
 
         *guard = Some(handle);
         Ok(())
+    }
+
+    pub(crate) async fn shutdown_resilience_workers(&self) {
+        for worker in [
+            &self.resilience_worker,
+            &self.task_event_listener_worker,
+            &self.hook_recovery_worker,
+        ] {
+            if let Some(handle) = worker.lock().await.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+        self.task_runtime.shutdown().await;
     }
 
     async fn update_cli_runtime_command_item_registry(

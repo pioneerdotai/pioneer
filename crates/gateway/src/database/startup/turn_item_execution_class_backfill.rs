@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 const TURN_ITEM_EXECUTION_CLASS_BACKFILL_KEY: &str = "turn_item_execution_class_backfill";
 const TURN_ITEM_EXECUTION_CLASS_BACKFILL_VERSION: i64 = 1;
-const TURN_ITEM_EXECUTION_CLASS_BACKFILL_BATCH_SIZE: u64 = 256;
+const TURN_ITEM_EXECUTION_CLASS_BACKFILL_BATCH_SIZE: u64 = 32;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TurnItemExecutionClassBackfillSummary {
@@ -23,7 +23,7 @@ pub(crate) struct TurnItemExecutionClassBackfillSummary {
 pub(super) async fn run(
     crud_store: &CrudStore,
     context_compaction_config: GatewayContextCompactionTimeoutConfig,
-) {
+) -> Result<()> {
     match backfill_once(crud_store, context_compaction_config).await {
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
@@ -39,8 +39,10 @@ pub(super) async fn run(
                 error = %format!("{error:#}"),
                 "turn item execution-class background backfill failed"
             );
+            return Err(error);
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn backfill_once(
@@ -115,7 +117,7 @@ async fn backfill_all_batches(
         summary.context_compactions_classified = summary
             .context_compactions_classified
             .saturating_add(batch.context_compactions_classified as u64);
-        tokio::task::yield_now().await;
+        super::maintenance_checkpoint().await?;
     }
     Ok(summary)
 }

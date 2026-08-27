@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use pioneer_config::AppConfig;
+use pioneer_protocol::GatewayReadinessStatus;
 use tokio::sync::{Mutex, watch};
 
 use crate::auth::{AuthAdmissionService, GatewayAuthService};
@@ -117,18 +118,62 @@ impl ActiveConnectionGuard {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ReadinessDegradation {
+    Resilience = 1 << 0,
+    SelfImprovement = 1 << 1,
+    Mcp = 1 << 2,
+    RemoteAccess = 1 << 3,
+    DatabaseMaintenance = 1 << 4,
+}
+
+const GENERIC_DEGRADATION: u8 = 1 << 7;
+
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ReadinessState {
-    ready: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
+    degradations: Arc<AtomicU8>,
 }
 
 impl ReadinessState {
-    pub(crate) fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+    pub(crate) fn status(&self) -> GatewayReadinessStatus {
+        let phase = self.phase.load(Ordering::Acquire);
+        if phase == 0 {
+            return GatewayReadinessStatus::Starting;
+        }
+        if self.degradations.load(Ordering::Acquire) != 0 {
+            return GatewayReadinessStatus::Degraded;
+        }
+        match phase {
+            1 => GatewayReadinessStatus::AcceptingSessions,
+            2 => GatewayReadinessStatus::Operational,
+            _ => GatewayReadinessStatus::Starting,
+        }
     }
 
-    pub(crate) fn set_ready(&self, ready: bool) {
-        self.ready.store(ready, Ordering::Release);
+    pub(crate) fn set_status(&self, status: GatewayReadinessStatus) {
+        match status {
+            GatewayReadinessStatus::Starting => {
+                self.phase.store(0, Ordering::Release);
+                self.degradations.store(0, Ordering::Release);
+            }
+            GatewayReadinessStatus::AcceptingSessions => self.phase.store(1, Ordering::Release),
+            GatewayReadinessStatus::Operational => self.phase.store(2, Ordering::Release),
+            GatewayReadinessStatus::Degraded => {
+                self.degradations
+                    .fetch_or(GENERIC_DEGRADATION, Ordering::AcqRel);
+            }
+        }
+    }
+
+    pub(crate) fn set_degraded(&self, component: ReadinessDegradation, degraded: bool) {
+        let component = component as u8;
+        if degraded {
+            self.degradations.fetch_or(component, Ordering::AcqRel);
+        } else {
+            self.degradations.fetch_and(!component, Ordering::AcqRel);
+        }
     }
 }
 
@@ -174,12 +219,12 @@ impl GatewayHttpState {
         })
     }
 
-    pub(crate) fn set_ready(&self, ready: bool) {
-        self.readiness.set_ready(ready);
+    pub(crate) fn set_readiness(&self, status: GatewayReadinessStatus) {
+        self.readiness.set_status(status);
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.readiness.is_ready()
+        self.readiness.status().accepts_sessions()
     }
 
     pub(crate) fn readiness(&self) -> ReadinessState {
@@ -194,13 +239,28 @@ mod tests {
     #[test]
     fn readiness_is_fail_closed_until_explicitly_enabled() {
         let readiness = ReadinessState::default();
-        assert!(!readiness.is_ready());
+        assert_eq!(readiness.status(), GatewayReadinessStatus::Starting);
 
-        readiness.set_ready(true);
-        assert!(readiness.is_ready());
+        readiness.set_status(GatewayReadinessStatus::AcceptingSessions);
+        assert!(readiness.status().accepts_sessions());
 
-        readiness.set_ready(false);
-        assert!(!readiness.is_ready());
+        readiness.set_status(GatewayReadinessStatus::Degraded);
+        assert!(readiness.status().accepts_sessions());
+    }
+
+    #[test]
+    fn component_degradation_recovers_without_hiding_other_failures() {
+        let readiness = ReadinessState::default();
+        readiness.set_status(GatewayReadinessStatus::Operational);
+        readiness.set_degraded(ReadinessDegradation::Mcp, true);
+        readiness.set_degraded(ReadinessDegradation::RemoteAccess, true);
+        assert_eq!(readiness.status(), GatewayReadinessStatus::Degraded);
+
+        readiness.set_degraded(ReadinessDegradation::Mcp, false);
+        assert_eq!(readiness.status(), GatewayReadinessStatus::Degraded);
+
+        readiness.set_degraded(ReadinessDegradation::RemoteAccess, false);
+        assert_eq!(readiness.status(), GatewayReadinessStatus::Operational);
     }
 
     #[tokio::test]

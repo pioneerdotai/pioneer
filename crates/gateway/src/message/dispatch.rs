@@ -7599,7 +7599,8 @@ impl MessageProcessor {
                         self.artifact_runtime_home.clone(),
                         Some(self.thread_episodic_vector_refill_status_sender()),
                         self.thread_episodic_workspace_refill_supervisor.clone(),
-                    );
+                    )
+                    .await;
                     vector_refill_started = true;
                 }
             }

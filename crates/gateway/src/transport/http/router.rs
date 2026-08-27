@@ -71,7 +71,7 @@ mod tests {
             .unwrap();
         assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        readiness.set_ready(true);
+        readiness.set_status(pioneer_protocol::GatewayReadinessStatus::Operational);
         let ready = app
             .clone()
             .oneshot(Request::get("/ready").body(Body::empty()).unwrap())

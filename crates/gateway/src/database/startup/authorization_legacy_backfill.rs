@@ -1,52 +1,73 @@
 use anyhow::{Context, Result};
-use pioneer_crud::{CrudStore, load_gateway_singleton, scan_authorization_persistence_invariants};
+use pioneer_crud::{
+    CrudStore, load_gateway_singleton, scan_authorization_persistence_invariants_cooperative,
+};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use tracing::{info, warn};
 
 const CLASSIFY_LEGACY_THREADS_SQL: &str = "\
     UPDATE thread \
        SET access_class = 'internal' \
-     WHERE access_class <> 'internal' \
-       AND (origin_kind IN ('task_run', 'system') \
-            OR sidebar_visibility = 'hidden' \
-            OR EXISTS ( \
-                SELECT 1 \
-                  FROM thread_lineage \
-                 WHERE thread_lineage.child_thread_id = thread.id \
-            ))";
+     WHERE id IN ( \
+        SELECT id FROM thread \
+         WHERE access_class <> 'internal' \
+           AND (origin_kind IN ('task_run', 'system') \
+                OR sidebar_visibility = 'hidden' \
+                OR EXISTS ( \
+                    SELECT 1 \
+                      FROM thread_lineage \
+                     WHERE thread_lineage.child_thread_id = thread.id \
+                )) \
+         ORDER BY created_at, id \
+         LIMIT 64 \
+     )";
 
-pub(super) async fn run(crud_store: &CrudStore) {
+pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
     let database = crud_store.database_connection();
-    match backfill_once(&database).await {
-        Ok(0) => {}
-        Ok(updated_threads) => info!(
+    let mut updated_threads = 0_u64;
+    loop {
+        let Some(updated) = crud_store
+            .try_run_low_priority_write(|| backfill_once(&database))
+            .await?
+        else {
+            super::maintenance_checkpoint().await?;
+            continue;
+        };
+        updated_threads = updated_threads.saturating_add(updated);
+        if updated == 0 {
+            break;
+        }
+        super::maintenance_checkpoint().await?;
+    }
+    if updated_threads > 0 {
+        info!(
             updated_threads,
             "legacy thread access-class background backfill completed"
-        ),
-        Err(error) => {
-            warn!(
-                error = %format!("{error:#}"),
-                "legacy thread access-class background backfill failed; it will retry on the next Gateway start"
-            );
-            return;
-        }
+        );
     }
 
     let gateway = match load_gateway_singleton(&database).await {
         Ok(Some(gateway)) => gateway,
         Ok(None) => {
             warn!("authorization background audit skipped because Gateway identity is missing");
-            return;
+            return Ok(());
         }
         Err(error) => {
             warn!(
                 error = %format!("{error:#}"),
                 "authorization background audit could not load Gateway identity"
             );
-            return;
+            return Err(error.into());
         }
     };
-    match scan_authorization_persistence_invariants(&database, &gateway.id).await {
+    match scan_authorization_persistence_invariants_cooperative(
+        &database,
+        &gateway.id,
+        128,
+        super::maintenance_checkpoint,
+    )
+    .await
+    {
         Ok(report) if report.is_valid() => {
             if report.ineligible_active_learned_versions > 0 {
                 info!(
@@ -59,11 +80,15 @@ pub(super) async fn run(crud_store: &CrudStore) {
             violations = %report.safe_diagnostic(),
             "Gateway authorization background audit found persistence invariant violations"
         ),
-        Err(error) => warn!(
-            error = %format!("{error:#}"),
-            "Gateway authorization background audit failed"
-        ),
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "Gateway authorization background audit failed"
+            );
+            return Err(error);
+        }
     }
+    Ok(())
 }
 
 async fn backfill_once(database: &DatabaseConnection) -> Result<u64> {

@@ -8,8 +8,8 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use pioneer_config::AppConfig;
 use pioneer_protocol::{
-    AuthAccessExpiringNotification, AuthSessionTerminationReason, JsonRpcNotification,
-    constants::events,
+    AuthAccessExpiringNotification, AuthSessionTerminationReason, GatewayReadinessStatus,
+    JsonRpcNotification, constants::events,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
@@ -40,11 +40,20 @@ pub struct GatewayServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     join_handle: JoinHandle<Result<()>>,
+    readiness: super::http::ReadinessState,
 }
 
 impl GatewayServerHandle {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    pub fn set_readiness(&self, status: GatewayReadinessStatus) {
+        self.readiness.set_status(status);
+    }
+
+    pub(crate) fn readiness_state(&self) -> super::http::ReadinessState {
+        self.readiness.clone()
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -81,7 +90,7 @@ pub async fn spawn_server(
     .map_err(|error| anyhow::anyhow!("invalid Gateway HTTP configuration: {error:?}"))?;
     let app = gateway_router(state.clone());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    state.set_ready(true);
+    let readiness = state.readiness();
     let join_handle = tokio::spawn(async move {
         axum::serve(
             listener,
@@ -96,6 +105,7 @@ pub async fn spawn_server(
         local_addr,
         shutdown_tx,
         join_handle,
+        readiness,
     })
 }
 
@@ -105,7 +115,7 @@ async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>, state: GatewayH
             break;
         }
     }
-    state.set_ready(false);
+    state.set_readiness(GatewayReadinessStatus::Starting);
     state.view_grants.begin_shutdown();
     state.http_streams.begin_shutdown();
     state.active_connections.cancel_all().await;
@@ -143,6 +153,12 @@ pub(super) async fn run_admitted_connection(
                 Ok(Some(RestrictedExchangeOutcome::Succeeded)) => {
                     permit.record_success();
                     tracing::debug!(event = "websocket_auth", outcome = "restricted_succeeded",);
+                }
+                Ok(Some(RestrictedExchangeOutcome::RetryableFailure)) => {
+                    tracing::debug!(
+                        event = "websocket_auth",
+                        outcome = "restricted_retryable_failure",
+                    );
                 }
                 Ok(Some(RestrictedExchangeOutcome::Failed)) | Err(_) => {
                     permit.record_failure();

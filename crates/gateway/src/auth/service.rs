@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Utc};
@@ -261,14 +262,16 @@ impl GatewayAuthService {
         let transaction_acquire_stage = trace.stage(
             pioneer_observability::GatewayOperationStage::AuthRefreshDatabaseTransactionAcquire,
         );
-        let transaction = self
-            .database
-            .begin_with_options(TransactionOptions {
+        let transaction = tokio::time::timeout(
+            Duration::from_millis(self.config.database_acquire_timeout_ms),
+            self.database.begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
                 ..Default::default()
-            })
-            .await
-            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+            }),
+        )
+        .await
+        .map_err(|_| AuthError::new(AuthErrorCode::TemporarilyUnavailable))?
+        .map_err(refresh_transaction_acquire_error)?;
         transaction_acquire_stage.succeed();
         let session = match load_session(&transaction, &presented.session_id)
             .await
@@ -2597,6 +2600,17 @@ fn datetime(unix: u64) -> Result<DateTime<FixedOffset>, AuthError> {
 
 fn storage_error(_error: anyhow::Error) -> AuthError {
     AuthError::new(AuthErrorCode::InvalidCredential)
+}
+
+fn refresh_transaction_acquire_error(error: sea_orm::DbErr) -> AuthError {
+    let error = anyhow::Error::new(error);
+    if pioneer_sqlite::is_anyhow_sqlite_lock(&error)
+        || pioneer_sqlite::is_anyhow_sqlite_pool_timeout(&error)
+    {
+        AuthError::new(AuthErrorCode::TemporarilyUnavailable)
+    } else {
+        AuthError::new(AuthErrorCode::InvalidCredential)
+    }
 }
 
 fn client_kind_from_db(value: &str) -> Result<ClientKind, AuthError> {

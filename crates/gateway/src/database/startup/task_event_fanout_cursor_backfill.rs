@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 const TASK_EVENT_FANOUT_CURSOR_BACKFILL_KEY: &str = "task_event_fanout_cursor_backfill";
 const TASK_EVENT_FANOUT_CURSOR_BACKFILL_VERSION: i64 = 1;
-const TASK_EVENT_FANOUT_CURSOR_BACKFILL_BATCH_SIZE: u64 = 256;
+const TASK_EVENT_FANOUT_CURSOR_BACKFILL_BATCH_SIZE: u64 = 64;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TaskEventFanoutCursorBackfillSummary {
@@ -18,7 +18,7 @@ pub(crate) struct TaskEventFanoutCursorBackfillSummary {
     pub(crate) tasks_initialized: u64,
 }
 
-pub(super) async fn run(crud_store: &CrudStore) {
+pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
     match backfill_once(crud_store).await {
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
@@ -33,8 +33,10 @@ pub(super) async fn run(crud_store: &CrudStore) {
                 error = %format!("{error:#}"),
                 "task event fanout cursor background backfill failed"
             );
+            return Err(error);
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn backfill_once(
@@ -94,7 +96,7 @@ async fn backfill_all_batches(
         }
         summary.batches = summary.batches.saturating_add(1);
         summary.tasks_initialized = summary.tasks_initialized.saturating_add(processed as u64);
-        tokio::task::yield_now().await;
+        super::maintenance_checkpoint().await?;
     }
     Ok(summary)
 }

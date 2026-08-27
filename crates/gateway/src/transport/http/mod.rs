@@ -10,4 +10,4 @@ pub(crate) mod streams;
 mod views;
 
 pub(crate) use router::gateway_router;
-pub(crate) use state::GatewayHttpState;
+pub(crate) use state::{GatewayHttpState, ReadinessDegradation, ReadinessState};

@@ -176,4 +176,11 @@ impl MessageProcessor {
 
         *guard = Some(handle);
     }
+
+    pub(crate) async fn shutdown_skills_watcher(&self) {
+        if let Some(handle) = self.skills_watcher_worker.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }

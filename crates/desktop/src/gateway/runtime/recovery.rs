@@ -1,6 +1,10 @@
-use crate::gateway::connectivity::{is_gateway_reachable, is_local_gateway_reachable};
+use crate::gateway::connectivity::{
+    LocalGatewayReadiness, is_gateway_reachable, is_local_gateway_reachable,
+    local_gateway_readiness,
+};
 use crate::gateway::control::{
     create_local_pending_device_session, is_configured_service_active, start_gateway_service,
+    wait_for_gateway_service,
 };
 use crate::gateway::registry::save_registry;
 use anyhow::{Result, bail};
@@ -22,16 +26,34 @@ impl GatewayRuntime {
             return Ok(ActiveGatewayState::NotConfigured);
         };
 
-        let reachable =
-            is_gateway_reachable(&active.gateway_base_url, self.timings.connect_timeout)?;
-
         if active.kind == GatewayEndpointKind::Local {
+            let tcp_reachable =
+                is_gateway_reachable(&active.gateway_base_url, self.timings.connect_timeout)?;
+            let readiness = if tcp_reachable {
+                local_gateway_readiness(
+                    self.config.gateway.listen_addr.as_str(),
+                    self.timings.connect_timeout,
+                )?
+            } else {
+                LocalGatewayReadiness::Unavailable
+            };
+            if readiness == LocalGatewayReadiness::IncompatibleService {
+                return Ok(ActiveGatewayState::LocalAddressConflict);
+            }
+            let gateway_present = readiness.status().is_some();
             let service_active =
                 is_configured_service_active(self.config.gateway.service_name.as_str())?;
-            let service_active = normalize_local_service_active(reachable, service_active);
-            return Ok(classify_local_gateway_state(reachable, service_active));
+            let service_active = normalize_local_service_active(gateway_present, service_active);
+            return Ok(classify_local_gateway_state(
+                readiness
+                    .status()
+                    .is_some_and(|status| status.accepts_sessions()),
+                service_active,
+            ));
         }
 
+        let reachable =
+            is_gateway_reachable(&active.gateway_base_url, self.timings.connect_timeout)?;
         Ok(if reachable {
             ActiveGatewayState::Connected
         } else {
@@ -80,7 +102,7 @@ impl GatewayRuntime {
                 "managed local gateway auto-update warning"
             );
         }
-        let reachable = observe_startup_stage(
+        let tcp_reachable = observe_startup_stage(
             trace,
             pioneer_observability::DesktopStartupStage::GatewayRuntimeReachabilityCheck,
             || is_local_gateway_reachable(listen_addr.as_str(), self.timings.connect_timeout),
@@ -90,9 +112,28 @@ impl GatewayRuntime {
             pioneer_observability::DesktopStartupStage::GatewayRuntimeServiceStatusCheck,
             || is_configured_service_active(service_name.as_str()),
         )?;
-        let service_active = normalize_local_service_active(reachable, service_active);
+        let readiness = if tcp_reachable {
+            local_gateway_readiness(listen_addr.as_str(), self.timings.connect_timeout)?
+        } else {
+            LocalGatewayReadiness::Unavailable
+        };
+        if readiness == LocalGatewayReadiness::IncompatibleService {
+            bail!(
+                "{}",
+                t!(
+                    "errors.gateway.address_conflict_inactive_service",
+                    listen_addr = listen_addr.as_str(),
+                    service_name = service_name.as_str()
+                )
+            );
+        }
+        let gateway_present = readiness.status().is_some();
+        let service_active = normalize_local_service_active(gateway_present, service_active);
+        let accepting_sessions = readiness
+            .status()
+            .is_some_and(|status| status.accepts_sessions());
 
-        match classify_local_gateway_state(reachable, service_active) {
+        match classify_local_gateway_state(accepting_sessions, service_active) {
             ActiveGatewayState::Connected => {
                 observe_startup_stage(
                     trace,
@@ -110,17 +151,26 @@ impl GatewayRuntime {
                 )
             ),
             ActiveGatewayState::Unreachable => {
-                let warnings = observe_startup_stage(
-                    trace,
-                    pioneer_observability::DesktopStartupStage::GatewayRuntimeServiceStart,
-                    || {
-                        start_gateway_service(
-                            service_name.as_str(),
-                            listen_addr.as_str(),
-                            &self.timings,
-                        )
-                    },
-                )?;
+                let warnings = if tcp_reachable || gateway_present || service_active {
+                    observe_startup_stage(
+                        trace,
+                        pioneer_observability::DesktopStartupStage::GatewayRuntimeServiceStart,
+                        || wait_for_gateway_service(listen_addr.as_str(), &self.timings),
+                    )?;
+                    Vec::new()
+                } else {
+                    observe_startup_stage(
+                        trace,
+                        pioneer_observability::DesktopStartupStage::GatewayRuntimeServiceStart,
+                        || {
+                            start_gateway_service(
+                                service_name.as_str(),
+                                listen_addr.as_str(),
+                                &self.timings,
+                            )
+                        },
+                    )?
+                };
                 for warning in warnings {
                     info!(
                         warning_code = %warning.code,
@@ -148,19 +198,15 @@ impl GatewayRuntime {
         let mut warnings =
             ensure_managed_gateway_up_to_date(service_name, listen_addr, &self.timings)?;
 
-        let reachable = is_local_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
+        let tcp_reachable = is_local_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
         let service_active = is_configured_service_active(service_name)?;
-        let service_active = normalize_local_service_active(reachable, service_active);
+        let readiness = if tcp_reachable {
+            local_gateway_readiness(listen_addr, self.timings.connect_timeout)?
+        } else {
+            LocalGatewayReadiness::Unavailable
+        };
 
-        if reachable && service_active {
-            self.ensure_local_gateway_session()?;
-            return Ok(LocalGatewayStartOutcome {
-                endpoint: self.local_gateway()?.clone(),
-                warnings,
-            });
-        }
-
-        if reachable && !service_active {
+        if readiness == LocalGatewayReadiness::IncompatibleService {
             bail!(
                 "{}",
                 t!(
@@ -171,11 +217,26 @@ impl GatewayRuntime {
             );
         }
 
-        warnings.extend(start_gateway_service(
-            service_name,
-            listen_addr,
-            &self.timings,
-        )?);
+        if readiness
+            .status()
+            .is_some_and(|status| status.accepts_sessions())
+        {
+            self.ensure_local_gateway_session()?;
+            return Ok(LocalGatewayStartOutcome {
+                endpoint: self.local_gateway()?.clone(),
+                warnings,
+            });
+        }
+
+        if tcp_reachable || readiness.status().is_some() || service_active {
+            wait_for_gateway_service(listen_addr, &self.timings)?;
+        } else {
+            warnings.extend(start_gateway_service(
+                service_name,
+                listen_addr,
+                &self.timings,
+            )?);
+        }
 
         self.ensure_local_gateway_session()?;
 

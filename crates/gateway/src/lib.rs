@@ -43,6 +43,7 @@ mod message;
 mod operations;
 mod patch_history_observer;
 mod permissions;
+mod post_startup;
 mod profile_avatar;
 mod prompt_hooks;
 mod public_error;
@@ -82,6 +83,7 @@ use pioneer_crud::CrudStore;
 use pioneer_hooks::HookAwaitPolicy;
 use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
 use pioneer_protocol::AuthDeviceCreateResponse;
+use pioneer_protocol::GatewayReadinessStatus;
 use pioneer_provider::{
     ArtifactExternalRefCachePolicy, AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy,
     AttachmentPipelineConfig, AttachmentRetryPolicy, AttachmentRuntimePolicy,
@@ -117,7 +119,7 @@ use crate::thread_episodic::{
     ThreadEpisodicIndexExecutorConfig, ThreadEpisodicRecallServiceConfig,
     ThreadEpisodicRuntimeConfig,
 };
-use crate::transport::spawn_server;
+use crate::transport::{ReadinessDegradation, spawn_server};
 use crate::voice::model_catalog::voice_model_catalog;
 use crate::voice::supervisor::{
     EagerVoiceEngineLoader, FilesystemVoiceModelInstaller, VoiceEngineLoader,
@@ -831,82 +833,173 @@ async fn run_gateway_until_shutdown_inner(
         stage.succeed();
 
         let stage =
-            startup.stage(pioneer_observability::GatewayStartupStage::ServicesSelfImprovementStart);
-        self_improvement_supervisor
-            .start()
-            .await
-            .context("failed to start self-improvement supervisor")?;
-        stage.succeed();
-
-        let stage =
             startup.stage(pioneer_observability::GatewayStartupStage::ServicesNotificationsStart);
         message_processor.start_remote_access_status_notifications();
         message_processor.start_voice_input_status_notifications();
         message_processor.start_thread_episodic_vector_refill_status_notifications();
         stage.succeed();
 
-        let stage =
-            startup.stage(pioneer_observability::GatewayStartupStage::ServicesResilienceStart);
-        message_processor
-            .start_resilience_workers()
-            .await
-            .context("failed to start resilience workers")?;
-        stage.succeed();
-
-        let stage = startup.stage(pioneer_observability::GatewayStartupStage::ServicesMcpStart);
-        message_processor.start_mcp_workspace_supervisor().await;
-        stage.succeed();
-
-        let stage =
-            startup.stage(pioneer_observability::GatewayStartupStage::ServicesSkillsWatcherStart);
-        message_processor.start_skills_watcher().await;
-        stage.succeed();
-
-        let stage =
-            startup.stage(pioneer_observability::GatewayStartupStage::ServicesDatabaseWorkersStart);
-        // Long-running migrations and backfills start only after the Gateway listener exists.
-        database::startup::spawn(
-            message_processor.clone(),
-            message_processor.crud_store.clone(),
-            thread_episodic_storage_root.clone(),
-            startup_thread_episodic_vector_search_config,
-            thread_episodic_workspace_vector_search_configs.clone(),
-            provider_registry.clone(),
-            runtime_home.clone(),
-            Some(message_processor.thread_episodic_vector_refill_status_sender()),
-            message_processor.thread_episodic_workspace_refill_supervisor(),
-            context_compaction_timeout_config,
-        );
-        database::maintenance::spawn(message_processor.crud_store.clone());
-        stage.succeed();
-
-        let stage =
-            startup.stage(pioneer_observability::GatewayStartupStage::ServicesRemoteAccessStart);
-        remote_access_supervisor
-            .apply(remote_access_desired_state(
-                &remote_access_config,
-                &gateway_settings,
-                gateway_secrets.as_ref(),
-            )?)
-            .await
-            .context("failed to apply initial remote access settings")?;
-        stage.succeed();
-
-        let stage = startup
-            .stage(pioneer_observability::GatewayStartupStage::ServicesProviderReadinessStart);
-        message_processor
-            .start_provider_readiness_supervisor()
-            .await;
-        stage.succeed();
-
         Ok(())
     }
     .await;
+    let post_message_processor = message_processor.clone();
+    let post_crud_store = message_processor.crud_store.clone();
+    let post_self_improvement_supervisor = self_improvement_supervisor.clone();
+    let post_remote_access_supervisor = remote_access_supervisor.clone();
+    let post_remote_access_config = remote_access_config.clone();
+    let post_gateway_settings = gateway_settings.clone();
+    let post_gateway_secrets = gateway_secrets.clone();
+    let post_thread_episodic_storage_root = thread_episodic_storage_root.clone();
+    let post_workspace_vector_search_configs =
+        thread_episodic_workspace_vector_search_configs.clone();
+    let post_provider_registry = provider_registry.clone();
+    let post_runtime_home = runtime_home.clone();
+    let post_readiness = handle.readiness_state();
+    let mut post_startup = None;
     let runtime_result = match services_start_result {
         Ok(()) => {
             services_start_stage.succeed();
+            // Schema, identity, authorization and the fast in-process service
+            // bindings are complete. Clients may now authenticate while the
+            // single owned post-startup pipeline brings optional subsystems
+            // online without competing background jobs.
+            handle.set_readiness(GatewayReadinessStatus::AcceptingSessions);
             startup.finish_success();
             info!(listen_addr = %handle.local_addr(), "gateway daemon started");
+            post_startup = Some(post_startup::PostStartupSupervisor::start(
+                move |scope| async move {
+                    let cancellation = scope.cancellation();
+                    // Resilience owns an independent, joined retry loop. A
+                    // persistent repair/runtime failure must be visible in
+                    // readiness, but must not head-of-line block unrelated
+                    // providers, MCP, remote access, or database maintenance.
+                    let resilience_message_processor = post_message_processor.clone();
+                    let resilience_cancellation = cancellation.clone();
+                    let resilience_readiness = post_readiness.clone();
+                    scope.spawn(async move {
+                        let readiness_updates = resilience_readiness.clone();
+                        let result = tokio::select! {
+                            _ = resilience_cancellation.cancelled() => return,
+                            result = resilience_message_processor.start_resilience_workers_with_cancellation(
+                                &resilience_cancellation,
+                                move |degraded| {
+                                    readiness_updates
+                                        .set_degraded(ReadinessDegradation::Resilience, degraded);
+                                },
+                            ) => result,
+                        };
+                        if let Err(error) = result
+                            && !resilience_cancellation.is_cancelled()
+                        {
+                            resilience_readiness
+                                .set_degraded(ReadinessDegradation::Resilience, true);
+                            warn!(error = %format!("{error:#}"), "resilience retry worker stopped");
+                        }
+                    });
+
+                    let self_improvement_result = tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        result = post_self_improvement_supervisor.start() => result,
+                    };
+                    if let Err(error) = self_improvement_result {
+                        warn!(error = %format!("{error:#}"), "failed to start self-improvement supervisor");
+                        post_readiness.set_degraded(ReadinessDegradation::SelfImprovement, true);
+                    }
+
+                    // MCP has its own owned retry loop. A broken workspace must
+                    // degrade MCP readiness without head-of-line blocking
+                    // skills, providers, remote access, or DB maintenance.
+                    let mcp_message_processor = post_message_processor.clone();
+                    let mcp_cancellation = cancellation.clone();
+                    let mcp_readiness = post_readiness.clone();
+                    scope.spawn(async move {
+                        let readiness_updates = mcp_readiness.clone();
+                        let result = tokio::select! {
+                            _ = mcp_cancellation.cancelled() => return,
+                            result = mcp_message_processor.initialize_mcp_workspaces_with_retry(
+                                &mcp_cancellation,
+                                move |degraded| {
+                                    readiness_updates.set_degraded(
+                                        ReadinessDegradation::Mcp,
+                                        degraded,
+                                    );
+                                },
+                            ) => result,
+                        };
+                        if let Err(error) = result
+                            && !mcp_cancellation.is_cancelled()
+                        {
+                            mcp_readiness.set_degraded(ReadinessDegradation::Mcp, true);
+                            warn!(error = %format!("{error:#}"), "MCP workspace retry worker stopped");
+                        }
+                    });
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        _ = post_message_processor.start_skills_watcher() => {}
+                    }
+
+                    match remote_access_desired_state(
+                        &post_remote_access_config,
+                        &post_gateway_settings,
+                        post_gateway_secrets.as_ref(),
+                    ) {
+                        Ok(desired) => {
+                            let result = tokio::select! {
+                                _ = cancellation.cancelled() => return,
+                                result = post_remote_access_supervisor.apply(desired) => result,
+                            };
+                            if let Err(error) = result {
+                                warn!(error = %format!("{error:#}"), "failed to apply initial remote access settings");
+                                post_readiness
+                                    .set_degraded(ReadinessDegradation::RemoteAccess, true);
+                            }
+                        }
+                        Err(error) => {
+                            warn!(error = %format!("{error:#}"), "failed to resolve initial remote access state");
+                            post_readiness.set_degraded(ReadinessDegradation::RemoteAccess, true);
+                        }
+                    }
+
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        _ = post_message_processor.start_provider_readiness_supervisor() => {}
+                    }
+                    post_readiness.set_status(GatewayReadinessStatus::Operational);
+
+                    // Phase 2: all legacy maintenance is best-effort and
+                    // cooperative. It runs only after the operational runtime
+                    // exists, one bounded batch at a time, and is the sole
+                    // owner of periodic database maintenance afterwards.
+                    let maintenance = tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        result = database::startup::run(
+                            post_message_processor.clone(),
+                            post_crud_store.clone(),
+                            post_thread_episodic_storage_root,
+                            startup_thread_episodic_vector_search_config,
+                            post_workspace_vector_search_configs,
+                            post_provider_registry,
+                            post_runtime_home,
+                            Some(post_message_processor.thread_episodic_vector_refill_status_sender()),
+                            post_message_processor.thread_episodic_workspace_refill_supervisor(),
+                            context_compaction_timeout_config,
+                            cancellation.clone(),
+                        ) => result,
+                    };
+                    if let Err(error) = maintenance {
+                        if cancellation.is_cancelled() {
+                            return;
+                        }
+                        warn!(error = %format!("{error:#}"), "post-startup database maintenance ended early");
+                        post_readiness
+                            .set_degraded(ReadinessDegradation::DatabaseMaintenance, true);
+                    }
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {}
+                        _ = database::maintenance::run(post_crud_store, cancellation.clone()) => {}
+                    }
+                },
+            ));
             wait_for_shutdown_signal().await
         }
         Err(error) => {
@@ -917,9 +1010,19 @@ async fn run_gateway_until_shutdown_inner(
     };
 
     info!("gateway daemon stopping with telemetry snapshot");
+    handle.set_readiness(GatewayReadinessStatus::Starting);
+    if let Some(post_startup) = post_startup.as_mut() {
+        post_startup.shutdown().await;
+    }
+    message_processor
+        .thread_episodic_workspace_refill_supervisor()
+        .shutdown()
+        .await;
     message_processor
         .shutdown_provider_readiness_supervisor()
         .await;
+    message_processor.shutdown_skills_watcher().await;
+    message_processor.shutdown_resilience_workers().await;
     let patch_telemetry = pioneer_tools::apply_patch::patch_telemetry().snapshot();
     info!(
         calls = patch_telemetry.calls,

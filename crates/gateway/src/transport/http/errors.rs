@@ -88,9 +88,9 @@ impl HttpError {
 
     pub(crate) fn from_auth(error: &AuthError, request_id: RequestId) -> Self {
         match error.code() {
-            AuthErrorCode::AuthNotReady | AuthErrorCode::ExchangeTimeout => {
-                Self::service_unavailable(request_id)
-            }
+            AuthErrorCode::AuthNotReady
+            | AuthErrorCode::TemporarilyUnavailable
+            | AuthErrorCode::ExchangeTimeout => Self::service_unavailable(request_id),
             _ => Self::unauthorized(request_id),
         }
     }

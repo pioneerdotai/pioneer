@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 const TURN_ITEM_ATTEMPT_PAYLOAD_COMPACTION_KEY: &str = "turn_item_attempt_payload_compaction";
 const TURN_ITEM_ATTEMPT_PAYLOAD_COMPACTION_VERSION: i64 = 1;
-const TURN_ITEM_ATTEMPT_PAYLOAD_COMPACTION_BATCH_SIZE: u64 = 4096;
+const TURN_ITEM_ATTEMPT_PAYLOAD_COMPACTION_BATCH_SIZE: u64 = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct TurnItemAttemptPayloadCompactionStartupSummary {
@@ -21,7 +21,7 @@ pub(crate) struct TurnItemAttemptPayloadCompactionStartupSummary {
     pub(crate) turns_touched: u64,
 }
 
-pub(super) async fn run(crud_store: &CrudStore) {
+pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
     match compact_once(crud_store).await {
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
@@ -39,8 +39,10 @@ pub(super) async fn run(crud_store: &CrudStore) {
                 error = %format!("{error:#}"),
                 "turn_item_attempt terminal payload compaction failed at startup"
             );
+            return Err(error);
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn compact_once(
@@ -105,6 +107,7 @@ async fn compact_all_batches(
         if batch.candidate_rows == 0 {
             break;
         }
+        super::maintenance_checkpoint().await?;
     }
 
     Ok(summary)

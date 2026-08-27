@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 use anyhow::{Context, Result};
 use pioneer_entity::{
@@ -9,7 +10,9 @@ use pioneer_protocol::{
     GatewayId, PrincipalKind, PrincipalStatus, RoleKey, ThreadOriginKind, ThreadSidebarVisibility,
     TurnKind, TurnOrigin, TurnStatus,
 };
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 
 use super::identity::{actor_ref_from_db, principal_kind_from_db, principal_status_from_db};
 use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
@@ -270,27 +273,106 @@ pub async fn scan_authorization_persistence_invariants<C: ConnectionTrait>(
     db: &C,
     gateway_id: &GatewayId,
 ) -> Result<AuthorizationPersistenceInvariantReport> {
-    let principals = gateway_principal::Entity::find()
-        .all(db)
+    scan_authorization_persistence_invariants_cooperative(db, gateway_id, 256, || async { Ok(()) })
         .await
-        .context("failed to scan authorization principals")?;
+}
+
+/// Scans authorization invariants without monopolizing a pooled SQLite
+/// connection for an entire table. The checkpoint runs only after a bounded
+/// query has completed and its connection has returned to the pool.
+pub async fn scan_authorization_persistence_invariants_cooperative<C, F, Fut>(
+    db: &C,
+    gateway_id: &GatewayId,
+    batch_size: u64,
+    mut checkpoint: F,
+) -> Result<AuthorizationPersistenceInvariantReport>
+where
+    C: ConnectionTrait,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let batch_size = batch_size.clamp(1, 1_024);
+
+    let mut principals = Vec::new();
+    let mut principal_cursor: Option<String> = None;
+    loop {
+        let mut query = gateway_principal::Entity::find();
+        if let Some(cursor) = principal_cursor.as_deref() {
+            query = query.filter(gateway_principal::Column::Id.gt(cursor.to_owned()));
+        }
+        let batch = query
+            .order_by_asc(gateway_principal::Column::Id)
+            .limit(batch_size)
+            .all(db)
+            .await
+            .context("failed to scan authorization principals")?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        principal_cursor = Some(last.id.clone());
+        principals.extend(batch);
+        checkpoint().await?;
+    }
     let principal_by_id = principals
         .iter()
         .map(|principal| (principal.id.as_str(), principal))
         .collect::<HashMap<_, _>>();
-    let workspaces = workspace::Entity::find()
-        .select_only()
-        .column(workspace::Column::Id)
-        .into_tuple::<String>()
-        .all(db)
-        .await
-        .context("failed to scan authorization workspaces")?
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let workspace_memberships = workspace_membership::Entity::find()
-        .all(db)
-        .await
-        .context("failed to scan workspace memberships")?;
+
+    let mut workspaces = HashSet::new();
+    let mut workspace_cursor: Option<String> = None;
+    loop {
+        let mut query = workspace::Entity::find()
+            .select_only()
+            .column(workspace::Column::Id);
+        if let Some(cursor) = workspace_cursor.as_deref() {
+            query = query.filter(workspace::Column::Id.gt(cursor.to_owned()));
+        }
+        let batch = query
+            .order_by_asc(workspace::Column::Id)
+            .limit(batch_size)
+            .into_tuple::<String>()
+            .all(db)
+            .await
+            .context("failed to scan authorization workspaces")?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        workspace_cursor = Some(last.clone());
+        workspaces.extend(batch);
+        checkpoint().await?;
+    }
+
+    let mut workspace_memberships = Vec::new();
+    let mut workspace_membership_cursor: Option<(String, String)> = None;
+    loop {
+        let mut query = workspace_membership::Entity::find();
+        if let Some((principal_id, workspace_id)) = workspace_membership_cursor.as_ref() {
+            query = query.filter(
+                Condition::any()
+                    .add(workspace_membership::Column::PrincipalId.gt(principal_id.clone()))
+                    .add(
+                        Condition::all()
+                            .add(workspace_membership::Column::PrincipalId.eq(principal_id.clone()))
+                            .add(
+                                workspace_membership::Column::WorkspaceId.gt(workspace_id.clone()),
+                            ),
+                    ),
+            );
+        }
+        let batch = query
+            .order_by_asc(workspace_membership::Column::PrincipalId)
+            .order_by_asc(workspace_membership::Column::WorkspaceId)
+            .limit(batch_size)
+            .all(db)
+            .await
+            .context("failed to scan workspace memberships")?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        workspace_membership_cursor = Some((last.principal_id.clone(), last.workspace_id.clone()));
+        workspace_memberships.extend(batch);
+        checkpoint().await?;
+    }
     let workspace_membership_keys = workspace_memberships
         .iter()
         .map(|membership| {
@@ -300,27 +382,83 @@ pub async fn scan_authorization_persistence_invariants<C: ConnectionTrait>(
             )
         })
         .collect::<HashSet<_>>();
-    let threads = thread::Entity::find()
-        .all(db)
-        .await
-        .context("failed to scan authorization threads")?;
+    let mut threads = Vec::new();
+    let mut thread_cursor: Option<String> = None;
+    loop {
+        let mut query = thread::Entity::find();
+        if let Some(cursor) = thread_cursor.as_deref() {
+            query = query.filter(thread::Column::Id.gt(cursor.to_owned()));
+        }
+        let batch = query
+            .order_by_asc(thread::Column::Id)
+            .limit(batch_size)
+            .all(db)
+            .await
+            .context("failed to scan authorization threads")?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        thread_cursor = Some(last.id.clone());
+        threads.extend(batch);
+        checkpoint().await?;
+    }
     let thread_by_id = threads
         .iter()
         .map(|model| (model.id.as_str(), model))
         .collect::<HashMap<_, _>>();
-    let lineage_children = thread_lineage::Entity::find()
-        .select_only()
-        .column(thread_lineage::Column::ChildThreadId)
-        .into_tuple::<String>()
-        .all(db)
-        .await
-        .context("failed to scan thread lineage children")?
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let thread_memberships = thread_membership::Entity::find()
-        .all(db)
-        .await
-        .context("failed to scan thread memberships")?;
+    let mut lineage_children = HashSet::new();
+    let mut lineage_cursor: Option<String> = None;
+    loop {
+        let mut query = thread_lineage::Entity::find()
+            .select_only()
+            .column(thread_lineage::Column::ChildThreadId);
+        if let Some(cursor) = lineage_cursor.as_deref() {
+            query = query.filter(thread_lineage::Column::ChildThreadId.gt(cursor.to_owned()));
+        }
+        let batch = query
+            .order_by_asc(thread_lineage::Column::ChildThreadId)
+            .limit(batch_size)
+            .into_tuple::<String>()
+            .all(db)
+            .await
+            .context("failed to scan thread lineage children")?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        lineage_cursor = Some(last.clone());
+        lineage_children.extend(batch);
+        checkpoint().await?;
+    }
+
+    let mut thread_memberships = Vec::new();
+    let mut thread_membership_cursor: Option<(String, String)> = None;
+    loop {
+        let mut query = thread_membership::Entity::find();
+        if let Some((thread_id, principal_id)) = thread_membership_cursor.as_ref() {
+            query = query.filter(
+                Condition::any()
+                    .add(thread_membership::Column::ThreadId.gt(thread_id.clone()))
+                    .add(
+                        Condition::all()
+                            .add(thread_membership::Column::ThreadId.eq(thread_id.clone()))
+                            .add(thread_membership::Column::PrincipalId.gt(principal_id.clone())),
+                    ),
+            );
+        }
+        let batch = query
+            .order_by_asc(thread_membership::Column::ThreadId)
+            .order_by_asc(thread_membership::Column::PrincipalId)
+            .limit(batch_size)
+            .all(db)
+            .await
+            .context("failed to scan thread memberships")?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        thread_membership_cursor = Some((last.thread_id.clone(), last.principal_id.clone()));
+        thread_memberships.extend(batch);
+        checkpoint().await?;
+    }
     let thread_membership_keys = thread_memberships
         .iter()
         .map(|membership| {
@@ -462,21 +600,39 @@ pub async fn scan_authorization_persistence_invariants<C: ConnectionTrait>(
         }
     }
 
-    let active_versions = agent_skill::Entity::find()
-        .filter(agent_skill::Column::ActiveVersionId.is_not_null())
-        .all(db)
-        .await
-        .context("failed to scan active learned versions")?;
     let mut ineligible_active_learned_versions = 0usize;
-    for skill in active_versions {
-        let Some(version_id) = skill.active_version_id.as_deref() else {
-            continue;
+    let mut skill_cursor: Option<String> = None;
+    loop {
+        let mut query =
+            agent_skill::Entity::find().filter(agent_skill::Column::ActiveVersionId.is_not_null());
+        if let Some(cursor) = skill_cursor.as_deref() {
+            query = query.filter(agent_skill::Column::Id.gt(cursor.to_owned()));
+        }
+        let batch = query
+            .order_by_asc(agent_skill::Column::Id)
+            .limit(batch_size)
+            .all(db)
+            .await
+            .context("failed to scan active learned versions")?;
+        let Some(last) = batch.last() else {
+            break;
         };
-        if derive_member_learned_version_eligibility(db, skill.workspace_id.as_str(), version_id)
+        skill_cursor = Some(last.id.clone());
+        for skill in batch {
+            let Some(version_id) = skill.active_version_id.as_deref() else {
+                continue;
+            };
+            if derive_member_learned_version_eligibility(
+                db,
+                skill.workspace_id.as_str(),
+                version_id,
+            )
             .await?
-            != MemberLearnedVersionEligibility::Eligible
-        {
-            ineligible_active_learned_versions += 1;
+                != MemberLearnedVersionEligibility::Eligible
+            {
+                ineligible_active_learned_versions += 1;
+            }
+            checkpoint().await?;
         }
     }
 
@@ -560,6 +716,9 @@ fn push_violation(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use migration::{Migrator, MigratorTrait};
     use pioneer_entity::{
         agent_skill, agent_skill_version, gateway_identity, gateway_principal,
@@ -685,6 +844,27 @@ mod tests {
         .unwrap();
         assert!(report.is_valid(), "{}", report.safe_diagnostic());
         assert_eq!(report.ineligible_active_learned_versions, 0);
+    }
+
+    #[tokio::test]
+    async fn cooperative_scan_checkpoints_between_bounded_table_batches() {
+        let database = base_database(true).await;
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let observed = checkpoints.clone();
+        let report = scan_authorization_persistence_invariants_cooperative(
+            &database,
+            &GatewayId::new(GATEWAY_ID).unwrap(),
+            1,
+            move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(report.is_valid(), "{}", report.safe_diagnostic());
+        assert!(checkpoints.load(Ordering::Relaxed) >= 4);
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 const TASK_ANCHOR_BACKFILL_KEY: &str = "task_anchor_payload_backfill";
 const TASK_ANCHOR_BACKFILL_VERSION: i64 = 3;
-const TASK_ANCHOR_BACKFILL_BATCH_SIZE: u64 = 256;
+const TASK_ANCHOR_BACKFILL_BATCH_SIZE: u64 = 32;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TaskAnchorBackfillSummary {
@@ -25,7 +25,7 @@ pub(crate) struct TaskAnchorBackfillSummary {
     pub(crate) missing_tasks: usize,
 }
 
-pub(super) async fn run(crud_store: &CrudStore) {
+pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
     match backfill_once(crud_store).await {
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
@@ -42,8 +42,10 @@ pub(super) async fn run(crud_store: &CrudStore) {
                 error = %format!("{error:#}"),
                 "task anchor backfill failed at startup"
             );
+            return Err(error);
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn backfill_once(crud_store: &CrudStore) -> Result<TaskAnchorBackfillSummary> {
@@ -145,6 +147,7 @@ pub(crate) async fn backfill_once(crud_store: &CrudStore) -> Result<TaskAnchorBa
                 .context("failed to update task anchor payload")?;
             summary.anchors_updated = summary.anchors_updated.saturating_add(1);
         }
+        super::maintenance_checkpoint().await?;
     }
 
     mark_backfill_complete(&db, total_task_rows as i64).await?;

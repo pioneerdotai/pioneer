@@ -77,18 +77,25 @@ pub(crate) struct ZstdColumnCompressionSummary {
     pub(crate) pending_before: u64,
     pub(crate) pending_after: u64,
     pub(crate) maintenance_more_pending: bool,
+    /// Exact row counts are intentionally collected only by explicit test and
+    /// diagnostic entry points. Production cooperative maintenance must not
+    /// turn telemetry into an unbounded full-table scan while it owns the
+    /// Gateway's single SQLite connection.
+    pub(crate) counts_exact: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ZstdPeriodicMaintenanceOutcome {
     pub(crate) summaries: Vec<ZstdColumnCompressionSummary>,
     pub(crate) deferred: bool,
+    pub(crate) cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CooperativeMaintenanceOutcome {
     more_pending: bool,
     deferred: bool,
+    cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,8 +104,16 @@ struct EnsureCompressionResult {
     was_enabled: bool,
     enabled_now: bool,
     skipped_empty: bool,
+    counts_exact: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowInspection {
+    Exact,
+    Bounded,
+}
+
+#[cfg(test)]
 pub(crate) async fn run_startup_once(
     crud_store: &CrudStore,
     config: ZstdColumnConfig,
@@ -108,7 +123,7 @@ pub(crate) async fn run_startup_once(
     let db = crud_store.database_connection();
     verify_sqlite_zstd_registered(&db).await?;
 
-    let ensure = ensure_compression_enabled(&db, config).await?;
+    let ensure = ensure_compression_enabled(&db, config, RowInspection::Exact).await?;
     if ensure.skipped_empty {
         return Ok(summary_without_maintenance(config, ensure));
     }
@@ -128,15 +143,60 @@ pub(crate) async fn run_startup_once(
         pending_before,
         pending_after,
         maintenance_more_pending,
+        counts_exact: ensure.counts_exact,
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn run_periodic_maintenance_once(
     crud_store: &CrudStore,
     configs: &[ZstdColumnConfig],
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
 ) -> Result<ZstdPeriodicMaintenanceOutcome> {
+    run_periodic_maintenance(
+        crud_store,
+        configs,
+        maintenance_seconds,
+        target_db_load,
+        None,
+        RowInspection::Exact,
+    )
+    .await
+}
+
+pub(crate) async fn run_cooperative_maintenance_cycle(
+    crud_store: &CrudStore,
+    configs: &[ZstdColumnConfig],
+    maintenance_seconds: Option<f64>,
+    target_db_load: f64,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<ZstdPeriodicMaintenanceOutcome> {
+    run_periodic_maintenance(
+        crud_store,
+        configs,
+        maintenance_seconds,
+        target_db_load,
+        Some(cancellation),
+        RowInspection::Bounded,
+    )
+    .await
+}
+
+async fn run_periodic_maintenance(
+    crud_store: &CrudStore,
+    configs: &[ZstdColumnConfig],
+    maintenance_seconds: Option<f64>,
+    target_db_load: f64,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    row_inspection: RowInspection,
+) -> Result<ZstdPeriodicMaintenanceOutcome> {
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Ok(ZstdPeriodicMaintenanceOutcome {
+            cancelled: true,
+            ..Default::default()
+        });
+    }
     let db = crud_store.database_connection();
     verify_sqlite_zstd_registered(&db).await?;
 
@@ -148,8 +208,11 @@ pub(crate) async fn run_periodic_maintenance_once(
             async move {
                 let mut before = Vec::with_capacity(configs.len());
                 for config in configs {
-                    let ensure = ensure_compression_enabled(&db, config).await?;
-                    let pending_before = pending_uncompressed_rows(&db, config).await?;
+                    let ensure = ensure_compression_enabled(&db, config, row_inspection).await?;
+                    let pending_before = match row_inspection {
+                        RowInspection::Exact => pending_uncompressed_rows(&db, config).await?,
+                        RowInspection::Bounded => 0,
+                    };
                     before.push((config, ensure, pending_before));
                 }
                 Ok(before)
@@ -160,6 +223,7 @@ pub(crate) async fn run_periodic_maintenance_once(
         return Ok(ZstdPeriodicMaintenanceOutcome {
             summaries: Vec::new(),
             deferred: true,
+            cancelled: false,
         });
     };
 
@@ -167,14 +231,32 @@ pub(crate) async fn run_periodic_maintenance_once(
         .iter()
         .any(|(_, ensure, _)| ensure.was_enabled || ensure.enabled_now);
     let maintenance = if should_run_maintenance {
-        run_cooperative_maintenance(crud_store, &db, maintenance_seconds, target_db_load).await?
+        run_cooperative_maintenance(
+            crud_store,
+            &db,
+            maintenance_seconds,
+            target_db_load,
+            cancellation,
+        )
+        .await?
     } else {
         CooperativeMaintenanceOutcome::default()
     };
 
+    if maintenance.cancelled {
+        return Ok(ZstdPeriodicMaintenanceOutcome {
+            summaries: Vec::new(),
+            deferred: false,
+            cancelled: true,
+        });
+    }
+
     let mut summaries = Vec::with_capacity(before.len());
     for (config, ensure, pending_before) in before {
-        let pending_after = pending_uncompressed_rows(&db, config).await?;
+        let pending_after = match row_inspection {
+            RowInspection::Exact => pending_uncompressed_rows(&db, config).await?,
+            RowInspection::Bounded => 0,
+        };
         summaries.push(ZstdColumnCompressionSummary {
             table: config.table,
             column: config.column,
@@ -185,12 +267,14 @@ pub(crate) async fn run_periodic_maintenance_once(
             pending_before,
             pending_after,
             maintenance_more_pending: maintenance.more_pending,
+            counts_exact: ensure.counts_exact,
         });
     }
 
     Ok(ZstdPeriodicMaintenanceOutcome {
         summaries,
         deferred: maintenance.deferred,
+        cancelled: false,
     })
 }
 
@@ -199,6 +283,7 @@ async fn run_cooperative_maintenance(
     db: &DatabaseConnection,
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<CooperativeMaintenanceOutcome> {
     let Some(total_seconds) = maintenance_seconds else {
         let result = crud_store
@@ -211,10 +296,12 @@ async fn run_cooperative_maintenance(
             Some(more_pending) => CooperativeMaintenanceOutcome {
                 more_pending,
                 deferred: false,
+                cancelled: false,
             },
             None => CooperativeMaintenanceOutcome {
                 more_pending: true,
                 deferred: true,
+                cancelled: false,
             },
         });
     };
@@ -223,6 +310,13 @@ async fn run_cooperative_maintenance(
     let deadline = Instant::now() + budget;
     let mut more_pending = true;
     while more_pending {
+        if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Ok(CooperativeMaintenanceOutcome {
+                more_pending: true,
+                deferred: false,
+                cancelled: true,
+            });
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -240,29 +334,54 @@ async fn run_cooperative_maintenance(
             return Ok(CooperativeMaintenanceOutcome {
                 more_pending: true,
                 deferred: true,
+                cancelled: false,
             });
         };
         more_pending = slice_more_pending;
-        tokio::task::yield_now().await;
+        if more_pending {
+            if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Ok(CooperativeMaintenanceOutcome {
+                            more_pending: true,
+                            deferred: false,
+                            cancelled: true,
+                        });
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     Ok(CooperativeMaintenanceOutcome {
         more_pending,
         deferred: false,
+        cancelled: false,
     })
 }
 
 async fn ensure_compression_enabled(
     db: &DatabaseConnection,
     config: ZstdColumnConfig,
+    row_inspection: RowInspection,
 ) -> Result<EnsureCompressionResult> {
-    let total_rows = row_count(db, config).await?;
     let was_enabled = compression_is_enabled(db, config).await?;
+    let (total_rows, has_rows) = match row_inspection {
+        RowInspection::Exact => {
+            let total_rows = row_count(db, config).await?;
+            (total_rows, total_rows != 0)
+        }
+        RowInspection::Bounded if was_enabled => (0, true),
+        RowInspection::Bounded => (0, table_has_rows(db, config).await?),
+    };
     let mut enabled_now = false;
     let mut skipped_empty = false;
 
     if !was_enabled {
-        if total_rows == 0 {
+        if !has_rows {
             skipped_empty = true;
         } else {
             mark_compression_backfilling(db, config).await?;
@@ -282,9 +401,11 @@ async fn ensure_compression_enabled(
         was_enabled,
         enabled_now,
         skipped_empty,
+        counts_exact: row_inspection == RowInspection::Exact,
     })
 }
 
+#[cfg(test)]
 fn summary_without_maintenance(
     config: ZstdColumnConfig,
     ensure: EnsureCompressionResult,
@@ -299,6 +420,7 @@ fn summary_without_maintenance(
         pending_before: 0,
         pending_after: 0,
         maintenance_more_pending: false,
+        counts_exact: ensure.counts_exact,
     }
 }
 
@@ -409,6 +531,20 @@ async fn row_count(db: &DatabaseConnection, config: ZstdColumnConfig) -> Result<
     )
     .await
     .map(|value| value.max(0) as u64)
+}
+
+async fn table_has_rows(db: &DatabaseConnection, config: ZstdColumnConfig) -> Result<bool> {
+    query_i64(
+        db,
+        format!(
+            "SELECT EXISTS(SELECT 1 FROM {} LIMIT 1) AS value",
+            config.table
+        )
+        .as_str(),
+        "failed to inspect zstd target rows",
+    )
+    .await
+    .map(|value| value != 0)
 }
 
 async fn query_i64<C>(db: &C, sql: &str, error_context: &'static str) -> Result<i64>

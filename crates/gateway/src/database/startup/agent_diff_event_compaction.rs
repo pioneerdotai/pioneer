@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 const AGENT_DIFF_EVENT_COMPACTION_KEY: &str = "agent_diff_turn_event_compaction";
 const AGENT_DIFF_EVENT_COMPACTION_VERSION: i64 = 1;
-const AGENT_DIFF_EVENT_COMPACTION_BATCH_SIZE: u64 = 1024;
+const AGENT_DIFF_EVENT_COMPACTION_BATCH_SIZE: u64 = 128;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct AgentDiffEventCompactionStartupSummary {
@@ -23,7 +23,7 @@ pub(crate) struct AgentDiffEventCompactionStartupSummary {
     pub(crate) skipped_failed: u64,
 }
 
-pub(super) async fn run(crud_store: &CrudStore) {
+pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
     match compact_once(crud_store).await {
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
@@ -43,8 +43,10 @@ pub(super) async fn run(crud_store: &CrudStore) {
                 error = %format!("{error:#}"),
                 "agent diff turn_event compaction failed at startup"
             );
+            return Err(error);
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn compact_once(
@@ -109,6 +111,7 @@ async fn compact_all_batches(
         if batch.candidate_rows == 0 {
             break;
         }
+        super::maintenance_checkpoint().await?;
     }
 
     Ok(summary)

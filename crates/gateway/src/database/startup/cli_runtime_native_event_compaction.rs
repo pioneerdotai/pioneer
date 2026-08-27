@@ -10,7 +10,7 @@ use tracing::{info, warn};
 const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_KEY: &str =
     "cli_runtime_native_event_terminal_delta_compaction";
 const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_VERSION: i64 = 2;
-const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_BATCH_SIZE: u64 = 16_384;
+const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_BATCH_SIZE: u64 = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct CliRuntimeNativeEventCompactionStartupSummary {
@@ -22,7 +22,7 @@ pub(crate) struct CliRuntimeNativeEventCompactionStartupSummary {
     pub(crate) turns_touched: u64,
 }
 
-pub(super) async fn run(crud_store: &CrudStore) {
+pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
     match compact_once(crud_store).await {
         Ok(summary) if summary.skipped => {}
         Ok(summary) => {
@@ -40,8 +40,10 @@ pub(super) async fn run(crud_store: &CrudStore) {
                 error = %format!("{error:#}"),
                 "CLI runtime native terminal delta event compaction failed at startup"
             );
+            return Err(error);
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn compact_once(
@@ -106,6 +108,7 @@ async fn compact_all_batches(
         if batch.candidate_rows == 0 {
             break;
         }
+        super::maintenance_checkpoint().await?;
     }
 
     Ok(summary)

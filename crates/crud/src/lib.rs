@@ -78,6 +78,7 @@ pub use repositories::authorization_persistence::{
     AuthorizationPersistenceInvariantKind, AuthorizationPersistenceInvariantReport,
     LearnedVersionIneligibleReason, MemberLearnedVersionEligibility,
     derive_member_learned_version_eligibility, scan_authorization_persistence_invariants,
+    scan_authorization_persistence_invariants_cooperative,
 };
 pub use repositories::authorization_scope::{
     ArtifactAuthorizationScope, CapabilityAuthorizationScope, PersistedCapabilityScopeKind,
@@ -201,6 +202,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -2055,6 +2058,84 @@ pub struct CrudStore {
     projector: TurnProjector,
     task_projector: TaskProjector,
     write_coordinator: SqliteWriteCoordinator,
+    semantic_timeline_revisions: SemanticTimelineRevisionRegistry,
+}
+
+#[derive(Clone, Default)]
+struct SemanticTimelineRevisionRegistry {
+    inner: Arc<Mutex<HashMap<String, SemanticTimelineRevisionEntry>>>,
+}
+
+struct SemanticTimelineRevisionEntry {
+    generation: Arc<AtomicU64>,
+    registrations: usize,
+}
+
+/// Short-lived per-Turn fence used by startup maintenance to detect a
+/// concurrent live semantic-timeline projection without rescanning the Turn's
+/// source tables before every bounded write.
+pub struct SemanticTimelineRevisionFence {
+    registry: SemanticTimelineRevisionRegistry,
+    turn_id: String,
+    generation: Arc<AtomicU64>,
+}
+
+impl SemanticTimelineRevisionRegistry {
+    fn register(&self, turn_id: &str) -> SemanticTimelineRevisionFence {
+        let mut entries = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry =
+            entries
+                .entry(turn_id.to_owned())
+                .or_insert_with(|| SemanticTimelineRevisionEntry {
+                    generation: Arc::new(AtomicU64::new(0)),
+                    registrations: 0,
+                });
+        entry.registrations = entry.registrations.saturating_add(1);
+        SemanticTimelineRevisionFence {
+            registry: self.clone(),
+            turn_id: turn_id.to_owned(),
+            generation: Arc::clone(&entry.generation),
+        }
+    }
+
+    fn advance_if_registered(&self, turn_id: &str) {
+        let entries = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = entries.get(turn_id) {
+            entry.generation.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+impl SemanticTimelineRevisionFence {
+    pub fn current(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SemanticTimelineRevisionFence {
+    fn drop(&mut self) {
+        let mut entries = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = entries.get_mut(self.turn_id.as_str()).is_some_and(|entry| {
+            if !Arc::ptr_eq(&entry.generation, &self.generation) {
+                return false;
+            }
+            entry.registrations = entry.registrations.saturating_sub(1);
+            entry.registrations == 0
+        });
+        if remove {
+            entries.remove(self.turn_id.as_str());
+        }
+    }
 }
 
 /// Complete durable write-set for one Task creation.  Task events, frozen
@@ -3476,7 +3557,90 @@ impl CrudStore {
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
             write_coordinator: SqliteWriteCoordinator::default(),
+            semantic_timeline_revisions: SemanticTimelineRevisionRegistry::default(),
         }
+    }
+
+    pub fn register_semantic_timeline_revision_fence(
+        &self,
+        turn_id: &str,
+    ) -> SemanticTimelineRevisionFence {
+        self.semantic_timeline_revisions.register(turn_id)
+    }
+
+    fn advance_semantic_timeline_revision(&self, turn_id: &str) {
+        self.semantic_timeline_revisions
+            .advance_if_registered(turn_id);
+    }
+
+    fn advance_semantic_timeline_pending_request_revision(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+    ) {
+        if let Some(turn_id) = request.turn_id.as_deref() {
+            self.advance_semantic_timeline_revision(turn_id);
+        }
+    }
+
+    async fn project_semantic_timeline_live_turn_event(
+        &self,
+        transaction: &DatabaseTransaction,
+        event: &AppendedTurnEvent,
+    ) -> Result<()> {
+        crate::timeline_live_projection::project_semantic_timeline_live_turn_event(
+            transaction,
+            event,
+        )
+        .await?;
+        self.advance_semantic_timeline_revision(event.turn_id.as_str());
+        Ok(())
+    }
+
+    async fn project_cli_runtime_pending_request(
+        &self,
+        transaction: &DatabaseTransaction,
+        request: &CliRuntimePendingRequestRecord,
+    ) -> Result<()> {
+        crate::timeline_live_projection::project_cli_runtime_pending_request(transaction, request)
+            .await?;
+        self.advance_semantic_timeline_pending_request_revision(request);
+        Ok(())
+    }
+
+    async fn project_cli_runtime_turn_binding_state(
+        &self,
+        transaction: &DatabaseTransaction,
+        turn_id: &str,
+        refreshed_at: DateTimeWithTimeZone,
+    ) -> Result<()> {
+        crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+            transaction,
+            turn_id,
+            refreshed_at,
+        )
+        .await?;
+        self.advance_semantic_timeline_revision(turn_id);
+        Ok(())
+    }
+
+    async fn project_semantic_timeline_snapshot_turn_item(
+        &self,
+        transaction: &DatabaseTransaction,
+        turn_id: &str,
+        item_id: &str,
+        source_sequence: i64,
+        refreshed_at: DateTimeWithTimeZone,
+    ) -> Result<()> {
+        crate::timeline_live_projection::project_semantic_timeline_snapshot_turn_item(
+            transaction,
+            turn_id,
+            item_id,
+            source_sequence,
+            refreshed_at,
+        )
+        .await?;
+        self.advance_semantic_timeline_revision(turn_id);
+        Ok(())
     }
 
     pub fn database_connection(&self) -> DatabaseConnection {
@@ -4099,7 +4263,13 @@ impl CrudStore {
         binding: NewCliRuntimeTurnBinding,
     ) -> Result<CliRuntimeTurnBindingRecord> {
         self.run_serialized_write(|| async {
-            cli_runtime_binding::upsert_turn_binding(&self.connection, binding.clone()).await
+            let stored =
+                cli_runtime_binding::upsert_turn_binding(&self.connection, binding.clone()).await?;
+            // This low-level path intentionally does not synthesize a live
+            // projection, but startup backfill still reads binding status and
+            // must discard any plan assembled across this mutation.
+            self.advance_semantic_timeline_revision(stored.turn_id.as_str());
+            Ok(stored)
         })
         .await
     }
@@ -4643,7 +4813,7 @@ impl CrudStore {
                 cli_runtime_binding::find_turn_binding(&transaction, binding.turn_id.as_str())
                     .await?
                     .context("initial CLI runtime turn binding is missing")?;
-            crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+            self.project_cli_runtime_turn_binding_state(
                 &transaction,
                 stored_binding.turn_id.as_str(),
                 stored_binding.updated_at,
@@ -4831,7 +5001,7 @@ impl CrudStore {
                 prepared_at,
             )
             .await?;
-            crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+            self.project_cli_runtime_turn_binding_state(
                 &transaction,
                 stored_binding.turn_id.as_str(),
                 prepared_at,
@@ -4970,7 +5140,7 @@ impl CrudStore {
                             bail!("CLI Turn execution ownership changed before activation");
                         }
                     }
-                    crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+                    self.project_cli_runtime_turn_binding_state(
                         &transaction,
                         binding.turn_id.as_str(),
                         binding.updated_at,
@@ -5053,7 +5223,7 @@ impl CrudStore {
                     bail!("CLI Turn execution ownership changed before activation");
                 }
             }
-            crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+            self.project_cli_runtime_turn_binding_state(
                 &transaction,
                 stored_binding.turn_id.as_str(),
                 started_at,
@@ -5137,6 +5307,12 @@ impl CrudStore {
                 },
             )
             .await?;
+            self.project_cli_runtime_turn_binding_state(
+                &transaction,
+                stored_binding.turn_id.as_str(),
+                completed_at,
+            )
+            .await?;
             transaction
                 .commit()
                 .await
@@ -5158,11 +5334,8 @@ impl CrudStore {
                 .context("failed to begin CLI runtime pending request create transaction")?;
             let record =
                 cli_runtime_binding::create_pending_request(&transaction, request.clone()).await?;
-            if let Err(error) =
-                crate::timeline_live_projection::project_cli_runtime_pending_request(
-                    &transaction,
-                    &record,
-                )
+            if let Err(error) = self
+                .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
                 let _ = transaction.rollback().await;
@@ -5189,11 +5362,8 @@ impl CrudStore {
                 .context("failed to begin CLI runtime pending request open transaction")?;
             let record =
                 cli_runtime_binding::open_pending_request(&transaction, request.clone()).await?;
-            if let Err(error) =
-                crate::timeline_live_projection::project_cli_runtime_pending_request(
-                    &transaction,
-                    &record,
-                )
+            if let Err(error) = self
+                .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
                 let _ = transaction.rollback().await;
@@ -5237,11 +5407,8 @@ impl CrudStore {
                 &authorization,
             )
             .await?;
-            if let Err(error) =
-                crate::timeline_live_projection::project_cli_runtime_pending_request(
-                    &transaction,
-                    &record,
-                )
+            if let Err(error) = self
+                .project_cli_runtime_pending_request(&transaction, &record)
                 .await
             {
                 let _ = transaction.rollback().await;
@@ -5300,6 +5467,7 @@ impl CrudStore {
                 }
                 opened
             };
+            self.advance_semantic_timeline_pending_request_revision(&record);
             transaction
                 .commit()
                 .await
@@ -5322,6 +5490,9 @@ impl CrudStore {
             let record =
                 cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
                     .await?;
+            if let Some(record) = &record {
+                self.advance_semantic_timeline_pending_request_revision(record);
+            }
             transaction
                 .commit()
                 .await
@@ -5346,6 +5517,9 @@ impl CrudStore {
                 response.clone(),
             )
             .await?;
+            if let Some(record) = &record {
+                self.advance_semantic_timeline_pending_request_revision(record);
+            }
             transaction
                 .commit()
                 .await
@@ -5370,6 +5544,9 @@ impl CrudStore {
                 transition.clone(),
             )
             .await?;
+            if let Some(record) = &record {
+                self.advance_semantic_timeline_pending_request_revision(record);
+            }
             transaction
                 .commit()
                 .await
@@ -5408,11 +5585,8 @@ impl CrudStore {
                 cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
                     .await?;
             if let Some(record) = &record
-                && let Err(error) =
-                    crate::timeline_live_projection::project_cli_runtime_pending_request(
-                        &transaction,
-                        record,
-                    )
+                && let Err(error) = self
+                    .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
                 let _ = transaction.rollback().await;
@@ -5443,11 +5617,8 @@ impl CrudStore {
             )
             .await?;
             if let Some(record) = &record
-                && let Err(error) =
-                    crate::timeline_live_projection::project_cli_runtime_pending_request(
-                        &transaction,
-                        record,
-                    )
+                && let Err(error) = self
+                    .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
                 let _ = transaction.rollback().await;
@@ -5478,11 +5649,8 @@ impl CrudStore {
             )
             .await?;
             if let Some(record) = &record
-                && let Err(error) =
-                    crate::timeline_live_projection::project_cli_runtime_pending_request(
-                        &transaction,
-                        record,
-                    )
+                && let Err(error) = self
+                    .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
                 let _ = transaction.rollback().await;
@@ -5518,11 +5686,8 @@ impl CrudStore {
             )
             .await?;
             if let Some(record) = &record
-                && let Err(error) =
-                    crate::timeline_live_projection::project_cli_runtime_pending_request(
-                        &transaction,
-                        record,
-                    )
+                && let Err(error) = self
+                    .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
                 let _ = transaction.rollback().await;
@@ -5558,11 +5723,8 @@ impl CrudStore {
             )
             .await?;
             if let Some(record) = &record
-                && let Err(error) =
-                    crate::timeline_live_projection::project_cli_runtime_pending_request(
-                        &transaction,
-                        record,
-                    )
+                && let Err(error) = self
+                    .project_cli_runtime_pending_request(&transaction, record)
                     .await
             {
                 let _ = transaction.rollback().await;
@@ -11218,7 +11380,7 @@ impl CrudStore {
                         updated_at,
                     )
                     .await?;
-                    crate::timeline_live_projection::project_semantic_timeline_snapshot_turn_item(
+                    self.project_semantic_timeline_snapshot_turn_item(
                         &transaction,
                         notification.turn_id.as_str(),
                         notification.item.item_id(),
@@ -20410,6 +20572,9 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     .exec(&self.connection)
                     .await
                     .context("failed to update repaired turn_item payload")?;
+                if result.rows_affected > 0 {
+                    self.advance_semantic_timeline_revision(row.turn_id.as_str());
+                }
                 repaired = repaired.saturating_add(result.rows_affected as usize);
             }
 
@@ -20485,6 +20650,9 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     .exec(&self.connection)
                     .await
                     .context("failed to repair turn_item active attempt status")?;
+                if item_result.rows_affected > 0 {
+                    self.advance_semantic_timeline_revision(running_attempt.turn_id.as_str());
+                }
                 repaired = repaired.saturating_add(item_result.rows_affected as usize);
             }
 
@@ -22861,12 +23029,9 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             )
             .await?;
         }
-        crate::timeline_live_projection::project_semantic_timeline_live_turn_event(
-            transaction,
-            &appended_event,
-        )
-        .await
-        .context("failed to project turn event to semantic timeline")?;
+        self.project_semantic_timeline_live_turn_event(transaction, &appended_event)
+            .await
+            .context("failed to project turn event to semantic timeline")?;
 
         if !turn_event_projection_state::mark_projected_claimed(
             transaction,
@@ -23077,11 +23242,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             }
         }
 
-        if let Err(error) =
-            crate::timeline_live_projection::project_semantic_timeline_live_turn_event(
-                &transaction,
-                &appended_event,
-            )
+        if let Err(error) = self
+            .project_semantic_timeline_live_turn_event(&transaction, &appended_event)
             .await
             .context("failed to project turn event to semantic timeline")
         {

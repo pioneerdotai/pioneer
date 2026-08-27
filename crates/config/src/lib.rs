@@ -2908,6 +2908,8 @@ pub struct GatewayAuthConfig {
     pub device_activation_code_ttl_seconds: u64,
     #[serde(default = "default_gateway_auth_exchange_timeout_seconds")]
     pub auth_exchange_timeout_seconds: u64,
+    #[serde(default = "default_gateway_auth_database_acquire_timeout_ms")]
+    pub database_acquire_timeout_ms: u64,
 }
 
 const fn default_gateway_access_token_ttl_seconds() -> u64 {
@@ -2924,6 +2926,10 @@ const fn default_gateway_device_activation_code_ttl_seconds() -> u64 {
 
 const fn default_gateway_auth_exchange_timeout_seconds() -> u64 {
     15
+}
+
+const fn default_gateway_auth_database_acquire_timeout_ms() -> u64 {
+    500
 }
 
 const MAX_GATEWAY_REFRESH_TOKEN_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
@@ -2951,6 +2957,9 @@ impl GatewayAuthConfig {
         if !(1..=60).contains(&self.auth_exchange_timeout_seconds) {
             bail!("gateway.auth.auth_exchange_timeout_seconds must be between 1 and 60");
         }
+        if !(50..=5_000).contains(&self.database_acquire_timeout_ms) {
+            bail!("gateway.auth.database_acquire_timeout_ms must be between 50 and 5000");
+        }
         if self.token_refresh_leeway_seconds == 0
             || self.token_refresh_leeway_seconds >= self.access_token_ttl_seconds
         {
@@ -2974,6 +2983,7 @@ impl Default for GatewayAuthConfig {
             device_activation_code_ttl_seconds: default_gateway_device_activation_code_ttl_seconds(
             ),
             auth_exchange_timeout_seconds: default_gateway_auth_exchange_timeout_seconds(),
+            database_acquire_timeout_ms: default_gateway_auth_database_acquire_timeout_ms(),
         }
     }
 }
@@ -5021,6 +5031,7 @@ token_refresh_leeway_seconds = 300
         assert_eq!(config.refresh_token_ttl_seconds, 7_776_000);
         assert_eq!(config.device_activation_code_ttl_seconds, 600);
         assert_eq!(config.auth_exchange_timeout_seconds, 15);
+        assert_eq!(config.database_acquire_timeout_ms, 500);
         config.validate_session_security().expect("secure defaults");
     }
 
@@ -5072,6 +5083,11 @@ token_refresh_leeway_seconds = 300
         config.device_activation_code_ttl_seconds = 0;
         assert!(config.validate_session_security().is_err());
         config.device_activation_code_ttl_seconds = 600;
+        config.database_acquire_timeout_ms = 49;
+        assert!(config.validate_session_security().is_err());
+        config.database_acquire_timeout_ms = 5_001;
+        assert!(config.validate_session_security().is_err());
+        config.database_acquire_timeout_ms = 500;
         config.jwt_issuer.clear();
         assert!(config.validate_session_security().is_err());
     }

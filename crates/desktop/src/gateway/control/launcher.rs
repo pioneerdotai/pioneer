@@ -1,4 +1,4 @@
-use crate::gateway::connectivity::is_local_gateway_reachable;
+use crate::gateway::connectivity::is_local_gateway_accepting_sessions;
 use crate::gateway::timings::GatewayTimings;
 use anyhow::{Context, Result, bail};
 use pioneer_config::AppConfig;
@@ -251,11 +251,11 @@ fn try_start_with_launcher(
     Ok(None)
 }
 
-fn wait_for_gateway_service(listen_addr: &str, timings: &GatewayTimings) -> Result<()> {
+pub(crate) fn wait_for_gateway_service(listen_addr: &str, timings: &GatewayTimings) -> Result<()> {
     let deadline = Instant::now() + timings.startup_timeout;
 
     while Instant::now() < deadline {
-        if is_local_gateway_reachable(listen_addr, timings.connect_timeout)? {
+        if is_local_gateway_accepting_sessions(listen_addr, timings.connect_timeout)? {
             return Ok(());
         }
         thread::sleep(timings.poll_interval);

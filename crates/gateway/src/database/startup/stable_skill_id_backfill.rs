@@ -17,14 +17,11 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 const BATCH_SIZE: u64 = 32;
 const JSON_BATCH_SIZE: u64 = 8;
-const BATCH_PAUSE: Duration = Duration::from_millis(25);
-const BUSY_PAUSE: Duration = Duration::from_millis(100);
 const STABLE_SKILL_ID_BACKFILL_KEY: &str = "stable_skill_id_backfill";
 const STABLE_SKILL_ID_BACKFILL_VERSION: i64 = 1;
 const BUNDLED_MANIFEST_BYTES: &str = include_str!(concat!(
@@ -72,17 +69,20 @@ impl BatchOutcome {
     }
 }
 
-pub(super) async fn run(crud_store: &CrudStore, message_processor: &MessageProcessor) {
+pub(super) async fn run(
+    crud_store: &CrudStore,
+    message_processor: &MessageProcessor,
+) -> Result<()> {
     let db = crud_store.database_connection();
     match backfill_is_current(&db).await {
-        Ok(true) => return,
+        Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(error) => {
             warn!(
                 error = %format!("{error:#}"),
                 "failed to read Stable SkillId backfill status"
             );
-            return;
+            return Err(error);
         }
     }
 
@@ -106,22 +106,29 @@ pub(super) async fn run(crud_store: &CrudStore, message_processor: &MessageProce
                     failed = storage_summary.failed,
                     "stable SkillId migration remains incomplete after filesystem failures"
                 );
-                return;
+                bail!(
+                    "stable SkillId filesystem migration has {} failed items",
+                    storage_summary.failed
+                );
             }
             if let Err(error) = mark_backfill_complete(&db, started_at).await {
                 warn!(
                     error = %format!("{error:#}"),
                     "failed to mark Stable SkillId migration complete"
                 );
-                return;
+                return Err(error);
             }
             info!("stable SkillId migration completed");
         }
-        Err(error) => warn!(
-            error = %format!("{error:#}"),
-            "stable SkillId background backfill stopped; remaining database and filesystem work will retry on the next Gateway start"
-        ),
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "stable SkillId background backfill stopped; remaining database and filesystem work will retry on the next Gateway start"
+            );
+            return Err(error);
+        }
     }
+    Ok(())
 }
 
 async fn backfill_is_current(db: &DatabaseConnection) -> Result<bool> {
@@ -219,14 +226,14 @@ async fn backfill_installations(crud_store: &CrudStore) -> Result<u64> {
             })
             .await?;
         let Some(outcome) = outcome else {
-            tokio::time::sleep(BUSY_PAUSE).await;
+            super::maintenance_checkpoint().await?;
             continue;
         };
         migrated = migrated.saturating_add(outcome.processed);
         if outcome.complete {
             return Ok(migrated);
         }
-        tokio::time::sleep(BATCH_PAUSE).await;
+        super::maintenance_checkpoint().await?;
     }
 }
 
@@ -248,14 +255,14 @@ async fn backfill_policies(
             })
             .await?;
         let Some(outcome) = outcome else {
-            tokio::time::sleep(BUSY_PAUSE).await;
+            super::maintenance_checkpoint().await?;
             continue;
         };
         migrated = migrated.saturating_add(outcome.processed);
         if outcome.complete {
             return Ok(migrated);
         }
-        tokio::time::sleep(BATCH_PAUSE).await;
+        super::maintenance_checkpoint().await?;
     }
 }
 
@@ -278,14 +285,14 @@ async fn backfill_history(
             })
             .await?;
         let Some(outcome) = outcome else {
-            tokio::time::sleep(BUSY_PAUSE).await;
+            super::maintenance_checkpoint().await?;
             continue;
         };
         migrated = migrated.saturating_add(outcome.processed);
         if outcome.complete {
             return Ok(migrated);
         }
-        tokio::time::sleep(BATCH_PAUSE).await;
+        super::maintenance_checkpoint().await?;
     }
 }
 
@@ -319,10 +326,10 @@ async fn backfill_json(
             if let Some(processed) = outcome {
                 break processed;
             }
-            tokio::time::sleep(BUSY_PAUSE).await;
+            super::maintenance_checkpoint().await?;
         };
         migrated = migrated.saturating_add(processed);
-        tokio::time::sleep(BATCH_PAUSE).await;
+        super::maintenance_checkpoint().await?;
     }
 }
 
@@ -1757,6 +1764,7 @@ mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, DatabaseConnection};
+    use std::time::Duration;
 
     const WORKSPACE_ID: &str = "WWWWWWWWWWWWWWWWWWWWW";
     const THREAD_ID: &str = "TTTTTTTTTTTTTTTTTTTTT";
