@@ -2,7 +2,7 @@ use super::super::handler::ComputerUseHandler;
 use super::super::model::*;
 use super::super::permissions::computer_use_preflight_payload;
 use super::super::platform;
-use super::super::state::cleanup_artifacts_sync;
+use super::super::state::{ActiveArtifactLease, cleanup_artifacts_sync};
 use super::super::util::{
     default_loop_guard, now_unix_ms, resolve_snapshot_budget, stop_session_as_completed,
     stop_session_as_stopped, stop_session_with_reason,
@@ -18,6 +18,7 @@ impl ComputerUseHandler {
         &self,
         attempt_id: u32,
         trace: &ToolEventTrace,
+        _process_environment: &crate::process_policy::ProcessEnvironmentPlan,
     ) -> Result<FunctionToolOutput, ToolError> {
         let report = self.backend.preflight(DesktopPreflightOptions {
             screenshot_probe_enabled: self.config.preflight_screenshot_probe_enabled,
@@ -116,8 +117,9 @@ impl ComputerUseHandler {
         &self,
         attempt_id: u32,
         trace: &ToolEventTrace,
+        process_environment: &crate::process_policy::ProcessEnvironmentPlan,
     ) -> Result<FunctionToolOutput, ToolError> {
-        let apps = self.backend.list_apps()?;
+        let apps = self.backend.list_apps(process_environment)?;
         trace.emit_stage(
             attempt_id,
             "computer_use.list_apps",
@@ -135,7 +137,11 @@ impl ComputerUseHandler {
         ))
     }
 
-    fn resolve_start_target(&self, args: &ComputerUseArgs) -> Result<ComputerUseTarget, ToolError> {
+    fn resolve_start_target(
+        &self,
+        args: &ComputerUseArgs,
+        process_environment: &crate::process_policy::ProcessEnvironmentPlan,
+    ) -> Result<ComputerUseTarget, ToolError> {
         let display = Self::choose_display(
             self.backend.list_displays()?,
             args.target
@@ -185,6 +191,7 @@ impl ComputerUseHandler {
                     activation_timeout,
                     launch_if_missing,
                     launch_command,
+                    process_environment,
                 )?;
                 Ok(ComputerUseTarget::App {
                     requested,
@@ -206,6 +213,7 @@ impl ComputerUseHandler {
                     activation_timeout,
                     launch_if_missing,
                     launch_command,
+                    process_environment,
                 )?;
                 Ok(ComputerUseTarget::App {
                     requested,
@@ -227,6 +235,7 @@ impl ComputerUseHandler {
                     activation_timeout,
                     launch_if_missing,
                     launch_command,
+                    process_environment,
                 )?;
                 Ok(ComputerUseTarget::App {
                     requested,
@@ -248,6 +257,7 @@ impl ComputerUseHandler {
                     activation_timeout,
                     launch_if_missing,
                     launch_command,
+                    process_environment,
                 )?;
                 Ok(ComputerUseTarget::App {
                     requested,
@@ -267,6 +277,7 @@ impl ComputerUseHandler {
                     activation_timeout,
                     launch_if_missing,
                     launch_command,
+                    process_environment,
                 )?;
                 Ok(ComputerUseTarget::App {
                     requested,
@@ -276,7 +287,10 @@ impl ComputerUseHandler {
                 })
             }
             "active_app" => {
-                let app = self.backend.frontmost_app()?.ok_or_else(|| {
+                let app = self
+                    .backend
+                    .frontmost_app(process_environment)?
+                    .ok_or_else(|| {
                     ToolError::execution_failed(
                         "computer_use active_app target is unsupported because the backend did not report a frontmost app; pass target.type=app_name or target.type=screen explicitly",
                     )
@@ -299,24 +313,28 @@ impl ComputerUseHandler {
         timeout: Duration,
         launch_if_missing: bool,
         launch_command: Option<&str>,
+        process_environment: &crate::process_policy::ProcessEnvironmentPlan,
     ) -> Result<AppHandle, ToolError> {
         self.ensure_launch_command_allowed(launch_command)?;
-        let target = platform::enrich_launch_target(target);
-        match self.find_exact_app(&target, timeout) {
+        let target = platform::enrich_launch_target(target, process_environment);
+        match self.find_exact_app(&target, timeout, process_environment) {
             Ok(app) => {
-                self.backend.activate_app(&app)?;
+                self.backend.activate_app(&app, process_environment)?;
                 Ok(app)
             }
             Err(first_error) if launch_if_missing => {
-                self.backend.launch_app(&target, launch_command)?;
-                let app = self.find_exact_app(&target, timeout).map_err(|second_error| {
+                self.backend
+                    .launch_app(&target, launch_command, process_environment)?;
+                let app = self
+                    .find_exact_app(&target, timeout, process_environment)
+                    .map_err(|second_error| {
                     ToolError::NotFound(format!(
                         "computer_use app target not found after launch; failure_class=app_not_found; initial={}; retry={}. Verify the explicit target fields, desktop automation permissions, and screenshot permissions.",
                         compact_error_text(first_error.to_string().as_str(), 700),
                         compact_error_text(second_error.to_string().as_str(), 700)
                     ))
                 })?;
-                self.backend.activate_app(&app)?;
+                self.backend.activate_app(&app, process_environment)?;
                 Ok(app)
             }
             Err(error) => Err(ToolError::NotFound(format!(
@@ -330,9 +348,13 @@ impl ComputerUseHandler {
         &self,
         target: &AppTarget,
         timeout: Duration,
+        process_environment: &crate::process_policy::ProcessEnvironmentPlan,
     ) -> Result<AppHandle, ToolError> {
         ensure_app_target_has_identity(target)?;
-        let apps = self.backend.list_apps().unwrap_or_default();
+        let apps = self
+            .backend
+            .list_apps(process_environment)
+            .unwrap_or_default();
         let matches = apps
             .iter()
             .filter(|app| app_meta_matches_target(app, target))
@@ -349,7 +371,7 @@ impl ComputerUseHandler {
             let resolved_target = app_target_from_meta(app);
             return self
                 .backend
-                .find_app(&resolved_target, timeout)
+                .find_app(&resolved_target, timeout, process_environment)
                 .map_err(|error| {
                     ToolError::NotFound(app_resolution_diagnostic(
                         format!("matched app could not be opened by backend: {error}").as_str(),
@@ -359,7 +381,7 @@ impl ComputerUseHandler {
                 });
         }
         if target.pid.is_some() || target.name.is_some() {
-            match self.backend.find_app(target, timeout) {
+            match self.backend.find_app(target, timeout, process_environment) {
                 Ok(app) if app_handle_matches_target(&app, target) => return Ok(app),
                 Ok(_) => {
                     return Err(ToolError::NotFound(app_resolution_diagnostic(
@@ -393,7 +415,7 @@ impl ComputerUseHandler {
                 .config
                 .allowed_launch_commands
                 .iter()
-                .any(|allowed| command == allowed || command.starts_with(&format!("{allowed} ")))
+                .any(|allowed| command == allowed)
         {
             return Ok(());
         }
@@ -407,22 +429,19 @@ impl ComputerUseHandler {
         args: ComputerUseArgs,
         attempt_id: u32,
         trace: &ToolEventTrace,
+        process_environment: &crate::process_policy::ProcessEnvironmentPlan,
     ) -> Result<FunctionToolOutput, ToolError> {
         self.cleanup_artifacts().await?;
 
-        let target = self.resolve_start_target(&args)?;
+        let target = self.resolve_start_target(&args, process_environment)?;
         let display = target.display().clone();
-        let session_id = {
-            let mut manager = self.manager.lock().await;
-            manager.next_session_id = manager.next_session_id.saturating_add(1);
-            manager.next_session_id
-        };
-
-        let artifacts_dir = self.artifacts_root().join(session_id.to_string());
+        let (session_id, artifacts_dir, artifact_lease) =
+            self.reserve_session_artifacts_dir().await?;
         let snapshots_dir = artifacts_dir.join("snapshots");
         tokio::fs::create_dir_all(snapshots_dir.as_path())
             .await
             .map_err(|error| {
+                let _ = std::fs::remove_dir_all(artifacts_dir.as_path());
                 ToolError::execution_failed(format!(
                     "failed to create computer_use artifacts directory `{}`: {error}",
                     snapshots_dir.display()
@@ -478,6 +497,7 @@ impl ComputerUseHandler {
             max_recovery_attempts_per_run: self.config.max_recovery_attempts_per_run,
             snapshot_budget,
             artifacts_dir: artifacts_dir.display().to_string(),
+            _artifact_lease: artifact_lease,
         };
         {
             let mut manager = self.manager.lock().await;
@@ -550,6 +570,41 @@ impl ComputerUseHandler {
                 }
             }),
         ))
+    }
+
+    async fn reserve_session_artifacts_dir(
+        &self,
+    ) -> Result<(u64, PathBuf, std::sync::Arc<ActiveArtifactLease>), ToolError> {
+        let root = self.artifacts_root();
+        loop {
+            let session_id = {
+                let mut manager = self.manager.lock().await;
+                let next = manager.next_session_id.checked_add(1).ok_or_else(|| {
+                    ToolError::execution_failed("computer_use session id space is exhausted")
+                })?;
+                manager.next_session_id = next;
+                next
+            };
+            let artifacts_dir = root.join(session_id.to_string());
+            let reserve_path = artifacts_dir.clone();
+            let reservation = tokio::task::spawn_blocking(move || {
+                ActiveArtifactLease::reserve_directory(reserve_path)
+            })
+            .await
+            .map_err(|error| {
+                ToolError::internal(format!("artifact reservation task join error: {error}"))
+            })?;
+            match reservation {
+                Ok(lease) => return Ok((session_id, artifacts_dir, lease)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(ToolError::execution_failed(format!(
+                        "failed to reserve computer_use artifacts directory `{}`: {error}",
+                        artifacts_dir.display()
+                    )));
+                }
+            }
+        }
     }
     pub(crate) async fn handle_status(
         &self,

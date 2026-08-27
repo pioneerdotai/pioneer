@@ -12,13 +12,10 @@ use crate::{
     configure_windows_restricted_token_command, prepare_native_sandbox_backend,
 };
 use async_trait::async_trait;
-use chrono::Utc;
 use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,12 +31,10 @@ const MAX_ACTIVE_SESSIONS: usize = 64;
 const SESSION_MAX_BUFFER_BYTES: usize = 512 * 1024;
 const SESSION_TTL_MS: u64 = if cfg!(test) { 500 } else { 10 * 60 * 1000 };
 const PROCESS_KILL_GRACE_MS: u64 = 300;
-const SESSION_STATE_FILE: &str = "pioneer_tools_exec_sessions.json";
 
 pub struct UnifiedExecHandler {
     sessions: Arc<Mutex<HashMap<u64, Arc<Mutex<ExecSession>>>>>,
     next_session_id: AtomicU64,
-    persistence: Option<SessionPersistence>,
 }
 
 struct ExecSession {
@@ -52,6 +47,7 @@ struct ExecSession {
     command: Vec<String>,
     started_at: Instant,
     last_touched: Instant,
+    _runtime_temp_dir: Option<Arc<crate::process_policy::ProcessRuntimeTempDir>>,
 }
 
 impl Default for UnifiedExecHandler {
@@ -59,7 +55,6 @@ impl Default for UnifiedExecHandler {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: AtomicU64::new(0),
-            persistence: SessionPersistence::new_default(),
         }
     }
 }
@@ -67,33 +62,13 @@ impl Default for UnifiedExecHandler {
 impl Drop for UnifiedExecHandler {
     fn drop(&mut self) {
         if let Ok(sessions) = self.sessions.try_lock() {
-            for (session_id, session) in sessions.iter() {
+            for session in sessions.values() {
                 if let Ok(mut guard) = session.try_lock() {
                     terminate_child_process_now(&mut guard.child);
-                    if let Some(persistence) = self.persistence.as_ref() {
-                        persistence.mark_unresumable(*session_id);
-                    }
                 }
             }
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedSessionRecord {
-    session_id: u64,
-    command: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pid: Option<u32>,
-    created_unix_ms: i64,
-    last_touched_unix_ms: i64,
-    resumable: bool,
-}
-
-#[derive(Clone)]
-struct SessionPersistence {
-    path: PathBuf,
-    records: Arc<std::sync::Mutex<HashMap<u64, PersistedSessionRecord>>>,
 }
 
 #[derive(Default)]
@@ -118,131 +93,6 @@ impl SessionBuffer {
         let start_index = start_offset.saturating_sub(self.base_offset);
         let lost_output = cursor < self.base_offset;
         (self.bytes[start_index..].to_vec(), current_end, lost_output)
-    }
-}
-
-impl SessionPersistence {
-    fn new_for_path(path: PathBuf) -> Self {
-        let loaded = fs::read_to_string(path.as_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Vec<PersistedSessionRecord>>(raw.as_str()).ok())
-            .unwrap_or_default();
-
-        let mut map = HashMap::new();
-        for mut record in loaded {
-            record.resumable = false;
-            map.insert(record.session_id, record);
-        }
-
-        let persistence = Self {
-            path,
-            records: Arc::new(std::sync::Mutex::new(map)),
-        };
-        persistence.persist_snapshot();
-        persistence
-    }
-
-    fn new_default() -> Option<Self> {
-        if cfg!(test) {
-            return None;
-        }
-
-        let path = std::env::var_os("PIONEER_EXEC_SESSION_STATE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("{SESSION_STATE_FILE}.{}", std::process::id()))
-            });
-        Some(Self::new_for_path(path))
-    }
-
-    fn insert_live(&self, session_id: u64, command: &[String], pid: Option<u32>) {
-        let now = Utc::now().timestamp_millis();
-        if let Ok(mut guard) = self.records.lock() {
-            guard.insert(
-                session_id,
-                PersistedSessionRecord {
-                    session_id,
-                    command: command.to_vec(),
-                    pid,
-                    created_unix_ms: now,
-                    last_touched_unix_ms: now,
-                    resumable: true,
-                },
-            );
-        }
-        self.persist_snapshot();
-    }
-
-    fn touch(&self, session_id: u64) {
-        if let Ok(mut guard) = self.records.lock()
-            && let Some(record) = guard.get_mut(&session_id)
-        {
-            record.last_touched_unix_ms = Utc::now().timestamp_millis();
-        }
-        self.persist_snapshot();
-    }
-
-    fn mark_unresumable(&self, session_id: u64) {
-        if let Ok(mut guard) = self.records.lock()
-            && let Some(record) = guard.get_mut(&session_id)
-        {
-            record.resumable = false;
-            record.last_touched_unix_ms = Utc::now().timestamp_millis();
-        }
-        self.persist_snapshot();
-    }
-
-    fn remove(&self, session_id: u64) {
-        if let Ok(mut guard) = self.records.lock() {
-            guard.remove(&session_id);
-        }
-        self.persist_snapshot();
-    }
-
-    fn take_resume_error(&self, session_id: u64) -> Option<String> {
-        let record = if let Ok(mut guard) = self.records.lock() {
-            guard.remove(&session_id)
-        } else {
-            None
-        };
-        if record.is_some() {
-            self.persist_snapshot();
-        }
-
-        record.map(|record| {
-            if record.resumable {
-                format!(
-                    "session {} metadata exists but active process is unavailable; run exec_command again to create a new session",
-                    session_id
-                )
-            } else {
-                format!(
-                    "session {} was created before runtime restart and cannot be resumed; run exec_command again",
-                    session_id
-                )
-            }
-        })
-    }
-
-    fn persist_snapshot(&self) {
-        let snapshot = if let Ok(guard) = self.records.lock() {
-            guard.values().cloned().collect::<Vec<_>>()
-        } else {
-            return;
-        };
-
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let serialized = match serde_json::to_string_pretty(&snapshot) {
-            Ok(serialized) => serialized,
-            Err(_) => return,
-        };
-
-        let tmp_path = self.path.with_extension("tmp");
-        if fs::write(tmp_path.as_path(), serialized.as_bytes()).is_ok() {
-            let _ = fs::rename(tmp_path, self.path.as_path());
-        }
     }
 }
 
@@ -356,8 +206,6 @@ impl UnifiedExecHandler {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
-        let child_pid = child.id();
-
         let session_id = self
             .next_session_id
             .fetch_add(1, Ordering::Relaxed)
@@ -381,15 +229,13 @@ impl UnifiedExecHandler {
             command: command_preview.clone(),
             started_at: session_started_at,
             last_touched: Instant::now(),
+            _runtime_temp_dir: process_plan.runtime_temp_dir.clone(),
         }));
 
         self.sessions
             .lock()
             .await
             .insert(session_id, session.clone());
-        if let Some(persistence) = self.persistence.as_ref() {
-            persistence.insert_live(session_id, command_preview.as_slice(), child_pid);
-        }
 
         let session_cancelled = tokio::select! {
             _ = cancellation.cancelled() => true,
@@ -408,9 +254,6 @@ impl UnifiedExecHandler {
                 }
             }
             self.sessions.lock().await.remove(&session_id);
-            if let Some(persistence) = self.persistence.as_ref() {
-                persistence.remove(session_id);
-            }
             return Err(ToolError::cancelled("command cancelled"));
         }
 
@@ -427,9 +270,6 @@ impl UnifiedExecHandler {
 
         if state.finished {
             self.sessions.lock().await.remove(&session_id);
-            if let Some(persistence) = self.persistence.as_ref() {
-                persistence.remove(session_id);
-            }
         }
 
         let payload = build_exec_model_payload(ExecPayloadInput {
@@ -466,20 +306,12 @@ impl UnifiedExecHandler {
             .get(&args.session_id)
             .cloned()
             .ok_or_else(|| {
-                if let Some(persistence) = self.persistence.as_ref()
-                    && let Some(message) = persistence.take_resume_error(args.session_id)
-                {
-                    return ToolError::NotFound(message);
-                }
                 ToolError::NotFound(format!("session {} was not found", args.session_id))
             })?;
 
         if let Some(chars) = args.chars.as_deref() {
             let mut guard = session.lock().await;
             guard.last_touched = Instant::now();
-            if let Some(persistence) = self.persistence.as_ref() {
-                persistence.touch(args.session_id);
-            }
             match guard.stdin.as_mut() {
                 Some(stdin) => {
                     stdin.write_all(chars.as_bytes()).await.map_err(|error| {
@@ -523,9 +355,6 @@ impl UnifiedExecHandler {
 
         if state.finished {
             self.sessions.lock().await.remove(&args.session_id);
-            if let Some(persistence) = self.persistence.as_ref() {
-                persistence.remove(args.session_id);
-            }
         }
 
         let payload = build_exec_model_payload(ExecPayloadInput {
@@ -581,9 +410,6 @@ impl UnifiedExecHandler {
             let mut sessions = self.sessions.lock().await;
             for session_id in to_remove {
                 sessions.remove(&session_id);
-                if let Some(persistence) = self.persistence.as_ref() {
-                    persistence.remove(session_id);
-                }
             }
         }
     }
@@ -870,7 +696,9 @@ fn apply_shell_sandbox_backend(
                 execution_label: "shell",
             };
             match prepare_native_sandbox_backend(&backend, &request)? {
-                NativeSandboxPrepareOutcome::Ready(_) => configure_nono_command(command, snapshot),
+                NativeSandboxPrepareOutcome::Ready(_) => {
+                    configure_nono_command(command, snapshot, process_plan)
+                }
                 NativeSandboxPrepareOutcome::Degraded { reason, .. }
                 | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
                     tracing::warn!(
@@ -1491,6 +1319,92 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn restricted_tty_keeps_spawn_sandbox_across_write_stdin() {
+        if !nono::Sandbox::is_supported() {
+            return;
+        }
+
+        let current = std::env::current_dir().expect("test cwd");
+        let fixture = tempfile::tempdir_in(current).expect("tty sandbox fixture");
+        let workspace = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(outside.as_path()).expect("outside");
+        let outside_secret = outside.join("secret.txt");
+        std::fs::write(outside_secret.as_path(), "OUTSIDE_SECRET\n").expect("outside fixture");
+
+        let handler = UnifiedExecHandler::default();
+        let mut exec_invocation = invocation(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                command: Some(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "read target; if cat \"$target\" 2>/dev/null; then echo LEAKED; else echo DENIED; fi; printf WORKSPACE_OK > allowed.txt; cat allowed.txt".to_owned(),
+                ]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: Some(50),
+                tty: Some(true),
+            })),
+        );
+        exec_invocation.workdir = workspace.clone();
+        exec_invocation.execution_security_snapshot = Some(shell_security_snapshot(
+            TurnPermissionMode::AutoAcceptEdits,
+            workspace.as_path(),
+        ));
+
+        let exec_output = handler
+            .handle(exec_invocation, trace("exec_command"))
+            .await
+            .expect("restricted tty should start");
+        let session_id = parse_session_id(exec_output.raw_text().as_str());
+
+        let mut write_invocation = invocation(
+            "write_stdin",
+            ToolPayload::LocalShell(LocalShellPayload::WriteStdin(WriteStdinArgs {
+                session_id,
+                chars: Some(format!("{}\n", outside_secret.display())),
+                yield_time_ms: Some(250),
+                max_output_tokens: None,
+            })),
+        );
+        write_invocation.workdir = workspace.clone();
+        write_invocation.execution_security_snapshot = Some(shell_security_snapshot(
+            TurnPermissionMode::AutoAcceptEdits,
+            workspace.as_path(),
+        ));
+
+        let output = handler
+            .handle(write_invocation, trace("write_stdin"))
+            .await
+            .expect("write_stdin should interact with the live restricted process");
+        let text = output.raw_text();
+        let stdout = output
+            .raw_json()
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(text.contains("DENIED"), "outside read must fail: {text}");
+        assert!(
+            text.contains("WORKSPACE_OK"),
+            "workspace write/read should remain available: {text}"
+        );
+        assert!(
+            !stdout.contains("OUTSIDE_SECRET") && !stdout.contains("LEAKED"),
+            "stdin must not widen the spawn sandbox: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("allowed.txt"))
+                .expect("workspace output should exist"),
+            "WORKSPACE_OK"
+        );
+    }
+
     #[tokio::test]
     async fn exec_command_marks_non_zero_exit_as_failed() {
         let handler = UnifiedExecHandler::default();
@@ -1813,29 +1727,5 @@ mod tests {
                 "set -o pipefail; echo ok | cat".to_owned(),
             ]
         );
-    }
-
-    #[test]
-    fn persisted_sessions_become_unresumable_after_reload() {
-        let path = std::env::temp_dir().join(format!(
-            "pioneer-shell-persist-test-{}-{}.json",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-
-        let persistence = SessionPersistence::new_for_path(path.clone());
-        persistence.insert_live(
-            42,
-            &["sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
-            Some(1234),
-        );
-
-        let reloaded = SessionPersistence::new_for_path(path.clone());
-        let message = reloaded
-            .take_resume_error(42)
-            .expect("expected persisted session message");
-        assert!(message.contains("cannot be resumed"));
-
-        let _ = std::fs::remove_file(path);
     }
 }

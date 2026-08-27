@@ -188,8 +188,11 @@ impl HumanInteractionService {
         match request.kind {
             CLIRuntimeRequestKind::CommandApproval
             | CLIRuntimeRequestKind::FileChangeApproval
+            | CLIRuntimeRequestKind::PermissionApproval
             | CLIRuntimeRequestKind::Other => match resolution {
-                CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::Cancelled => {}
+                CLIRuntimeRequestResolution::Approved
+                | CLIRuntimeRequestResolution::ApprovedForSession
+                | CLIRuntimeRequestResolution::Cancelled => {}
                 CLIRuntimeRequestResolution::Denied { .. } => {}
                 CLIRuntimeRequestResolution::Answered { .. }
                 | CLIRuntimeRequestResolution::Expired
@@ -243,6 +246,7 @@ impl HumanInteractionService {
             }
             CLIRuntimeRequestResolution::Error { message } => message.zeroize(),
             CLIRuntimeRequestResolution::Approved
+            | CLIRuntimeRequestResolution::ApprovedForSession
             | CLIRuntimeRequestResolution::Cancelled
             | CLIRuntimeRequestResolution::Expired => {}
         }

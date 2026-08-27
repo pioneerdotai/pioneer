@@ -3,8 +3,9 @@ use crate::error::ToolError;
 use pioneer_protocol::{
     SandboxBackendKind, SandboxBackendRequirement, TurnExecutionSecuritySnapshot,
     TurnFilesystemAccess, TurnFilesystemSandboxEntry, TurnFilesystemSandboxKind,
-    TurnFilesystemSandboxPath, TurnNetworkMode,
+    TurnFilesystemSandboxPath, TurnNetworkMode, TurnTmpMode,
 };
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,12 @@ pub struct NonoBackendSupport {
 pub struct NonoCapabilityPlan {
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
+    /// Backend-only paths required to load executables, dynamic libraries,
+    /// language toolchains, and other non-secret runtime dependencies. These
+    /// do not become model-visible filesystem grants in the turn snapshot.
+    pub runtime_read_paths: Vec<PathBuf>,
+    /// Backend-only scratch/artifact paths required by normal CLI programs.
+    pub runtime_write_paths: Vec<PathBuf>,
     pub cwd: PathBuf,
     pub network_blocked: bool,
 }
@@ -92,7 +99,10 @@ impl NativeSandboxBackend for NonoSandboxBackend {
             };
         }
 
-        let capability_plan = match build_nono_capability_plan(request.snapshot) {
+        let capability_plan = match build_nono_capability_plan_for_process(
+            request.snapshot,
+            Some(request.process_plan),
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 return NativeSandboxPrepareOutcome::Unavailable {
@@ -106,9 +116,11 @@ impl NativeSandboxBackend for NonoSandboxBackend {
             backend: SandboxBackendKind::Nono,
             process_plan: request.process_plan.clone(),
             notes: vec![format!(
-                "nono capability plan: read_roots={}, write_roots={}, network_blocked={}",
+                "nono capability plan: read_roots={}, write_roots={}, runtime_read_paths={}, runtime_write_paths={}, network_blocked={}",
                 capability_plan.read_roots.len(),
                 capability_plan.write_roots.len(),
+                capability_plan.runtime_read_paths.len(),
+                capability_plan.runtime_write_paths.len(),
                 capability_plan.network_blocked
             )],
         })
@@ -118,13 +130,31 @@ impl NativeSandboxBackend for NonoSandboxBackend {
 pub fn build_nono_capability_plan(
     snapshot: &TurnExecutionSecuritySnapshot,
 ) -> Result<NonoCapabilityPlan, ToolError> {
+    build_nono_capability_plan_for_process(snapshot, None)
+}
+
+fn build_nono_capability_plan_for_process(
+    snapshot: &TurnExecutionSecuritySnapshot,
+    process_plan: Option<&ProcessSpawnPlan>,
+) -> Result<NonoCapabilityPlan, ToolError> {
     let cwd = PathBuf::from(snapshot.sandbox.cwd.as_str());
     if snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted {
+        let network_blocked = snapshot.network.mode != TurnNetworkMode::Enabled;
         return Ok(NonoCapabilityPlan {
             read_roots: Vec::new(),
-            write_roots: Vec::new(),
+            // Applying a network-only nono profile still starts from a
+            // deny-by-default filesystem profile. Grant the filesystem root
+            // explicitly so an independent network restriction cannot
+            // accidentally narrow an unrestricted filesystem policy.
+            write_roots: if network_blocked {
+                vec![PathBuf::from("/")]
+            } else {
+                Vec::new()
+            },
+            runtime_read_paths: Vec::new(),
+            runtime_write_paths: Vec::new(),
             cwd,
-            network_blocked: false,
+            network_blocked,
         });
     }
 
@@ -152,6 +182,8 @@ pub fn build_nono_capability_plan(
     Ok(NonoCapabilityPlan {
         read_roots,
         write_roots,
+        runtime_read_paths: nono_runtime_read_paths(process_plan),
+        runtime_write_paths: nono_runtime_write_paths(snapshot, process_plan)?,
         cwd,
         network_blocked: snapshot.network.mode != TurnNetworkMode::Enabled,
     })
@@ -161,12 +193,13 @@ pub fn build_nono_capability_plan(
 pub fn configure_nono_command(
     command: &mut tokio::process::Command,
     snapshot: &TurnExecutionSecuritySnapshot,
+    process_plan: &ProcessSpawnPlan,
 ) -> Result<(), ToolError> {
-    if snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted {
+    if nono_policy_is_noop(snapshot) {
         return Ok(());
     }
 
-    let capability_set = build_nono_capability_set(snapshot)?;
+    let capability_set = build_nono_capability_set(snapshot, Some(process_plan))?;
     unsafe {
         command.pre_exec(move || {
             nono::Sandbox::apply(&capability_set)
@@ -179,10 +212,16 @@ pub fn configure_nono_command(
     Ok(())
 }
 
+fn nono_policy_is_noop(snapshot: &TurnExecutionSecuritySnapshot) -> bool {
+    snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted
+        && snapshot.network.mode == TurnNetworkMode::Enabled
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn configure_nono_command(
     _command: &mut tokio::process::Command,
     _snapshot: &TurnExecutionSecuritySnapshot,
+    _process_plan: &ProcessSpawnPlan,
 ) -> Result<(), ToolError> {
     Err(ToolError::Rejected(
         "nono backend is not supported on this platform".to_owned(),
@@ -192,23 +231,296 @@ pub fn configure_nono_command(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn build_nono_capability_set(
     snapshot: &TurnExecutionSecuritySnapshot,
+    process_plan: Option<&ProcessSpawnPlan>,
 ) -> Result<nono::CapabilitySet, ToolError> {
-    let plan = build_nono_capability_plan(snapshot)?;
+    let plan = build_nono_capability_plan_for_process(snapshot, process_plan)?;
     let mut capabilities = nono::CapabilitySet::new();
     for path in &plan.read_roots {
-        capabilities = capabilities
-            .allow_path(path, nono::AccessMode::Read)
-            .map_err(|error| ToolError::Rejected(format!("nono read root rejected: {error}")))?;
+        capabilities = allow_nono_path(capabilities, path, nono::AccessMode::Read, "read root")?;
     }
     for path in &plan.write_roots {
-        capabilities = capabilities
-            .allow_path(path, nono::AccessMode::ReadWrite)
-            .map_err(|error| ToolError::Rejected(format!("nono write root rejected: {error}")))?;
+        capabilities = allow_nono_path(
+            capabilities,
+            path,
+            nono::AccessMode::ReadWrite,
+            "write root",
+        )?;
+    }
+    for path in &plan.runtime_read_paths {
+        capabilities = allow_nono_path(
+            capabilities,
+            path,
+            nono::AccessMode::Read,
+            "runtime read path",
+        )?;
+    }
+    for path in &plan.runtime_write_paths {
+        capabilities = allow_nono_path(
+            capabilities,
+            path,
+            nono::AccessMode::ReadWrite,
+            "runtime write path",
+        )?;
     }
     if plan.network_blocked {
         capabilities = capabilities.block_network();
     }
     Ok(capabilities)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn allow_nono_path(
+    capabilities: nono::CapabilitySet,
+    path: &std::path::Path,
+    access: nono::AccessMode,
+    label: &str,
+) -> Result<nono::CapabilitySet, ToolError> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        ToolError::Rejected(format!(
+            "nono {label} `{}` is unavailable: {error}",
+            path.display()
+        ))
+    })?;
+    let result = if metadata.is_dir() {
+        capabilities.allow_path(path, access)
+    } else {
+        capabilities.allow_file(path, access)
+    };
+    result.map_err(|error| {
+        ToolError::Rejected(format!(
+            "nono {label} `{}` was rejected: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn nono_runtime_read_paths(process_plan: Option<&ProcessSpawnPlan>) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    for path in platform_runtime_read_paths() {
+        insert_existing_path(&mut paths, PathBuf::from(path));
+    }
+
+    let Some(process_plan) = process_plan else {
+        return paths.into_iter().collect();
+    };
+    if let Some(path) = process_plan.environment.get("PATH") {
+        for entry in std::env::split_paths(path) {
+            insert_existing_path(&mut paths, entry);
+        }
+    }
+    for key in ["NODE_PATH"] {
+        if let Some(value) = process_plan.environment.get(key) {
+            for entry in std::env::split_paths(value) {
+                insert_existing_path(&mut paths, entry);
+            }
+        }
+    }
+    for key in [
+        "RUSTUP_HOME",
+        "GOROOT",
+        "JAVA_HOME",
+        "MAVEN_HOME",
+        "GRADLE_HOME",
+        "NVM_DIR",
+        "NVM_BIN",
+        "PNPM_HOME",
+        "BUN_INSTALL",
+        "VOLTA_HOME",
+        "PYENV_ROOT",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+    ] {
+        if let Some(value) = process_plan.environment.get(key) {
+            insert_existing_path(&mut paths, PathBuf::from(value));
+        }
+    }
+    if let Some(cargo_home) = process_plan.environment.get("CARGO_HOME") {
+        insert_cargo_runtime_paths(&mut paths, PathBuf::from(cargo_home));
+    }
+    if let Some(go_path) = process_plan.environment.get("GOPATH") {
+        let go_path = PathBuf::from(go_path);
+        for relative in ["bin", "pkg"] {
+            insert_existing_path(&mut paths, go_path.join(relative));
+        }
+    }
+    if let Some(home) = process_plan.environment.get("HOME") {
+        let home = PathBuf::from(home);
+        insert_cargo_runtime_paths(&mut paths, home.join(".cargo"));
+        for relative in [
+            ".rustup",
+            ".nvm/versions",
+            ".fnm",
+            ".local/bin",
+            ".local/share/fnm",
+            ".local/share/pnpm",
+            ".bun",
+            ".volta",
+            ".pyenv",
+            ".conda",
+            "Library/pnpm",
+        ] {
+            insert_existing_path(&mut paths, home.join(relative));
+        }
+        for relative in ["go/bin", "go/pkg"] {
+            insert_existing_path(&mut paths, home.join(relative));
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
+fn insert_cargo_runtime_paths(paths: &mut BTreeSet<PathBuf>, cargo_home: PathBuf) {
+    for relative in ["bin", "registry", "git", ".package-cache"] {
+        insert_existing_path(paths, cargo_home.join(relative));
+    }
+}
+
+fn nono_runtime_write_paths(
+    snapshot: &TurnExecutionSecuritySnapshot,
+    process_plan: Option<&ProcessSpawnPlan>,
+) -> Result<Vec<PathBuf>, ToolError> {
+    let mut paths = BTreeSet::new();
+    for path in platform_runtime_read_write_paths() {
+        insert_existing_path(&mut paths, PathBuf::from(path));
+    }
+    match snapshot.sandbox.tmp.mode {
+        TurnTmpMode::Host => {
+            insert_existing_path(&mut paths, std::env::temp_dir());
+            if let Some(process_plan) = process_plan {
+                for key in ["TMPDIR", "TEMP", "TMP"] {
+                    if let Some(value) = process_plan.environment.get(key) {
+                        insert_existing_path(&mut paths, PathBuf::from(value));
+                    }
+                }
+            }
+        }
+        TurnTmpMode::Isolated => {
+            for root in &snapshot.sandbox.tmp.writable_roots {
+                insert_existing_path(&mut paths, PathBuf::from(root));
+            }
+            if let Some(process_plan) = process_plan {
+                let runtime_temp = process_plan.runtime_temp_path().ok_or_else(|| {
+                    ToolError::Rejected(
+                        "nono isolated tmp policy is missing its private process temp directory"
+                            .to_owned(),
+                    )
+                })?;
+                insert_existing_path(&mut paths, runtime_temp.to_path_buf());
+            }
+        }
+    }
+    if let Some(process_plan) = process_plan
+        && let Some(value) = process_plan.environment.get("PIONEER_ARTIFACT_OUTPUT_DIR")
+    {
+        insert_existing_path(&mut paths, PathBuf::from(value));
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn insert_existing_path(paths: &mut BTreeSet<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() || std::fs::metadata(path.as_path()).is_err() {
+        return;
+    }
+    paths.insert(path);
+}
+
+#[cfg(target_os = "macos")]
+fn platform_runtime_read_paths() -> &'static [&'static str] {
+    &[
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/lib",
+        "/usr/libexec",
+        "/usr/share",
+        "/System/Library",
+        "/System/Cryptexes",
+        "/Library/Frameworks",
+        "/private/etc",
+        "/private/var/db/dyld",
+        "/private/var/db/timezone",
+        "/private/var/db/xcode_select_link",
+        "/private/var/select",
+        "/Library/Developer/CommandLineTools",
+        "/Applications/Xcode.app",
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/opt/homebrew/lib",
+        "/opt/homebrew/share",
+        "/opt/homebrew/Cellar",
+        "/opt/homebrew/opt",
+        "/opt/homebrew/Frameworks",
+        "/opt/homebrew/Library/Homebrew",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/local/lib",
+        "/usr/local/share",
+        "/usr/local/Cellar",
+        "/usr/local/opt",
+        "/usr/local/Frameworks",
+        "/usr/local/Homebrew",
+        "/nix/store",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn platform_runtime_read_paths() -> &'static [&'static str] {
+    &[
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/local/lib",
+        "/usr/share",
+        "/etc/alternatives",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/nsswitch.conf",
+        "/etc/gai.conf",
+        "/etc/ld.so.cache",
+        "/etc/localtime",
+        "/etc/timezone",
+        "/etc/os-release",
+        "/etc/ssl",
+        "/etc/pki",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/proc/self",
+        "/proc/cpuinfo",
+        "/proc/meminfo",
+        "/proc/stat",
+        "/proc/loadavg",
+        "/proc/version",
+        "/nix/store",
+        "/run/current-system/sw",
+    ]
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_runtime_read_write_paths() -> &'static [&'static str] {
+    &["/dev/null", "/dev/tty"]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_runtime_read_write_paths() -> &'static [&'static str] {
+    &[]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_runtime_read_paths() -> &'static [&'static str] {
+    &[]
 }
 
 fn nono_entry_path(
@@ -356,6 +668,7 @@ mod tests {
             inherit_environment: true,
             environment: BTreeMap::new(),
             removed_environment: Vec::new(),
+            runtime_temp_dir: None,
         }
     }
 
@@ -496,6 +809,173 @@ mod tests {
         assert!(plan.read_roots.is_empty());
         assert!(plan.write_roots.is_empty());
         assert!(!plan.network_blocked);
+        assert!(nono_policy_is_noop(&snapshot));
+    }
+
+    #[test]
+    fn nono_unrestricted_filesystem_still_enforces_disabled_network() {
+        let mut snapshot =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/workspace", 1);
+        snapshot.network = pioneer_protocol::TurnNetworkPolicySnapshot::disabled();
+        snapshot.sandbox.network = snapshot.network.clone();
+
+        let plan = build_nono_capability_plan(&snapshot).expect("nono plan should build");
+
+        assert!(plan.read_roots.is_empty());
+        assert_eq!(plan.write_roots, vec![PathBuf::from("/")]);
+        assert!(plan.network_blocked);
+        assert!(!nono_policy_is_noop(&snapshot));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn nono_restricted_command_loads_runtime_without_exposing_sibling_data() {
+        if !nono::Sandbox::is_supported() {
+            return;
+        }
+
+        let current = std::env::current_dir().expect("test cwd");
+        let temp = tempfile::tempdir_in(current).expect("sandbox fixture");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        let artifact_output = temp.path().join("artifact-output");
+        let skill_root = temp.path().join("skills/workspace-a/selected");
+        let other_workspace_skill_root = temp.path().join("skills/workspace-b/private");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(outside.as_path()).expect("outside");
+        std::fs::create_dir_all(artifact_output.as_path()).expect("artifact output");
+        std::fs::create_dir_all(skill_root.as_path()).expect("selected skill root");
+        std::fs::create_dir_all(other_workspace_skill_root.as_path())
+            .expect("other workspace skill root");
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(outside_file.as_path(), "secret\n").expect("outside fixture");
+        let skill_script = skill_root.join("run.sh");
+        std::fs::write(skill_script.as_path(), "selected skill\n").expect("selected skill script");
+        let other_workspace_skill = other_workspace_skill_root.join("secret.txt");
+        std::fs::write(other_workspace_skill.as_path(), "private skill\n")
+            .expect("other workspace skill");
+
+        let mut snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            workspace.to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                workspace.to_string_lossy(),
+            )],
+            1,
+        );
+        snapshot
+            .sandbox
+            .filesystem
+            .entries
+            .push(TurnFilesystemSandboxEntry {
+                path: pioneer_protocol::TurnFilesystemSandboxPath::ExplicitPath {
+                    path: artifact_output.to_string_lossy().into_owned(),
+                },
+                access: TurnFilesystemAccess::Write,
+                provenance: pioneer_protocol::TurnSecurityRuleProvenance::Runtime,
+                resolved_path: Some(artifact_output.to_string_lossy().into_owned()),
+            });
+        snapshot
+            .sandbox
+            .filesystem
+            .entries
+            .push(TurnFilesystemSandboxEntry {
+                path: pioneer_protocol::TurnFilesystemSandboxPath::ExplicitPath {
+                    path: skill_root.to_string_lossy().into_owned(),
+                },
+                access: TurnFilesystemAccess::Read,
+                provenance: pioneer_protocol::TurnSecurityRuleProvenance::Runtime,
+                resolved_path: Some(skill_root.to_string_lossy().into_owned()),
+            });
+        let neighboring_temp = tempfile::Builder::new()
+            .prefix("pioneer-neighbor-")
+            .tempdir()
+            .expect("neighboring host temp");
+        let neighboring_temp_file = neighboring_temp.path().join("secret.txt");
+        std::fs::write(neighboring_temp_file.as_path(), "temp secret\n")
+            .expect("neighboring temp fixture");
+        let script = "if cat \"$1\" >/dev/null 2>&1; then exit 42; fi; \
+             if cat \"$2\" >/dev/null 2>&1; then exit 43; fi; \
+             cat \"$3\" >/dev/null 2>&1 || exit 44; \
+             if cat \"$4\" >/dev/null 2>&1; then exit 45; fi; \
+             test -d \"$TMPDIR\" || exit 46; \
+             command -v cargo >/dev/null || exit 47; \
+             cargo --version >/dev/null || exit 48; \
+             printf 'fn main() {}' > \"$TMPDIR/probe.rs\"; \
+             rustc --crate-name pioneer_sandbox_probe \"$TMPDIR/probe.rs\" \
+               -o \"$TMPDIR/probe\" || exit 49; \
+             \"$TMPDIR/probe\" || exit 50; \
+             printf 'temp' > \"$TMPDIR/owned.txt\"; \
+             printf 'artifact' > \"$5/output.txt\"; printf 'ok' > created.txt";
+        let command_argv = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "sh".to_owned(),
+            outside_file.to_string_lossy().into_owned(),
+            neighboring_temp_file.to_string_lossy().into_owned(),
+            skill_script.to_string_lossy().into_owned(),
+            other_workspace_skill.to_string_lossy().into_owned(),
+            artifact_output.to_string_lossy().into_owned(),
+        ];
+        let args = crate::context::ExecCommandArgs {
+            command: Some(command_argv.clone()),
+            workdir: None,
+            timeout_ms: None,
+            max_output_tokens: None,
+            yield_time_ms: None,
+            tty: Some(false),
+        };
+        let process_plan = crate::build_process_spawn_plan(
+            Some(&snapshot),
+            workspace.as_path(),
+            &args,
+            &BTreeMap::new(),
+            60_000,
+        )
+        .expect("isolated process plan");
+        let runtime_temp = process_plan
+            .runtime_temp_path()
+            .expect("private runtime temp")
+            .to_path_buf();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(&command_argv[1..]);
+        command.current_dir(workspace.as_path());
+        command.env_clear();
+        command.envs(&process_plan.environment);
+        configure_nono_command(&mut command, &snapshot, &process_plan).expect("nono configuration");
+
+        let output = command
+            .output()
+            .await
+            .expect("sandboxed command should spawn");
+        assert!(
+            output.status.success(),
+            "sandboxed shell failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("created.txt")).expect("workspace output"),
+            "ok"
+        );
+        assert_eq!(
+            std::fs::read_to_string(runtime_temp.join("owned.txt")).expect("private temp output"),
+            "temp"
+        );
+        assert_eq!(
+            std::fs::read_to_string(artifact_output.join("output.txt")).expect("artifact output"),
+            "artifact"
+        );
+        drop(process_plan);
+        assert!(
+            !runtime_temp.exists(),
+            "private temp must be removed after process completion"
+        );
     }
 
     #[test]

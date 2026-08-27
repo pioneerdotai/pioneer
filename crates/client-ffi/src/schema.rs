@@ -908,7 +908,7 @@ mod tests {
     fn epic6_ffi_contracts_are_registered_and_content_bytes_are_absent() {
         let documents = client_ffi_schema_documents();
         for expected in [
-            "client_thread_tree_snapshot.json",
+            "thread_tree_snapshot.json",
             "thread_read_params.json",
             "thread_read_response.json",
             "turn_message_edit_params.json",

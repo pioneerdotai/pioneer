@@ -136,6 +136,7 @@ impl PioneerDesktop {
                                             thread_id: response.thread_id,
                                             turn_id: response.turn_id,
                                             item_id: response.item_id,
+                                            visible_thread_ids: Vec::new(),
                                             resolution: response.resolution,
                                         },
                                     );

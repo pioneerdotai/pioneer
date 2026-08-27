@@ -407,6 +407,12 @@ impl MessageProcessor {
             replay_thread_id.as_str(),
         )
         .await;
+        self.replay_cli_runtime_pending_requests_for_thread(
+            connection_id,
+            replay_workspace_id.as_str(),
+            replay_thread_id.as_str(),
+        )
+        .await;
     }
 
     pub(super) async fn thread_tree(

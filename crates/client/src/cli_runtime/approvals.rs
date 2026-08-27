@@ -15,6 +15,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 pub enum PendingRequestKind {
     CommandApproval,
     FileChangeApproval,
+    PermissionApproval,
     UserInput,
     Other,
 }
@@ -24,6 +25,7 @@ impl From<CLIRuntimeRequestKind> for PendingRequestKind {
         match kind {
             CLIRuntimeRequestKind::CommandApproval => Self::CommandApproval,
             CLIRuntimeRequestKind::FileChangeApproval => Self::FileChangeApproval,
+            CLIRuntimeRequestKind::PermissionApproval => Self::PermissionApproval,
             CLIRuntimeRequestKind::UserInput => Self::UserInput,
             CLIRuntimeRequestKind::Other => Self::Other,
         }
@@ -67,6 +69,8 @@ pub struct PendingRequest {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_thread_ids: Vec<String>,
     pub origin: PendingRequestOrigin,
     pub kind: PendingRequestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,8 +96,9 @@ impl PendingRequest {
             thread_id: Some(request.thread_id.clone()),
             turn_id: Some(request.turn_id.clone()),
             item_id: None,
+            visible_thread_ids: request.visible_thread_ids.clone(),
             origin: PendingRequestOrigin::NativePermissionGate,
-            kind: PendingRequestKind::Other,
+            kind: PendingRequestKind::PermissionApproval,
             title: Some(request.tool_name.clone()),
             message: request
                 .summary
@@ -153,6 +158,7 @@ pub enum PendingRequestActionKind {
     Deny,
     Allow,
     AllowForTurn,
+    AllowForSession,
     Answer,
 }
 
@@ -241,7 +247,19 @@ pub fn pending_request_available_actions(
             Kind::Allow,
         ][..],
         (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::CommandApproval)
-        | (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::FileChangeApproval) => {
+        | (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::FileChangeApproval)
+            if cli_runtime_request_supports_session_approval(request) =>
+        {
+            &[
+                Kind::CancelTurn,
+                Kind::Deny,
+                Kind::AllowForSession,
+                Kind::Allow,
+            ][..]
+        }
+        (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::CommandApproval)
+        | (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::FileChangeApproval)
+        | (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::PermissionApproval) => {
             &[Kind::CancelTurn, Kind::Deny, Kind::Allow][..]
         }
         (PendingRequestOrigin::CLIRuntime { .. }, PendingRequestKind::UserInput) => {
@@ -276,12 +294,35 @@ pub fn pending_request_action_resolution(
             }
             (
                 PendingRequestOrigin::CLIRuntime { .. },
-                PendingRequestKind::CommandApproval | PendingRequestKind::FileChangeApproval,
+                PendingRequestKind::CommandApproval
+                | PendingRequestKind::FileChangeApproval
+                | PendingRequestKind::PermissionApproval,
             ) => None,
             (PendingRequestOrigin::CLIRuntime { .. }, _) => None,
         },
+        PendingRequestActionKind::AllowForSession => match (&request.origin, request.kind) {
+            (
+                PendingRequestOrigin::CLIRuntime { .. },
+                PendingRequestKind::CommandApproval | PendingRequestKind::FileChangeApproval,
+            ) if cli_runtime_request_supports_session_approval(request) => {
+                Some(PendingRequestResolution::AllowForSession)
+            }
+            _ => None,
+        },
         PendingRequestActionKind::Answer => None,
     }
+}
+
+fn cli_runtime_request_supports_session_approval(request: &PendingRequest) -> bool {
+    let PendingRequestPayload::CLIRuntime { request } = &request.payload else {
+        return false;
+    };
+    request
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("supportsSessionApproval"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
 }
 
 pub fn pending_request_answered_resolution(
@@ -339,7 +380,7 @@ pub fn plan_pending_request_response(
             },
         ) => {
             let resolution =
-                cli_runtime_resolution_from_pending_resolution(cli_request.kind, resolution)?;
+                cli_runtime_resolution_from_pending_resolution(cli_request, resolution)?;
             Ok(PendingRequestResponseAction::CLIRuntime {
                 method: pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND
                     .to_owned(),
@@ -370,25 +411,35 @@ pub fn plan_pending_request_response(
 }
 
 fn cli_runtime_resolution_from_pending_resolution(
-    kind: CLIRuntimeRequestKind,
+    request: &CLIRuntimePendingRequest,
     resolution: PendingRequestResolution,
 ) -> Result<CLIRuntimeRequestResolution, PendingRequestResponsePlanError> {
-    match kind {
-        CLIRuntimeRequestKind::CommandApproval | CLIRuntimeRequestKind::FileChangeApproval => {
-            match resolution {
-                PendingRequestResolution::Allow => Ok(CLIRuntimeRequestResolution::Approved),
-                PendingRequestResolution::Deny { reason } => {
-                    Ok(CLIRuntimeRequestResolution::Denied { reason })
-                }
-                PendingRequestResolution::Cancel => Ok(CLIRuntimeRequestResolution::Cancelled),
-                PendingRequestResolution::Expired => Ok(CLIRuntimeRequestResolution::Expired),
-                PendingRequestResolution::AllowForTurn
-                | PendingRequestResolution::AllowForSession
-                | PendingRequestResolution::Answered { .. } => {
-                    Err(PendingRequestResponsePlanError::UnsupportedResolutionForOrigin)
-                }
+    match request.kind {
+        CLIRuntimeRequestKind::CommandApproval
+        | CLIRuntimeRequestKind::FileChangeApproval
+        | CLIRuntimeRequestKind::PermissionApproval => match resolution {
+            PendingRequestResolution::Allow => Ok(CLIRuntimeRequestResolution::Approved),
+            PendingRequestResolution::AllowForSession
+                if request
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("supportsSessionApproval"))
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false) =>
+            {
+                Ok(CLIRuntimeRequestResolution::ApprovedForSession)
             }
-        }
+            PendingRequestResolution::Deny { reason } => {
+                Ok(CLIRuntimeRequestResolution::Denied { reason })
+            }
+            PendingRequestResolution::Cancel => Ok(CLIRuntimeRequestResolution::Cancelled),
+            PendingRequestResolution::Expired => Ok(CLIRuntimeRequestResolution::Expired),
+            PendingRequestResolution::AllowForTurn
+            | PendingRequestResolution::AllowForSession
+            | PendingRequestResolution::Answered { .. } => {
+                Err(PendingRequestResponsePlanError::UnsupportedResolutionForOrigin)
+            }
+        },
         CLIRuntimeRequestKind::UserInput => match resolution {
             PendingRequestResolution::Answered { response } => {
                 Ok(CLIRuntimeRequestResolution::Answered { response })
@@ -568,12 +619,7 @@ fn pending_request_matches_scope(
 }
 
 fn pending_request_visible_thread_ids(request: &PendingRequest) -> &[String] {
-    match &request.payload {
-        PendingRequestPayload::NativePermissionGate { request } => {
-            request.visible_thread_ids.as_slice()
-        }
-        _ => &[],
-    }
+    request.visible_thread_ids.as_slice()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -584,6 +630,7 @@ pub struct CLIRuntimePendingRequestEntry {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub item_id: Option<String>,
+    pub visible_thread_ids: Vec<String>,
     pub request: CLIRuntimePendingRequest,
 }
 
@@ -596,6 +643,7 @@ impl CLIRuntimePendingRequestEntry {
             thread_id: notification.thread_id,
             turn_id: notification.turn_id,
             item_id: notification.item_id,
+            visible_thread_ids: notification.visible_thread_ids,
             request: notification.request,
         }
     }
@@ -618,6 +666,7 @@ impl CLIRuntimePendingRequestEntry {
             thread_id: request.thread_id.clone(),
             turn_id: request.turn_id.clone(),
             item_id: request.item_id.clone(),
+            visible_thread_ids: request.visible_thread_ids.clone(),
             request: cli_request.clone(),
         })
     }
@@ -633,6 +682,7 @@ impl CLIRuntimePendingRequestEntry {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
             item_id: self.item_id.clone(),
+            visible_thread_ids: self.visible_thread_ids.clone(),
             origin: PendingRequestOrigin::CLIRuntime {
                 runtime_id: self.runtime_id.clone(),
             },
@@ -657,6 +707,7 @@ impl CLIRuntimePendingRequestEntry {
             thread_id: self.thread_id,
             turn_id: self.turn_id,
             item_id: self.item_id,
+            visible_thread_ids: self.visible_thread_ids,
             origin: PendingRequestOrigin::CLIRuntime {
                 runtime_id: self.runtime_id,
             },
@@ -694,6 +745,9 @@ pub fn pending_request_detail_rows(request: &PendingRequest) -> Vec<PendingReque
             }
             CLIRuntimeRequestKind::FileChangeApproval => {
                 cli_runtime_file_change_detail_rows(entry.request.payload.as_ref())
+            }
+            CLIRuntimeRequestKind::PermissionApproval => {
+                cli_runtime_permission_detail_rows(entry.request.payload.as_ref())
             }
             CLIRuntimeRequestKind::UserInput | CLIRuntimeRequestKind::Other => Vec::new(),
         };
@@ -733,6 +787,7 @@ pub fn pending_request_kind_label(kind: PendingRequestKind) -> &'static str {
     match kind {
         PendingRequestKind::CommandApproval => "Command approval",
         PendingRequestKind::FileChangeApproval => "File change approval",
+        PendingRequestKind::PermissionApproval => "Permission approval",
         PendingRequestKind::UserInput => "Input requested",
         PendingRequestKind::Other => "Pending request",
     }
@@ -786,6 +841,24 @@ fn cli_runtime_file_change_detail_rows(
         });
     }
 
+    rows
+}
+
+fn cli_runtime_permission_detail_rows(payload: Option<&JsonValue>) -> Vec<PendingRequestDetailRow> {
+    let mut rows = Vec::new();
+    if let Some(cwd) = payload.and_then(|payload| string_field(payload, &["cwd"])) {
+        rows.push(detail_row("Directory", cwd, true));
+    }
+    if let Some(permissions) = payload.and_then(|payload| payload.get("permissions")) {
+        rows.push(detail_row(
+            "Requested permissions",
+            serde_json::to_string_pretty(permissions).unwrap_or_else(|_| permissions.to_string()),
+            true,
+        ));
+    }
+    if let Some(reason) = payload.and_then(|payload| string_field(payload, &["reason"])) {
+        rows.push(detail_row("Reason", reason, false));
+    }
     rows
 }
 
@@ -1034,6 +1107,7 @@ mod tests {
             thread_id: thread_id.map(str::to_owned),
             turn_id: turn_id.map(str::to_owned),
             item_id: None,
+            visible_thread_ids: Vec::new(),
             request: CLIRuntimePendingRequest {
                 kind: CLIRuntimeRequestKind::CommandApproval,
                 title: Some(format!("Run {command}")),
@@ -1042,6 +1116,29 @@ mod tests {
                 payload: None,
             },
         }
+    }
+
+    fn session_approvable_request_opened(
+        request_id: &str,
+        workspace_id: &str,
+        runtime_id: &str,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+        command: &str,
+    ) -> CLIRuntimeRequestOpenedNotification {
+        let mut opened = request_opened(
+            request_id,
+            workspace_id,
+            runtime_id,
+            thread_id,
+            turn_id,
+            command,
+        );
+        opened.request.payload = Some(serde_json::json!({
+            "supportsSessionApproval": true,
+            "command": command,
+        }));
+        opened
     }
 
     fn file_change_request_opened(
@@ -1058,6 +1155,7 @@ mod tests {
             thread_id: thread_id.map(str::to_owned),
             turn_id: turn_id.map(str::to_owned),
             item_id: Some("item_file_change".to_owned()),
+            visible_thread_ids: Vec::new(),
             request: CLIRuntimePendingRequest {
                 kind: CLIRuntimeRequestKind::FileChangeApproval,
                 title: Some("Apply file changes".to_owned()),
@@ -1085,6 +1183,7 @@ mod tests {
             thread_id: thread_id.map(str::to_owned),
             turn_id: turn_id.map(str::to_owned),
             item_id: Some("item_input".to_owned()),
+            visible_thread_ids: Vec::new(),
             request: CLIRuntimePendingRequest {
                 kind: CLIRuntimeRequestKind::UserInput,
                 title: Some("Input requested".to_owned()),
@@ -1229,7 +1328,7 @@ mod tests {
         assert_eq!(pending.thread_id.as_deref(), Some("thread"));
         assert_eq!(pending.turn_id.as_deref(), Some("turn"));
         assert_eq!(pending.origin, PendingRequestOrigin::NativePermissionGate);
-        assert_eq!(pending.kind, PendingRequestKind::Other);
+        assert_eq!(pending.kind, PendingRequestKind::PermissionApproval);
         assert_eq!(pending.title.as_deref(), Some("exec_command"));
         assert_eq!(pending.message.as_deref(), Some("Approve command"));
         assert_eq!(pending.native_request_id.as_deref(), Some("req_native"));
@@ -1251,6 +1350,7 @@ mod tests {
             thread_id: Some("child_thread".to_owned()),
             turn_id: Some("turn".to_owned()),
             item_id: None,
+            visible_thread_ids: vec!["parent_thread".to_owned()],
             request: CLIRuntimePendingRequest {
                 kind: CLIRuntimeRequestKind::Other,
                 title: Some("Tool permission requested".to_owned()),
@@ -1316,6 +1416,41 @@ mod tests {
     }
 
     #[test]
+    fn cli_runtime_request_is_visible_in_every_projected_ancestor_thread_scope() {
+        let mut opened = request_opened(
+            "req_cli",
+            "ws",
+            "codex",
+            Some("grandchild_thread"),
+            Some("turn"),
+            "cargo check",
+        );
+        opened.visible_thread_ids = vec!["child_thread".to_owned(), "root_thread".to_owned()];
+        let pending = PendingRequest::from_cli_runtime_opened_notification(opened);
+        let mut state = PendingRequestState::default();
+
+        state.apply(PendingRequestsReduction::Opened(pending.clone()));
+
+        assert_eq!(
+            state.pending_for_scope(Some("ws"), Some("grandchild_thread")),
+            vec![pending.clone()]
+        );
+        assert_eq!(
+            state.pending_for_scope(Some("ws"), Some("child_thread")),
+            vec![pending.clone()]
+        );
+        assert_eq!(
+            state.pending_for_scope(Some("ws"), Some("root_thread")),
+            vec![pending]
+        );
+        assert!(
+            state
+                .pending_for_scope(Some("ws"), Some("other_thread"))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn shared_pending_request_serializes_roundtrip() {
         let pending =
             PendingRequest::from_native_permission_request(native_permission_request("req_native"));
@@ -1371,6 +1506,31 @@ mod tests {
         assert_eq!(
             error,
             PendingRequestResponsePlanError::UnsupportedResolutionForOrigin
+        );
+    }
+
+    #[test]
+    fn response_planner_routes_eligible_codex_session_scope_as_typed_resolution() {
+        let pending = PendingRequest::from_cli_runtime_opened_notification(
+            session_approvable_request_opened(
+                "req",
+                "ws",
+                "codex",
+                Some("thread"),
+                Some("turn"),
+                "pwd",
+            ),
+        );
+
+        let action =
+            plan_pending_request_response(&pending, PendingRequestResolution::AllowForSession)
+                .expect("eligible Codex approval should expose session scope");
+        let PendingRequestResponseAction::CLIRuntime { params, .. } = action else {
+            panic!("expected CLI runtime action");
+        };
+        assert_eq!(
+            params.resolution,
+            CLIRuntimeRequestResolution::ApprovedForSession
         );
     }
 
@@ -1500,6 +1660,16 @@ mod tests {
         ));
         let native =
             PendingRequest::from_native_permission_request(native_permission_request("req_native"));
+        let cli_session_command = PendingRequest::from_cli_runtime_opened_notification(
+            session_approvable_request_opened(
+                "req_session",
+                "ws",
+                "codex",
+                Some("thread"),
+                Some("turn"),
+                "pwd",
+            ),
+        );
         let user_input = PendingRequest::from_cli_runtime_opened_notification(
             user_input_request_opened("req_input", "ws", "codex", Some("thread"), Some("turn")),
         );
@@ -1512,6 +1682,18 @@ mod tests {
             vec![
                 PendingRequestActionKind::CancelTurn,
                 PendingRequestActionKind::Deny,
+                PendingRequestActionKind::Allow,
+            ]
+        );
+        assert_eq!(
+            pending_request_available_actions(&cli_session_command)
+                .into_iter()
+                .map(|action| action.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                PendingRequestActionKind::CancelTurn,
+                PendingRequestActionKind::Deny,
+                PendingRequestActionKind::AllowForSession,
                 PendingRequestActionKind::Allow,
             ]
         );
@@ -1647,6 +1829,7 @@ mod tests {
                     thread_id: Some("thread".to_owned()),
                     turn_id: Some("turn".to_owned()),
                     item_id: None,
+                    visible_thread_ids: Vec::new(),
                     resolution: CLIRuntimeRequestResolution::Cancelled,
                 },
             ),)
@@ -1673,6 +1856,7 @@ mod tests {
                     thread_id: Some("thread".to_owned()),
                     turn_id: Some("turn".to_owned()),
                     item_id: None,
+                    visible_thread_ids: Vec::new(),
                     resolution: CLIRuntimeRequestResolution::Approved,
                 },
             ),)

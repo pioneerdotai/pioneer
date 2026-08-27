@@ -5315,6 +5315,7 @@ mod tests {
             set_invoker_permission_mode(&fixture, TurnPermissionMode::FullAccess).await;
         snapshot.network = TurnNetworkPolicySnapshot::disabled();
         snapshot.sandbox.network = TurnNetworkPolicySnapshot::disabled();
+        snapshot.authority_cap.network = TurnNetworkPolicySnapshot::disabled();
         fixture
             .crud_store
             .set_turn_execution_security_snapshot(fixture.turn_id.as_str(), &snapshot)

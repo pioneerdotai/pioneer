@@ -836,7 +836,15 @@ impl PatchExecutor {
                     stages.push_back(Some(stage));
                 }
                 operation_kind::Replace | operation_kind::Update => {
-                    let source_metadata_path = source.absolute().to_path_buf();
+                    // A preceding operation in this same patch may have
+                    // created or replaced the logical source, while every
+                    // private stage is intentionally prepared before the
+                    // first publish. In that case the on-disk source either
+                    // does not exist yet or contains the old generation;
+                    // preserve the already-frozen virtual mode and do not
+                    // probe stale source metadata again.
+                    let source_metadata_path = (!virtual_modes.contains_key(&change.source))
+                        .then(|| source.absolute().to_path_buf());
                     let mode =
                         match virtual_source_mode(&mut virtual_modes, &change.source, &source) {
                             Ok(mode) => mode,
@@ -866,7 +874,7 @@ impl PatchExecutor {
                         after.bytes.clone(),
                         StageMetadata::PreserveSupportedMode {
                             mode,
-                            source_path: Some(source_metadata_path),
+                            source_path: source_metadata_path,
                         },
                         lock,
                     ) {
@@ -1556,7 +1564,7 @@ mod tests {
             ExecuteOptions::default(),
             &NeverCancel,
         );
-        assert_eq!(report.status, ExecutionStatus::Applied);
+        assert_eq!(report.status, ExecutionStatus::Applied, "{report:#?}");
         assert_eq!(report.delta.changes.len(), 2);
         assert_eq!(fs::read(root.path().join("file.txt")).unwrap(), b"new");
     }
@@ -1997,7 +2005,7 @@ mod tests {
             ExecuteOptions::default(),
             &NeverCancel,
         );
-        assert_eq!(report.status, ExecutionStatus::Applied);
+        assert_eq!(report.status, ExecutionStatus::Applied, "{report:#?}");
         let intent = observer.intent_journal().get(&identity).unwrap().unwrap();
         assert_eq!(
             intent

@@ -238,7 +238,7 @@ pub async fn probe_claude_help_contract(
         "--strict-mcp-config",
         "--allowedTools",
         "--setting-sources",
-        "--safe-mode",
+        "--plugin-dir",
         "--session-id",
         "--resume",
         "--no-session-persistence",
@@ -1596,7 +1596,6 @@ async fn run_initialize_probe(
             "stdio",
             "--permission-mode",
             "default",
-            "--safe-mode",
             "--setting-sources=",
             "--include-partial-messages",
             "--input-format",
@@ -2340,7 +2339,7 @@ mod tests {
         let executable = root.join("claude-help-fixture");
         fs::write(
             executable.as_path(),
-            b"#!/bin/sh\nprintf '%s\\n' '--mcp-config --strict-mcp-config --allowedTools --setting-sources --safe-mode --session-id --resume --no-session-persistence --input-format --output-format'\n",
+            b"#!/bin/sh\nprintf '%s\\n' '--mcp-config --strict-mcp-config --allowedTools --setting-sources --plugin-dir --session-id --resume --no-session-persistence --input-format --output-format'\n",
         )
         .expect("help fixture");
         fs::set_permissions(executable.as_path(), fs::Permissions::from_mode(0o700))

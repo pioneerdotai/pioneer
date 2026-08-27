@@ -3,10 +3,45 @@ use crate::error::ToolError;
 use crate::{FilePolicyChecker, FilePolicyDecision};
 use pioneer_protocol::{
     PermissionBehavior, TurnEnvironmentPolicy, TurnExecutionSecuritySnapshot,
-    TurnProcessPolicySnapshot,
+    TurnProcessPolicySnapshot, TurnTmpMode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+#[derive(Debug)]
+pub(crate) struct ProcessRuntimeTempDir {
+    directory: tempfile::TempDir,
+}
+
+impl ProcessRuntimeTempDir {
+    fn create(snapshot: &TurnExecutionSecuritySnapshot) -> Result<Self, ToolError> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("pioneer-exec-");
+        let directory = match snapshot.sandbox.tmp.writable_roots.first() {
+            Some(root) => builder.tempdir_in(root),
+            None => builder.tempdir(),
+        }
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "failed to create isolated process temp directory: {error}"
+            ))
+        })?;
+        Ok(Self { directory })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+impl PartialEq for ProcessRuntimeTempDir {
+    fn eq(&self, other: &Self) -> bool {
+        self.path() == other.path()
+    }
+}
+
+impl Eq for ProcessRuntimeTempDir {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpawnPlan {
@@ -15,6 +50,90 @@ pub struct ProcessSpawnPlan {
     pub inherit_environment: bool,
     pub environment: BTreeMap<String, String>,
     pub removed_environment: Vec<String>,
+    /// Owns the private temp directory for an isolated process. Cloned plans
+    /// share ownership so a live TTY session keeps the directory until the
+    /// final process-plan owner is dropped.
+    pub(crate) runtime_temp_dir: Option<Arc<ProcessRuntimeTempDir>>,
+}
+
+/// Environment projection for a native helper that intentionally performs a
+/// host-side effect outside the shell sandbox (for example computer-use app
+/// launch/activation). It still must honor the immutable Turn environment
+/// policy so a restricted native tool cannot hand Gateway credentials to the
+/// launched process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "computer-use"), allow(dead_code))]
+pub(crate) struct ProcessEnvironmentPlan {
+    inherit_environment: bool,
+    environment: BTreeMap<String, String>,
+    removed_environment: Vec<String>,
+}
+
+#[cfg_attr(not(feature = "computer-use"), allow(dead_code))]
+impl ProcessEnvironmentPlan {
+    pub(crate) fn from_snapshot(
+        snapshot: Option<&TurnExecutionSecuritySnapshot>,
+        invocation_environment: &BTreeMap<String, String>,
+    ) -> Self {
+        let Some(snapshot) = snapshot else {
+            // Direct handler/unit tests predate execution snapshots. Product
+            // dispatch attaches and validates one before invoking a tool.
+            return Self {
+                inherit_environment: true,
+                environment: BTreeMap::new(),
+                removed_environment: Vec::new(),
+            };
+        };
+        Self::from_policy_with_host_environment(
+            &snapshot.process.environment,
+            invocation_environment,
+            std::env::vars(),
+        )
+    }
+
+    fn from_policy_with_host_environment<I>(
+        policy: &TurnEnvironmentPolicy,
+        invocation_environment: &BTreeMap<String, String>,
+        host_environment: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let (inherit_environment, environment, removed_environment) =
+            sanitize_environment(policy, invocation_environment, host_environment);
+        Self {
+            inherit_environment,
+            environment,
+            removed_environment,
+        }
+    }
+
+    pub(crate) fn apply_to_std_command(&self, command: &mut std::process::Command) {
+        if !self.inherit_environment {
+            command.env_clear();
+        }
+        for key in &self.removed_environment {
+            command.env_remove(key);
+        }
+        command.envs(self.environment.iter());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inherited_for_test() -> Self {
+        Self {
+            inherit_environment: true,
+            environment: BTreeMap::new(),
+            removed_environment: Vec::new(),
+        }
+    }
+}
+
+impl ProcessSpawnPlan {
+    pub(crate) fn runtime_temp_path(&self) -> Option<&Path> {
+        self.runtime_temp_dir
+            .as_deref()
+            .map(ProcessRuntimeTempDir::path)
+    }
 }
 
 pub fn build_process_spawn_plan(
@@ -57,11 +176,25 @@ where
     enforce_process_policy(snapshot, command)?;
     enforce_process_cwd(snapshot, cwd.as_path())?;
 
-    let (inherit_environment, environment, removed_environment) = sanitize_environment(
+    let (inherit_environment, mut environment, removed_environment) = sanitize_environment(
         &snapshot.process.environment,
         invocation_environment,
         host_environment,
     );
+    #[cfg(target_os = "macos")]
+    if !inherit_environment {
+        configure_macos_developer_environment(&mut environment);
+    }
+    let runtime_temp_dir = if snapshot.sandbox.tmp.mode == TurnTmpMode::Isolated {
+        let runtime_temp_dir = Arc::new(ProcessRuntimeTempDir::create(snapshot)?);
+        let runtime_temp = runtime_temp_dir.path().to_string_lossy().into_owned();
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            environment.insert(key.to_owned(), runtime_temp.clone());
+        }
+        Some(runtime_temp_dir)
+    } else {
+        None
+    };
 
     Ok(ProcessSpawnPlan {
         cwd,
@@ -69,7 +202,58 @@ where
         inherit_environment,
         environment,
         removed_environment,
+        runtime_temp_dir,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_developer_environment(environment: &mut BTreeMap<String, String>) {
+    let developer_dir = environment
+        .get("DEVELOPER_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| std::fs::canonicalize("/private/var/db/xcode_select_link").ok());
+    let Some(developer_dir) = developer_dir else {
+        return;
+    };
+    environment.insert(
+        "DEVELOPER_DIR".to_owned(),
+        developer_dir.to_string_lossy().into_owned(),
+    );
+
+    let configured_sdk_exists = environment
+        .get("SDKROOT")
+        .is_some_and(|value| Path::new(value).is_dir());
+    if !configured_sdk_exists {
+        let sdk_candidates = [
+            developer_dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
+            developer_dir.join("SDKs/MacOSX.sdk"),
+        ];
+        if let Some(sdk_root) = sdk_candidates.into_iter().find(|path| path.is_dir()) {
+            environment.insert(
+                "SDKROOT".to_owned(),
+                sdk_root.to_string_lossy().into_owned(),
+            );
+        }
+    }
+
+    let toolchain_candidates = [
+        developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin"),
+        developer_dir.join("usr/bin"),
+    ];
+    let Some(toolchain_bin) = toolchain_candidates.into_iter().find(|path| path.is_dir()) else {
+        return;
+    };
+    let mut path_entries = vec![toolchain_bin];
+    if let Some(current_path) = environment.get("PATH") {
+        path_entries.extend(std::env::split_paths(current_path));
+    }
+    path_entries.dedup();
+    if let Ok(path) = std::env::join_paths(path_entries)
+        && let Ok(path) = path.into_string()
+    {
+        environment.insert("PATH".to_owned(), path);
+    }
 }
 
 fn enforce_process_policy(
@@ -375,6 +559,9 @@ mod tests {
         .expect("plan should build");
 
         assert!(!plan.environment.contains_key("SAFE_VALUE"));
+        assert!(plan.environment.get("PATH").is_some_and(|path| {
+            std::env::split_paths(path).any(|entry| entry == Path::new("/bin"))
+        }));
         assert!(!plan.environment.contains_key("API_TOKEN"));
         assert!(plan.removed_environment.contains(&"SAFE_VALUE".to_owned()));
         assert!(plan.removed_environment.contains(&"API_TOKEN".to_owned()));
@@ -387,6 +574,10 @@ mod tests {
         let snapshot = workspace_write_snapshot(root.path());
         let invocation_env = BTreeMap::from([
             ("OPENAI_API_KEY".to_owned(), "openai-canary".to_owned()),
+            (
+                "PIONEER_ARTIFACT_OUTPUT_DIR".to_owned(),
+                "/tmp/pioneer-output".to_owned(),
+            ),
             (
                 "custom_workspace_credential".to_owned(),
                 "custom-canary".to_owned(),
@@ -419,6 +610,13 @@ mod tests {
         .expect("restricted process plan should build");
 
         assert!(!plan.inherit_environment);
+        assert_eq!(
+            plan.environment.get("PIONEER_ARTIFACT_OUTPUT_DIR"),
+            Some(&"/tmp/pioneer-output".to_owned())
+        );
+        assert!(plan.environment.get("PATH").is_some_and(|path| {
+            std::env::split_paths(path).any(|entry| entry == Path::new("/trusted/bin"))
+        }));
         for name in [
             "OPENAI_API_KEY",
             "custom_workspace_credential",
@@ -428,7 +626,6 @@ mod tests {
             "AZURE_CLIENT_ID",
             "DATABASE_URL",
             "SSH_AUTH_SOCK",
-            "PATH",
         ] {
             assert!(
                 !plan.environment.contains_key(name),
@@ -440,6 +637,63 @@ mod tests {
                     .any(|removed| removed == name),
                 "restricted child environment did not account for removed {name}"
             );
+        }
+        assert!(!plan.removed_environment.iter().any(|name| name == "PATH"));
+    }
+
+    #[test]
+    fn restricted_native_helper_environment_uses_turn_policy() {
+        let policy = TurnEnvironmentPolicy::restricted();
+        let invocation_environment = BTreeMap::from([
+            (
+                "PIONEER_ARTIFACT_OUTPUT_DIR".to_owned(),
+                "/runtime/output".to_owned(),
+            ),
+            ("OPENAI_API_KEY".to_owned(), "invocation-secret".to_owned()),
+        ]);
+        let host_environment = BTreeMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), "host-secret".to_owned()),
+            ("DATABASE_URL".to_owned(), "database-secret".to_owned()),
+        ]);
+
+        let plan = ProcessEnvironmentPlan::from_policy_with_host_environment(
+            &policy,
+            &invocation_environment,
+            host_environment,
+        );
+
+        assert!(!plan.inherit_environment);
+        assert_eq!(
+            plan.environment.get("PATH"),
+            Some(&"/usr/bin:/bin".to_owned())
+        );
+        assert_eq!(
+            plan.environment.get("PIONEER_ARTIFACT_OUTPUT_DIR"),
+            Some(&"/runtime/output".to_owned())
+        );
+        assert!(!plan.environment.contains_key("OPENAI_API_KEY"));
+        assert!(!plan.environment.contains_key("DATABASE_URL"));
+
+        #[cfg(unix)]
+        {
+            let mut command = std::process::Command::new("/usr/bin/env");
+            plan.apply_to_std_command(&mut command);
+            let output = command.output().expect("run environment probe");
+            assert!(output.status.success());
+            let child_environment = String::from_utf8(output.stdout).expect("UTF-8 environment");
+            assert!(
+                child_environment
+                    .lines()
+                    .any(|line| line == "PATH=/usr/bin:/bin")
+            );
+            assert!(
+                child_environment
+                    .lines()
+                    .any(|line| line == "PIONEER_ARTIFACT_OUTPUT_DIR=/runtime/output")
+            );
+            assert!(!child_environment.contains("OPENAI_API_KEY="));
+            assert!(!child_environment.contains("DATABASE_URL="));
         }
     }
 
@@ -509,5 +763,55 @@ mod tests {
         .expect("plan should build");
 
         assert_eq!(plan.timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn isolated_process_temp_is_private_rebound_and_owned_by_plan_clones() {
+        let root = tempfile::tempdir().expect("root");
+        let snapshot = workspace_write_snapshot(root.path());
+        let host_temp = root.path().join("host-temp");
+        std::fs::create_dir_all(host_temp.as_path()).expect("host temp");
+        let host_env = BTreeMap::from([
+            (
+                "TMPDIR".to_owned(),
+                host_temp.to_string_lossy().into_owned(),
+            ),
+            ("TEMP".to_owned(), host_temp.to_string_lossy().into_owned()),
+            ("TMP".to_owned(), host_temp.to_string_lossy().into_owned()),
+        ]);
+
+        let plan = build_process_spawn_plan_with_host_environment(
+            Some(&snapshot),
+            root.path(),
+            &exec_args(&["sh", "-c", "true"]),
+            &BTreeMap::new(),
+            host_env,
+            60_000,
+        )
+        .expect("isolated process plan");
+        let runtime_temp = plan
+            .runtime_temp_path()
+            .expect("private runtime temp")
+            .to_path_buf();
+        assert!(runtime_temp.is_dir());
+        assert_ne!(runtime_temp, host_temp);
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            assert_eq!(
+                plan.environment.get(key).map(String::as_str),
+                Some(runtime_temp.to_string_lossy().as_ref())
+            );
+        }
+
+        let clone = plan.clone();
+        drop(plan);
+        assert!(
+            runtime_temp.is_dir(),
+            "clone must retain the temp directory"
+        );
+        drop(clone);
+        assert!(
+            !runtime_temp.exists(),
+            "last process-plan owner must remove the temp directory"
+        );
     }
 }

@@ -1243,6 +1243,14 @@ impl AgentThreadControlPlane {
             .map(|active| active.execution.clone())
     }
 
+    fn active_turn_id(&self) -> Option<String> {
+        self.active
+            .read()
+            .expect("agent thread control plane lock poisoned")
+            .as_ref()
+            .map(|active| active.turn_id.clone())
+    }
+
     fn set_observation(&self, turn_id: &str, run_id: u64, observation: ExecutionTurnObservation) {
         let mut active = self
             .active
@@ -2128,6 +2136,18 @@ impl AgentManager {
             .ok()?
             .ok()
             .flatten()
+    }
+
+    /// Returns the exact native Turn currently occupying a thread runtime.
+    /// Durable callers use this only as a retry fence; it grants no authority
+    /// and does not expose provider state.
+    pub async fn active_turn_id(&self, thread_id: &str) -> Option<String> {
+        self.state
+            .read()
+            .await
+            .threads
+            .get(thread_id)
+            .and_then(|thread| thread.control_plane.active_turn_id())
     }
 
     pub async fn start_recovery_attempt(

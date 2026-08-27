@@ -1,7 +1,12 @@
 use super::http::{
-    BufferedHttpRequest, build_http_client, execute_buffered_http_request, validate_http_url,
+    BufferedHttpRequest, build_http_client, execute_buffered_http_request, map_http_request_error,
+    validate_http_url,
 };
 use crate::WebToolsConfig;
+use crate::apply_patch::file_mutation::{
+    CanonicalTarget, StagedFile, TargetExpectation, TargetResolver, TargetRole,
+    ensure_parent_directories,
+};
 use crate::context::{FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
 use crate::error::ToolError;
 use crate::network_policy::enforce_network_url;
@@ -371,15 +376,27 @@ impl ToolHandler for DownloadUrlHandler {
             include_headers: false,
         };
 
-        let mut destination = resolve_download_destination(
+        let requested_destination = resolve_download_destination(
             invocation.workdir.as_path(),
             args.destination.as_deref(),
             args.url.as_str(),
         )?;
-        if let Some(snapshot) = invocation.execution_security_snapshot.as_ref() {
-            match FilePolicyChecker::check_write(snapshot, destination.as_path()) {
+        let snapshot = invocation
+            .execution_security_snapshot
+            .as_ref()
+            .ok_or_else(|| {
+                ToolError::Rejected(
+                "missing turn execution security snapshot; refusing download filesystem mutation"
+                    .to_owned(),
+            )
+            })?;
+        let (destination, authorized_root) =
+            match FilePolicyChecker::check_write(snapshot, requested_destination.as_path()) {
                 FilePolicyDecision::Allowed(grant) => {
-                    destination = grant.resolved_path;
+                    let authorized_root = grant
+                        .matched_root
+                        .unwrap_or_else(|| filesystem_volume_root(grant.resolved_path.as_path()));
+                    (grant.resolved_path, authorized_root)
                 }
                 FilePolicyDecision::Denied(deny) => {
                     return Err(ToolError::Rejected(format!(
@@ -388,12 +405,33 @@ impl ToolHandler for DownloadUrlHandler {
                         deny.message
                     )));
                 }
-            }
-        }
+            };
+        let target = TargetResolver::new(authorized_root)
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "download destination authorization root is invalid: {error}"
+                ))
+            })?
+            .with_absolute_paths(true)
+            .resolve(
+                destination.to_string_lossy().as_ref(),
+                TargetRole::Destination,
+                TargetExpectation::ExistingOrMissing,
+            )
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "download destination cannot be securely resolved: {error}"
+                ))
+            })?;
+        target.validate_expectation().map_err(|error| {
+            ToolError::Rejected(format!(
+                "download destination is not a regular file or missing path: {error}"
+            ))
+        })?;
 
         let stream_result = download_to_file(
             args.url.as_str(),
-            destination.as_path(),
+            &target,
             settings,
             args.overwrite.unwrap_or(false),
             args.create_dirs.unwrap_or(true),
@@ -510,7 +548,13 @@ async fn search_duckduckgo_html(
     let timeout_ms = config
         .default_timeout_ms
         .clamp(1, config.hard_max_timeout_ms.max(1));
-    let client = build_http_client(timeout_ms, true, Some(config.default_user_agent.as_str()))?;
+    let client = build_http_client(
+        timeout_ms,
+        true,
+        Some(config.default_user_agent.as_str()),
+        security_snapshot,
+        "web_search",
+    )?;
 
     let mut params: Vec<(&str, String)> = vec![("q", query.to_owned())];
     if let Some(region) = region {
@@ -549,9 +593,7 @@ async fn search_duckduckgo_html(
         .query(&params)
         .send()
         .await
-        .map_err(|error| {
-            ToolError::execution_failed(format!("duckduckgo request failed: {error}"))
-        })?;
+        .map_err(|error| map_http_request_error(error, "duckduckgo request failed"))?;
 
     let status = response.status().as_u16();
     let body = response.text().await.map_err(|error| {
@@ -642,7 +684,13 @@ async fn search_duckduckgo_instant_api(
     let timeout_ms = config
         .default_timeout_ms
         .clamp(1, config.hard_max_timeout_ms.max(1));
-    let client = build_http_client(timeout_ms, true, Some(config.default_user_agent.as_str()))?;
+    let client = build_http_client(
+        timeout_ms,
+        true,
+        Some(config.default_user_agent.as_str()),
+        security_snapshot,
+        "web_search",
+    )?;
     let payload = client
         .get(config.ddg_instant_api_url.as_str())
         .query(&[
@@ -653,9 +701,7 @@ async fn search_duckduckgo_instant_api(
         ])
         .send()
         .await
-        .map_err(|error| {
-            ToolError::execution_failed(format!("duckduckgo instant API request failed: {error}"))
-        })?
+        .map_err(|error| map_http_request_error(error, "duckduckgo instant API request failed"))?
         .json::<JsonValue>()
         .await
         .map_err(|error| {
@@ -819,17 +865,21 @@ async fn fetch_url(
 ) -> Result<HttpFetchResult, ToolError> {
     enforce_network_url(security_snapshot, url, "web_fetch")?;
 
-    let response = execute_buffered_http_request(BufferedHttpRequest {
-        method: "GET".to_owned(),
-        url: url.to_owned(),
-        timeout_ms: settings.timeout_ms,
-        follow_redirects: settings.follow_redirects,
-        user_agent: Some(user_agent.to_owned()),
-        headers: HashMap::new(),
-        query: None,
-        body: None,
-        max_bytes: settings.max_bytes.max(1),
-    })
+    let response = execute_buffered_http_request(
+        BufferedHttpRequest {
+            method: "GET".to_owned(),
+            url: url.to_owned(),
+            timeout_ms: settings.timeout_ms,
+            follow_redirects: settings.follow_redirects,
+            user_agent: Some(user_agent.to_owned()),
+            headers: HashMap::new(),
+            query: None,
+            body: None,
+            max_bytes: settings.max_bytes.max(1),
+        },
+        security_snapshot,
+        "web_fetch",
+    )
     .await?;
 
     let headers = response.headers;
@@ -856,7 +906,7 @@ async fn fetch_url(
 
 async fn download_to_file(
     url: &str,
-    destination: &Path,
+    target: &CanonicalTarget,
     settings: FetchSettings,
     overwrite: bool,
     create_dirs: bool,
@@ -865,57 +915,51 @@ async fn download_to_file(
 ) -> Result<DownloadStreamResult, ToolError> {
     validate_http_url(url)?;
     enforce_network_url(security_snapshot, url, "download_url")?;
-
-    if create_dirs && let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            ToolError::execution_failed(format!(
-                "failed to create destination directory `{}`: {error}",
-                parent.display()
-            ))
-        })?;
-    }
-
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true);
-    if overwrite {
-        options.truncate(true);
-    } else {
-        options.create_new(true);
-    }
-
-    let mut file = options.open(destination).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            ToolError::execution_failed(format!(
-                "destination already exists: {} (set overwrite=true)",
-                destination.display()
-            ))
-        } else {
-            ToolError::execution_failed(format!(
-                "failed to open destination `{}`: {error}",
-                destination.display()
-            ))
-        }
-    })?;
+    let destination = target.absolute();
 
     let client = build_http_client(
         settings.timeout_ms,
         settings.follow_redirects,
         Some(user_agent),
+        security_snapshot,
+        "download_url",
     )?;
     let started = Instant::now();
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|error| ToolError::execution_failed(format!("request failed: {error}")))?;
+        .map_err(|error| map_http_request_error(error, "request failed"))?;
 
     let status_code = response.status().as_u16();
     if status_code >= 400 {
-        let _ = tokio::fs::remove_file(destination).await;
         return Err(ToolError::execution_failed(format!(
             "download request failed with HTTP {status_code}"
         )));
     }
+
+    if create_dirs {
+        ensure_parent_directories(target).map_err(|failure| {
+            ToolError::execution_failed(format!(
+                "failed to securely create destination directories for `{}`: {}",
+                destination.display(),
+                failure.source
+            ))
+        })?;
+    }
+    let staged = StagedFile::create(target).map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to securely stage download destination `{}`: {error}",
+            destination.display()
+        ))
+    })?;
+    let staged_file = staged.file().try_clone().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to prepare staged download file `{}`: {error}",
+            destination.display()
+        ))
+    })?;
+    let mut file = tokio::fs::File::from_std(staged_file);
 
     let final_url = response.url().to_string();
     let content_type = response
@@ -936,7 +980,6 @@ async fn download_to_file(
         let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         let next_size = bytes_written.saturating_add(chunk_len);
         if next_size > u64::try_from(settings.max_bytes).unwrap_or(u64::MAX) {
-            let _ = tokio::fs::remove_file(destination).await;
             return Err(ToolError::execution_failed(format!(
                 "download exceeds max_bytes limit ({})",
                 settings.max_bytes
@@ -959,6 +1002,45 @@ async fn download_to_file(
             destination.display()
         ))
     })?;
+    file.sync_all().await.map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to sync staged download `{}`: {error}",
+            destination.display()
+        ))
+    })?;
+    drop(file);
+
+    let published_parent = if overwrite {
+        staged.publish_replace(false)
+    } else {
+        staged.publish_no_replace(false)
+    }
+    .map_err(|error| {
+        if error.source.kind() == std::io::ErrorKind::AlreadyExists {
+            ToolError::execution_failed(format!(
+                "destination already exists: {} (set overwrite=true)",
+                destination.display()
+            ))
+        } else {
+            ToolError::execution_failed(format!(
+                "failed to publish staged download `{}`: {}",
+                destination.display(),
+                error.source
+            ))
+        }
+    })?;
+    if published_parent.cleanup_failed {
+        tracing::warn!(
+            destination = %destination.display(),
+            "download was published but its staging filename could not be removed"
+        );
+    }
+    published_parent.sync_all().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "download was published to `{}` but its parent directory could not be synced: {error}",
+            destination.display()
+        ))
+    })?;
 
     Ok(DownloadStreamResult {
         request_url: url.to_owned(),
@@ -970,6 +1052,27 @@ async fn download_to_file(
         truncated: false,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+fn filesystem_volume_root(path: &Path) -> PathBuf {
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                root.push(component.as_os_str());
+            }
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::Normal(_) => break,
+        }
+    }
+    if root.as_os_str().is_empty() {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        root
+    }
 }
 
 fn extract_from_http(
@@ -1163,7 +1266,7 @@ fn is_probably_binary(content_type: Option<&str>, bytes: &[u8]) -> bool {
     non_printable.saturating_mul(100) / probe.len().max(1) > 20
 }
 
-fn resolve_download_destination(
+pub(crate) fn resolve_download_destination(
     workdir: &Path,
     destination: Option<&str>,
     source_url: &str,
@@ -1192,10 +1295,6 @@ fn resolve_download_destination(
             "invalid destination path `{}`",
             path.display()
         )));
-    }
-
-    if path.is_dir() {
-        return Ok(path.join(inferred_name.as_str()));
     }
 
     Ok(path)
@@ -1262,6 +1361,34 @@ fn looks_like_html(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn secure_download_target(root: &Path, destination: &Path) -> CanonicalTarget {
+        TargetResolver::new(root)
+            .expect("download root")
+            .with_absolute_paths(true)
+            .resolve(
+                destination.to_string_lossy().as_ref(),
+                TargetRole::Destination,
+                TargetExpectation::ExistingOrMissing,
+            )
+            .expect("download target")
+    }
+
+    async fn one_response_server(response: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("download test listener");
+        let address = listener.local_addr().expect("download test address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("download request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            stream.write_all(response).await.expect("write response");
+        });
+        (format!("http://{address}/download"), server)
+    }
 
     #[test]
     fn normalize_duckduckgo_redirect_extracts_uddg() {
@@ -1326,6 +1453,86 @@ mod tests {
             matches!(error, ToolError::Rejected(ref message) if message.contains("network access is disabled")),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_overwrite_download_preserves_existing_destination() {
+        let root = tempfile::tempdir().expect("download root");
+        let destination = root.path().join("existing.bin");
+        std::fs::write(destination.as_path(), b"original").expect("existing destination");
+        let target = secure_download_target(root.path(), destination.as_path());
+        let (url, server) = one_response_server(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+
+        let error = download_to_file(
+            url.as_str(),
+            &target,
+            FetchSettings {
+                timeout_ms: 2_000,
+                max_bytes: 1024,
+                follow_redirects: false,
+                include_headers: false,
+            },
+            true,
+            true,
+            "pioneer-test",
+            Some(&snapshot),
+        )
+        .await
+        .expect_err("HTTP failure must not publish the staged download");
+
+        assert!(error.to_string().contains("HTTP 500"));
+        assert_eq!(
+            std::fs::read(destination).expect("preserved destination"),
+            b"original"
+        );
+        server.await.expect("download server");
+    }
+
+    #[tokio::test]
+    async fn oversized_overwrite_download_preserves_existing_destination() {
+        let root = tempfile::tempdir().expect("download root");
+        let destination = root.path().join("existing.bin");
+        std::fs::write(destination.as_path(), b"original").expect("existing destination");
+        let target = secure_download_target(root.path(), destination.as_path());
+        let (url, server) = one_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
+        )
+        .await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+
+        let error = download_to_file(
+            url.as_str(),
+            &target,
+            FetchSettings {
+                timeout_ms: 2_000,
+                max_bytes: 4,
+                follow_redirects: false,
+                include_headers: false,
+            },
+            true,
+            true,
+            "pioneer-test",
+            Some(&snapshot),
+        )
+        .await
+        .expect_err("oversized response must not publish the staged download");
+
+        assert!(error.to_string().contains("exceeds max_bytes"));
+        assert_eq!(
+            std::fs::read(destination).expect("preserved destination"),
+            b"original"
+        );
+        server.await.expect("download server");
     }
 
     #[tokio::test]

@@ -865,6 +865,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn participant_add_reprojects_running_execution_without_fencing_it() {
+        let harness = IsolatedEpic4Harness::new()
+            .await
+            .expect("isolated authorization fixture");
+        let store = CrudStore::new(harness.database.clone());
+        let member_a = principal(
+            MEMBER_A_ID,
+            PrincipalKind::User,
+            Some(RoleKey::member()),
+            "D0000000000000000000A",
+            "S0000000000000000000A",
+        );
+        let supervised = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        let context = ExecutionAuthorizationContext::for_test(
+            &member_a,
+            WORKSPACE_RED_ID,
+            THREAD_RED_PRIVATE_A_ID,
+            &supervised,
+            None,
+        );
+        let registry = ExecutionLeaseRegistry::default();
+        registry
+            .register(&store, "V00000000000000000004", &context, 1)
+            .await
+            .expect("register running collaborative execution");
+
+        let member_b = PrincipalId::new(MEMBER_B_ID).expect("Member B id");
+        {
+            let leases = registry.leases.read().await;
+            let lease = leases
+                .get("V00000000000000000004")
+                .expect("registered lease");
+            assert!(
+                lease
+                    .action_collaborators
+                    .get(&ResourceAction::AgentRequestRespond)
+                    .is_none_or(|ids| !ids.contains(&member_b))
+            );
+        }
+
+        add_member_b_to_private_root(&harness).await;
+        let signal = crate::authorization::AuthorizationInvalidationHub::default()
+            .publish(
+                pioneer_protocol::AccessChangeKind::ThreadParticipantAdded,
+                Some(member_b.clone()),
+                WORKSPACE_RED_ID,
+                Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
+            )
+            .await
+            .expect("publish participant-add invalidation");
+        let reprojection = registry
+            .reproject_scope(&store, &signal)
+            .await
+            .expect("reproject shared execution");
+        assert!(
+            reprojection.fenced_execution_ids.is_empty(),
+            "adding a collaborator must not stop the running shared execution"
+        );
+
+        let leases = registry.leases.read().await;
+        let lease = leases
+            .get("V00000000000000000004")
+            .expect("reprojected lease");
+        for action in [
+            ResourceAction::AgentExecutionCancel,
+            ResourceAction::AgentExecutionSteer,
+            ResourceAction::AgentRequestRespond,
+            ResourceAction::TaskCreate,
+        ] {
+            assert!(
+                lease
+                    .action_collaborators
+                    .get(&action)
+                    .is_some_and(|ids| ids.contains(&member_b)),
+                "new collaborator must receive current `{}` authority",
+                action.safe_name()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn collaboration_action_does_not_require_backend_start_authority() {
         let harness = IsolatedEpic4Harness::new()
             .await

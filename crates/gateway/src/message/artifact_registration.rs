@@ -44,7 +44,6 @@ impl MessageProcessor {
                 binding_role: Some(ArtifactRole::Tool),
                 allowed_roots: vec![allowed_root.clone()],
                 max_file_bytes: Some(REGISTRATION_MAX_FILE_BYTES),
-                cleanup_source_after_success: false,
             };
 
             match self

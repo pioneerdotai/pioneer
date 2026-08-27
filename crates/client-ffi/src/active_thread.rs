@@ -515,11 +515,12 @@ impl ClientFfiActiveThreadState {
         // Workspace notifications can update an inactive parent while its child is active.
         // Return the affected thread projection so every UI cache stays live without
         // changing the native active-thread selection.
-        let affected_thread_id = match &request.event {
-            ClientEvent::GatewayNotification(notification) => {
-                notification_thread_id(notification).map(str::to_owned)
-            }
-            _ => None,
+        let (affected_thread_id, visible_thread_ids) = match &request.event {
+            ClientEvent::GatewayNotification(notification) => (
+                notification_thread_id(notification).map(str::to_owned),
+                notification_visible_thread_ids(notification).to_vec(),
+            ),
+            _ => (None, Vec::new()),
         };
         let notification_reduction =
             if let ClientEvent::GatewayNotification(notification) = request.event {
@@ -533,10 +534,16 @@ impl ClientFfiActiveThreadState {
                 .inner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-            let thread_id = affected_thread_id
-                .as_deref()
-                .or(inner.active_thread_id.as_deref());
-            snapshot_for_thread_from_inner(&inner, thread_id, request.expanded_keys.as_slice())
+            let thread_id = notification_snapshot_thread_id(
+                inner.active_thread_id.as_deref(),
+                affected_thread_id.as_deref(),
+                visible_thread_ids.as_slice(),
+            );
+            snapshot_for_thread_from_inner(
+                &inner,
+                thread_id.as_deref(),
+                request.expanded_keys.as_slice(),
+            )
         };
 
         Ok(ClientActiveThreadEventResult {
@@ -2348,12 +2355,54 @@ fn notification_thread_id(notification: &GatewayNotification) -> Option<&str> {
         GatewayNotification::TurnToolLoopBudgetExceeded(notification) => {
             Some(notification.thread_id.as_str())
         }
+        GatewayNotification::CLIRuntimeRequestOpened(notification) => {
+            notification.thread_id.as_deref()
+        }
+        GatewayNotification::CLIRuntimeRequestResolved(notification) => {
+            notification.thread_id.as_deref()
+        }
+        GatewayNotification::TurnPermissionRequestOpened(notification) => {
+            Some(notification.request.thread_id.as_str())
+        }
+        GatewayNotification::TurnPermissionRequestResolved(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         GatewayNotification::ThreadArtifactsChanged(notification) => {
             Some(notification.thread_id.as_str())
         }
         GatewayNotification::Unknown(notification) => notification.thread_id.as_deref(),
         _ => None,
     }
+}
+
+fn notification_visible_thread_ids(notification: &GatewayNotification) -> &[String] {
+    match notification {
+        GatewayNotification::CLIRuntimeRequestOpened(notification) => {
+            notification.visible_thread_ids.as_slice()
+        }
+        GatewayNotification::CLIRuntimeRequestResolved(notification) => {
+            notification.visible_thread_ids.as_slice()
+        }
+        GatewayNotification::TurnPermissionRequestOpened(notification) => {
+            notification.request.visible_thread_ids.as_slice()
+        }
+        _ => &[],
+    }
+}
+
+fn notification_snapshot_thread_id(
+    active_thread_id: Option<&str>,
+    affected_thread_id: Option<&str>,
+    visible_thread_ids: &[String],
+) -> Option<String> {
+    if let Some(active_thread_id) = active_thread_id
+        && visible_thread_ids
+            .iter()
+            .any(|visible_thread_id| visible_thread_id == active_thread_id)
+    {
+        return Some(active_thread_id.to_owned());
+    }
+    affected_thread_id.or(active_thread_id).map(str::to_owned)
 }
 
 fn notification_workspace_id(notification: &GatewayNotification) -> Option<&str> {
@@ -2419,6 +2468,18 @@ fn notification_workspace_id(notification: &GatewayNotification) -> Option<&str>
         GatewayNotification::TurnToolLoopBudgetExceeded(notification) => {
             Some(notification.workspace_id.as_str())
         }
+        GatewayNotification::CLIRuntimeRequestOpened(notification) => {
+            Some(notification.workspace_id.as_str())
+        }
+        GatewayNotification::CLIRuntimeRequestResolved(notification) => {
+            Some(notification.workspace_id.as_str())
+        }
+        GatewayNotification::TurnPermissionRequestOpened(notification) => {
+            Some(notification.request.workspace_id.as_str())
+        }
+        GatewayNotification::TurnPermissionRequestResolved(notification) => {
+            Some(notification.workspace_id.as_str())
+        }
         GatewayNotification::ThreadArtifactsChanged(notification) => {
             Some(notification.workspace_id.as_str())
         }
@@ -2458,11 +2519,13 @@ mod tests {
     use pioneer_client::cli_runtime::approvals::{PendingRequest, PendingRequestsReduction};
     use pioneer_client::conversation::reducer::{TurnPhase, TurnView};
     use pioneer_protocol::{
-        CLIAgentRuntimeKind, McpScopeKind, RuntimeCapabilities, RuntimeStatus, SkillId,
-        ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        CLIAgentRuntimeKind, CLIRuntimePendingRequest, CLIRuntimeRequestKind,
+        CLIRuntimeRequestOpenedNotification, McpScopeKind, RuntimeCapabilities, RuntimeStatus,
+        SkillId, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
         ThreadTimelineBlocksChangedNotification, TimelineChangeReason, Turn, TurnKind, TurnOrigin,
-        TurnPermissionApprovalRequest, TurnStatus, TurnWorkBlock, TurnWorkItemsChangedNotification,
-        TurnWorkPresentation, TurnWorkState, TurnWorkStateChangedNotification,
+        TurnPermissionApprovalRequest, TurnPermissionRequestOpenedNotification, TurnStatus,
+        TurnWorkBlock, TurnWorkItemsChangedNotification, TurnWorkPresentation, TurnWorkState,
+        TurnWorkStateChangedNotification,
     };
     use serde_json::json;
 
@@ -2803,6 +2866,71 @@ mod tests {
         assert_eq!(affected_thread_id, Some("parent_thread"));
         assert_eq!(snapshot.thread_id.as_deref(), Some("parent_thread"));
         assert_eq!(inner.active_thread_id.as_deref(), Some("child_thread"));
+    }
+
+    #[test]
+    fn permission_notifications_preserve_their_exact_thread_and_workspace_scope() {
+        let cli =
+            GatewayNotification::CLIRuntimeRequestOpened(CLIRuntimeRequestOpenedNotification {
+                workspace_id: "ws_cli".to_owned(),
+                runtime_id: "codex".to_owned(),
+                request_id: "request_cli".to_owned(),
+                thread_id: Some("thread_cli".to_owned()),
+                turn_id: Some("turn_cli".to_owned()),
+                item_id: None,
+                visible_thread_ids: Vec::new(),
+                request: CLIRuntimePendingRequest {
+                    kind: CLIRuntimeRequestKind::CommandApproval,
+                    title: None,
+                    message: None,
+                    native_request_id: None,
+                    payload: None,
+                },
+            });
+        assert_eq!(notification_thread_id(&cli), Some("thread_cli"));
+        assert_eq!(notification_workspace_id(&cli), Some("ws_cli"));
+
+        let native = GatewayNotification::TurnPermissionRequestOpened(
+            TurnPermissionRequestOpenedNotification {
+                request: TurnPermissionApprovalRequest {
+                    request_id: "request_native".to_owned(),
+                    workspace_id: "ws_native".to_owned(),
+                    thread_id: "thread_native".to_owned(),
+                    turn_id: "turn_native".to_owned(),
+                    visible_thread_ids: Vec::new(),
+                    tool_name: "exec_command".to_owned(),
+                    action: pioneer_protocol::TurnPermissionActionKind::ShellCommand,
+                    scope_hash: "scope_native".to_owned(),
+                    reason: pioneer_protocol::TurnPermissionDecisionReason::PolicyRequiresApproval,
+                    summary: None,
+                    details: Vec::new(),
+                },
+            },
+        );
+        assert_eq!(notification_thread_id(&native), Some("thread_native"));
+        assert_eq!(notification_workspace_id(&native), Some("ws_native"));
+    }
+
+    #[test]
+    fn permission_notification_projects_into_the_active_visible_ancestor() {
+        assert_eq!(
+            notification_snapshot_thread_id(
+                Some("root_thread"),
+                Some("child_thread"),
+                &["root_thread".to_owned()],
+            )
+            .as_deref(),
+            Some("root_thread")
+        );
+        assert_eq!(
+            notification_snapshot_thread_id(
+                Some("unrelated_thread"),
+                Some("child_thread"),
+                &["root_thread".to_owned()],
+            )
+            .as_deref(),
+            Some("child_thread")
+        );
     }
 
     #[test]

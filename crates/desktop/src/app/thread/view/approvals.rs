@@ -71,12 +71,7 @@ impl PioneerDesktop {
         request: PendingRequest,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let icon = match request.kind {
-            PendingRequestKind::CommandApproval => IconName::SquareTerminal,
-            PendingRequestKind::FileChangeApproval => IconName::File,
-            PendingRequestKind::UserInput => IconName::User,
-            PendingRequestKind::Other => IconName::Info,
-        };
+        let icon = pending_request_icon(request.kind);
         let presentation = present_pending_request(&request);
         let title = presentation.title.clone();
         let origin_label = presentation.origin_label.clone();
@@ -302,6 +297,16 @@ impl PioneerDesktop {
     }
 }
 
+fn pending_request_icon(kind: PendingRequestKind) -> IconName {
+    match kind {
+        PendingRequestKind::CommandApproval => IconName::SquareTerminal,
+        PendingRequestKind::FileChangeApproval => IconName::File,
+        PendingRequestKind::PermissionApproval => IconName::TriangleAlert,
+        PendingRequestKind::UserInput => IconName::User,
+        PendingRequestKind::Other => IconName::Info,
+    }
+}
+
 fn render_pending_request_action(
     request: PendingRequest,
     action: PendingRequestAvailableAction,
@@ -330,6 +335,12 @@ fn render_pending_request_action(
         ),
         PendingRequestActionKind::AllowForTurn => respond_pending_request_button(
             default_outline_button(element_id).label("Allow for turn"),
+            request,
+            action.resolution,
+            cx,
+        ),
+        PendingRequestActionKind::AllowForSession => respond_pending_request_button(
+            default_outline_button(element_id).label("Allow for session"),
             request,
             action.resolution,
             cx,
@@ -377,6 +388,7 @@ fn pending_request_action_element_prefix(kind: PendingRequestActionKind) -> &'st
         PendingRequestActionKind::Deny => "pending-request-action-deny",
         PendingRequestActionKind::Allow => "pending-request-action-allow",
         PendingRequestActionKind::AllowForTurn => "pending-request-action-allow-turn",
+        PendingRequestActionKind::AllowForSession => "pending-request-action-allow-session",
         PendingRequestActionKind::Answer => "pending-request-action-answer",
     }
 }
@@ -544,4 +556,32 @@ fn render_user_input_question_summary(
                 .into_any_element()
         }))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pending_request_action_element_prefix, pending_request_icon};
+    use gpui_component::{IconName, IconNamed};
+    use pioneer_client::cli_runtime::approvals::PendingRequestActionKind;
+    use pioneer_client::cli_runtime::approvals::PendingRequestKind;
+
+    #[test]
+    fn provider_session_approval_has_a_distinct_desktop_action_identity() {
+        assert_eq!(
+            pending_request_action_element_prefix(PendingRequestActionKind::AllowForSession),
+            "pending-request-action-allow-session"
+        );
+        assert_ne!(
+            pending_request_action_element_prefix(PendingRequestActionKind::AllowForSession),
+            pending_request_action_element_prefix(PendingRequestActionKind::AllowForTurn)
+        );
+    }
+
+    #[test]
+    fn permission_approval_has_a_distinct_desktop_icon() {
+        assert_eq!(
+            pending_request_icon(PendingRequestKind::PermissionApproval).path(),
+            IconName::TriangleAlert.path()
+        );
+    }
 }

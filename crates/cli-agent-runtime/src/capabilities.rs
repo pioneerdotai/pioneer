@@ -66,7 +66,7 @@ const CODEX_CAPABILITIES: CLIRuntimeProviderCapabilities = CLIRuntimeProviderCap
         permission_mode_mapping: CLIRuntimeCapabilitySupport::Supported,
         request_permissions: CLIRuntimeCapabilitySupport::Supported,
         turn_scope_approval: UNSUPPORTED_TURN_SCOPE_APPROVAL,
-        session_scope_approval: UNSUPPORTED_SESSION_SCOPE_APPROVAL,
+        session_scope_approval: CLIRuntimeCapabilitySupport::Supported,
     },
     sandbox: CLIRuntimeSandboxCapabilities {
         provider_sandbox_policy: CLIRuntimeCapabilitySupport::Supported,
@@ -78,7 +78,7 @@ const CODEX_CAPABILITIES: CLIRuntimeProviderCapabilities = CLIRuntimeProviderCap
 
 const CLAUDE_DETAILED_SANDBOX_UNSUPPORTED: CLIRuntimeCapabilitySupport =
     CLIRuntimeCapabilitySupport::Unsupported {
-        reason: "Claude CLI adapter currently maps permission mode only; no proven detailed sandbox knob is available",
+        reason: "Pioneer maps only the provider permission mode and does not configure Claude's detailed sandbox",
     };
 
 const CLAUDE_CAPABILITIES: CLIRuntimeProviderCapabilities = CLIRuntimeProviderCapabilities {
@@ -90,7 +90,10 @@ const CLAUDE_CAPABILITIES: CLIRuntimeProviderCapabilities = CLIRuntimeProviderCa
         session_scope_approval: UNSUPPORTED_SESSION_SCOPE_APPROVAL,
     },
     sandbox: CLIRuntimeSandboxCapabilities {
-        provider_sandbox_policy: CLAUDE_DETAILED_SANDBOX_UNSUPPORTED,
+        // Claude owns its native sandbox. Pioneer selects only the provider
+        // permission mode and must not synthesize filesystem/network/process
+        // rules or replace Claude's built-in tool surface.
+        provider_sandbox_policy: CLIRuntimeCapabilitySupport::Supported,
         detailed_filesystem_sandbox: CLAUDE_DETAILED_SANDBOX_UNSUPPORTED,
         detailed_network_sandbox: CLAUDE_DETAILED_SANDBOX_UNSUPPORTED,
         detailed_process_sandbox: CLAUDE_DETAILED_SANDBOX_UNSUPPORTED,
@@ -109,7 +112,7 @@ mod tests {
         assert!(descriptor.approval.permission_mode_mapping.is_supported());
         assert!(descriptor.approval.request_permissions.is_supported());
         assert!(!descriptor.approval.turn_scope_approval.is_supported());
-        assert!(!descriptor.approval.session_scope_approval.is_supported());
+        assert!(descriptor.approval.session_scope_approval.is_supported());
         assert!(descriptor.sandbox.provider_sandbox_policy.is_supported());
         assert!(
             descriptor
@@ -122,14 +125,14 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_claude_does_not_claim_detailed_sandbox_support() {
+    fn capabilities_claude_reports_provider_owned_sandbox_support() {
         let descriptor = cli_runtime_provider_capabilities(CLIAgentRuntimeProviderKind::Claude);
 
         assert_eq!(descriptor.provider, CLIAgentRuntimeProviderKind::Claude);
         assert!(descriptor.approval.permission_mode_mapping.is_supported());
         assert!(descriptor.approval.request_permissions.is_supported());
         assert!(!descriptor.approval.turn_scope_approval.is_supported());
-        assert!(!descriptor.sandbox.provider_sandbox_policy.is_supported());
+        assert!(descriptor.sandbox.provider_sandbox_policy.is_supported());
         assert!(
             !descriptor
                 .sandbox
@@ -141,20 +144,17 @@ mod tests {
     }
 
     #[test]
-    fn claude_security_descriptor_supports_permission_mode_not_detailed_sandbox() {
+    fn claude_security_descriptor_does_not_claim_pioneer_detailed_sandbox() {
         let descriptor = cli_runtime_provider_capabilities(CLIAgentRuntimeProviderKind::Claude);
 
         assert!(descriptor.approval.permission_mode_mapping.is_supported());
         assert!(descriptor.approval.request_permissions.is_supported());
-        assert!(matches!(
-            descriptor.sandbox.detailed_filesystem_sandbox,
-            CLIRuntimeCapabilitySupport::Unsupported { reason }
-                if reason.contains("permission mode only")
-        ));
-        assert!(matches!(
-            descriptor.sandbox.detailed_network_sandbox,
-            CLIRuntimeCapabilitySupport::Unsupported { reason }
-                if reason.contains("permission mode only")
-        ));
+        assert!(
+            !descriptor
+                .sandbox
+                .detailed_filesystem_sandbox
+                .is_supported()
+        );
+        assert!(!descriptor.sandbox.detailed_network_sandbox.is_supported());
     }
 }

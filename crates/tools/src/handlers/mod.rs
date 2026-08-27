@@ -27,4 +27,5 @@ pub use skill::{
     SkillReadToolConfig, SkillReadToolEntry, SkillRuntimeToolMaterialization,
     SkillRuntimeToolPolicyDiagnostic, materialize_skill_runtime_tools,
 };
+pub(crate) use web::resolve_download_destination;
 pub use web::{DownloadUrlHandler, WebFetchHandler, WebSearchHandler};

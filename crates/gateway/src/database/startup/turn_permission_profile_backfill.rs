@@ -7,8 +7,8 @@ use pioneer_crud::{
 use pioneer_entity::{task_agent_spec, turn, turn_event};
 use pioneer_protocol::{
     TaskAgentSecurityCap, TurnExecutionSecuritySnapshot, TurnFilesystemSandboxEntry,
-    TurnFilesystemSandboxPath, TurnNetworkPolicySnapshot, TurnPermissionMode,
-    TurnPermissionProfileSnapshot, TurnProcessPolicySnapshot, TurnSandboxMode,
+    TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnNetworkPolicySnapshot,
+    TurnPermissionMode, TurnPermissionProfileSnapshot, TurnProcessPolicySnapshot, TurnSandboxMode,
     TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
 };
 use sea_orm::{
@@ -21,12 +21,12 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 const TURN_PERMISSION_PROFILE_BACKFILL_KEY: &str = "turn_permission_profile_payload_backfill";
-const TURN_PERMISSION_PROFILE_BACKFILL_VERSION: i64 = 3;
+const TURN_PERMISSION_PROFILE_BACKFILL_VERSION: i64 = 4;
 const TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE: u64 = 512;
 const TURN_PERMISSION_PROFILE_BACKFILL_YIELD_MS: u64 = 10;
 const DEFAULT_TURN_PERMISSION_PROFILE_MODE: &str = "full_access";
 const DEFAULT_TURN_PERMISSION_PROFILE_SOURCE: &str = "defaulted";
-const DEFAULT_TURN_PERMISSION_PROFILE_SNAPSHOT_JSON: &str = r#"{"mode":"full_access","source":"defaulted","effective_policy":{"default_behavior":"allow","file_read":"allow","file_write":"allow","shell_command":"allow","network":"allow","mcp_read":"allow","mcp_write_or_unknown":"allow","dynamic_skill_tool":"allow","computer_use":"allow","task_subagent":"allow"}}"#;
+const DEFAULT_TURN_PERMISSION_PROFILE_SNAPSHOT_JSON: &str = r#"{"mode":"full_access","source":"defaulted","effective_policy":{"default_behavior":"allow","file_read":"allow","file_write":"allow","shell_command":"allow","network":"allow","mcp_read":"allow","mcp_write_or_unknown":"allow","dynamic_skill_tool":"allow","computer_use":"allow","task_subagent":"allow","memory_write":"allow","agent_action":"allow"}}"#;
 
 #[derive(Debug, FromQueryResult)]
 struct LegacyTurnEventPayload {
@@ -164,10 +164,16 @@ async fn backfill_all_batches(
             backfill_full_access_turn_security_snapshot_batch(db, cwd.as_str())
                 .await
                 .context("failed to backfill full access turn security snapshots")?;
-        let security_snapshots_repaired =
+        let synthetic_workspace_security_snapshots_repaired =
             repair_synthetic_workspace_security_snapshot_batch(db, runtime_home, cwd.as_str())
                 .await
                 .context("failed to repair synthetic workspace paths in turn security snapshots")?;
+        let regressed_security_snapshots_repaired =
+            repair_regressed_turn_security_snapshot_batch(db)
+                .await
+                .context("failed to repair regressed turn security snapshots")?;
+        let security_snapshots_repaired = synthetic_workspace_security_snapshots_repaired
+            .saturating_add(regressed_security_snapshots_repaired);
         let cli_runtime_thread_bindings_removed =
             remove_synthetic_workspace_cli_thread_binding_batch(db, runtime_home)
                 .await
@@ -210,11 +216,135 @@ async fn backfill_all_batches(
     Ok(summary)
 }
 
+async fn repair_regressed_turn_security_snapshot_batch(db: &DatabaseConnection) -> Result<u64> {
+    let candidates = SyntheticWorkspaceTurnSecuritySnapshot::find_by_statement(
+        Statement::from_string(
+            db.get_database_backend(),
+            format!(
+                "SELECT id, execution_security_snapshot_json \
+                 FROM turn \
+                 WHERE execution_security_snapshot_json IS NOT NULL \
+                   AND (\
+                        (\
+                            json_extract(execution_security_snapshot_json, '$.source') = 'composer_selection' \
+                            AND \
+                            (json_type(execution_security_snapshot_json, '$.parent_cap') IS NULL \
+                             OR json_type(execution_security_snapshot_json, '$.parent_cap') = 'null') \
+                            AND json_extract(execution_security_snapshot_json, '$.sandbox.mode') != 'unrestricted' \
+                            AND (\
+                                json_extract(execution_security_snapshot_json, '$.authority_cap.filesystem.kind') != 'unrestricted' \
+                                OR json_extract(execution_security_snapshot_json, '$.authority_cap.network.mode') != 'enabled'\
+                            )\
+                        ) \
+                        OR (\
+                            json_extract(execution_security_snapshot_json, '$.process.environment.inherit') = 0 \
+                            AND COALESCE(json_array_length(execution_security_snapshot_json, '$.process.environment.allowed_vars'), 0) = 0 \
+                            AND COALESCE(json_array_length(execution_security_snapshot_json, '$.process.environment.denied_patterns'), 0) = 0\
+                        ) \
+                        OR (\
+                            json_extract(execution_security_snapshot_json, '$.authority_cap.process.environment.inherit') = 0 \
+                            AND COALESCE(json_array_length(execution_security_snapshot_json, '$.authority_cap.process.environment.allowed_vars'), 0) = 0 \
+                            AND COALESCE(json_array_length(execution_security_snapshot_json, '$.authority_cap.process.environment.denied_patterns'), 0) = 0\
+                        )\
+                   ) \
+                 ORDER BY created_at, id \
+                 LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}",
+            ),
+        ),
+    )
+    .all(db)
+    .await
+    .context("failed to list turn snapshots with regressed security policies")?;
+
+    let mut updated = 0_u64;
+    for candidate in candidates {
+        let mut snapshot: TurnExecutionSecuritySnapshot =
+            serde_json::from_str(candidate.execution_security_snapshot_json.as_str())
+                .with_context(|| {
+                    format!(
+                        "failed to decode regressed security snapshot for turn `{}`",
+                        candidate.id
+                    )
+                })?;
+        if !repair_regressed_turn_security_snapshot(&mut snapshot) {
+            continue;
+        }
+
+        let snapshot_version = i64::from(snapshot.version);
+        let snapshot_json = serde_json::to_string(&snapshot).with_context(|| {
+            format!(
+                "failed to serialize repaired security snapshot for turn `{}`",
+                candidate.id
+            )
+        })?;
+        turn::ActiveModel {
+            id: Set(candidate.id),
+            execution_security_snapshot_version: Set(Some(snapshot_version)),
+            execution_security_snapshot_json: Set(Some(snapshot_json)),
+            ..Default::default()
+        }
+        .update(db)
+        .await
+        .context("failed to update turn snapshot with repaired security policies")?;
+        updated = updated.saturating_add(1);
+    }
+
+    Ok(updated)
+}
+
+fn repair_regressed_turn_security_snapshot(snapshot: &mut TurnExecutionSecuritySnapshot) -> bool {
+    let mut changed = false;
+
+    // Root turns are interactive security principals. Their initial sandbox
+    // remains restricted, while this immutable cap describes the maximum an
+    // exact human consent may grant. Child and reviewer snapshots carry a
+    // parent cap and must retain that durable inherited maximum.
+    // The regressed constructors emitted only ComposerSelection snapshots.
+    // Other provenance classes can encode inherited or recovery authority
+    // even when old records lack parent metadata, so never infer a wider cap
+    // for them during startup repair.
+    let provenance_allows_root_repair =
+        snapshot.source == TurnSecuritySnapshotSource::ComposerSelection;
+    if provenance_allows_root_repair
+        && snapshot.parent_cap.is_none()
+        && snapshot.sandbox.mode != TurnSandboxMode::Unrestricted
+    {
+        if snapshot.authority_cap.filesystem.kind
+            != pioneer_protocol::TurnFilesystemSandboxKind::Unrestricted
+        {
+            snapshot.authority_cap.filesystem =
+                pioneer_protocol::TurnFilesystemSandboxPolicy::unrestricted();
+            changed = true;
+        }
+        if snapshot.authority_cap.network.mode != pioneer_protocol::TurnNetworkMode::Enabled {
+            snapshot.authority_cap.network = TurnNetworkPolicySnapshot::enabled();
+            changed = true;
+        }
+    }
+
+    let restricted_environment = TurnProcessPolicySnapshot::restricted().environment;
+    for environment in [
+        &mut snapshot.process.environment,
+        &mut snapshot.authority_cap.process.environment,
+    ] {
+        if !environment.inherit
+            && environment.allowed_vars.is_empty()
+            && environment.denied_patterns.is_empty()
+        {
+            *environment = restricted_environment.clone();
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 async fn backfill_task_agent_cap_batch(db: &DatabaseConnection) -> Result<u64> {
     let permission_cap =
         pioneer_protocol::task_permission_cap_for_mode(TurnPermissionMode::FullAccess);
     let security_cap = TaskAgentSecurityCap {
         max_permission_profile: permission_cap.clone(),
+        max_filesystem_kind: Some(TurnFilesystemSandboxKind::Unrestricted),
         max_filesystem_entries: Vec::new(),
         max_network_policy: TurnNetworkPolicySnapshot::enabled(),
         max_sandbox_mode: TurnSandboxMode::Unrestricted,
@@ -315,6 +445,7 @@ async fn repair_synthetic_workspace_security_snapshot_batch(
                 repair_synthetic_workspace_entry(entry, synthetic_cwd.as_str(), cwd);
             }
         }
+        repair_regressed_turn_security_snapshot(&mut snapshot);
         let snapshot_version = i64::from(snapshot.version);
         let snapshot_json = serde_json::to_string(&snapshot).with_context(|| {
             format!(
@@ -765,7 +896,7 @@ fn has_non_null_field(object: &serde_json::Map<String, JsonValue>, field: &str) 
 mod tests {
     use super::{
         TURN_PERMISSION_PROFILE_BACKFILL_KEY, TURN_PERMISSION_PROFILE_BACKFILL_VERSION,
-        backfill_once, now_datetime,
+        backfill_once, now_datetime, repair_regressed_turn_security_snapshot,
     };
     use anyhow::Context;
     use migration::{Migrator, MigratorTrait};
@@ -776,13 +907,55 @@ mod tests {
     use pioneer_entity::{task, task_agent_spec, thread, turn, turn_event, workspace};
     use pioneer_protocol::{
         TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
-        TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnPermissionMode,
+        TurnFilesystemSandboxKind, TurnFilesystemSandboxPath, TurnNetworkMode, TurnPermissionMode,
         TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSandboxMode,
         TurnSecuritySnapshotSource,
     };
     use sea_orm::{Database, EntityTrait, Set};
     use sea_orm::{FromQueryResult, Statement};
     use serde_json::Value as JsonValue;
+
+    #[test]
+    fn regressed_snapshot_repair_never_widens_non_composer_authority_without_parent_metadata() {
+        for source in [
+            TurnSecuritySnapshotSource::GatewayDefault,
+            TurnSecuritySnapshotSource::TaskInherited,
+            TurnSecuritySnapshotSource::ReviewerInherited,
+            TurnSecuritySnapshotSource::RevisionInherited,
+            TurnSecuritySnapshotSource::RuntimeRecovery,
+            TurnSecuritySnapshotSource::BackfilledLegacy,
+        ] {
+            let mut snapshot = TurnExecutionSecuritySnapshot::read_only(
+                TurnPermissionProfileSnapshot::from_mode(
+                    TurnPermissionMode::Supervised,
+                    TurnPermissionProfileSource::Composer,
+                ),
+                "/tmp/inherited-workspace",
+                vec![TurnFilesystemSandboxEntry::workspace_root(
+                    TurnFilesystemAccess::Read,
+                    "/tmp/inherited-workspace",
+                )],
+                1,
+            );
+            snapshot.source = source;
+            snapshot.authority_cap.filesystem = snapshot.sandbox.filesystem.clone();
+            snapshot.authority_cap.network = snapshot.network.clone();
+            snapshot.parent_cap = None;
+            let expected_filesystem = snapshot.authority_cap.filesystem.clone();
+            let expected_network = snapshot.authority_cap.network.clone();
+
+            repair_regressed_turn_security_snapshot(&mut snapshot);
+
+            assert_eq!(
+                snapshot.authority_cap.filesystem, expected_filesystem,
+                "source {source:?} must remain fail-closed"
+            );
+            assert_eq!(
+                snapshot.authority_cap.network, expected_network,
+                "source {source:?} must remain fail-closed"
+            );
+        }
+    }
 
     #[derive(Debug, FromQueryResult)]
     struct CandidateCount {
@@ -1040,7 +1213,7 @@ mod tests {
             TurnPermissionMode::AutoAcceptEdits,
             TurnPermissionProfileSource::Composer,
         );
-        let synthetic_snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+        let mut synthetic_snapshot = TurnExecutionSecuritySnapshot::workspace_write(
             synthetic_profile.clone(),
             synthetic_cwd.clone(),
             vec![TurnFilesystemSandboxEntry::workspace_root(
@@ -1049,8 +1222,28 @@ mod tests {
             )],
             now.timestamp_millis(),
         );
+        // Reproduce the authority/environment regression shipped before
+        // backfill version 4. The initial sandbox remains the same; only the
+        // maximum consent cap and process runtime contract were corrupted.
+        synthetic_snapshot.authority_cap.filesystem = synthetic_snapshot.sandbox.filesystem.clone();
+        synthetic_snapshot.authority_cap.network = synthetic_snapshot.network.clone();
+        synthetic_snapshot.process.environment.allowed_vars.clear();
+        synthetic_snapshot
+            .process
+            .environment
+            .denied_patterns
+            .clear();
+        synthetic_snapshot.authority_cap.process.environment =
+            synthetic_snapshot.process.environment.clone();
         let synthetic_task_security_cap =
             crate::turn_security::task_security_cap_from_snapshot(&synthetic_snapshot);
+        let mut synthetic_task_security_cap_json =
+            serde_json::to_value(&synthetic_task_security_cap)
+                .expect("synthetic security cap should serialize");
+        synthetic_task_security_cap_json
+            .as_object_mut()
+            .expect("synthetic security cap should be an object")
+            .remove("maxFilesystemKind");
         task_agent_spec::Entity::insert(task_agent_spec::ActiveModel {
             id: Set("agent_spec_synthetic_workspace_caps".to_owned()),
             task_id: Set(task_id.to_owned()),
@@ -1077,7 +1270,7 @@ mod tests {
                     .expect("synthetic permission cap should serialize"),
             )),
             security_cap_json: Set(Some(
-                serde_json::to_string(&synthetic_task_security_cap)
+                serde_json::to_string(&synthetic_task_security_cap_json)
                     .expect("synthetic security cap should serialize"),
             )),
         })
@@ -1314,6 +1507,10 @@ mod tests {
             .security_cap
             .as_ref()
             .expect("repaired security cap should remain present");
+        assert_eq!(
+            repaired_cap.max_filesystem_kind, None,
+            "the legacy missing kind remains fail-closed and is inferred from bounded roots"
+        );
         let repaired_cap_entry = repaired_cap
             .max_filesystem_entries
             .first()
@@ -1448,6 +1645,31 @@ mod tests {
         assert_eq!(
             repaired_entry.resolved_path.as_deref(),
             Some(synthetic_snapshot.sandbox.cwd.as_str())
+        );
+        assert_eq!(
+            synthetic_snapshot.authority_cap.filesystem.kind,
+            TurnFilesystemSandboxKind::Unrestricted
+        );
+        assert_eq!(
+            synthetic_snapshot.authority_cap.network.mode,
+            TurnNetworkMode::Enabled
+        );
+        assert!(
+            synthetic_snapshot
+                .process
+                .environment
+                .allowed_vars
+                .iter()
+                .any(|name| name == "PATH")
+        );
+        assert!(
+            synthetic_snapshot
+                .authority_cap
+                .process
+                .environment
+                .denied_patterns
+                .iter()
+                .any(|pattern| pattern.contains("TOKEN"))
         );
 
         let refill_meta = find_projection_meta(&connection, refill_key)

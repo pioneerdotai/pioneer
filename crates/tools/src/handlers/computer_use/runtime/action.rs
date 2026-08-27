@@ -19,6 +19,7 @@ impl ComputerUseHandler {
         args: ComputerUseArgs,
         attempt_id: u32,
         trace: &ToolEventTrace,
+        process_environment: &crate::process_policy::ProcessEnvironmentPlan,
     ) -> Result<FunctionToolOutput, ToolError> {
         let session_id = args
             .session_id
@@ -273,7 +274,9 @@ impl ComputerUseHandler {
             execution
         } else {
             match &resolved {
-                ComputerUseAction::Os(action) => self.backend.perform_os_action(action)?,
+                ComputerUseAction::Os(action) => self
+                    .backend
+                    .perform_os_action(action, process_environment)?,
                 ComputerUseAction::Input(action) if action.action_type == InputActionKind::Wait => {
                     let wait_ms = action.wait_ms.unwrap_or(250).clamp(1, 60_000);
                     tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;

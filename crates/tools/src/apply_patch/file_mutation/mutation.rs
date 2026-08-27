@@ -1730,10 +1730,8 @@ mod tests {
             0o751
         );
         assert!(
-            replaced
-                .side_effects
-                .metadata_warnings
-                .contains(&crate::apply_patch::file_mutation::MetadataWarning::AclNotPreserved)
+            replaced.side_effects.metadata_warnings.is_empty(),
+            "a source without ACLs or relevant xattrs must not report metadata loss"
         );
 
         let destination = target(

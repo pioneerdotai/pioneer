@@ -31,11 +31,12 @@ use pioneer_cli_agent_runtime::codex::{
     CodexCommandApprovalDecision, CodexCommandApprovalRequest, CodexFileChangeApprovalDecision,
     CodexFileChangeApprovalRequest, CodexJsonlRpcServerRequest, CodexLoginStartResponse,
     CodexLoginStartSnapshot, CodexLoginStartStatus, CodexModelListProbeSnapshot,
-    CodexModelListProbeStatus, CodexModelSnapshot, CodexProbe, CodexProbeDiagnostic,
-    CodexProbeDiagnosticLevel, CodexUserInputRequest, codex_command_approval_response,
-    codex_file_change_approval_response, codex_user_input_response,
+    CodexModelListProbeStatus, CodexModelSnapshot, CodexPermissionApprovalRequest, CodexProbe,
+    CodexProbeDiagnostic, CodexProbeDiagnosticLevel, CodexUserInputRequest,
+    codex_command_approval_response, codex_file_change_approval_response,
+    codex_permission_approval_response, codex_user_input_response,
     decode_codex_command_approval_request, decode_codex_file_change_approval_request,
-    decode_codex_user_input_request,
+    decode_codex_permission_approval_request, decode_codex_user_input_request,
 };
 use pioneer_cli_agent_runtime::event::{
     RuntimeEvent, RuntimeEventMappingOptions, RuntimeRequestResolved, RuntimeTurnCompleted,
@@ -57,6 +58,7 @@ use pioneer_tools::apply_patch::history::{
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
 use std::sync::Arc;
 
 const CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_BYTES: usize = 4 * 1024;
@@ -2475,9 +2477,27 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if let Err(error) = self
+            .revalidate_codex_session_approval_authority(&pending, &resolution)
+            .await
+        {
+            self.send_error(
+                connection_id,
+                cli_runtime_public_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "CLI runtime request `{}` cannot install a provider session approval: {error:#}",
+                        pending.request_id
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
         if let Some(permission_profile) = current_permission_profile.as_ref()
-            && let Err(error) = validate_cli_runtime_resolution_against_permission_profile(
-                cli_runtime_request_kind_from_stored(pending.request_kind.as_str()),
+            && let Err(error) = validate_cli_runtime_pending_resolution_against_permission_profile(
+                &pending,
                 &resolution,
                 permission_profile,
             )
@@ -2961,7 +2981,11 @@ impl MessageProcessor {
         turn_id: Option<String>,
         request: CodexCommandApprovalRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
-        let payload = cli_runtime_command_approval_pending_request(&request);
+        let supports_session_approval = self
+            .codex_session_approval_supported_for_turn(turn_id.as_deref())
+            .await?;
+        let payload =
+            cli_runtime_command_approval_pending_request(&request, supports_session_approval);
         let payload_json = pioneer_crud::serialize_cli_runtime_json(&payload)
             .context("failed to serialize Codex command approval pending request")?;
         let now = cli_runtime_request_timestamp();
@@ -2982,6 +3006,105 @@ impl MessageProcessor {
             updated_at: now,
         })
         .await
+    }
+
+    async fn open_codex_permission_approval_request_for_turn(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_kind: &str,
+        thread_id: &str,
+        turn_id: String,
+        request: CodexPermissionApprovalRequest,
+    ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
+        let payload = cli_runtime_permission_approval_pending_request(&request);
+        let payload_json = pioneer_crud::serialize_cli_runtime_json(&payload)
+            .context("failed to serialize Codex permission approval pending request")?;
+        let now = cli_runtime_request_timestamp();
+        self.open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: format!("cli_req_{}", generate_id(21)),
+            runtime_id: runtime_id.to_owned(),
+            runtime_kind: runtime_kind.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id),
+            native_thread_id: request.native_thread_id.clone(),
+            native_turn_id: request.native_turn_id.clone(),
+            native_item_id: request.native_item_id.clone(),
+            request_kind: cli_runtime_request_kind_as_str(
+                CLIRuntimeRequestKind::PermissionApproval,
+            )
+            .to_owned(),
+            payload_json,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+    }
+
+    fn validate_codex_permission_request(
+        request: &CodexPermissionApprovalRequest,
+    ) -> anyhow::Result<()> {
+        let cwd = request
+            .cwd
+            .as_deref()
+            .context("Codex permission request has no cwd")?;
+        if !Path::new(cwd).is_absolute() {
+            anyhow::bail!("Codex permission request cwd is not absolute");
+        }
+        validate_codex_permission_profile_shape(&request.requested_permissions)
+    }
+
+    async fn codex_session_approval_supported_for_turn(
+        &self,
+        turn_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let Some(turn_id) = turn_id else {
+            return Ok(false);
+        };
+        let security = self
+            .crud_store
+            .get_turn_execution_security_snapshot(turn_id)
+            .await?
+            .context("Codex approval turn has no execution security snapshot")?
+            .snapshot;
+        Ok(security.backend.execution_backend
+            == pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli
+            && security
+                .backend
+                .capabilities
+                .supports_session_scope_approval
+            && security.approval.allow_for_session
+            && security.authority_cap.approval.allow_for_session)
+    }
+
+    async fn revalidate_codex_session_approval_authority(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+        resolution: &CLIRuntimeRequestResolution,
+    ) -> anyhow::Result<()> {
+        if request.runtime_kind != "codex"
+            || !matches!(resolution, CLIRuntimeRequestResolution::ApprovedForSession)
+        {
+            return Ok(());
+        }
+        if !matches!(
+            cli_runtime_request_kind_from_stored(request.request_kind.as_str()),
+            CLIRuntimeRequestKind::CommandApproval | CLIRuntimeRequestKind::FileChangeApproval
+        ) {
+            anyhow::bail!("session approval is not supported for this Codex request kind");
+        }
+        let turn_id = request
+            .turn_id
+            .as_deref()
+            .context("Codex session approval request has no Pioneer turn binding")?;
+        if !self
+            .codex_session_approval_supported_for_turn(Some(turn_id))
+            .await?
+        {
+            anyhow::bail!("current Codex turn authority does not allow session approval");
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -3025,7 +3148,11 @@ impl MessageProcessor {
         turn_id: Option<String>,
         request: CodexFileChangeApprovalRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
-        let payload = cli_runtime_file_change_approval_pending_request(&request);
+        let supports_session_approval = self
+            .codex_session_approval_supported_for_turn(turn_id.as_deref())
+            .await?;
+        let payload =
+            cli_runtime_file_change_approval_pending_request(&request, supports_session_approval);
         let payload_json = pioneer_crud::serialize_cli_runtime_json(&payload)
             .context("failed to serialize Codex file change approval pending request")?;
         let now = cli_runtime_request_timestamp();
@@ -7214,27 +7341,19 @@ impl MessageProcessor {
 
         match request.method.as_str() {
             "item/permissions/requestApproval" => {
-                let params = request
-                    .params
-                    .as_ref()
-                    .and_then(JsonValue::as_object)
-                    .expect("validated Codex permission approval params");
-                let native_thread_id = params
-                    .get("threadId")
-                    .and_then(JsonValue::as_str)
+                let decoded = decode_codex_permission_approval_request(&request);
+                let native_thread_id = decoded
+                    .native_thread_id
+                    .as_deref()
                     .expect("validated Codex permission approval threadId");
-                let native_turn_id = params
-                    .get("turnId")
-                    .and_then(JsonValue::as_str)
+                let native_turn_id = decoded
+                    .native_turn_id
+                    .as_deref()
                     .expect("validated Codex permission approval turnId");
-                let native_item_id = params
-                    .get("itemId")
-                    .and_then(JsonValue::as_str)
+                let native_item_id = decoded
+                    .native_item_id
+                    .as_deref()
                     .expect("validated Codex permission approval itemId");
-                let requested_permissions = params
-                    .get("permissions")
-                    .cloned()
-                    .expect("validated Codex permission approval permissions");
 
                 let Some(turn_binding) = self
                     .cli_runtime_turn_binding_for_native_turn_option(
@@ -7260,7 +7379,7 @@ impl MessageProcessor {
                     self.fail_codex_machine_request(
                         &responder,
                         CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
-                        "Codex MCP permission request has no active Pioneer turn binding",
+                        "Codex permission request has no active Pioneer turn binding",
                         Some(json!({"method": request.method})),
                     )
                     .await;
@@ -7278,7 +7397,7 @@ impl MessageProcessor {
                     self.fail_codex_machine_request(
                         &responder,
                         CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
-                        "Codex MCP permission request belongs to a stale or terminal turn",
+                        "Codex permission request belongs to a stale or terminal turn",
                         Some(json!({"method": request.method})),
                     )
                     .await;
@@ -7291,7 +7410,7 @@ impl MessageProcessor {
                         native_thread_id: native_thread_id.to_owned(),
                         native_turn_id: native_turn_id.to_owned(),
                         native_item_id: native_item_id.to_owned(),
-                        requested_permissions,
+                        requested_permissions: decoded.requested_permissions.clone(),
                     })
                     .await;
                 match approval {
@@ -7310,13 +7429,73 @@ impl MessageProcessor {
                         }
                     }
                     Ok(None) => {
-                        self.fail_codex_machine_request(
-                            &responder,
-                            CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
-                            "Codex MCP permission request does not match the active frozen binding",
-                            Some(json!({"method": request.method})),
-                        )
-                        .await;
+                        if let Err(error) = Self::validate_codex_permission_request(&decoded) {
+                            warn!(
+                                workspace_id = key.workspace_id.as_str(),
+                                runtime_id = key.runtime_id.as_str(),
+                                thread_id = key.thread_id.as_str(),
+                                native_thread_id,
+                                native_turn_id,
+                                native_item_id,
+                                error = %format!("{error:#}"),
+                                "invalid Codex permission request"
+                            );
+                            self.fail_codex_machine_request(
+                                &responder,
+                                CLI_RUNTIME_MACHINE_REQUEST_INVALID_PARAMS_CODE,
+                                "invalid Codex permission request",
+                                Some(json!({"method": request.method})),
+                            )
+                            .await;
+                            return;
+                        }
+                        match self
+                            .open_codex_permission_approval_request_for_turn(
+                                key.workspace_id.as_str(),
+                                key.runtime_id.as_str(),
+                                "codex",
+                                turn_binding.thread_id.as_str(),
+                                turn_binding.turn_id.clone(),
+                                decoded.clone(),
+                            )
+                            .await
+                        {
+                            Ok(opened) => {
+                                self.register_cli_runtime_machine_request(
+                                    instance,
+                                    &request,
+                                    responder.clone(),
+                                    &opened,
+                                )
+                                .await;
+                                self.confirm_cli_runtime_recovery_for_native_progress(
+                                    key,
+                                    &turn_binding,
+                                    native_turn_id,
+                                    request.method.as_str(),
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    workspace_id = key.workspace_id.as_str(),
+                                    runtime_id = key.runtime_id.as_str(),
+                                    thread_id = key.thread_id.as_str(),
+                                    native_thread_id,
+                                    native_turn_id,
+                                    native_item_id,
+                                    error = %format!("{error:#}"),
+                                    "failed to open Codex permission approval request"
+                                );
+                                self.fail_codex_machine_request(
+                                    &responder,
+                                    CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE,
+                                    "failed to open Pioneer permission request",
+                                    Some(json!({"method": request.method})),
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Err(error) => {
                         warn!(
@@ -9466,6 +9645,12 @@ impl MessageProcessor {
                                 decision == CodexFileChangeApprovalDecision::Cancel,
                             )
                         }
+                        CLIRuntimeRequestKind::PermissionApproval => (
+                            codex_permission_approval_response_from_resolution(
+                                request, resolution,
+                            )?,
+                            matches!(resolution, CLIRuntimeRequestResolution::Cancelled),
+                        ),
                         CLIRuntimeRequestKind::UserInput => (
                             codex_user_input_response_from_resolution(request, resolution)?,
                             false,
@@ -9584,13 +9769,140 @@ impl MessageProcessor {
     }
 
     #[allow(dead_code)]
+    /// Replays provider-owned human requests to one connection after it opens
+    /// or reopens a collaborative Thread. Live fanout cannot cover a late
+    /// joiner, and durable approval blocks are not themselves the mobile
+    /// pending-request state.
+    pub(super) async fn replay_cli_runtime_pending_requests_for_thread(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        thread_id: &str,
+    ) {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        let mut after = None;
+        loop {
+            let requests = match self
+                .crud_store
+                .list_cli_runtime_pending_requests(
+                    pioneer_crud::CliRuntimePendingRequestListFilter {
+                        workspace_id: Some(workspace_id.to_owned()),
+                        status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                        after,
+                        limit: Some(pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(requests) => requests,
+                Err(error) => {
+                    warn!(
+                        workspace_id,
+                        thread_id,
+                        error = %format!("{error:#}"),
+                        "failed to replay durable CLI human interactions"
+                    );
+                    break;
+                }
+            };
+            let next = requests
+                .last()
+                .map(|record| (record.created_at, record.request_id.clone()));
+
+            for request in requests {
+                // Native Pioneer requests have their own typed replay lane;
+                // machine-level provider requests are Gateway-management only.
+                if request.runtime_id == NATIVE_HUMAN_INTERACTION_RUNTIME_ID
+                    || request.authorization_binding.is_none()
+                {
+                    continue;
+                }
+                let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
+                if request.thread_id != thread_id
+                    && !visible_thread_ids
+                        .iter()
+                        .any(|visible_thread_id| visible_thread_id == thread_id)
+                {
+                    continue;
+                }
+                if now_unix_ms.saturating_sub(request.created_at.timestamp_millis())
+                    >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
+                {
+                    if let Err(error) = self
+                        .expire_cli_runtime_pending_request_as_stale(&request)
+                        .await
+                    {
+                        warn!(
+                            request_id = request.request_id,
+                            error = %format!("{error:#}"),
+                            "failed to expire stale CLI human interaction during replay"
+                        );
+                    }
+                    continue;
+                }
+
+                let opened = cli_runtime_request_opened_notification_from_record(
+                    &request,
+                    visible_thread_ids.clone(),
+                );
+                self.send_execution_collaborator_notification_to_connections(
+                    thread_id,
+                    crate::authorization::ResourceAction::AgentRequestObserve,
+                    events::CLI_RUNTIME_REQUEST_OPENED,
+                    &opened,
+                    vec![connection_id],
+                )
+                .await;
+
+                // Resolution may race the replay. Never leave a late client
+                // with an opened card after the durable request was consumed.
+                let current = self
+                    .crud_store
+                    .get_cli_runtime_pending_request(request.request_id.as_str())
+                    .await
+                    .ok()
+                    .flatten();
+                if current.as_ref().is_some_and(|record| {
+                    record.status == StoredCliRuntimePendingRequestStatus::Pending
+                }) {
+                    continue;
+                }
+                let resolved_record = current.as_ref().unwrap_or(&request);
+                let resolved = cli_runtime_request_resolved_notification_from_record(
+                    resolved_record,
+                    visible_thread_ids,
+                    cli_runtime_replay_resolution(resolved_record),
+                );
+                self.send_execution_collaborator_notification_to_connections(
+                    thread_id,
+                    crate::authorization::ResourceAction::AgentRequestObserve,
+                    events::CLI_RUNTIME_REQUEST_RESOLVED,
+                    &resolved,
+                    vec![connection_id],
+                )
+                .await;
+            }
+
+            let Some(next) = next else {
+                break;
+            };
+            after = Some(next);
+        }
+    }
+
     pub(super) async fn emit_cli_runtime_request_opened(
         &self,
         request: CliRuntimePendingRequestRecord,
     ) {
-        let notification = cli_runtime_request_opened_notification_from_record(&request);
+        let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
+        let notification = cli_runtime_request_opened_notification_from_record(
+            &request,
+            visible_thread_ids.clone(),
+        );
         self.send_cli_runtime_request_notification(
             &request,
+            visible_thread_ids.as_slice(),
             events::CLI_RUNTIME_REQUEST_OPENED,
             &notification,
         )
@@ -9604,10 +9916,15 @@ impl MessageProcessor {
         request: CliRuntimePendingRequestRecord,
         resolution: CLIRuntimeRequestResolution,
     ) {
-        let notification =
-            cli_runtime_request_resolved_notification_from_record(&request, resolution);
+        let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
+        let notification = cli_runtime_request_resolved_notification_from_record(
+            &request,
+            visible_thread_ids.clone(),
+            resolution,
+        );
         self.send_cli_runtime_request_notification(
             &request,
+            visible_thread_ids.as_slice(),
             events::CLI_RUNTIME_REQUEST_RESOLVED,
             &notification,
         )
@@ -9619,12 +9936,16 @@ impl MessageProcessor {
     async fn send_cli_runtime_request_notification<T: serde::Serialize>(
         &self,
         request: &CliRuntimePendingRequestRecord,
+        visible_thread_ids: &[String],
         method: &str,
         notification: &T,
     ) {
         if request.authorization_binding.is_some() {
-            self.send_execution_collaborator_notification(
-                request.thread_id.as_str(),
+            let mut notification_thread_ids = Vec::with_capacity(visible_thread_ids.len() + 1);
+            notification_thread_ids.push(request.thread_id.as_str());
+            notification_thread_ids.extend(visible_thread_ids.iter().map(String::as_str));
+            self.send_execution_collaborator_notification_for_threads(
+                notification_thread_ids.as_slice(),
                 crate::authorization::ResourceAction::AgentRequestObserve,
                 method,
                 notification,
@@ -10801,6 +11122,7 @@ fn cli_runtime_login_start_response_from_codex(
 #[allow(dead_code)]
 fn cli_runtime_request_opened_notification_from_record(
     record: &CliRuntimePendingRequestRecord,
+    visible_thread_ids: Vec<String>,
 ) -> CLIRuntimeRequestOpenedNotification {
     CLIRuntimeRequestOpenedNotification {
         workspace_id: record.workspace_id.clone(),
@@ -10809,12 +11131,14 @@ fn cli_runtime_request_opened_notification_from_record(
         thread_id: Some(record.thread_id.clone()),
         turn_id: record.turn_id.clone(),
         item_id: record.native_item_id.clone(),
+        visible_thread_ids,
         request: cli_runtime_pending_request_from_record(record),
     }
 }
 
 fn cli_runtime_request_resolved_notification_from_record(
     record: &CliRuntimePendingRequestRecord,
+    visible_thread_ids: Vec<String>,
     resolution: CLIRuntimeRequestResolution,
 ) -> CLIRuntimeRequestResolvedNotification {
     CLIRuntimeRequestResolvedNotification {
@@ -10824,12 +11148,31 @@ fn cli_runtime_request_resolved_notification_from_record(
         thread_id: Some(record.thread_id.clone()),
         turn_id: record.turn_id.clone(),
         item_id: record.native_item_id.clone(),
+        visible_thread_ids,
         resolution,
+    }
+}
+
+fn cli_runtime_replay_resolution(
+    record: &CliRuntimePendingRequestRecord,
+) -> CLIRuntimeRequestResolution {
+    if let Some(response_json) = record.response_json.as_deref()
+        && let Ok(resolution) = pioneer_crud::deserialize_cli_runtime_json(response_json)
+    {
+        return resolution;
+    }
+    match record.status {
+        StoredCliRuntimePendingRequestStatus::Cancelled => CLIRuntimeRequestResolution::Cancelled,
+        StoredCliRuntimePendingRequestStatus::Expired => CLIRuntimeRequestResolution::Expired,
+        _ => CLIRuntimeRequestResolution::Error {
+            message: "request is no longer awaiting a response".to_owned(),
+        },
     }
 }
 
 fn cli_runtime_command_approval_pending_request(
     request: &CodexCommandApprovalRequest,
+    supports_session_approval: bool,
 ) -> CLIRuntimePendingRequest {
     let display_command = request.display_command();
     CLIRuntimePendingRequest {
@@ -10852,7 +11195,33 @@ fn cli_runtime_command_approval_pending_request(
             "threadId": request.native_thread_id,
             "turnId": request.native_turn_id,
             "itemId": request.native_item_id,
+            "supportsSessionApproval": supports_session_approval,
             "raw": request.raw,
+        })),
+    }
+}
+
+fn cli_runtime_permission_approval_pending_request(
+    request: &CodexPermissionApprovalRequest,
+) -> CLIRuntimePendingRequest {
+    CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::PermissionApproval,
+        title: Some("Grant sandbox permissions".to_owned()),
+        message: request
+            .reason
+            .clone()
+            .or_else(|| Some("Codex requested additional filesystem or network access".to_owned())),
+        native_request_id: Some(request.native_request_id.clone()),
+        payload: Some(json!({
+            "cwd": request.cwd,
+            "reason": request.reason,
+            "permissions": request.requested_permissions,
+            "startedAtMs": request.started_at_ms,
+            "nativeRequestId": request.native_request_id,
+            "nativeRequestIdJson": request.native_request_id_json,
+            "threadId": request.native_thread_id,
+            "turnId": request.native_turn_id,
+            "itemId": request.native_item_id,
         })),
     }
 }
@@ -10884,6 +11253,9 @@ fn cli_runtime_pending_request_from_runtime_event(
         .or_else(|| match kind {
             CLIRuntimeRequestKind::FileChangeApproval => Some("Review file changes".to_owned()),
             CLIRuntimeRequestKind::CommandApproval => Some("Approve command".to_owned()),
+            CLIRuntimeRequestKind::PermissionApproval => {
+                Some("Grant sandbox permissions".to_owned())
+            }
             CLIRuntimeRequestKind::UserInput => Some("User input required".to_owned()),
             CLIRuntimeRequestKind::Other => None,
         });
@@ -10914,6 +11286,7 @@ fn cli_runtime_pending_request_from_runtime_event(
 
 fn cli_runtime_file_change_approval_pending_request(
     request: &CodexFileChangeApprovalRequest,
+    supports_session_approval: bool,
 ) -> CLIRuntimePendingRequest {
     let changed_files = cli_runtime_file_change_changed_files(request);
     let summary = request.summary.clone().or_else(|| {
@@ -10960,6 +11333,7 @@ fn cli_runtime_file_change_approval_pending_request(
             "threadId": request.native_thread_id,
             "turnId": request.native_turn_id,
             "itemId": request.native_item_id,
+            "supportsSessionApproval": supports_session_approval,
         })),
     }
 }
@@ -11074,6 +11448,140 @@ fn cli_runtime_native_request_id_json_from_record(
     );
 }
 
+fn validate_codex_permission_profile_shape(permissions: &JsonValue) -> anyhow::Result<()> {
+    let profile = permissions
+        .as_object()
+        .context("Codex requested permissions must be an object")?;
+    if profile
+        .keys()
+        .any(|key| !matches!(key.as_str(), "fileSystem" | "network"))
+    {
+        anyhow::bail!("Codex requested permissions contain an unknown capability");
+    }
+
+    if let Some(file_system) = profile.get("fileSystem").filter(|value| !value.is_null()) {
+        let file_system = file_system
+            .as_object()
+            .context("Codex fileSystem permissions must be an object")?;
+        if file_system.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "entries" | "read" | "write" | "globScanMaxDepth"
+            )
+        }) {
+            anyhow::bail!("Codex fileSystem permissions contain an unknown field");
+        }
+        for field in ["read", "write"] {
+            if let Some(paths) = file_system.get(field).filter(|value| !value.is_null()) {
+                let paths = paths
+                    .as_array()
+                    .with_context(|| format!("Codex fileSystem.{field} must be an array"))?;
+                if paths
+                    .iter()
+                    .any(|path| !path.as_str().is_some_and(|path| !path.trim().is_empty()))
+                {
+                    anyhow::bail!("Codex fileSystem.{field} contains an invalid path");
+                }
+            }
+        }
+        if let Some(depth) = file_system
+            .get("globScanMaxDepth")
+            .filter(|value| !value.is_null())
+            && !depth.as_u64().is_some_and(|depth| depth > 0)
+        {
+            anyhow::bail!("Codex globScanMaxDepth must be a positive integer");
+        }
+        if let Some(entries) = file_system.get("entries").filter(|value| !value.is_null()) {
+            for entry in entries
+                .as_array()
+                .context("Codex fileSystem.entries must be an array")?
+            {
+                let entry = entry
+                    .as_object()
+                    .context("Codex filesystem entry must be an object")?;
+                if entry
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "access" | "path"))
+                {
+                    anyhow::bail!("Codex filesystem entry contains an unknown field");
+                }
+                if !entry
+                    .get("access")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|access| matches!(access, "read" | "write" | "deny"))
+                {
+                    anyhow::bail!("Codex filesystem entry has invalid access");
+                }
+                validate_codex_permission_path_shape(
+                    entry
+                        .get("path")
+                        .context("Codex filesystem entry has no path")?,
+                )?;
+            }
+        }
+    }
+
+    if let Some(network) = profile.get("network").filter(|value| !value.is_null()) {
+        let network = network
+            .as_object()
+            .context("Codex network permissions must be an object")?;
+        if network.keys().any(|key| key != "enabled")
+            || network
+                .get("enabled")
+                .is_some_and(|enabled| !enabled.is_null() && !enabled.is_boolean())
+        {
+            anyhow::bail!("Codex network permissions have invalid fields");
+        }
+    }
+    Ok(())
+}
+
+fn validate_codex_permission_path_shape(path: &JsonValue) -> anyhow::Result<()> {
+    let path = path
+        .as_object()
+        .context("Codex filesystem path must be an object")?;
+    match path.get("type").and_then(JsonValue::as_str) {
+        Some("path") => {
+            if !path
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|path| !path.trim().is_empty())
+            {
+                anyhow::bail!("Codex filesystem path is empty");
+            }
+        }
+        Some("glob_pattern") => {
+            if !path
+                .get("pattern")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|pattern| !pattern.trim().is_empty())
+            {
+                anyhow::bail!("Codex filesystem glob is empty");
+            }
+        }
+        Some("special") => {
+            let value = path
+                .get("value")
+                .and_then(JsonValue::as_object)
+                .context("Codex special filesystem path has no value")?;
+            if !value
+                .get("kind")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "root" | "minimal" | "project_roots" | "tmpdir" | "slash_tmp" | "unknown"
+                    )
+                })
+            {
+                anyhow::bail!("Codex special filesystem path has an unknown kind");
+            }
+        }
+        _ => anyhow::bail!("Codex filesystem path has an unknown type"),
+    }
+    Ok(())
+}
+
 fn validate_codex_machine_request_shape(
     request: &CodexJsonlRpcServerRequest,
 ) -> std::result::Result<(), String> {
@@ -11111,11 +11619,27 @@ fn validate_codex_machine_request_shape(
             .and_then(JsonValue::as_str)
             .is_some_and(|value| !value.trim().is_empty());
         if !item_id_is_valid {
-            return Err("Codex MCP permission approval requires non-empty `itemId`".to_owned());
+            return Err("Codex permission approval requires non-empty `itemId`".to_owned());
         }
-        if !params.get("permissions").is_some_and(JsonValue::is_object) {
-            return Err("Codex MCP permission approval requires object `permissions`".to_owned());
+        let cwd = params
+            .get("cwd")
+            .and_then(JsonValue::as_str)
+            .filter(|cwd| !cwd.trim().is_empty())
+            .ok_or_else(|| "Codex permission approval requires non-empty `cwd`".to_owned())?;
+        if !Path::new(cwd).is_absolute() {
+            return Err("Codex permission approval requires absolute `cwd`".to_owned());
         }
+        if !params.get("startedAtMs").is_some_and(|value| {
+            value.as_i64().is_some() || value.as_u64().is_some_and(|value| value <= i64::MAX as u64)
+        }) {
+            return Err("Codex permission approval requires integer `startedAtMs`".to_owned());
+        }
+        validate_codex_permission_profile_shape(
+            params
+                .get("permissions")
+                .ok_or_else(|| "Codex permission approval requires `permissions`".to_owned())?,
+        )
+        .map_err(|error| format!("invalid Codex permission approval: {error:#}"))?;
     }
     if matches!(
         request.method.as_str(),
@@ -11149,12 +11673,34 @@ fn validate_cli_runtime_native_request_resolution(
         }
     }
 
+    if matches!(resolution, CLIRuntimeRequestResolution::ApprovedForSession) {
+        let kind = cli_runtime_request_kind_from_stored(record.request_kind.as_str());
+        if !matches!(
+            kind,
+            CLIRuntimeRequestKind::CommandApproval | CLIRuntimeRequestKind::FileChangeApproval
+        ) {
+            anyhow::bail!("session approval is not supported for this request kind");
+        }
+        let supports_session = cli_runtime_pending_request_from_record(record)
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("supportsSessionApproval"))
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        if !supports_session {
+            anyhow::bail!("this Codex request is not eligible for session approval");
+        }
+    }
+
     match cli_runtime_request_kind_from_stored(record.request_kind.as_str()) {
         CLIRuntimeRequestKind::CommandApproval => {
             let _ = codex_command_approval_decision_from_resolution(resolution)?;
         }
         CLIRuntimeRequestKind::FileChangeApproval => {
             let _ = codex_file_change_approval_decision_from_resolution(resolution)?;
+        }
+        CLIRuntimeRequestKind::PermissionApproval => {
+            let _ = codex_permission_approval_response_from_resolution(record, resolution)?;
         }
         CLIRuntimeRequestKind::UserInput => {
             let mut response = codex_user_input_response_from_resolution(record, resolution)?;
@@ -11171,13 +11717,17 @@ fn validate_cli_runtime_resolution_against_permission_profile(
     resolution: &CLIRuntimeRequestResolution,
     permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
 ) -> anyhow::Result<()> {
-    if !matches!(resolution, CLIRuntimeRequestResolution::Approved) {
+    if !matches!(
+        resolution,
+        CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::ApprovedForSession
+    ) {
         return Ok(());
     }
 
     let behavior = match request_kind {
         CLIRuntimeRequestKind::CommandApproval => permission_profile.effective_policy.shell_command,
         CLIRuntimeRequestKind::FileChangeApproval => permission_profile.effective_policy.file_write,
+        CLIRuntimeRequestKind::PermissionApproval => return Ok(()),
         CLIRuntimeRequestKind::UserInput => return Ok(()),
         CLIRuntimeRequestKind::Other => {
             anyhow::bail!("opaque CLI approval request has no typed permission class")
@@ -11189,9 +11739,93 @@ fn validate_cli_runtime_resolution_against_permission_profile(
             match request_kind {
                 CLIRuntimeRequestKind::CommandApproval => "shell_command",
                 CLIRuntimeRequestKind::FileChangeApproval => "file_write",
-                CLIRuntimeRequestKind::UserInput | CLIRuntimeRequestKind::Other => unreachable!(),
+                CLIRuntimeRequestKind::PermissionApproval
+                | CLIRuntimeRequestKind::UserInput
+                | CLIRuntimeRequestKind::Other => unreachable!(),
             }
         );
+    }
+    Ok(())
+}
+
+fn validate_cli_runtime_pending_resolution_against_permission_profile(
+    request: &CliRuntimePendingRequestRecord,
+    resolution: &CLIRuntimeRequestResolution,
+    permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
+) -> anyhow::Result<()> {
+    let request_kind = cli_runtime_request_kind_from_stored(request.request_kind.as_str());
+    validate_cli_runtime_resolution_against_permission_profile(
+        request_kind,
+        resolution,
+        permission_profile,
+    )?;
+    if request_kind != CLIRuntimeRequestKind::PermissionApproval
+        || !matches!(resolution, CLIRuntimeRequestResolution::Approved)
+    {
+        return Ok(());
+    }
+
+    let permissions = cli_runtime_pending_request_from_record(request)
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("permissions"))
+        .cloned()
+        .context("Codex permission approval request has no permissions")?;
+    validate_codex_requested_permissions_against_permission_profile(
+        &permissions,
+        permission_profile,
+    )
+}
+
+fn validate_codex_requested_permissions_against_permission_profile(
+    permissions: &JsonValue,
+    permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
+) -> anyhow::Result<()> {
+    validate_codex_permission_profile_shape(permissions)?;
+    let policy = &permission_profile.effective_policy;
+    let file_system = permissions.get("fileSystem").and_then(JsonValue::as_object);
+    let requests_file_read = file_system.is_some_and(|file_system| {
+        file_system
+            .get("read")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|paths| !paths.is_empty())
+            || file_system
+                .get("entries")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("access").and_then(JsonValue::as_str) == Some("read")
+                    })
+                })
+    });
+    let requests_file_write = file_system.is_some_and(|file_system| {
+        file_system
+            .get("write")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|paths| !paths.is_empty())
+            || file_system
+                .get("entries")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("access").and_then(JsonValue::as_str) == Some("write")
+                    })
+                })
+    });
+    let requests_network = permissions
+        .get("network")
+        .and_then(|network| network.get("enabled"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+
+    if requests_file_read && policy.file_read == pioneer_protocol::PermissionBehavior::Deny {
+        anyhow::bail!("current `file_read` permission is deny");
+    }
+    if requests_file_write && policy.file_write == pioneer_protocol::PermissionBehavior::Deny {
+        anyhow::bail!("current `file_write` permission is deny");
+    }
+    if requests_network && policy.network == pioneer_protocol::PermissionBehavior::Deny {
+        anyhow::bail!("current `network` permission is deny");
     }
     Ok(())
 }
@@ -11248,6 +11882,9 @@ fn codex_command_approval_decision_from_resolution(
 ) -> anyhow::Result<CodexCommandApprovalDecision> {
     match resolution {
         CLIRuntimeRequestResolution::Approved => Ok(CodexCommandApprovalDecision::Accept),
+        CLIRuntimeRequestResolution::ApprovedForSession => {
+            Ok(CodexCommandApprovalDecision::AcceptForSession)
+        }
         CLIRuntimeRequestResolution::Denied { .. } => Ok(CodexCommandApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Cancelled => Ok(CodexCommandApprovalDecision::Cancel),
         CLIRuntimeRequestResolution::Expired => Ok(CodexCommandApprovalDecision::Decline),
@@ -11263,12 +11900,47 @@ fn codex_file_change_approval_decision_from_resolution(
 ) -> anyhow::Result<CodexFileChangeApprovalDecision> {
     match resolution {
         CLIRuntimeRequestResolution::Approved => Ok(CodexFileChangeApprovalDecision::Accept),
+        CLIRuntimeRequestResolution::ApprovedForSession => {
+            Ok(CodexFileChangeApprovalDecision::AcceptForSession)
+        }
         CLIRuntimeRequestResolution::Denied { .. } => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Cancelled => Ok(CodexFileChangeApprovalDecision::Cancel),
         CLIRuntimeRequestResolution::Expired => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Error { .. } => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Answered { .. } => anyhow::bail!(
             "file-change approvals accept only canonical approve, deny, or cancel decisions"
+        ),
+    }
+}
+
+fn codex_permission_approval_response_from_resolution(
+    record: &CliRuntimePendingRequestRecord,
+    resolution: &CLIRuntimeRequestResolution,
+) -> anyhow::Result<JsonValue> {
+    let permissions = cli_runtime_pending_request_from_record(record)
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("permissions"))
+        .cloned()
+        .context("Codex permission approval request has no permissions")?;
+    validate_codex_permission_profile_shape(&permissions)?;
+    match resolution {
+        CLIRuntimeRequestResolution::Approved => {
+            Ok(codex_permission_approval_response(permissions, true, false))
+        }
+        CLIRuntimeRequestResolution::ApprovedForSession => {
+            anyhow::bail!("Codex general permission requests are bounded to the active turn")
+        }
+        CLIRuntimeRequestResolution::Denied { .. }
+        | CLIRuntimeRequestResolution::Cancelled
+        | CLIRuntimeRequestResolution::Expired
+        | CLIRuntimeRequestResolution::Error { .. } => Ok(codex_permission_approval_response(
+            permissions,
+            false,
+            false,
+        )),
+        CLIRuntimeRequestResolution::Answered { .. } => anyhow::bail!(
+            "permission approvals accept only canonical approve, deny, or cancel decisions"
         ),
     }
 }
@@ -11287,6 +11959,9 @@ fn claude_permission_response_from_resolution(
                 "behavior": "allow",
                 "updatedInput": original_input,
             })
+        }
+        CLIRuntimeRequestResolution::ApprovedForSession => {
+            anyhow::bail!("Claude permission responses do not support session approval")
         }
         CLIRuntimeRequestResolution::Answered { .. } => {
             anyhow::bail!("Claude permission responses do not accept opaque answer payloads")
@@ -11326,9 +12001,9 @@ fn file_change_approval_timeline_status_for_resolution(
     resolution: &CLIRuntimeRequestResolution,
 ) -> &'static str {
     match resolution {
-        CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::Answered { .. } => {
-            "approval_accepted"
-        }
+        CLIRuntimeRequestResolution::Approved
+        | CLIRuntimeRequestResolution::ApprovedForSession
+        | CLIRuntimeRequestResolution::Answered { .. } => "approval_accepted",
         CLIRuntimeRequestResolution::Denied { .. }
         | CLIRuntimeRequestResolution::Expired
         | CLIRuntimeRequestResolution::Error { .. } => "approval_declined",
@@ -11353,6 +12028,7 @@ fn codex_user_input_response_from_resolution(
             Ok(codex_user_input_response(answers))
         }
         CLIRuntimeRequestResolution::Approved
+        | CLIRuntimeRequestResolution::ApprovedForSession
         | CLIRuntimeRequestResolution::Denied { .. }
         | CLIRuntimeRequestResolution::Error { .. } => {
             anyhow::bail!("user input requests must be answered or cancelled")
@@ -11453,6 +12129,7 @@ pub(super) fn cli_runtime_request_kind_as_str(kind: CLIRuntimeRequestKind) -> &'
     match kind {
         CLIRuntimeRequestKind::CommandApproval => "command_approval",
         CLIRuntimeRequestKind::FileChangeApproval => "file_change_approval",
+        CLIRuntimeRequestKind::PermissionApproval => "permission_approval",
         CLIRuntimeRequestKind::UserInput => "user_input",
         CLIRuntimeRequestKind::Other => "other",
     }
@@ -11463,6 +12140,7 @@ fn cli_runtime_request_kind_from_stored(value: &str) -> CLIRuntimeRequestKind {
     match value {
         "command_approval" => CLIRuntimeRequestKind::CommandApproval,
         "file_change_approval" => CLIRuntimeRequestKind::FileChangeApproval,
+        "permission_approval" => CLIRuntimeRequestKind::PermissionApproval,
         "user_input" => CLIRuntimeRequestKind::UserInput,
         _ => CLIRuntimeRequestKind::Other,
     }
@@ -11473,6 +12151,7 @@ fn cli_runtime_request_kind_requires_turn_binding(kind: CLIRuntimeRequestKind) -
         kind,
         CLIRuntimeRequestKind::CommandApproval
             | CLIRuntimeRequestKind::FileChangeApproval
+            | CLIRuntimeRequestKind::PermissionApproval
             | CLIRuntimeRequestKind::UserInput
     )
 }
@@ -11741,6 +12420,7 @@ fn cli_runtime_request_status_for_resolution(
 ) -> StoredCliRuntimePendingRequestStatus {
     match resolution {
         CLIRuntimeRequestResolution::Approved
+        | CLIRuntimeRequestResolution::ApprovedForSession
         | CLIRuntimeRequestResolution::Denied { .. }
         | CLIRuntimeRequestResolution::Answered { .. } => {
             StoredCliRuntimePendingRequestStatus::Answered
@@ -11833,6 +12513,54 @@ mod tests {
                 &asking,
             )
             .is_ok()
+        );
+
+        let requested_permissions = json!({
+            "fileSystem": {
+                "write": ["/tmp/project/output"],
+                "entries": [{
+                    "access": "read",
+                    "path": {"type": "path", "path": "/tmp/project/input"}
+                }]
+            },
+            "network": {"enabled": true}
+        });
+        assert!(
+            validate_codex_requested_permissions_against_permission_profile(
+                &requested_permissions,
+                &denied,
+            )
+            .is_err(),
+            "a provider sandbox permission response must not widen a denied execution cap"
+        );
+        assert!(
+            validate_codex_requested_permissions_against_permission_profile(
+                &requested_permissions,
+                &asking,
+            )
+            .is_ok(),
+            "an asking execution cap may be satisfied by this exact human approval"
+        );
+
+        let mut file_write_denied = asking.clone();
+        file_write_denied.effective_policy.file_write = pioneer_protocol::PermissionBehavior::Deny;
+        assert!(
+            validate_codex_requested_permissions_against_permission_profile(
+                &json!({"fileSystem": {"write": ["/tmp/project/output"]}}),
+                &file_write_denied,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_codex_requested_permissions_against_permission_profile(
+                &json!({"fileSystem": {"entries": [{
+                    "access": "deny",
+                    "path": {"type": "path", "path": "/tmp/project/secret"}
+                }]}}),
+                &file_write_denied,
+            )
+            .is_ok(),
+            "a provider-side deny entry does not request authority"
         );
     }
 

@@ -50,6 +50,41 @@ pub fn open_regular_file(path: impl AsRef<Path>) -> io::Result<File> {
     Ok(file)
 }
 
+/// Open and pin a directory without following any application-controlled
+/// symlink/reparse-point component. Callers can enumerate the returned handle
+/// without re-opening a previously authorized pathname.
+pub fn open_directory(path: impl AsRef<Path>) -> io::Result<File> {
+    let path = trusted_platform_path(path.as_ref());
+    #[cfg(unix)]
+    let directory = open_directory_unix(&path)?;
+    #[cfg(windows)]
+    let directory = open_directory_windows(&path)?;
+    #[cfg(not(any(unix, windows)))]
+    let directory = File::open(&path)?;
+
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace target is not a directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workspace directory is a reparse point",
+            ));
+        }
+    }
+    Ok(directory)
+}
+
 /// Resolve only immutable macOS compatibility aliases that precede the
 /// application-owned path.  Never canonicalize the workspace descendants:
 /// doing so would follow an attacker-controlled symlink before `openat` gets
@@ -145,6 +180,50 @@ fn open_regular_file_unix(path: &Path) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[cfg(unix)]
+fn open_directory_unix(path: &Path) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let mut directory = if path.is_absolute() {
+        File::open("/")?
+    } else {
+        File::open(".")?
+    };
+    for component in path.components() {
+        let name = match component {
+            Component::Normal(value) => CString::new(value.as_bytes()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workspace directory contains NUL",
+                )
+            })?,
+            Component::CurDir | Component::RootDir => continue,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workspace directory must be normalized before secure open",
+                ));
+            }
+        };
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+    Ok(directory)
+}
+
 #[cfg(windows)]
 fn open_regular_file_windows(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
@@ -154,6 +233,20 @@ fn open_regular_file_windows(path: &Path) -> io::Result<File> {
     let file = options.open(path)?;
     verify_windows_handle_path(&file, path)?;
     Ok(file)
+}
+
+#[cfg(windows)]
+fn open_directory_windows(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    use std::os::windows::fs::OpenOptionsExt;
+    options.custom_flags(
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
+            | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+    );
+    let directory = options.open(path)?;
+    verify_windows_handle_path(&directory, path)?;
+    Ok(directory)
 }
 
 #[cfg(windows)]

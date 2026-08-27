@@ -244,6 +244,7 @@ fn claude_reserved_flag(flag: &str) -> Option<&'static str> {
         "--mcp-config" => Some("--mcp-config"),
         "--strict-mcp-config" => Some("--strict-mcp-config"),
         "--safe-mode" => Some("--safe-mode"),
+        "--tools" => Some("--tools"),
         "--allowedtools" | "--allowed-tools" => Some("--allowedTools"),
         "--permission-prompt-tool" => Some("--permission-prompt-tool"),
         "--permission-mode" => Some("--permission-mode"),

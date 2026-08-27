@@ -745,6 +745,98 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
     assert_eq!(refreshed.workspaces[0].id, unrelated_workspace_id);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_full_access_cli_request_is_capped_before_codex_permissions_adaptation() {
+    let member_principal = register_member_principal();
+    let mut harness = setup_cli_runtime_security_harness_for_principal(
+        Some(CLIAgentRuntimeKind::Codex),
+        Some(member_principal),
+    )
+    .await;
+    harness
+        .crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "INSERT INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES(\
+                '{MEMBER_A_ID}','{}','user','member','active',\
+                'CLI Member','cli-member','cli-member',\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+             );\
+             INSERT INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES(\
+                '{MEMBER_A_ID}','{}','system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT INTO device(\
+                id,gateway_id,principal_id,installation_id,display_name,client_kind,\
+                platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at\
+             ) VALUES(\
+                '{MEMBER_DEVICE_ID}','{}','{MEMBER_A_ID}','cli-member-fixture',\
+                'CLI Member','desktop','test','1','active',CURRENT_TIMESTAMP,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+             );\
+             INSERT INTO auth_session(\
+                id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,\
+                activation_token_hash,activation_locator_hash,activation_failed_attempts,\
+                activation_expires_at,activated_at,status,refresh_generation,created_at,\
+                updated_at,last_seen_at,last_refreshed_at,refresh_expires_at,revoked_at,\
+                revoke_reason\
+             ) VALUES(\
+                '{MEMBER_SESSION_ID}','{}','{MEMBER_A_ID}','{MEMBER_DEVICE_ID}',\
+                'F0000000000000000000A',NULL,randomblob(32),randomblob(32),0,\
+                datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',1,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
+                datetime('now','+90 days'),NULL,NULL\
+             );",
+            crate::session::test_support::TEST_GATEWAY_ID,
+            harness.workspace_id,
+            crate::session::test_support::TEST_GATEWAY_ID,
+            crate::session::test_support::TEST_GATEWAY_ID,
+        ))
+        .await
+        .expect("materialize CLI Member authority");
+
+    start_member_thread(
+        harness.processor.as_ref(),
+        harness.connection_id,
+        &mut harness.rx,
+        harness.workspace_id.as_str(),
+        "thread_member_cli_cap",
+        ThreadVisibility::Workspace,
+    )
+    .await;
+
+    let request_id = generate_test_request_id("memberclicap", "turn");
+    let request = cli_runtime_turn_start_request(
+        request_id.as_str(),
+        "thread_member_cli_cap",
+        "turn_member_cli_cap",
+        cli_runtime_execution_backend("codex", CLIAgentRuntimeKind::Codex),
+        "full_access",
+        "run a command that requires approval",
+        None,
+    );
+    process_cli_runtime_turn_start(&harness, request.as_str()).await;
+
+    let turn_start = wait_for_recorded_cli_runtime_turn_start(&harness.cli_session).await;
+    assert_eq!(turn_start.approval_policy.as_deref(), Some("on-request"));
+    assert_eq!(turn_start.permissions.as_deref(), Some(":read-only"));
+    let persisted =
+        load_persisted_security_snapshot_record(&harness.crud_store, "turn_member_cli_cap").await;
+    assert_eq!(
+        persisted.snapshot.permission_profile.mode,
+        pioneer_protocol::TurnPermissionMode::Supervised
+    );
+    assert_eq!(
+        persisted.snapshot.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::ReadOnly
+    );
+}
+
 async fn recv_turn_terminal_notification(rx: &mut mpsc::Receiver<Message>) -> JsonRpcNotification {
     for _ in 0..200 {
         let payload = recv_text_timeout_context(

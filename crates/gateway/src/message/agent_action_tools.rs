@@ -1930,6 +1930,15 @@ pub(crate) async fn process_due_agent_action_outbox(
                 )
                 .await?;
             }
+            Ok(AgentActionOutboxDispatch::AwaitingRuntime) => {
+                pioneer_crud::defer_agent_action_outbox_for_runtime(
+                    &database,
+                    row.id.as_str(),
+                    row.attempts,
+                    pioneer_crud::utc_now(),
+                )
+                .await?;
+            }
             Err(_error) => {
                 let marked = pioneer_crud::mark_agent_action_outbox_failed(
                     &database,
@@ -1957,6 +1966,7 @@ pub(crate) async fn process_due_agent_action_outbox(
 enum AgentActionOutboxDispatch {
     Delivered,
     AwaitingPermit,
+    AwaitingRuntime,
 }
 
 async fn dispatch_agent_action_outbox_row(
@@ -2058,16 +2068,31 @@ async fn dispatch_agent_action_outbox_row(
             execution.status.as_str(),
             "completed" | "succeeded" | "failed" | "blocked" | "cancelled" | "timed_out"
         )
-        || processor
-            .agent_manager
-            .observe_turn(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
-            .await
-            .is_some()
     {
         // The runtime was already activated (or has since reached a terminal
         // state). This is the crash-after-dispatch replay window: acknowledge
         // the outbox without starting the same provider/CLI turn again.
         return Ok(AgentActionOutboxDispatch::Delivered);
+    }
+    if processor
+        .agent_manager
+        .observe_turn(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
+        .await
+        .is_some()
+    {
+        return Ok(AgentActionOutboxDispatch::Delivered);
+    }
+    if processor
+        .thread_manager
+        .has_running_turn_other_than(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
+        .await
+        || processor
+            .agent_manager
+            .active_turn_id(dispatch.thread_id.as_str())
+            .await
+            .is_some_and(|active_turn_id| active_turn_id != dispatch.turn_id)
+    {
+        return Ok(AgentActionOutboxDispatch::AwaitingRuntime);
     }
     let resource = pioneer_crud::load_agent_execution_resource_state(
         &processor.crud_store.database_connection(),
@@ -2617,7 +2642,7 @@ impl AgentActionToolHandler {
         };
         let child_security_cap =
             crate::turn_security::task_security_cap_from_snapshot(&parent_security_snapshot);
-        let child_security_snapshot =
+        let mut child_security_snapshot =
             crate::turn_security::resolve_task_child_execution_security_for_backend(
                 self.context.workspace_id.as_str(),
                 self.context.turn_id.as_str(),
@@ -2632,6 +2657,18 @@ impl AgentActionToolHandler {
             .map_err(|error| {
                 ToolError::execution_failed(format!(
                     "failed to derive child Agent security snapshot: {error:#}"
+                ))
+            })?;
+        processor
+            .add_native_turn_runtime_sandbox_roots(
+                &mut child_security_snapshot,
+                self.context.workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+            )
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to install child Agent runtime sandbox roots: {error:#}"
                 ))
             })?;
         let permission_profile = child_security_snapshot.permission_profile.clone();
@@ -2683,22 +2720,11 @@ impl AgentActionToolHandler {
             permission_profile: start.launch.execution.permission_profile.clone(),
             cli_runtime_options: None,
         };
-        let outcome = processor
-            .thread_manager
-            .agent_turn_start_with_permission_profile(
-                params.clone(),
-                permission_profile.clone(),
-                child.authored_turn.author.clone(),
-            )
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!("failed to prepare child Agent: {error:#}"))
-            })?;
         let audit_event = processor.turn_profile_selected_audit_event_for_turn(
             self.context.workspace_id.as_str(),
             thread_id.as_str(),
             turn_id.as_str(),
-            permission_profile,
+            permission_profile.clone(),
         );
         let authorization_revision = processor
             .authorization_invalidation_hub
@@ -2764,10 +2790,6 @@ impl AgentActionToolHandler {
                     != i64::try_from(child.grant.identity.source_revision).unwrap_or(-1)
                 || row.source_fingerprint != child.grant.identity.source_fingerprint
         }) {
-            processor
-                .thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
             return Err(ToolError::execution_failed(
                 "child identity changed before commit",
             ));
@@ -2799,13 +2821,43 @@ impl AgentActionToolHandler {
                 .map_err(|error| {
                     ToolError::internal(format!("failed to fingerprint child authority: {error:#}"))
                 })?;
-        let snapshot_id = pioneer_crud::canonical_agent_id(
-            'S',
-            &format!(
-                "agent-start-snapshot\0{}\0{}",
-                child.grant.identity.id, child.grant.execution_id
-            ),
-        );
+        let snapshot_id = if identity_row.is_some() {
+            let snapshot = pioneer_crud::load_current_agent_presentation_snapshot(
+                &processor.crud_store.database_connection(),
+                child.grant.identity.id.as_str(),
+                source_revision,
+                child.grant.identity.source_fingerprint.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to resolve child presentation snapshot: {error:#}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ToolError::execution_failed(
+                    "existing child identity has no authoritative presentation snapshot",
+                )
+            })?;
+            if snapshot.display_name != child.grant.identity.display_name
+                || snapshot.nickname != child.grant.identity.nickname
+                || snapshot.avatar_revision != child.grant.identity.avatar_revision
+                || snapshot.role_label != child.grant.identity.role_label
+            {
+                return Err(ToolError::execution_failed(
+                    "child presentation changed before commit",
+                ));
+            }
+            snapshot.id
+        } else {
+            pioneer_crud::canonical_agent_id(
+                'S',
+                &format!(
+                    "agent-start-snapshot\0{}\0{}",
+                    child.grant.identity.id, child.grant.execution_id
+                ),
+            )
+        };
         let resource =
             plan.input.resource.clone().ok_or_else(|| {
                 ToolError::internal("StartAgent action has no resource admission")
@@ -2813,10 +2865,6 @@ impl AgentActionToolHandler {
         if resource.execution_id != child.grant.execution_id.as_str()
             || resource.root_execution_id != child.grant.root_execution_id.as_str()
         {
-            processor
-                .thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
             return Err(ToolError::internal(
                 "StartAgent resource admission differs from its child graph",
             ));
@@ -2983,6 +3031,21 @@ impl AgentActionToolHandler {
         // coordinator is only an early backpressure hint and must not write a
         // competing permit/queue transition.
         plan.input.resource = None;
+        // Keep the in-memory Turn admission immediately adjacent to its
+        // durable commit. Every fallible identity, authority, presentation,
+        // graph and outbox preparation step above therefore leaves no phantom
+        // child Turn behind when it fails.
+        let outcome = processor
+            .thread_manager
+            .concurrent_agent_turn_start_with_permission_profile(
+                params.clone(),
+                permission_profile,
+                child.authored_turn.author.clone(),
+            )
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!("failed to prepare child Agent: {error:#}"))
+            })?;
         let graph_result = match processor
             .crud_store
             .materialize_agent_turn_start_with_graph_and_action(

@@ -385,14 +385,14 @@ impl MessageProcessor {
         recipients
     }
 
-    pub(super) async fn send_execution_collaborator_notification<T: Serialize>(
+    pub(super) async fn send_execution_collaborator_notification_to_connections<T: Serialize>(
         &self,
         thread_id: &str,
         action: crate::authorization::ResourceAction,
         method: &str,
         payload: &T,
+        candidate_connection_ids: Vec<ConnectionId>,
     ) {
-        let candidate_connection_ids = self.session_manager.connection_ids().await;
         self.send_execution_scoped_notification(
             thread_id,
             action,
@@ -403,14 +403,15 @@ impl MessageProcessor {
         .await;
     }
 
-    pub(super) async fn send_execution_collaborator_notification_to_connections<T: Serialize>(
+    #[allow(dead_code)]
+    pub(super) async fn send_execution_collaborator_notification<T: Serialize>(
         &self,
         thread_id: &str,
         action: crate::authorization::ResourceAction,
         method: &str,
         payload: &T,
-        candidate_connection_ids: Vec<ConnectionId>,
     ) {
+        let candidate_connection_ids = self.session_manager.connection_ids().await;
         self.send_execution_scoped_notification(
             thread_id,
             action,

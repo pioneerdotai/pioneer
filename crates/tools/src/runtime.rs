@@ -116,15 +116,6 @@ impl ToolCallRuntime {
         .await
     }
 
-    pub async fn execute_nested_tool_call(
-        &self,
-        call: ToolCall,
-        workdir: PathBuf,
-    ) -> Result<AnyToolResult, ToolError> {
-        self.execute_nested_tool_call_with_cancellation(call, workdir, CancellationToken::new())
-            .await
-    }
-
     pub async fn execute_nested_tool_call_with_cancellation(
         &self,
         call: ToolCall,

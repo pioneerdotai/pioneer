@@ -721,7 +721,12 @@ pub(crate) fn codex_native_approval_fallback_response(
         serde_json::json!({
             "permissions": requested_permissions,
             "scope": "turn",
-            "strictAutoReview": false,
+            // Codex permission grants cannot be scoped to one MCP item. The
+            // bridge grants the provider-side prerequisite for this exact,
+            // correlated item, while Pioneer performs the real tool approval.
+            // Force later commands back through review so this turn-scoped
+            // transport grant cannot silently authorize an unrelated command.
+            "strictAutoReview": true,
         })
     })
 }
@@ -3378,7 +3383,7 @@ mod tests {
             Some(json!({
                 "permissions": requested_permissions,
                 "scope": "turn",
-                "strictAutoReview": false,
+                "strictAutoReview": true,
             }))
         );
 

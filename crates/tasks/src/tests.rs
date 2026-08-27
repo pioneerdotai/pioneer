@@ -906,6 +906,7 @@ fn test_security_cap() -> TaskAgentSecurityCap {
         max_permission_profile: pioneer_protocol::task_permission_cap_for_mode(
             TurnPermissionMode::AutoAcceptEdits,
         ),
+        max_filesystem_kind: Some(pioneer_protocol::TurnFilesystemSandboxKind::Restricted),
         max_filesystem_entries: vec![TurnFilesystemSandboxEntry::workspace_root(
             TurnFilesystemAccess::Write,
             "/workspace",

@@ -916,6 +916,33 @@ impl ThreadManager {
         .await
     }
 
+    /// Starts an Agent-authored child Turn without taking the interactive
+    /// foreground-start gate. A model can only call `agent_start` while its
+    /// parent Turn is still running, and routed collaborative targets may also
+    /// have an active Turn. These child Turns remain ordinary conversation
+    /// Turns, are independently cancellable, and keep the Thread active until
+    /// the final concurrent Turn reaches a terminal state.
+    pub async fn concurrent_agent_turn_start_with_permission_profile(
+        &self,
+        params: TurnStartParams,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        author: pioneer_protocol::TurnAuthorSnapshot,
+    ) -> Result<TurnStartOutcome> {
+        if params.mode != Some(ThreadMode::Agent) {
+            bail!("concurrent Agent child start requires Agent mode");
+        }
+        self.turn_start_for_actor_with_permission_profile_concurrency(
+            None,
+            params,
+            Some(permission_profile),
+            Some(author),
+            Vec::new(),
+            TurnOrigin::User,
+            true,
+        )
+        .await
+    }
+
     /// Rebuild the runtime-only start envelope for a Turn whose canonical
     /// events were committed before a crash. This method is read-only: the
     /// durable Turn, author and input remain authoritative and no second Turn
@@ -1007,6 +1034,28 @@ impl ThreadManager {
         mentions: Vec<pioneer_protocol::TurnMention>,
         origin: TurnOrigin,
     ) -> Result<TurnStartOutcome> {
+        self.turn_start_for_actor_with_permission_profile_concurrency(
+            connection_id,
+            params,
+            resolved_permission_profile,
+            author,
+            mentions,
+            origin,
+            false,
+        )
+        .await
+    }
+
+    async fn turn_start_for_actor_with_permission_profile_concurrency(
+        &self,
+        connection_id: Option<ConnectionId>,
+        params: TurnStartParams,
+        resolved_permission_profile: Option<pioneer_protocol::TurnPermissionProfileSnapshot>,
+        author: Option<pioneer_protocol::TurnAuthorSnapshot>,
+        mentions: Vec<pioneer_protocol::TurnMention>,
+        origin: TurnOrigin,
+        allow_concurrent_agent_child: bool,
+    ) -> Result<TurnStartOutcome> {
         pioneer_protocol::validate_turn_execution_envelope(&params)
             .map_err(|message| anyhow!(message))?;
         let thread_id = params.thread_id.trim();
@@ -1069,7 +1118,7 @@ impl ThreadManager {
 
         let has_running_turn = entry.thread.turns.iter().any(turn_owns_foreground);
 
-        if has_running_turn {
+        if has_running_turn && !allow_concurrent_agent_child {
             bail!("thread `{thread_id}` already has a running turn");
         }
 
@@ -1397,13 +1446,18 @@ impl ThreadManager {
 
         turn.status = status;
         turn.error = error;
-        entry.thread.status = ThreadStatus::Idle;
+        let finished_turn = turn.clone();
+        entry.thread.status = if entry.thread.turns.iter().any(turn_owns_foreground) {
+            ThreadStatus::Active
+        } else {
+            ThreadStatus::Idle
+        };
         entry.thread.updated_at = now;
 
         Ok(TurnFinishOutcome {
             thread_id: thread_id.to_owned(),
             workspace_id: entry.thread.workspace_id.clone(),
-            turn: turn.clone(),
+            turn: finished_turn,
             rollback_context: TurnFinishRollbackContext {
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -1606,6 +1660,21 @@ impl ThreadManager {
         let entry = state.threads.get(thread_id)?;
         let turn = entry.thread.turns.iter().find(|turn| turn.id == turn_id)?;
         Some((entry.thread.workspace_id.clone(), turn.clone()))
+    }
+
+    pub(crate) async fn has_running_turn_other_than(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.state
+            .read()
+            .await
+            .threads
+            .get(thread_id)
+            .is_some_and(|entry| {
+                entry
+                    .thread
+                    .turns
+                    .iter()
+                    .any(|turn| turn.id != turn_id && turn_owns_foreground(turn))
+            })
     }
 
     pub async fn set_turn_prompt_manifest(
@@ -2749,6 +2818,109 @@ mod tests {
         let unloaded = manager.unload_orphaned_thread_if_idle(&thread_id).await;
         assert!(unloaded);
         assert!(!manager.has_thread(&thread_id).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_agent_child_keeps_thread_active_until_both_turns_finish() {
+        let manager = ThreadManager::new("o4-mini", "openai");
+        let thread_id = "thr_concurrent_agent_child";
+        manager
+            .thread_start(
+                10,
+                "ws_000000000000000001".to_owned(),
+                start_params(thread_id),
+            )
+            .await
+            .expect("thread should start");
+
+        let parent_turn_id = "turn_parent_agent";
+        manager
+            .turn_start(
+                10,
+                TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: parent_turn_id.to_owned(),
+                    input: vec![UserInput::Text {
+                        text: "parent".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    capabilities: Vec::new(),
+                    model: None,
+                    model_provider: None,
+                    sandbox_policy: None,
+                    mode: Some(ThreadMode::Agent),
+                    agent_launch: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+            )
+            .await
+            .expect("parent Agent turn should start");
+
+        let child_turn_id = "turn_child_agent";
+        let child = manager
+            .concurrent_agent_turn_start_with_permission_profile(
+                TurnStartParams {
+                    agent_delegation_routes: Vec::new(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: child_turn_id.to_owned(),
+                    input: vec![UserInput::Text {
+                        text: "child".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    capabilities: Vec::new(),
+                    model: None,
+                    model_provider: None,
+                    sandbox_policy: None,
+                    mode: Some(ThreadMode::Agent),
+                    agent_launch: None,
+                    reply_to_turn_id: None,
+                    mentioned_principal_ids: Vec::new(),
+                    execution_backend: None,
+                    reasoning: None,
+                    permission_profile: None,
+                    cli_runtime_options: None,
+                },
+                pioneer_protocol::resolve_turn_permission_profile(None),
+                pioneer_protocol::TurnAuthorSnapshot {
+                    actor: pioneer_protocol::PersistedActorRef::System,
+                    display_name: "Child Agent".to_owned(),
+                    nickname: "child-agent".to_owned(),
+                    avatar_revision: None,
+                    agent: None,
+                },
+            )
+            .await
+            .expect("concurrent child Agent turn should start");
+        assert_eq!(child.response.turn.status, TurnStatus::InProgress);
+        assert_eq!(
+            manager.thread_get(thread_id).await.expect("thread").status,
+            ThreadStatus::Active
+        );
+
+        manager
+            .turn_finish(thread_id, parent_turn_id, TurnStatus::Completed, None)
+            .await
+            .expect("parent should finish");
+        assert_eq!(
+            manager.thread_get(thread_id).await.expect("thread").status,
+            ThreadStatus::Active,
+            "the running child must retain active thread state"
+        );
+
+        manager
+            .turn_finish(thread_id, child_turn_id, TurnStatus::Completed, None)
+            .await
+            .expect("child should finish");
+        assert_eq!(
+            manager.thread_get(thread_id).await.expect("thread").status,
+            ThreadStatus::Idle
+        );
     }
 
     #[tokio::test]

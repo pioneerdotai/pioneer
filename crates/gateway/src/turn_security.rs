@@ -159,6 +159,94 @@ pub(crate) fn resolve_turn_execution_security(
     Ok(apply_turn_security_backend_capabilities(snapshot, input))
 }
 
+/// Installs a Gateway-owned, turn-private write root into a native sandbox.
+///
+/// This is deliberately not added to the consent authority cap: the path is
+/// an application-created output surface for this one turn, analogous to the
+/// isolated process temp. It cannot authorize another host path or propagate
+/// through a task cap. Provider-owned CLI sandboxes remain untouched.
+pub(crate) fn add_native_runtime_write_root(
+    snapshot: &mut TurnExecutionSecuritySnapshot,
+    root: &std::path::Path,
+) {
+    if snapshot.backend.execution_backend != TurnSecurityExecutionBackendKind::Native
+        || snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted
+        || root.as_os_str().is_empty()
+    {
+        return;
+    }
+
+    let root = normalize_path_lexically(root.to_path_buf());
+    if snapshot.sandbox.filesystem.entries.iter().any(|entry| {
+        entry.access == TurnFilesystemAccess::Write
+            && filesystem_entry_resolved_path(entry)
+                .is_some_and(|existing| root.starts_with(existing))
+    }) {
+        return;
+    }
+
+    let root = root.to_string_lossy().into_owned();
+    if let Some(existing) = snapshot
+        .sandbox
+        .filesystem
+        .entries
+        .iter_mut()
+        .find(|entry| entry.resolved_path.as_deref() == Some(root.as_str()))
+    {
+        existing.access = TurnFilesystemAccess::Write;
+        existing.provenance = TurnSecurityRuleProvenance::Runtime;
+        return;
+    }
+
+    snapshot
+        .sandbox
+        .filesystem
+        .entries
+        .push(TurnFilesystemSandboxEntry {
+            path: TurnFilesystemSandboxPath::ExplicitPath { path: root.clone() },
+            access: TurnFilesystemAccess::Write,
+            provenance: TurnSecurityRuleProvenance::Runtime,
+            resolved_path: Some(root),
+        });
+}
+
+/// Installs a Gateway-owned read-only runtime root into a native sandbox.
+///
+/// Runtime roots contain application-projected data such as the immutable
+/// skill packages available to this workspace. They are baseline sandbox
+/// inputs, not user-consent authority: they must never widen a task cap or be
+/// projected into a provider-owned CLI sandbox.
+pub(crate) fn add_native_runtime_read_root(
+    snapshot: &mut TurnExecutionSecuritySnapshot,
+    root: &std::path::Path,
+) {
+    if snapshot.backend.execution_backend != TurnSecurityExecutionBackendKind::Native
+        || snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted
+        || root.as_os_str().is_empty()
+    {
+        return;
+    }
+
+    let root = normalize_path_lexically(root.to_path_buf());
+    if snapshot.sandbox.filesystem.entries.iter().any(|entry| {
+        filesystem_entry_resolved_path(entry).is_some_and(|existing| root.starts_with(existing))
+    }) {
+        return;
+    }
+
+    let root = root.to_string_lossy().into_owned();
+    snapshot
+        .sandbox
+        .filesystem
+        .entries
+        .push(TurnFilesystemSandboxEntry {
+            path: TurnFilesystemSandboxPath::ExplicitPath { path: root.clone() },
+            access: TurnFilesystemAccess::Read,
+            provenance: TurnSecurityRuleProvenance::Runtime,
+            resolved_path: Some(root),
+        });
+}
+
 pub(crate) fn task_security_cap_from_snapshot(
     snapshot: &TurnExecutionSecuritySnapshot,
 ) -> TaskAgentSecurityCap {
@@ -166,10 +254,11 @@ pub(crate) fn task_security_cap_from_snapshot(
         max_permission_profile: pioneer_protocol::task_permission_cap_from_snapshot(
             &snapshot.permission_profile,
         ),
+        max_filesystem_kind: Some(snapshot.authority_cap.filesystem.kind),
         max_filesystem_entries: task_cap_filesystem_entries(snapshot),
-        max_network_policy: snapshot.network.clone(),
+        max_network_policy: snapshot.authority_cap.network.clone(),
         max_sandbox_mode: snapshot.sandbox.mode,
-        max_process_policy: snapshot.process.clone(),
+        max_process_policy: snapshot.authority_cap.process.clone(),
     }
 }
 
@@ -274,10 +363,11 @@ pub(crate) fn resolve_task_child_execution_security_for_backend(
     let authority_cap = &mut snapshot.authority_cap;
     authority_cap.resource_binding_id = format!("workspace:{workspace_id}:agent");
     authority_cap.resource_binding_revision = 1;
-    authority_cap.filesystem = TurnFilesystemSandboxPolicy {
-        kind: TurnFilesystemSandboxKind::Restricted,
-        entries: task_cap.max_filesystem_entries.clone(),
-    };
+    authority_cap.filesystem = intersect_filesystem_policies(
+        &parent_snapshot.authority_cap.filesystem,
+        &task_cap_filesystem_policy(task_cap)?,
+        TurnFilesystemAccess::Write,
+    )?;
     authority_cap.network = intersect_network_policies(
         &parent_snapshot.authority_cap.network,
         &task_cap.max_network_policy,
@@ -290,6 +380,7 @@ pub(crate) fn resolve_task_child_execution_security_for_backend(
     snapshot.parent_cap = Some(TurnSecurityParentCapSnapshot {
         parent_turn_id: parent_turn_id.to_owned(),
         max_permission_profile: task_cap.max_permission_profile.clone(),
+        max_filesystem_kind: Some(authority_cap.filesystem.kind),
         max_filesystem_entries: task_cap.max_filesystem_entries.clone(),
         max_network_policy: task_cap.max_network_policy.clone(),
         max_sandbox_mode: task_cap.max_sandbox_mode,
@@ -323,6 +414,11 @@ pub(crate) fn apply_turn_security_backend_capabilities(
     input: &TurnSecurityResolverInput,
 ) -> TurnExecutionSecuritySnapshot {
     let backend = backend_snapshot_for(input);
+    if backend.capabilities.supports_session_scope_approval {
+        snapshot.approval.allow_for_session = snapshot.approval.allow_once;
+        snapshot.authority_cap.approval.allow_for_session =
+            snapshot.authority_cap.approval.allow_once;
+    }
     snapshot.backend = backend.clone();
     snapshot.enforcement = enforcement_status_for(&snapshot, &backend.capabilities);
     snapshot
@@ -383,13 +479,22 @@ fn cli_provider_sandbox_backend(
 fn backend_capabilities_from_cli_provider(
     capabilities: &CLIRuntimeProviderCapabilities,
 ) -> BackendSecurityCapabilities {
+    // CLI providers own their sandbox boundary. Pioneer passes the selected
+    // permission mode and transports approval decisions; it does not project
+    // native filesystem/network/process rules into those runtimes. Detailed
+    // knobs describe optional adapter features, while a provider-native
+    // sandbox policy is sufficient for the three composer modes.
+    let provider_managed_sandbox = capabilities.sandbox.provider_sandbox_policy.is_supported();
     BackendSecurityCapabilities {
-        can_enforce_filesystem: capabilities
-            .sandbox
-            .detailed_filesystem_sandbox
-            .is_supported(),
-        can_enforce_network: capabilities.sandbox.detailed_network_sandbox.is_supported(),
-        can_enforce_process: capabilities.sandbox.detailed_process_sandbox.is_supported(),
+        can_enforce_filesystem: provider_managed_sandbox
+            || capabilities
+                .sandbox
+                .detailed_filesystem_sandbox
+                .is_supported(),
+        can_enforce_network: provider_managed_sandbox
+            || capabilities.sandbox.detailed_network_sandbox.is_supported(),
+        can_enforce_process: provider_managed_sandbox
+            || capabilities.sandbox.detailed_process_sandbox.is_supported(),
         supports_turn_scope_approval: capabilities.approval.turn_scope_approval.is_supported(),
         supports_session_scope_approval: capabilities
             .approval
@@ -582,14 +687,47 @@ fn filesystem_entries(
 fn task_cap_filesystem_entries(
     snapshot: &TurnExecutionSecuritySnapshot,
 ) -> Vec<TurnFilesystemSandboxEntry> {
-    if snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted {
-        vec![TurnFilesystemSandboxEntry::current_working_directory(
-            TurnFilesystemAccess::Write,
-            snapshot.sandbox.cwd.clone(),
-        )]
+    if snapshot.authority_cap.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted {
+        // TaskAgentSecurityCap predates TurnFilesystemSandboxPolicy and has no
+        // separate `kind` field. An empty maximum-root list is its durable
+        // representation of unrestricted filesystem authority (and is also
+        // how legacy full-access caps were persisted by startup backfill).
+        Vec::new()
     } else {
-        snapshot.sandbox.filesystem.entries.clone()
+        snapshot.authority_cap.filesystem.entries.clone()
     }
+}
+
+fn task_cap_filesystem_policy(
+    task_cap: &TaskAgentSecurityCap,
+) -> Result<TurnFilesystemSandboxPolicy> {
+    let kind = match task_cap.max_filesystem_kind {
+        Some(kind) => kind,
+        None if legacy_task_cap_has_unrestricted_filesystem(task_cap) => {
+            TurnFilesystemSandboxKind::Unrestricted
+        }
+        None => TurnFilesystemSandboxKind::Restricted,
+    };
+    match kind {
+        TurnFilesystemSandboxKind::Unrestricted => {
+            if !task_cap.max_filesystem_entries.is_empty() {
+                bail!("unrestricted task filesystem cap must not contain bounded roots");
+            }
+            Ok(TurnFilesystemSandboxPolicy::unrestricted())
+        }
+        TurnFilesystemSandboxKind::Restricted => Ok(TurnFilesystemSandboxPolicy {
+            kind,
+            entries: task_cap.max_filesystem_entries.clone(),
+        }),
+    }
+}
+
+fn legacy_task_cap_has_unrestricted_filesystem(task_cap: &TaskAgentSecurityCap) -> bool {
+    task_cap.max_filesystem_entries.is_empty()
+        && task_cap.max_permission_profile.mode == TurnPermissionMode::FullAccess
+        && task_cap.max_sandbox_mode == TurnSandboxMode::Unrestricted
+        && task_cap.max_network_policy.mode == TurnNetworkMode::Enabled
+        && task_cap.max_process_policy == TurnProcessPolicySnapshot::unrestricted()
 }
 
 fn validate_task_security_cap_within_parent(
@@ -609,20 +747,29 @@ fn validate_task_security_cap_within_parent(
         bail!("task security cap sandbox mode exceeds parent turn");
     }
     if most_restrictive_network_mode(
-        parent_snapshot.network.mode,
+        parent_snapshot.authority_cap.network.mode,
         task_cap.max_network_policy.mode,
     ) != task_cap.max_network_policy.mode
     {
         bail!("task security cap network policy exceeds parent turn");
     }
-    if !process_policy_within(&task_cap.max_process_policy, &parent_snapshot.process) {
+    if !process_policy_within(
+        &task_cap.max_process_policy,
+        &parent_snapshot.authority_cap.process,
+    ) {
         bail!("task security cap process policy exceeds parent turn");
     }
-    if parent_snapshot.sandbox.filesystem.kind != TurnFilesystemSandboxKind::Unrestricted {
+    let task_filesystem = task_cap_filesystem_policy(task_cap)?;
+    if task_filesystem.kind == TurnFilesystemSandboxKind::Unrestricted
+        && parent_snapshot.authority_cap.filesystem.kind != TurnFilesystemSandboxKind::Unrestricted
+    {
+        bail!("task security cap filesystem roots exceed parent turn");
+    }
+    if parent_snapshot.authority_cap.filesystem.kind != TurnFilesystemSandboxKind::Unrestricted {
         for entry in &task_cap.max_filesystem_entries {
             if !filesystem_entry_allowed_by_parent(
                 entry,
-                parent_snapshot.sandbox.filesystem.entries.as_slice(),
+                parent_snapshot.authority_cap.filesystem.entries.as_slice(),
             ) {
                 bail!("task security cap filesystem roots exceed parent turn");
             }
@@ -636,37 +783,110 @@ fn intersect_filesystem_entries(
     task_cap: &TaskAgentSecurityCap,
     requested_access: TurnFilesystemAccess,
 ) -> Result<Vec<TurnFilesystemSandboxEntry>> {
-    let parent_entries =
-        if parent_snapshot.sandbox.filesystem.kind == TurnFilesystemSandboxKind::Unrestricted {
-            task_cap.max_filesystem_entries.clone()
-        } else {
-            parent_snapshot.sandbox.filesystem.entries.clone()
-        };
-    let mut entries = Vec::new();
-    for cap_entry in &task_cap.max_filesystem_entries {
-        let mut narrowed = cap_entry.clone();
-        narrowed.provenance = TurnSecurityRuleProvenance::TaskCap;
-        narrowed.access = most_restrictive_filesystem_access(cap_entry.access, requested_access);
-        if parent_snapshot.sandbox.filesystem.kind != TurnFilesystemSandboxKind::Unrestricted {
-            let Some(parent_entry) = matching_parent_filesystem_entry(cap_entry, &parent_entries)
-            else {
-                bail!("task security cap filesystem roots exceed parent turn");
-            };
-            narrowed.access =
-                most_restrictive_filesystem_access(narrowed.access, parent_entry.access);
-            narrowed.resolved_path = cap_entry
-                .resolved_path
-                .clone()
-                .or_else(|| parent_entry.resolved_path.clone());
-        }
-        if narrowed.access != TurnFilesystemAccess::None {
-            entries.push(narrowed);
-        }
+    let task_policy = task_cap_filesystem_policy(task_cap)?;
+    let mut parent_initial_policy = parent_snapshot.sandbox.filesystem.clone();
+    if parent_initial_policy.kind == TurnFilesystemSandboxKind::Restricted {
+        // Explicit Runtime roots are materialized for one concrete Turn
+        // (private artifact output and application projections). They are
+        // ambient inputs, not delegable authority. The child receives its own
+        // roots from `add_native_turn_runtime_sandbox_roots` after derivation.
+        // Keep the Runtime-tagged CWD fallback: unlike an ExplicitPath, it is
+        // the durable execution base for legacy restricted snapshots.
+        parent_initial_policy.entries.retain(|entry| {
+            !(entry.provenance == TurnSecurityRuleProvenance::Runtime
+                && matches!(&entry.path, TurnFilesystemSandboxPath::ExplicitPath { .. }))
+        });
     }
-    if entries.is_empty() {
-        bail!("task security cap does not allow any filesystem roots");
-    }
+    let policy =
+        intersect_filesystem_policies(&parent_initial_policy, &task_policy, requested_access)?;
+    let entries = if policy.kind == TurnFilesystemSandboxKind::Unrestricted {
+        // A narrowed child profile must never inherit an unrestricted initial
+        // sandbox merely because both durable maxima are unrestricted. Its
+        // ambient access starts at the real turn CWD; exact consent can still
+        // draw on the separately persisted unrestricted authority cap.
+        vec![TurnFilesystemSandboxEntry::current_working_directory(
+            requested_access,
+            parent_snapshot.sandbox.cwd.clone(),
+        )]
+    } else {
+        policy.entries
+    };
     Ok(entries)
+}
+
+fn intersect_filesystem_policies(
+    left: &TurnFilesystemSandboxPolicy,
+    right: &TurnFilesystemSandboxPolicy,
+    requested_access: TurnFilesystemAccess,
+) -> Result<TurnFilesystemSandboxPolicy> {
+    if left.kind == TurnFilesystemSandboxKind::Unrestricted
+        && right.kind == TurnFilesystemSandboxKind::Unrestricted
+    {
+        return Ok(TurnFilesystemSandboxPolicy::unrestricted());
+    }
+
+    let entries = if left.kind == TurnFilesystemSandboxKind::Unrestricted {
+        narrowed_filesystem_entries(right.entries.as_slice(), requested_access)
+    } else if right.kind == TurnFilesystemSandboxKind::Unrestricted {
+        narrowed_filesystem_entries(left.entries.as_slice(), requested_access)
+    } else {
+        let mut intersections = Vec::new();
+        for left_entry in &left.entries {
+            for right_entry in &right.entries {
+                let Some(mut narrower) = intersect_filesystem_entry_roots(left_entry, right_entry)
+                else {
+                    continue;
+                };
+                narrower.provenance = TurnSecurityRuleProvenance::TaskCap;
+                narrower.access = most_restrictive_filesystem_access(
+                    most_restrictive_filesystem_access(left_entry.access, right_entry.access),
+                    requested_access,
+                );
+                if narrower.access != TurnFilesystemAccess::None {
+                    intersections.push(narrower);
+                }
+            }
+        }
+        intersections
+    };
+
+    Ok(TurnFilesystemSandboxPolicy {
+        kind: TurnFilesystemSandboxKind::Restricted,
+        entries,
+    })
+}
+
+fn narrowed_filesystem_entries(
+    entries: &[TurnFilesystemSandboxEntry],
+    requested_access: TurnFilesystemAccess,
+) -> Vec<TurnFilesystemSandboxEntry> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let mut narrowed = entry.clone();
+            narrowed.provenance = TurnSecurityRuleProvenance::TaskCap;
+            narrowed.access = most_restrictive_filesystem_access(entry.access, requested_access);
+            (narrowed.access != TurnFilesystemAccess::None).then_some(narrowed)
+        })
+        .collect()
+}
+
+fn intersect_filesystem_entry_roots(
+    left: &TurnFilesystemSandboxEntry,
+    right: &TurnFilesystemSandboxEntry,
+) -> Option<TurnFilesystemSandboxEntry> {
+    let left_path = filesystem_entry_resolved_path(left);
+    let right_path = filesystem_entry_resolved_path(right);
+    match (left_path, right_path) {
+        (Some(left_path), Some(right_path)) if left_path.starts_with(&right_path) => {
+            Some(left.clone())
+        }
+        (Some(left_path), Some(right_path)) if right_path.starts_with(&left_path) => {
+            Some(right.clone())
+        }
+        (None, None) if left.path == right.path => Some(left.clone()),
+        _ => None,
+    }
 }
 
 fn filesystem_entry_allowed_by_parent(
@@ -984,11 +1204,13 @@ mod tests {
         TurnPermissionProfileSource,
     };
     use pioneer_tools::{
-        FilePolicyChecker, FilePolicyDenyReason, PermissionActionKind, PermissionDecision,
-        PermissionEvaluationContext, ProfileToolPermissionEvaluator, ToolPayload,
-        ToolPermissionEvaluator, enforce_mcp_network_policy, extract_permission_intent,
+        FilePolicyChecker, FilePolicyDenyReason, FilePolicyOperation, PermissionActionKind,
+        PermissionDecision, PermissionEvaluationContext, ProfileToolPermissionEvaluator,
+        ToolPayload, ToolPermissionEvaluator, enforce_mcp_network_policy,
+        extract_permission_intent,
     };
     use serde_json::json;
+    use std::path::Path;
 
     fn context() -> TurnSecurityResolverInputContext {
         TurnSecurityResolverInputContext {
@@ -1195,6 +1417,16 @@ mod tests {
             assert_eq!(snapshot.sandbox.mode, expected_sandbox);
             assert_eq!(snapshot.network.mode, expected_network);
             assert_eq!(snapshot.sandbox.network.mode, expected_network);
+            assert_eq!(
+                snapshot.authority_cap.filesystem.kind,
+                TurnFilesystemSandboxKind::Unrestricted,
+                "interactive root turns must be able to request exact outside-path consent"
+            );
+            assert_eq!(
+                snapshot.authority_cap.network.mode,
+                TurnNetworkMode::Enabled,
+                "interactive root turns must be able to request network consent"
+            );
             if let Some(expected_access) = expected_access {
                 assert_eq!(
                     snapshot.sandbox.filesystem.kind,
@@ -1269,6 +1501,127 @@ mod tests {
     }
 
     #[test]
+    fn native_runtime_write_root_is_bounded_and_does_not_expand_authority_cap() {
+        let mut snapshot = resolve_turn_execution_security(&resolver_input_for_mode_and_backend(
+            TurnPermissionMode::Supervised,
+            None,
+        ))
+        .expect("snapshot should resolve");
+        let authority_before = snapshot.authority_cap.clone();
+        let fixture = tempfile::tempdir().expect("runtime root fixture");
+        let output_root = fixture.path().join("ws/thread/turn");
+        std::fs::create_dir_all(output_root.as_path()).expect("runtime output root");
+
+        add_native_runtime_write_root(&mut snapshot, output_root.as_path());
+
+        assert!(
+            pioneer_tools::FilePolicyChecker::check(
+                &snapshot,
+                FilePolicyOperation::Write,
+                output_root.join("report.txt").as_path(),
+            )
+            .is_allowed()
+        );
+        assert!(matches!(
+            pioneer_tools::FilePolicyChecker::check(
+                &snapshot,
+                FilePolicyOperation::Write,
+                fixture
+                    .path()
+                    .join("ws/thread/sibling/secret.txt")
+                    .as_path(),
+            ),
+            pioneer_tools::FilePolicyDecision::Denied(_)
+        ));
+        assert_eq!(snapshot.authority_cap, authority_before);
+    }
+
+    #[test]
+    fn provider_owned_cli_snapshot_ignores_native_runtime_write_root() {
+        let mut snapshot = resolve_turn_execution_security(&resolver_input_for_mode_and_backend(
+            TurnPermissionMode::Supervised,
+            Some(AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: "codex_default".to_owned(),
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+            }),
+        ))
+        .expect("Codex snapshot should resolve");
+        let filesystem_before = snapshot.sandbox.filesystem.clone();
+
+        add_native_runtime_write_root(
+            &mut snapshot,
+            Path::new("/tmp/pioneer-runtime/artifacts/ws/thread/turn"),
+        );
+
+        assert_eq!(snapshot.sandbox.filesystem, filesystem_before);
+    }
+
+    #[test]
+    fn native_runtime_read_root_is_bounded_and_does_not_expand_authority_cap() {
+        let mut snapshot = resolve_turn_execution_security(&resolver_input_for_mode_and_backend(
+            TurnPermissionMode::Supervised,
+            None,
+        ))
+        .expect("snapshot should resolve");
+        let authority_before = snapshot.authority_cap.clone();
+        let fixture = tempfile::tempdir().expect("runtime root fixture");
+        let skill_root = fixture.path().join("workspace-a/skills/selected");
+        let skill_script = skill_root.join("scripts/run.sh");
+        std::fs::create_dir_all(skill_script.parent().expect("skill script parent"))
+            .expect("runtime skill root");
+        std::fs::write(skill_script.as_path(), "#!/bin/sh\n").expect("runtime skill script");
+        let other_workspace_script = fixture.path().join("workspace-b/skills/private/SKILL.md");
+        std::fs::create_dir_all(
+            other_workspace_script
+                .parent()
+                .expect("other workspace skill parent"),
+        )
+        .expect("other workspace skill root");
+        std::fs::write(other_workspace_script.as_path(), "private\n")
+            .expect("other workspace skill");
+
+        add_native_runtime_read_root(&mut snapshot, skill_root.as_path());
+
+        assert!(
+            pioneer_tools::FilePolicyChecker::check(
+                &snapshot,
+                FilePolicyOperation::Read,
+                skill_script.as_path(),
+            )
+            .is_allowed()
+        );
+        assert!(matches!(
+            pioneer_tools::FilePolicyChecker::check(
+                &snapshot,
+                FilePolicyOperation::Read,
+                other_workspace_script.as_path(),
+            ),
+            pioneer_tools::FilePolicyDecision::Denied(_)
+        ));
+        assert_eq!(snapshot.authority_cap, authority_before);
+    }
+
+    #[test]
+    fn provider_owned_cli_snapshot_ignores_native_runtime_read_root() {
+        let mut snapshot = resolve_turn_execution_security(&resolver_input_for_mode_and_backend(
+            TurnPermissionMode::Supervised,
+            Some(AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: "codex_default".to_owned(),
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+            }),
+        ))
+        .expect("Codex snapshot should resolve");
+        let filesystem_before = snapshot.sandbox.filesystem.clone();
+
+        add_native_runtime_read_root(
+            &mut snapshot,
+            Path::new("/tmp/pioneer-runtime/skills/workspace/workspace-a"),
+        );
+
+        assert_eq!(snapshot.sandbox.filesystem, filesystem_before);
+    }
+
+    #[test]
     fn process_policy_resolver_sets_shell_env_and_timeout_defaults() {
         let full_access = resolve_turn_execution_security(&resolver_input_for_mode_and_backend(
             TurnPermissionMode::FullAccess,
@@ -1293,13 +1646,29 @@ mod tests {
         .expect("workspace-write snapshot should resolve");
         assert!(workspace_write.process.shell.enabled);
         assert!(!workspace_write.process.environment.inherit);
-        assert!(workspace_write.process.environment.allowed_vars.is_empty());
+        assert!(
+            workspace_write
+                .process
+                .environment
+                .allowed_vars
+                .iter()
+                .any(|name| name == "PATH")
+        );
+        assert!(
+            workspace_write
+                .process
+                .environment
+                .allowed_vars
+                .iter()
+                .any(|name| name == "PIONEER_ARTIFACT_OUTPUT_DIR")
+        );
         assert!(
             workspace_write
                 .process
                 .environment
                 .denied_patterns
-                .is_empty()
+                .iter()
+                .any(|pattern| pattern.contains("TOKEN"))
         );
         assert_eq!(
             workspace_write.process.timeout.max_duration_ms,
@@ -1339,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_policy_read_only_hint_routes_to_mcp_read_permission() {
+    fn mcp_policy_does_not_trust_server_read_only_hint() {
         let invocation = mcp_invocation(
             Some(true),
             Some(false),
@@ -1357,13 +1726,11 @@ mod tests {
             ),
         );
 
-        assert_eq!(intent.action, PermissionActionKind::McpRead);
-        assert_eq!(
+        assert_eq!(intent.action, PermissionActionKind::McpWriteOrUnknown);
+        assert!(matches!(
             ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-            PermissionDecision::Allow {
-                reason: pioneer_tools::PermissionDecisionReason::PolicyAllowsAction
-            }
-        );
+            PermissionDecision::Ask { .. }
+        ));
     }
 
     #[test]
@@ -1603,12 +1970,15 @@ mod tests {
                     .expect("valid security test SkillId"),
                 skill_owner: Some("workspace".to_owned()),
                 skill_slug: "user:workspace/proxy".to_owned(),
+                skill_fingerprint: "test-skill-fingerprint".to_owned(),
                 source_kind: "User".to_owned(),
                 trust_level: "Community".to_owned(),
                 target_tool: None,
                 configured_method: None,
                 configured_url: None,
             }),
+            nested_dynamic_skills: Vec::new(),
+            network_targets: Vec::new(),
         };
         invocation
     }
@@ -1763,16 +2133,17 @@ mod tests {
         assert!(snapshot.backend.capabilities.supports_request_permissions);
         assert!(!snapshot.backend.capabilities.supports_turn_scope_approval);
         assert!(
-            !snapshot
+            snapshot
                 .backend
                 .capabilities
                 .supports_session_scope_approval
         );
+        assert!(snapshot.approval.allow_for_session);
         assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
     }
 
     #[test]
-    fn security_backend_capabilities_claude_restricted_snapshot_is_unavailable() {
+    fn security_backend_capabilities_claude_restricted_snapshot_is_active() {
         let input = resolver_input_for_mode_and_backend(
             TurnPermissionMode::Supervised,
             Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -1787,18 +2158,15 @@ mod tests {
             snapshot.backend.execution_backend,
             TurnSecurityExecutionBackendKind::ClaudeCli
         );
-        assert_eq!(snapshot.backend.sandbox_backend, None);
-        assert!(
-            matches!(
-                snapshot.enforcement,
-                TurnSecurityEnforcementStatus::Unavailable { .. }
-            ),
-            "Claude must not claim detailed sandbox enforcement"
+        assert_eq!(
+            snapshot.backend.sandbox_backend,
+            Some(SandboxBackendKind::ProviderNative)
         );
+        assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
     }
 
     #[test]
-    fn cli_capabilities_claude_provider_descriptor_marks_detailed_sandbox_unavailable() {
+    fn cli_capabilities_claude_provider_descriptor_marks_managed_sandbox_active() {
         let input = resolver_input_for_mode_and_backend(
             TurnPermissionMode::AutoAcceptEdits,
             Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -1812,20 +2180,20 @@ mod tests {
             snapshot.backend.execution_backend,
             TurnSecurityExecutionBackendKind::ClaudeCli
         );
-        assert_eq!(snapshot.backend.sandbox_backend, None);
-        assert!(!snapshot.backend.capabilities.can_enforce_filesystem);
-        assert!(!snapshot.backend.capabilities.can_enforce_network);
-        assert!(!snapshot.backend.capabilities.can_enforce_process);
+        assert_eq!(
+            snapshot.backend.sandbox_backend,
+            Some(SandboxBackendKind::ProviderNative)
+        );
+        assert!(snapshot.backend.capabilities.can_enforce_filesystem);
+        assert!(snapshot.backend.capabilities.can_enforce_network);
+        assert!(snapshot.backend.capabilities.can_enforce_process);
         assert!(snapshot.backend.capabilities.supports_request_permissions);
         assert!(!snapshot.backend.capabilities.supports_turn_scope_approval);
-        assert!(matches!(
-            snapshot.enforcement,
-            TurnSecurityEnforcementStatus::Unavailable { .. }
-        ));
+        assert_eq!(snapshot.enforcement, TurnSecurityEnforcementStatus::Active);
     }
 
     #[test]
-    fn security_diagnostics_claude_unavailable_marks_provider_limitation_without_paths() {
+    fn security_diagnostics_claude_restricted_reports_active_managed_sandbox() {
         let input = resolver_input_for_mode_and_backend(
             TurnPermissionMode::Supervised,
             Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -1836,15 +2204,9 @@ mod tests {
         let snapshot = resolve_turn_execution_security(&input).expect("snapshot should resolve");
         let diagnostic = turn_security_diagnostic_summary(&snapshot);
 
-        assert_eq!(diagnostic.enforcement_status, "unavailable");
-        assert_eq!(
-            diagnostic.diagnostic_code,
-            "provider_sandbox_capability_unavailable"
-        );
-        assert!(
-            diagnostic.degraded_capabilities.contains(&"filesystem"),
-            "provider limitation should identify missing filesystem enforcement"
-        );
+        assert_eq!(diagnostic.enforcement_status, "active");
+        assert_eq!(diagnostic.diagnostic_code, "sandbox_active");
+        assert!(diagnostic.degraded_capabilities.is_empty());
         let rendered = format!("{diagnostic:?}");
         assert!(!rendered.contains("/tmp/workspace_1"));
         assert!(!rendered.contains("PATH"));
@@ -1911,12 +2273,127 @@ mod tests {
     }
 
     #[test]
+    fn supervised_task_inherits_initial_restrictions_and_parent_consent_authority() {
+        let parent = TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            "/tmp/task-security-supervised",
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                "/tmp/task-security-supervised",
+            )],
+            1,
+        );
+        let cap = task_security_cap_from_snapshot(&parent);
+
+        assert!(
+            cap.max_filesystem_entries.is_empty(),
+            "unrestricted caps do not need bounded roots"
+        );
+        assert_eq!(
+            cap.max_filesystem_kind,
+            Some(TurnFilesystemSandboxKind::Unrestricted)
+        );
+        assert_eq!(cap.max_network_policy.mode, TurnNetworkMode::Enabled);
+
+        let child = resolve_task_child_execution_security(
+            "workspace_1",
+            "parent_turn",
+            &parent,
+            &cap,
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+            "openai",
+            "child_thread",
+            "child_turn",
+            2,
+        )
+        .expect("supervised child security should resolve");
+
+        assert_eq!(child.sandbox.mode, TurnSandboxMode::ReadOnly);
+        assert_eq!(child.network.mode, TurnNetworkMode::Disabled);
+        assert_eq!(
+            child.authority_cap.filesystem.kind,
+            TurnFilesystemSandboxKind::Unrestricted,
+            "a child approval must retain the parent's bounded maximum filesystem authority"
+        );
+        assert_eq!(child.authority_cap.network.mode, TurnNetworkMode::Enabled);
+    }
+
+    #[test]
+    fn task_child_never_inherits_parent_turn_private_runtime_roots() {
+        let workspace_root = "/tmp/task-security-runtime-root/workspace";
+        let parent_output_root = Path::new("/tmp/task-security-runtime-root/parent-output");
+        let parent_app_root = Path::new("/tmp/task-security-runtime-root/parent-app-data");
+        let mut parent = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            workspace_root,
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
+                workspace_root,
+            )],
+            1,
+        );
+        add_native_runtime_write_root(&mut parent, parent_output_root);
+        add_native_runtime_read_root(&mut parent, parent_app_root);
+        let cap = task_security_cap_from_snapshot(&parent);
+
+        let child = resolve_task_child_execution_security(
+            "workspace_1",
+            "parent_turn",
+            &parent,
+            &cap,
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+            "openai",
+            "child_thread",
+            "child_turn",
+            2,
+        )
+        .expect("workspace-write child security should resolve");
+
+        assert!(child.sandbox.filesystem.entries.iter().any(|entry| {
+            entry.resolved_path.as_deref() == Some(workspace_root)
+                && entry.access == TurnFilesystemAccess::Write
+        }));
+        for non_delegable_root in [parent_output_root, parent_app_root] {
+            assert!(
+                child.sandbox.filesystem.entries.iter().all(|entry| {
+                    entry.resolved_path.as_deref()
+                        != Some(non_delegable_root.to_string_lossy().as_ref())
+                }),
+                "parent runtime root `{}` must be re-resolved for the child instead of inherited",
+                non_delegable_root.display()
+            );
+        }
+        assert_eq!(
+            child.authority_cap.filesystem.kind,
+            TurnFilesystemSandboxKind::Unrestricted,
+            "filtering ambient runtime roots must not narrow the separately inherited consent cap"
+        );
+    }
+
+    #[test]
     fn task_security_parent_full_access_is_narrowed_by_task_cap() {
         let parent =
             TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/task-security-narrow", 1);
         let mut cap = task_security_cap_from_snapshot(&parent);
         cap.max_permission_profile =
             pioneer_protocol::task_permission_cap_for_mode(TurnPermissionMode::AutoAcceptEdits);
+        cap.max_filesystem_kind = Some(TurnFilesystemSandboxKind::Restricted);
+        cap.max_filesystem_entries = vec![TurnFilesystemSandboxEntry::current_working_directory(
+            TurnFilesystemAccess::Write,
+            "/tmp/task-security-narrow",
+        )];
         cap.max_sandbox_mode = TurnSandboxMode::WorkspaceWrite;
         cap.max_network_policy = pioneer_protocol::TurnNetworkPolicySnapshot::disabled();
         cap.max_process_policy = pioneer_protocol::TurnProcessPolicySnapshot::restricted();
@@ -1944,11 +2421,129 @@ mod tests {
         );
         assert_eq!(snapshot.sandbox.mode, TurnSandboxMode::WorkspaceWrite);
         assert_eq!(snapshot.network.mode, TurnNetworkMode::Disabled);
+        assert_eq!(
+            snapshot.authority_cap.filesystem.kind,
+            TurnFilesystemSandboxKind::Restricted
+        );
+        assert_eq!(snapshot.authority_cap.filesystem.entries.len(), 1);
+        assert_eq!(
+            snapshot.authority_cap.filesystem.entries[0].path,
+            cap.max_filesystem_entries[0].path
+        );
+        assert_eq!(
+            snapshot.authority_cap.filesystem.entries[0].access,
+            cap.max_filesystem_entries[0].access
+        );
+        assert_eq!(
+            snapshot.authority_cap.filesystem.entries[0].provenance,
+            TurnSecurityRuleProvenance::TaskCap
+        );
+        assert_eq!(
+            snapshot.authority_cap.network.mode,
+            TurnNetworkMode::Disabled,
+            "child approval must not widen the durable task cap"
+        );
+    }
+
+    #[test]
+    fn legacy_empty_restricted_task_cap_remains_deny_all() {
+        let parent =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/task-security-empty", 1);
+        let mut cap = task_security_cap_from_snapshot(&parent);
+        cap.max_permission_profile =
+            pioneer_protocol::task_permission_cap_for_mode(TurnPermissionMode::Supervised);
+        cap.max_filesystem_kind = None;
+        cap.max_filesystem_entries.clear();
+        cap.max_sandbox_mode = TurnSandboxMode::ReadOnly;
+        cap.max_network_policy = TurnNetworkPolicySnapshot::disabled();
+        cap.max_process_policy = TurnProcessPolicySnapshot::restricted();
+
+        let snapshot = resolve_task_child_execution_security(
+            "workspace_1",
+            "parent_turn",
+            &parent,
+            &cap,
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+            "openai",
+            "child_thread",
+            "child_turn",
+            2,
+        )
+        .expect("legacy empty restricted cap should resolve fail-closed");
+
+        assert_eq!(
+            snapshot.authority_cap.filesystem.kind,
+            TurnFilesystemSandboxKind::Restricted
+        );
+        assert!(snapshot.authority_cap.filesystem.entries.is_empty());
+    }
+
+    #[test]
+    fn legacy_full_access_task_cap_keeps_unrestricted_filesystem() {
+        let parent =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/task-security-legacy", 1);
+        let mut cap = task_security_cap_from_snapshot(&parent);
+        cap.max_filesystem_kind = None;
+
+        let snapshot = resolve_task_child_execution_security(
+            "workspace_1",
+            "parent_turn",
+            &parent,
+            &cap,
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::FullAccess,
+                TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+            "openai",
+            "child_thread",
+            "child_turn",
+            2,
+        )
+        .expect("exact legacy full-access signature should remain unrestricted");
+
+        assert_eq!(
+            snapshot.authority_cap.filesystem.kind,
+            TurnFilesystemSandboxKind::Unrestricted
+        );
+    }
+
+    #[test]
+    fn explicit_unrestricted_task_cap_rejects_bounded_roots() {
+        let parent = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            "/tmp/task-security-invalid",
+            1,
+        );
+        let mut cap = task_security_cap_from_snapshot(&parent);
+        cap.max_filesystem_entries = vec![TurnFilesystemSandboxEntry::current_working_directory(
+            TurnFilesystemAccess::Write,
+            "/tmp/task-security-invalid",
+        )];
+
+        let error = resolve_task_child_execution_security(
+            "workspace_1",
+            "parent_turn",
+            &parent,
+            &cap,
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::FullAccess,
+                TurnPermissionProfileSource::TaskPermissionCap,
+            ),
+            "openai",
+            "child_thread",
+            "child_turn",
+            2,
+        )
+        .expect_err("ambiguous unrestricted cap must be rejected");
+
+        assert!(error.to_string().contains("must not contain bounded roots"));
     }
 
     #[test]
     fn task_security_rejects_cap_that_widens_write_roots() {
-        let parent = TurnExecutionSecuritySnapshot::workspace_write(
+        let mut parent = TurnExecutionSecuritySnapshot::workspace_write(
             TurnPermissionProfileSnapshot::from_mode(
                 TurnPermissionMode::AutoAcceptEdits,
                 TurnPermissionProfileSource::Composer,
@@ -1960,6 +2555,7 @@ mod tests {
             )],
             1,
         );
+        parent.authority_cap.filesystem = parent.sandbox.filesystem.clone();
         let mut cap = task_security_cap_from_snapshot(&parent);
         cap.max_filesystem_entries = vec![TurnFilesystemSandboxEntry::workspace_root(
             TurnFilesystemAccess::Write,
@@ -1987,7 +2583,7 @@ mod tests {
 
     #[test]
     fn task_security_rejects_cap_that_widens_network() {
-        let parent = TurnExecutionSecuritySnapshot::workspace_write(
+        let mut parent = TurnExecutionSecuritySnapshot::workspace_write(
             TurnPermissionProfileSnapshot::from_mode(
                 TurnPermissionMode::AutoAcceptEdits,
                 TurnPermissionProfileSource::Composer,
@@ -1999,6 +2595,7 @@ mod tests {
             )],
             1,
         );
+        parent.authority_cap.network = TurnNetworkPolicySnapshot::disabled();
         let mut cap = task_security_cap_from_snapshot(&parent);
         cap.max_network_policy = pioneer_protocol::TurnNetworkPolicySnapshot::enabled();
 
@@ -2036,6 +2633,7 @@ mod tests {
             1,
         );
         parent.process.shell.enabled = false;
+        parent.authority_cap.process.shell.enabled = false;
         let mut cap = task_security_cap_from_snapshot(&parent);
         cap.max_process_policy.shell.enabled = true;
 

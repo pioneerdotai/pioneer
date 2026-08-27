@@ -241,6 +241,7 @@ pub(crate) struct ComputerUseSession {
     pub(crate) max_recovery_attempts_per_run: u32,
     pub(crate) snapshot_budget: SnapshotBudget,
     pub(crate) artifacts_dir: String,
+    pub(crate) _artifact_lease: std::sync::Arc<super::state::ActiveArtifactLease>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

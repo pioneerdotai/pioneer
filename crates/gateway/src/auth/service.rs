@@ -5108,13 +5108,26 @@ mod tests {
         let historical_hash = service
             .opaque_credentials
             .fingerprint_device_activation_raw(wrong.as_str());
+        let current_locator = pioneer_protocol::device_activation_locator(wrong.as_str()).unwrap();
+        let historical_locator = pioneer_protocol::DEVICE_ACTIVATION_ALPHABET
+            .iter()
+            .copied()
+            .map(char::from)
+            .find(|candidate| Some(*candidate) != current_locator.chars().next())
+            .unwrap()
+            .to_string();
+        let historical_locator_hash = service
+            .opaque_credentials
+            .fingerprint_device_activation_locator_symbol(historical_locator.as_str())
+            .unwrap();
         service
             .database
             .execute_raw(Statement::from_sql_and_values(
                 service.database.get_database_backend(),
-                "UPDATE auth_session SET activation_token_hash = ? WHERE id = ?",
+                "UPDATE auth_session SET activation_token_hash = ?, activation_locator_hash = ? WHERE id = ?",
                 [
                     historical_hash.to_vec().into(),
+                    historical_locator_hash.to_vec().into(),
                     historical.session_id.to_string().into(),
                 ],
             ))

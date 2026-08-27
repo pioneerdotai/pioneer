@@ -296,7 +296,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn pending_request_ancestor_thread_ids(
+    pub(super) async fn pending_request_ancestor_thread_ids(
         &self,
         request: &CliRuntimePendingRequestRecord,
     ) -> Vec<String> {

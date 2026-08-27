@@ -33,22 +33,25 @@ impl MockComputerUseBackend {
             preflight_status: status.into(),
             launched_apps: Mutex::new(HashSet::new()),
             os_actions: Mutex::new(Vec::new()),
-            apps: Mutex::new(vec![platform::enrich_app_identity(AppMeta {
-                identity_key: Some(derive_app_identity_key(
-                    "MockApp",
-                    Some(42),
-                    Some("com.pioneer.mockapp"),
-                    None,
-                )),
-                name: "MockApp".to_owned(),
-                pid: Some(42),
-                role: Some("application".to_owned()),
-                window_title: Some("Mock Window".to_owned()),
-                bundle_id: Some("com.pioneer.mockapp".to_owned()),
-                localized_name: None,
-                executable_path: None,
-                frontmost: Some(true),
-            })]),
+            apps: Mutex::new(vec![platform::enrich_app_identity(
+                AppMeta {
+                    identity_key: Some(derive_app_identity_key(
+                        "MockApp",
+                        Some(42),
+                        Some("com.pioneer.mockapp"),
+                        None,
+                    )),
+                    name: "MockApp".to_owned(),
+                    pid: Some(42),
+                    role: Some("application".to_owned()),
+                    window_title: Some("Mock Window".to_owned()),
+                    bundle_id: Some("com.pioneer.mockapp".to_owned()),
+                    localized_name: None,
+                    executable_path: None,
+                    frontmost: Some(true),
+                },
+                &crate::process_policy::ProcessEnvironmentPlan::inherited_for_test(),
+            )]),
             unsupported_semantic_actions: HashSet::new(),
             extra_button: false,
             scale_factor: 2.0,
@@ -77,7 +80,12 @@ impl MockComputerUseBackend {
     pub(crate) fn with_apps(mut self, apps: Vec<AppMeta>) -> Self {
         self.apps = Mutex::new(
             apps.into_iter()
-                .map(platform::enrich_app_identity)
+                .map(|app| {
+                    platform::enrich_app_identity(
+                        app,
+                        &crate::process_policy::ProcessEnvironmentPlan::inherited_for_test(),
+                    )
+                })
                 .collect(),
         );
         self
@@ -243,14 +251,20 @@ impl ComputerUseDesktopBackend for MockComputerUseBackend {
         })
     }
 
-    fn list_apps(&self) -> Result<Vec<AppMeta>, ToolError> {
+    fn list_apps(
+        &self,
+        _environment: &crate::process_policy::ProcessEnvironmentPlan,
+    ) -> Result<Vec<AppMeta>, ToolError> {
         self.apps
             .lock()
             .map(|apps| apps.clone())
             .map_err(|_| ToolError::internal("mock apps lock poisoned"))
     }
 
-    fn frontmost_app(&self) -> Result<Option<AppMeta>, ToolError> {
+    fn frontmost_app(
+        &self,
+        _environment: &crate::process_policy::ProcessEnvironmentPlan,
+    ) -> Result<Option<AppMeta>, ToolError> {
         let apps = self
             .apps
             .lock()
@@ -258,7 +272,12 @@ impl ComputerUseDesktopBackend for MockComputerUseBackend {
         Ok(apps.iter().find(|app| app.frontmost == Some(true)).cloned())
     }
 
-    fn find_app(&self, target: &AppTarget, _timeout: Duration) -> Result<AppHandle, ToolError> {
+    fn find_app(
+        &self,
+        target: &AppTarget,
+        _timeout: Duration,
+        _environment: &crate::process_policy::ProcessEnvironmentPlan,
+    ) -> Result<AppHandle, ToolError> {
         let launched = self
             .launched_apps
             .lock()
@@ -293,6 +312,7 @@ impl ComputerUseDesktopBackend for MockComputerUseBackend {
         &self,
         target: &AppTarget,
         _launch_command: Option<&str>,
+        _environment: &crate::process_policy::ProcessEnvironmentPlan,
     ) -> Result<(), ToolError> {
         if let Some(name) = target.name.as_deref() {
             self.launched_apps
@@ -307,23 +327,30 @@ impl ComputerUseDesktopBackend for MockComputerUseBackend {
                 .iter()
                 .all(|app| !platform::app_identity_matches(app, name))
             {
-                apps.push(platform::enrich_app_identity(AppMeta {
-                    identity_key: Some(derive_app_identity_key(name, Some(43), None, None)),
-                    name: name.to_owned(),
-                    pid: Some(43),
-                    role: Some("application".to_owned()),
-                    window_title: Some("Mock Window".to_owned()),
-                    bundle_id: None,
-                    localized_name: None,
-                    executable_path: None,
-                    frontmost: Some(true),
-                }));
+                apps.push(platform::enrich_app_identity(
+                    AppMeta {
+                        identity_key: Some(derive_app_identity_key(name, Some(43), None, None)),
+                        name: name.to_owned(),
+                        pid: Some(43),
+                        role: Some("application".to_owned()),
+                        window_title: Some("Mock Window".to_owned()),
+                        bundle_id: None,
+                        localized_name: None,
+                        executable_path: None,
+                        frontmost: Some(true),
+                    },
+                    _environment,
+                ));
             }
         }
         Ok(())
     }
 
-    fn activate_app(&self, _app: &AppHandle) -> Result<(), ToolError> {
+    fn activate_app(
+        &self,
+        _app: &AppHandle,
+        _environment: &crate::process_policy::ProcessEnvironmentPlan,
+    ) -> Result<(), ToolError> {
         Ok(())
     }
 
@@ -412,7 +439,11 @@ impl ComputerUseDesktopBackend for MockComputerUseBackend {
         })
     }
 
-    fn perform_os_action(&self, action: &OsAction) -> Result<ActionExecution, ToolError> {
+    fn perform_os_action(
+        &self,
+        action: &OsAction,
+        _environment: &crate::process_policy::ProcessEnvironmentPlan,
+    ) -> Result<ActionExecution, ToolError> {
         self.action_count.fetch_add(1, Ordering::SeqCst);
         let action_type = action.action_type.as_str().to_owned();
         self.os_actions
@@ -539,7 +570,8 @@ mod tests {
             })
             .expect("preflight");
         assert_eq!(preflight.status, "ready");
-        assert_eq!(backend.list_apps().expect("apps").len(), 1);
+        let environment = crate::process_policy::ProcessEnvironmentPlan::inherited_for_test();
+        assert_eq!(backend.list_apps(&environment).expect("apps").len(), 1);
         let app = backend
             .find_app(
                 &AppTarget {
@@ -550,6 +582,7 @@ mod tests {
                     executable_path: None,
                 },
                 Duration::ZERO,
+                &environment,
             )
             .expect("app");
         assert_eq!(app.name, "MockApp");
@@ -607,14 +640,17 @@ mod tests {
         );
         assert_eq!(
             backend
-                .perform_os_action(&OsAction {
-                    action_type: OsActionKind::OpenApp,
-                    app: Some("MockApp".to_owned()),
-                    path: None,
-                    url: None,
-                    menu_path: None,
-                    title: None,
-                })
+                .perform_os_action(
+                    &OsAction {
+                        action_type: OsActionKind::OpenApp,
+                        app: Some("MockApp".to_owned()),
+                        path: None,
+                        url: None,
+                        menu_path: None,
+                        title: None,
+                    },
+                    &crate::process_policy::ProcessEnvironmentPlan::inherited_for_test()
+                )
                 .expect("os")
                 .status,
             "ok"

@@ -192,6 +192,42 @@ const INTERNAL_TOOL_RECORDS: &[AuthorizationCatalogRecord] = &[
     ),
     record(
         AuthorizationCatalogSurface::InternalTool,
+        "agent_start_options",
+        "child_observe",
+        "execution_agent_options",
+        "not_found",
+        "read",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "thread_message_send",
+        "message_create",
+        "execution_approved_message_target",
+        "not_found",
+        "mutation",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "thread_create",
+        "thread_create_private|thread_create_workspace",
+        "execution_approved_thread_option",
+        "not_found",
+        "mutation",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
+        "agent_start",
+        "child_start|agent_turn_start",
+        "execution_approved_agent_target",
+        "not_found",
+        "execution",
+        true,
+    ),
+    record(
+        AuthorizationCatalogSurface::InternalTool,
         "memory_search",
         "memory_read",
         "thread_memory_scope",
@@ -456,6 +492,7 @@ pub(crate) fn authorization_catalog() -> Vec<AuthorizationCatalogRecord> {
 mod tests {
     use std::collections::BTreeSet;
 
+    use pioneer_protocol::AgentModelToolName;
     use pioneer_tools::{ARTIFACT_DOMAIN_TOOL_NAMES, BuiltinToolDomain, builtin_tool_specs};
 
     use super::*;
@@ -526,6 +563,15 @@ mod tests {
                 .map(|name| (*name).to_owned()),
         );
         sensitive.insert("read_skill".to_owned());
+        sensitive.extend(
+            [
+                AgentModelToolName::AgentStartOptions,
+                AgentModelToolName::SendMessage,
+                AgentModelToolName::CreateThread,
+                AgentModelToolName::StartAgent,
+            ]
+            .map(|name| name.as_str().to_owned()),
+        );
 
         assert_eq!(
             unregistered_sensitive_tools(sensitive.iter().map(String::as_str)),

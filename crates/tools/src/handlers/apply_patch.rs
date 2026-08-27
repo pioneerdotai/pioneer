@@ -1041,19 +1041,24 @@ mod tests {
         let traversal_patch =
             "*** Begin Patch\n*** Add File: ../escape.txt\n+escape\n*** End Patch";
         let mut traversal = invocation(traversal_root.path(), traversal_patch);
-        traversal.execution_security_snapshot =
-            Some(TurnExecutionSecuritySnapshot::workspace_write(
-                TurnPermissionProfileSnapshot::from_mode(
-                    TurnPermissionMode::AutoAcceptEdits,
-                    TurnPermissionProfileSource::Composer,
-                ),
+        let mut traversal_snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::AutoAcceptEdits,
+                TurnPermissionProfileSource::Composer,
+            ),
+            traversal_root.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Write,
                 traversal_root.path().to_string_lossy(),
-                vec![TurnFilesystemSandboxEntry::workspace_root(
-                    TurnFilesystemAccess::Write,
-                    traversal_root.path().to_string_lossy(),
-                )],
-                1,
-            ));
+            )],
+            1,
+        );
+        // Model a child/task hard cap. Root turns may now ask for a bounded
+        // grant outside the initial workspace sandbox, so a root-like fixture
+        // would correctly defer this path to consent instead of classifying it
+        // as an ungrantable traversal.
+        traversal_snapshot.authority_cap.filesystem = traversal_snapshot.sandbox.filesystem.clone();
+        traversal.execution_security_snapshot = Some(traversal_snapshot);
         let (_, preflight) = extract_permission_intent_with_preflight(&traversal);
         traversal.apply_patch_preflight = preflight;
         let traversal_identity =

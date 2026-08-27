@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +13,7 @@ use pioneer_protocol::{
     ThreadArtifactsChangedNotification, constants::events,
 };
 use pioneer_provider::AttachmentDataSource;
+use pioneer_tools::apply_patch::file_mutation::open_regular_file;
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FilePolicyChecker, FilePolicyDecision, FilePolicyOperation,
     FunctionToolOutput, PayloadKind, ToolError, ToolHandler, ToolIdempotencyMode, ToolInvocation,
@@ -37,6 +39,7 @@ pub const ARTIFACT_OUTPUT_DIR_ENV: &str = PIONEER_ARTIFACT_OUTPUT_DIR_ENV;
 const PREPARED_OUTPUT_TTL_HOURS: i64 = 24;
 const MAX_FILENAME_CHARS: usize = 120;
 const ARTIFACT_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const PREPARED_FINGERPRINT_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreparedArtifactOutputStatus {
@@ -784,12 +787,6 @@ async fn register_artifact_for_invocation(
     let allowed_roots =
         artifact_register_allowed_roots(invocation, workspace_root.as_path()).await?;
     let source_canonical = tokio::fs::canonicalize(source_path.as_path()).await.ok();
-    let output_root_canonical = invocation
-        .environment
-        .get(ARTIFACT_OUTPUT_DIR_ENV)
-        .map(String::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .and_then(|path| std::fs::canonicalize(path).ok());
     let prepared_canonical = prepared_output_path
         .as_ref()
         .and_then(|path| std::fs::canonicalize(path).ok());
@@ -800,33 +797,7 @@ async fn register_artifact_for_invocation(
         prepared_canonical.as_deref(),
     )
     .await?;
-    let cleanup_source_after_success = source_canonical.as_ref().is_some_and(|path| {
-        prepared_canonical.as_ref() == Some(path)
-            || output_root_canonical
-                .as_ref()
-                .is_some_and(|root| path.starts_with(root))
-            || artifact_state.prepared_output_for_path(path).is_some()
-    });
-    if cleanup_source_after_success {
-        enforce_artifact_path_policy(
-            invocation,
-            FilePolicyOperation::Write,
-            source_path.as_path(),
-            "artifact_register cleanup source path",
-        )?;
-    }
-    for prepared in &prepared_registration_plan.prepared_outputs {
-        let prepared_canonical = std::fs::canonicalize(prepared.output_path.as_path()).ok();
-        if prepared_canonical.as_ref() != source_canonical.as_ref() {
-            enforce_artifact_path_policy(
-                invocation,
-                FilePolicyOperation::Write,
-                prepared.output_path.as_path(),
-                "artifact_register cleanup prepared output path",
-            )?;
-        }
-    }
-
+    let expected_source_fingerprint = prepared_registration_plan.source_fingerprint.clone();
     let registration_context = ArtifactRegistrationContext {
         workspace_id: context.workspace_id.clone(),
         thread_id: context.thread_id.clone(),
@@ -842,7 +813,6 @@ async fn register_artifact_for_invocation(
         binding_role: Some(ArtifactRole::Assistant),
         allowed_roots,
         max_file_bytes: None,
-        cleanup_source_after_success,
     };
     let candidate = ArtifactRegistrationCandidate {
         path: source_path,
@@ -850,8 +820,12 @@ async fn register_artifact_for_invocation(
         mime_type: clean_optional_string(input.mime_type),
         kind_hint: input.kind.map(artifact_prepare_kind_to_artifact_kind),
         description: clean_optional_string(input.description),
-        sha256: None,
-        size_bytes: None,
+        sha256: expected_source_fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.sha256.clone()),
+        size_bytes: expected_source_fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.size_bytes),
         source: ArtifactRegistrationSource::ExplicitArtifactRegister,
     };
 
@@ -873,11 +847,6 @@ async fn register_artifact_for_invocation(
             artifact.artifact_id.as_str(),
             version_id.as_str(),
         );
-        let prepared_canonical = std::fs::canonicalize(prepared.output_path.as_path()).ok();
-        if prepared_canonical.as_ref() != source_canonical.as_ref() {
-            let _ = crate::output_dir::cleanup_artifact_output_file(prepared.output_path.as_path())
-                .await;
-        }
     }
     let size_bytes = artifact.size_bytes.ok_or_else(|| {
         ToolError::internal(format!(
@@ -912,6 +881,7 @@ struct FileFingerprint {
 #[derive(Debug, Clone, Default)]
 struct PreparedRegistrationPlan {
     prepared_outputs: Vec<PreparedArtifactOutput>,
+    source_fingerprint: Option<FileFingerprint>,
 }
 
 async fn resolve_prepared_registration_plan(
@@ -941,15 +911,20 @@ async fn resolve_prepared_registration_plan(
                 ));
             }
 
-            validate_prepared_source_content_match(
+            let source_fingerprint = validate_prepared_source_content_match(
                 source_path,
                 explicit_prepared.output_path.as_path(),
             )
             .await?;
+            return Ok(PreparedRegistrationPlan {
+                prepared_outputs: vec![explicit_prepared],
+                source_fingerprint,
+            });
         }
 
         return Ok(PreparedRegistrationPlan {
             prepared_outputs: vec![explicit_prepared],
+            source_fingerprint: None,
         });
     }
 
@@ -958,6 +933,7 @@ async fn resolve_prepared_registration_plan(
     {
         return Ok(PreparedRegistrationPlan {
             prepared_outputs: vec![source_prepared],
+            source_fingerprint: None,
         });
     }
 
@@ -987,6 +963,7 @@ async fn resolve_prepared_registration_plan(
         0 => Ok(PreparedRegistrationPlan::default()),
         1 => Ok(PreparedRegistrationPlan {
             prepared_outputs: matches,
+            source_fingerprint: Some(source_fingerprint),
         }),
         _ => Err(ToolError::invalid_arguments(
             "registered file matches multiple prepared outputs; pass preparedOutputPath",
@@ -1007,46 +984,80 @@ fn find_prepared_output(
 async fn validate_prepared_source_content_match(
     source_path: &Path,
     prepared_path: &Path,
-) -> Result<(), ToolError> {
+) -> Result<Option<FileFingerprint>, ToolError> {
     let source_fingerprint = file_fingerprint(source_path).await?;
     let prepared_fingerprint = file_fingerprint(prepared_path).await?;
-    if let (Some(source), Some(prepared)) = (source_fingerprint, prepared_fingerprint)
-        && source != prepared
+    if let (Some(source), Some(prepared)) = (&source_fingerprint, prepared_fingerprint)
+        && source != &prepared
     {
         return Err(ToolError::invalid_arguments(
             "`path` content does not match `preparedOutputPath`",
         ));
     }
-    Ok(())
+    Ok(source_fingerprint)
 }
 
 async fn file_fingerprint(path: &Path) -> Result<Option<FileFingerprint>, ToolError> {
-    let metadata = match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(ToolError::execution_failed(format!(
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = match open_regular_file(path.as_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ToolError::execution_failed(format!(
+                    "failed to securely open prepared artifact output `{}`: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let metadata = file.metadata().map_err(|error| {
+            ToolError::execution_failed(format!(
                 "failed to inspect prepared artifact output `{}`: {error}",
                 path.display()
+            ))
+        })?;
+        if metadata.len() > PREPARED_FINGERPRINT_MAX_BYTES {
+            return Err(ToolError::execution_failed(format!(
+                "prepared artifact output `{}` exceeds fingerprint limit of {} bytes",
+                path.display(),
+                PREPARED_FINGERPRINT_MAX_BYTES
             )));
         }
-    };
-    if !metadata.is_file() {
-        return Ok(None);
-    }
 
-    let bytes = tokio::fs::read(path).await.map_err(|error| {
-        ToolError::execution_failed(format!(
-            "failed to read prepared artifact output `{}`: {error}",
-            path.display()
+        let mut hasher = Sha256::new();
+        let mut size_bytes = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to read prepared artifact output `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            size_bytes = size_bytes.saturating_add(read as u64);
+            if size_bytes > PREPARED_FINGERPRINT_MAX_BYTES {
+                return Err(ToolError::execution_failed(format!(
+                    "prepared artifact output `{}` grew beyond fingerprint limit of {} bytes",
+                    path.display(),
+                    PREPARED_FINGERPRINT_MAX_BYTES
+                )));
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(Some(FileFingerprint {
+            size_bytes,
+            sha256: hex::encode(hasher.finalize()),
+        }))
+    })
+    .await
+    .map_err(|error| {
+        ToolError::internal(format!(
+            "prepared artifact fingerprint worker failed: {error}"
         ))
-    })?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes.as_slice());
-    Ok(Some(FileFingerprint {
-        size_bytes: metadata.len(),
-        sha256: hex::encode(hasher.finalize()),
-    }))
+    })?
 }
 
 fn artifact_register_workspace_root(invocation: &ToolInvocation) -> Result<PathBuf, ToolError> {
@@ -1667,7 +1678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_register_registers_file_from_output_dir_and_cleans_up() {
+    async fn artifact_register_registers_file_from_output_dir_and_defers_cleanup_to_gc() {
         let temp = tempfile::tempdir().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let output_dir = temp.path().join("output");
@@ -1705,8 +1716,8 @@ mod tests {
         assert_eq!(outcome.response.display_name, "registered.txt");
         assert_eq!(outcome.response.kind, ArtifactKind::File);
         assert!(
-            !source_path.exists(),
-            "output-dir source should be cleaned after successful registration"
+            source_path.exists(),
+            "output-dir source stays until turn-output GC can remove it without a path race"
         );
         let page = service
             .list_thread_artifacts(
@@ -1769,8 +1780,8 @@ mod tests {
         assert!(prepared_after.is_registered());
         assert_eq!(outcome.response.display_name, "registered.txt");
         assert!(
-            !prepared.output_path.exists(),
-            "staging source should be cleaned after copied registration"
+            prepared.output_path.exists(),
+            "staging source stays until turn-output GC can remove it without a path race"
         );
         assert!(copy_path.exists(), "user-requested copy should remain");
     }
@@ -1818,8 +1829,8 @@ mod tests {
             .expect("prepared output remains tracked");
         assert!(prepared_after.is_registered());
         assert!(
-            !prepared.output_path.exists(),
-            "matched staging source should be cleaned after registration"
+            prepared.output_path.exists(),
+            "matched staging source stays until turn-output GC"
         );
     }
 

@@ -60,6 +60,7 @@ const AGENT_ROUTE_EXPIRY_BATCH_SIZE: u64 = 512;
 const AGENT_ACTION_OUTBOX_LEASE_SECONDS: i64 = 30;
 const AGENT_ACTION_OUTBOX_MAX_RETRY_SECONDS: i64 = 30 * 60;
 const AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS: &str = "waiting_for_durable_permit";
+const AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS: &str = "waiting_for_native_thread_runtime";
 pub(super) const AGENT_ACTION_COMPACTION_FORMAT: &str = "agent_action_response_v1";
 pub(super) const AGENT_ACTION_RECEIPT_COMPACTION_FORMAT: &str = "agent_action_receipt_response_v1";
 pub(super) const AGENT_ACTION_OUTBOX_COMPACTION_FORMAT: &str = "agent_action_outbox_payload_v1";
@@ -4917,6 +4918,48 @@ pub async fn defer_agent_action_outbox_for_permit<C: ConnectionTrait>(
     Ok(result.rows_affected == 1)
 }
 
+/// Release a StartAgent outbox claim while another native Turn still owns the
+/// target thread runtime. This is ordinary serialization, not a delivery
+/// failure, so it restores the attempt counter and retries promptly after the
+/// parent Turn can finish.
+pub async fn defer_agent_action_outbox_for_runtime<C: ConnectionTrait>(
+    db: &C,
+    outbox_id: &str,
+    expected_attempts: i64,
+    deferred_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let restored_attempts = expected_attempts
+        .checked_sub(1)
+        .filter(|attempts| *attempts >= 0)
+        .context("outbox runtime deferral has an invalid attempt fence")?;
+    let result = agent_action_outbox::Entity::update_many()
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value("failed"),
+        )
+        .col_expr(
+            agent_action_outbox::Column::Attempts,
+            sea_orm::sea_query::Expr::value(restored_attempts),
+        )
+        .col_expr(
+            agent_action_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(
+                AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS.to_owned(),
+            )),
+        )
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(Some(deferred_at + Duration::milliseconds(100))),
+        )
+        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+        .filter(agent_action_outbox::Column::Status.eq("pending"))
+        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+        .exec(db)
+        .await
+        .context("failed to defer agent domain outbox for a busy native thread runtime")?;
+    Ok(result.rows_affected == 1)
+}
+
 /// Make a capacity-deferred StartAgent row immediately eligible after the
 /// exact execution is promoted. The failure-class fence prevents scheduler
 /// activity from disturbing an unrelated delivery retry.
@@ -7325,6 +7368,66 @@ mod tests {
             .unwrap();
         assert_eq!(woken.attempts, 0);
         assert_eq!(woken.next_attempt_at, Some(now));
+    }
+
+    #[tokio::test]
+    async fn busy_native_runtime_wait_does_not_consume_outbox_retry_budget() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA foreign_keys = OFF".to_owned(),
+        ))
+        .await
+        .unwrap();
+        let now = utc_now();
+        insert_compaction_test_tuple(
+            &db,
+            "runtime-wait",
+            "pending",
+            0,
+            now.clone(),
+            None,
+            "response".to_owned(),
+            serde_json::json!({
+                "kind": "start_agent",
+                "spawned_execution_id": "Eruntimewait123456789",
+            })
+            .to_string(),
+        )
+        .await;
+
+        let claimed = claim_agent_action_outbox(&db, now.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempts, 1);
+        assert!(
+            defer_agent_action_outbox_for_runtime(
+                &db,
+                claimed[0].id.as_str(),
+                claimed[0].attempts,
+                now.clone(),
+            )
+            .await
+            .unwrap()
+        );
+        let deferred = agent_action_outbox::Entity::find_by_id("outbox-runtime-wait")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.status, "failed");
+        assert_eq!(deferred.attempts, 0);
+        assert_eq!(
+            deferred.last_error.as_deref(),
+            Some(AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS)
+        );
+        let retry_at = deferred
+            .next_attempt_at
+            .expect("runtime wait should have a retry deadline");
+        assert!(retry_at > now.clone());
+        assert!(retry_at <= now + Duration::seconds(1));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use crate::apply_patch::file_mutation::{
     PatchError, PatchErrorCode, PatchLimits, PatchRequest, PatchRequestSource, PatchStage,
-    Retryability, TargetResolver,
+    Retryability, TargetResolver, TargetRole,
 };
 use crate::apply_patch::{
     ExecutionReport, OperationKind, PrepareOptions, TelemetryStage, ValidatedPatchDocument, parse,
@@ -125,6 +125,8 @@ pub(crate) fn extract_permission_intent_with_preflight(
         .or_else(|| extract_mcp_permission_intent(invocation))
         .or_else(|| extract_dynamic_skill_permission_intent(invocation))
         .or_else(|| extract_computer_use_permission_intent(invocation))
+        .or_else(|| extract_agent_action_permission_intent(invocation))
+        .or_else(|| extract_memory_permission_intent(invocation))
         .or_else(|| extract_task_permission_intent(invocation))
         .or_else(|| extract_internal_permission_intent(invocation))
         .or_else(|| extract_file_permission_intent(invocation))
@@ -203,6 +205,7 @@ fn extract_mcp_permission_intent(invocation: &ToolInvocation) -> Option<Permissi
     let ToolPayload::Mcp {
         server,
         tool,
+        arguments,
         read_only_hint,
         destructive_hint,
         open_world_hint,
@@ -226,6 +229,7 @@ fn extract_mcp_permission_intent(invocation: &ToolInvocation) -> Option<Permissi
     scope
         .entries
         .insert("callable_name".to_owned(), invocation.tool_name.clone());
+    bind_json_payload(&mut scope, arguments);
     if let Some(value) = read_only_hint {
         scope
             .entries
@@ -282,6 +286,10 @@ fn extract_dynamic_skill_permission_intent(
     scope
         .entries
         .insert("skill_slug".to_owned(), metadata.skill_slug.clone());
+    scope.entries.insert(
+        "skill_fingerprint".to_owned(),
+        metadata.skill_fingerprint.clone(),
+    );
     scope
         .entries
         .insert("source_kind".to_owned(), metadata.source_kind.clone());
@@ -319,6 +327,9 @@ fn extract_dynamic_skill_permission_intent(
     match metadata.kind {
         DynamicSkillPermissionKind::Http => {
             let args = function_arguments(invocation);
+            if let Some(arguments) = args {
+                bind_json_payload(&mut scope, arguments);
+            }
             let method = args
                 .and_then(|arguments| string_field(arguments, "method"))
                 .or(metadata.configured_method.as_deref())
@@ -356,7 +367,10 @@ fn extract_dynamic_skill_permission_intent(
                 );
             }
             Some(PermissionIntent {
-                action: PermissionActionKind::ShellCommand,
+                // The wrapper has no side effect of its own. Its nested
+                // exec_command receives the real ShellCommand decision and
+                // sandbox grants, with this skill attached as provenance.
+                action: PermissionActionKind::Internal,
                 scope,
                 summary: Some(format!(
                     "dynamic skill shell tool `{}`",
@@ -365,7 +379,20 @@ fn extract_dynamic_skill_permission_intent(
             })
         }
         DynamicSkillPermissionKind::FunctionProxy => Some(PermissionIntent {
-            action: PermissionActionKind::DynamicSkillTool,
+            // The target invocation is permission-gated once using its real
+            // semantic action. The nested skill origin tightens that decision
+            // through `dynamic_skill_tool` policy.
+            action: if metadata
+                .target_tool
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+            {
+                PermissionActionKind::Internal
+            } else {
+                PermissionActionKind::DynamicSkillTool
+            },
             scope,
             summary: Some(format!(
                 "dynamic skill function proxy `{}`",
@@ -398,6 +425,16 @@ fn extract_computer_use_permission_intent(invocation: &ToolInvocation) -> Option
             scope
                 .entries
                 .insert("parse_status".to_owned(), "arguments_present".to_owned());
+            // Turn-scoped approvals are cached by the normalized scope hash.
+            // Bind that cache to the complete model-visible operation so an
+            // approval for one app, URL, path or input target cannot authorize
+            // a different desktop effect whose abbreviated UI fields happen
+            // to share the same action/session pair.
+            if let Ok(encoded) = serde_json::to_vec(arguments) {
+                scope
+                    .entries
+                    .insert("payload_hash".to_owned(), sha256_hex(encoded.as_slice()));
+            }
             if let Some(session_id) = u64_field(arguments, "session_id") {
                 scope
                     .entries
@@ -408,10 +445,113 @@ fn extract_computer_use_permission_intent(invocation: &ToolInvocation) -> Option
                     .entries
                     .insert("target_type".to_owned(), target_type.to_owned());
             }
+            for (field, scope_key) in [
+                ("name", "target_name"),
+                ("identity_key", "target_identity_key"),
+                ("bundle_id", "target_bundle_id"),
+                ("executable_path", "target_executable_path"),
+            ] {
+                if let Some(value) = nested_string_field(arguments, "target", field) {
+                    scope
+                        .entries
+                        .insert(scope_key.to_owned(), normalize_scope_value(value));
+                }
+            }
+            if let Some(pid) = arguments
+                .get("target")
+                .and_then(JsonValue::as_object)
+                .and_then(|target| target.get("pid"))
+                .and_then(JsonValue::as_u64)
+            {
+                scope
+                    .entries
+                    .insert("target_pid".to_owned(), pid.to_string());
+            }
+            if let Some(display_id) = arguments
+                .get("target")
+                .and_then(JsonValue::as_object)
+                .and_then(|target| target.get("display_id"))
+                .and_then(JsonValue::as_u64)
+                .or_else(|| u64_field(arguments, "display_id"))
+            {
+                scope
+                    .entries
+                    .insert("display_id".to_owned(), display_id.to_string());
+            }
+            if let Some(launch_if_missing) = arguments
+                .get("target")
+                .and_then(JsonValue::as_object)
+                .and_then(|target| target.get("launch_if_missing"))
+                .and_then(JsonValue::as_bool)
+                .or_else(|| bool_field(arguments, "launch_if_missing"))
+            {
+                scope.entries.insert(
+                    "launch_if_missing".to_owned(),
+                    launch_if_missing.to_string(),
+                );
+            }
+            if let Some(command) = nested_string_field(arguments, "target", "launch_command")
+                .or_else(|| string_field(arguments, "launch_command"))
+            {
+                scope
+                    .entries
+                    .insert("launch_command".to_owned(), normalize_scope_value(command));
+            }
+            if let Some(screenshot_path) = string_field(arguments, "screenshot_path") {
+                scope.entries.insert(
+                    "screenshot_path".to_owned(),
+                    normalize_scope_value(screenshot_path),
+                );
+            }
             if let Some(act_type) = nested_string_field(arguments, "act", "type") {
                 scope
                     .entries
                     .insert("act_type".to_owned(), act_type.to_owned());
+            }
+            if let Some(act) = arguments.get("act").and_then(JsonValue::as_object) {
+                for (field, scope_key) in [
+                    ("app", "act_app"),
+                    ("path", "act_path"),
+                    ("action_name", "act_action_name"),
+                    ("condition", "act_condition"),
+                    ("title", "act_title"),
+                ] {
+                    if let Some(value) = act.get(field).and_then(JsonValue::as_str) {
+                        scope
+                            .entries
+                            .insert(scope_key.to_owned(), normalize_scope_value(value));
+                    }
+                }
+                if let Some(url) = act.get("url").and_then(JsonValue::as_str) {
+                    apply_url_scope(&mut scope, url);
+                }
+                if let Some(keys) = act.get("keys").and_then(JsonValue::as_array) {
+                    scope.entries.insert(
+                        "act_keys".to_owned(),
+                        serde_json::to_string(keys).unwrap_or_else(|_| "[]".to_owned()),
+                    );
+                }
+                if let Some(text) = act.get("text").and_then(JsonValue::as_str) {
+                    scope
+                        .entries
+                        .insert("input_text_present".to_owned(), "true".to_owned());
+                    scope
+                        .entries
+                        .insert("input_text_bytes".to_owned(), text.len().to_string());
+                }
+                for (field, scope_key) in [
+                    ("target", "act_target"),
+                    ("from", "act_from"),
+                    ("to", "act_to"),
+                    ("menu_path", "act_menu_path"),
+                ] {
+                    if let Some(value) = act.get(field) {
+                        scope.entries.insert(
+                            scope_key.to_owned(),
+                            serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()),
+                        );
+                    }
+                }
             }
         }
         None => {
@@ -422,18 +562,117 @@ fn extract_computer_use_permission_intent(invocation: &ToolInvocation) -> Option
         }
     }
 
-    if action == "preflight" {
-        return Some(PermissionIntent {
-            action: PermissionActionKind::Internal,
-            scope,
-            summary: Some("computer_use preflight".to_owned()),
-        });
-    }
-
     Some(PermissionIntent {
         action: PermissionActionKind::ComputerUse,
         scope,
         summary: Some(format!("computer_use {action}")),
+    })
+}
+
+fn extract_agent_action_permission_intent(invocation: &ToolInvocation) -> Option<PermissionIntent> {
+    let (operation, mutation) = match invocation.tool_name.as_str() {
+        "agent_start_options" => ("read agent start options", false),
+        "thread_message_send" => ("send message to thread", true),
+        "thread_create" => ("create thread", true),
+        "agent_start" => ("start agent", true),
+        _ => return None,
+    };
+
+    let mut scope = base_scope(invocation);
+    scope
+        .entries
+        .insert("domain".to_owned(), "agent".to_owned());
+    scope
+        .entries
+        .insert("operation".to_owned(), operation.to_owned());
+    if let Some(arguments) = function_arguments(invocation) {
+        for key in ["targetOptionId", "optionId"] {
+            if let Some(value) = string_field(arguments, key) {
+                scope
+                    .entries
+                    .insert(normalize_scope_key(key), normalize_scope_value(value));
+            }
+        }
+        if mutation {
+            bind_json_payload(&mut scope, arguments);
+        }
+    }
+
+    Some(PermissionIntent {
+        action: if mutation {
+            PermissionActionKind::AgentAction
+        } else {
+            PermissionActionKind::Internal
+        },
+        scope,
+        summary: Some(operation.to_owned()),
+    })
+}
+
+fn extract_memory_permission_intent(invocation: &ToolInvocation) -> Option<PermissionIntent> {
+    let operation = match invocation.tool_name.as_str() {
+        "memory_remember" => "remember memory",
+        "memory_forget" => "forget memory",
+        _ => return None,
+    };
+    let arguments = function_arguments(invocation);
+    let dry_run = arguments
+        .and_then(|arguments| {
+            bool_field(arguments, "dryRun").or_else(|| bool_field(arguments, "dry_run"))
+        })
+        .unwrap_or(false);
+
+    let mut scope = base_scope(invocation);
+    scope
+        .entries
+        .insert("domain".to_owned(), "memory".to_owned());
+    scope
+        .entries
+        .insert("operation".to_owned(), operation.to_owned());
+    if let Some(arguments) = arguments {
+        for key in ["scope", "category", "namespace", "key", "supersedes"] {
+            if let Some(value) = string_field(arguments, key) {
+                scope
+                    .entries
+                    .insert(key.to_owned(), normalize_scope_value(value));
+            }
+        }
+        if let Some(memory_id) = string_field(arguments, "memoryId")
+            .or_else(|| string_field(arguments, "memory_id"))
+            .or_else(|| nested_string_field(arguments, "target", "memory_id"))
+            .or_else(|| nested_string_field(arguments, "target", "memoryId"))
+        {
+            scope
+                .entries
+                .insert("memory_id".to_owned(), normalize_scope_value(memory_id));
+        }
+        if let Some(target_key) = nested_string_field(arguments, "target", "key") {
+            scope
+                .entries
+                .insert("key".to_owned(), normalize_scope_value(target_key));
+        }
+        if dry_run {
+            scope
+                .entries
+                .insert("dry_run".to_owned(), "true".to_owned());
+        }
+        if !dry_run {
+            bind_json_payload(&mut scope, arguments);
+        }
+    }
+
+    Some(PermissionIntent {
+        action: if dry_run {
+            PermissionActionKind::Internal
+        } else {
+            PermissionActionKind::MemoryWrite
+        },
+        scope,
+        summary: Some(if dry_run {
+            "preview memory forget".to_owned()
+        } else {
+            operation.to_owned()
+        }),
     })
 }
 
@@ -497,6 +736,7 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
     let operation = match tool_name {
         "task_create" => "create task/subagent",
         "task_wait" => "wait for task/subagent",
+        "task_result" => "read task/subagent result",
         "task_accept" => "accept task/subagent result",
         "task_revise" => "revise task/subagent result",
         "task_cancel" => "cancel task/subagent",
@@ -522,10 +762,34 @@ fn extract_task_permission_intent(invocation: &ToolInvocation) -> Option<Permiss
                 .entries
                 .insert("task_id".to_owned(), task_id.to_owned());
         }
+        if matches!(
+            tool_name,
+            "task_create"
+                | "task_accept"
+                | "task_revise"
+                | "task_cancel"
+                | "task_update"
+                | "task_detach"
+                | "task_reschedule"
+                | "task_pause"
+                | "task_resume"
+        ) {
+            bind_json_payload(&mut scope, arguments);
+        }
     }
 
     Some(PermissionIntent {
-        action: PermissionActionKind::Internal,
+        action: match tool_name {
+            // Observation is non-effectful. Every task mutation, including
+            // lifecycle/review control, consumes the profile's explicit
+            // task/subagent authority; otherwise `Internal` would bypass
+            // supervised consent for durable task graph changes.
+            "task_create" | "task_accept" | "task_revise" | "task_cancel" | "task_update"
+            | "task_detach" | "task_reschedule" | "task_pause" | "task_resume" => {
+                PermissionActionKind::TaskSubagent
+            }
+            _ => PermissionActionKind::Internal,
+        },
         scope,
         summary: Some(operation.to_owned()),
     })
@@ -559,6 +823,59 @@ fn web_search_intent(invocation: &ToolInvocation) -> PermissionIntent {
     scope
         .entries
         .insert("query_present".to_owned(), query_present.to_string());
+    if let Some(arguments) = args {
+        bind_json_payload(&mut scope, arguments);
+    }
+    let mut targets = invocation
+        .permission_metadata
+        .network_targets
+        .iter()
+        .filter_map(|target| Url::parse(target).ok())
+        .filter(|target| matches!(target.scheme(), "http" | "https"))
+        .filter_map(|target| {
+            target.host_str().map(|host| {
+                (
+                    target.origin().ascii_serialization(),
+                    host.to_ascii_lowercase(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        // Runtime materialization replaces these defaults from the normalized
+        // WebToolsConfig. Keep directly constructed builtin specs safe and
+        // functional without falling back to unrestricted network access.
+        targets.extend([
+            (
+                "https://duckduckgo.com".to_owned(),
+                "duckduckgo.com".to_owned(),
+            ),
+            (
+                "https://api.duckduckgo.com".to_owned(),
+                "api.duckduckgo.com".to_owned(),
+            ),
+        ]);
+    }
+    targets.sort();
+    targets.dedup();
+    let origins = targets
+        .iter()
+        .map(|(origin, _)| origin.clone())
+        .collect::<Vec<_>>();
+    let mut hosts = targets
+        .into_iter()
+        .map(|(_, host)| host)
+        .collect::<Vec<_>>();
+    hosts.sort();
+    hosts.dedup();
+    scope.entries.insert(
+        "network_origins".to_owned(),
+        serde_json::to_string(&origins).unwrap_or_else(|_| "[]".to_owned()),
+    );
+    scope.entries.insert(
+        "network_hosts".to_owned(),
+        serde_json::to_string(&hosts).unwrap_or_else(|_| "[]".to_owned()),
+    );
 
     PermissionIntent {
         action: PermissionActionKind::Network,
@@ -596,18 +913,41 @@ fn network_url_intent(
     };
 
     apply_url_scope(&mut scope, raw_url);
+    if let Some(arguments) = args {
+        bind_json_payload(&mut scope, arguments);
+    }
     if invocation.tool_name == "download_url" {
-        let destination = args
-            .and_then(|arguments| string_field(arguments, "destination"))
-            .map(|destination| resolve_requested_path(invocation.workdir.as_path(), destination))
-            .unwrap_or_else(|| {
-                invocation
-                    .workdir
-                    .join("__pioneer_download_destination__")
-                    .display()
-                    .to_string()
-            });
-        scope.entries.insert("destination".to_owned(), destination);
+        if let Ok(destination) = crate::handlers::resolve_download_destination(
+            invocation.workdir.as_path(),
+            args.and_then(|arguments| string_field(arguments, "destination")),
+            raw_url,
+        ) {
+            scope.entries.insert(
+                "destination".to_owned(),
+                normalize_path_lexically(&destination).display().to_string(),
+            );
+        } else {
+            scope
+                .entries
+                .insert("destination_status".to_owned(), "invalid".to_owned());
+        }
+        for (key, default) in [
+            ("overwrite", false),
+            ("create_dirs", true),
+            ("follow_redirects", true),
+        ] {
+            scope.entries.insert(
+                key.to_owned(),
+                args.and_then(|arguments| bool_field(arguments, key))
+                    .unwrap_or(default)
+                    .to_string(),
+            );
+        }
+        if let Some(max_bytes) = args.and_then(|arguments| u64_field(arguments, "max_bytes")) {
+            scope
+                .entries
+                .insert("max_bytes".to_owned(), max_bytes.to_string());
+        }
     }
 
     let target = scope
@@ -966,9 +1306,16 @@ fn apply_patch_intent_with_preflight(
     };
     patch_telemetry().record_stage_latency(TelemetryStage::Parse, parse_started.elapsed());
 
+    let validated_for_consent = validated.clone();
     let (validated, patch_root) = match authorize_and_normalize_patch_paths(invocation, validated) {
         Ok(result) => result,
         Err(error) => {
+            if let Ok(validated) = authorize_patch_paths_with_maximum_consent_authority(
+                invocation,
+                validated_for_consent,
+            ) {
+                return deferred_apply_patch_intent(scope, &validated);
+            }
             scope.entries.insert(
                 "parse_status".to_owned(),
                 "unauthorized_target_manifest".to_owned(),
@@ -1025,6 +1372,7 @@ fn apply_patch_intent_with_preflight(
         .target_manifest()
         .targets()
         .iter()
+        .filter(|target| target.role != TargetRole::Parent)
         .map(|target| target.absolute().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     let mut operations = BTreeMap::<&'static str, ()>::new();
@@ -1105,6 +1453,99 @@ fn apply_patch_intent_with_preflight(
             )),
         },
         Some(ApplyPatchPreflight::Ready(resolved)),
+    )
+}
+
+fn authorize_patch_paths_with_maximum_consent_authority(
+    invocation: &ToolInvocation,
+    document: ValidatedPatchDocument,
+) -> Result<ValidatedPatchDocument, PatchError> {
+    let Some(snapshot) = invocation.execution_security_snapshot.as_ref() else {
+        return authorize_and_normalize_patch_paths(invocation, document)
+            .map(|(document, _)| document);
+    };
+    let mut authority_invocation = invocation.clone();
+    let authority_snapshot = authority_invocation
+        .execution_security_snapshot
+        .as_mut()
+        .expect("snapshot cloned from present invocation");
+    authority_snapshot.sandbox.filesystem = snapshot.authority_cap.filesystem.clone();
+    authorize_and_normalize_patch_paths(&authority_invocation, document)
+        .map(|(document, _)| document)
+}
+
+fn deferred_apply_patch_intent(
+    mut scope: PermissionRequestScope,
+    document: &ValidatedPatchDocument,
+) -> (PermissionIntent, Option<ApplyPatchPreflight>) {
+    let mut resolved_paths = document
+        .operations
+        .iter()
+        .flat_map(|operation| {
+            std::iter::once(operation.operation.path.clone())
+                .chain(operation.operation.move_to.iter().cloned())
+        })
+        .collect::<Vec<_>>();
+    resolved_paths.sort();
+    resolved_paths.dedup();
+
+    let mut operations = BTreeMap::<&'static str, ()>::new();
+    for operation in &document.operations {
+        operations.insert(
+            match operation.kind() {
+                OperationKind::Add => "add",
+                OperationKind::Replace => "replace",
+                OperationKind::Update => "update",
+                OperationKind::Delete => "delete",
+            },
+            (),
+        );
+        if operation.operation.move_to.is_some() {
+            operations.insert("move", ());
+        }
+    }
+
+    scope.entries.insert(
+        "parse_status".to_owned(),
+        "awaiting_filesystem_grant".to_owned(),
+    );
+    scope.entries.insert(
+        "changed_path_count".to_owned(),
+        resolved_paths.len().to_string(),
+    );
+    scope.entries.insert(
+        "changed_paths".to_owned(),
+        serde_json::to_string(&resolved_paths).unwrap_or_else(|_| "[]".to_owned()),
+    );
+    scope.entries.insert(
+        "parser_schema_version".to_owned(),
+        document.schema_version.to_string(),
+    );
+    scope.entries.insert(
+        "payload_hash".to_owned(),
+        hex::encode(document.payload_hash),
+    );
+    for (index, path) in resolved_paths.iter().take(20).enumerate() {
+        scope.entries.insert(format!("path.{index}"), path.clone());
+    }
+    if !operations.is_empty() {
+        scope.entries.insert(
+            "operations".to_owned(),
+            serde_json::to_string(&operations.into_keys().collect::<Vec<_>>())
+                .unwrap_or_else(|_| "[]".to_owned()),
+        );
+    }
+
+    (
+        PermissionIntent {
+            action: PermissionActionKind::FileWrite,
+            scope,
+            summary: Some(format!(
+                "apply patch touching {} path(s)",
+                resolved_paths.len()
+            )),
+        },
+        None,
     )
 }
 
@@ -1344,10 +1785,37 @@ fn existing_directory(mut path: PathBuf) -> Option<PathBuf> {
 }
 
 fn base_scope(invocation: &ToolInvocation) -> PermissionRequestScope {
-    PermissionRequestScope::from_pairs([
+    let mut scope = PermissionRequestScope::from_pairs([
         ("tool_name", invocation.tool_name.as_str()),
         ("source", invocation.source.as_str()),
-    ])
+    ]);
+    for (index, origin) in invocation
+        .permission_metadata
+        .nested_dynamic_skills
+        .iter()
+        .enumerate()
+    {
+        let prefix = format!("skill_origin_{index}");
+        scope
+            .entries
+            .insert(format!("{prefix}_skill_id"), origin.skill_id.to_string());
+        scope
+            .entries
+            .insert(format!("{prefix}_skill_slug"), origin.skill_slug.clone());
+        scope.entries.insert(
+            format!("{prefix}_skill_fingerprint"),
+            origin.skill_fingerprint.clone(),
+        );
+        scope
+            .entries
+            .insert(format!("{prefix}_trust_level"), origin.trust_level.clone());
+        if let Some(target) = origin.target_tool.as_ref() {
+            scope
+                .entries
+                .insert(format!("{prefix}_declared_target"), target.clone());
+        }
+    }
+    scope
 }
 
 fn function_arguments(invocation: &ToolInvocation) -> Option<&JsonValue> {
@@ -1363,6 +1831,10 @@ fn string_field<'a>(value: &'a JsonValue, key: &str) -> Option<&'a str> {
 
 fn u64_field(value: &JsonValue, key: &str) -> Option<u64> {
     value.as_object()?.get(key)?.as_u64()
+}
+
+fn bool_field(value: &JsonValue, key: &str) -> Option<bool> {
+    value.as_object()?.get(key)?.as_bool()
 }
 
 fn nested_string_field<'a>(
@@ -1476,8 +1948,28 @@ impl ToolPermissionEvaluator for ProfileToolPermissionEvaluator {
                 message,
             };
         }
-        let behavior =
-            behavior_for_action(&context.permission_profile.effective_policy, intent.action);
+        let policy = &context.permission_profile.effective_policy;
+        let mut behavior = behavior_for_action(policy, intent.action);
+        let defers_to_nested_target = intent.action == PermissionActionKind::Internal
+            && invocation
+                .permission_metadata
+                .dynamic_skill
+                .as_ref()
+                .is_some_and(|metadata| {
+                    matches!(
+                        metadata.kind,
+                        DynamicSkillPermissionKind::Shell
+                            | DynamicSkillPermissionKind::FunctionProxy
+                    )
+                });
+        if !invocation
+            .permission_metadata
+            .nested_dynamic_skills
+            .is_empty()
+            && !defers_to_nested_target
+        {
+            behavior = most_restrictive_behavior(behavior, policy.dynamic_skill_tool);
+        }
         decision_from_behavior(behavior, context, invocation, intent)
     }
 }
@@ -1575,8 +2067,21 @@ fn behavior_for_action(
         PermissionActionKind::DynamicSkillTool => policy.dynamic_skill_tool,
         PermissionActionKind::ComputerUse => policy.computer_use,
         PermissionActionKind::TaskSubagent => policy.task_subagent,
+        PermissionActionKind::MemoryWrite => policy.memory_write,
+        PermissionActionKind::AgentAction => policy.agent_action,
         PermissionActionKind::Internal => PermissionBehavior::Allow,
         PermissionActionKind::Unknown => policy.default_behavior,
+    }
+}
+
+fn most_restrictive_behavior(
+    left: PermissionBehavior,
+    right: PermissionBehavior,
+) -> PermissionBehavior {
+    match (left, right) {
+        (PermissionBehavior::Deny, _) | (_, PermissionBehavior::Deny) => PermissionBehavior::Deny,
+        (PermissionBehavior::Ask, _) | (_, PermissionBehavior::Ask) => PermissionBehavior::Ask,
+        (PermissionBehavior::Allow, PermissionBehavior::Allow) => PermissionBehavior::Allow,
     }
 }
 
@@ -1642,7 +2147,7 @@ fn policy_denies_tool_name(
             "tool `{tool_name}` denied by turn permission profile"
         ));
     }
-    if !policy.allowed_tools.is_empty()
+    if (policy.allowed_tools_restricted || !policy.allowed_tools.is_empty())
         && !policy
             .allowed_tools
             .iter()
@@ -1660,7 +2165,7 @@ fn policy_denies_intent_paths(
     policy: &ToolPermissionPolicySnapshot,
     intent: &PermissionIntent,
 ) -> Option<String> {
-    if policy.allowed_paths.is_empty()
+    if (!policy.allowed_paths_restricted && policy.allowed_paths.is_empty())
         || !matches!(
             intent.action,
             PermissionActionKind::FileRead | PermissionActionKind::FileWrite
@@ -1679,7 +2184,7 @@ fn policy_denies_intent_paths(
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     if allowed_paths.is_empty() {
-        return None;
+        return Some("file action denied because the allowed path set is empty".to_owned());
     }
     let all_paths_allowed = requested_paths.iter().all(|path| {
         let normalized = normalize_policy_path(path);
@@ -1719,14 +2224,15 @@ fn normalize_policy_value(value: &str) -> String {
 }
 
 fn normalize_policy_path(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_owned()
+    normalize_path_lexically(Path::new(value.trim()))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn path_is_within_allowed_scope(path: &str, allowed: &str) -> bool {
-    path == allowed
-        || path
-            .strip_prefix(allowed)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    let path = Path::new(path);
+    let allowed = Path::new(allowed);
+    path == allowed || path.starts_with(allowed)
 }
 
 fn normalize_scope_key(value: &str) -> String {
@@ -1741,6 +2247,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn bind_json_payload(scope: &mut PermissionRequestScope, payload: &JsonValue) {
+    if let Ok(encoded) = serde_json::to_vec(payload) {
+        scope
+            .entries
+            .insert("payload_hash".to_owned(), sha256_hex(encoded.as_slice()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1749,6 +2263,7 @@ mod tests {
         DynamicSkillPermissionKind, DynamicSkillPermissionMetadata, ToolPermissionMetadata,
         ToolRecoveryMetadata,
     };
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use tokio_util::sync::CancellationToken;
 
@@ -1800,6 +2315,168 @@ mod tests {
         }
     }
 
+    #[test]
+    fn permission_semantics_cover_every_registered_native_tool() {
+        let mut registered = crate::builtin_tool_specs()
+            .into_iter()
+            .map(|configured| configured.spec.name)
+            .collect::<BTreeSet<_>>();
+        for domain in crate::BuiltinToolDomain::ALL {
+            registered.extend(domain.tool_names().iter().map(|name| (*name).to_owned()));
+        }
+        registered.insert("read_skill".to_owned());
+        registered.extend(
+            [
+                "agent_start_options",
+                "thread_message_send",
+                "thread_create",
+                "agent_start",
+            ]
+            .map(str::to_owned),
+        );
+
+        assert_eq!(registered.len(), 37, "native tool inventory changed");
+        let unknown = registered
+            .iter()
+            .filter(|name| {
+                let invocation = invocation_for_tool(
+                    name,
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({}),
+                    },
+                );
+                extract_permission_intent(&invocation).action == PermissionActionKind::Unknown
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(
+            unknown.is_empty(),
+            "registered native tools without semantic permission classification: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn every_registered_native_tool_has_the_expected_three_mode_permission_matrix() {
+        let expected_actions = BTreeMap::from([
+            ("exec_command", PermissionActionKind::ShellCommand),
+            ("write_stdin", PermissionActionKind::ShellCommand),
+            ("read_file", PermissionActionKind::FileRead),
+            ("list_dir", PermissionActionKind::FileRead),
+            ("grep_files", PermissionActionKind::FileRead),
+            ("apply_patch", PermissionActionKind::FileWrite),
+            ("web_search", PermissionActionKind::Network),
+            ("web_fetch", PermissionActionKind::Network),
+            ("download_url", PermissionActionKind::Network),
+            ("request_tools", PermissionActionKind::Internal),
+            ("memory_search", PermissionActionKind::Internal),
+            ("memory_list", PermissionActionKind::Internal),
+            ("memory_get", PermissionActionKind::Internal),
+            ("memory_remember", PermissionActionKind::MemoryWrite),
+            ("memory_forget", PermissionActionKind::MemoryWrite),
+            ("task_create", PermissionActionKind::TaskSubagent),
+            ("task_wait", PermissionActionKind::Internal),
+            ("task_result", PermissionActionKind::Internal),
+            ("task_accept", PermissionActionKind::TaskSubagent),
+            ("task_revise", PermissionActionKind::TaskSubagent),
+            ("task_cancel", PermissionActionKind::TaskSubagent),
+            ("task_update", PermissionActionKind::TaskSubagent),
+            ("task_detach", PermissionActionKind::TaskSubagent),
+            ("task_list", PermissionActionKind::Internal),
+            ("task_get", PermissionActionKind::Internal),
+            ("task_reschedule", PermissionActionKind::TaskSubagent),
+            ("task_pause", PermissionActionKind::TaskSubagent),
+            ("task_resume", PermissionActionKind::TaskSubagent),
+            ("artifact_prepare", PermissionActionKind::Internal),
+            ("artifact_register", PermissionActionKind::Internal),
+            ("artifact_read", PermissionActionKind::Internal),
+            ("computer_use", PermissionActionKind::ComputerUse),
+            ("read_skill", PermissionActionKind::Internal),
+            ("agent_start_options", PermissionActionKind::Internal),
+            ("thread_message_send", PermissionActionKind::AgentAction),
+            ("thread_create", PermissionActionKind::AgentAction),
+            ("agent_start", PermissionActionKind::AgentAction),
+        ]);
+
+        let mut registered = crate::builtin_tool_specs()
+            .into_iter()
+            .map(|configured| configured.spec.name)
+            .collect::<BTreeSet<_>>();
+        for domain in crate::BuiltinToolDomain::ALL {
+            registered.extend(domain.tool_names().iter().map(|name| (*name).to_owned()));
+        }
+        registered.insert("read_skill".to_owned());
+        registered.extend(
+            [
+                "agent_start_options",
+                "thread_message_send",
+                "thread_create",
+                "agent_start",
+            ]
+            .map(str::to_owned),
+        );
+
+        assert_eq!(registered.len(), 37, "native tool inventory changed");
+        assert_eq!(
+            registered,
+            expected_actions
+                .keys()
+                .map(|name| (*name).to_owned())
+                .collect::<BTreeSet<_>>(),
+            "the permission matrix must be updated atomically with the native tool registry"
+        );
+
+        for (tool_name, expected_action) in expected_actions {
+            let invocation = invocation_for_tool(
+                tool_name,
+                ToolPayload::Function {
+                    arguments: serde_json::json!({}),
+                },
+            );
+            let intent = extract_permission_intent(&invocation);
+            assert_eq!(intent.action, expected_action, "{tool_name} action");
+
+            for (mode, expected_behavior) in [
+                (
+                    pioneer_protocol::TurnPermissionMode::FullAccess,
+                    PermissionBehavior::Allow,
+                ),
+                (
+                    pioneer_protocol::TurnPermissionMode::AutoAcceptEdits,
+                    match expected_action {
+                        PermissionActionKind::FileRead
+                        | PermissionActionKind::FileWrite
+                        | PermissionActionKind::McpRead
+                        | PermissionActionKind::Internal => PermissionBehavior::Allow,
+                        _ => PermissionBehavior::Ask,
+                    },
+                ),
+                (
+                    pioneer_protocol::TurnPermissionMode::Supervised,
+                    match expected_action {
+                        PermissionActionKind::FileRead
+                        | PermissionActionKind::McpRead
+                        | PermissionActionKind::Internal => PermissionBehavior::Allow,
+                        _ => PermissionBehavior::Ask,
+                    },
+                ),
+            ] {
+                let context = test_context(mode);
+                let decision =
+                    ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
+                assert!(
+                    matches!(
+                        (expected_behavior, decision),
+                        (PermissionBehavior::Allow, PermissionDecision::Allow { .. })
+                            | (PermissionBehavior::Ask, PermissionDecision::Ask { .. })
+                            | (PermissionBehavior::Deny, PermissionDecision::Deny { .. })
+                    ),
+                    "unexpected {mode:?} decision for {tool_name} ({expected_action:?})"
+                );
+            }
+        }
+    }
+
     fn dynamic_skill_metadata(
         kind: DynamicSkillPermissionKind,
         target_tool: Option<&str>,
@@ -1813,12 +2490,15 @@ mod tests {
                     .expect("valid permission test SkillId"),
                 skill_owner: Some("workspace".to_owned()),
                 skill_slug: "user:weather".to_owned(),
+                skill_fingerprint: "weather-test-fingerprint".to_owned(),
                 source_kind: "User".to_owned(),
                 trust_level: "Trusted".to_owned(),
                 target_tool: target_tool.map(str::to_owned),
                 configured_method: configured_method.map(str::to_owned),
                 configured_url: configured_url.map(str::to_owned),
             }),
+            nested_dynamic_skills: Vec::new(),
+            network_targets: Vec::new(),
         }
     }
 
@@ -1882,6 +2562,44 @@ mod tests {
             },
         );
         let intent = extract_permission_intent(&invocation);
+        let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
+
+        assert!(matches!(
+            decision,
+            PermissionDecision::Deny {
+                reason: PermissionDecisionReason::PolicyDeniesAction,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_evaluator_denies_every_tool_for_a_restricted_empty_tool_set() {
+        let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+        policy.allowed_tools_restricted = true;
+        let context = context_with_policy(policy);
+        let invocation = invocation();
+        let intent = extract_permission_intent(&invocation);
+
+        let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
+
+        assert!(matches!(
+            decision,
+            PermissionDecision::Deny {
+                reason: PermissionDecisionReason::PolicyDeniesAction,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_evaluator_denies_every_file_for_a_restricted_empty_path_set() {
+        let mut policy = ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow);
+        policy.allowed_paths_restricted = true;
+        let context = context_with_policy(policy);
+        let invocation = invocation();
+        let intent = extract_permission_intent(&invocation);
+
         let decision = ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent);
 
         assert!(matches!(
@@ -2048,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn extractor_classifies_task_create_as_internal_task_management() {
+    fn extractor_classifies_task_create_as_subagent_launch() {
         let invocation = invocation_for_tool(
             "task_create",
             ToolPayload::Function {
@@ -2061,7 +2779,7 @@ mod tests {
 
         let intent = extract_permission_intent(&invocation);
 
-        assert_eq!(intent.action, PermissionActionKind::Internal);
+        assert_eq!(intent.action, PermissionActionKind::TaskSubagent);
         assert_eq!(intent.scope.entries.get("domain"), Some(&"task".to_owned()));
         assert_eq!(
             intent.scope.entries.get("operation"),
@@ -2147,28 +2865,21 @@ mod tests {
         );
         assert_eq!(
             intent.scope.entries.get("changed_path_count"),
-            Some(&"5".to_owned())
+            Some(&"3".to_owned())
         );
         assert_eq!(
             intent.scope.entries.get("path.0"),
-            Some(&"/workspace".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("path.1"),
             Some(&"/workspace/a.txt".to_owned())
         );
         assert_eq!(
-            intent.scope.entries.get("path.2"),
+            intent.scope.entries.get("path.1"),
             Some(&"/workspace/old.txt".to_owned())
         );
         assert_eq!(
-            intent.scope.entries.get("path.3"),
-            Some(&"/workspace/src".to_owned())
-        );
-        assert_eq!(
-            intent.scope.entries.get("path.4"),
+            intent.scope.entries.get("path.2"),
             Some(&"/workspace/src/lib.rs".to_owned())
         );
+        assert!(!intent.scope.entries.contains_key("path.3"));
         assert_eq!(
             intent.scope.entries.get("parser_schema_version"),
             Some(&"1".to_owned())
@@ -2178,6 +2889,56 @@ mod tests {
         assert_eq!(
             intent.scope.entries.get("operations"),
             Some(&"[\"add\",\"delete\",\"update\"]".to_owned())
+        );
+    }
+
+    #[test]
+    fn apply_patch_defers_content_preflight_until_supervised_write_grant() {
+        let root = tempfile::tempdir().expect("workspace should create");
+        let target = root
+            .path()
+            .canonicalize()
+            .expect("workspace should canonicalize")
+            .join("approved.txt");
+        let mut invocation = invocation_for_tool(
+            "apply_patch",
+            ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Add File: approved.txt\n+approved\n*** End Patch"
+                }),
+            },
+        );
+        invocation.workdir = root.path().to_path_buf();
+        invocation.execution_security_snapshot =
+            Some(pioneer_protocol::TurnExecutionSecuritySnapshot::read_only(
+                pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                    pioneer_protocol::TurnPermissionMode::Supervised,
+                    pioneer_protocol::TurnPermissionProfileSource::Composer,
+                ),
+                root.path().to_string_lossy(),
+                vec![
+                    pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                        pioneer_protocol::TurnFilesystemAccess::Read,
+                        root.path().to_string_lossy(),
+                    ),
+                ],
+                1,
+            ));
+
+        let (intent, preflight) = extract_permission_intent_with_preflight(&invocation);
+
+        assert_eq!(intent.action, PermissionActionKind::FileWrite);
+        assert!(
+            preflight.is_none(),
+            "content preflight must wait for consent"
+        );
+        assert_eq!(
+            intent.scope.entries.get("parse_status"),
+            Some(&"awaiting_filesystem_grant".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("changed_paths"),
+            Some(&serde_json::to_string(&vec![target.to_string_lossy().into_owned()]).unwrap())
         );
     }
 
@@ -2454,8 +3215,21 @@ mod tests {
         assert_eq!(intent.action, PermissionActionKind::Network);
         assert_eq!(
             intent.scope.entries.get("destination"),
-            Some(&"/workspace/__pioneer_download_destination__".to_owned())
+            Some(&"/workspace/archive.tgz".to_owned())
         );
+        assert_eq!(
+            intent.scope.entries.get("overwrite"),
+            Some(&"false".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("create_dirs"),
+            Some(&"true".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("follow_redirects"),
+            Some(&"true".to_owned())
+        );
+        assert!(intent.scope.entries.contains_key("payload_hash"));
     }
 
     #[test]
@@ -2485,6 +3259,38 @@ mod tests {
     }
 
     #[test]
+    fn web_search_permission_scope_preserves_configured_origins() {
+        let mut invocation = invocation_for_tool(
+            "web_search",
+            ToolPayload::Function {
+                arguments: serde_json::json!({ "query": "pioneer permissions" }),
+            },
+        );
+        invocation.permission_metadata.network_targets = vec![
+            "https://search.example:8443/html/".to_owned(),
+            "http://answers.example:8080/api".to_owned(),
+        ];
+
+        let intent = extract_permission_intent(&invocation);
+        let origins = serde_json::from_str::<Vec<String>>(
+            intent
+                .scope
+                .entries
+                .get("network_origins")
+                .expect("configured origins"),
+        )
+        .expect("origin list");
+
+        assert_eq!(
+            origins,
+            vec![
+                "http://answers.example:8080".to_owned(),
+                "https://search.example:8443".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn full_access_allows_network_tools() {
         let invocation = invocation_for_tool(
             "web_fetch",
@@ -2503,7 +3309,7 @@ mod tests {
     }
 
     #[test]
-    fn extractor_classifies_read_only_mcp_hint_as_mcp_read() {
+    fn extractor_treats_server_declared_read_only_mcp_as_untrusted() {
         let invocation = invocation_for_tool(
             "mcp_docs_search",
             ToolPayload::Mcp {
@@ -2518,7 +3324,7 @@ mod tests {
 
         let intent = extract_permission_intent(&invocation);
 
-        assert_eq!(intent.action, PermissionActionKind::McpRead);
+        assert_eq!(intent.action, PermissionActionKind::McpWriteOrUnknown);
         assert_eq!(
             intent.scope.entries.get("server"),
             Some(&"srv_docs".to_owned())
@@ -2526,16 +3332,16 @@ mod tests {
         assert_eq!(intent.scope.entries.get("tool"), Some(&"search".to_owned()));
         assert_eq!(
             intent.scope.entries.get("mcp_side_effect_class"),
-            Some(&"read_only".to_owned())
+            Some(&"unknown".to_owned())
         );
         assert_eq!(
             intent.scope.entries.get("mcp_requires_network"),
-            Some(&"false".to_owned())
+            Some(&"true".to_owned())
         );
     }
 
     #[test]
-    fn restricted_profiles_allow_read_only_hint_mcp() {
+    fn restricted_profiles_ask_for_server_declared_read_only_mcp() {
         let invocation = invocation_for_tool(
             "mcp_docs_search",
             ToolPayload::Mcp {
@@ -2550,21 +3356,22 @@ mod tests {
         let intent = extract_permission_intent(&invocation);
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
 
-        assert_eq!(
+        assert!(matches!(
             ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-            PermissionDecision::Allow {
-                reason: PermissionDecisionReason::PolicyAllowsAction
+            PermissionDecision::Ask {
+                reason: PermissionDecisionReason::UnknownActionDefault,
+                ..
             }
-        );
+        ));
     }
 
     #[test]
     fn extractor_classifies_destructive_network_or_unknown_mcp_as_write_or_unknown() {
         for (read_only_hint, destructive_hint, open_world_hint, expected_class, requires_network) in [
-            (Some(true), Some(true), Some(false), "write_like", "false"),
+            (Some(true), Some(true), Some(false), "write_like", "true"),
             (Some(false), Some(false), Some(true), "network_like", "true"),
             (None, None, None, "unknown", "true"),
-            (Some(false), Some(false), Some(false), "unknown", "false"),
+            (Some(false), Some(false), Some(false), "unknown", "true"),
         ] {
             let invocation = invocation_for_tool(
                 "mcp_repo_write",
@@ -2689,7 +3496,7 @@ mod tests {
     }
 
     #[test]
-    fn extractor_classifies_dynamic_shell_skill_as_shell_command() {
+    fn dynamic_shell_wrapper_defers_permission_to_nested_command() {
         let mut invocation = invocation_for_tool(
             "skill_shell",
             ToolPayload::Function {
@@ -2701,7 +3508,7 @@ mod tests {
 
         let intent = extract_permission_intent(&invocation);
 
-        assert_eq!(intent.action, PermissionActionKind::ShellCommand);
+        assert_eq!(intent.action, PermissionActionKind::Internal);
         assert_eq!(
             intent.scope.entries.get("dynamic_skill_kind"),
             Some(&"shell".to_owned())
@@ -2713,7 +3520,7 @@ mod tests {
     }
 
     #[test]
-    fn extractor_classifies_dynamic_function_proxy_as_dynamic_skill_tool() {
+    fn dynamic_function_proxy_wrapper_defers_permission_to_target() {
         let mut invocation = invocation_for_tool(
             "skill_proxy",
             ToolPayload::Function {
@@ -2729,7 +3536,7 @@ mod tests {
 
         let intent = extract_permission_intent(&invocation);
 
-        assert_eq!(intent.action, PermissionActionKind::DynamicSkillTool);
+        assert_eq!(intent.action, PermissionActionKind::Internal);
         assert_eq!(
             intent.scope.entries.get("target_tool"),
             Some(&"read_file".to_owned())
@@ -2737,7 +3544,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_profiles_ask_for_dynamic_skill_function_proxy() {
+    fn nested_dynamic_skill_target_receives_one_tightened_semantic_permission() {
         let mut invocation = invocation_for_tool(
             "skill_proxy",
             ToolPayload::Function {
@@ -2750,9 +3557,28 @@ mod tests {
             None,
             None,
         );
+        let origin = invocation
+            .permission_metadata
+            .dynamic_skill
+            .take()
+            .expect("proxy metadata");
+        invocation.tool_name = "read_file".to_owned();
+        invocation.source = ToolCallSource::NestedTool;
+        invocation.payload = ToolPayload::Function {
+            arguments: serde_json::json!({ "path": "README.md" }),
+        };
+        invocation
+            .permission_metadata
+            .nested_dynamic_skills
+            .push(origin);
         let intent = extract_permission_intent(&invocation);
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
 
+        assert_eq!(intent.action, PermissionActionKind::FileRead);
+        assert_eq!(
+            intent.scope.entries.get("skill_origin_0_skill_slug"),
+            Some(&"user:weather".to_owned())
+        );
         assert!(matches!(
             ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
             PermissionDecision::Ask {
@@ -2763,7 +3589,7 @@ mod tests {
     }
 
     #[test]
-    fn extractor_allows_computer_use_preflight_as_internal() {
+    fn extractor_requires_computer_use_permission_for_preflight() {
         let invocation = invocation_for_tool(
             "computer_use",
             ToolPayload::Function {
@@ -2773,17 +3599,18 @@ mod tests {
         let intent = extract_permission_intent(&invocation);
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
 
-        assert_eq!(intent.action, PermissionActionKind::Internal);
+        assert_eq!(intent.action, PermissionActionKind::ComputerUse);
         assert_eq!(
             intent.scope.entries.get("action"),
             Some(&"preflight".to_owned())
         );
-        assert_eq!(
+        assert!(matches!(
             ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-            PermissionDecision::Allow {
-                reason: PermissionDecisionReason::PolicyAllowsAction
+            PermissionDecision::Ask {
+                reason: PermissionDecisionReason::PolicyRequiresApproval,
+                ..
             }
-        );
+        ));
     }
 
     #[test]
@@ -2820,6 +3647,95 @@ mod tests {
     }
 
     #[test]
+    fn computer_use_permission_scope_binds_effective_launch_target_and_command() {
+        let first = invocation_for_tool(
+            "computer_use",
+            ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "action": "start",
+                    "goal": "Inspect app",
+                    "launch_command": "ignored-top-level-command",
+                    "target": {
+                        "type": "bundle_id",
+                        "bundle_id": "com.example.First",
+                        "launch_if_missing": true,
+                        "launch_command": "open -b com.example.First"
+                    }
+                }),
+            },
+        );
+        let second = invocation_for_tool(
+            "computer_use",
+            ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "action": "start",
+                    "goal": "Inspect app",
+                    "target": {
+                        "type": "bundle_id",
+                        "bundle_id": "com.example.Second",
+                        "launch_if_missing": true,
+                        "launch_command": "open -b com.example.Second"
+                    }
+                }),
+            },
+        );
+
+        let first_intent = extract_permission_intent(&first);
+        let second_intent = extract_permission_intent(&second);
+
+        assert_eq!(
+            first_intent.scope.entries.get("target_bundle_id"),
+            Some(&"com.example.First".to_owned())
+        );
+        assert_eq!(
+            first_intent.scope.entries.get("launch_command"),
+            Some(&"open -b com.example.First".to_owned()),
+            "the nested target command is the effective runtime command"
+        );
+        assert_ne!(
+            first_intent.scope.normalized_hash(),
+            second_intent.scope.normalized_hash(),
+            "turn approval for one desktop target must not authorize another"
+        );
+    }
+
+    #[test]
+    fn computer_use_permission_scope_binds_act_payload_without_exposing_typed_text() {
+        let invocation = invocation_for_tool(
+            "computer_use",
+            ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "action": "act",
+                    "session_id": 42,
+                    "act": {
+                        "type": "input_type_text",
+                        "target": { "node_id": "password-field", "snapshot_id": "s1" },
+                        "text": "super-secret-password"
+                    }
+                }),
+            },
+        );
+
+        let intent = extract_permission_intent(&invocation);
+        let rendered_scope = serde_json::to_string(&intent.scope.entries).expect("scope JSON");
+
+        assert_eq!(
+            intent.scope.entries.get("act_type"),
+            Some(&"input_type_text".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("input_text_present"),
+            Some(&"true".to_owned())
+        );
+        assert_eq!(
+            intent.scope.entries.get("input_text_bytes"),
+            Some(&"21".to_owned())
+        );
+        assert!(!rendered_scope.contains("super-secret-password"));
+        assert!(intent.scope.entries.contains_key("payload_hash"));
+    }
+
+    #[test]
     fn malformed_computer_use_is_still_computer_use() {
         let invocation = invocation_for_tool(
             "computer_use",
@@ -2837,7 +3753,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_discovery_tools_are_allowed_in_restricted_profiles() {
+    fn read_only_domain_tools_remain_allowed_but_domain_mutations_require_approval() {
         let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
         let invocations = [
             invocation_for_tool(
@@ -2945,6 +3861,12 @@ mod tests {
                 },
             ),
             invocation_for_tool(
+                "task_result",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({ "candidateId": "candidate_a" }),
+                },
+            ),
+            invocation_for_tool(
                 "task_accept",
                 ToolPayload::Function {
                     arguments: serde_json::json!({ "candidateId": "candidate_a" }),
@@ -2990,14 +3912,284 @@ mod tests {
 
         for invocation in invocations {
             let intent = extract_permission_intent(&invocation);
-
-            assert_eq!(intent.action, PermissionActionKind::Internal);
-            assert_eq!(
-                ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
-                PermissionDecision::Allow {
-                    reason: PermissionDecisionReason::PolicyAllowsAction
-                }
-            );
+            if matches!(
+                invocation.tool_name.as_str(),
+                "task_create"
+                    | "task_accept"
+                    | "task_revise"
+                    | "task_cancel"
+                    | "task_update"
+                    | "task_detach"
+                    | "task_reschedule"
+                    | "task_pause"
+                    | "task_resume"
+            ) {
+                assert_eq!(intent.action, PermissionActionKind::TaskSubagent);
+                assert!(matches!(
+                    ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
+                    PermissionDecision::Ask {
+                        reason: PermissionDecisionReason::PolicyRequiresApproval,
+                        ..
+                    }
+                ));
+            } else if matches!(
+                invocation.tool_name.as_str(),
+                "memory_remember" | "memory_forget"
+            ) {
+                assert_eq!(intent.action, PermissionActionKind::MemoryWrite);
+                assert!(matches!(
+                    ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
+                    PermissionDecision::Ask {
+                        reason: PermissionDecisionReason::PolicyRequiresApproval,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(intent.action, PermissionActionKind::Internal);
+                assert_eq!(
+                    ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
+                    PermissionDecision::Allow {
+                        reason: PermissionDecisionReason::PolicyAllowsAction
+                    }
+                );
+            }
         }
+    }
+
+    #[test]
+    fn memory_forget_dry_run_is_read_only_but_mutations_require_approval() {
+        let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
+        let preview = invocation_for_tool(
+            "memory_forget",
+            ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "memoryId": "mem_a",
+                    "dryRun": true
+                }),
+            },
+        );
+        let preview_intent = extract_permission_intent(&preview);
+        assert_eq!(preview_intent.action, PermissionActionKind::Internal);
+        assert_eq!(
+            preview_intent.scope.entries.get("memory_id"),
+            Some(&"mem_a".to_owned())
+        );
+        assert!(matches!(
+            ProfileToolPermissionEvaluator.evaluate(&context, &preview, &preview_intent),
+            PermissionDecision::Allow { .. }
+        ));
+
+        let remember = invocation_for_tool(
+            "memory_remember",
+            ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "scope": "user",
+                    "category": "preference",
+                    "key": "tone",
+                    "content": "concise"
+                }),
+            },
+        );
+        let remember_intent = extract_permission_intent(&remember);
+        assert_eq!(remember_intent.action, PermissionActionKind::MemoryWrite);
+        assert_eq!(
+            remember_intent.scope.entries.get("key"),
+            Some(&"tone".to_owned())
+        );
+        assert!(matches!(
+            ProfileToolPermissionEvaluator.evaluate(&context, &remember, &remember_intent),
+            PermissionDecision::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn agent_catalog_is_internal_but_agent_mutations_have_semantic_permissions() {
+        let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
+        let options = invocation_for_tool(
+            "agent_start_options",
+            ToolPayload::Function {
+                arguments: serde_json::json!({}),
+            },
+        );
+        let options_intent = extract_permission_intent(&options);
+        assert_eq!(options_intent.action, PermissionActionKind::Internal);
+        assert!(matches!(
+            ProfileToolPermissionEvaluator.evaluate(&context, &options, &options_intent),
+            PermissionDecision::Allow { .. }
+        ));
+
+        for (name, arguments) in [
+            (
+                "thread_message_send",
+                serde_json::json!({ "targetOptionId": "target_a", "input": {} }),
+            ),
+            (
+                "thread_create",
+                serde_json::json!({ "optionId": "create_a" }),
+            ),
+            (
+                "agent_start",
+                serde_json::json!({ "targetOptionId": "target_a", "input": {}, "launch": {} }),
+            ),
+        ] {
+            let invocation = invocation_for_tool(name, ToolPayload::Function { arguments });
+            let intent = extract_permission_intent(&invocation);
+            assert_eq!(intent.action, PermissionActionKind::AgentAction);
+            assert_eq!(
+                intent.scope.entries.get("domain"),
+                Some(&"agent".to_owned())
+            );
+            assert!(matches!(
+                ProfileToolPermissionEvaluator.evaluate(&context, &invocation, &intent),
+                PermissionDecision::Ask {
+                    reason: PermissionDecisionReason::PolicyRequiresApproval,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn turn_scoped_mutation_approvals_are_bound_to_complete_payloads() {
+        let cases = [
+            (
+                "memory_remember",
+                serde_json::json!({
+                    "scope": "user",
+                    "category": "preference",
+                    "key": "editor",
+                    "content": "first-secret-value"
+                }),
+                serde_json::json!({
+                    "scope": "user",
+                    "category": "preference",
+                    "key": "editor",
+                    "content": "second-secret-value"
+                }),
+            ),
+            (
+                "task_create",
+                serde_json::json!({ "title": "First", "goal": "first-private-goal" }),
+                serde_json::json!({ "title": "Second", "goal": "second-private-goal" }),
+            ),
+            (
+                "agent_start",
+                serde_json::json!({
+                    "targetOptionId": "same-target",
+                    "input": { "prompt": "first-private-agent-input" }
+                }),
+                serde_json::json!({
+                    "targetOptionId": "same-target",
+                    "input": { "prompt": "second-private-agent-input" }
+                }),
+            ),
+            (
+                "web_search",
+                serde_json::json!({ "query": "first-private-query" }),
+                serde_json::json!({ "query": "second-private-query" }),
+            ),
+        ];
+
+        for (tool_name, first, second) in cases {
+            let first = extract_permission_intent(&invocation_for_tool(
+                tool_name,
+                ToolPayload::Function { arguments: first },
+            ));
+            let second = extract_permission_intent(&invocation_for_tool(
+                tool_name,
+                ToolPayload::Function { arguments: second },
+            ));
+            assert!(
+                first.scope.entries.contains_key("payload_hash"),
+                "{tool_name}"
+            );
+            assert_ne!(
+                first.scope.normalized_hash(),
+                second.scope.normalized_hash(),
+                "changed {tool_name} payload must require a distinct decision"
+            );
+            let rendered = serde_json::to_string(&first.scope.entries).expect("scope JSON");
+            assert!(!rendered.contains("first-private"), "{tool_name}");
+        }
+    }
+
+    #[test]
+    fn mcp_approval_is_bound_to_arguments_without_exposing_them() {
+        let invocation = |arguments| {
+            invocation_for_tool(
+                "mcp_repo_mutate",
+                ToolPayload::Mcp {
+                    server: "srv_repo".to_owned(),
+                    tool: "mutate".to_owned(),
+                    arguments,
+                    read_only_hint: Some(false),
+                    destructive_hint: Some(true),
+                    open_world_hint: Some(false),
+                },
+            )
+        };
+        let first = extract_permission_intent(&invocation(serde_json::json!({
+            "path": "first-private-path"
+        })));
+        let second = extract_permission_intent(&invocation(serde_json::json!({
+            "path": "second-private-path"
+        })));
+
+        assert_ne!(
+            first.scope.normalized_hash(),
+            second.scope.normalized_hash()
+        );
+        let rendered = serde_json::to_string(&first.scope.entries).expect("scope JSON");
+        assert!(!rendered.contains("first-private-path"));
+        assert!(first.scope.entries.contains_key("payload_hash"));
+    }
+
+    #[test]
+    fn dynamic_http_approval_is_bound_to_payload_and_selected_skill_revision() {
+        let mut first = invocation_for_tool(
+            "skill_http",
+            ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "url": "https://example.com/action",
+                    "method": "POST",
+                    "body": { "secret": "first-private-body" }
+                }),
+            },
+        );
+        first.permission_metadata = dynamic_skill_metadata(
+            DynamicSkillPermissionKind::Http,
+            None,
+            Some("POST"),
+            Some("https://example.com/action"),
+        );
+        let mut second = first.clone();
+        second.payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "url": "https://example.com/action",
+                "method": "POST",
+                "body": { "secret": "second-private-body" }
+            }),
+        };
+        let first_intent = extract_permission_intent(&first);
+        let second_intent = extract_permission_intent(&second);
+        assert_ne!(
+            first_intent.scope.normalized_hash(),
+            second_intent.scope.normalized_hash()
+        );
+
+        let mut revised = first.clone();
+        revised
+            .permission_metadata
+            .dynamic_skill
+            .as_mut()
+            .expect("skill metadata")
+            .skill_fingerprint = "revised-fingerprint".to_owned();
+        let revised_intent = extract_permission_intent(&revised);
+        assert_ne!(
+            first_intent.scope.normalized_hash(),
+            revised_intent.scope.normalized_hash()
+        );
+        let rendered = serde_json::to_string(&first_intent.scope.entries).expect("scope JSON");
+        assert!(!rendered.contains("first-private-body"));
     }
 }

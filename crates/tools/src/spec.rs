@@ -109,6 +109,9 @@ pub struct DynamicSkillPermissionMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_owner: Option<String>,
     pub skill_slug: String,
+    /// Immutable selected-skill revision. Permission cache entries must not
+    /// survive a tool configuration/body change under the same slug.
+    pub skill_fingerprint: String,
     pub source_kind: String,
     pub trust_level: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +126,15 @@ pub struct DynamicSkillPermissionMetadata {
 pub struct ToolPermissionMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_skill: Option<DynamicSkillPermissionMetadata>,
+    /// Dynamic skill wrappers that delegated this invocation. The target tool
+    /// keeps its own permission metadata; origins only tighten its policy and
+    /// add provenance to the single target-specific approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_dynamic_skills: Vec<DynamicSkillPermissionMetadata>,
+    /// Configured destinations used by a handler when they cannot be derived
+    /// from model-visible arguments (for example the web-search backends).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

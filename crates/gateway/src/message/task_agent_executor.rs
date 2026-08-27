@@ -7783,7 +7783,7 @@ async fn resolve_task_child_execution_security_snapshot(
         })?
         .snapshot;
 
-    crate::turn_security::resolve_task_child_execution_security(
+    let mut snapshot = crate::turn_security::resolve_task_child_execution_security(
         workspace_id,
         parent_turn_id,
         &parent_snapshot,
@@ -7793,7 +7793,14 @@ async fn resolve_task_child_execution_security_snapshot(
         child_thread_id.to_owned(),
         child_turn_id.to_owned(),
         now_timestamp_secs().saturating_mul(1000),
-    )
+    )?;
+    processor.add_native_turn_runtime_sandbox_roots(
+        &mut snapshot,
+        workspace_id,
+        child_thread_id,
+        child_turn_id,
+    )?;
+    Ok(snapshot)
 }
 
 async fn resolve_task_child_cli_execution_security_snapshot(
@@ -8064,8 +8071,10 @@ fn task_tool_policy_permission_snapshot(
         policy.network = PermissionBehavior::Deny;
     }
     policy.allowed_tools = normalized_task_policy_values(&tool_policy.allowed_tools);
+    policy.allowed_tools_restricted = !policy.allowed_tools.is_empty();
     policy.denied_tools = normalized_task_policy_values(&tool_policy.denied_tools);
     policy.allowed_paths = normalized_task_policy_values(&tool_policy.allowed_paths);
+    policy.allowed_paths_restricted = !policy.allowed_paths.is_empty();
     policy
 }
 

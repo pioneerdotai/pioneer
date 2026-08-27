@@ -12,8 +12,9 @@ use pioneer_skills::{
     ExternalRuntimeReceiptConversionCandidate, ExternalRuntimeSkillReceiptEntry,
     compute_skill_folder_hash, ensure_external_runtime_receipt_v2,
     external_runtime_skill_is_current, find_external_runtime_receipt_destination_entry,
-    remove_external_runtime_receipt_destination_entry, replace_external_runtime_skill,
-    upsert_external_runtime_receipt_entry, write_external_runtime_receipt_atomic,
+    read_external_runtime_receipt, remove_external_runtime_receipt_destination_entry,
+    replace_external_runtime_skill, upsert_external_runtime_receipt_entry,
+    write_external_runtime_receipt_atomic,
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -23,6 +24,13 @@ pub(crate) const CLI_RUNTIME_SYSTEM_SKILL_NOT_EXPORTABLE: &str =
     "cli_runtime.system_skill_not_exportable";
 pub(crate) const CLI_RUNTIME_CLAUDE_SKILL_NOT_MODEL_INVOCABLE: &str =
     "cli_runtime.claude_skill_not_model_invocable";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CliRuntimeSelectedSkill {
+    pub install_name: String,
+    pub installed_path: PathBuf,
+    pub source_folder_hash: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CliRuntimeSystemSkillNotExportable {
@@ -174,6 +182,101 @@ pub(crate) fn build_cli_runtime_skill_install_plans(
         });
     }
     Ok(plans)
+}
+
+pub(crate) fn restore_cli_runtime_selected_skills(
+    runtime: &pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+    bindings: &[TurnSkillBinding],
+    receipt_path: &Path,
+) -> Result<Vec<CliRuntimeSelectedSkill>> {
+    if bindings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let runtime_kind_name = match runtime_kind {
+        pioneer_protocol::CLIAgentRuntimeKind::Codex => "codex",
+        pioneer_protocol::CLIAgentRuntimeKind::Claude => "claude",
+    };
+    let native_skills_root = cli_runtime_native_skills_root(runtime, runtime_kind)?;
+    let receipt = read_external_runtime_receipt(receipt_path)?;
+    let mut selected = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let entries = receipt
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.runtime_id == runtime.id
+                    && entry.runtime_kind == runtime_kind_name
+                    && entry.skill_id == binding.skill_id
+            })
+            .collect::<Vec<_>>();
+        let [entry] = entries.as_slice() else {
+            anyhow::bail!(
+                "CLI runtime skill `{}` does not have one exact installation receipt",
+                binding.skill_id
+            );
+        };
+        if entry.owner != binding.skill_owner
+            || entry.slug != binding.skill_slug
+            || entry.source_kind != binding.source_kind
+        {
+            anyhow::bail!(
+                "CLI runtime skill `{}` receipt differs from its frozen projection",
+                binding.skill_id
+            );
+        }
+        if pioneer_skills::sanitize_name(entry.install_name.as_str()) != entry.install_name {
+            anyhow::bail!(
+                "CLI runtime skill `{}` receipt has a non-canonical install name",
+                binding.skill_id
+            );
+        }
+        let receipt_root = normalized_destination(Path::new(entry.native_skills_root.as_str()))?;
+        if receipt_root != native_skills_root {
+            anyhow::bail!(
+                "CLI runtime skill `{}` receipt names a different native skill root",
+                binding.skill_id
+            );
+        }
+        let expected_path = normalized_destination(
+            native_skills_root
+                .join(entry.install_name.as_str())
+                .as_path(),
+        )?;
+        let installed_path = normalized_destination(Path::new(entry.install_path.as_str()))?;
+        if installed_path != expected_path {
+            anyhow::bail!(
+                "CLI runtime skill `{}` receipt escapes its configured native skill root",
+                binding.skill_id
+            );
+        }
+        let actual_hash =
+            compute_skill_folder_hash(installed_path.as_path()).with_context(|| {
+                format!(
+                    "failed to verify restored CLI runtime skill `{}`",
+                    binding.skill_id
+                )
+            })?;
+        if actual_hash != entry.source_folder_hash {
+            anyhow::bail!(
+                "CLI runtime skill `{}` installed content differs from its receipt",
+                binding.skill_id
+            );
+        }
+        selected.push(CliRuntimeSelectedSkill {
+            install_name: entry.install_name.clone(),
+            installed_path,
+            source_folder_hash: entry.source_folder_hash.clone(),
+        });
+    }
+    selected.sort_by(|left, right| left.install_name.cmp(&right.install_name));
+    if selected
+        .windows(2)
+        .any(|pair| pair[0].install_name == pair[1].install_name)
+    {
+        anyhow::bail!("CLI runtime selected skill installation names collide");
+    }
+    Ok(selected)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,6 +446,16 @@ pub(crate) struct CliRuntimeSkillInstallResult {
     pub source_folder_hash: String,
     pub installed_path: PathBuf,
     pub receipt_updated_at_unix_ms: u64,
+}
+
+impl From<&CliRuntimeSkillInstallResult> for CliRuntimeSelectedSkill {
+    fn from(value: &CliRuntimeSkillInstallResult) -> Self {
+        Self {
+            install_name: value.install_name.clone(),
+            installed_path: value.installed_path.clone(),
+            source_folder_hash: value.source_folder_hash.clone(),
+        }
+    }
 }
 
 fn unix_timestamp_millis() -> u64 {
@@ -1338,6 +1451,78 @@ mod tests {
         assert_eq!(receipt.entries.len(), 2);
         assert_eq!(receipt.entries[0].install_name, "one");
         assert_eq!(receipt.entries[1].install_name, "two");
+    }
+
+    #[tokio::test]
+    async fn claude_selected_skill_restore_is_exact_and_rejects_receipt_or_content_drift() {
+        use pioneer_config::GatewayCliAgentRuntimeKindConfig;
+        use pioneer_protocol::CLIAgentRuntimeKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = install_plan(temp.path(), "one");
+        plan.runtime_kind = "claude".to_owned();
+        let destination_locks = new_cli_runtime_skill_destination_locks();
+        let receipt_lock = Arc::new(Mutex::new(()));
+        let candidates = [receipt_candidate(&plan)];
+        let installed =
+            install_one_cli_runtime_skill(&destination_locks, &receipt_lock, &candidates, &plan)
+                .await
+                .unwrap();
+        let runtime = runtime_instance(
+            GatewayCliAgentRuntimeKindConfig::Claude,
+            temp.path()
+                .join("claude-home")
+                .to_string_lossy()
+                .into_owned(),
+            Some(temp.path().join("runtime").to_string_lossy().into_owned()),
+        );
+        let binding = TurnSkillBinding {
+            skill_id: plan.skill_id.clone(),
+            skill_owner: plan.owner.clone(),
+            skill_slug: plan.slug.clone(),
+            skill_version: None,
+            fingerprint: "frozen-definition-fingerprint".to_owned(),
+            source_kind: plan.source_kind.clone(),
+            resolved_reason: "explicit_capability".to_owned(),
+        };
+
+        let selected = restore_cli_runtime_selected_skills(
+            &runtime,
+            CLIAgentRuntimeKind::Claude,
+            std::slice::from_ref(&binding),
+            plan.receipt_path.as_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            vec![CliRuntimeSelectedSkill {
+                install_name: installed.install_name,
+                installed_path: installed.installed_path.clone(),
+                source_folder_hash: installed.source_folder_hash,
+            }]
+        );
+
+        fs::write(installed.installed_path.join("SKILL.md"), b"# replaced\n").unwrap();
+        let drift = restore_cli_runtime_selected_skills(
+            &runtime,
+            CLIAgentRuntimeKind::Claude,
+            std::slice::from_ref(&binding),
+            plan.receipt_path.as_path(),
+        )
+        .unwrap_err();
+        assert!(format!("{drift:#}").contains("installed content differs"));
+
+        let mut receipt = read_external_runtime_receipt(plan.receipt_path.as_path()).unwrap();
+        receipt.entries[0].install_name = "../outside".to_owned();
+        write_external_runtime_receipt_atomic(plan.receipt_path.as_path(), &receipt).unwrap();
+        let escaped = restore_cli_runtime_selected_skills(
+            &runtime,
+            CLIAgentRuntimeKind::Claude,
+            std::slice::from_ref(&binding),
+            plan.receipt_path.as_path(),
+        )
+        .unwrap_err();
+        assert!(format!("{escaped:#}").contains("non-canonical install name"));
     }
 
     #[cfg(unix)]

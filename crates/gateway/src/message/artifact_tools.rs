@@ -359,7 +359,7 @@ impl MessageProcessor {
         self.artifact_output_dirs
             .lock()
             .await
-            .insert(turn_id.to_owned(), output_dir.path.display().to_string());
+            .insert(turn_id.to_owned(), output_dir);
         Ok(environment)
     }
 
@@ -467,7 +467,12 @@ impl MessageProcessor {
             .get(turn_id)
             .map(|state| state.prepared_outputs())
             .unwrap_or_default();
-        let output_dir = self.artifact_output_dirs.lock().await.get(turn_id).cloned();
+        let output_dir = self
+            .artifact_output_dirs
+            .lock()
+            .await
+            .get(turn_id)
+            .map(|output| output.path.display().to_string());
 
         artifact_finalization_diagnostics::diagnose_artifact_finalization(
             prepared_outputs.as_slice(),

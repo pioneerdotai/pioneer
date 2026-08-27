@@ -371,8 +371,12 @@ fn synthetic_observer_permission_cap() -> TurnPermissionProfileCap {
             dynamic_skill_tool: pioneer_protocol::PermissionBehavior::Deny,
             computer_use: pioneer_protocol::PermissionBehavior::Deny,
             task_subagent: pioneer_protocol::PermissionBehavior::Deny,
+            memory_write: pioneer_protocol::PermissionBehavior::Deny,
+            agent_action: pioneer_protocol::PermissionBehavior::Deny,
+            allowed_tools_restricted: true,
             allowed_tools: vec!["review_read".to_owned()],
             denied_tools: vec!["shell".to_owned()],
+            allowed_paths_restricted: false,
             allowed_paths: Vec::new(),
         },
     }

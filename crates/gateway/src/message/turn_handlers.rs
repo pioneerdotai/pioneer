@@ -268,6 +268,24 @@ fn native_turn_admission_digest(
     Ok(hex::encode(Sha256::digest(canonical)))
 }
 
+fn cli_runtime_session_authorization_scope_fingerprint(
+    context: &crate::authorization::ExecutionAuthorizationContext,
+    security: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let authorization = context.cli_runtime_collaboration_scope_fingerprint()?;
+    let canonical = serde_json::to_vec(&(
+        authorization,
+        &security.permission_profile,
+        &security.authority_cap,
+        &security.approval,
+        &security.backend,
+    ))
+    .context("failed to encode CLI runtime session authorization scope")?;
+    Ok(hex::encode(Sha256::digest(canonical)))
+}
+
 fn validate_root_agent_launch_matches_turn(
     params: &TurnStartParams,
 ) -> Result<(), TurnStartFailure> {
@@ -4266,6 +4284,27 @@ impl MessageProcessor {
                 success_response.task_permission_profile().map(|profile| {
                     pioneer_protocol::TurnPermissionProfileSelection { mode: profile.mode }
                 });
+            if let Err(error) =
+                super::message_turn::normalize_turn_collaboration_params(&mut params)
+            {
+                send_turn_start_failure!(format!("invalid Turn collaboration metadata: {error}"));
+                return None;
+            }
+            let resolved_permission_profile = match &execution_authority {
+                TurnExecutionAuthority::Fresh(admission)
+                    if admission.uses_scoped_collaboration_policy() =>
+                {
+                    let requested = pioneer_protocol::resolve_turn_permission_profile(
+                        params.permission_profile.as_ref(),
+                    );
+                    Some(admission.cap_permission_profile(&requested))
+                }
+                TurnExecutionAuthority::Fresh(_) | TurnExecutionAuthority::Durable { .. } => None,
+            };
+            if let Some(profile) = resolved_permission_profile.as_ref() {
+                params.permission_profile =
+                    Some(pioneer_protocol::TurnPermissionProfileSelection { mode: profile.mode });
+            }
             let permission_adapter =
                 crate::cli_runtime::permissions::adapt_cli_runtime_permissions_for_turn(
                     runtime_kind,
@@ -4311,27 +4350,6 @@ impl MessageProcessor {
                 .as_ref()
                 .and_then(|options| options.summary.clone());
 
-            if let Err(error) =
-                super::message_turn::normalize_turn_collaboration_params(&mut params)
-            {
-                send_turn_start_failure!(format!("invalid Turn collaboration metadata: {error}"));
-                return None;
-            }
-            let resolved_permission_profile = match &execution_authority {
-                TurnExecutionAuthority::Fresh(admission)
-                    if admission.uses_scoped_collaboration_policy() =>
-                {
-                    let requested = pioneer_protocol::resolve_turn_permission_profile(
-                        params.permission_profile.as_ref(),
-                    );
-                    Some(admission.cap_permission_profile(&requested))
-                }
-                TurnExecutionAuthority::Fresh(_) | TurnExecutionAuthority::Durable { .. } => None,
-            };
-            if let Some(profile) = resolved_permission_profile.as_ref() {
-                params.permission_profile =
-                    Some(pioneer_protocol::TurnPermissionProfileSelection { mode: profile.mode });
-            }
             let security_params = params.clone();
             #[cfg(test)]
             self.cli_runtime_skill_preflight_test_events
@@ -5077,14 +5095,64 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            let execution_authorization_context = match self
+                .load_turn_execution_authorization_context(
+                    outcome.started_notification.turn.id.as_str(),
+                )
+                .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!(
+                            "failed to bind CLI runtime session authorization scope: {error:#}"
+                        ),
+                    )
+                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to bind CLI runtime session authorization scope: {error:#}"
+                    ));
+                    return;
+                }
+            };
+            let authorization_scope_fingerprint =
+                match cli_runtime_session_authorization_scope_fingerprint(
+                    &execution_authorization_context,
+                    &security_snapshot,
+                ) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            format!(
+                                "failed to fingerprint CLI runtime session authorization scope: {error:#}"
+                            ),
+                        )
+                        .await;
+                        send_turn_start_failure!(format!(
+                            "failed to fingerprint CLI runtime session authorization scope: {error:#}"
+                        ));
+                        return;
+                    }
+                };
             let native_cwd = security_snapshot.sandbox.cwd.clone();
             let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
             let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                 cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
                 approval_policy: Some(effective_approval_policy.clone()),
+                authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
                 env: proxy_env,
-                enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                    && !installed_skills.is_empty(),
+                selected_skills: if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) {
+                    installed_skills
+                        .iter()
+                        .map(crate::cli_runtime::skills::CliRuntimeSelectedSkill::from)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
                     .then_some(elevated_instructions.clone()),
                 ..Default::default()
@@ -6268,12 +6336,60 @@ impl MessageProcessor {
                 };
             }
         };
+        let authorization_scope_fingerprint =
+            match cli_runtime_session_authorization_scope_fingerprint(
+                &authorization_context,
+                &security_snapshot,
+            ) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                        diagnostic: format!(
+                            "CLI runtime continuation authorization scope is invalid: {error:#}"
+                        ),
+                    };
+                }
+            };
+        let selected_skills = if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) {
+            let frozen_bindings = skill_bindings
+                .iter()
+                .map(|binding| pioneer_protocol::TurnSkillBinding {
+                    skill_id: binding.skill_id.clone(),
+                    skill_owner: binding.skill_owner.clone(),
+                    skill_slug: binding.skill_slug.clone(),
+                    skill_version: binding.skill_version.clone(),
+                    fingerprint: binding.fingerprint.clone(),
+                    source_kind: binding.source_kind.clone(),
+                    resolved_reason: binding.resolved_reason.clone(),
+                })
+                .collect::<Vec<_>>();
+            let receipt_path = self
+                .artifact_runtime_home
+                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
+            match crate::cli_runtime::skills::restore_cli_runtime_selected_skills(
+                &runtime,
+                runtime_kind,
+                frozen_bindings.as_slice(),
+                receipt_path.as_path(),
+            ) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                        diagnostic: format!(
+                            "failed to restore exact Claude skill projection: {error:#}"
+                        ),
+                    };
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
             cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
             approval_policy: binding.approval_policy.clone(),
+            authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
             env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
-            enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                && !skill_bindings.is_empty(),
+            selected_skills,
             elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
                 .then_some(elevated_instructions.clone()),
             ..Default::default()
@@ -6927,6 +7043,17 @@ impl MessageProcessor {
             )?
         };
         snapshot.authority_cap.resource_binding_revision = execution_authority.policy_revision();
+        self.add_native_turn_runtime_sandbox_roots(
+            &mut snapshot,
+            outcome.started_notification.workspace_id.as_str(),
+            outcome.started_notification.thread_id.as_str(),
+            outcome.started_notification.turn.id.as_str(),
+        )
+        .map_err(|error| {
+            TurnStartFailure::internal(format!(
+                "failed to resolve native runtime sandbox roots: {error:#}"
+            ))
+        })?;
         self.log_turn_security_snapshot(
             outcome.started_notification.workspace_id.as_str(),
             outcome.started_notification.thread_id.as_str(),
@@ -6941,6 +7068,37 @@ impl MessageProcessor {
             )));
         }
         Ok(snapshot)
+    }
+
+    pub(crate) fn add_native_turn_runtime_sandbox_roots(
+        &self,
+        snapshot: &mut pioneer_protocol::TurnExecutionSecuritySnapshot,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        if snapshot.backend.execution_backend
+            != pioneer_protocol::TurnSecurityExecutionBackendKind::Native
+            || snapshot.sandbox.filesystem.kind
+                == pioneer_protocol::TurnFilesystemSandboxKind::Unrestricted
+        {
+            return Ok(());
+        }
+
+        for root in self.turn_security_app_read_roots(workspace_id)? {
+            crate::turn_security::add_native_runtime_read_root(snapshot, root.as_path());
+        }
+        let artifact_output_root = pioneer_artifacts::artifact_output_dir_path(
+            self.artifact_runtime_home.join("artifacts").as_path(),
+            workspace_id,
+            thread_id,
+            turn_id,
+        )?;
+        crate::turn_security::add_native_runtime_write_root(
+            snapshot,
+            artifact_output_root.as_path(),
+        );
+        Ok(())
     }
 
     pub(crate) async fn load_turn_execution_authorization_context(

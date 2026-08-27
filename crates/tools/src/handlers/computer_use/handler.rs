@@ -5,6 +5,7 @@ use crate::ComputerUseToolsConfig;
 use crate::context::{ToolInvocation, ToolOutput};
 use crate::error::ToolError;
 use crate::events::ToolEventTrace;
+use crate::process_policy::ProcessEnvironmentPlan;
 use crate::registry::ToolHandler;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -41,26 +42,39 @@ impl ToolHandler for ComputerUseHandler {
         invocation: ToolInvocation,
         trace: ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        let process_environment = ProcessEnvironmentPlan::from_snapshot(
+            invocation.execution_security_snapshot.as_ref(),
+            &invocation.environment,
+        );
         let args = parse_computer_use_args(invocation.payload)?;
         let action = args.action.trim().to_ascii_lowercase();
         validate_computer_use_action_contract(&args, action.as_str())?;
 
         let output = match action.as_str() {
-            "preflight" => self.handle_preflight(invocation.attempt_id, &trace).await?,
+            "preflight" => {
+                self.handle_preflight(invocation.attempt_id, &trace, &process_environment)
+                    .await?
+            }
             "list_displays" => {
                 self.handle_list_displays(invocation.attempt_id, &trace)
                     .await?
             }
-            "list_apps" => self.handle_list_apps(invocation.attempt_id, &trace).await?,
+            "list_apps" => {
+                self.handle_list_apps(invocation.attempt_id, &trace, &process_environment)
+                    .await?
+            }
             "start" => {
-                self.handle_start(args, invocation.attempt_id, &trace)
+                self.handle_start(args, invocation.attempt_id, &trace, &process_environment)
                     .await?
             }
             "snapshot" => {
                 self.handle_snapshot(args, invocation.attempt_id, &trace)
                     .await?
             }
-            "act" => self.handle_act(args, invocation.attempt_id, &trace).await?,
+            "act" => {
+                self.handle_act(args, invocation.attempt_id, &trace, &process_environment)
+                    .await?
+            }
             "verify" => {
                 self.handle_verify(args, invocation.attempt_id, &trace)
                     .await?

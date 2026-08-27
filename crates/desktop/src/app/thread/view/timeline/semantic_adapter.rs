@@ -136,6 +136,7 @@ fn pending_request_from_semantic_block(
             thread_id: Some(block.thread_id.clone()),
             turn_id: block.turn_id.clone(),
             item_id: item_id.clone(),
+            visible_thread_ids: Vec::new(),
             request: request.clone(),
         }
         .into_pending_request(),
@@ -266,6 +267,7 @@ mod tests {
             thread_id: Some("thread_a".to_owned()),
             turn_id: Some("turn_a".to_owned()),
             item_id: None,
+            visible_thread_ids: Vec::new(),
             request: CLIRuntimePendingRequest {
                 kind: CLIRuntimeRequestKind::CommandApproval,
                 title: Some("Run command".to_owned()),

@@ -479,7 +479,7 @@ pub struct MessageProcessor {
         Arc<Mutex<HashMap<String, tokio::sync::OwnedMutexGuard<()>>>>,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
-    artifact_output_dirs: Arc<Mutex<HashMap<String, String>>>,
+    artifact_output_dirs: Arc<Mutex<HashMap<String, pioneer_artifacts::ArtifactOutputDir>>>,
     turn_final_assistant_texts: Arc<Mutex<HashMap<String, String>>>,
     native_permission_pending_requests:
         Arc<Mutex<HashMap<String, PendingNativePermissionApprovalRequest>>>,

@@ -655,6 +655,16 @@ fn permission_policy_locks(
             requested.task_subagent,
             effective.task_subagent,
         ),
+        (
+            "memory_write",
+            requested.memory_write,
+            effective.memory_write,
+        ),
+        (
+            "agent_action",
+            requested.agent_action,
+            effective.agent_action,
+        ),
     ] {
         if requested != effective {
             locked.push(AuthorizationPermissionLock {

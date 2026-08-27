@@ -272,6 +272,7 @@ fn permission_metadata_for_descriptor(
             skill_id: descriptor.skill_id.clone(),
             skill_owner: descriptor.skill_owner.clone(),
             skill_slug: descriptor.skill_slug.clone(),
+            skill_fingerprint: descriptor.skill_fingerprint.clone(),
             source_kind: format!("{:?}", descriptor.source_kind),
             trust_level: format!("{:?}", descriptor.trust_level),
             target_tool: config
@@ -293,6 +294,8 @@ fn permission_metadata_for_descriptor(
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
         }),
+        nested_dynamic_skills: Vec::new(),
+        network_targets: Vec::new(),
     }
 }
 
@@ -616,17 +619,21 @@ impl ToolHandler for SkillHttpToolHandler {
             .cloned();
         let body = arguments.get("body").cloned();
 
-        let response = execute_buffered_http_request(BufferedHttpRequest {
-            method,
-            url,
-            timeout_ms,
-            follow_redirects: true,
-            user_agent: None,
-            headers: merged_headers,
-            query,
-            body,
-            max_bytes: MAX_HTTP_BODY_BYTES,
-        })
+        let response = execute_buffered_http_request(
+            BufferedHttpRequest {
+                method,
+                url,
+                timeout_ms,
+                follow_redirects: true,
+                user_agent: None,
+                headers: merged_headers,
+                query,
+                body,
+                max_bytes: MAX_HTTP_BODY_BYTES,
+            },
+            invocation.execution_security_snapshot.as_ref(),
+            "dynamic_skill_http",
+        )
         .await
         .map_err(|error| match error {
             ToolError::ExecutionFailed(message) => ToolError::execution_failed(format!(
@@ -741,13 +748,7 @@ impl ToolHandler for SkillShellToolHandler {
 
         let nested =
             execute_nested_tool_call(&runtime, &invocation, "exec_command", nested_arguments)
-                .await
-                .map_err(|error| {
-                    ToolError::execution_failed(format!(
-                        "shell skill tool `{}` execution failed: {error}",
-                        self.descriptor.canonical_tool_name
-                    ))
-                })?;
+                .await?;
 
         let raw_payload = nested.raw_output_json();
         let stdout = raw_payload
@@ -864,16 +865,42 @@ async fn execute_nested_tool_call(
         arguments: arguments.to_string(),
     };
 
-    let call = runtime
+    let mut call = runtime
         .router
         .build_tool_call(raw_call)
         .map_err(|error| ToolError::invalid_arguments(error.to_string()))?;
 
+    let mut origins = invocation.permission_metadata.nested_dynamic_skills.clone();
+    if let Some(origin) = invocation.permission_metadata.dynamic_skill.clone() {
+        if origins.contains(&origin) {
+            return Err(ToolError::Rejected(format!(
+                "dynamic skill proxy cycle detected at `{}`",
+                origin.skill_slug
+            )));
+        }
+        origins.push(origin);
+    }
+    // Each proxy re-enters the complete router/orchestrator stack. Two
+    // wrappers preserve a bounded composition use case; a third is rejected
+    // before the default Tokio worker stack can be exhausted. The historical
+    // limit of eight, and even a limit of four, overflowed before their guard
+    // could return a typed error in a standard runtime thread.
+    const MAX_DYNAMIC_SKILL_PROXY_DEPTH: usize = 2;
+    if origins.len() > MAX_DYNAMIC_SKILL_PROXY_DEPTH {
+        return Err(ToolError::Rejected(format!(
+            "dynamic skill proxy nesting exceeds the maximum depth of {MAX_DYNAMIC_SKILL_PROXY_DEPTH}"
+        )));
+    }
+    call.permission_metadata.nested_dynamic_skills = origins;
+
     runtime
         .runtime
-        .execute_nested_tool_call(call, invocation.workdir.clone())
+        .execute_nested_tool_call_with_cancellation(
+            call,
+            invocation.workdir.clone(),
+            invocation.cancellation.clone(),
+        )
         .await
-        .map_err(|error| ToolError::execution_failed(error.to_string()))
 }
 
 #[cfg(test)]

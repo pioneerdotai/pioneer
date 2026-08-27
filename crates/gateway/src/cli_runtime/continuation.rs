@@ -146,9 +146,10 @@ fn restart_relevant_options_changed(
 ) -> bool {
     old.cwd != new.cwd
         || old.approval_policy != new.approval_policy
+        || old.authorization_scope_fingerprint != new.authorization_scope_fingerprint
         || old.app_server_args != new.app_server_args
         || old.env != new.env
-        || old.enable_user_skills != new.enable_user_skills
+        || old.selected_skills != new.selected_skills
         || instruction_fingerprint(&old.elevated_instructions)
             != instruction_fingerprint(&new.elevated_instructions)
 }
@@ -230,6 +231,18 @@ mod tests {
                     ..pioneer_cli_agent_runtime::NativeEventBudget::default()
                 });
         assert!(requires_restart(&first, &narrowed));
+    }
+
+    #[test]
+    fn authorization_scope_change_restarts_provider_session_grants() {
+        let mut first_options = CLIAgentRuntimeSessionStartOptions::default();
+        first_options.authorization_scope_fingerprint = Some("shared-scope-a".to_owned());
+        let mut changed_options = first_options.clone();
+        changed_options.authorization_scope_fingerprint = Some("shared-scope-b".to_owned());
+        let first = CliSessionLaunchSpec::unmanaged_codex(first_options);
+        let changed = CliSessionLaunchSpec::unmanaged_codex(changed_options);
+
+        assert!(requires_restart(&first, &changed));
     }
 
     #[test]

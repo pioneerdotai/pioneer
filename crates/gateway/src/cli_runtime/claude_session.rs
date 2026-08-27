@@ -28,6 +28,7 @@ use crate::cli_runtime::permissions::{
     ClaudeMcpPermissionFallbackDecision, claude_mcp_permission_fallback_response,
 };
 use crate::cli_runtime::session_instance::{CliSessionGenerationAllocator, CliSessionInstanceId};
+use crate::cli_runtime::skills::CliRuntimeSelectedSkill;
 use crate::turn_mcp::invoker::{
     TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode, TurnMcpInvoker,
 };
@@ -61,9 +62,10 @@ use pioneer_crud::CliRuntimeProviderSessionLifecycle;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::ToolMetadataValue;
 use pioneer_runtime_events::{OrderedEventIngress, OrderedIngressConfig, OrderedIngressOffer};
+use pioneer_skills::{compute_skill_folder_hash, replace_external_runtime_skill, sanitize_name};
 use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write as StdWrite};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -952,6 +954,144 @@ impl Drop for ClaudeManagedMcpConfigStartupGuard {
     }
 }
 
+fn materialize_claude_selected_skill_plugins(
+    managed_mcp_config: &ClaudeManagedMcpConfigDescriptor,
+    selected_skills: &[CliRuntimeSelectedSkill],
+) -> Result<Vec<PathBuf>> {
+    let plugins_root = managed_mcp_config
+        .session_root_path
+        .join("selected-skill-plugins");
+    match std::fs::symlink_metadata(plugins_root.as_path()) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(plugins_root.as_path()).with_context(|| {
+                format!(
+                    "failed to reset managed Claude skill plugin root `{}`",
+                    plugins_root.display()
+                )
+            })?;
+        }
+        Ok(_) => bail!(
+            "managed Claude skill plugin root `{}` is not a real directory",
+            plugins_root.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect managed Claude skill plugin root `{}`",
+                    plugins_root.display()
+                )
+            });
+        }
+    }
+    if selected_skills.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir(plugins_root.as_path()).with_context(|| {
+        format!(
+            "failed to create managed Claude skill plugin root `{}`",
+            plugins_root.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            plugins_root.as_path(),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+    }
+
+    let mut plugins = Vec::with_capacity(selected_skills.len());
+    for (index, selected) in selected_skills.iter().enumerate() {
+        let install_name = sanitize_name(selected.install_name.as_str());
+        if install_name != selected.install_name {
+            bail!(
+                "selected Claude skill install name `{}` is not canonical",
+                selected.install_name
+            );
+        }
+        // Plugin identifiers are provider-facing and intentionally independent
+        // from the selected skill's install name: install names may legally
+        // contain characters that are not accepted by Claude's plugin-name
+        // grammar. The manifest still points to the exact canonical skill
+        // directory below this generation-scoped plugin root.
+        let plugin_name = format!("pioneer-selected-skill-{index}");
+        let plugin_root = plugins_root.join(plugin_name.as_str());
+        let skill_destination = plugin_root.join("skills").join(install_name.as_str());
+        replace_external_runtime_skill(
+            selected.installed_path.as_path(),
+            skill_destination.as_path(),
+        )
+        .with_context(|| {
+            format!(
+                "failed to snapshot selected Claude skill `{}`",
+                selected.install_name
+            )
+        })?;
+        let copied_hash =
+            compute_skill_folder_hash(skill_destination.as_path()).with_context(|| {
+                format!(
+                    "failed to fingerprint managed Claude skill snapshot `{}`",
+                    selected.install_name
+                )
+            })?;
+        if copied_hash != selected.source_folder_hash {
+            bail!(
+                "selected Claude skill `{}` changed after its installation receipt was verified",
+                selected.install_name
+            );
+        }
+
+        let manifest_dir = plugin_root.join(".claude-plugin");
+        std::fs::create_dir(manifest_dir.as_path()).with_context(|| {
+            format!(
+                "failed to create Claude skill plugin manifest directory `{}`",
+                manifest_dir.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                plugin_root.as_path(),
+                std::fs::Permissions::from_mode(0o700),
+            )?;
+            std::fs::set_permissions(
+                manifest_dir.as_path(),
+                std::fs::Permissions::from_mode(0o700),
+            )?;
+        }
+        let manifest_path = manifest_dir.join("plugin.json");
+        let manifest = serde_json::to_vec_pretty(&json!({
+            "name": plugin_name,
+            "version": "1.0.0",
+            "description": format!("Pioneer-selected skill {}", selected.install_name),
+            "skills": [format!("./skills/{install_name}")]
+        }))
+        .context("failed to serialize managed Claude skill plugin manifest")?;
+        let mut manifest_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(manifest_path.as_path())
+            .with_context(|| {
+                format!(
+                    "failed to create managed Claude skill plugin manifest `{}`",
+                    manifest_path.display()
+                )
+            })?;
+        manifest_file.write_all(manifest.as_slice())?;
+        manifest_file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            manifest_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        plugins.push(plugin_root);
+    }
+    Ok(plugins)
+}
+
 fn claude_process_config_from_instance_with_managed_mcp(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     options: &CLIAgentRuntimeSessionStartOptions,
@@ -995,6 +1135,10 @@ fn claude_process_config_from_instance_with_managed_mcp(
         .filter(|mode| !mode.is_empty())
         .unwrap_or("default")
         .to_owned();
+    let selected_skill_plugins = materialize_claude_selected_skill_plugins(
+        managed_mcp_config,
+        options.selected_skills.as_slice(),
+    )?;
 
     let elevated_prompt_path = options
         .elevated_instructions
@@ -1025,15 +1169,15 @@ fn claude_process_config_from_instance_with_managed_mcp(
             .to_string_lossy()
             .into_owned(),
         "--strict-mcp-config".to_owned(),
-        if options.enable_user_skills {
-            "--setting-sources=user".to_owned()
-        } else {
-            "--setting-sources=".to_owned()
-        },
+        "--setting-sources=".to_owned(),
         "--include-partial-messages".to_owned(),
         "--input-format".to_owned(),
         "stream-json".to_owned(),
     ]);
+    for plugin in selected_skill_plugins {
+        args.push("--plugin-dir".to_owned());
+        args.push(plugin.to_string_lossy().into_owned());
+    }
     if managed_mcp_config.has_pioneer_server {
         // A tracked profile has exactly one mutation authority.  Claude's
         // built-in writers remain unavailable even in full-access mode; the
@@ -1045,12 +1189,6 @@ fn claude_process_config_from_instance_with_managed_mcp(
             "MultiEdit".to_owned(),
             "NotebookEdit".to_owned(),
         ]);
-    }
-    if !options.enable_user_skills
-        && !managed_mcp_config.has_pioneer_server
-        && permission_mode != "bypassPermissions"
-    {
-        args.push("--safe-mode".to_owned());
     }
     append_claude_exact_allowed_tools(&mut args, managed_mcp_config, allowed_tool_names)
         .context("Claude exact MCP allowed-tool projection is invalid")?;
@@ -1270,7 +1408,6 @@ pub(crate) async fn run_claude_mcp_local_provider_probe(
     validate_claude_readiness_launch_matrix(
         &probed_instance,
         &options,
-        &managed,
         &empty,
         launch_projection.preflight.allowed_tool_names.as_slice(),
         &continuation,
@@ -1346,7 +1483,6 @@ pub(crate) async fn run_claude_mcp_local_provider_probe(
 fn validate_claude_readiness_launch_matrix(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     base_options: &CLIAgentRuntimeSessionStartOptions,
-    managed: &ClaudeManagedMcpConfigDescriptor,
     empty: &ClaudeManagedMcpConfigDescriptor,
     allowed_tool_names: &[String],
     continuation: &CliProviderContinuation,
@@ -1380,31 +1516,23 @@ fn validate_claude_readiness_launch_matrix(
     {
         bail!("Claude readiness launch does not contain the exact allowed tool set");
     }
-    for (skills, expected_safe_mode) in [(false, true), (true, false)] {
-        let mut options = base_options.clone();
-        options.enable_user_skills = skills;
-        let config = claude_process_config_from_instance_with_managed_mcp(
-            instance,
-            &options,
-            empty,
-            &[],
-            continuation,
-        )?;
-        if has(&config, "--safe-mode") != expected_safe_mode {
-            bail!("Claude empty-projection safe-mode launch matrix changed");
-        }
-    }
-    let mut skills_options = base_options.clone();
-    skills_options.enable_user_skills = true;
-    let skills_with_mcp = claude_process_config_from_instance_with_managed_mcp(
+    let empty_config = claude_process_config_from_instance_with_managed_mcp(
         instance,
-        &skills_options,
-        managed,
-        allowed_tool_names,
+        base_options,
+        empty,
+        &[],
         continuation,
     )?;
-    if has(&skills_with_mcp, "--safe-mode") {
-        bail!("Claude skills plus MCP readiness launch unexpectedly enabled safe mode");
+    for config in [non_empty_config, &empty_config] {
+        if has(config, "--safe-mode") {
+            bail!("Claude launch must leave sandboxing to the provider permission mode");
+        }
+        if has(config, "--setting-sources=user") || !has(config, "--setting-sources=") {
+            bail!("Claude launch must not load the shared user settings source");
+        }
+        if has(config, "--plugin-dir") {
+            bail!("Claude readiness launch projected a skill that was not selected");
+        }
     }
     Ok(())
 }
@@ -4650,6 +4778,21 @@ done
         args.iter().any(|arg| arg == flag)
     }
 
+    fn arg_values_after(args: &[String], flag: &str) -> Vec<PathBuf> {
+        args.windows(2)
+            .filter(|pair| pair[0] == flag)
+            .map(|pair| PathBuf::from(pair[1].as_str()))
+            .collect()
+    }
+
+    fn selected_skill_fixture(path: &Path, install_name: &str) -> CliRuntimeSelectedSkill {
+        CliRuntimeSelectedSkill {
+            install_name: install_name.to_owned(),
+            installed_path: path.to_path_buf(),
+            source_folder_hash: compute_skill_folder_hash(path).expect("skill fixture hash"),
+        }
+    }
+
     fn elevated_instructions(text: &str) -> CLIRuntimeElevatedInstructions {
         let fingerprint = Sha256::digest(text.as_bytes())
             .iter()
@@ -4688,9 +4831,20 @@ done
         std::fs::set_permissions(bootstrap.as_path(), std::fs::Permissions::from_mode(0o600))
             .expect("bootstrap permissions");
         let managed_root = temp.path().join("managed");
+        let selected_skill_root = temp.path().join("selected-skill");
+        std::fs::create_dir_all(selected_skill_root.join("references"))
+            .expect("selected skill directory");
+        std::fs::write(selected_skill_root.join("SKILL.md"), b"# selected\n")
+            .expect("selected skill");
+        std::fs::write(
+            selected_skill_root.join("references/guide.txt"),
+            b"selected support\n",
+        )
+        .expect("selected skill support");
+        let selected_skill = selected_skill_fixture(selected_skill_root.as_path(), "selected");
         let mut generation = 1;
 
-        for enable_user_skills in [false, true] {
+        for skills_selected in [false, true] {
             for mcp_enabled in [false, true] {
                 let artifact = serialize_claude_managed_mcp_config(if mcp_enabled {
                     ClaudeManagedMcpConfigInput::pioneer(helper.clone(), bootstrap.clone())
@@ -4722,7 +4876,10 @@ done
                     &CLIAgentRuntimeSessionStartOptions {
                         cwd: Some(temp.path().to_path_buf()),
                         approval_policy: Some("default".to_owned()),
-                        enable_user_skills,
+                        selected_skills: skills_selected
+                            .then(|| selected_skill.clone())
+                            .into_iter()
+                            .collect(),
                         ..Default::default()
                     },
                     &descriptor,
@@ -4742,14 +4899,19 @@ done
                     arg_value_after(&process.args, "--permission-prompt-tool").as_deref(),
                     Some("stdio")
                 );
-                assert_eq!(
-                    has_arg(&process.args, "--safe-mode"),
-                    !enable_user_skills && !mcp_enabled
-                );
-                assert_eq!(
-                    has_arg(&process.args, "--setting-sources=user"),
-                    enable_user_skills
-                );
+                assert!(!has_arg(&process.args, "--safe-mode"));
+                assert!(has_arg(&process.args, "--setting-sources="));
+                assert!(!has_arg(&process.args, "--setting-sources=user"));
+                assert_eq!(has_arg(&process.args, "--plugin-dir"), skills_selected);
+                if skills_selected {
+                    let plugins = arg_values_after(&process.args, "--plugin-dir");
+                    assert_eq!(plugins.len(), 1);
+                    assert_eq!(
+                        std::fs::read(plugins[0].join("skills/selected/SKILL.md"))
+                            .expect("managed selected skill"),
+                        b"# selected\n"
+                    );
+                }
                 assert_eq!(has_arg(&process.args, "--allowedTools"), mcp_enabled);
                 if mcp_enabled {
                     let flag_index = process
@@ -4782,6 +4944,8 @@ done
             "# test skill",
         )
         .expect("write user skill");
+        let selected_skill =
+            selected_skill_fixture(config_dir.join("skills/test-skill").as_path(), "test-skill");
         std::fs::write(
             config_dir.join(".mcp.json"),
             r#"{"mcpServers":{"malicious_sentinel":{"command":"/sentinel"}}}"#,
@@ -4797,13 +4961,16 @@ done
         instance.shadow_home_path = Some(config_dir.to_string_lossy().into_owned());
         let mut generated_paths = HashSet::new();
 
-        for enable_user_skills in [false, true] {
+        for skills_selected in [false, true] {
             for permission_mode in ["default", "acceptEdits", "bypassPermissions"] {
                 let process = claude_process_config_from_instance(
                     &instance,
                     &CLIAgentRuntimeSessionStartOptions {
                         approval_policy: Some(permission_mode.to_owned()),
-                        enable_user_skills,
+                        selected_skills: skills_selected
+                            .then(|| selected_skill.clone())
+                            .into_iter()
+                            .collect(),
                         ..Default::default()
                     },
                 )
@@ -4824,14 +4991,10 @@ done
                         .iter()
                         .any(|arg| arg.contains("malicious_sentinel"))
                 );
-                assert_eq!(
-                    has_arg(&process.args, "--safe-mode"),
-                    !enable_user_skills && permission_mode != "bypassPermissions"
-                );
-                assert_eq!(
-                    has_arg(&process.args, "--setting-sources=user"),
-                    enable_user_skills
-                );
+                assert!(!has_arg(&process.args, "--safe-mode"));
+                assert!(has_arg(&process.args, "--setting-sources="));
+                assert!(!has_arg(&process.args, "--setting-sources=user"));
+                assert_eq!(has_arg(&process.args, "--plugin-dir"), skills_selected);
             }
         }
         assert_eq!(generated_paths.len(), 6);
@@ -4903,9 +5066,10 @@ done
             &CLIAgentRuntimeSessionStartOptions {
                 cwd: None,
                 approval_policy: Some("acceptEdits".to_owned()),
+                authorization_scope_fingerprint: None,
                 app_server_args: Vec::new(),
                 env: Default::default(),
-                enable_user_skills: false,
+                selected_skills: Vec::new(),
                 elevated_instructions: None,
             },
         )
@@ -4927,9 +5091,10 @@ done
             &CLIAgentRuntimeSessionStartOptions {
                 cwd: None,
                 approval_policy: Some("bypassPermissions".to_owned()),
+                authorization_scope_fingerprint: None,
                 app_server_args: Vec::new(),
                 env: Default::default(),
-                enable_user_skills: false,
+                selected_skills: Vec::new(),
                 elevated_instructions: None,
             },
         )
@@ -4943,10 +5108,14 @@ done
             !has_arg(config.args.as_slice(), "--safe-mode"),
             "FullAccess must not leave Claude trapped in safe-mode"
         );
+        assert!(
+            !has_arg(config.args.as_slice(), "--tools"),
+            "FullAccess must retain Claude's built-in tool surface"
+        );
     }
 
     #[test]
-    fn claude_cli_runtime_restricted_modes_keep_safe_mode() {
+    fn claude_cli_runtime_restricted_modes_use_only_provider_permission_mode() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
 
@@ -4956,9 +5125,10 @@ done
                 &CLIAgentRuntimeSessionStartOptions {
                     cwd: None,
                     approval_policy: Some(permission_mode.to_owned()),
+                    authorization_scope_fingerprint: None,
                     app_server_args: Vec::new(),
                     env: Default::default(),
-                    enable_user_skills: false,
+                    selected_skills: Vec::new(),
                     elevated_instructions: None,
                 },
             )
@@ -4969,14 +5139,18 @@ done
                 Some(permission_mode)
             );
             assert!(
-                has_arg(config.args.as_slice(), "--safe-mode"),
-                "restricted Claude mode `{permission_mode}` should keep safe-mode"
+                !has_arg(config.args.as_slice(), "--safe-mode"),
+                "restricted Claude mode `{permission_mode}` must not receive a Pioneer-selected sandbox flag"
+            );
+            assert!(
+                !has_arg(config.args.as_slice(), "--tools"),
+                "Pioneer must not replace Claude's provider-owned tool sandbox"
             );
         }
     }
 
     #[test]
-    fn claude_process_config_skill_enabled_mode_uses_complete_user_source() {
+    fn claude_process_config_projects_only_exact_selected_skill_plugins() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config_dir = temp_dir.path().join("effective-config");
         for relative in [
@@ -4986,12 +5160,16 @@ done
             "agents/agent.md",
             "rules/rule.md",
             "CLAUDE.md",
+            "skills/selected/SKILL.md",
+            "skills/selected/references/guide.txt",
             "skills/unrelated/SKILL.md",
         ] {
             let path = config_dir.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, relative).unwrap();
         }
+        let selected =
+            selected_skill_fixture(config_dir.join("skills/selected").as_path(), "selected");
         let mut instance =
             claude_instance(temp_dir.path().join("home").to_string_lossy().into_owned());
         instance.shadow_home_path = Some(config_dir.to_string_lossy().into_owned());
@@ -5009,7 +5187,7 @@ done
                 &instance,
                 &CLIAgentRuntimeSessionStartOptions {
                     approval_policy: Some(permission_mode.to_owned()),
-                    enable_user_skills: true,
+                    selected_skills: vec![selected.clone()],
                     ..Default::default()
                 },
             )
@@ -5017,8 +5195,28 @@ done
 
             assert!(has_arg(&normal.args, "--setting-sources="));
             assert!(!has_arg(&normal.args, "--setting-sources=user"));
-            assert!(has_arg(&enabled.args, "--setting-sources=user"));
-            assert!(!has_arg(&enabled.args, "--setting-sources="));
+            assert!(has_arg(&enabled.args, "--setting-sources="));
+            assert!(!has_arg(&enabled.args, "--setting-sources=user"));
+            assert!(!has_arg(&normal.args, "--plugin-dir"));
+            let plugins = arg_values_after(&enabled.args, "--plugin-dir");
+            assert_eq!(plugins.len(), 1);
+            let plugin = &plugins[0];
+            assert_eq!(
+                std::fs::read(plugin.join("skills/selected/SKILL.md")).unwrap(),
+                b"skills/selected/SKILL.md"
+            );
+            assert_eq!(
+                std::fs::read(plugin.join("skills/selected/references/guide.txt")).unwrap(),
+                b"skills/selected/references/guide.txt"
+            );
+            assert!(!plugin.join("skills/unrelated").exists());
+            let manifest: JsonValue = serde_json::from_slice(
+                std::fs::read(plugin.join(".claude-plugin/plugin.json"))
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap();
+            assert_eq!(manifest["skills"], json!(["./skills/selected"]));
             assert!(!has_arg(&enabled.args, "--safe-mode"));
             assert_eq!(
                 arg_value_after(&enabled.args, "--permission-mode").as_deref(),
@@ -5041,10 +5239,26 @@ done
             "agents/agent.md",
             "rules/rule.md",
             "CLAUDE.md",
+            "skills/selected/SKILL.md",
+            "skills/selected/references/guide.txt",
             "skills/unrelated/SKILL.md",
         ] {
             assert!(config_dir.join(relative).exists());
         }
+
+        let mut stale = selected;
+        stale.source_folder_hash = "0".repeat(64);
+        let error = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                selected_skills: vec![stale],
+                ..Default::default()
+            },
+        )
+        .expect_err("stale selected skill receipt must fail before Claude spawn");
+        assert!(
+            format!("{error:#}").contains("changed after its installation receipt was verified")
+        );
     }
 
     #[test]
@@ -5124,12 +5338,13 @@ done
         .unwrap();
         let mut instance = claude_instance(temp_dir.path().join("home").to_string_lossy().into());
         instance.shadow_home_path = Some(config_dir.to_string_lossy().into_owned());
+        let selected = selected_skill_fixture(installed.as_path(), "proposal-51-sentinel");
         let skill_config = claude_process_config_from_instance(
             &instance,
             &CLIAgentRuntimeSessionStartOptions {
                 cwd: Some(temp_dir.path().join("workspace")),
                 approval_policy: Some("acceptEdits".to_owned()),
-                enable_user_skills: true,
+                selected_skills: vec![selected],
                 ..Default::default()
             },
         )
@@ -5139,15 +5354,20 @@ done
             &CLIAgentRuntimeSessionStartOptions {
                 cwd: Some(temp_dir.path().join("workspace")),
                 approval_policy: Some("acceptEdits".to_owned()),
-                enable_user_skills: false,
                 ..Default::default()
             },
         )
         .unwrap();
-        assert!(has_arg(&skill_config.args, "--setting-sources=user"));
+        assert!(has_arg(&skill_config.args, "--setting-sources="));
+        assert!(!has_arg(&skill_config.args, "--setting-sources=user"));
+        assert_eq!(
+            arg_values_after(&skill_config.args, "--plugin-dir").len(),
+            1
+        );
         assert!(!has_arg(&skill_config.args, "--safe-mode"));
         assert!(has_arg(&zero_config.args, "--setting-sources="));
-        assert!(has_arg(&zero_config.args, "--safe-mode"));
+        assert!(!has_arg(&zero_config.args, "--plugin-dir"));
+        assert!(!has_arg(&zero_config.args, "--safe-mode"));
         assert_eq!(skill_config.executable, zero_config.executable);
         assert_eq!(skill_config.cwd, zero_config.cwd);
         assert_eq!(

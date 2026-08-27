@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -16,6 +18,51 @@ pub struct ArtifactOutputDir {
     pub thread_id: String,
     pub turn_id: String,
     pub path: PathBuf,
+    _active_lease: Arc<ActiveArtifactOutputLease>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ActiveArtifactOutputLease {
+    path: PathBuf,
+}
+
+fn active_output_dirs() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl ActiveArtifactOutputLease {
+    fn reserve(path: PathBuf) -> ArtifactResult<Self> {
+        let mut active = active_output_dirs().lock().map_err(|_| ArtifactError::Io {
+            message: "artifact output activity registry is unavailable".to_owned(),
+            source: std::io::Error::other("artifact output activity registry lock poisoned"),
+        })?;
+        *active.entry(path.clone()).or_insert(0) += 1;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ActiveArtifactOutputLease {
+    fn drop(&mut self) {
+        let Ok(mut active) = active_output_dirs().lock() else {
+            return;
+        };
+        let Some(count) = active.get_mut(&self.path) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active.remove(&self.path);
+        }
+    }
+}
+
+fn output_dir_is_active(path: &Path) -> bool {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    active_output_dirs()
+        .lock()
+        .map(|active| active.contains_key(&path))
+        .unwrap_or(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -72,11 +119,19 @@ pub async fn create_artifact_output_dir(
             message: format!("failed to create artifact output dir {}", path.display()),
             source,
         })?;
+    let path = fs::canonicalize(path.as_path())
+        .await
+        .map_err(|source| ArtifactError::Io {
+            message: format!("failed to resolve artifact output dir {}", path.display()),
+            source,
+        })?;
+    let active_lease = Arc::new(ActiveArtifactOutputLease::reserve(path.clone())?);
     Ok(ArtifactOutputDir {
         workspace_id: workspace_id.to_owned(),
         thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
         path,
+        _active_lease: active_lease,
     })
 }
 
@@ -166,6 +221,9 @@ pub async fn plan_output_dir_gc(
             if !entry_is_dir(turn_entry.file_type().await, turn_path.as_path())? {
                 continue;
             }
+            if output_dir_is_active(turn_path.as_path()) {
+                continue;
+            }
             let metadata =
                 fs::metadata(turn_path.as_path())
                     .await
@@ -208,8 +266,29 @@ pub async fn execute_output_dir_gc(
         let path = output_root
             .join(path_segment("thread_id", candidate.thread_id.as_str())?)
             .join(path_segment("turn_id", candidate.turn_id.as_str())?);
-        match fs::remove_dir_all(path.as_path()).await {
-            Ok(()) => deleted_dirs += 1,
+        let removal_path = path.clone();
+        let removal = tokio::task::spawn_blocking(move || {
+            let active = active_output_dirs().lock().map_err(|_| {
+                std::io::Error::other("artifact output activity registry lock poisoned")
+            })?;
+            let canonical = std::fs::canonicalize(removal_path.as_path())
+                .unwrap_or_else(|_| removal_path.clone());
+            if active.contains_key(&canonical) {
+                return Ok(false);
+            }
+            std::fs::remove_dir_all(removal_path.as_path()).map(|()| true)
+        })
+        .await
+        .map_err(|source| ArtifactError::Io {
+            message: format!(
+                "artifact output cleanup worker failed for {}",
+                path.display()
+            ),
+            source: std::io::Error::other(source.to_string()),
+        })?;
+        match removal {
+            Ok(true) => deleted_dirs += 1,
+            Ok(false) => {}
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(ArtifactError::Io {
@@ -314,13 +393,15 @@ mod tests {
             .expect("time")
             .as_millis() as i64
             + 60_000;
+        let output_path = dir.path.clone();
+        drop(dir);
         let report = execute_output_dir_gc(&artifact_root, "ws_gc", now_ms, 0)
             .await
             .expect("gc");
 
         assert_eq!(report.deleted_dirs, 1);
         assert_eq!(report.plan.candidates.len(), 1);
-        assert!(!fs::try_exists(dir.path).await.expect("exists check"));
+        assert!(!fs::try_exists(output_path).await.expect("exists check"));
     }
 
     #[tokio::test]
@@ -343,6 +424,31 @@ mod tests {
             .expect("gc");
 
         assert_eq!(report.deleted_dirs, 0);
+        assert!(fs::try_exists(dir.path).await.expect("exists check"));
+    }
+
+    #[tokio::test]
+    async fn gc_never_removes_an_active_artifact_output_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact_root = temp.path().join("artifacts");
+        let dir = create_artifact_output_dir(&artifact_root, "ws_gc", "thr_gc", "turn_active")
+            .await
+            .expect("create active output dir");
+        fs::write(dir.path.join("result.txt"), b"result")
+            .await
+            .expect("write output");
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_millis() as i64
+            + 60_000;
+        let report = execute_output_dir_gc(&artifact_root, "ws_gc", now_ms, 0)
+            .await
+            .expect("gc");
+
+        assert_eq!(report.deleted_dirs, 0);
+        assert!(report.plan.candidates.is_empty());
         assert!(fs::try_exists(dir.path).await.expect("exists check"));
     }
 }

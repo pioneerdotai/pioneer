@@ -3657,6 +3657,52 @@ pub fn codex_command_approval_response(decision: CodexCommandApprovalDecision) -
     json!({ "decision": decision.as_codex_value() })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexPermissionApprovalRequest {
+    pub native_request_id: String,
+    pub native_request_id_json: JsonValue,
+    pub cwd: Option<String>,
+    pub reason: Option<String>,
+    pub native_thread_id: Option<String>,
+    pub native_turn_id: Option<String>,
+    pub native_item_id: Option<String>,
+    pub requested_permissions: JsonValue,
+    pub started_at_ms: Option<i64>,
+    pub raw: JsonValue,
+}
+
+pub fn decode_codex_permission_approval_request(
+    request: &CodexJsonlRpcServerRequest,
+) -> CodexPermissionApprovalRequest {
+    let raw = request.params.clone().unwrap_or(JsonValue::Null);
+    CodexPermissionApprovalRequest {
+        native_request_id: request.id.to_string(),
+        native_request_id_json: jsonl_rpc_id_value(&request.id),
+        cwd: optional_string_field(&raw, &["cwd"]),
+        reason: optional_string_field(&raw, &["reason", "message"]),
+        native_thread_id: optional_string_field(&raw, &["threadId", "thread_id"]),
+        native_turn_id: optional_string_field(&raw, &["turnId", "turn_id"]),
+        native_item_id: optional_string_field(&raw, &["itemId", "item_id"]),
+        requested_permissions: raw.get("permissions").cloned().unwrap_or_else(|| json!({})),
+        started_at_ms: optional_i64_field(&raw, &["startedAtMs", "started_at_ms"]),
+        raw,
+    }
+}
+
+pub fn codex_permission_approval_response(
+    permissions: JsonValue,
+    approved: bool,
+    session_scope: bool,
+) -> JsonValue {
+    json!({
+        "permissions": if approved { permissions } else { json!({}) },
+        "scope": if session_scope { "session" } else { "turn" },
+        // Keep later commands behind their normal typed approval even after
+        // Codex receives the requested provider-side sandbox capability.
+        "strictAutoReview": true,
+    })
+}
+
 pub fn decode_codex_command_approval_request(
     request: &CodexJsonlRpcServerRequest,
 ) -> CodexCommandApprovalRequest {
@@ -7007,6 +7053,61 @@ while read line; do :; done
         assert_eq!(decoded.native_item_id.as_deref(), Some("codex-item-1"));
         assert_eq!(decoded.started_at_ms, Some(1234));
         assert_eq!(decoded.raw["futureField"], json!(true));
+    }
+
+    #[test]
+    fn permission_approval_request_preserves_native_profile_and_response_scope() {
+        let permissions = json!({
+            "fileSystem": {
+                "write": ["/tmp/project/output"],
+                "entries": [{
+                    "access": "read",
+                    "path": {"type": "path", "path": "/tmp/project/input"}
+                }]
+            },
+            "network": {"enabled": true}
+        });
+        let request = CodexJsonlRpcServerRequest {
+            id: JsonlRpcId::String("permission-42".to_owned()),
+            method: "item/permissions/requestApproval".to_owned(),
+            params: Some(json!({
+                "cwd": "/tmp/project",
+                "reason": "build needs an output directory",
+                "threadId": "codex-thread-1",
+                "turnId": "codex-turn-1",
+                "itemId": "codex-item-1",
+                "permissions": permissions,
+                "startedAtMs": 1234
+            })),
+            raw: json!({"id": "permission-42"}),
+        };
+
+        let decoded = decode_codex_permission_approval_request(&request);
+        assert_eq!(decoded.native_request_id, "permission-42");
+        assert_eq!(decoded.native_request_id_json, json!("permission-42"));
+        assert_eq!(decoded.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(decoded.native_thread_id.as_deref(), Some("codex-thread-1"));
+        assert_eq!(decoded.native_turn_id.as_deref(), Some("codex-turn-1"));
+        assert_eq!(decoded.native_item_id.as_deref(), Some("codex-item-1"));
+        assert_eq!(decoded.requested_permissions, permissions);
+        assert_eq!(decoded.started_at_ms, Some(1234));
+
+        assert_eq!(
+            codex_permission_approval_response(permissions.clone(), true, false),
+            json!({
+                "permissions": permissions,
+                "scope": "turn",
+                "strictAutoReview": true
+            })
+        );
+        assert_eq!(
+            codex_permission_approval_response(json!({"network": {"enabled": true}}), false, false),
+            json!({
+                "permissions": {},
+                "scope": "turn",
+                "strictAutoReview": true
+            })
+        );
     }
 
     #[tokio::test]

@@ -789,6 +789,10 @@ pub struct CLIRuntimeRequestOpenedNotification {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
+    /// Additional ancestor Thread capsules in which this child execution
+    /// request is intentionally visible and actionable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_thread_ids: Vec<String>,
     pub request: CLIRuntimePendingRequest,
 }
 
@@ -803,6 +807,10 @@ pub struct CLIRuntimeRequestResolvedNotification {
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
+    /// Mirrors the opened notification so clients can remove an ancestor-
+    /// projected request without waiting for a separate timeline refresh.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_thread_ids: Vec<String>,
     pub resolution: CLIRuntimeRequestResolution,
 }
 
@@ -824,6 +832,7 @@ pub struct CLIRuntimePendingRequest {
 pub enum CLIRuntimeRequestKind {
     CommandApproval,
     FileChangeApproval,
+    PermissionApproval,
     UserInput,
     Other,
 }
@@ -854,6 +863,7 @@ impl CLIRuntimePendingRequestStatus {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CLIRuntimeRequestResolution {
     Approved,
+    ApprovedForSession,
     Denied {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,

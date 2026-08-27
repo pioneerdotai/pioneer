@@ -12,6 +12,7 @@ use super::super::tree::{AccessibilityTreeBudget, compact_xa11y_app_tree};
 use super::ComputerUseDesktopBackend;
 use super::screenshots::{captured_frame_from_rgba_buffer, captured_frame_from_rgba_image};
 use crate::error::ToolError;
+use crate::process_policy::ProcessEnvironmentPlan;
 use std::time::{Duration, Instant};
 use xa11y::{
     Anchor, AppExt, ClickOptions, ClickTarget, DragOptions, InputSim, Key, MouseButton, Point,
@@ -104,40 +105,51 @@ impl ComputerUseDesktopBackend for Xa11yComputerUseBackend {
         })
     }
 
-    fn list_apps(&self) -> Result<Vec<AppMeta>, ToolError> {
+    fn list_apps(&self, environment: &ProcessEnvironmentPlan) -> Result<Vec<AppMeta>, ToolError> {
         xa11y::App::list()
             .map_err(to_xa11y_error("app.list"))?
             .into_iter()
             .map(|app| {
-                Ok(platform::enrich_app_identity(AppMeta {
-                    identity_key: Some(derive_app_identity_key(
-                        app.name.as_str(),
-                        app.pid,
-                        None,
-                        None,
-                    )),
-                    name: app.name,
-                    pid: app.pid,
-                    role: None,
-                    window_title: None,
-                    bundle_id: None,
-                    localized_name: None,
-                    executable_path: None,
-                    frontmost: None,
-                }))
+                Ok(platform::enrich_app_identity(
+                    AppMeta {
+                        identity_key: Some(derive_app_identity_key(
+                            app.name.as_str(),
+                            app.pid,
+                            None,
+                            None,
+                        )),
+                        name: app.name,
+                        pid: app.pid,
+                        role: None,
+                        window_title: None,
+                        bundle_id: None,
+                        localized_name: None,
+                        executable_path: None,
+                        frontmost: None,
+                    },
+                    environment,
+                ))
             })
             .collect()
     }
 
-    fn frontmost_app(&self) -> Result<Option<AppMeta>, ToolError> {
+    fn frontmost_app(
+        &self,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<Option<AppMeta>, ToolError> {
         Ok(self
-            .list_apps()?
+            .list_apps(environment)?
             .into_iter()
             .find(|app| app.frontmost == Some(true)))
     }
 
-    fn find_app(&self, target: &AppTarget, timeout: Duration) -> Result<AppHandle, ToolError> {
-        if let Some(app) = self.find_app_from_inventory(target)? {
+    fn find_app(
+        &self,
+        target: &AppTarget,
+        timeout: Duration,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<AppHandle, ToolError> {
+        if let Some(app) = self.find_app_from_inventory(target, environment)? {
             return Ok(app);
         }
 
@@ -172,6 +184,7 @@ impl ComputerUseDesktopBackend for Xa11yComputerUseBackend {
                 executable_path: None,
                 frontmost: None,
             },
+            environment,
         )))
     }
 
@@ -179,12 +192,17 @@ impl ComputerUseDesktopBackend for Xa11yComputerUseBackend {
         &self,
         target: &AppTarget,
         launch_command: Option<&str>,
+        environment: &ProcessEnvironmentPlan,
     ) -> Result<(), ToolError> {
-        platform::launch_app_target(target, launch_command)
+        platform::launch_app_target(target, launch_command, environment)
     }
 
-    fn activate_app(&self, app: &AppHandle) -> Result<(), ToolError> {
-        platform::activate_app(app)
+    fn activate_app(
+        &self,
+        app: &AppHandle,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<(), ToolError> {
+        platform::activate_app(app, environment)
     }
 
     fn app_tree(
@@ -296,13 +314,17 @@ impl ComputerUseDesktopBackend for Xa11yComputerUseBackend {
         }
     }
 
-    fn perform_os_action(&self, action: &OsAction) -> Result<ActionExecution, ToolError> {
+    fn perform_os_action(
+        &self,
+        action: &OsAction,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<ActionExecution, ToolError> {
         match action.action_type {
             OsActionKind::OpenApp | OsActionKind::ActivateApp | OsActionKind::FocusWindow => {
-                self.perform_app_os_action(action)
+                self.perform_app_os_action(action, environment)
             }
             OsActionKind::OpenPath | OsActionKind::RevealPath | OsActionKind::OpenUrl => {
-                Ok(self.perform_external_os_action(action))
+                Ok(self.perform_external_os_action(action, environment))
             }
             _ => Ok(unsupported_os_action(action)),
         }
@@ -356,7 +378,11 @@ impl ComputerUseDesktopBackend for Xa11yComputerUseBackend {
 }
 
 impl Xa11yComputerUseBackend {
-    fn find_app_from_inventory(&self, target: &AppTarget) -> Result<Option<AppHandle>, ToolError> {
+    fn find_app_from_inventory(
+        &self,
+        target: &AppTarget,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<Option<AppHandle>, ToolError> {
         if target.pid.is_none()
             && target.name.as_deref().is_none_or(str::is_empty)
             && target.identity_key.as_deref().is_none_or(str::is_empty)
@@ -366,14 +392,18 @@ impl Xa11yComputerUseBackend {
             return Ok(None);
         }
 
-        let apps = self.list_apps()?;
+        let apps = self.list_apps(environment)?;
         Ok(apps
             .into_iter()
             .find(|app| app_matches_target(app, target))
             .map(app_handle_from_meta))
     }
 
-    fn perform_app_os_action(&self, action: &OsAction) -> Result<ActionExecution, ToolError> {
+    fn perform_app_os_action(
+        &self,
+        action: &OsAction,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<ActionExecution, ToolError> {
         let started = Instant::now();
         let action_type = action.action_type.as_str().to_owned();
         let expected_after = app_action_expected_after(action);
@@ -396,12 +426,12 @@ impl Xa11yComputerUseBackend {
             executable_path: None,
         };
         let app_before = self
-            .find_app(&target, Duration::from_millis(100))
+            .find_app(&target, Duration::from_millis(100), environment)
             .ok()
             .map(AppHandleMeta::from);
 
         if action.action_type == OsActionKind::OpenApp {
-            if let Err(error) = platform::launch_app_target(&target, None) {
+            if let Err(error) = platform::launch_app_target(&target, None, environment) {
                 let failure_class = match &error {
                     ToolError::NotFound(_) => ComputerUseFailureClass::ActionNotSupported,
                     _ => ComputerUseFailureClass::RuntimeActionError,
@@ -420,7 +450,7 @@ impl Xa11yComputerUseBackend {
             std::thread::sleep(Duration::from_millis(250));
         }
 
-        let app = match self.find_app(&target, Duration::from_millis(2_500)) {
+        let app = match self.find_app(&target, Duration::from_millis(2_500), environment) {
             Ok(app) => app,
             Err(error) => {
                 return Ok(app_os_execution(
@@ -461,7 +491,7 @@ impl Xa11yComputerUseBackend {
             }
         }
 
-        if let Err(error) = platform::activate_app(&app) {
+        if let Err(error) = platform::activate_app(&app, environment) {
             return Ok(app_os_execution(
                 action_type,
                 format!("failed to activate app `{}`: {error}", app.name),
@@ -495,7 +525,11 @@ impl Xa11yComputerUseBackend {
         ))
     }
 
-    fn perform_external_os_action(&self, action: &OsAction) -> ActionExecution {
+    fn perform_external_os_action(
+        &self,
+        action: &OsAction,
+        environment: &ProcessEnvironmentPlan,
+    ) -> ActionExecution {
         let started = Instant::now();
         let action_type = action.action_type.as_str().to_owned();
         let result = match action.action_type {
@@ -503,18 +537,19 @@ impl Xa11yComputerUseBackend {
                 .path
                 .as_deref()
                 .ok_or_else(|| ToolError::invalid_arguments("open_path requires path"))
-                .and_then(|path| platform::open_path(std::path::Path::new(path))),
+                .and_then(|path| platform::open_path(std::path::Path::new(path), environment)),
             OsActionKind::RevealPath => action
                 .path
                 .as_deref()
                 .ok_or_else(|| ToolError::invalid_arguments("reveal_path requires path"))
-                .and_then(|path| platform::reveal_path(std::path::Path::new(path))),
+                .and_then(|path| platform::reveal_path(std::path::Path::new(path), environment)),
             OsActionKind::OpenUrl => action
                 .url
                 .as_deref()
                 .ok_or_else(|| ToolError::invalid_arguments("open_url requires url"))
                 .and_then(|raw_url| {
-                    platform::normalize_open_url(raw_url).and_then(|url| platform::open_url(&url))
+                    platform::normalize_open_url(raw_url)
+                        .and_then(|url| platform::open_url(&url, environment))
                 }),
             _ => Ok(()),
         };
@@ -1122,15 +1157,19 @@ mod tests {
     #[test]
     fn menu_action_unsupported_is_structured() {
         let backend = Xa11yComputerUseBackend;
+        let environment = ProcessEnvironmentPlan::inherited_for_test();
         let result = backend
-            .perform_os_action(&OsAction {
-                action_type: OsActionKind::SelectMenuItem,
-                app: Some("ExampleApp".to_owned()),
-                path: None,
-                url: None,
-                menu_path: Some(vec!["File".to_owned(), "New Window".to_owned()]),
-                title: None,
-            })
+            .perform_os_action(
+                &OsAction {
+                    action_type: OsActionKind::SelectMenuItem,
+                    app: Some("ExampleApp".to_owned()),
+                    path: None,
+                    url: None,
+                    menu_path: Some(vec!["File".to_owned(), "New Window".to_owned()]),
+                    title: None,
+                },
+                &environment,
+            )
             .expect("menu action result");
 
         assert_eq!(result.status, "failed");

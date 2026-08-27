@@ -2,18 +2,26 @@ use crate::apply_patch::file_mutation::{
     AllowAllReadAccess, PaginatedReader, ReadError, ReadErrorCode, ReadRequest, SnapshotLimits,
     TargetResolver,
 };
-use crate::context::{FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
+use crate::context::{
+    ExecCommandArgs, FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload,
+};
 use crate::error::ToolError;
 use crate::registry::ToolHandler;
-use crate::{FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation};
+use crate::{
+    FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation,
+    NativeSandboxPrepareOutcome, NativeSandboxRequest, NonoSandboxBackend, ProcessSpawnPlan,
+    WindowsRestrictedTokenBackend, build_process_spawn_plan, configure_nono_command,
+    configure_windows_restricted_token_command, prepare_native_sandbox_backend,
+};
 use async_trait::async_trait;
+use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -318,126 +326,18 @@ impl ToolHandler for ListDirHandler {
             .clamp(1, HARD_MAX_LIST_LIMIT);
         let include_hidden = args.include_hidden.unwrap_or(false);
 
-        let mut queue = VecDeque::new();
-        queue.push_back((root.clone(), 0usize));
-
-        let mut items = Vec::new();
-        let mut truncated = false;
-        while let Some((path, depth)) = queue.pop_front() {
-            if items.len() >= limit {
-                truncated = true;
-                break;
-            }
-
-            let mut read_dir = tokio::fs::read_dir(path.as_path()).await.map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "failed to list `{}`: {error}",
-                    display_workspace_path(invocation.workdir.as_path(), path.as_path())
-                ))
-            })?;
-            // Keep only the lexicographically smallest entries that could
-            // still fit in the bounded result.  A directory may contain
-            // millions of entries; collecting all of them before sorting
-            // would turn a model-visible `limit` into an unbounded memory
-            // allocation.  The extra slot proves whether more entries were
-            // present without exposing them.
-            let remaining = limit.saturating_sub(items.len());
-            let candidate_limit = remaining.saturating_add(1);
-            let mut entries = BTreeMap::new();
-            let mut directory_truncated = false;
-            while let Some(entry) = read_dir.next_entry().await.map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "failed to read dir entry under `{}`: {error}",
-                    display_workspace_path(invocation.workdir.as_path(), path.as_path())
-                ))
-            })? {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if !include_hidden && file_name.starts_with('.') {
-                    continue;
-                }
-                if candidate_limit == 0 {
-                    directory_truncated = true;
-                    continue;
-                }
-                let entry_path = entry.path();
-                let key = entry_path.clone();
-                entries.insert(key, entry);
-                if entries.len() > candidate_limit {
-                    if let Some(last) = entries.keys().next_back().cloned() {
-                        entries.remove(&last);
-                    }
-                    directory_truncated = true;
-                }
-            }
-
-            if directory_truncated {
-                truncated = true;
-            }
-
-            for (_, entry) in entries {
-                if items.len() >= limit {
-                    truncated = true;
-                    break;
-                }
-
-                let entry_path = entry.path();
-                let file_type = entry.file_type().await.map_err(|error| {
-                    ToolError::execution_failed(format!(
-                        "failed to inspect file type for `{}`: {error}",
-                        display_workspace_path(invocation.workdir.as_path(), entry_path.as_path())
-                    ))
-                })?;
-
-                let kind = if file_type.is_dir() {
-                    "dir"
-                } else if file_type.is_file() {
-                    "file"
-                } else if file_type.is_symlink() {
-                    "symlink"
-                } else {
-                    "other"
-                }
-                .to_owned();
-
-                let size = if file_type.is_file() {
-                    Some(
-                        entry
-                            .metadata()
-                            .await
-                            .map_err(|error| {
-                                ToolError::execution_failed(format!(
-                                    "failed to read metadata for `{}`: {error}",
-                                    display_workspace_path(
-                                        invocation.workdir.as_path(),
-                                        entry_path.as_path(),
-                                    )
-                                ))
-                            })?
-                            .len(),
-                    )
-                } else {
-                    None
-                };
-
-                items.push(DirEntryView {
-                    path: display_absolute_path(&entry_path),
-                    kind: kind.clone(),
-                    size,
-                });
-
-                if file_type.is_dir() && !file_type.is_symlink() && depth < depth_limit {
-                    queue.push_back((entry_path, depth.saturating_add(1)));
-                }
-            }
-        }
-
-        // Reaching the limit is only truncation when there is actually more
-        // work that could have produced an entry.  This avoids reporting a
-        // false positive for a directory whose result happens to contain
-        // exactly `limit` entries.
-        if !queue.is_empty() {
-            truncated = true;
-        }
+        let scan_root = root.clone();
+        let (items, truncated) = tokio::task::spawn_blocking(move || {
+            list_directory_tree_secure(scan_root.as_path(), depth_limit, limit, include_hidden)
+        })
+        .await
+        .map_err(|error| ToolError::internal(format!("directory listing task failed: {error}")))?
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "failed to securely list `{}`: {error}",
+                display_workspace_path(invocation.workdir.as_path(), root.as_path())
+            ))
+        })?;
 
         let payload = serde_json::json!({
             "root": display_absolute_path(&root),
@@ -456,6 +356,264 @@ impl ToolHandler for ListDirHandler {
             body, true, payload,
         )))
     }
+}
+
+#[cfg(unix)]
+fn list_directory_tree_secure(
+    root: &Path,
+    depth_limit: usize,
+    limit: usize,
+    include_hidden: bool,
+) -> std::io::Result<(Vec<DirEntryView>, bool)> {
+    use crate::apply_patch::file_mutation::open_directory;
+    use std::ffi::{CStr, CString, OsString};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    struct PendingDirectory {
+        descriptor: std::fs::File,
+        display_path: PathBuf,
+        depth: usize,
+    }
+
+    struct DirectoryStream(*mut libc::DIR);
+
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    fn directory_names(
+        directory: &std::fs::File,
+        include_hidden: bool,
+        candidate_limit: usize,
+        truncated: &mut bool,
+    ) -> std::io::Result<BTreeSet<OsString>> {
+        let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(duplicate);
+            }
+            return Err(error);
+        }
+        let stream = DirectoryStream(stream);
+        let mut names = BTreeSet::new();
+        loop {
+            let mut entry = std::mem::MaybeUninit::<libc::dirent>::zeroed();
+            let mut result = std::ptr::null_mut();
+            let status = unsafe { libc::readdir_r(stream.0, entry.as_mut_ptr(), &mut result) };
+            if status != 0 {
+                return Err(std::io::Error::from_raw_os_error(status));
+            }
+            if result.is_null() {
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*result).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if !include_hidden && name.first() == Some(&b'.') {
+                continue;
+            }
+            names.insert(OsString::from_vec(name.to_vec()));
+            if names.len() > candidate_limit {
+                names.pop_last();
+                *truncated = true;
+            }
+        }
+        Ok(names)
+    }
+
+    fn entry_metadata(
+        parent: &std::fs::File,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<libc::stat> {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "directory entry contains NUL",
+            )
+        })?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        let status = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { metadata.assume_init() })
+    }
+
+    fn open_child_directory(
+        parent: &std::fs::File,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<std::fs::File> {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "directory entry contains NUL",
+            )
+        })?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+    }
+
+    let root_descriptor = open_directory(root)?;
+    let mut queue = VecDeque::from([PendingDirectory {
+        descriptor: root_descriptor,
+        display_path: root.to_path_buf(),
+        depth: 0,
+    }]);
+    let mut items = Vec::new();
+    let mut truncated = false;
+
+    while let Some(directory) = queue.pop_front() {
+        if items.len() >= limit {
+            truncated = true;
+            break;
+        }
+
+        let remaining = limit.saturating_sub(items.len());
+        let candidate_limit = remaining.saturating_add(1);
+        let names = directory_names(
+            &directory.descriptor,
+            include_hidden,
+            candidate_limit,
+            &mut truncated,
+        )?;
+
+        for name in names {
+            if items.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let metadata = match entry_metadata(&directory.descriptor, &name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let file_type = metadata.st_mode & libc::S_IFMT;
+            let entry_path = directory.display_path.join(&name);
+            let kind = if file_type == libc::S_IFLNK {
+                "symlink"
+            } else if file_type == libc::S_IFDIR {
+                "dir"
+            } else if file_type == libc::S_IFREG {
+                "file"
+            } else {
+                "other"
+            };
+            items.push(DirEntryView {
+                path: display_lexical_absolute_path(entry_path.as_path()),
+                kind: kind.to_owned(),
+                size: (file_type == libc::S_IFREG).then_some(metadata.st_size.max(0) as u64),
+            });
+
+            if file_type == libc::S_IFDIR && directory.depth < depth_limit {
+                match open_child_directory(&directory.descriptor, &name) {
+                    Ok(descriptor) => queue.push_back(PendingDirectory {
+                        descriptor,
+                        display_path: entry_path,
+                        depth: directory.depth.saturating_add(1),
+                    }),
+                    // The entry changed or disappeared after enumeration. It
+                    // remains safe to report the observed item, but recursion
+                    // is incomplete and must be marked as truncated.
+                    Err(_) => truncated = true,
+                }
+            }
+        }
+    }
+
+    if !queue.is_empty() {
+        truncated = true;
+    }
+    Ok((items, truncated))
+}
+
+#[cfg(not(unix))]
+fn list_directory_tree_secure(
+    root: &Path,
+    depth_limit: usize,
+    limit: usize,
+    include_hidden: bool,
+) -> std::io::Result<(Vec<DirEntryView>, bool)> {
+    let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut items = Vec::new();
+    let mut truncated = false;
+    while let Some((directory, depth)) = queue.pop_front() {
+        if items.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let remaining = limit.saturating_sub(items.len());
+        let candidate_limit = remaining.saturating_add(1);
+        let mut paths = BTreeSet::new();
+        for entry in std::fs::read_dir(directory.as_path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !include_hidden && name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            paths.insert(entry.path());
+            if paths.len() > candidate_limit {
+                paths.pop_last();
+                truncated = true;
+            }
+        }
+        for path in paths {
+            if items.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let metadata = std::fs::symlink_metadata(path.as_path())?;
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_symlink() {
+                "symlink"
+            } else if file_type.is_dir() {
+                "dir"
+            } else if file_type.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            items.push(DirEntryView {
+                path: display_lexical_absolute_path(path.as_path()),
+                kind: kind.to_owned(),
+                size: file_type.is_file().then_some(metadata.len()),
+            });
+            if file_type.is_dir() && depth < depth_limit {
+                queue.push_back((path, depth.saturating_add(1)));
+            }
+        }
+    }
+    if !queue.is_empty() {
+        truncated = true;
+    }
+    Ok((items, truncated))
 }
 
 #[async_trait]
@@ -499,7 +657,7 @@ impl ToolHandler for GrepHandler {
             match count_rg_search_files(
                 search_path.as_path(),
                 invocation.workdir.as_path(),
-                &invocation.environment,
+                invocation.execution_security_snapshot.as_ref(),
                 timeout_ms.min(3_000),
             )
             .await?
@@ -542,7 +700,7 @@ impl ToolHandler for GrepHandler {
             max_results,
             search_path.as_path(),
             invocation.workdir.as_path(),
-            &invocation.environment,
+            invocation.execution_security_snapshot.as_ref(),
             timeout_ms,
         )
         .await;
@@ -581,7 +739,7 @@ impl ToolHandler for GrepHandler {
                     case_sensitive,
                     search_path.as_path(),
                     invocation.workdir.as_path(),
-                    &invocation.environment,
+                    invocation.execution_security_snapshot.as_ref(),
                     timeout_ms,
                 )
                 .await;
@@ -744,7 +902,7 @@ async fn run_rg_search(
     max_results: usize,
     search_path: &Path,
     workdir: &Path,
-    environment: &BTreeMap<String, String>,
+    snapshot: Option<&TurnExecutionSecuritySnapshot>,
     timeout_ms: u64,
 ) -> Result<Option<BoundedCommandOutput>, ToolError> {
     let mut command = Command::new("rg");
@@ -765,10 +923,16 @@ async fn run_rg_search(
     command.arg("--");
     command.arg(pattern);
     command.arg(command_path(workdir, search_path));
-    command.current_dir(workdir);
-    command.envs(environment.iter());
+    let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
 
-    run_bounded_command(command, timeout_ms, HARD_MAX_GREP_OUTPUT_BYTES, "rg").await
+    run_bounded_command(
+        command,
+        timeout_ms,
+        HARD_MAX_GREP_OUTPUT_BYTES,
+        "rg",
+        process_plan,
+    )
+    .await
 }
 
 async fn run_grep_fallback(
@@ -776,7 +940,7 @@ async fn run_grep_fallback(
     case_sensitive: bool,
     search_path: &Path,
     workdir: &Path,
-    environment: &BTreeMap<String, String>,
+    snapshot: Option<&TurnExecutionSecuritySnapshot>,
     timeout_ms: u64,
 ) -> Result<BoundedCommandOutput, ToolError> {
     let mut command = Command::new("grep");
@@ -794,18 +958,23 @@ async fn run_grep_fallback(
     command.arg("--");
     command.arg(pattern);
     command.arg(command_path(workdir, search_path));
-    command.current_dir(workdir);
-    command.envs(environment.iter());
+    let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
 
-    run_bounded_command(command, timeout_ms, HARD_MAX_GREP_OUTPUT_BYTES, "grep")
-        .await?
-        .ok_or_else(|| ToolError::execution_failed("grep executable is unavailable"))
+    run_bounded_command(
+        command,
+        timeout_ms,
+        HARD_MAX_GREP_OUTPUT_BYTES,
+        "grep",
+        process_plan,
+    )
+    .await?
+    .ok_or_else(|| ToolError::execution_failed("grep executable is unavailable"))
 }
 
 async fn count_rg_search_files(
     search_path: &Path,
     workdir: &Path,
-    environment: &BTreeMap<String, String>,
+    snapshot: Option<&TurnExecutionSecuritySnapshot>,
     timeout_ms: u64,
 ) -> Result<Option<usize>, ToolError> {
     let mut command = Command::new("rg");
@@ -813,14 +982,14 @@ async fn count_rg_search_files(
     append_default_rg_excludes(&mut command);
     command.arg("--");
     command.arg(command_path(workdir, search_path));
-    command.current_dir(workdir);
-    command.envs(environment.iter());
+    let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
 
     let Some(output) = run_bounded_command(
         command,
         timeout_ms,
         HARD_MAX_GREP_OUTPUT_BYTES,
         "rg --files",
+        process_plan,
     )
     .await?
     else {
@@ -849,13 +1018,113 @@ struct BoundedCommandOutput {
     output_limit_exceeded: bool,
 }
 
+fn prepare_scoped_search_command(
+    command: &mut Command,
+    snapshot: Option<&TurnExecutionSecuritySnapshot>,
+    workdir: &Path,
+    timeout_ms: u64,
+) -> Result<Option<ProcessSpawnPlan>, ToolError> {
+    let Some(snapshot) = snapshot else {
+        // Legacy direct handler tests may not carry a turn snapshot. Product
+        // agent execution rejects a missing snapshot before tool dispatch.
+        command.current_dir(workdir);
+        return Ok(None);
+    };
+
+    let std_command = command.as_std();
+    let program = std_command.get_program().to_string_lossy().into_owned();
+    let argv = std::iter::once(program)
+        .chain(
+            std_command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned()),
+        )
+        .collect::<Vec<_>>();
+    let args = ExecCommandArgs {
+        command: Some(argv),
+        workdir: None,
+        timeout_ms: Some(timeout_ms),
+        max_output_tokens: None,
+        yield_time_ms: None,
+        tty: Some(false),
+    };
+    // Search helpers need no turn-projected variables (including the artifact
+    // output directory). Build their environment from the immutable process
+    // policy so host secrets and rg configuration cannot leak into an
+    // unapproved internal subprocess.
+    let process_plan =
+        build_process_spawn_plan(Some(snapshot), workdir, &args, &BTreeMap::new(), timeout_ms)?;
+    command.current_dir(process_plan.cwd.as_path());
+    if !process_plan.inherit_environment {
+        command.env_clear();
+    }
+    for key in &process_plan.removed_environment {
+        command.env_remove(key);
+    }
+    command.envs(process_plan.environment.iter());
+
+    match snapshot.backend.sandbox_backend {
+        None => {}
+        Some(SandboxBackendKind::Nono) => {
+            let backend = NonoSandboxBackend::new();
+            let request = NativeSandboxRequest {
+                snapshot,
+                process_plan: &process_plan,
+                workspace_roots: &[],
+                execution_label: "grep_files",
+            };
+            match prepare_native_sandbox_backend(&backend, &request)? {
+                NativeSandboxPrepareOutcome::Ready(_) => {
+                    configure_nono_command(command, snapshot, &process_plan)?;
+                }
+                NativeSandboxPrepareOutcome::Degraded { reason, .. }
+                | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
+                    return Err(ToolError::Rejected(format!(
+                        "grep_files sandbox is unavailable: {reason}"
+                    )));
+                }
+            }
+        }
+        Some(SandboxBackendKind::WindowsRestrictedToken) => {
+            let backend = WindowsRestrictedTokenBackend::new();
+            let request = NativeSandboxRequest {
+                snapshot,
+                process_plan: &process_plan,
+                workspace_roots: &[],
+                execution_label: "grep_files",
+            };
+            match prepare_native_sandbox_backend(&backend, &request)? {
+                NativeSandboxPrepareOutcome::Ready(_) => {
+                    configure_windows_restricted_token_command(command, snapshot, &process_plan)?;
+                }
+                NativeSandboxPrepareOutcome::Degraded { reason, .. }
+                | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
+                    return Err(ToolError::Rejected(format!(
+                        "grep_files sandbox is unavailable: {reason}"
+                    )));
+                }
+            }
+        }
+        Some(SandboxBackendKind::ProviderNative) => {
+            return Err(ToolError::Rejected(
+                "provider-native sandbox cannot protect Pioneer grep_files execution".to_owned(),
+            ));
+        }
+    }
+
+    Ok(Some(process_plan))
+}
+
 async fn run_bounded_command(
     mut command: Command,
     timeout_ms: u64,
     max_output_bytes: usize,
     executable_name: &str,
+    _process_plan: Option<ProcessSpawnPlan>,
 ) -> Result<Option<BoundedCommandOutput>, ToolError> {
     command.kill_on_drop(true);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -1200,6 +1469,12 @@ fn display_absolute_path(path: &Path) -> String {
         .replace('\\', "/")
 }
 
+fn display_lexical_absolute_path(path: &Path) -> String {
+    normalize_path_lexically(path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 fn normalize_path_lexically(path: PathBuf) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -1474,5 +1749,121 @@ mod tests {
             .unwrap();
         assert_eq!(read.raw_json()["path"], listed_path);
         assert_eq!(read.raw_json()["text"], "absolute\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_directory_listing_never_descends_through_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("listing root");
+        let outside = tempfile::tempdir().expect("outside root");
+        std::fs::write(outside.path().join("secret.txt"), "outside-secret")
+            .expect("outside secret");
+        symlink(outside.path(), root.path().join("escape")).expect("directory symlink");
+
+        let (entries, _) = list_directory_tree_secure(root.path(), HARD_MAX_LIST_DEPTH, 100, true)
+            .expect("secure listing");
+        assert!(
+            entries.iter().any(|entry| {
+                entry.path.ends_with("/escape") && entry.kind.as_str() == "symlink"
+            })
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.path.ends_with("/escape/secret.txt"))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn grep_files_returns_matches_through_native_sandbox_backend() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let search_dir = root.path().join("src");
+        std::fs::create_dir_all(search_dir.as_path()).expect("search dir");
+        std::fs::write(
+            search_dir.join("sample.txt"),
+            "alpha\npioneer-permission-marker\nomega\n",
+        )
+        .expect("search fixture");
+        let security = TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                root.path().to_string_lossy(),
+            )],
+            1,
+        );
+
+        let output = GrepHandler
+            .handle(
+                invocation(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "pattern": "pioneer-permission-marker",
+                            "path": search_dir,
+                            "max_results": 10,
+                            "timeout_ms": 5_000
+                        }),
+                    },
+                    root.path(),
+                    security,
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_grep_files",
+                    "call_grep_files",
+                    "grep_files",
+                ),
+            )
+            .await
+            .expect("grep_files should execute inside the native sandbox");
+
+        assert_eq!(output.raw_json()["status"], "ok");
+        assert!(
+            output.raw_json()["stdout"]
+                .as_str()
+                .is_some_and(|stdout| stdout.contains("pioneer-permission-marker"))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn grep_helper_process_cannot_read_outside_native_sandbox() {
+        let root = tempfile::tempdir().expect("authorized root");
+        let outside = tempfile::tempdir().expect("outside root");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(secret.as_path(), "outside-secret").expect("outside secret");
+        let security = TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                root.path().to_string_lossy(),
+            )],
+            1,
+        );
+        let mut command = Command::new("/bin/cat");
+        command.arg(secret.as_path());
+        let process_plan =
+            prepare_scoped_search_command(&mut command, Some(&security), root.path(), 2_000)
+                .expect("native sandbox should prepare");
+
+        let output = run_bounded_command(command, 2_000, 16 * 1024, "sandbox probe", process_plan)
+            .await
+            .expect("sandbox probe should spawn")
+            .expect("shell is available");
+
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("outside-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("outside-secret"));
     }
 }

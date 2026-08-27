@@ -51,27 +51,25 @@ pub struct McpToolPolicyClassification {
 }
 
 pub fn classify_mcp_tool_policy(hints: McpToolSafetyHints) -> McpToolPolicyClassification {
+    // MCP annotations are supplied by the server itself. Until Pioneer has a
+    // separate, server-owned trust policy, they may only make the displayed
+    // classification more conservative; they must never remove consent or
+    // network enforcement. In particular, `readOnlyHint=true` and
+    // `openWorldHint=false` are not security assertions.
     let side_effect_class = if hints.destructive_hint == Some(true) {
         McpToolSideEffectClass::WriteLike
     } else if hints.open_world_hint == Some(true) {
         McpToolSideEffectClass::NetworkLike
-    } else if hints.read_only_hint == Some(true) {
-        McpToolSideEffectClass::ReadOnly
     } else {
         McpToolSideEffectClass::Unknown
     };
 
-    let permission_class = match side_effect_class {
-        McpToolSideEffectClass::ReadOnly => McpToolPermissionClass::Read,
-        McpToolSideEffectClass::WriteLike
-        | McpToolSideEffectClass::NetworkLike
-        | McpToolSideEffectClass::Unknown => McpToolPermissionClass::WriteOrUnknown,
-    };
-
     McpToolPolicyClassification {
         side_effect_class,
-        permission_class,
-        requires_network: hints.open_world_hint.unwrap_or(true),
+        permission_class: McpToolPermissionClass::WriteOrUnknown,
+        // An out-of-process MCP server can perform network effects regardless
+        // of what it advertises in tools/list.
+        requires_network: true,
     }
 }
 
@@ -80,7 +78,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_classifies_known_read_only_tool_as_read() {
+    fn policy_does_not_trust_server_declared_read_only_tool() {
         let classification = classify_mcp_tool_policy(McpToolSafetyHints {
             read_only_hint: Some(true),
             destructive_hint: Some(false),
@@ -89,13 +87,13 @@ mod tests {
 
         assert_eq!(
             classification.side_effect_class,
-            McpToolSideEffectClass::ReadOnly
+            McpToolSideEffectClass::Unknown
         );
         assert_eq!(
             classification.permission_class,
-            McpToolPermissionClass::Read
+            McpToolPermissionClass::WriteOrUnknown
         );
-        assert!(!classification.requires_network);
+        assert!(classification.requires_network);
     }
 
     #[test]
@@ -114,7 +112,7 @@ mod tests {
             classification.permission_class,
             McpToolPermissionClass::WriteOrUnknown
         );
-        assert!(!classification.requires_network);
+        assert!(classification.requires_network);
     }
 
     #[test]

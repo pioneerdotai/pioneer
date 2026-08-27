@@ -489,14 +489,6 @@ impl TurnExecutionSecuritySnapshot {
         let network = TurnNetworkPolicySnapshot::disabled();
         let process = TurnProcessPolicySnapshot::restricted();
         let approval = TurnApprovalScopePolicySnapshot::supervised();
-        let maximum_roots = read_roots
-            .iter()
-            .cloned()
-            .map(|mut entry| {
-                entry.access = TurnFilesystemAccess::Write;
-                entry
-            })
-            .collect();
         Self {
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
@@ -521,11 +513,13 @@ impl TurnExecutionSecuritySnapshot {
                 version: 1,
                 resource_binding_id: "restricted".to_owned(),
                 resource_binding_revision: 0,
-                filesystem: TurnFilesystemSandboxPolicy {
-                    kind: TurnFilesystemSandboxKind::Restricted,
-                    entries: maximum_roots,
-                },
-                network: network.clone(),
+                // The sandbox above is the authority available without
+                // consent. The cap is the maximum authority an interactive
+                // approval may grant for one bounded invocation. Task and
+                // reviewer turns replace these maxima with their inherited
+                // durable cap in the gateway resolver.
+                filesystem: TurnFilesystemSandboxPolicy::unrestricted(),
+                network: TurnNetworkPolicySnapshot::enabled(),
                 process,
                 approval,
             },
@@ -545,7 +539,6 @@ impl TurnExecutionSecuritySnapshot {
         let network = TurnNetworkPolicySnapshot::disabled();
         let process = TurnProcessPolicySnapshot::restricted();
         let approval = TurnApprovalScopePolicySnapshot::auto_accept_edits();
-        let maximum_roots = read_write_roots.clone();
         Self {
             schema_version: TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
             version: 1,
@@ -570,11 +563,11 @@ impl TurnExecutionSecuritySnapshot {
                 version: 1,
                 resource_binding_id: "restricted".to_owned(),
                 resource_binding_revision: 0,
-                filesystem: TurnFilesystemSandboxPolicy {
-                    kind: TurnFilesystemSandboxKind::Restricted,
-                    entries: maximum_roots,
-                },
-                network: network.clone(),
+                // Auto-accepted workspace edits stay inside the initial
+                // sandbox. Broader filesystem or network access is possible
+                // only through an exact consent-bound grant.
+                filesystem: TurnFilesystemSandboxPolicy::unrestricted(),
+                network: TurnNetworkPolicySnapshot::enabled(),
                 process,
                 approval,
             },
@@ -837,6 +830,49 @@ pub struct TurnEnvironmentPolicy {
 }
 
 impl TurnEnvironmentPolicy {
+    const RESTRICTED_ALLOWED_VARS: &'static [&'static str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GOPATH",
+        "GOROOT",
+        "JAVA_HOME",
+        "MAVEN_HOME",
+        "GRADLE_HOME",
+        "NODE_PATH",
+        "NVM_BIN",
+        "NVM_DIR",
+        "PNPM_HOME",
+        "BUN_INSTALL",
+        "VOLTA_HOME",
+        "PYENV_ROOT",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "PIONEER_ARTIFACT_OUTPUT_DIR",
+    ];
+
     pub fn unrestricted() -> Self {
         Self {
             inherit: true,
@@ -848,8 +884,21 @@ impl TurnEnvironmentPolicy {
     pub fn restricted() -> Self {
         Self {
             inherit: false,
-            allowed_vars: Vec::new(),
-            denied_patterns: Vec::new(),
+            allowed_vars: Self::RESTRICTED_ALLOWED_VARS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            denied_patterns: vec![
+                ".*TOKEN.*".to_owned(),
+                ".*SECRET.*".to_owned(),
+                ".*PASSWORD.*".to_owned(),
+                ".*API_KEY.*".to_owned(),
+                ".*ACCESS_KEY.*".to_owned(),
+                ".*CREDENTIAL.*".to_owned(),
+                ".*DATABASE_URL.*".to_owned(),
+                ".*AUTH.*".to_owned(),
+                ".*COOKIE.*".to_owned(),
+            ],
         }
     }
 }
@@ -1036,6 +1085,8 @@ pub enum TurnSecurityCapabilityKind {
 pub struct TurnSecurityParentCapSnapshot {
     pub parent_turn_id: String,
     pub max_permission_profile: TurnPermissionProfileCap,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_filesystem_kind: Option<TurnFilesystemSandboxKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub max_filesystem_entries: Vec<TurnFilesystemSandboxEntry>,
     pub max_network_policy: TurnNetworkPolicySnapshot,
@@ -1081,6 +1132,8 @@ pub enum TurnPermissionActionKind {
     DynamicSkillTool,
     ComputerUse,
     TaskSubagent,
+    MemoryWrite,
+    AgentAction,
     Internal,
     Unknown,
 }
@@ -1097,6 +1150,8 @@ impl TurnPermissionActionKind {
             Self::DynamicSkillTool => "dynamic_skill_tool",
             Self::ComputerUse => "computer_use",
             Self::TaskSubagent => "task_subagent",
+            Self::MemoryWrite => "memory_write",
+            Self::AgentAction => "agent_action",
             Self::Internal => "internal",
             Self::Unknown => "unknown",
         }
@@ -1195,7 +1250,7 @@ impl TurnPermissionProfileSource {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ToolPermissionPolicySnapshot {
     pub default_behavior: PermissionBehavior,
     pub file_read: PermissionBehavior,
@@ -1207,12 +1262,91 @@ pub struct ToolPermissionPolicySnapshot {
     pub dynamic_skill_tool: PermissionBehavior,
     pub computer_use: PermissionBehavior,
     pub task_subagent: PermissionBehavior,
+    pub memory_write: PermissionBehavior,
+    pub agent_action: PermissionBehavior,
+    /// `allowed_tools = []` historically means "no allow-list".  This bit
+    /// preserves the distinct result of intersecting two disjoint allow-lists:
+    /// a restricted empty set must deny every tool rather than reopen all of
+    /// them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allowed_tools_restricted: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_tools: Vec<String>,
+    /// See `allowed_tools_restricted`.  A restricted empty path set is a
+    /// durable deny-all result, while an unrestricted empty set is the legacy
+    /// wildcard.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allowed_paths_restricted: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_paths: Vec<String>,
+}
+
+// Permission snapshots are durable and older Gateway databases do not contain
+// fields introduced after the original policy schema. Inherit a missing new
+// action from the snapshot's own default instead of choosing a global default:
+// legacy full-access snapshots remain full access, while restricted snapshots
+// remain fail-closed (`ask`).
+#[derive(Deserialize)]
+struct ToolPermissionPolicySnapshotWire {
+    default_behavior: PermissionBehavior,
+    file_read: PermissionBehavior,
+    file_write: PermissionBehavior,
+    shell_command: PermissionBehavior,
+    network: PermissionBehavior,
+    mcp_read: PermissionBehavior,
+    mcp_write_or_unknown: PermissionBehavior,
+    dynamic_skill_tool: PermissionBehavior,
+    computer_use: PermissionBehavior,
+    task_subagent: PermissionBehavior,
+    #[serde(default)]
+    memory_write: Option<PermissionBehavior>,
+    #[serde(default)]
+    agent_action: Option<PermissionBehavior>,
+    #[serde(default)]
+    allowed_tools_restricted: bool,
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    denied_tools: Vec<String>,
+    #[serde(default)]
+    allowed_paths_restricted: bool,
+    #[serde(default)]
+    allowed_paths: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ToolPermissionPolicySnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ToolPermissionPolicySnapshotWire::deserialize(deserializer)?;
+        let inherited_behavior = wire.default_behavior;
+        let allowed_tools_restricted =
+            wire.allowed_tools_restricted || !wire.allowed_tools.is_empty();
+        let allowed_paths_restricted =
+            wire.allowed_paths_restricted || !wire.allowed_paths.is_empty();
+        Ok(Self {
+            default_behavior: wire.default_behavior,
+            file_read: wire.file_read,
+            file_write: wire.file_write,
+            shell_command: wire.shell_command,
+            network: wire.network,
+            mcp_read: wire.mcp_read,
+            mcp_write_or_unknown: wire.mcp_write_or_unknown,
+            dynamic_skill_tool: wire.dynamic_skill_tool,
+            computer_use: wire.computer_use,
+            task_subagent: wire.task_subagent,
+            memory_write: wire.memory_write.unwrap_or(inherited_behavior),
+            agent_action: wire.agent_action.unwrap_or(inherited_behavior),
+            allowed_tools_restricted,
+            allowed_tools: wire.allowed_tools,
+            denied_tools: wire.denied_tools,
+            allowed_paths_restricted,
+            allowed_paths: wire.allowed_paths,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1246,8 +1380,12 @@ impl ToolPermissionPolicySnapshot {
             dynamic_skill_tool: behavior,
             computer_use: behavior,
             task_subagent: behavior,
+            memory_write: behavior,
+            agent_action: behavior,
+            allowed_tools_restricted: false,
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
+            allowed_paths_restricted: false,
             allowed_paths: Vec::new(),
         }
     }
@@ -4712,8 +4850,12 @@ mod tests {
                 dynamic_skill_tool: PermissionBehavior::Ask,
                 computer_use: PermissionBehavior::Ask,
                 task_subagent: PermissionBehavior::Ask,
+                memory_write: PermissionBehavior::Ask,
+                agent_action: PermissionBehavior::Ask,
+                allowed_tools_restricted: true,
                 allowed_tools: vec!["read_file".to_owned()],
                 denied_tools: vec!["exec_command".to_owned()],
+                allowed_paths_restricted: true,
                 allowed_paths: vec!["/workspace/src".to_owned()],
             },
         };
@@ -4896,6 +5038,8 @@ mod tests {
         );
         assert_eq!(auto_accept_edits.computer_use, PermissionBehavior::Ask);
         assert_eq!(auto_accept_edits.task_subagent, PermissionBehavior::Ask);
+        assert_eq!(auto_accept_edits.memory_write, PermissionBehavior::Ask);
+        assert_eq!(auto_accept_edits.agent_action, PermissionBehavior::Ask);
 
         let supervised = crate::permission_policy_for_mode(TurnPermissionMode::Supervised);
         assert_eq!(supervised.default_behavior, PermissionBehavior::Ask);
@@ -4908,6 +5052,38 @@ mod tests {
         assert_eq!(supervised.dynamic_skill_tool, PermissionBehavior::Ask);
         assert_eq!(supervised.computer_use, PermissionBehavior::Ask);
         assert_eq!(supervised.task_subagent, PermissionBehavior::Ask);
+        assert_eq!(supervised.memory_write, PermissionBehavior::Ask);
+        assert_eq!(supervised.agent_action, PermissionBehavior::Ask);
+    }
+
+    #[test]
+    fn legacy_permission_policy_inherits_new_actions_from_its_durable_default() {
+        let legacy_full = json!({
+            "default_behavior": "allow",
+            "file_read": "allow",
+            "file_write": "allow",
+            "shell_command": "allow",
+            "network": "allow",
+            "mcp_read": "allow",
+            "mcp_write_or_unknown": "allow",
+            "dynamic_skill_tool": "allow",
+            "computer_use": "allow",
+            "task_subagent": "allow"
+        });
+        let decoded: ToolPermissionPolicySnapshot =
+            serde_json::from_value(legacy_full).expect("legacy full-access policy should decode");
+        assert_eq!(decoded.memory_write, PermissionBehavior::Allow);
+        assert_eq!(decoded.agent_action, PermissionBehavior::Allow);
+
+        let mut legacy_restricted = serde_json::to_value(&decoded).expect("policy should encode");
+        legacy_restricted["default_behavior"] = json!("ask");
+        let object = legacy_restricted.as_object_mut().expect("policy object");
+        object.remove("memory_write");
+        object.remove("agent_action");
+        let decoded: ToolPermissionPolicySnapshot = serde_json::from_value(legacy_restricted)
+            .expect("legacy restricted policy should decode");
+        assert_eq!(decoded.memory_write, PermissionBehavior::Ask);
+        assert_eq!(decoded.agent_action, PermissionBehavior::Ask);
     }
 
     #[test]
@@ -4928,6 +5104,8 @@ mod tests {
                 policy.dynamic_skill_tool,
                 policy.computer_use,
                 policy.task_subagent,
+                policy.memory_write,
+                policy.agent_action,
             ];
 
             assert!(
@@ -5015,6 +5193,11 @@ mod tests {
             "read"
         );
         assert_eq!(encoded["network"]["mode"], "disabled");
+        assert_eq!(
+            encoded["authority_cap"]["filesystem"]["kind"],
+            "unrestricted"
+        );
+        assert_eq!(encoded["authority_cap"]["network"]["mode"], "enabled");
         assert_eq!(encoded["sandbox"]["backend_requirement"], "required");
         assert_eq!(encoded["sandbox"]["backend_preference"], json!(["nono"]));
 
@@ -5050,6 +5233,11 @@ mod tests {
         );
         assert_eq!(encoded["approval"]["allow_for_turn"], true);
         assert_eq!(encoded["approval"]["request_permissions"], true);
+        assert_eq!(
+            encoded["authority_cap"]["filesystem"]["kind"],
+            "unrestricted"
+        );
+        assert_eq!(encoded["authority_cap"]["network"]["mode"], "enabled");
         assert_eq!(encoded["backend"]["sandbox_backend"], "nono");
 
         let decoded: TurnExecutionSecuritySnapshot =

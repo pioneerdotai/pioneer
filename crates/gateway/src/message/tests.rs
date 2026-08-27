@@ -439,6 +439,28 @@ async fn persist_test_cli_execution_authorization_context(
     runtime_id: &str,
     runtime_kind: &str,
 ) {
+    persist_test_cli_execution_authorization_context_with_profile(
+        crud_store,
+        workspace_id,
+        root_thread_id,
+        turn_id,
+        runtime_id,
+        runtime_kind,
+        &default_test_permission_profile(),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_test_cli_execution_authorization_context_with_profile(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    root_thread_id: &str,
+    turn_id: &str,
+    runtime_id: &str,
+    runtime_kind: &str,
+    permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
+) {
     ensure_test_superuser_execution_authority(crud_store).await;
     let runtime_kind = match runtime_kind {
         "codex" => CLIAgentRuntimeKind::Codex,
@@ -454,7 +476,7 @@ async fn persist_test_cli_execution_authorization_context(
         principal.as_ref(),
         workspace_id,
         root_thread_id,
-        &default_test_permission_profile(),
+        permission_profile,
         Some(&execution_backend),
     );
     let encoded = context
@@ -995,6 +1017,13 @@ struct CliRuntimeSecurityHarness {
 async fn setup_cli_runtime_security_harness(
     runtime_kind: Option<CLIAgentRuntimeKind>,
 ) -> CliRuntimeSecurityHarness {
+    setup_cli_runtime_security_harness_for_principal(runtime_kind, None).await
+}
+
+async fn setup_cli_runtime_security_harness_for_principal(
+    runtime_kind: Option<CLIAgentRuntimeKind>,
+    principal: Option<Arc<crate::auth::AuthenticatedSessionPrincipal>>,
+) -> CliRuntimeSecurityHarness {
     // Security tests normally consume each response immediately, while the
     // self-improvement vertical E2E intentionally leaves several real
     // Composer children running at once. Keep the test transport bounded but
@@ -1002,7 +1031,13 @@ async fn setup_cli_runtime_security_harness(
     // producer before the next response drain.
     let (tx, rx) = mpsc::channel(512);
     let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let connection_id = match principal {
+        Some(principal) => session_manager
+            .register_connection(tx, principal)
+            .await
+            .expect("test auth session must be registerable"),
+        None => register_authenticated_test_connection(session_manager.as_ref(), tx).await,
+    };
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
@@ -1867,7 +1902,7 @@ async fn capability_persistence_order_impl() {
                 ]
             );
             let instructions = native_turn.elevated_instructions.text();
-            assert!(instructions.contains("native Codex skill"));
+            assert!(instructions.contains("selected Skill input"));
             let beta = instructions
                 .find("- $beta")
                 .expect("Codex elevated instructions should include beta");
@@ -1879,7 +1914,7 @@ async fn capability_persistence_order_impl() {
                 item["type"] != "text"
                     || item["text"]
                         .as_str()
-                        .is_none_or(|text| !text.contains("native Codex skill"))
+                        .is_none_or(|text| !text.contains("selected Skill input"))
             }));
         } else {
             let input = native_turn.input.as_array().unwrap();
@@ -2950,6 +2985,13 @@ struct SequencedToolProvider {
     first_tool_calls: Vec<ProviderToolCall>,
     second_text: String,
     next_index: AtomicUsize,
+}
+
+struct DirectAgentSandboxProvider {
+    source: String,
+    destination: String,
+    root_round: AtomicUsize,
+    child_round: AtomicUsize,
 }
 
 struct VerticalSelfImprovementProvider {
@@ -4704,6 +4746,80 @@ impl SequencedToolProvider {
     }
 }
 
+impl DirectAgentSandboxProvider {
+    const CHILD_MARKER: &'static str = "DIRECT_AGENT_SANDBOX_CHILD";
+
+    fn new(source: impl Into<String>, destination: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            destination: destination.into(),
+            root_round: AtomicUsize::new(0),
+            child_round: AtomicUsize::new(0),
+        }
+    }
+
+    fn is_child_request(request: &ChatRequest) -> bool {
+        request
+            .messages
+            .iter()
+            .any(|message| message.content.contains(Self::CHILD_MARKER))
+    }
+
+    fn rounds(&self) -> (usize, usize) {
+        (
+            self.root_round.load(Ordering::SeqCst),
+            self.child_round.load(Ordering::SeqCst),
+        )
+    }
+}
+
+fn find_current_agent_target_option(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Object(object) => {
+            if let Some(options) = object
+                .get("targetOptions")
+                .or_else(|| object.get("target_options"))
+                .and_then(JsonValue::as_array)
+                && let Some(id) = options.iter().find_map(|option| {
+                    let label = option.get("label").and_then(JsonValue::as_str)?;
+                    (label == "Current thread")
+                        .then(|| option.get("id").and_then(JsonValue::as_str))
+                        .flatten()
+                })
+            {
+                return Some(id.to_owned());
+            }
+            object.values().find_map(find_current_agent_target_option)
+        }
+        JsonValue::Array(values) => values.iter().find_map(find_current_agent_target_option),
+        JsonValue::String(encoded) => serde_json::from_str::<JsonValue>(encoded)
+            .ok()
+            .as_ref()
+            .and_then(find_current_agent_target_option),
+        _ => None,
+    }
+}
+
+fn current_agent_target_option_from_request(request: &ChatRequest) -> Option<String> {
+    for message in request.messages.iter().rev() {
+        if let Ok(value) = serde_json::from_str::<JsonValue>(message.content.as_str())
+            && let Some(id) = find_current_agent_target_option(&value)
+        {
+            return Some(id);
+        }
+        for (index, _) in message.content.match_indices('{') {
+            let mut values = serde_json::Deserializer::from_str(&message.content[index..])
+                .into_iter::<JsonValue>();
+            if let Some(Ok(value)) = values.next()
+                && let Some(id) = find_current_agent_target_option(&value)
+            {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 impl VerticalSelfImprovementProvider {
     fn new() -> Self {
         Self {
@@ -5186,11 +5302,13 @@ fn single_prompt_parity_request(
 
 fn canonical_provider_messages_for_artifact_parity(
     messages: &[pioneer_provider::ChatMessage],
+    turn_private_paths: &[&str],
 ) -> Vec<pioneer_provider::ChatMessage> {
     let mut messages = messages.to_vec();
     for message in &mut messages {
         if message.role == pioneer_provider::Role::System {
-            message.content = canonical_prompt_text_for_parity(message.content.as_str());
+            message.content =
+                canonical_prompt_text_for_parity(message.content.as_str(), turn_private_paths);
         }
         for content_part in &mut message.content_parts {
             let attachment = match content_part {
@@ -5228,8 +5346,9 @@ fn canonical_provider_messages_for_artifact_parity(
     messages
 }
 
-fn canonical_prompt_text_for_parity(text: &str) -> String {
-    text.split('\n')
+fn canonical_prompt_text_for_parity(text: &str, turn_private_paths: &[&str]) -> String {
+    let mut canonical = text
+        .split('\n')
         .map(|line| {
             if line.starts_with("Current date/time: ") {
                 "Current date/time: <dynamic runtime clock>"
@@ -5238,46 +5357,69 @@ fn canonical_prompt_text_for_parity(text: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    for path in turn_private_paths {
+        canonical = canonical.replace(path, "<turn-private runtime root>");
+    }
+    canonical
 }
 
 fn canonical_compiled_prompt_for_parity(
     prompt: Option<&pioneer_provider::CompiledPromptPayload>,
+    turn_private_paths: &[&str],
 ) -> Option<pioneer_provider::CompiledPromptPayload> {
     prompt.cloned().map(|mut prompt| {
-        prompt.stable_system_text =
-            canonical_prompt_text_for_parity(prompt.stable_system_text.as_str());
-        prompt.dynamic_system_text =
-            canonical_prompt_text_for_parity(prompt.dynamic_system_text.as_str());
+        prompt.stable_system_text = canonical_prompt_text_for_parity(
+            prompt.stable_system_text.as_str(),
+            turn_private_paths,
+        );
+        prompt.dynamic_system_text = canonical_prompt_text_for_parity(
+            prompt.dynamic_system_text.as_str(),
+            turn_private_paths,
+        );
         prompt.full_system_text =
-            canonical_prompt_text_for_parity(prompt.full_system_text.as_str());
+            canonical_prompt_text_for_parity(prompt.full_system_text.as_str(), turn_private_paths);
         prompt
     })
 }
 
 fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &ChatRequest) {
+    assert_exact_chat_request_parity_with_turn_private_paths(stage, direct, child, &[], &[]);
+}
+
+fn assert_exact_chat_request_parity_with_turn_private_paths(
+    stage: &str,
+    direct: &ChatRequest,
+    child: &ChatRequest,
+    direct_turn_private_paths: &[&str],
+    child_turn_private_paths: &[&str],
+) {
     assert_eq!(
         direct.model, child.model,
         "{stage} model must be identical for parent and detached child"
     );
     assert_eq!(
         serde_json::to_value(canonical_provider_messages_for_artifact_parity(
-            direct.messages.as_slice()
+            direct.messages.as_slice(),
+            direct_turn_private_paths,
         ))
         .expect("direct messages should serialize"),
         serde_json::to_value(canonical_provider_messages_for_artifact_parity(
-            child.messages.as_slice()
+            child.messages.as_slice(),
+            child_turn_private_paths,
         ))
         .expect("child messages should serialize"),
         "{stage} provider messages must be identical for parent and detached child after verified artifact staging-path canonicalization"
     );
     assert_eq!(
         serde_json::to_value(canonical_provider_messages_for_artifact_parity(
-            direct.rendered_messages_with_compiled_prompt().as_slice()
+            direct.rendered_messages_with_compiled_prompt().as_slice(),
+            direct_turn_private_paths,
         ))
         .expect("direct rendered messages should serialize"),
         serde_json::to_value(canonical_provider_messages_for_artifact_parity(
-            child.rendered_messages_with_compiled_prompt().as_slice()
+            child.rendered_messages_with_compiled_prompt().as_slice(),
+            child_turn_private_paths,
         ))
         .expect("child rendered messages should serialize"),
         "{stage} rendered provider messages must be identical for parent and detached child after dynamic runtime-clock canonicalization"
@@ -5309,8 +5451,14 @@ fn assert_exact_chat_request_parity(stage: &str, direct: &ChatRequest, child: &C
         "{stage} reasoning configuration must be identical for parent and detached child"
     );
     assert_eq!(
-        canonical_compiled_prompt_for_parity(direct.compiled_prompt.as_ref()),
-        canonical_compiled_prompt_for_parity(child.compiled_prompt.as_ref()),
+        canonical_compiled_prompt_for_parity(
+            direct.compiled_prompt.as_ref(),
+            direct_turn_private_paths,
+        ),
+        canonical_compiled_prompt_for_parity(
+            child.compiled_prompt.as_ref(),
+            child_turn_private_paths,
+        ),
         "{stage} compiled system prompt must be identical for parent and detached child after dynamic runtime-clock canonicalization"
     );
 }
@@ -5521,6 +5669,125 @@ impl Provider for SequencedToolProvider {
             provider_replay_state: None,
             termination: pioneer_provider::ProviderTermination::Complete,
             tool_calls: Vec::new(),
+        })
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::Complete,
+            )),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for DirectAgentSandboxProvider {
+    fn name(&self) -> &str {
+        "direct-agent-sandbox"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: false,
+            vision: false,
+            tool_calling: true,
+            embeddings: false,
+            transcription: false,
+            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+        }
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let child = Self::is_child_request(&request);
+        if is_turn_preflight_request(&request) {
+            return Ok(if child {
+                test_turn_preflight_response_with_visible_tools(&["exec_command"])
+            } else {
+                test_turn_preflight_response_with_visible_tools(&[
+                    "agent_start_options",
+                    "agent_start",
+                ])
+            });
+        }
+
+        if child {
+            return Ok(match self.child_round.fetch_add(1, Ordering::SeqCst) {
+                0 => ChatResponse {
+                    text: String::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
+                    tool_calls: vec![ProviderToolCall {
+                        id: "call_direct_agent_child_shell".to_owned(),
+                        name: "exec_command".to_owned(),
+                        arguments: json!({
+                            "command": ["/bin/cp", self.source, self.destination],
+                            "timeout_ms": 10_000,
+                            "max_output_tokens": 1_000,
+                            "tty": false
+                        })
+                        .to_string(),
+                    }],
+                },
+                _ => text_response("direct Agent child completed"),
+            });
+        }
+
+        Ok(match self.root_round.fetch_add(1, Ordering::SeqCst) {
+            0 => ChatResponse {
+                text: String::new(),
+                usage: None,
+                reasoning_content: None,
+                provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::ToolCalls,
+                tool_calls: vec![ProviderToolCall {
+                    id: "call_direct_agent_options".to_owned(),
+                    name: "agent_start_options".to_owned(),
+                    arguments: json!({}).to_string(),
+                }],
+            },
+            1 => {
+                let target_option_id = current_agent_target_option_from_request(&request)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "agent_start_options output did not contain a current-thread target: {:#?}",
+                            request.messages
+                        )
+                    })?;
+                ChatResponse {
+                    text: String::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
+                    tool_calls: vec![ProviderToolCall {
+                        id: "call_direct_agent_start".to_owned(),
+                        name: "agent_start".to_owned(),
+                        arguments: json!({
+                            "targetOptionId": target_option_id,
+                            "input": [{
+                                "type": "text",
+                                "text": Self::CHILD_MARKER
+                            }],
+                            "launch": {
+                                "identity": {"kind": "inherit_parent"},
+                                "profile": {"kind": "inherit_parent"},
+                                "permissionProfile": {"mode": "supervised"}
+                            }
+                        })
+                        .to_string(),
+                    }],
+                }
+            }
+            _ => text_response("direct Agent parent completed"),
         })
     }
 
@@ -6117,6 +6384,7 @@ fn test_task_create_params(
                 max_permission_profile: pioneer_protocol::task_permission_cap_from_snapshot(
                     &pioneer_protocol::default_turn_permission_profile_snapshot(),
                 ),
+                max_filesystem_kind: Some(pioneer_protocol::TurnFilesystemSandboxKind::Restricted),
                 max_filesystem_entries: vec![
                     pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
                         pioneer_protocol::TurnFilesystemAccess::Write,
@@ -9281,6 +9549,95 @@ async fn materialize_artifact_api_thread(
         )
         .await
         .expect("artifact API test thread should materialize");
+}
+
+const TEST_COLLABORATOR_PRINCIPAL_ID: &str = "P0000000000000000000C";
+
+fn authenticated_test_member_collaborator() -> Arc<crate::auth::AuthenticatedSessionPrincipal> {
+    let mut principal = (*authenticated_test_superuser()).clone();
+    principal.principal_id = pioneer_protocol::PrincipalId::new(TEST_COLLABORATOR_PRINCIPAL_ID)
+        .expect("collaborator principal id");
+    principal.kind = pioneer_protocol::PrincipalKind::User;
+    principal.role_key = Some(RoleKey::member());
+    principal.device_id =
+        pioneer_protocol::DeviceId::new("D0000000000000000000C").expect("collaborator device id");
+    principal.session_id = pioneer_protocol::AuthSessionId::new("S0000000000000000000C")
+        .expect("collaborator session id");
+    Arc::new(principal)
+}
+
+async fn materialize_test_member_collaborator(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+) {
+    crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "INSERT OR IGNORE INTO gateway_principal(\
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                created_at,updated_at,removed_at\
+             ) VALUES(\
+                '{TEST_COLLABORATOR_PRINCIPAL_ID}','G00000000000000000001','user','member',\
+                'active','Test Collaborator','test-collaborator','test-collaborator',\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+             );\
+             INSERT OR IGNORE INTO workspace_membership(\
+                principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES(\
+                '{TEST_COLLABORATOR_PRINCIPAL_ID}','{workspace_id}','system',NULL,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );\
+             INSERT OR IGNORE INTO thread_membership(\
+                thread_id,principal_id,added_by_actor_kind,added_by_actor_id,\
+                created_at,updated_at\
+             ) VALUES(\
+                '{thread_id}','{TEST_COLLABORATOR_PRINCIPAL_ID}','system',NULL,\
+                CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+             );"
+        ))
+        .await
+        .expect("materialize current Member collaborator");
+    let principal_id = pioneer_protocol::PrincipalId::new(TEST_COLLABORATOR_PRINCIPAL_ID)
+        .expect("collaborator principal id");
+    assert!(
+        pioneer_crud::find_workspace_membership(
+            &crud_store.database_connection(),
+            &principal_id,
+            workspace_id,
+        )
+        .await
+        .expect("collaborator workspace membership lookup")
+        .is_some(),
+        "test collaborator must have current workspace membership"
+    );
+    let scope = pioneer_crud::resolve_thread_authorization_scope(
+        &crud_store.database_connection(),
+        thread_id,
+        Some(workspace_id),
+    )
+    .await
+    .expect("collaborative thread authorization scope lookup")
+    .expect("collaborative thread authorization scope");
+    if scope.access_class == pioneer_crud::PersistedThreadAccessClass::Private {
+        assert!(
+            pioneer_crud::find_thread_membership(
+                &crud_store.database_connection(),
+                thread_id,
+                &principal_id,
+            )
+            .await
+            .expect("collaborator thread membership lookup")
+            .is_some(),
+            "test collaborator must have current private-thread membership"
+        );
+    }
+    assert_ne!(
+        scope.access_class,
+        pioneer_crud::PersistedThreadAccessClass::Internal,
+        "ordinary collaborative regression fixture must not use an internal Thread"
+    );
 }
 
 async fn subscribe_test_connection_to_materialized_thread(
@@ -16432,7 +16789,20 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
     let session_manager = Arc::new(SessionManager::new());
     let (tx, mut rx) = mpsc::channel(8);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    // Initial and revision child turns can overlap task_wait on separate pool
+    // connections. `sqlite::memory:` gives each such connection an unrelated
+    // empty database, so retain one unique file-backed fixture for this exact
+    // concurrency contract.
+    let database_temp = tempfile::tempdir().expect("revision Task database tempdir should exist");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        database_temp.path().join("revision-task.sqlite3").display()
+    );
+    let connection = Database::connect(database_url)
+        .await
+        .expect("revision Task database should connect");
+    let (workspace_manager, crud_store, workspace_id) =
+        setup_workspace_manager_with_connection(connection).await;
     let processor = review_enabled_processor(
         provider_registry,
         session_manager,
@@ -20517,8 +20887,15 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
+#[test]
+fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
+    run_standard_stack_message_test(
+        "detached native Task FIFO continuation",
+        detached_native_tasks_share_parent_continuation_and_run_fifo_impl(),
+    );
+}
+
+async fn detached_native_tasks_share_parent_continuation_and_run_fifo_impl() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -21546,6 +21923,49 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     agent_spec.agent_nickname = None;
     agent_spec.model = Some("gpt-5.4".to_owned());
     agent_spec.model_provider = Some("openai".to_owned());
+    let direct_security = harness
+        .crud_store
+        .get_turn_execution_security_snapshot(direct_turn_id)
+        .await
+        .expect("direct full prompt parity security snapshot should load")
+        .expect("direct full prompt parity security snapshot should exist")
+        .snapshot;
+    let security_cap = agent_spec
+        .security_cap
+        .as_mut()
+        .expect("full prompt parity task should have a security cap");
+    *security_cap = crate::turn_security::task_security_cap_from_snapshot(&direct_security);
+    let direct_artifact_output_root = pioneer_artifacts::artifact_output_dir_path(
+        harness
+            .processor
+            .artifact_runtime_home
+            .join("artifacts")
+            .as_path(),
+        harness.workspace_id.as_str(),
+        direct_parent_thread_id,
+        direct_turn_id,
+    )
+    .expect("direct full-parity artifact output root should resolve");
+    assert!(
+        direct_security
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.provenance == pioneer_protocol::TurnSecurityRuleProvenance::Runtime
+                    && entry.resolved_path.as_deref()
+                        == Some(direct_artifact_output_root.to_string_lossy().as_ref())
+            }),
+        "the direct Turn must contain its exact private artifact-output root"
+    );
+    assert!(
+        security_cap.max_filesystem_entries.iter().all(|entry| {
+            entry.resolved_path.as_deref()
+                != Some(direct_artifact_output_root.to_string_lossy().as_ref())
+        }),
+        "a Turn-private runtime root must never enter a delegable Task cap"
+    );
     params.launch = Some(exact_agent_launch);
     params.metadata = Some(pioneer_protocol::TaskMetadata {
         labels: vec!["full-prompt-parity".to_owned()],
@@ -21579,6 +21999,52 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         .as_ref()
         .expect("full prompt parity task should have a run");
     let lineage = wait_for_child_lineage_for_run(harness.crud_store.clone(), run.id.as_str()).await;
+    let child_artifact_output_root = pioneer_artifacts::artifact_output_dir_path(
+        harness
+            .processor
+            .artifact_runtime_home
+            .join("artifacts")
+            .as_path(),
+        harness.workspace_id.as_str(),
+        lineage.child_thread_id.as_str(),
+        lineage.child_turn_id.as_str(),
+    )
+    .expect("child full-parity artifact output root should resolve");
+    let child_security = harness
+        .crud_store
+        .get_turn_execution_security_snapshot(lineage.child_turn_id.as_str())
+        .await
+        .expect("child full-parity security snapshot should load")
+        .expect("child full-parity security snapshot should exist")
+        .snapshot;
+    let child_runtime_write_roots = child_security
+        .sandbox
+        .filesystem
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.provenance == pioneer_protocol::TurnSecurityRuleProvenance::Runtime
+                && entry.access == pioneer_protocol::TurnFilesystemAccess::Write
+        })
+        .filter_map(|entry| entry.resolved_path.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        child_runtime_write_roots,
+        vec![child_artifact_output_root.to_string_lossy().as_ref()],
+        "the detached child must contain exactly its own private artifact-output root"
+    );
+    assert!(
+        child_security
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .all(|entry| {
+                entry.resolved_path.as_deref()
+                    != Some(direct_artifact_output_root.to_string_lossy().as_ref())
+            }),
+        "the detached child must not inherit the direct Turn's private artifact-output root"
+    );
     if !wait_for_prompt_parity_request_count(
         provider.as_ref(),
         PromptParityRequestKind::PostTurnExtractor,
@@ -21637,7 +22103,29 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         single_prompt_parity_request(&direct_requests, PromptParityRequestKind::TurnPreflight);
     let child_preflight =
         single_prompt_parity_request(&child_requests, PromptParityRequestKind::TurnPreflight);
-    assert_exact_chat_request_parity("full turn preflight", direct_preflight, child_preflight);
+    let direct_artifact_output_root_canonical = std::fs::canonicalize(&direct_artifact_output_root)
+        .expect("direct full-parity artifact output root should canonicalize")
+        .to_string_lossy()
+        .into_owned();
+    let child_artifact_output_root_canonical = std::fs::canonicalize(&child_artifact_output_root)
+        .expect("child full-parity artifact output root should canonicalize")
+        .to_string_lossy()
+        .into_owned();
+    let direct_artifact_output_root = direct_artifact_output_root.to_string_lossy().into_owned();
+    let child_artifact_output_root = child_artifact_output_root.to_string_lossy().into_owned();
+    assert_exact_chat_request_parity_with_turn_private_paths(
+        "full turn preflight",
+        direct_preflight,
+        child_preflight,
+        &[
+            direct_artifact_output_root_canonical.as_str(),
+            direct_artifact_output_root.as_str(),
+        ],
+        &[
+            child_artifact_output_root_canonical.as_str(),
+            child_artifact_output_root.as_str(),
+        ],
+    );
     for expected_tool in ["task_create", "read_skill"] {
         assert!(
             direct_preflight.messages[0].content.contains(expected_tool),
@@ -21647,7 +22135,19 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
 
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
-    assert_exact_chat_request_parity("full main turn", direct_main, child_main);
+    assert_exact_chat_request_parity_with_turn_private_paths(
+        "full main turn",
+        direct_main,
+        child_main,
+        &[
+            direct_artifact_output_root_canonical.as_str(),
+            direct_artifact_output_root.as_str(),
+        ],
+        &[
+            child_artifact_output_root_canonical.as_str(),
+            child_artifact_output_root.as_str(),
+        ],
+    );
     assert_eq!(
         direct_main.reasoning,
         Some(pioneer_provider::ReasoningConfig::Effort(
@@ -21718,7 +22218,19 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         single_prompt_parity_request(&direct_requests, PromptParityRequestKind::PostTurnExtractor);
     let child_post =
         single_prompt_parity_request(&child_requests, PromptParityRequestKind::PostTurnExtractor);
-    assert_exact_chat_request_parity("full post-turn extractor", direct_post, child_post);
+    assert_exact_chat_request_parity_with_turn_private_paths(
+        "full post-turn extractor",
+        direct_post,
+        child_post,
+        &[
+            direct_artifact_output_root_canonical.as_str(),
+            direct_artifact_output_root.as_str(),
+        ],
+        &[
+            child_artifact_output_root_canonical.as_str(),
+            child_artifact_output_root.as_str(),
+        ],
+    );
 
     let direct_mcp_bindings = harness
         .crud_store
@@ -22278,6 +22790,525 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
             Some(2)
         );
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect() {
+    run_standard_stack_message_test(
+        "supervised native Task permission grant",
+        supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect_body(),
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect_body() {
+    let current = std::env::current_dir().expect("gateway test cwd should resolve");
+    let fixture = tempfile::tempdir_in(current).expect("Task sandbox fixture should create");
+    let workspace = fixture.path().join("workspace");
+    let outside = fixture.path().join("outside");
+    std::fs::create_dir_all(workspace.as_path()).expect("Task workspace should create");
+    std::fs::create_dir_all(outside.as_path()).expect("Task outside fixture should create");
+    let source = outside.join("approved-source.txt");
+    let destination = workspace.join("approved-copy.txt");
+    std::fs::write(source.as_path(), "approved Task child\n")
+        .expect("Task source fixture should write");
+
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_supervised_task_shell".to_owned(),
+            name: "exec_command".to_owned(),
+            arguments: json!({
+                "command": [
+                    "/bin/cp",
+                    source.display().to_string(),
+                    destination.display().to_string()
+                ],
+                "workdir": workspace.display().to_string(),
+                "timeout_ms": 10_000,
+                "max_output_tokens": 1_000,
+                "tty": false
+            })
+            .to_string(),
+        }],
+        r#"<task_result>{"summary":"approved native Task shell completed"}</task_result>"#,
+    ));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "supervised-task-native",
+        provider,
+    ));
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "supervised-task-native"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_agent_tool_bridges().await;
+
+    let parent_thread_id = "thread_supervised_native_task_grant";
+    let parent_turn_id = "turn_supervised_native_task_grant";
+    materialize_artifact_api_thread(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
+        processor.as_ref(),
+        connection_id,
+        workspace_id.as_str(),
+        parent_thread_id,
+    )
+    .await;
+
+    let supervised_profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+        pioneer_protocol::TurnPermissionMode::Supervised,
+        pioneer_protocol::TurnPermissionProfileSource::Composer,
+    );
+    let mut parent_security = pioneer_protocol::TurnExecutionSecuritySnapshot::read_only(
+        supervised_profile.clone(),
+        workspace.display().to_string(),
+        vec![
+            pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                pioneer_protocol::TurnFilesystemAccess::Read,
+                workspace.display().to_string(),
+            ),
+        ],
+        1,
+    );
+    parent_security.authority_cap.resource_binding_id = format!("workspace:{workspace_id}:agent");
+    assert!(
+        processor
+            .crud_store
+            .set_turn_execution_security_snapshot(parent_turn_id, &parent_security)
+            .await
+            .expect("supervised parent security snapshot should persist")
+    );
+    persist_test_execution_authorization_context_for_principal_with_profile(
+        processor.as_ref(),
+        authenticated_test_superuser().as_ref(),
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        &supervised_profile,
+    )
+    .await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        parent_thread_id,
+        parent_turn_id,
+        "Run the supervised native child shell",
+        3,
+    );
+    let agent_spec = params
+        .agent_spec
+        .as_mut()
+        .expect("supervised Task should contain an Agent spec");
+    agent_spec.model_provider = Some("supervised-task-native".to_owned());
+    agent_spec.permission_cap = Some(pioneer_protocol::task_permission_cap_from_snapshot(
+        &supervised_profile,
+    ));
+    agent_spec.security_cap = Some(crate::turn_security::task_security_cap_from_snapshot(
+        &parent_security,
+    ));
+
+    let task = create_task_for_test(&processor, params)
+        .await
+        .expect("supervised native Task should start");
+    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    let opened_request = opened
+        .params
+        .as_ref()
+        .and_then(|params| params.get("request"))
+        .expect("native Task permission request should be present");
+    assert_eq!(opened_request["tool_name"], json!("exec_command"));
+    assert_eq!(opened_request["action"], json!("shell_command"));
+    let permission_request_id = opened_request["request_id"]
+        .as_str()
+        .expect("native Task permission request id should be present")
+        .to_owned();
+
+    let run = task
+        .run
+        .as_ref()
+        .expect("supervised Task should have a run");
+    let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+    assert_eq!(
+        opened_request["thread_id"],
+        json!(lineage.child_thread_id.as_str()),
+        "the prompt must be correlated to the executing child, not its creator"
+    );
+    assert_eq!(
+        opened_request["turn_id"],
+        json!(lineage.child_turn_id.as_str())
+    );
+    assert_eq!(
+        opened_request["visible_thread_ids"],
+        json!([parent_thread_id]),
+        "the parent thread collaborator must see its child permission request"
+    );
+
+    let respond_id = "rspnativepermission01";
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": respond_id,
+                "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
+                "params": {
+                    "request_id": permission_request_id,
+                    "resolution": "allow_once"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (responded, resolved) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        respond_id,
+        events::TURN_PERMISSION_REQUEST_RESOLVED,
+    )
+    .await;
+    assert_eq!(responded.result["resolution"], json!("allow_once"));
+    assert_eq!(
+        resolved
+            .params
+            .as_ref()
+            .expect("resolved Task permission payload")["request_id"],
+        json!(permission_request_id)
+    );
+
+    let status = wait_for_task_status(
+        crud_store.clone(),
+        task.task.id.as_str(),
+        pioneer_protocol::TaskStatus::Completed,
+    )
+    .await;
+    if status != pioneer_protocol::TaskStatus::Completed {
+        let failed = crud_store
+            .get_task(task.task.id.as_str())
+            .await
+            .expect("failed supervised Task should reload");
+        panic!("supervised native Task did not complete: {failed:#?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(destination.as_path())
+            .expect("approved child side effect should exist"),
+        "approved Task child\n"
+    );
+
+    let child_security = crud_store
+        .get_turn_execution_security_snapshot(lineage.child_turn_id.as_str())
+        .await
+        .expect("child security snapshot should load")
+        .expect("child security snapshot should exist")
+        .snapshot;
+    assert_eq!(
+        child_security.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::ReadOnly,
+        "approval must not mutate the persisted ambient child sandbox"
+    );
+    assert_eq!(
+        child_security.authority_cap.filesystem.kind,
+        pioneer_protocol::TurnFilesystemSandboxKind::Unrestricted,
+        "the child must retain the parent's consent ceiling"
+    );
+    assert!(
+        child_security
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .all(|entry| entry.resolved_path.as_deref() != Some(outside.to_string_lossy().as_ref())),
+        "the outside fixture must not be ambient child authority"
+    );
+    let expected_artifact_root = pioneer_artifacts::artifact_output_dir_path(
+        processor.artifact_runtime_home.join("artifacts").as_path(),
+        workspace_id.as_str(),
+        lineage.child_thread_id.as_str(),
+        lineage.child_turn_id.as_str(),
+    )
+    .expect("Task child artifact root should resolve");
+    assert!(
+        child_security
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.access == pioneer_protocol::TurnFilesystemAccess::Write
+                    && entry.provenance == pioneer_protocol::TurnSecurityRuleProvenance::Runtime
+                    && entry.resolved_path.as_deref()
+                        == Some(expected_artifact_root.to_string_lossy().as_ref())
+            }),
+        "the native Task child must receive only its own private artifact output root"
+    );
+
+    let permission_records = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            workspace_id: Some(workspace_id),
+            runtime_id: Some(
+                pioneer_protocol::constants::runtime_ids::NATIVE_PERMISSION.to_owned(),
+            ),
+            turn_id: Some(lineage.child_turn_id.clone()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("native Task permission records should list");
+    assert_eq!(
+        permission_records.len(),
+        1,
+        "one semantic shell approval must install the invocation grant without a second prompt"
+    );
+    assert!(permission_records[0].status.is_terminal());
+
+    let child_events = crud_store
+        .get_turn_item_events(
+            lineage.child_thread_id.as_str(),
+            lineage.child_turn_id.as_str(),
+        )
+        .await
+        .expect("child event stream should load")
+        .expect("child event stream should exist");
+    assert!(child_events.events.iter().any(|event| matches!(
+        &event.payload,
+        TurnItemEventPayload::TurnPermissionAudit(audit)
+            if audit.event_kind
+                == pioneer_protocol::TurnPermissionAuditEventKind::ApprovalResolved
+                && audit.decision
+                    == Some(pioneer_protocol::TurnPermissionAuditDecision::AllowOnce)
+    )));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effect() {
+    run_standard_stack_message_test(
+        "supervised direct Agent permission grant",
+        supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effect_body(),
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effect_body() {
+    let current = std::env::current_dir().expect("gateway test cwd should resolve");
+    let workspace_fixture =
+        tempfile::tempdir_in(current).expect("direct Agent workspace fixture should create");
+    let outside_fixture = tempfile::tempdir().expect("direct Agent outside fixture should create");
+    let source = outside_fixture.path().join("approved-source.txt");
+    let destination = workspace_fixture.path().join("approved-copy.txt");
+    std::fs::write(source.as_path(), "approved direct Agent child\n")
+        .expect("direct Agent source fixture should write");
+
+    let provider = Arc::new(DirectAgentSandboxProvider::new(
+        source.display().to_string(),
+        destination.display().to_string(),
+    ));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "direct-agent-sandbox",
+        provider.clone(),
+    ));
+    let (tx, mut rx) = mpsc::channel(256);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "direct-agent-sandbox"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_agent_tool_bridges().await;
+
+    let thread_id = "thread_direct_agent_permission";
+    let root_turn_id = "turn_direct_agent_permission_root";
+    start_thread_and_turn(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+        root_turn_id,
+        "Agent",
+        "direct-agent-sandbox",
+    )
+    .await;
+
+    let mut child_dispatched = false;
+    for _ in 0..200 {
+        if crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
+            .await
+            .expect("direct Agent outbox dispatch should succeed")
+            > 0
+        {
+            child_dispatched = true;
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    if !child_dispatched {
+        let root_turn = crud_store
+            .get_turn(thread_id, root_turn_id)
+            .await
+            .expect("direct Agent root turn should load");
+        let root_events = crud_store
+            .get_turn_item_events(thread_id, root_turn_id)
+            .await
+            .expect("direct Agent root events should load");
+        panic!(
+            "direct Agent child must be activated through its durable outbox; provider_rounds={:?}; root_turn={root_turn:#?}; root_events={root_events:#?}",
+            provider.rounds()
+        );
+    }
+    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    let opened_request = opened
+        .params
+        .as_ref()
+        .and_then(|params| params.get("request"))
+        .expect("direct Agent child permission request should be present");
+    assert_eq!(opened_request["tool_name"], json!("exec_command"));
+    assert_eq!(opened_request["action"], json!("shell_command"));
+    assert_eq!(opened_request["thread_id"], json!(thread_id));
+    let child_turn_id = opened_request["turn_id"]
+        .as_str()
+        .expect("direct Agent child turn id should be present")
+        .to_owned();
+    assert_ne!(child_turn_id, root_turn_id);
+    let permission_request_id = opened_request["request_id"]
+        .as_str()
+        .expect("direct Agent permission request id should be present")
+        .to_owned();
+
+    let respond_id = "directagentallow00001";
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": respond_id,
+                "method": pioneer_protocol::constants::methods::TURN_PERMISSION_REQUEST_RESPOND,
+                "params": {
+                    "request_id": permission_request_id,
+                    "resolution": "allow_once"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (responded, _) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        respond_id,
+        events::TURN_PERMISSION_REQUEST_RESOLVED,
+    )
+    .await;
+    assert_eq!(responded.result["resolution"], json!("allow_once"));
+
+    for _ in 0..200 {
+        if destination.is_file() {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(destination.as_path())
+            .expect("approved direct Agent child side effect should exist"),
+        "approved direct Agent child\n"
+    );
+
+    let child_security = crud_store
+        .get_turn_execution_security_snapshot(child_turn_id.as_str())
+        .await
+        .expect("direct Agent child security snapshot should load")
+        .expect("direct Agent child security snapshot should exist")
+        .snapshot;
+    assert_eq!(
+        child_security.permission_profile.mode,
+        pioneer_protocol::TurnPermissionMode::Supervised
+    );
+    assert_eq!(
+        child_security.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::ReadOnly
+    );
+    assert_eq!(
+        child_security.authority_cap.filesystem.kind,
+        pioneer_protocol::TurnFilesystemSandboxKind::Unrestricted
+    );
+    let expected_artifact_root = pioneer_artifacts::artifact_output_dir_path(
+        processor.artifact_runtime_home.join("artifacts").as_path(),
+        workspace_id.as_str(),
+        thread_id,
+        child_turn_id.as_str(),
+    )
+    .expect("direct Agent child artifact root should resolve");
+    assert!(
+        child_security
+            .sandbox
+            .filesystem
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.access == pioneer_protocol::TurnFilesystemAccess::Write
+                    && entry.provenance == pioneer_protocol::TurnSecurityRuleProvenance::Runtime
+                    && entry.resolved_path.as_deref()
+                        == Some(expected_artifact_root.to_string_lossy().as_ref())
+            }),
+        "the native direct Agent child must receive only its own private artifact output root"
+    );
+
+    let permission_records = crud_store
+        .list_cli_runtime_pending_requests(pioneer_crud::CliRuntimePendingRequestListFilter {
+            workspace_id: Some(workspace_id),
+            runtime_id: Some(
+                pioneer_protocol::constants::runtime_ids::NATIVE_PERMISSION.to_owned(),
+            ),
+            turn_id: Some(child_turn_id.clone()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .expect("direct Agent permission records should list");
+    assert_eq!(permission_records.len(), 1);
+    assert!(permission_records[0].status.is_terminal());
+
+    let child_events = crud_store
+        .get_turn_item_events(thread_id, child_turn_id.as_str())
+        .await
+        .expect("direct Agent child event stream should load")
+        .expect("direct Agent child event stream should exist");
+    assert!(child_events.events.iter().any(|event| matches!(
+        &event.payload,
+        TurnItemEventPayload::TurnPermissionAudit(audit)
+            if audit.event_kind
+                == pioneer_protocol::TurnPermissionAuditEventKind::ApprovalResolved
+                && audit.decision
+                    == Some(pioneer_protocol::TurnPermissionAuditDecision::AllowOnce)
+    )));
 }
 
 #[test]
@@ -31382,22 +32413,20 @@ async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl() 
 }
 
 #[test]
-fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call() {
+fn claude_cli_runtime_supervised_uses_provider_permission_mode() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("Claude supervised rejection test runtime should build")
+        .expect("Claude supervised provider-mode test runtime should build")
         .block_on(async {
-            tokio::spawn(
-                claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call_impl(),
-            )
-            .await
-            .expect("Claude supervised rejection test task should finish");
+            tokio::spawn(claude_cli_runtime_supervised_uses_provider_permission_mode_impl())
+                .await
+                .expect("Claude supervised provider-mode test task should finish");
         });
 }
 
-async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runtime_call_impl() {
+async fn claude_cli_runtime_supervised_uses_provider_permission_mode_impl() {
     let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Claude)).await;
     seed_cli_runtime_security_thread(
         &harness,
@@ -31421,22 +32450,28 @@ async fn claude_cli_runtime_supervised_required_sandbox_is_rejected_without_runt
     );
     process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
 
-    let error = recv_error_by_id(&mut harness.rx, turn_request_id.as_str()).await;
-    assert_public_error(
-        &error,
-        PublicErrorCode::Unavailable,
-        PublicErrorStage::Admission,
+    let response = recv_response_by_id(&mut harness.rx, turn_request_id.as_str()).await;
+    let _: TurnStartResponse = serde_json::from_value(response.result)
+        .expect("Claude supervised turn/start response should decode");
+    assert_cli_runtime_start_sandbox_none(&harness.cli_session, "default").await;
+
+    let persisted =
+        load_persisted_security_snapshot(&harness.crud_store, "turn_claude_supervised").await;
+    assert_eq!(
+        persisted.permission_profile.mode,
+        pioneer_protocol::TurnPermissionMode::Supervised
     );
-    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
-    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
-    assert!(
-        harness
-            .crud_store
-            .get_turn_execution_security_snapshot("turn_claude_supervised")
-            .await
-            .expect("security snapshot lookup should succeed")
-            .is_none(),
-        "rejected Claude restricted turn should roll back without a persisted snapshot"
+    assert_eq!(
+        persisted.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::ReadOnly
+    );
+    assert_eq!(
+        persisted.backend.execution_backend,
+        pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
+    );
+    assert_eq!(
+        persisted.enforcement,
+        pioneer_protocol::TurnSecurityEnforcementStatus::Active
     );
 }
 
@@ -31510,20 +32545,20 @@ async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl() {
 }
 
 #[test]
-fn turn_start_unavailable_sandbox_is_rejected_before_canonical_writes() {
+fn claude_auto_accept_provider_mode_is_persisted_before_runtime_start() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("CLI security audit test runtime should build")
+        .expect("Claude auto-accept security audit test runtime should build")
         .block_on(async {
-            tokio::spawn(turn_start_unavailable_sandbox_is_rejected_before_canonical_writes_impl())
+            tokio::spawn(claude_auto_accept_provider_mode_is_persisted_before_runtime_start_impl())
                 .await
-                .expect("CLI security audit test task should finish");
+                .expect("Claude auto-accept security audit test task should finish");
         });
 }
 
-async fn turn_start_unavailable_sandbox_is_rejected_before_canonical_writes_impl() {
+async fn claude_auto_accept_provider_mode_is_persisted_before_runtime_start_impl() {
     let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Claude)).await;
     let thread_id = "thread_security_audit_claude";
     let turn_id = "turn_security_audit_claude";
@@ -31543,48 +32578,29 @@ async fn turn_start_unavailable_sandbox_is_rejected_before_canonical_writes_impl
         thread_id,
         turn_id,
         cli_runtime_execution_backend("claude", CLIAgentRuntimeKind::Claude),
-        "supervised",
+        "auto_accept_edits",
         "inspect project",
         None,
     );
     process_cli_runtime_turn_start(&harness, turn_start_request.as_str()).await;
 
-    let error = recv_error_by_id(&mut harness.rx, turn_request_id.as_str()).await;
-    assert_public_error(
-        &error,
-        PublicErrorCode::Unavailable,
-        PublicErrorStage::Admission,
-    );
-    assert!(harness.cli_session.thread_starts.lock().await.is_empty());
-    assert!(harness.cli_session.turn_starts.lock().await.is_empty());
+    let response = recv_response_by_id(&mut harness.rx, turn_request_id.as_str()).await;
+    let _: TurnStartResponse = serde_json::from_value(response.result)
+        .expect("Claude auto-accept turn/start response should decode");
+    assert_cli_runtime_start_sandbox_none(&harness.cli_session, "acceptEdits").await;
 
-    let turn_items = harness
-        .crud_store
-        .get_turn_item_events(thread_id, turn_id)
-        .await
-        .expect("turn item events should load")
-        .expect("seeded thread should produce an empty event page");
-    assert!(
-        turn_items.events.is_empty(),
-        "pre-write sandbox rejection must not leave canonical Turn events"
+    let persisted = load_persisted_security_snapshot(&harness.crud_store, turn_id).await;
+    assert_eq!(
+        persisted.permission_profile.mode,
+        pioneer_protocol::TurnPermissionMode::AutoAcceptEdits
     );
-    assert!(
-        harness
-            .crud_store
-            .get_turn(thread_id, turn_id)
-            .await
-            .expect("turn lookup should succeed")
-            .is_none(),
-        "pre-write sandbox rejection must not leave a Turn ghost"
+    assert_eq!(
+        persisted.sandbox.mode,
+        pioneer_protocol::TurnSandboxMode::WorkspaceWrite
     );
-    assert!(
-        harness
-            .crud_store
-            .get_turn_execution_security_snapshot(turn_id)
-            .await
-            .expect("security snapshot lookup should succeed")
-            .is_none(),
-        "pre-write sandbox rejection must not leave a security snapshot ghost"
+    assert_eq!(
+        persisted.enforcement,
+        pioneer_protocol::TurnSecurityEnforcementStatus::Active
     );
 }
 
@@ -36039,8 +37055,10 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
 }
 
 #[test]
-fn codex_steer_calls_runtime_for_running_codex_turn() {
+fn codex_steer_allows_another_current_collaborator_user() {
     run_gateway_message_test("codex-steer-test", || async {
+        const THREAD_ID: &str = "T00000000000000000034";
+        const TURN_ID: &str = "V00000000000000000034";
         let (tx, mut rx) = mpsc::channel(32);
         let session_manager = Arc::new(SessionManager::new());
         let connection_id =
@@ -36058,7 +37076,7 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             MessageProcessor::new(
                 thread_manager,
                 test_provider(),
-                session_manager,
+                session_manager.clone(),
                 workspace_manager,
                 crud_store.clone(),
                 test_gateway_secrets(),
@@ -36074,26 +37092,37 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             connection_id,
             &mut rx,
             workspace_id.as_str(),
-            "thread_codex_steer",
-            "turn_codex_steer",
+            THREAD_ID,
+            TURN_ID,
         )
         .await;
         persist_test_cli_execution_authorization_context(
             crud_store.as_ref(),
             workspace_id.as_str(),
-            "thread_codex_steer",
-            "turn_codex_steer",
+            THREAD_ID,
+            TURN_ID,
             "codex",
             "codex",
         )
         .await;
+        materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
+            .await;
+
+        let (collaborator_tx, mut collaborator_rx) = mpsc::channel(8);
+        let collaborator_connection_id = session_manager
+            .register_connection(collaborator_tx, authenticated_test_member_collaborator())
+            .await
+            .expect("collaborator steer session should register");
+        session_manager
+            .set_connection_workspace(collaborator_connection_id, Some(workspace_id.clone()))
+            .await;
 
         let now = chrono::Utc::now().fixed_offset();
         crud_store
             .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-                turn_id: "turn_codex_steer".to_owned(),
-                thread_id: "thread_codex_steer".to_owned(),
-                continuation_thread_id: "thread_codex_steer".to_owned(),
+                turn_id: TURN_ID.to_owned(),
+                thread_id: THREAD_ID.to_owned(),
+                continuation_thread_id: THREAD_ID.to_owned(),
                 workspace_id: workspace_id.clone(),
                 runtime_id: "codex".to_owned(),
                 runtime_kind: "codex".to_owned(),
@@ -36115,7 +37144,7 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
 
         cli_manager
             .get_or_start(
-                CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", "thread_codex_steer")
+                CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", THREAD_ID)
                     .expect("session key should build"),
             )
             .await
@@ -36128,21 +37157,23 @@ fn codex_steer_calls_runtime_for_running_codex_turn() {
             "params": {
                 "workspace_id": workspace_id,
                 "runtime_id": "codex",
-                "thread_id": "thread_codex_steer",
-                "turn_id": "turn_codex_steer",
+                "thread_id": THREAD_ID,
+                "turn_id": TURN_ID,
                 "message": "Focus on the failing test"
             }
         })
         .to_string();
-        message_future(processor.process_request_for_connection(connection_id, &steer_payload))
-            .await;
+        message_future(
+            processor.process_request_for_connection(collaborator_connection_id, &steer_payload),
+        )
+        .await;
 
-        let response = recv_response_by_id(&mut rx, "codexsteer00000000001").await;
+        let response = recv_response_by_id(&mut collaborator_rx, "codexsteer00000000001").await;
         let result: CLIRuntimeTurnSteerResponse =
             serde_json::from_value(response.result).expect("steer result should decode");
         assert_eq!(result.runtime_id, "codex");
-        assert_eq!(result.thread_id, "thread_codex_steer");
-        assert_eq!(result.turn_id, "turn_codex_steer");
+        assert_eq!(result.thread_id, THREAD_ID);
+        assert_eq!(result.turn_id, TURN_ID);
 
         let steers = cli_session.turn_steers.lock().await;
         assert_eq!(steers.len(), 1);
@@ -36378,7 +37409,8 @@ async fn codex_steer_rejects_wrong_backend() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_request_respond_allows_another_current_collaborator_session() {
+async fn cli_runtime_request_respond_allows_another_current_collaborator_user() {
+    const THREAD_ID: &str = "T00000000000000000031";
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -36407,25 +37439,26 @@ async fn cli_runtime_request_respond_allows_another_current_collaborator_session
     seed_cli_runtime_approval_turn(
         crud_store.as_ref(),
         workspace_id.as_str(),
-        "thread_cli_request",
+        THREAD_ID,
         "turn_cli_request",
         "codex-thread-request",
     )
     .await;
+    materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
+        .await;
     cli_manager
         .get_or_start(
-            CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", "thread_cli_request")
+            CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", THREAD_ID)
                 .expect("session key should build"),
         )
         .await
         .expect("CLI runtime session should be active for native request response");
 
-    ensure_test_superuser_secondary_session_authority(crud_store.as_ref()).await;
     let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
     let foreign_connection_id = session_manager
-        .register_connection(foreign_tx, authenticated_test_superuser_secondary_session())
+        .register_connection(foreign_tx, authenticated_test_member_collaborator())
         .await
-        .expect("foreign CLI response session should register");
+        .expect("collaborator CLI response session should register");
     session_manager
         .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
         .await;
@@ -36450,7 +37483,7 @@ async fn cli_runtime_request_respond_allows_another_current_collaborator_session
             workspace_id.as_str(),
             "codex",
             "codex",
-            "thread_cli_request",
+            THREAD_ID,
             decode_codex_command_approval_request(&native_request),
         )
         .await
@@ -36547,6 +37580,459 @@ async fn cli_runtime_request_respond_allows_another_current_collaborator_session
     )
     .expect("initiator resolved payload should decode");
     assert_eq!(initiator_resolved_payload.request_id, pending_request_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_pending_request_replays_to_late_collaborator_thread_open() {
+    const THREAD_ID: &str = "T00000000000000000032";
+    const TURN_ID: &str = "turn_cli_request_late_collaborator";
+    const NATIVE_THREAD_ID: &str = "codex-thread-request-late-collaborator";
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager.clone(),
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
+
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        THREAD_ID,
+        TURN_ID,
+        NATIVE_THREAD_ID,
+    )
+    .await;
+    materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
+        .await;
+    cli_manager
+        .get_or_start(
+            CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", THREAD_ID)
+                .expect("session key should build"),
+        )
+        .await
+        .expect("CLI runtime session should be active for the replayed response");
+
+    let native_request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from("codex-native-request-late-collaborator"),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "command": "cargo check",
+            "cwd": "/tmp/pioneer",
+            "threadId": NATIVE_THREAD_ID,
+            "turnId": TURN_ID,
+            "itemId": "item-command-late-collaborator"
+        })),
+        raw: json!({
+            "id": "codex-native-request-late-collaborator",
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let opened_record = processor
+        .open_codex_command_approval_request(
+            workspace_id.as_str(),
+            "codex",
+            "codex",
+            THREAD_ID,
+            decode_codex_command_approval_request(&native_request),
+        )
+        .await
+        .expect("origin-bound pending request should open");
+    let pending_request_id = opened_record.request_id;
+    let initiator_opened =
+        recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    assert_eq!(
+        initiator_opened
+            .params
+            .as_ref()
+            .expect("initiator opened params")["request_id"],
+        serde_json::json!(pending_request_id)
+    );
+
+    // Register only after the provider prompt is already pending. This is the
+    // reconnect/late-collaborator path that live fanout cannot satisfy.
+    let (late_tx, mut late_rx) = mpsc::channel(16);
+    let late_connection_id = session_manager
+        .register_connection(late_tx, authenticated_test_member_collaborator())
+        .await
+        .expect("late collaborator connection should register");
+    session_manager
+        .set_connection_workspace(late_connection_id, Some(workspace_id.clone()))
+        .await;
+
+    let start_request_id = "clilatestart000000001";
+    processor
+        .process_request_for_connection(
+            late_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": start_request_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": THREAD_ID,
+                    "workspace_id": workspace_id,
+                    "mode": "Agent",
+                    "model": "test-model",
+                    "model_provider": "cli_runtime:codex"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (_start_response, started) = recv_response_and_notification_by_id_method(
+        &mut late_rx,
+        start_request_id,
+        events::THREAD_STARTED,
+    )
+    .await;
+    assert_eq!(
+        started.params.as_ref().expect("thread started params")["thread"]["id"],
+        serde_json::json!(THREAD_ID)
+    );
+
+    let replayed =
+        recv_notification_by_method(&mut late_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let replayed: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(replayed.params.expect("replayed CLI request opened params"))
+            .expect("replayed CLI request should decode");
+    assert_eq!(replayed.request_id, pending_request_id);
+    assert_eq!(replayed.thread_id.as_deref(), Some(THREAD_ID));
+    assert!(replayed.visible_thread_ids.is_empty());
+    assert_eq!(
+        replayed.request.native_request_id.as_deref(),
+        Some("codex-native-request-late-collaborator")
+    );
+
+    processor
+        .process_request_for_connection(
+            late_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "clilaterespond0000001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": pending_request_id,
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (response, resolved) = recv_response_and_notification_by_id_method(
+        &mut late_rx,
+        "clilaterespond0000001",
+        events::CLI_RUNTIME_REQUEST_RESOLVED,
+    )
+    .await;
+    let response: CLIRuntimeRequestRespondResponse =
+        serde_json::from_value(response.result).expect("late response should decode");
+    assert_eq!(response.status, CLIRuntimePendingRequestStatus::Answered);
+    let resolved: CLIRuntimeRequestResolvedNotification =
+        serde_json::from_value(resolved.params.expect("late resolved notification params"))
+            .expect("late resolved notification should decode");
+    assert_eq!(resolved.request_id, response.request_id);
+    assert_eq!(resolved.resolution, CLIRuntimeRequestResolution::Approved);
+
+    let provider_responses = cli_session.responses.lock().await;
+    assert_eq!(provider_responses.len(), 1);
+    assert_eq!(
+        provider_responses[0].0,
+        json!("codex-native-request-late-collaborator")
+    );
+    assert_eq!(provider_responses[0].1, json!({"decision": "accept"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_from_root_collaborator()
+ {
+    let (tx, mut rx) = mpsc::channel(16);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager.clone(),
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
+    let root_thread_id = "T00000000000000000033";
+    let root_turn_id = "R00000000000000000033";
+    let child_thread_id = "T00000000000000000034";
+    let child_turn_id = "R00000000000000000034";
+    let grandchild_thread_id = "T00000000000000000035";
+    let grandchild_turn_id = "R00000000000000000035";
+    let native_thread_id = "codex-thread-permission-grandchild";
+
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        root_thread_id,
+        root_turn_id,
+    )
+    .await;
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        child_thread_id,
+        child_turn_id,
+    )
+    .await;
+    persist_test_execution_authorization_context(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        root_thread_id,
+        root_turn_id,
+    )
+    .await;
+    persist_test_execution_authorization_context(
+        &processor,
+        connection_id,
+        workspace_id.as_str(),
+        root_thread_id,
+        child_turn_id,
+    )
+    .await;
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        grandchild_thread_id,
+        grandchild_turn_id,
+        native_thread_id,
+    )
+    .await;
+    // A provider child is authorized by the root collaborative capsule, not
+    // by the principal/session that happened to start the child Turn.
+    persist_test_cli_execution_authorization_context(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        root_thread_id,
+        grandchild_turn_id,
+        "codex",
+        "codex",
+    )
+    .await;
+    crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_cli_permission_child".to_owned(),
+                run_id: "run_cli_permission_child".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: child_thread_id.to_owned(),
+                    parent_thread_id: root_thread_id.to_owned(),
+                    root_thread_id: root_thread_id.to_owned(),
+                    depth: 1,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(root_thread_id.to_owned()),
+                    created_by_turn_id: Some(root_turn_id.to_owned()),
+                    created_at: 10,
+                },
+            },
+            10,
+        )
+        .await
+        .expect("child task lineage should persist");
+    crud_store
+        .append_task_event(
+            TaskEventPayload::TaskThreadLineageCreated {
+                task_id: "task_cli_permission_grandchild".to_owned(),
+                run_id: "run_cli_permission_grandchild".to_owned(),
+                lineage: TaskThreadLineage {
+                    child_thread_id: grandchild_thread_id.to_owned(),
+                    parent_thread_id: child_thread_id.to_owned(),
+                    root_thread_id: root_thread_id.to_owned(),
+                    depth: 2,
+                    origin_kind: Some("task_run".to_owned()),
+                    created_by_thread_id: Some(child_thread_id.to_owned()),
+                    created_by_turn_id: Some(child_turn_id.to_owned()),
+                    created_at: 11,
+                },
+            },
+            11,
+        )
+        .await
+        .expect("grandchild task lineage should persist");
+    crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "UPDATE thread SET access_class='internal', origin_kind='task_run', \
+             sidebar_visibility='hidden' WHERE id IN ('{child_thread_id}','{grandchild_thread_id}')"
+        ))
+        .await
+        .expect("CLI child threads should use the production internal access class");
+    materialize_test_member_collaborator(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        root_thread_id,
+    )
+    .await;
+    cli_manager
+        .get_or_start(
+            CLIAgentRuntimeSessionKey::new(workspace_id.clone(), "codex", grandchild_thread_id)
+                .expect("session key should build"),
+        )
+        .await
+        .expect("grandchild CLI runtime session should be active");
+
+    let native_request = CodexJsonlRpcServerRequest {
+        id: JsonlRpcId::from("codex-native-request-grandchild"),
+        method: "item/commandExecution/requestApproval".to_owned(),
+        params: Some(json!({
+            "command": "cargo check",
+            "cwd": "/tmp/pioneer",
+            "threadId": native_thread_id,
+            "turnId": grandchild_turn_id,
+            "itemId": "item-command-grandchild"
+        })),
+        raw: json!({
+            "id": "codex-native-request-grandchild",
+            "method": "item/commandExecution/requestApproval"
+        }),
+    };
+    let opened_record = processor
+        .open_codex_command_approval_request(
+            workspace_id.as_str(),
+            "codex",
+            "codex",
+            grandchild_thread_id,
+            decode_codex_command_approval_request(&native_request),
+        )
+        .await
+        .expect("grandchild provider request should open");
+    let pending_request_id = opened_record.request_id;
+    let opened = recv_notification_by_method(&mut rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let opened: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(opened.params.expect("grandchild opened params"))
+            .expect("grandchild opened request should decode");
+    assert_eq!(opened.request_id, pending_request_id);
+    assert_eq!(opened.thread_id.as_deref(), Some(grandchild_thread_id));
+    assert_eq!(
+        opened.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+
+    let (root_tx, mut root_rx) = mpsc::channel(16);
+    let root_connection_id = session_manager
+        .register_connection(root_tx, authenticated_test_member_collaborator())
+        .await
+        .expect("root collaborator connection should register");
+    session_manager
+        .set_connection_workspace(root_connection_id, Some(workspace_id.clone()))
+        .await;
+    let start_request_id = "cliparentstart0000001";
+    processor
+        .process_request_for_connection(
+            root_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": start_request_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": root_thread_id,
+                    "workspace_id": workspace_id,
+                    "mode": "Agent",
+                    "model": "test-model",
+                    "model_provider": "openai"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _ = recv_response_and_notification_by_id_method(
+        &mut root_rx,
+        start_request_id,
+        events::THREAD_STARTED,
+    )
+    .await;
+    let replayed =
+        recv_notification_by_method(&mut root_rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    let replayed: CLIRuntimeRequestOpenedNotification =
+        serde_json::from_value(replayed.params.expect("root replayed request params"))
+            .expect("root replayed request should decode");
+    assert_eq!(replayed.request_id, pending_request_id);
+    assert_eq!(replayed.thread_id.as_deref(), Some(grandchild_thread_id));
+    assert_eq!(
+        replayed.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+
+    processor
+        .process_request_for_connection(
+            root_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "cliparentresp00000001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": pending_request_id,
+                    "resolution": { "status": "approved" }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let (response, resolved) = recv_response_and_notification_by_id_method(
+        &mut root_rx,
+        "cliparentresp00000001",
+        events::CLI_RUNTIME_REQUEST_RESOLVED,
+    )
+    .await;
+    let response: CLIRuntimeRequestRespondResponse =
+        serde_json::from_value(response.result).expect("root response should decode");
+    assert_eq!(response.status, CLIRuntimePendingRequestStatus::Answered);
+    let resolved: CLIRuntimeRequestResolvedNotification =
+        serde_json::from_value(resolved.params.expect("root resolved notification params"))
+            .expect("root resolved notification should decode");
+    assert_eq!(resolved.request_id, response.request_id);
+    assert_eq!(
+        resolved.visible_thread_ids,
+        vec![child_thread_id.to_owned(), root_thread_id.to_owned()]
+    );
+    assert_eq!(resolved.resolution, CLIRuntimeRequestResolution::Approved);
+
+    let provider_responses = cli_session.responses.lock().await;
+    assert_eq!(provider_responses.len(), 1);
+    assert_eq!(
+        provider_responses[0].0,
+        json!("codex-native-request-grandchild")
+    );
+    assert_eq!(provider_responses[0].1, json!({"decision": "accept"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -36661,7 +38147,8 @@ async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_permission_request_respond_allows_another_current_collaborator_session() {
+async fn turn_permission_request_respond_allows_another_current_collaborator_user() {
+    const THREAD_ID: &str = "T00000000000000000032";
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -36684,8 +38171,14 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
     materialize_artifact_api_thread(
         processor.crud_store.as_ref(),
         workspace_id.as_str(),
-        "thread_native_permission",
+        THREAD_ID,
         "turn_native_permission",
+    )
+    .await;
+    materialize_test_member_collaborator(
+        processor.crud_store.as_ref(),
+        workspace_id.as_str(),
+        THREAD_ID,
     )
     .await;
     let connection = processor
@@ -36697,7 +38190,7 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
         &processor,
         connection.principal(),
         workspace_id.as_str(),
-        "thread_native_permission",
+        THREAD_ID,
         "turn_native_permission",
         &pioneer_protocol::system_turn_permission_profile_snapshot(
             pioneer_protocol::TurnPermissionMode::Supervised,
@@ -36708,15 +38201,14 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
         &processor,
         connection_id,
         workspace_id.as_str(),
-        "thread_native_permission",
+        THREAD_ID,
     )
     .await;
-    ensure_test_superuser_secondary_session_authority(processor.crud_store.as_ref()).await;
     let (foreign_tx, mut foreign_rx) = mpsc::channel(8);
     let foreign_connection_id = session_manager
-        .register_connection(foreign_tx, authenticated_test_superuser_secondary_session())
+        .register_connection(foreign_tx, authenticated_test_member_collaborator())
         .await
-        .expect("foreign test session should register");
+        .expect("collaborator test session should register");
     session_manager
         .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
         .await;
@@ -36724,7 +38216,7 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
         &processor,
         foreign_connection_id,
         workspace_id.as_str(),
-        "thread_native_permission",
+        THREAD_ID,
     )
     .await;
     let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
@@ -36733,7 +38225,7 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
         .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
             request_id: "perm-approval-request-1".to_owned(),
             workspace_id: Some(workspace_id.clone()),
-            thread_id: Some("thread_native_permission".to_owned()),
+            thread_id: Some(THREAD_ID.to_owned()),
             turn_id: Some("turn_native_permission".to_owned()),
             tool_name: "exec_command".to_owned(),
             key: pioneer_tools::PermissionRequestKey {
@@ -36766,7 +38258,7 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
     let opened_blocks: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
         serde_json::from_value(opened_blocks.params.expect("opened timeline block params"))
             .expect("opened timeline block notification should decode");
-    assert_eq!(opened_blocks.thread_id, "thread_native_permission");
+    assert_eq!(opened_blocks.thread_id, THREAD_ID);
     assert_eq!(
         opened_blocks.changed_block_ids,
         vec![
@@ -36852,7 +38344,7 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_ses
                 .expect("resolved timeline block params"),
         )
         .expect("resolved timeline block notification should decode");
-    assert_eq!(resolved_blocks.thread_id, "thread_native_permission");
+    assert_eq!(resolved_blocks.thread_id, THREAD_ID);
     assert_eq!(
         resolved_blocks.changed_block_ids,
         vec![pioneer_crud::work_block_id("turn_native_permission")]
@@ -37623,6 +39115,77 @@ async fn cli_runtime_command_approval_rejects_legacy_session_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_codex_session_approval_is_typed_and_authority_gated() {
+    let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let mut security =
+        load_persisted_security_snapshot(crud_store.as_ref(), "codex-turn-command").await;
+    security.backend.execution_backend =
+        pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli;
+    security
+        .backend
+        .capabilities
+        .supports_session_scope_approval = true;
+    security.approval.allow_once = true;
+    security.approval.allow_for_session = true;
+    security.authority_cap.approval.allow_once = true;
+    security.authority_cap.approval.allow_for_session = true;
+    assert!(
+        crud_store
+            .set_turn_execution_security_snapshot("codex-turn-command", &security)
+            .await
+            .expect("Codex session approval security should persist")
+    );
+
+    let opened =
+        open_test_codex_command_approval(&processor, &mut rx, workspace_id.as_str(), json!(779))
+            .await;
+    assert_eq!(
+        opened
+            .request
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("supportsSessionApproval")),
+        Some(&json!(true))
+    );
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "cmdapproval_session02",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": opened.request_id,
+                    "resolution": {"status": "approved_for_session"}
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let (response, _) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "cmdapproval_session02",
+        events::CLI_RUNTIME_REQUEST_RESOLVED,
+    )
+    .await;
+    let result: CLIRuntimeRequestRespondResponse =
+        serde_json::from_value(response.result).expect("respond result should decode");
+    assert_eq!(
+        result.resolution,
+        CLIRuntimeRequestResolution::ApprovedForSession
+    );
+    assert_eq!(
+        cli_session.responses.lock().await.as_slice(),
+        [(json!(779), json!({"decision": "acceptForSession"}))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_command_approval_denied_resolves_and_sends_decline() {
     let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
@@ -37695,6 +39258,166 @@ async fn cli_runtime_command_approval_denied_resolves_and_sends_decline() {
     assert_eq!(
         stored.status,
         pioneer_crud::CliRuntimePendingRequestStatus::Answered
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_general_permission_approval_prompts_and_returns_exact_bounded_profile() {
+    let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let permissions = json!({
+        "fileSystem": {
+            "write": ["/tmp/project/output"],
+            "entries": [{
+                "access": "read",
+                "path": {"type": "path", "path": "/tmp/project/input"}
+            }]
+        },
+        "network": {"enabled": true}
+    });
+    let opened = open_test_codex_permission_approval(
+        &processor,
+        &mut rx,
+        workspace_id.as_str(),
+        json!(778),
+        permissions.clone(),
+    )
+    .await;
+    assert_eq!(
+        opened.request.kind,
+        CLIRuntimeRequestKind::PermissionApproval
+    );
+    assert_eq!(
+        opened
+            .request
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("permissions")),
+        Some(&permissions)
+    );
+    assert!(
+        cli_session.responses.lock().await.is_empty(),
+        "a non-MCP provider permission request must wait for human consent"
+    );
+
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "permission_approve001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": opened.request_id,
+                    "resolution": {"status": "approved"}
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let (response, _) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "permission_approve001",
+        events::CLI_RUNTIME_REQUEST_RESOLVED,
+    )
+    .await;
+    let result: CLIRuntimeRequestRespondResponse =
+        serde_json::from_value(response.result).expect("respond result should decode");
+    assert_eq!(result.resolution, CLIRuntimeRequestResolution::Approved);
+    assert_eq!(
+        cli_session.responses.lock().await.as_slice(),
+        [(
+            json!(778),
+            json!({
+                "permissions": permissions,
+                "scope": "turn",
+                "strictAutoReview": true
+            })
+        )]
+    );
+    let stored = crud_store
+        .get_cli_runtime_pending_request(opened.request_id.as_str())
+        .await
+        .expect("permission request lookup should succeed")
+        .expect("permission request should remain durable");
+    assert_eq!(
+        stored.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Answered
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_general_permission_approval_cannot_exceed_current_turn_ceiling() {
+    let (processor, connection_id, mut rx, workspace_id, crud_store, cli_session) =
+        cli_runtime_approval_processor().await;
+    let denied_profile = pioneer_protocol::TurnPermissionProfileSnapshot {
+        mode: pioneer_protocol::TurnPermissionMode::Supervised,
+        source: pioneer_protocol::TurnPermissionProfileSource::TaskPermissionCap,
+        effective_policy: pioneer_protocol::ToolPermissionPolicySnapshot::all(
+            pioneer_protocol::PermissionBehavior::Deny,
+        ),
+    };
+    turn::Entity::update_many()
+        .col_expr(
+            turn::Column::PermissionProfileSnapshotJson,
+            Expr::value(serde_json::to_string(&denied_profile).unwrap()),
+        )
+        .filter(turn::Column::Id.eq("codex-turn-permission"))
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("denied CLI permission ceiling should persist");
+    persist_test_cli_execution_authorization_context_with_profile(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_permission_approval",
+        "codex-turn-permission",
+        "codex",
+        "codex",
+        &denied_profile,
+    )
+    .await;
+
+    let opened = open_test_codex_permission_approval(
+        &processor,
+        &mut rx,
+        workspace_id.as_str(),
+        json!(779),
+        json!({"fileSystem": {"write": ["/tmp/project/output"]}}),
+    )
+    .await;
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "permission_ceiling001",
+                "method": pioneer_protocol::constants::methods::CLI_RUNTIME_REQUEST_RESPOND,
+                "params": {
+                    "workspace_id": workspace_id,
+                    "runtime_id": "codex",
+                    "request_id": opened.request_id,
+                    "resolution": {"status": "approved"}
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let error = recv_error_by_id(&mut rx, "permission_ceiling001").await;
+    assert_eq!(error.error.code, INVALID_PARAMS_CODE);
+    assert!(cli_session.responses.lock().await.is_empty());
+    let stored = crud_store
+        .get_cli_runtime_pending_request(opened.request_id.as_str())
+        .await
+        .expect("permission request lookup should succeed")
+        .expect("permission request should remain durable");
+    assert_eq!(
+        stored.status,
+        pioneer_crud::CliRuntimePendingRequestStatus::Pending,
+        "a disallowed approval must not consume the pending request or reach the provider"
     );
 }
 
@@ -39721,9 +41444,18 @@ async fn cli_runtime_approval_processor() -> (
         "codex-thread-user-input",
     )
     .await;
+    seed_cli_runtime_approval_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        "thread_cli_permission_approval",
+        "codex-turn-permission",
+        "codex-thread-permission",
+    )
+    .await;
     for thread_id in [
         "thread_cli_command_approval",
         "thread_cli_file_change_approval",
+        "thread_cli_permission_approval",
         "thread_cli_user_input_request",
     ] {
         cli_manager
@@ -39968,6 +41700,44 @@ async fn open_test_codex_file_change_approval(
         )
         .await
         .expect("file change approval should open");
+
+    let opened = recv_notification_by_method(rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
+    serde_json::from_value(opened.params.expect("request_opened params"))
+        .expect("request_opened payload should decode")
+}
+
+async fn open_test_codex_permission_approval(
+    processor: &MessageProcessor,
+    rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    native_request_id: JsonValue,
+    permissions: JsonValue,
+) -> CLIRuntimeRequestOpenedNotification {
+    let request = CodexJsonlRpcServerRequest {
+        id: serde_json::from_value::<JsonlRpcId>(native_request_id.clone())
+            .expect("native request id should decode"),
+        method: "item/permissions/requestApproval".to_owned(),
+        params: Some(json!({
+            "cwd": "/tmp/project",
+            "reason": "provider sandbox needs additional access",
+            "permissions": permissions,
+            "threadId": "codex-thread-permission",
+            "turnId": "codex-turn-permission",
+            "itemId": "codex-item-permission",
+            "startedAtMs": 123456
+        })),
+        raw: json!({
+            "id": native_request_id,
+            "method": "item/permissions/requestApproval"
+        }),
+    };
+    let key =
+        CLIAgentRuntimeSessionKey::new(workspace_id, "codex", "thread_cli_permission_approval")
+            .expect("permission approval session key should build");
+    let event = map_codex_server_request_event(&request, RuntimeEventMappingOptions::default());
+    processor
+        .handle_cli_runtime_codex_server_request(&key, request, event)
+        .await;
 
     let opened = recv_notification_by_method(rx, events::CLI_RUNTIME_REQUEST_OPENED).await;
     serde_json::from_value(opened.params.expect("request_opened params"))
@@ -41865,16 +43635,23 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_cancel_allows_authorized_non_subscribed_connection() {
+async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
+    const THREAD_ID: &str = "T00000000000000000033";
+    const TURN_ID: &str = "V00000000000000000033";
     let (tx_owner, mut rx_owner) = mpsc::channel(16);
     let (tx_foreign, mut rx_foreign) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let owner_connection_id =
         register_authenticated_test_connection(session_manager.as_ref(), tx_owner).await;
-    let foreign_connection_id =
-        register_authenticated_test_connection(session_manager.as_ref(), tx_foreign).await;
+    let foreign_connection_id = session_manager
+        .register_connection(tx_foreign, authenticated_test_member_collaborator())
+        .await
+        .expect("register collaborator connection");
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "delayed"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
+        .await;
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(DelayedProvider {
@@ -41887,7 +43664,7 @@ async fn turn_cancel_allows_authorized_non_subscribed_connection() {
         provider_registry,
         session_manager,
         workspace_manager,
-        crud_store,
+        crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
         test_context_budget(),
@@ -41900,7 +43677,7 @@ async fn turn_cancel_allows_authorized_non_subscribed_connection() {
         "id": thread_request_id,
         "method": "thread/start",
         "params": {
-            "thread_id": "thr_000000000000000023",
+            "thread_id": THREAD_ID,
             "workspace_id": workspace_id,
             "model": "test-model",
             "model_provider": "delayed"
@@ -41917,8 +43694,8 @@ async fn turn_cancel_allows_authorized_non_subscribed_connection() {
         "id": turn_start_request_id,
         "method": "turn/start",
         "params": {
-            "thread_id": "thr_000000000000000023",
-            "turn_id": "turn_000000000000000023",
+            "thread_id": THREAD_ID,
+            "turn_id": TURN_ID,
             "mode": "Chat",
             "model": "test-model",
             "model_provider": "delayed",
@@ -41929,6 +43706,8 @@ async fn turn_cancel_allows_authorized_non_subscribed_connection() {
         .process_request_for_connection(owner_connection_id, &turn_start_request.to_string())
         .await;
     let _ = recv_response_by_id(&mut rx_owner, turn_start_request_id.as_str()).await;
+    materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
+        .await;
 
     let cancel_request_id = generate_test_request_id("turncancelforeign", "stop");
     let cancel_request = json!({
@@ -41936,8 +43715,8 @@ async fn turn_cancel_allows_authorized_non_subscribed_connection() {
         "id": cancel_request_id,
         "method": "turn/cancel",
         "params": {
-            "thread_id": "thr_000000000000000023",
-            "turn_id": "turn_000000000000000023",
+            "thread_id": THREAD_ID,
+            "turn_id": TURN_ID,
             "reason": "foreign stop"
         }
     });
@@ -41949,6 +43728,81 @@ async fn turn_cancel_allows_authorized_non_subscribed_connection() {
     let response: TurnCancelResponse =
         serde_json::from_value(response.result).expect("authorized cancel response should decode");
     assert_eq!(response.turn.status, TurnStatus::Interrupted);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_cancel_allows_another_current_collaborator_user() {
+    const THREAD_ID: &str = "T00000000000000000035";
+    const TURN_ID: &str = "V00000000000000000035";
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager.clone(),
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_context_budget(),
+        test_tool_loop_config(),
+    ));
+    processor.bind_task_bridge().await;
+
+    let mut params = test_task_create_params(
+        workspace_id.as_str(),
+        THREAD_ID,
+        TURN_ID,
+        "Collaborator-cancellable task",
+        3,
+    );
+    params.trigger = TaskTriggerInput {
+        spec: TaskTriggerSpec::Manual {
+            allowed_actor: None,
+        },
+    };
+    let created = create_task_for_test(&processor, params)
+        .await
+        .expect("manual task should be created for collaborator cancellation");
+    materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
+        .await;
+
+    let (collaborator_tx, mut collaborator_rx) = mpsc::channel(8);
+    let collaborator_connection_id = session_manager
+        .register_connection(collaborator_tx, authenticated_test_member_collaborator())
+        .await
+        .expect("collaborator task session should register");
+    session_manager
+        .set_connection_workspace(collaborator_connection_id, Some(workspace_id.clone()))
+        .await;
+
+    let request_id = generate_test_request_id("taskcancelforeign", "cancel");
+    processor
+        .process_request_for_connection(
+            collaborator_connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": pioneer_protocol::constants::methods::TASK_CANCEL,
+                "params": {
+                    "taskId": created.task.id.clone(),
+                    "reason": "cancelled by another current collaborator",
+                    "scope": "task_only"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+
+    let response = recv_response_by_id(&mut collaborator_rx, request_id.as_str()).await;
+    let response: pioneer_protocol::TaskCancelResponse = serde_json::from_value(response.result)
+        .expect("authorized collaborator task/cancel response should decode");
+    assert_eq!(
+        response.task.status,
+        pioneer_protocol::TaskStatus::Cancelled
+    );
+    assert_eq!(response.task.id, created.task.id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -57823,6 +59677,123 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
         .expect("service get should succeed");
     assert!(get.record.is_some());
 
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
+    let harness = setup_memory_gateway_harness("tool_supervised_consent", true).await;
+    let context = memory_tool_context(&harness, "tool_supervised_consent");
+    let materialization = materialize_memory_tools_for_context(&harness, context.clone()).await;
+    let permission_profile = pioneer_protocol::system_turn_permission_profile_snapshot(
+        pioneer_protocol::TurnPermissionMode::Supervised,
+    );
+    let permission_context = pioneer_tools::PermissionEvaluationContext::for_turn(
+        context.workspace_id.clone(),
+        context.thread_id.clone(),
+        context.turn_id.clone(),
+        permission_profile.clone(),
+    );
+    let snapshot = pioneer_protocol::TurnExecutionSecuritySnapshot::read_only(
+        permission_profile,
+        harness.runtime_home.display().to_string(),
+        vec![
+            pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                pioneer_protocol::TurnFilesystemAccess::Read,
+                harness.runtime_home.display().to_string(),
+            ),
+        ],
+        1,
+    );
+    let (broker, mut approval_events) =
+        crate::permissions::GatewayPermissionApprovalBroker::channel();
+    let opened = Arc::new(AtomicUsize::new(0));
+    let opened_for_worker = opened.clone();
+    let approval_worker = tokio::spawn(async move {
+        while let Some(event) = approval_events.recv().await {
+            match event {
+                crate::permissions::GatewayPermissionApprovalEvent::Revalidate(request) => {
+                    let context = request.context.clone();
+                    let _ = request.respond_to.send(Ok(context));
+                }
+                crate::permissions::GatewayPermissionApprovalEvent::Open(request) => {
+                    assert_eq!(
+                        request.key.action,
+                        pioneer_tools::PermissionActionKind::MemoryWrite
+                    );
+                    let index = opened_for_worker.fetch_add(1, Ordering::SeqCst);
+                    let resolution = if index == 0 {
+                        pioneer_tools::PermissionApprovalResolution::AllowOnce
+                    } else {
+                        pioneer_tools::PermissionApprovalResolution::Deny {
+                            message: "memory mutation denied by test user".to_owned(),
+                        }
+                    };
+                    let _ = request.respond_to.send(resolution);
+                }
+                crate::permissions::GatewayPermissionApprovalEvent::Cancelled { request_id }
+                | crate::permissions::GatewayPermissionApprovalEvent::Expired { request_id } => {
+                    panic!("unexpected terminal approval event for `{request_id}`")
+                }
+            }
+        }
+    });
+    let tool_loop_config = test_tool_loop_config();
+    let tools = build_tools_with_environment_and_security_snapshot(
+        harness.runtime_home.clone(),
+        context.turn_id.clone(),
+        permission_context,
+        tool_loop_config.web,
+        tool_loop_config.computer_use,
+        materialization.bundles,
+        BTreeMap::new(),
+        Some(snapshot),
+    )
+    .expect("supervised memory tools should build")
+    .with_permission_approval_broker(Arc::new(broker));
+
+    let allowed = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "call_memory_supervised_allowed",
+        json!({
+            "content": "approved supervised memory",
+            "category": "project_fact",
+            "scope": "thread",
+            "key": "supervised_allowed"
+        }),
+    )
+    .await;
+    assert_eq!(allowed.get("created"), Some(&serde_json::Value::Bool(true)));
+
+    let denied = execute_memory_tool_error(
+        &tools,
+        "memory_remember",
+        "call_memory_supervised_denied",
+        json!({
+            "content": "denied supervised memory",
+            "category": "project_fact",
+            "scope": "thread",
+            "key": "supervised_denied"
+        }),
+    )
+    .await;
+    assert!(matches!(
+        denied,
+        ToolError::Rejected(message) if message == "memory mutation denied by test user"
+    ));
+
+    let rows = harness
+        .crud_store
+        .list_agent_memory_records(AgentMemoryListFilter::default())
+        .await
+        .expect("list supervised memory records");
+    assert_eq!(opened.load(Ordering::SeqCst), 2);
+    assert_eq!(rows.len(), 1, "denied mutation must not create a DB row");
+    assert_eq!(rows[0].key.as_deref(), Some("supervised_allowed"));
+
+    drop(tools);
+    approval_worker.abort();
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 

@@ -149,7 +149,7 @@ pub fn materialize_mcp_runtime_tools(
             continue;
         }
         let parameters = descriptor.parameters.clone();
-        let recovery = recovery_for_annotations(&descriptor.annotations);
+        let recovery = recovery_for_untrusted_annotations(&descriptor.annotations);
         let spec = ToolSpec::new(
             descriptor.callable_name.clone(),
             description_for_descriptor(descriptor),
@@ -238,27 +238,12 @@ fn description_for_descriptor(descriptor: &McpDynamicToolDescriptor) -> String {
     parts.join("\n")
 }
 
-fn recovery_for_annotations(annotations: &McpDynamicToolAnnotations) -> ToolRecoveryMetadata {
-    if annotations.read_only_hint == Some(true) {
-        return ToolRecoveryMetadata {
-            retry_class: ToolRetryClass::Network,
-            idempotency_mode: ToolIdempotencyMode::Safe,
-            max_attempts: 2,
-            can_resume: false,
-            max_wall_clock_secs: None,
-        };
-    }
-
-    if annotations.idempotent_hint == Some(true) {
-        return ToolRecoveryMetadata {
-            retry_class: ToolRetryClass::Network,
-            idempotency_mode: ToolIdempotencyMode::Safe,
-            max_attempts: 2,
-            can_resume: false,
-            max_wall_clock_secs: None,
-        };
-    }
-
+fn recovery_for_untrusted_annotations(
+    _annotations: &McpDynamicToolAnnotations,
+) -> ToolRecoveryMetadata {
+    // readOnlyHint/idempotentHint are server-authored hints, not proof that a
+    // repeated call cannot duplicate a side effect. External MCP calls remain
+    // single-attempt until a separate trusted-server policy exists.
     ToolRecoveryMetadata {
         retry_class: ToolRetryClass::Never,
         idempotency_mode: ToolIdempotencyMode::None,
@@ -514,14 +499,12 @@ mod tests {
         let configured = &materialized.bundles[0].specs[0];
         assert_eq!(configured.spec.name, descriptor.callable_name);
         assert_eq!(configured.spec.parameters, schema);
-        assert_eq!(
-            configured.spec.recovery.retry_class,
-            ToolRetryClass::Network
-        );
+        assert_eq!(configured.spec.recovery.retry_class, ToolRetryClass::Never);
         assert_eq!(
             configured.spec.recovery.idempotency_mode,
-            ToolIdempotencyMode::Safe
+            ToolIdempotencyMode::None
         );
+        assert_eq!(configured.spec.recovery.max_attempts, 1);
         assert_eq!(
             configured.payload_binding,
             ToolPayloadBinding::Mcp {

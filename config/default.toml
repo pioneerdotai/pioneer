@@ -135,7 +135,8 @@ semantic_action_timeout_ms = 30000
 app_activation_timeout_ms = 5000
 input_simulation_enabled = true
 launch_if_missing_default = false
-# Empty allows any explicit launch_command. Non-empty restricts launch_command by exact command or prefix.
+# Empty allows any explicit launch_command. Non-empty allows only exact commands.
+# List each intended variant explicitly; prefix matching would let shell syntax append another command.
 allowed_launch_commands = []
 preflight_screenshot_probe_enabled = true
 max_consecutive_same_snapshot_hash = 6

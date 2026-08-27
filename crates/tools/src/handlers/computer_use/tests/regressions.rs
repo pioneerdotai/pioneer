@@ -1,5 +1,90 @@
 use super::*;
 
+#[tokio::test]
+async fn concurrently_materialized_handlers_reserve_distinct_artifact_sessions() {
+    let (first, root) = test_handler();
+    let config = ComputerUseToolsConfig {
+        runtime_home_dir: root.clone(),
+        artifacts_subdir: "tools/computer_use".to_owned(),
+        ..ComputerUseToolsConfig::default()
+    };
+    // Materialize both handlers before either creates a session. Historically
+    // both discovered the same maximum id and then shared one output directory.
+    let second =
+        ComputerUseHandler::with_backend(config, Arc::new(MockComputerUseBackend::default()));
+
+    let first_started = invoke(
+        &first,
+        serde_json::json!({
+            "action": "start",
+            "goal": "first",
+            "target": { "type": "app_name", "name": "MockApp" }
+        }),
+    )
+    .await;
+    let second_started = invoke(
+        &second,
+        serde_json::json!({
+            "action": "start",
+            "goal": "second",
+            "target": { "type": "app_name", "name": "MockApp" }
+        }),
+    )
+    .await;
+    let first_id = first_started["session_id"].as_u64().expect("first id");
+    let second_id = second_started["session_id"].as_u64().expect("second id");
+
+    assert_ne!(first_id, second_id);
+    assert!(
+        root.join("tools/computer_use")
+            .join(first_id.to_string())
+            .is_dir()
+    );
+    assert!(
+        root.join("tools/computer_use")
+            .join(second_id.to_string())
+            .is_dir()
+    );
+}
+
+#[tokio::test]
+async fn quota_cleanup_does_not_remove_another_handlers_active_session() {
+    let (first, root) = test_handler();
+    let first_started = invoke(
+        &first,
+        serde_json::json!({
+            "action": "start",
+            "goal": "active first session",
+            "target": { "type": "screen" }
+        }),
+    )
+    .await;
+    let first_id = first_started["session_id"].as_u64().expect("first id");
+    let first_dir = root.join("tools/computer_use").join(first_id.to_string());
+    std::fs::write(first_dir.join("active.bin"), b"active").expect("active artifact");
+
+    let second = ComputerUseHandler::with_backend(
+        ComputerUseToolsConfig {
+            runtime_home_dir: root,
+            artifacts_subdir: "tools/computer_use".to_owned(),
+            max_total_bytes: 0,
+            ..ComputerUseToolsConfig::default()
+        },
+        Arc::new(MockComputerUseBackend::default()),
+    );
+    invoke(
+        &second,
+        serde_json::json!({
+            "action": "start",
+            "goal": "trigger quota cleanup",
+            "target": { "type": "screen" }
+        }),
+    )
+    .await;
+
+    assert!(first_dir.join("active.bin").is_file());
+}
+
 async fn session_status(handler: &ComputerUseHandler, session_id: u64) -> JsonValue {
     invoke(
         handler,

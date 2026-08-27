@@ -97,9 +97,15 @@ pub(crate) struct CLIAgentRuntimeTurnSteerResult {
 pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<String>,
+    /// Stable identity of the principal, role, permission ceiling and maximum
+    /// security authority allowed to share provider-side session grants.
+    pub authorization_scope_fingerprint: Option<String>,
     pub app_server_args: Vec<String>,
     pub env: SensitiveEnvironment,
-    pub enable_user_skills: bool,
+    /// Exact selected Claude skill installations. Claude receives these as
+    /// generation-scoped managed plugins; the shared user settings source is
+    /// never enabled for skill discovery.
+    pub selected_skills: Vec<super::skills::CliRuntimeSelectedSkill>,
     pub elevated_instructions: Option<CLIRuntimeElevatedInstructions>,
 }
 
@@ -1346,17 +1352,19 @@ mod tests {
         let options_a = CLIAgentRuntimeSessionStartOptions {
             cwd: None,
             approval_policy: Some("on-request".to_owned()),
+            authorization_scope_fingerprint: Some("scope-a".to_owned()),
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5-codex\"".to_owned()],
             env: Default::default(),
-            enable_user_skills: false,
+            selected_skills: Vec::new(),
             elevated_instructions: None,
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
             cwd: None,
             approval_policy: Some("never".to_owned()),
+            authorization_scope_fingerprint: Some("scope-b".to_owned()),
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5\"".to_owned()],
             env: Default::default(),
-            enable_user_skills: false,
+            selected_skills: Vec::new(),
             elevated_instructions: None,
         };
 
@@ -1899,13 +1907,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_runtime_manager_restarts_session_when_user_skills_mode_changes() {
+    async fn cli_runtime_manager_restarts_session_when_selected_skills_change() {
         let factory = Arc::new(FakeFactory::default());
         let manager = manager_with_factory(factory.clone());
         let key = key("thread-skill-mode");
         let normal = CLIAgentRuntimeSessionStartOptions::default();
         let skill_enabled = CLIAgentRuntimeSessionStartOptions {
-            enable_user_skills: true,
+            selected_skills: vec![crate::cli_runtime::skills::CliRuntimeSelectedSkill {
+                install_name: "selected".to_owned(),
+                installed_path: std::path::PathBuf::from("/tmp/selected"),
+                source_folder_hash: "selected-hash".to_owned(),
+            }],
             ..Default::default()
         };
 
