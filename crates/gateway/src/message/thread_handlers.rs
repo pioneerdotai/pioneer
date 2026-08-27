@@ -437,6 +437,11 @@ impl MessageProcessor {
         let trace = pioneer_observability::GatewayOperationTrace::start(
             pioneer_observability::GatewayOperation::ThreadTreeLoad,
         );
+        trace.set_variant(if authorization.decision().is_absolute() {
+            pioneer_observability::GatewayOperationVariant::ThreadTreeWorkspaceWide
+        } else {
+            pioneer_observability::GatewayOperationVariant::ThreadTreePrincipalScoped
+        });
         let workspace_id = authorization.workspace_id().to_owned();
         let connection_workspace_stage = trace
             .stage(pioneer_observability::GatewayOperationStage::ThreadTreeConnectionWorkspaceSet);
@@ -500,6 +505,10 @@ impl MessageProcessor {
                 return;
             }
         };
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreeFolders,
+            folders.len() as u64,
+        );
 
         let placements_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreePlacementsLoad);
@@ -527,10 +536,18 @@ impl MessageProcessor {
                 return;
             }
         };
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreePlacements,
+            placements.len() as u64,
+        );
         let accessible_thread_ids = threads
             .iter()
             .map(|thread| thread.id.clone())
             .collect::<HashSet<_>>();
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreeUnreadCandidateThreads,
+            accessible_thread_ids.len() as u64,
+        );
         let unread_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeUnreadLoad);
         let unread_counts = match self
@@ -560,6 +577,17 @@ impl MessageProcessor {
                 return;
             }
         };
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreeUnreadThreads,
+            unread_counts.len() as u64,
+        );
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreeUnreadMessages,
+            unread_counts
+                .values()
+                .copied()
+                .fold(0_u64, u64::saturating_add),
+        );
         let unread = threads
             .iter()
             .map(|thread| ThreadUnreadSummary {
@@ -606,6 +634,10 @@ impl MessageProcessor {
                 &accessible_thread_ids,
             );
         }
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreeAgentsDocs,
+            agents_docs.len() as u64,
+        );
 
         let response_payload = ThreadTreeResponse {
             workspace_id,
@@ -822,6 +854,10 @@ impl MessageProcessor {
                 )
                 .await?
         };
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreePersistedThreads,
+            persisted_threads.len() as u64,
+        );
         persisted_stage.succeed();
         let runtime_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeRuntimeThreadsLoad);
@@ -832,6 +868,10 @@ impl MessageProcessor {
                 Some(connection_id),
             )
             .await;
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreeRuntimeThreads,
+            runtime_threads.len() as u64,
+        );
         runtime_stage.succeed();
         let merge_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeMerge);
@@ -872,6 +912,10 @@ impl MessageProcessor {
                 .then_with(|| lhs.id.cmp(&rhs.id))
         });
         threads.truncate(limit as usize);
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTreeReturnedThreads,
+            threads.len() as u64,
+        );
         merge_stage.succeed();
         Ok(threads)
     }

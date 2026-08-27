@@ -34,10 +34,10 @@ pub use metrics::{
     register_database_pool_observer,
 };
 pub use operations::{
-    GatewayCliRuntimeKind, GatewayOperation, GatewayOperationStage, GatewayOperationStageGuard,
-    GatewayOperationTrace, GatewayProviderReadinessState, GatewayProviderType,
-    GatewayProviderWarmupScope, GatewayProviderWarmupStage, GatewayProviderWarmupStageGuard,
-    GatewayProviderWarmupTrace,
+    GatewayCliRuntimeKind, GatewayOperation, GatewayOperationItemKind, GatewayOperationStage,
+    GatewayOperationStageGuard, GatewayOperationTrace, GatewayOperationVariant,
+    GatewayProviderReadinessState, GatewayProviderType, GatewayProviderWarmupScope,
+    GatewayProviderWarmupStage, GatewayProviderWarmupStageGuard, GatewayProviderWarmupTrace,
 };
 pub use patch_telemetry::{PatchTelemetrySnapshot, register_patch_telemetry_snapshot_provider};
 pub use performance::{
@@ -50,9 +50,10 @@ pub use performance::{
     record_desktop_timeline_stage, record_gateway_markdown_message, record_gateway_markdown_stage,
 };
 pub use startup::{
-    DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
-    GatewayStartupStage, GatewayStartupStageGuard, GatewayStartupTrace, MobileStartupOutcome,
-    MobileStartupReport, MobileStartupStage, MobileStartupStageTiming, record_mobile_startup,
+    DesktopGatewayConnectFailureClass, DesktopStartupOutcome, DesktopStartupStage,
+    DesktopStartupStageGuard, DesktopStartupTrace, GatewayStartupStage, GatewayStartupStageGuard,
+    GatewayStartupTrace, MobileStartupOutcome, MobileStartupReport, MobileStartupStage,
+    MobileStartupStageTiming, record_mobile_startup,
 };
 pub use telemetry::{
     OtlpTelemetryConfig, TelemetryTarget, force_flush_observability, init_otlp_observability,

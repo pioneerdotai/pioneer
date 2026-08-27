@@ -143,14 +143,25 @@ impl PioneerDesktop {
             GatewayWsEvent::Connecting { .. } => {
                 self.startup.gateway_session_attempt_started();
             }
-            GatewayWsEvent::Reconnecting { .. } => {
-                self.startup.gateway_session_retry_scheduled();
+            GatewayWsEvent::Reconnecting {
+                attempt,
+                delay_ms,
+                reason,
+                ..
+            } => {
+                self.startup
+                    .gateway_session_retry_scheduled(*attempt, *delay_ms, reason.as_str());
             }
             GatewayWsEvent::Connected { .. } => {
                 self.startup.gateway_session_transport_connected();
             }
-            GatewayWsEvent::Disconnected { .. } | GatewayWsEvent::ConnectFailed { .. } => {
-                self.startup.gateway_session_transport_failed();
+            GatewayWsEvent::Disconnected { reason, .. } => {
+                self.startup
+                    .gateway_session_transport_failed(reason.as_str());
+            }
+            GatewayWsEvent::ConnectFailed { error, .. } => {
+                self.startup
+                    .gateway_session_transport_failed(error.as_str());
             }
             GatewayWsEvent::Notification { .. } => {}
         }

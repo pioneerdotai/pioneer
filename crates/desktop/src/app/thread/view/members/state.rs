@@ -188,6 +188,7 @@ impl PioneerDesktop {
                                     view.startup.succeed(
                                         pioneer_observability::DesktopStartupStage::ThreadCapabilitiesLoad,
                                     );
+                                    view.startup.readiness_notification_scheduled();
                                     cx.notify();
                                     ThreadCapabilityRefreshDecision::Complete
                                 }

@@ -764,6 +764,15 @@ impl GatewayAuthService {
         &self,
         principal: &AuthenticatedSessionPrincipal,
     ) -> Result<SessionLeaseSnapshot, AuthError> {
+        self.validate_session_lease_with_trace(principal, None)
+            .await
+    }
+
+    async fn validate_session_lease_with_trace(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        trace: Option<&pioneer_observability::GatewayOperationTrace>,
+    ) -> Result<SessionLeaseSnapshot, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         if now_unix >= principal.access_expires_at_unix {
@@ -772,18 +781,27 @@ impl GatewayAuthService {
         if principal.gateway_id != self.identity.gateway.id {
             return Err(AuthError::new(AuthErrorCode::GatewayIdentityMismatch));
         }
-        let session = load_session(&self.database, &principal.session_id)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let device = load_device(&self.database, &principal.device_id)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let owner = load_principal_by_id(&self.database, &principal.principal_id)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let session = trace_auth_me_database_read(
+            trace,
+            pioneer_observability::GatewayOperationStage::AuthMeSessionLoad,
+            load_session(&self.database, &principal.session_id),
+        )
+        .await?
+        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let device = trace_auth_me_database_read(
+            trace,
+            pioneer_observability::GatewayOperationStage::AuthMeDeviceLoad,
+            load_device(&self.database, &principal.device_id),
+        )
+        .await?
+        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let owner = trace_auth_me_database_read(
+            trace,
+            pioneer_observability::GatewayOperationStage::AuthMePrincipalLoad,
+            load_principal_by_id(&self.database, &principal.principal_id),
+        )
+        .await?
+        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
 
         if session.gateway_id != principal.gateway_id.as_str()
             || session.principal_id != principal.principal_id.as_str()
@@ -812,10 +830,13 @@ impl GatewayAuthService {
         if device.status != "active" {
             return Err(AuthError::new(AuthErrorCode::SessionRevoked));
         }
-        let avatar_revision = load_principal_avatar(&self.database, &principal.principal_id)
-            .await
-            .map_err(storage_error)?
-            .map(|avatar| hex::encode(avatar.content_hash));
+        let avatar_revision = trace_auth_me_database_read(
+            trace,
+            pioneer_observability::GatewayOperationStage::AuthMeAvatarLoad,
+            load_principal_avatar(&self.database, &principal.principal_id),
+        )
+        .await?
+        .map(|avatar| hex::encode(avatar.content_hash));
         Ok(SessionLeaseSnapshot {
             kind: owner.kind,
             role_key: role_key.clone(),
@@ -929,7 +950,23 @@ impl GatewayAuthService {
         &self,
         principal: &AuthenticatedSessionPrincipal,
     ) -> Result<AuthMeResponse, AuthError> {
-        Ok(self.validate_session_lease(principal).await?.me)
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::AuthMe,
+        );
+        let result = self
+            .validate_session_lease_with_trace(principal, Some(&trace))
+            .await
+            .map(|snapshot| snapshot.me);
+        match result {
+            Ok(me) => {
+                trace.finish_success();
+                Ok(me)
+            }
+            Err(error) => {
+                trace.finish_failure();
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn update_profile(
@@ -2596,6 +2633,26 @@ fn datetime(unix: u64) -> Result<DateTime<FixedOffset>, AuthError> {
     DateTime::<Utc>::from_timestamp(unix, 0)
         .map(|value| value.fixed_offset())
         .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))
+}
+
+async fn trace_auth_me_database_read<T>(
+    trace: Option<&pioneer_observability::GatewayOperationTrace>,
+    stage: pioneer_observability::GatewayOperationStage,
+    read: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Result<T, AuthError> {
+    let stage = trace.map(|trace| trace.stage(stage));
+    match read.await {
+        Ok(value) => {
+            if let Some(stage) = stage {
+                stage.succeed();
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            drop(stage);
+            Err(storage_error(error))
+        }
+    }
 }
 
 fn storage_error(_error: anyhow::Error) -> AuthError {

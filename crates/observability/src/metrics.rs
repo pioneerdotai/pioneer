@@ -81,6 +81,7 @@ pub(crate) struct GatewayMetrics {
     pub(crate) provider_readiness_checks: Counter<u64>,
     pub(crate) gateway_operation_duration: Histogram<f64>,
     pub(crate) gateway_operation_stage_duration: Histogram<f64>,
+    pub(crate) gateway_operation_items: Histogram<u64>,
     pub(crate) gateway_operation_failures: Counter<u64>,
     pub(crate) patch_operations: Counter<u64>,
     pub(crate) patch_operation_duration: Histogram<f64>,
@@ -151,6 +152,12 @@ impl GatewayMetrics {
             .with_unit("ms")
             .with_boundaries(operation_duration_boundaries())
             .build();
+        let gateway_operation_items = meter
+            .u64_histogram("pioneer.gateway.operation.items")
+            .with_description("Bounded item counts observed by a Gateway operation")
+            .with_unit("{item}")
+            .with_boundaries(operation_item_boundaries())
+            .build();
         let gateway_operation_failures = meter
             .u64_counter("pioneer.gateway.operation.failures")
             .with_description("Number of failed bounded Gateway operations")
@@ -203,6 +210,7 @@ impl GatewayMetrics {
             provider_readiness_checks,
             gateway_operation_duration,
             gateway_operation_stage_duration,
+            gateway_operation_items,
             gateway_operation_failures,
             patch_operations,
             patch_operation_duration,
@@ -271,6 +279,13 @@ fn operation_duration_boundaries() -> Vec<f64> {
     vec![
         0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0,
         5_000.0, 10_000.0, 30_000.0,
+    ]
+}
+
+fn operation_item_boundaries() -> Vec<f64> {
+    vec![
+        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 500.0, 1_000.0, 2_500.0, 5_000.0,
+        10_000.0, 25_000.0, 100_000.0,
     ]
 }
 

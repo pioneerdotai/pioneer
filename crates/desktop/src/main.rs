@@ -185,8 +185,11 @@ fn main() {
         let _ = url_sender.send(urls);
     });
 
+    let ui_event_loop_stage =
+        startup.stage(pioneer_observability::DesktopStartupStage::UiEventLoopEnter);
     let startup_for_app = startup.clone();
     app.run(move |cx| {
+        ui_event_loop_stage.succeed();
         let ui_components_stage = startup_for_app
             .stage(pioneer_observability::DesktopStartupStage::UiComponentsInitialize);
         gpui_component::init(cx);

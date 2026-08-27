@@ -80,6 +80,7 @@ pub enum DesktopStartupStage {
     RuntimeHomePrepare,
     HttpClientInitialize,
     UiRuntimeInitialize,
+    UiEventLoopEnter,
     UiComponentsInitialize,
     WindowOpen,
     GatewayRuntimeLoad,
@@ -110,6 +111,7 @@ pub enum DesktopStartupStage {
     ThreadCapabilitiesLoad,
     ComposerModelSelectionResolve,
     ComposerPolicyReconcile,
+    ReadinessToRender,
     OperationalFrame,
 }
 
@@ -123,6 +125,7 @@ impl DesktopStartupStage {
             Self::RuntimeHomePrepare => "runtime_home.prepare",
             Self::HttpClientInitialize => "http_client.initialize",
             Self::UiRuntimeInitialize => "ui_runtime.initialize",
+            Self::UiEventLoopEnter => "ui_runtime.event_loop.enter",
             Self::UiComponentsInitialize => "ui_components.initialize",
             Self::WindowOpen => "window.open",
             Self::GatewayRuntimeLoad => "gateway_runtime.load",
@@ -153,7 +156,40 @@ impl DesktopStartupStage {
             Self::ThreadCapabilitiesLoad => "thread_capabilities.load",
             Self::ComposerModelSelectionResolve => "composer.model_selection.resolve",
             Self::ComposerPolicyReconcile => "composer.policy.reconcile",
+            Self::ReadinessToRender => "ui.readiness_to_render",
             Self::OperationalFrame => "ui.operational_frame",
+        }
+    }
+}
+
+/// Stable, low-cardinality classification for a failed Desktop Gateway
+/// transport attempt. Raw transport errors, endpoints and credentials must
+/// never be attached to startup telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopGatewayConnectFailureClass {
+    AccessRefreshRequired,
+    ConnectionRefused,
+    ConnectionReset,
+    Dns,
+    Handshake,
+    Network,
+    Timeout,
+    Tls,
+    Transport,
+}
+
+impl DesktopGatewayConnectFailureClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccessRefreshRequired => "access_refresh_required",
+            Self::ConnectionRefused => "connection_refused",
+            Self::ConnectionReset => "connection_reset",
+            Self::Dns => "dns",
+            Self::Handshake => "handshake",
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::Tls => "tls",
+            Self::Transport => "transport",
         }
     }
 }
@@ -328,6 +364,7 @@ pub fn record_mobile_startup(report: MobileStartupReport) {
                 (false, true) => StageOutcome::Cancelled,
                 (false, false) => StageOutcome::Ok,
             },
+            diagnostics: StageDiagnostics::default(),
         })
         .collect();
     emit_startup_observability(&StartupSnapshot {
@@ -378,6 +415,15 @@ struct StageRecord {
     started_at: SystemTime,
     elapsed: Duration,
     outcome: StageOutcome,
+    diagnostics: StageDiagnostics,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StageDiagnostics {
+    connect_attempt: Option<i64>,
+    reconnect_attempt: Option<i64>,
+    backoff_delay_ms: Option<i64>,
+    failure_class: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -424,6 +470,7 @@ impl StartupTimeline {
             name,
             started_at: SystemTime::now(),
             started_instant: Instant::now(),
+            diagnostics: StageDiagnostics::default(),
             finished: false,
         }
     }
@@ -462,6 +509,7 @@ impl StartupTimeline {
         started_at: SystemTime,
         elapsed: Duration,
         outcome: StageOutcome,
+        diagnostics: StageDiagnostics,
     ) {
         let mut state = self.lock();
         if !state.finalized {
@@ -470,6 +518,7 @@ impl StartupTimeline {
                 started_at,
                 elapsed,
                 outcome,
+                diagnostics,
             });
         }
     }
@@ -486,6 +535,7 @@ struct StartupStageGuard {
     name: &'static str,
     started_at: SystemTime,
     started_instant: Instant,
+    diagnostics: StageDiagnostics,
     finished: bool,
 }
 
@@ -508,6 +558,7 @@ impl StartupStageGuard {
             self.started_at,
             self.started_instant.elapsed(),
             outcome,
+            self.diagnostics.clone(),
         );
     }
 }
@@ -591,6 +642,29 @@ impl DesktopStartupTrace {
         DesktopStartupStageGuard(self.timeline.stage(stage.as_str()))
     }
 
+    #[must_use = "the Gateway connection attempt must be completed"]
+    pub fn gateway_session_attempt(&self, attempt: u32) -> DesktopStartupStageGuard {
+        let mut guard = self
+            .timeline
+            .stage(DesktopStartupStage::GatewaySessionAttempt.as_str());
+        guard.diagnostics.connect_attempt = Some(i64::from(attempt));
+        DesktopStartupStageGuard(guard)
+    }
+
+    #[must_use = "the Gateway reconnect backoff must be completed"]
+    pub fn gateway_session_backoff(
+        &self,
+        reconnect_attempt: u32,
+        delay_ms: u64,
+    ) -> DesktopStartupStageGuard {
+        let mut guard = self
+            .timeline
+            .stage(DesktopStartupStage::GatewaySessionBackoff.as_str());
+        guard.diagnostics.reconnect_attempt = Some(i64::from(reconnect_attempt));
+        guard.diagnostics.backoff_delay_ms = Some(i64::try_from(delay_ms).unwrap_or(i64::MAX));
+        DesktopStartupStageGuard(guard)
+    }
+
     /// Binds early startup timings to the persisted consent decision.
     pub fn bind_consent(&self) {
         self.timeline.bind_consent();
@@ -616,6 +690,11 @@ impl DesktopStartupStageGuard {
 
     pub fn cancel(self) {
         self.0.cancel();
+    }
+
+    pub fn fail_gateway_connect(mut self, class: DesktopGatewayConnectFailureClass) {
+        self.0.diagnostics.failure_class = Some(class.as_str());
+        self.0.finish(StageOutcome::Error);
     }
 }
 
@@ -670,13 +749,17 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
         state.startup_metrics.failures.add(1, &root_attributes);
     }
     for stage in &snapshot.stages {
-        state.startup_metrics.stage_duration.record(
-            stage.elapsed.as_secs_f64() * 1_000.0,
-            &[
-                KeyValue::new("startup.stage", stage.name),
-                KeyValue::new("outcome", stage.outcome.as_str()),
-            ],
-        );
+        let mut metric_attributes = vec![
+            KeyValue::new("startup.stage", stage.name),
+            KeyValue::new("outcome", stage.outcome.as_str()),
+        ];
+        if let Some(failure_class) = stage.diagnostics.failure_class {
+            metric_attributes.push(KeyValue::new("failure.class", failure_class));
+        }
+        state
+            .startup_metrics
+            .stage_duration
+            .record(stage.elapsed.as_secs_f64() * 1_000.0, &metric_attributes);
     }
 
     let root_builder = SpanBuilder::from_name(snapshot.root_name)
@@ -687,13 +770,26 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
     let root_context = Context::new().with_span(root_span);
 
     for stage in &snapshot.stages {
+        let mut attributes = vec![
+            KeyValue::new("startup.stage", stage.name),
+            KeyValue::new("outcome", stage.outcome.as_str()),
+        ];
+        if let Some(attempt) = stage.diagnostics.connect_attempt {
+            attributes.push(KeyValue::new("gateway.connection.attempt", attempt));
+        }
+        if let Some(attempt) = stage.diagnostics.reconnect_attempt {
+            attributes.push(KeyValue::new("gateway.reconnect.attempt", attempt));
+        }
+        if let Some(delay_ms) = stage.diagnostics.backoff_delay_ms {
+            attributes.push(KeyValue::new("gateway.backoff.delay_ms", delay_ms));
+        }
+        if let Some(failure_class) = stage.diagnostics.failure_class {
+            attributes.push(KeyValue::new("failure.class", failure_class));
+        }
         let builder = SpanBuilder::from_name(stage.name)
             .with_kind(SpanKind::Internal)
             .with_start_time(stage.started_at)
-            .with_attributes([
-                KeyValue::new("startup.stage", stage.name),
-                KeyValue::new("outcome", stage.outcome.as_str()),
-            ]);
+            .with_attributes(attributes);
         let mut span = state.tracer.build_with_context(builder, &root_context);
         span.set_status(stage.outcome.status());
         span.end_with_timestamp(end_timestamp(stage.started_at, stage.elapsed));
@@ -720,8 +816,9 @@ fn end_timestamp(started_at: SystemTime, elapsed: Duration) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopStartupOutcome, DesktopStartupStage, DesktopStartupTrace, GatewayStartupStage,
-        GatewayStartupTrace, MobileStartupOutcome, MobileStartupStage, StageOutcome,
+        DesktopGatewayConnectFailureClass, DesktopStartupOutcome, DesktopStartupStage,
+        DesktopStartupTrace, GatewayStartupStage, GatewayStartupTrace, MobileStartupOutcome,
+        MobileStartupStage, StageOutcome,
     };
 
     #[test]
@@ -801,6 +898,14 @@ mod tests {
             "thread_tree.response.apply"
         );
         assert_eq!(
+            DesktopStartupStage::UiEventLoopEnter.as_str(),
+            "ui_runtime.event_loop.enter"
+        );
+        assert_eq!(
+            DesktopStartupStage::ReadinessToRender.as_str(),
+            "ui.readiness_to_render"
+        );
+        assert_eq!(
             DesktopStartupStage::GatewayRuntimeServiceStart.as_str(),
             "gateway_runtime.service_start"
         );
@@ -830,5 +935,24 @@ mod tests {
             MobileStartupStage::ComposerPrepare.as_str(),
             "composer.prepare"
         );
+    }
+
+    #[test]
+    fn gateway_connect_diagnostics_keep_raw_errors_out_of_startup_state() {
+        let trace = DesktopStartupTrace::start();
+        trace
+            .gateway_session_attempt(2)
+            .fail_gateway_connect(DesktopGatewayConnectFailureClass::ConnectionRefused);
+        trace.gateway_session_backoff(1, 500).succeed();
+
+        let state = trace.timeline.lock();
+        assert_eq!(state.stages.len(), 2);
+        assert_eq!(state.stages[0].diagnostics.connect_attempt, Some(2));
+        assert_eq!(
+            state.stages[0].diagnostics.failure_class,
+            Some("connection_refused")
+        );
+        assert_eq!(state.stages[1].diagnostics.reconnect_attempt, Some(1));
+        assert_eq!(state.stages[1].diagnostics.backoff_delay_ms, Some(500));
     }
 }

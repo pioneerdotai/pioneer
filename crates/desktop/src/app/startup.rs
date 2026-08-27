@@ -2,7 +2,8 @@ use super::PioneerDesktop;
 use gpui::{Context, Window};
 use pioneer_client::state::client_state::GatewayConnectionState;
 use pioneer_observability::{
-    DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
+    DesktopGatewayConnectFailureClass, DesktopStartupOutcome, DesktopStartupStage,
+    DesktopStartupStageGuard, DesktopStartupTrace,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -18,8 +19,10 @@ pub(super) struct DesktopStartupCoordinator {
     completed: HashSet<DesktopStartupStage>,
     failed: HashSet<DesktopStartupStage>,
     gateway_session_attempt: Option<DesktopStartupStageGuard>,
+    gateway_session_attempt_number: u32,
     gateway_session_backoff: Option<DesktopStartupStageGuard>,
     gateway_session_identity_verify: Option<DesktopStartupStageGuard>,
+    readiness_to_render: Option<DesktopStartupStageGuard>,
     frame_scheduled: bool,
     finalized: bool,
 }
@@ -32,8 +35,10 @@ impl DesktopStartupCoordinator {
             completed: HashSet::new(),
             failed: HashSet::new(),
             gateway_session_attempt: None,
+            gateway_session_attempt_number: 0,
             gateway_session_backoff: None,
             gateway_session_identity_verify: None,
+            readiness_to_render: None,
             frame_scheduled: false,
             finalized: false,
         }
@@ -104,6 +109,9 @@ impl DesktopStartupCoordinator {
             self.completed.insert(stage);
         }
         self.cancel_gateway_session_diagnostics();
+        if let Some(stage) = self.readiness_to_render.take() {
+            stage.cancel();
+        }
     }
 
     fn tracks_gateway_session_startup(&self) -> bool {
@@ -121,22 +129,32 @@ impl DesktopStartupCoordinator {
             backoff.succeed();
         }
         if self.gateway_session_attempt.is_none() {
-            self.gateway_session_attempt =
-                Some(self.trace.stage(DesktopStartupStage::GatewaySessionAttempt));
+            self.gateway_session_attempt_number =
+                self.gateway_session_attempt_number.saturating_add(1);
+            self.gateway_session_attempt = Some(
+                self.trace
+                    .gateway_session_attempt(self.gateway_session_attempt_number),
+            );
         }
     }
 
-    pub(super) fn gateway_session_retry_scheduled(&mut self) {
+    pub(super) fn gateway_session_retry_scheduled(
+        &mut self,
+        reconnect_attempt: u32,
+        delay_ms: u64,
+        reason: &str,
+    ) {
         if !self.tracks_gateway_session_startup() {
             return;
         }
-        // A retry event means the preceding attempt failed. Dropping the
-        // guard deliberately records an error child span while the aggregate
-        // session stage remains active and can still complete successfully.
-        drop(self.gateway_session_attempt.take());
+        if let Some(attempt) = self.gateway_session_attempt.take() {
+            attempt.fail_gateway_connect(gateway_connect_failure_class(reason));
+        }
         if self.gateway_session_backoff.is_none() {
-            self.gateway_session_backoff =
-                Some(self.trace.stage(DesktopStartupStage::GatewaySessionBackoff));
+            self.gateway_session_backoff = Some(
+                self.trace
+                    .gateway_session_backoff(reconnect_attempt, delay_ms),
+            );
         }
     }
 
@@ -158,15 +176,24 @@ impl DesktopStartupCoordinator {
         }
     }
 
-    pub(super) fn gateway_session_transport_failed(&mut self) {
+    pub(super) fn gateway_session_transport_failed(&mut self, reason: &str) {
         if !self.tracks_gateway_session_startup() {
             return;
         }
-        drop(self.gateway_session_attempt.take());
+        if let Some(attempt) = self.gateway_session_attempt.take() {
+            attempt.fail_gateway_connect(gateway_connect_failure_class(reason));
+        }
         if let Some(backoff) = self.gateway_session_backoff.take() {
             backoff.cancel();
         }
         drop(self.gateway_session_identity_verify.take());
+    }
+
+    pub(super) fn readiness_notification_scheduled(&mut self) {
+        if self.finalized || self.frame_scheduled || self.readiness_to_render.is_some() {
+            return;
+        }
+        self.readiness_to_render = Some(self.trace.stage(DesktopStartupStage::ReadinessToRender));
     }
 
     pub(super) fn gateway_session_identity_verified(&mut self) {
@@ -210,6 +237,13 @@ impl DesktopStartupCoordinator {
             // already recorded through `fail`.
             self.cancel_active_stages();
         }
+        if let Some(stage) = self.readiness_to_render.take() {
+            if outcome == DesktopStartupOutcome::Ready {
+                stage.succeed();
+            } else {
+                stage.cancel();
+            }
+        }
         self.begin(DesktopStartupStage::OperationalFrame);
         self.frame_scheduled = true;
         cx.on_next_frame(window, move |view, _, cx| {
@@ -224,6 +258,39 @@ impl DesktopStartupCoordinator {
             // principal capability snapshot is already available.
             view.refresh_gateway_settings(cx);
         });
+    }
+}
+
+fn gateway_connect_failure_class(reason: &str) -> DesktopGatewayConnectFailureClass {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("access_refresh_required") || reason.contains("credential expired") {
+        DesktopGatewayConnectFailureClass::AccessRefreshRequired
+    } else if reason.contains("timed out") || reason.contains("timeout") {
+        DesktopGatewayConnectFailureClass::Timeout
+    } else if reason.contains("connection refused") {
+        DesktopGatewayConnectFailureClass::ConnectionRefused
+    } else if reason.contains("connection reset") || reason.contains("broken pipe") {
+        DesktopGatewayConnectFailureClass::ConnectionReset
+    } else if reason.contains("dns")
+        || reason.contains("failed to lookup")
+        || reason.contains("name or service not known")
+        || reason.contains("nodename nor servname")
+    {
+        DesktopGatewayConnectFailureClass::Dns
+    } else if reason.contains("tls")
+        || reason.contains("certificate")
+        || reason.contains("cert verifier")
+    {
+        DesktopGatewayConnectFailureClass::Tls
+    } else if reason.contains("handshake") || reason.contains("http error") {
+        DesktopGatewayConnectFailureClass::Handshake
+    } else if reason.contains("network is unreachable")
+        || reason.contains("no route to host")
+        || reason.contains("address not available")
+    {
+        DesktopGatewayConnectFailureClass::Network
+    } else {
+        DesktopGatewayConnectFailureClass::Transport
     }
 }
 
@@ -390,7 +457,7 @@ mod tests {
         startup.gateway_session_attempt_started();
         assert!(startup.gateway_session_attempt.is_some());
 
-        startup.gateway_session_retry_scheduled();
+        startup.gateway_session_retry_scheduled(1, 500, "connection refused");
         assert!(startup.gateway_session_attempt.is_none());
         assert!(startup.gateway_session_backoff.is_some());
 
@@ -404,6 +471,24 @@ mod tests {
 
         startup.gateway_session_identity_verified();
         assert!(startup.gateway_session_identity_verify.is_none());
+    }
+
+    #[test]
+    fn gateway_connect_failures_are_reduced_to_bounded_classes() {
+        use pioneer_observability::DesktopGatewayConnectFailureClass;
+
+        assert_eq!(
+            super::gateway_connect_failure_class("websocket connect timeout reached"),
+            DesktopGatewayConnectFailureClass::Timeout
+        );
+        assert_eq!(
+            super::gateway_connect_failure_class("Connection refused (os error 61)"),
+            DesktopGatewayConnectFailureClass::ConnectionRefused
+        );
+        assert_eq!(
+            super::gateway_connect_failure_class("websocket handshake failed: HTTP error: 503"),
+            DesktopGatewayConnectFailureClass::Handshake
+        );
     }
 
     #[test]

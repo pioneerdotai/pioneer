@@ -637,6 +637,7 @@ fn end_timestamp(started_at: SystemTime, elapsed: Duration) -> SystemTime {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayOperation {
     AuthRefresh,
+    AuthMe,
     ResilienceInitialize,
     SelfImprovementInitialize,
     McpWorkspaceInitialize,
@@ -649,6 +650,7 @@ impl GatewayOperation {
     const fn as_str(self) -> &'static str {
         match self {
             Self::AuthRefresh => "auth.refresh",
+            Self::AuthMe => "auth.me",
             Self::ResilienceInitialize => "services.resilience.initialize",
             Self::SelfImprovementInitialize => "services.self_improvement.initialize",
             Self::McpWorkspaceInitialize => "services.mcp.initialize",
@@ -661,6 +663,7 @@ impl GatewayOperation {
     const fn span_name(self) -> &'static str {
         match self {
             Self::AuthRefresh => "gateway.auth.refresh",
+            Self::AuthMe => "gateway.auth.me",
             Self::ResilienceInitialize => "gateway.services.resilience.initialize",
             Self::SelfImprovementInitialize => "gateway.services.self_improvement.initialize",
             Self::McpWorkspaceInitialize => "gateway.services.mcp.initialize",
@@ -671,12 +674,34 @@ impl GatewayOperation {
     }
 }
 
+/// Stable execution variants for bounded Gateway operations. Variants are
+/// deliberately modeled as an enum so request values and authorization
+/// identifiers cannot become telemetry dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayOperationVariant {
+    ThreadTreeWorkspaceWide,
+    ThreadTreePrincipalScoped,
+}
+
+impl GatewayOperationVariant {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThreadTreeWorkspaceWide => "thread_tree.workspace_wide",
+            Self::ThreadTreePrincipalScoped => "thread_tree.principal_scoped",
+        }
+    }
+}
+
 /// Stable stages used by [`GatewayOperationTrace`]. Repeated stages are
 /// allowed (for example, one MCP reload per workspace) and remain bounded
 /// because identifiers are intentionally excluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayOperationStage {
     AuthRefreshDatabaseTransactionAcquire,
+    AuthMeSessionLoad,
+    AuthMeDeviceLoad,
+    AuthMePrincipalLoad,
+    AuthMeAvatarLoad,
     ResilienceReadModelRepair,
     ResilienceDeadlineBackfill,
     ResilienceAdmissionLeaseReconcile,
@@ -717,6 +742,10 @@ impl GatewayOperationStage {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AuthRefreshDatabaseTransactionAcquire => "db.transaction.acquire",
+            Self::AuthMeSessionLoad => "session.load",
+            Self::AuthMeDeviceLoad => "device.load",
+            Self::AuthMePrincipalLoad => "principal.load",
+            Self::AuthMeAvatarLoad => "avatar.load",
             Self::ResilienceReadModelRepair => "read_model.repair",
             Self::ResilienceDeadlineBackfill => "deadlines.backfill",
             Self::ResilienceAdmissionLeaseReconcile => "admission_leases.reconcile",
@@ -755,6 +784,58 @@ impl GatewayOperationStage {
     }
 }
 
+/// Bounded item categories attached to Gateway operation traces and metrics.
+/// Counts are useful for separating query complexity from database contention;
+/// identifiers and request data are deliberately excluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayOperationItemKind {
+    ThreadTreePersistedThreads,
+    ThreadTreeRuntimeThreads,
+    ThreadTreeReturnedThreads,
+    ThreadTreeFolders,
+    ThreadTreePlacements,
+    ThreadTreeUnreadCandidateThreads,
+    ThreadTreeUnreadThreads,
+    ThreadTreeUnreadMessages,
+    ThreadTreeAgentsDocs,
+}
+
+impl GatewayOperationItemKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThreadTreePersistedThreads => "thread_tree.threads.persisted",
+            Self::ThreadTreeRuntimeThreads => "thread_tree.threads.runtime",
+            Self::ThreadTreeReturnedThreads => "thread_tree.threads.returned",
+            Self::ThreadTreeFolders => "thread_tree.folders",
+            Self::ThreadTreePlacements => "thread_tree.placements",
+            Self::ThreadTreeUnreadCandidateThreads => "thread_tree.unread.candidate_threads",
+            Self::ThreadTreeUnreadThreads => "thread_tree.unread.nonzero_threads",
+            Self::ThreadTreeUnreadMessages => "thread_tree.unread.messages",
+            Self::ThreadTreeAgentsDocs => "thread_tree.agents_docs",
+        }
+    }
+
+    const fn span_attribute(self) -> &'static str {
+        match self {
+            Self::ThreadTreePersistedThreads => "thread_tree.threads.persisted.count",
+            Self::ThreadTreeRuntimeThreads => "thread_tree.threads.runtime.count",
+            Self::ThreadTreeReturnedThreads => "thread_tree.threads.returned.count",
+            Self::ThreadTreeFolders => "thread_tree.folders.count",
+            Self::ThreadTreePlacements => "thread_tree.placements.count",
+            Self::ThreadTreeUnreadCandidateThreads => "thread_tree.unread.candidate_threads.count",
+            Self::ThreadTreeUnreadThreads => "thread_tree.unread.nonzero_threads.count",
+            Self::ThreadTreeUnreadMessages => "thread_tree.unread.messages.count",
+            Self::ThreadTreeAgentsDocs => "thread_tree.agents_docs.count",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GatewayOperationItemRecord {
+    kind: GatewayOperationItemKind,
+    count: u64,
+}
+
 #[derive(Clone, Debug)]
 struct GatewayOperationStageRecord {
     name: &'static str,
@@ -766,10 +847,12 @@ struct GatewayOperationStageRecord {
 #[derive(Debug)]
 struct GatewayOperationState {
     operation: GatewayOperation,
+    variant: Option<GatewayOperationVariant>,
     consent_generation: Option<u64>,
     started_at: SystemTime,
     started_instant: Instant,
     stages: Vec<GatewayOperationStageRecord>,
+    items: Vec<GatewayOperationItemRecord>,
     finalized: bool,
 }
 
@@ -784,10 +867,12 @@ impl GatewayOperationTimeline {
         Self {
             inner: Arc::new(Mutex::new(GatewayOperationState {
                 operation,
+                variant: None,
                 consent_generation: telemetry_enabled.then_some(consent_generation),
                 started_at: SystemTime::now(),
                 started_instant: Instant::now(),
                 stages: Vec::new(),
+                items: Vec::new(),
                 finalized: false,
             })),
         }
@@ -821,6 +906,25 @@ impl GatewayOperationTimeline {
         }
     }
 
+    fn record_items(&self, kind: GatewayOperationItemKind, count: u64) {
+        let mut state = self.lock();
+        if state.finalized {
+            return;
+        }
+        if let Some(existing) = state.items.iter_mut().find(|item| item.kind == kind) {
+            existing.count = count;
+        } else {
+            state.items.push(GatewayOperationItemRecord { kind, count });
+        }
+    }
+
+    fn set_variant(&self, variant: GatewayOperationVariant) {
+        let mut state = self.lock();
+        if !state.finalized {
+            state.variant = Some(variant);
+        }
+    }
+
     fn finish(&self, outcome: &'static str, failed: bool) {
         let snapshot = {
             let mut state = self.lock();
@@ -830,10 +934,12 @@ impl GatewayOperationTimeline {
             state.finalized = true;
             GatewayOperationSnapshot {
                 operation: state.operation,
+                variant: state.variant,
                 consent_generation: state.consent_generation,
                 started_at: state.started_at,
                 elapsed: state.started_instant.elapsed(),
                 stages: state.stages.clone(),
+                items: state.items.clone(),
                 outcome,
                 failed,
             }
@@ -865,6 +971,14 @@ impl GatewayOperationTrace {
 
     pub fn stage(&self, stage: GatewayOperationStage) -> GatewayOperationStageGuard {
         self.timeline.stage(stage)
+    }
+
+    pub fn record_items(&self, kind: GatewayOperationItemKind, count: u64) {
+        self.timeline.record_items(kind, count);
+    }
+
+    pub fn set_variant(&self, variant: GatewayOperationVariant) {
+        self.timeline.set_variant(variant);
     }
 
     pub fn finish_success(mut self) {
@@ -932,10 +1046,12 @@ impl Drop for GatewayOperationStageGuard {
 
 struct GatewayOperationSnapshot {
     operation: GatewayOperation,
+    variant: Option<GatewayOperationVariant>,
     consent_generation: Option<u64>,
     started_at: SystemTime,
     elapsed: Duration,
     stages: Vec<GatewayOperationStageRecord>,
+    items: Vec<GatewayOperationItemRecord>,
     outcome: &'static str,
     failed: bool,
 }
@@ -970,11 +1086,14 @@ fn emit_gateway_operation(snapshot: &GatewayOperationSnapshot) {
     } else {
         "none"
     };
-    let attributes = [
+    let mut attributes = vec![
         KeyValue::new("operation.name", snapshot.operation.as_str()),
         KeyValue::new("outcome", snapshot.outcome),
         KeyValue::new("operation.failed_stage", failed_stage),
     ];
+    if let Some(variant) = snapshot.variant {
+        attributes.push(KeyValue::new("operation.variant", variant.as_str()));
+    }
     metrics
         .gateway_operation_duration
         .record(snapshot.elapsed.as_secs_f64() * 1_000.0, &attributes);
@@ -982,31 +1101,57 @@ fn emit_gateway_operation(snapshot: &GatewayOperationSnapshot) {
         metrics.gateway_operation_failures.add(1, &attributes);
     }
     for stage in &snapshot.stages {
-        metrics.gateway_operation_stage_duration.record(
-            stage.elapsed.as_secs_f64() * 1_000.0,
-            &[
-                KeyValue::new("operation.name", snapshot.operation.as_str()),
-                KeyValue::new("operation.stage", stage.name),
-                KeyValue::new("outcome", stage.outcome.as_str()),
-            ],
-        );
+        let mut stage_attributes = vec![
+            KeyValue::new("operation.name", snapshot.operation.as_str()),
+            KeyValue::new("operation.stage", stage.name),
+            KeyValue::new("outcome", stage.outcome.as_str()),
+        ];
+        if let Some(variant) = snapshot.variant {
+            stage_attributes.push(KeyValue::new("operation.variant", variant.as_str()));
+        }
+        metrics
+            .gateway_operation_stage_duration
+            .record(stage.elapsed.as_secs_f64() * 1_000.0, &stage_attributes);
+    }
+    for item in &snapshot.items {
+        let mut item_attributes = vec![
+            KeyValue::new("operation.name", snapshot.operation.as_str()),
+            KeyValue::new("operation.item.kind", item.kind.as_str()),
+        ];
+        if let Some(variant) = snapshot.variant {
+            item_attributes.push(KeyValue::new("operation.variant", variant.as_str()));
+        }
+        metrics
+            .gateway_operation_items
+            .record(item.count, &item_attributes);
     }
 
+    let mut root_attributes = attributes;
+    for item in &snapshot.items {
+        root_attributes.push(KeyValue::new(
+            item.kind.span_attribute(),
+            i64::try_from(item.count).unwrap_or(i64::MAX),
+        ));
+    }
     let root_builder = SpanBuilder::from_name(snapshot.operation.span_name())
         .with_kind(SpanKind::Internal)
         .with_start_time(snapshot.started_at)
-        .with_attributes(attributes);
+        .with_attributes(root_attributes);
     let root_span = state.tracer.build(root_builder);
     let root_context = Context::new().with_span(root_span);
     for stage in &snapshot.stages {
+        let mut stage_attributes = vec![
+            KeyValue::new("operation.name", snapshot.operation.as_str()),
+            KeyValue::new("operation.stage", stage.name),
+            KeyValue::new("outcome", stage.outcome.as_str()),
+        ];
+        if let Some(variant) = snapshot.variant {
+            stage_attributes.push(KeyValue::new("operation.variant", variant.as_str()));
+        }
         let builder = SpanBuilder::from_name(stage.name)
             .with_kind(SpanKind::Internal)
             .with_start_time(stage.started_at)
-            .with_attributes([
-                KeyValue::new("operation.name", snapshot.operation.as_str()),
-                KeyValue::new("operation.stage", stage.name),
-                KeyValue::new("outcome", stage.outcome.as_str()),
-            ]);
+            .with_attributes(stage_attributes);
         let mut span = state.tracer.build_with_context(builder, &root_context);
         span.set_status(stage.outcome.status());
         span.end_with_timestamp(end_timestamp(stage.started_at, stage.elapsed));
@@ -1028,9 +1173,10 @@ fn emit_gateway_operation(snapshot: &GatewayOperationSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayCliRuntimeKind, GatewayOperation, GatewayOperationStage, GatewayOperationTrace,
-        GatewayProviderReadinessState, GatewayProviderWarmupScope, GatewayProviderWarmupStage,
-        GatewayProviderWarmupTrace, OperationStageOutcome,
+        GatewayCliRuntimeKind, GatewayOperation, GatewayOperationItemKind, GatewayOperationStage,
+        GatewayOperationTrace, GatewayOperationVariant, GatewayProviderReadinessState,
+        GatewayProviderWarmupScope, GatewayProviderWarmupStage, GatewayProviderWarmupTrace,
+        OperationStageOutcome,
     };
 
     #[test]
@@ -1051,6 +1197,11 @@ mod tests {
             GatewayOperationStage::DatabasePayloadCompression.as_str(),
             "payload.compress"
         );
+        assert_eq!(GatewayOperation::AuthMe.span_name(), "gateway.auth.me");
+        assert_eq!(
+            GatewayOperationStage::AuthMePrincipalLoad.as_str(),
+            "principal.load"
+        );
     }
 
     #[test]
@@ -1069,6 +1220,29 @@ mod tests {
         assert_eq!(state.stages.len(), 2);
         assert_eq!(state.stages[0].outcome, OperationStageOutcome::Ok);
         assert_eq!(state.stages[1].outcome, OperationStageOutcome::Error);
+    }
+
+    #[test]
+    fn gateway_operation_item_counts_are_bounded_and_replaceable() {
+        let trace = GatewayOperationTrace::start(GatewayOperation::ThreadTreeLoad);
+        trace.set_variant(GatewayOperationVariant::ThreadTreePrincipalScoped);
+        trace.record_items(GatewayOperationItemKind::ThreadTreeReturnedThreads, 10);
+        trace.record_items(GatewayOperationItemKind::ThreadTreeReturnedThreads, 12);
+        let timeline = trace.timeline.clone();
+
+        trace.finish_success();
+
+        let state = timeline.lock();
+        assert_eq!(
+            state.variant,
+            Some(GatewayOperationVariant::ThreadTreePrincipalScoped)
+        );
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].count, 12);
+        assert_eq!(
+            state.items[0].kind.span_attribute(),
+            "thread_tree.threads.returned.count"
+        );
     }
 
     #[test]
