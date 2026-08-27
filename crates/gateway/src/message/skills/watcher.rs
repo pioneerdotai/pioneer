@@ -15,21 +15,39 @@ impl MessageProcessor {
             let mut initialized = false;
             let mut configured_digests = HashMap::new();
             let mut managed_digests = HashMap::new();
+            let mut startup_trace = Some(pioneer_observability::GatewayOperationTrace::start(
+                pioneer_observability::GatewayOperation::SkillsWatcherInitialize,
+            ));
             loop {
                 timer.tick().await;
+                let workspaces_stage = startup_trace.as_ref().map(|trace| {
+                    trace.stage(pioneer_observability::GatewayOperationStage::SkillsWorkspacesLoad)
+                });
                 let workspaces = match this.workspace_manager.list_workspaces().await {
-                    Ok(workspaces) => workspaces
-                        .into_iter()
-                        .filter(|workspace| workspace.is_active)
-                        .collect::<Vec<_>>(),
+                    Ok(workspaces) => {
+                        if let Some(stage) = workspaces_stage {
+                            stage.succeed();
+                        }
+                        workspaces
+                            .into_iter()
+                            .filter(|workspace| workspace.is_active)
+                            .collect::<Vec<_>>()
+                    }
                     Err(error) => {
+                        drop(workspaces_stage);
                         warn!(
                             error = %error,
                             "failed to list workspaces for skills watcher notification"
                         );
+                        if let Some(trace) = startup_trace.take() {
+                            trace.finish_failure();
+                        }
                         continue;
                     }
                 };
+                let catalog_stage = startup_trace.as_ref().map(|trace| {
+                    trace.stage(pioneer_observability::GatewayOperationStage::SkillsCatalogSnapshot)
+                });
                 let mut next_configured_digests = HashMap::new();
                 let mut next_managed_digests = HashMap::new();
                 let mut changes = Vec::with_capacity(workspaces.len());
@@ -99,8 +117,17 @@ impl MessageProcessor {
                 configured_digests = next_configured_digests;
                 managed_digests = next_managed_digests;
                 if !initialized {
+                    if let Some(stage) = catalog_stage {
+                        stage.succeed();
+                    }
                     initialized = true;
+                    if let Some(trace) = startup_trace.take() {
+                        trace.finish_success();
+                    }
                     continue;
+                }
+                if let Some(stage) = catalog_stage {
+                    stage.succeed();
                 }
 
                 let now = now_timestamp_secs();

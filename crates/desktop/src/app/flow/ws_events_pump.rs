@@ -139,6 +139,21 @@ impl PioneerDesktop {
         event: GatewayWsEvent,
         cx: &mut Context<Self>,
     ) {
+        match &event {
+            GatewayWsEvent::Connecting { .. } => {
+                self.startup.gateway_session_attempt_started();
+            }
+            GatewayWsEvent::Reconnecting { .. } => {
+                self.startup.gateway_session_retry_scheduled();
+            }
+            GatewayWsEvent::Connected { .. } => {
+                self.startup.gateway_session_transport_connected();
+            }
+            GatewayWsEvent::Disconnected { .. } | GatewayWsEvent::ConnectFailed { .. } => {
+                self.startup.gateway_session_transport_failed();
+            }
+            GatewayWsEvent::Notification { .. } => {}
+        }
         if self.apply_gateway_auth_control_event(&event, cx) {
             return;
         }
@@ -218,11 +233,15 @@ impl PioneerDesktop {
                                         cx,
                                     );
                                 }
-                                Ok(None) => {}
+                                Ok(None) => {
+                                    view.startup.gateway_session_identity_failed();
+                                }
                                 Ok(Some(reason)) => {
+                                    view.startup.gateway_session_identity_failed();
                                     view.apply_gateway_session_terminal(reason, cx);
                                 }
                                 Err(error) => {
+                                    view.startup.gateway_session_identity_failed();
                                     let rendered = format!("{error:#}");
                                     if let Some(reason) =
                                         pioneer_client::gateway::session_lifecycle::terminal_reason_from_auth_code(

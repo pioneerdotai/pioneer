@@ -161,22 +161,69 @@ pub(crate) fn spawn(
 ) {
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let _handle = tokio::spawn(async move {
-        turn_item_execution_class_backfill::run(
-            crud_store.as_ref(),
-            context_compaction_timeout_config,
-        )
-        .await;
-        turn_event_projection_stream_state_backfill::run(crud_store.as_ref()).await;
-        task_event_fanout_cursor_backfill::run(crud_store.as_ref()).await;
-        authorization_legacy_backfill::run(crud_store.as_ref()).await;
-        stable_skill_id_backfill::run(crud_store.as_ref(), message_processor.as_ref()).await;
-        task_anchor_backfill::run(crud_store.as_ref()).await;
-        turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path()).await;
-        timeline_pagination_backfill::run(crud_store.as_ref()).await;
-        agent_diff_event_compaction::run(crud_store.as_ref()).await;
-        cli_runtime_native_event_compaction::run(crud_store.as_ref()).await;
-        turn_item_attempt_payload_compaction::run(crud_store.as_ref()).await;
-        zstd_payload_compression::run(crud_store.as_ref()).await;
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::DatabaseStartupMaintenance,
+        );
+        macro_rules! run_stage {
+            ($stage:expr, $future:expr) => {{
+                let stage = trace.stage($stage);
+                $future.await;
+                stage.succeed();
+            }};
+        }
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseTurnItemExecutionClassBackfill,
+            turn_item_execution_class_backfill::run(
+                crud_store.as_ref(),
+                context_compaction_timeout_config,
+            )
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseTurnEventProjectionBackfill,
+            turn_event_projection_stream_state_backfill::run(crud_store.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseTaskEventFanoutCursorBackfill,
+            task_event_fanout_cursor_backfill::run(crud_store.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseAuthorizationLegacyBackfill,
+            authorization_legacy_backfill::run(crud_store.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseStableSkillIdBackfill,
+            stable_skill_id_backfill::run(crud_store.as_ref(), message_processor.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseTaskAnchorBackfill,
+            task_anchor_backfill::run(crud_store.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseTurnPermissionProfileBackfill,
+            turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseTimelinePaginationBackfill,
+            timeline_pagination_backfill::run(crud_store.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseAgentDiffCompaction,
+            agent_diff_event_compaction::run(crud_store.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseCliRuntimeEventCompaction,
+            cli_runtime_native_event_compaction::run(crud_store.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabaseTurnItemAttemptPayloadCompaction,
+            turn_item_attempt_payload_compaction::run(crud_store.as_ref())
+        );
+        run_stage!(
+            pioneer_observability::GatewayOperationStage::DatabasePayloadCompression,
+            zstd_payload_compression::run(crud_store.as_ref())
+        );
+        let refill_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::DatabaseThreadEpisodicRefill);
         run_thread_episodic_workspace_capsule_refill(
             crud_store,
             thread_episodic_storage_root,
@@ -189,6 +236,8 @@ pub(crate) fn spawn(
             Some(interrupted_before_unix),
         )
         .await;
+        refill_stage.succeed();
+        trace.finish_success();
     });
 }
 

@@ -29,32 +29,54 @@ impl MessageProcessor {
     pub(crate) async fn start_mcp_workspace_supervisor(self: &std::sync::Arc<Self>) {
         let this = self.clone();
         let _handle = tokio::spawn(async move {
+            let trace = pioneer_observability::GatewayOperationTrace::start(
+                pioneer_observability::GatewayOperation::McpWorkspaceInitialize,
+            );
+            let workspaces_stage =
+                trace.stage(pioneer_observability::GatewayOperationStage::McpWorkspacesLoad);
             let workspaces = match this.workspace_manager.list_workspaces().await {
-                Ok(workspaces) => workspaces
-                    .into_iter()
-                    .filter(|workspace| workspace.is_active)
-                    .collect::<Vec<_>>(),
+                Ok(workspaces) => {
+                    workspaces_stage.succeed();
+                    workspaces
+                        .into_iter()
+                        .filter(|workspace| workspace.is_active)
+                        .collect::<Vec<_>>()
+                }
                 Err(error) => {
+                    drop(workspaces_stage);
                     warn!(
                         error = %error,
                         "failed to list workspaces for MCP startup supervisor"
                     );
+                    trace.finish_failure();
                     return;
                 }
             };
 
+            let mut failed = false;
             for workspace in workspaces {
+                let reload_stage =
+                    trace.stage(pioneer_observability::GatewayOperationStage::McpWorkspaceReload);
                 if let Err(error) = this
                     .mcp_service
                     .reload_workspace(workspace.id.as_str())
                     .await
                 {
+                    drop(reload_stage);
+                    failed = true;
                     warn!(
                         workspace_id = workspace.id.as_str(),
                         error = %format!("{error:#}"),
                         "failed to start MCP workspace runtime"
                     );
+                } else {
+                    reload_stage.succeed();
                 }
+            }
+            if failed {
+                trace.finish_failure();
+            } else {
+                trace.finish_success();
             }
         });
     }

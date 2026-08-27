@@ -8,11 +8,22 @@ use crate::gateway::timings::GatewayTimings;
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
-use super::GatewayRuntime;
 use super::compat::{is_same_gateway_version, local_gateway_version, managed_by_label};
+use super::{GatewayRuntime, observe_startup_stage};
 
 impl GatewayRuntime {
-    pub fn discover_and_adopt_existing_local_gateway_once(&mut self) -> Result<()> {
+    pub fn discover_and_adopt_existing_local_gateway_once(
+        &mut self,
+        trace: &pioneer_observability::DesktopStartupTrace,
+    ) -> Result<()> {
+        observe_startup_stage(
+            trace,
+            pioneer_observability::DesktopStartupStage::GatewayRuntimeLocalDiscovery,
+            || self.discover_and_adopt_existing_local_gateway_once_inner(),
+        )
+    }
+
+    fn discover_and_adopt_existing_local_gateway_once_inner(&mut self) -> Result<()> {
         if self.registry.active_gateway_id.is_some() {
             return Ok(());
         }

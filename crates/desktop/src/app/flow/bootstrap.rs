@@ -12,16 +12,24 @@ impl PioneerDesktop {
         self.gateway.status_level = GatewayStatusLevel::Neutral;
         self.gateway.error = None;
         let ws_sender = self.gateway.ws_command_sender.clone();
+        let startup_trace = self.startup.diagnostic_trace();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let ws_sender = ws_sender.clone();
+            let startup_trace = startup_trace.clone();
 
             async move {
+                let update_check_trace = startup_trace.clone();
                 let local_update_required = cx
-                    .background_spawn(
-                        async move { GatewayRuntime::local_gateway_update_required() },
-                    )
+                    .background_spawn(async move {
+                        let stage = update_check_trace.stage(
+                            pioneer_observability::DesktopStartupStage::GatewayRuntimeUpdateCheck,
+                        );
+                        let update_required = GatewayRuntime::local_gateway_update_required();
+                        stage.succeed();
+                        update_required
+                    })
                     .await;
 
                 if local_update_required {
@@ -36,13 +44,21 @@ impl PioneerDesktop {
 
                 let result = cx
                     .background_spawn(async move {
-                        let mut runtime = GatewayRuntime::load()?;
-                        runtime.discover_and_adopt_existing_local_gateway_once()?;
-                        runtime.try_recover_active_local_gateway_once()?;
+                        let mut runtime = crate::gateway::observe_startup_stage(
+                            &startup_trace,
+                            pioneer_observability::DesktopStartupStage::GatewayRuntimeStateLoad,
+                            GatewayRuntime::load,
+                        )?;
+                        runtime.discover_and_adopt_existing_local_gateway_once(&startup_trace)?;
+                        runtime.try_recover_active_local_gateway_once(&startup_trace)?;
                         let ws_connection_id = if runtime.setup_required() {
                             None
                         } else if let Some(endpoint) = runtime.active_gateway().cloned() {
-                            let spec = build_ws_connect_spec(&mut runtime, &endpoint)?;
+                            let spec = crate::gateway::observe_startup_stage(
+                                &startup_trace,
+                                pioneer_observability::DesktopStartupStage::GatewayRuntimeConnectionPrepare,
+                                || build_ws_connect_spec(&mut runtime, &endpoint),
+                            )?;
                             Some(ws_sender.connect_with_retry(spec)?)
                         } else {
                             None

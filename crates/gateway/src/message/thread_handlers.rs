@@ -434,10 +434,16 @@ impl MessageProcessor {
             return;
         }
 
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::ThreadTreeLoad,
+        );
         let workspace_id = authorization.workspace_id().to_owned();
+        let connection_workspace_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ThreadTreeConnectionWorkspaceSet);
         self.session_manager
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
+        connection_workspace_stage.succeed();
 
         let threads = match self
             .list_threads_snapshot_for_authorization(
@@ -448,6 +454,7 @@ impl MessageProcessor {
                     request_context.principal().principal_id.clone(),
                     request_context.principal().session_id.clone(),
                 ),
+                &trace,
             )
             .await
         {
@@ -462,17 +469,24 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
 
+        let folders_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeFoldersLoad);
         let folders = match self
             .crud_store
             .list_thread_folders(workspace_id.as_str())
             .await
         {
-            Ok(folders) => folders,
+            Ok(folders) => {
+                folders_stage.succeed();
+                folders
+            }
             Err(error) => {
+                drop(folders_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -482,17 +496,24 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
 
+        let placements_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreePlacementsLoad);
         let mut placements = match self
             .crud_store
             .list_thread_placements(workspace_id.as_str())
             .await
         {
-            Ok(placements) => placements,
+            Ok(placements) => {
+                placements_stage.succeed();
+                placements
+            }
             Err(error) => {
+                drop(placements_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -502,6 +523,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
@@ -509,6 +531,8 @@ impl MessageProcessor {
             .iter()
             .map(|thread| thread.id.clone())
             .collect::<HashSet<_>>();
+        let unread_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeUnreadLoad);
         let unread_counts = match self
             .crud_store
             .unread_counts_for_threads(
@@ -517,8 +541,12 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(counts) => counts,
+            Ok(counts) => {
+                unread_stage.succeed();
+                counts
+            }
             Err(error) => {
+                drop(unread_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -528,6 +556,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
@@ -540,16 +569,22 @@ impl MessageProcessor {
             .collect();
         retain_accessible_thread_placements(&mut placements, &accessible_thread_ids);
 
+        let agents_docs_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeAgentsDocsLoad);
         let mut agents_docs = match self
             .crud_store
             .list_thread_agents_doc_summaries(workspace_id.as_str())
             .await
         {
-            Ok(summaries) => summaries
-                .into_iter()
-                .map(Self::thread_tree_agents_doc_summary_from_record)
-                .collect(),
+            Ok(summaries) => {
+                agents_docs_stage.succeed();
+                summaries
+                    .into_iter()
+                    .map(Self::thread_tree_agents_doc_summary_from_record)
+                    .collect()
+            }
             Err(error) => {
+                drop(agents_docs_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -559,6 +594,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
@@ -580,9 +616,15 @@ impl MessageProcessor {
             agents_docs,
         };
 
+        let response_encode_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
-            Ok(response) => response,
+            Ok(response) => {
+                response_encode_stage.succeed();
+                response
+            }
             Err(error) => {
+                drop(response_encode_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -592,17 +634,25 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
 
+        let response_send_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeResponseSend);
         if let Err(error) = self.send_json(connection_id, &response).await {
+            drop(response_send_stage);
             warn!(
                 connection_id,
                 error = %format!("{error:#}"),
                 "failed to send thread/tree response"
             );
+            trace.finish_failure();
+            return;
         }
+        response_send_stage.succeed();
+        trace.finish_success();
     }
 
     pub(super) async fn thread_get(
@@ -755,7 +805,10 @@ impl MessageProcessor {
         limit: u64,
         connection_id: ConnectionId,
         identity: &ThreadSubscriptionIdentity,
+        trace: &pioneer_observability::GatewayOperationTrace,
     ) -> Result<Vec<pioneer_protocol::Thread>, anyhow::Error> {
+        let persisted_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ThreadTreePersistedThreadsLoad);
         let persisted_threads = if authorization.decision().is_absolute() {
             self.crud_store
                 .list_threads_for_workspace(authorization.workspace_id(), limit)
@@ -769,6 +822,19 @@ impl MessageProcessor {
                 )
                 .await?
         };
+        persisted_stage.succeed();
+        let runtime_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeRuntimeThreadsLoad);
+        let runtime_threads = self
+            .thread_manager
+            .list_threads_for_workspace_visible_to(
+                authorization.workspace_id(),
+                Some(connection_id),
+            )
+            .await;
+        runtime_stage.succeed();
+        let merge_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTreeMerge);
         let allowed_ids = persisted_threads
             .iter()
             .map(|thread| thread.id.clone())
@@ -777,14 +843,7 @@ impl MessageProcessor {
         for thread in persisted_threads {
             threads_by_id.insert(thread.id.clone(), thread);
         }
-        for thread in self
-            .thread_manager
-            .list_threads_for_workspace_visible_to(
-                authorization.workspace_id(),
-                Some(connection_id),
-            )
-            .await
-        {
+        for thread in runtime_threads {
             if !allowed_ids.contains(thread.id.as_str())
                 && self
                     .thread_manager
@@ -813,6 +872,7 @@ impl MessageProcessor {
                 .then_with(|| lhs.id.cmp(&rhs.id))
         });
         threads.truncate(limit as usize);
+        merge_stage.succeed();
         Ok(threads)
     }
 

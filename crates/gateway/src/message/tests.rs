@@ -24004,7 +24004,11 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         test_context_budget(),
         test_tool_loop_config(),
     ));
-    processor.start_resilience_workers().await;
+    processor.bind_agent_tool_bridges().await;
+    processor
+        .start_resilience_workers()
+        .await
+        .expect("resilience workers should start");
 
     start_thread_and_turn(
         &processor,

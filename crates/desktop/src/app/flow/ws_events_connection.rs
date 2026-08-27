@@ -69,6 +69,7 @@ impl PioneerDesktop {
         if let Some(cx) = cx.as_deref_mut() {
             self.rebuild_sidebar_tree_state(cx);
             if self.gateway.connection_state == GatewayConnectionState::Connected {
+                self.startup.gateway_session_identity_verified();
                 self.startup
                     .succeed(pioneer_observability::DesktopStartupStage::GatewaySessionConnect);
                 self.resolve_agent_avatar(cx);

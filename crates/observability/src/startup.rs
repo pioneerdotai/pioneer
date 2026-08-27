@@ -26,6 +26,15 @@ pub enum GatewayStartupStage {
     ServicesPrepare,
     ListenerBind,
     ServicesStart,
+    ServicesVoiceInputStart,
+    ServicesSelfImprovementStart,
+    ServicesNotificationsStart,
+    ServicesResilienceStart,
+    ServicesMcpStart,
+    ServicesSkillsWatcherStart,
+    ServicesDatabaseWorkersStart,
+    ServicesRemoteAccessStart,
+    ServicesProviderReadinessStart,
 }
 
 impl GatewayStartupStage {
@@ -49,6 +58,15 @@ impl GatewayStartupStage {
             Self::ServicesPrepare => "services.prepare",
             Self::ListenerBind => "listener.bind",
             Self::ServicesStart => "services.start",
+            Self::ServicesVoiceInputStart => "services.voice_input.start",
+            Self::ServicesSelfImprovementStart => "services.self_improvement.start",
+            Self::ServicesNotificationsStart => "services.notifications.start",
+            Self::ServicesResilienceStart => "services.resilience.start",
+            Self::ServicesMcpStart => "services.mcp.start",
+            Self::ServicesSkillsWatcherStart => "services.skills_watcher.start",
+            Self::ServicesDatabaseWorkersStart => "services.database_workers.start",
+            Self::ServicesRemoteAccessStart => "services.remote_access.start",
+            Self::ServicesProviderReadinessStart => "services.provider_readiness.start",
         }
     }
 }
@@ -65,12 +83,27 @@ pub enum DesktopStartupStage {
     UiComponentsInitialize,
     WindowOpen,
     GatewayRuntimeLoad,
+    GatewayRuntimeUpdateCheck,
+    GatewayRuntimeStateLoad,
+    GatewayRuntimeLocalDiscovery,
+    GatewayRuntimeLocalRecovery,
+    GatewayRuntimeVersionReconcile,
+    GatewayRuntimeReachabilityCheck,
+    GatewayRuntimeServiceStatusCheck,
+    GatewayRuntimeServiceStart,
+    GatewayRuntimeSessionEnsure,
+    GatewayRuntimeConnectionPrepare,
     GatewaySessionConnect,
+    GatewaySessionAttempt,
+    GatewaySessionBackoff,
+    GatewaySessionIdentityVerify,
     AuthorizationLoad,
     GatewaySettingsLoad,
     WorkspaceLoad,
     ProviderLoad,
     ThreadTreeLoad,
+    ThreadTreeRequest,
+    ThreadTreeResponseApply,
     ActiveThreadResolve,
     ActiveThreadBootstrap,
     ActiveThreadSubscribe,
@@ -93,12 +126,27 @@ impl DesktopStartupStage {
             Self::UiComponentsInitialize => "ui_components.initialize",
             Self::WindowOpen => "window.open",
             Self::GatewayRuntimeLoad => "gateway_runtime.load",
+            Self::GatewayRuntimeUpdateCheck => "gateway_runtime.update_check",
+            Self::GatewayRuntimeStateLoad => "gateway_runtime.state_load",
+            Self::GatewayRuntimeLocalDiscovery => "gateway_runtime.local_discovery",
+            Self::GatewayRuntimeLocalRecovery => "gateway_runtime.local_recovery",
+            Self::GatewayRuntimeVersionReconcile => "gateway_runtime.version_reconcile",
+            Self::GatewayRuntimeReachabilityCheck => "gateway_runtime.reachability_check",
+            Self::GatewayRuntimeServiceStatusCheck => "gateway_runtime.service_status_check",
+            Self::GatewayRuntimeServiceStart => "gateway_runtime.service_start",
+            Self::GatewayRuntimeSessionEnsure => "gateway_runtime.session_ensure",
+            Self::GatewayRuntimeConnectionPrepare => "gateway_runtime.connection_prepare",
             Self::GatewaySessionConnect => "gateway_session.connect",
+            Self::GatewaySessionAttempt => "gateway_session.connect_attempt",
+            Self::GatewaySessionBackoff => "gateway_session.backoff",
+            Self::GatewaySessionIdentityVerify => "gateway_session.identity_verify",
             Self::AuthorizationLoad => "authorization.load",
             Self::GatewaySettingsLoad => "gateway_settings.load",
             Self::WorkspaceLoad => "workspace.load",
             Self::ProviderLoad => "providers.load",
             Self::ThreadTreeLoad => "thread_tree.load",
+            Self::ThreadTreeRequest => "thread_tree.request",
+            Self::ThreadTreeResponseApply => "thread_tree.response.apply",
             Self::ActiveThreadResolve => "active_thread.resolve",
             Self::ActiveThreadBootstrap => "active_thread.bootstrap",
             Self::ActiveThreadSubscribe => "active_thread.subscribe",
@@ -142,9 +190,18 @@ pub enum MobileStartupStage {
     GatewayRegistryHydrate,
     NavigationMount,
     GatewaySessionConnect,
+    GatewaySessionConnectAttempt,
+    GatewaySessionIdentityVerify,
     AuthorizationLoad,
+    AuthorizationRegistryLoad,
+    AuthorizationCredentialsLoad,
+    AuthorizationRefreshIntentPersist,
+    AuthorizationRefreshRequest,
+    AuthorizationCredentialsPersist,
     WorkspaceLoad,
     ThreadTreeLoad,
+    ThreadTreeRequest,
+    ThreadTreeResponseApply,
     ComposerPrepare,
     OperationalFrame,
     SplashHide,
@@ -160,9 +217,18 @@ impl MobileStartupStage {
             Self::GatewayRegistryHydrate => "gateway_registry.hydrate",
             Self::NavigationMount => "navigation.mount",
             Self::GatewaySessionConnect => "gateway_session.connect",
+            Self::GatewaySessionConnectAttempt => "gateway_session.connect_attempt",
+            Self::GatewaySessionIdentityVerify => "gateway_session.identity_verify",
             Self::AuthorizationLoad => "authorization.load",
+            Self::AuthorizationRegistryLoad => "authorization.registry.load",
+            Self::AuthorizationCredentialsLoad => "authorization.credentials.load",
+            Self::AuthorizationRefreshIntentPersist => "authorization.refresh_intent.persist",
+            Self::AuthorizationRefreshRequest => "authorization.refresh.request",
+            Self::AuthorizationCredentialsPersist => "authorization.credentials.persist",
             Self::WorkspaceLoad => "workspace.load",
             Self::ThreadTreeLoad => "thread_tree.load",
+            Self::ThreadTreeRequest => "thread_tree.request",
+            Self::ThreadTreeResponseApply => "thread_tree.response.apply",
             Self::ComposerPrepare => "composer.prepare",
             Self::OperationalFrame => "ui.operational_frame",
             Self::SplashHide => "splash.hide",
@@ -178,9 +244,18 @@ impl MobileStartupStage {
             "gateway_registry.hydrate" => Self::GatewayRegistryHydrate,
             "navigation.mount" => Self::NavigationMount,
             "gateway_session.connect" => Self::GatewaySessionConnect,
+            "gateway_session.connect_attempt" => Self::GatewaySessionConnectAttempt,
+            "gateway_session.identity_verify" => Self::GatewaySessionIdentityVerify,
             "authorization.load" => Self::AuthorizationLoad,
+            "authorization.registry.load" => Self::AuthorizationRegistryLoad,
+            "authorization.credentials.load" => Self::AuthorizationCredentialsLoad,
+            "authorization.refresh_intent.persist" => Self::AuthorizationRefreshIntentPersist,
+            "authorization.refresh.request" => Self::AuthorizationRefreshRequest,
+            "authorization.credentials.persist" => Self::AuthorizationCredentialsPersist,
             "workspace.load" => Self::WorkspaceLoad,
             "thread_tree.load" => Self::ThreadTreeLoad,
+            "thread_tree.request" => Self::ThreadTreeRequest,
+            "thread_tree.response.apply" => Self::ThreadTreeResponseApply,
             "composer.prepare" => Self::ComposerPrepare,
             "ui.operational_frame" => Self::OperationalFrame,
             "splash.hide" => Self::SplashHide,
@@ -701,6 +776,46 @@ mod tests {
             Some(MobileStartupOutcome::AuthenticationRequired)
         );
         assert!(MobileStartupStage::parse("window.open").is_none());
+    }
+
+    #[test]
+    fn startup_diagnostic_stages_have_stable_names() {
+        assert_eq!(
+            GatewayStartupStage::ServicesResilienceStart.as_str(),
+            "services.resilience.start"
+        );
+        assert_eq!(
+            GatewayStartupStage::ServicesProviderReadinessStart.as_str(),
+            "services.provider_readiness.start"
+        );
+        assert_eq!(
+            DesktopStartupStage::GatewaySessionAttempt.as_str(),
+            "gateway_session.connect_attempt"
+        );
+        assert_eq!(
+            DesktopStartupStage::GatewaySessionBackoff.as_str(),
+            "gateway_session.backoff"
+        );
+        assert_eq!(
+            DesktopStartupStage::ThreadTreeResponseApply.as_str(),
+            "thread_tree.response.apply"
+        );
+        assert_eq!(
+            DesktopStartupStage::GatewayRuntimeServiceStart.as_str(),
+            "gateway_runtime.service_start"
+        );
+        assert_eq!(
+            MobileStartupStage::AuthorizationRefreshRequest.as_str(),
+            "authorization.refresh.request"
+        );
+        assert_eq!(
+            MobileStartupStage::GatewaySessionIdentityVerify.as_str(),
+            "gateway_session.identity_verify"
+        );
+        assert_eq!(
+            MobileStartupStage::parse("thread_tree.response.apply"),
+            Some(MobileStartupStage::ThreadTreeResponseApply)
+        );
     }
 
     #[test]

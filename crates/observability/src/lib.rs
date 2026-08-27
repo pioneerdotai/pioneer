@@ -33,7 +33,8 @@ pub use metrics::{
     register_database_pool_observer,
 };
 pub use operations::{
-    GatewayCliRuntimeKind, GatewayProviderReadinessState, GatewayProviderType,
+    GatewayCliRuntimeKind, GatewayOperation, GatewayOperationStage, GatewayOperationStageGuard,
+    GatewayOperationTrace, GatewayProviderReadinessState, GatewayProviderType,
     GatewayProviderWarmupScope, GatewayProviderWarmupStage, GatewayProviderWarmupStageGuard,
     GatewayProviderWarmupTrace,
 };

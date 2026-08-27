@@ -22,10 +22,24 @@ use pioneer_client::gateway::runtime as client_gateway_runtime;
 use pioneer_client::gateway::setup as client_gateway_setup;
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayRegistry};
 use pioneer_config::AppConfig;
+use pioneer_observability::{DesktopStartupStage, DesktopStartupTrace};
 use std::{collections::HashMap, path::PathBuf};
 use tracing::info;
 
 use pioneer_client::gateway::runtime::ActiveGatewayState;
+
+pub(crate) fn observe_startup_stage<T>(
+    trace: &DesktopStartupTrace,
+    stage: DesktopStartupStage,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let guard = trace.stage(stage);
+    let result = operation();
+    if result.is_ok() {
+        guard.succeed();
+    }
+    result
+}
 
 #[cfg(test)]
 pub(crate) use compat::is_same_gateway_version;

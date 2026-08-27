@@ -825,17 +825,45 @@ async fn run_gateway_until_shutdown_inner(
     let services_start_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ServicesStart);
     let services_start_result: Result<()> = async {
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesVoiceInputStart);
         start_voice_input_supervisor(&voice_input_supervisor, voice_input_desired_state)?;
+        stage.succeed();
+
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesSelfImprovementStart);
         self_improvement_supervisor
             .start()
             .await
             .context("failed to start self-improvement supervisor")?;
+        stage.succeed();
+
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesNotificationsStart);
         message_processor.start_remote_access_status_notifications();
         message_processor.start_voice_input_status_notifications();
         message_processor.start_thread_episodic_vector_refill_status_notifications();
-        message_processor.start_resilience_workers().await;
+        stage.succeed();
+
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesResilienceStart);
+        message_processor
+            .start_resilience_workers()
+            .await
+            .context("failed to start resilience workers")?;
+        stage.succeed();
+
+        let stage = startup.stage(pioneer_observability::GatewayStartupStage::ServicesMcpStart);
         message_processor.start_mcp_workspace_supervisor().await;
+        stage.succeed();
+
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesSkillsWatcherStart);
         message_processor.start_skills_watcher().await;
+        stage.succeed();
+
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesDatabaseWorkersStart);
         // Long-running migrations and backfills start only after the Gateway listener exists.
         database::startup::spawn(
             message_processor.clone(),
@@ -850,6 +878,10 @@ async fn run_gateway_until_shutdown_inner(
             context_compaction_timeout_config,
         );
         database::maintenance::spawn(message_processor.crud_store.clone());
+        stage.succeed();
+
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesRemoteAccessStart);
         remote_access_supervisor
             .apply(remote_access_desired_state(
                 &remote_access_config,
@@ -858,6 +890,14 @@ async fn run_gateway_until_shutdown_inner(
             )?)
             .await
             .context("failed to apply initial remote access settings")?;
+        stage.succeed();
+
+        let stage = startup
+            .stage(pioneer_observability::GatewayStartupStage::ServicesProviderReadinessStart);
+        message_processor
+            .start_provider_readiness_supervisor()
+            .await;
+        stage.succeed();
 
         Ok(())
     }
@@ -866,9 +906,6 @@ async fn run_gateway_until_shutdown_inner(
         Ok(()) => {
             services_start_stage.succeed();
             startup.finish_success();
-            message_processor
-                .start_provider_readiness_supervisor()
-                .await;
             info!(listen_addr = %handle.local_addr(), "gateway daemon started");
             wait_for_shutdown_signal().await
         }

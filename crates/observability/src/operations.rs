@@ -631,12 +631,440 @@ fn end_timestamp(started_at: SystemTime, elapsed: Duration) -> SystemTime {
         .unwrap_or_else(SystemTime::now)
 }
 
+/// A bounded Gateway operation that is useful outside the process-startup
+/// critical path. The enum deliberately prevents request data, workspace IDs,
+/// SQL, or other unbounded values from entering telemetry attributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayOperation {
+    ResilienceInitialize,
+    SelfImprovementInitialize,
+    McpWorkspaceInitialize,
+    SkillsWatcherInitialize,
+    DatabaseStartupMaintenance,
+    ThreadTreeLoad,
+}
+
+impl GatewayOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResilienceInitialize => "services.resilience.initialize",
+            Self::SelfImprovementInitialize => "services.self_improvement.initialize",
+            Self::McpWorkspaceInitialize => "services.mcp.initialize",
+            Self::SkillsWatcherInitialize => "services.skills_watcher.initialize",
+            Self::DatabaseStartupMaintenance => "database.startup_maintenance",
+            Self::ThreadTreeLoad => "thread_tree.load",
+        }
+    }
+
+    const fn span_name(self) -> &'static str {
+        match self {
+            Self::ResilienceInitialize => "gateway.services.resilience.initialize",
+            Self::SelfImprovementInitialize => "gateway.services.self_improvement.initialize",
+            Self::McpWorkspaceInitialize => "gateway.services.mcp.initialize",
+            Self::SkillsWatcherInitialize => "gateway.services.skills_watcher.initialize",
+            Self::DatabaseStartupMaintenance => "gateway.database.startup_maintenance",
+            Self::ThreadTreeLoad => "gateway.thread_tree.load",
+        }
+    }
+}
+
+/// Stable stages used by [`GatewayOperationTrace`]. Repeated stages are
+/// allowed (for example, one MCP reload per workspace) and remain bounded
+/// because identifiers are intentionally excluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayOperationStage {
+    ResilienceReadModelRepair,
+    ResilienceDeadlineBackfill,
+    ResilienceAdmissionLeaseReconcile,
+    ResilienceTaskRuntimeStart,
+    ResilienceTaskEventListenerStart,
+    ResilienceHookRecoveryStart,
+    SelfImprovementInitialWake,
+    McpWorkspacesLoad,
+    McpWorkspaceReload,
+    SkillsWorkspacesLoad,
+    SkillsCatalogSnapshot,
+    DatabaseTurnItemExecutionClassBackfill,
+    DatabaseTurnEventProjectionBackfill,
+    DatabaseTaskEventFanoutCursorBackfill,
+    DatabaseAuthorizationLegacyBackfill,
+    DatabaseStableSkillIdBackfill,
+    DatabaseTaskAnchorBackfill,
+    DatabaseTurnPermissionProfileBackfill,
+    DatabaseTimelinePaginationBackfill,
+    DatabaseAgentDiffCompaction,
+    DatabaseCliRuntimeEventCompaction,
+    DatabaseTurnItemAttemptPayloadCompaction,
+    DatabasePayloadCompression,
+    DatabaseThreadEpisodicRefill,
+    ThreadTreeConnectionWorkspaceSet,
+    ThreadTreePersistedThreadsLoad,
+    ThreadTreeRuntimeThreadsLoad,
+    ThreadTreeMerge,
+    ThreadTreeFoldersLoad,
+    ThreadTreePlacementsLoad,
+    ThreadTreeUnreadLoad,
+    ThreadTreeAgentsDocsLoad,
+    ThreadTreeResponseEncode,
+    ThreadTreeResponseSend,
+}
+
+impl GatewayOperationStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResilienceReadModelRepair => "read_model.repair",
+            Self::ResilienceDeadlineBackfill => "deadlines.backfill",
+            Self::ResilienceAdmissionLeaseReconcile => "admission_leases.reconcile",
+            Self::ResilienceTaskRuntimeStart => "task_runtime.start",
+            Self::ResilienceTaskEventListenerStart => "task_events.start",
+            Self::ResilienceHookRecoveryStart => "hook_recovery.start",
+            Self::SelfImprovementInitialWake => "self_improvement.initial_wake",
+            Self::McpWorkspacesLoad => "workspaces.load",
+            Self::McpWorkspaceReload => "workspace.reload",
+            Self::SkillsWorkspacesLoad => "workspaces.load",
+            Self::SkillsCatalogSnapshot => "catalog.snapshot",
+            Self::DatabaseTurnItemExecutionClassBackfill => "turn_item_execution_class.backfill",
+            Self::DatabaseTurnEventProjectionBackfill => "turn_event_projection.backfill",
+            Self::DatabaseTaskEventFanoutCursorBackfill => "task_event_fanout_cursor.backfill",
+            Self::DatabaseAuthorizationLegacyBackfill => "authorization_legacy.backfill",
+            Self::DatabaseStableSkillIdBackfill => "stable_skill_id.backfill",
+            Self::DatabaseTaskAnchorBackfill => "task_anchor.backfill",
+            Self::DatabaseTurnPermissionProfileBackfill => "turn_permission_profile.backfill",
+            Self::DatabaseTimelinePaginationBackfill => "timeline_pagination.backfill",
+            Self::DatabaseAgentDiffCompaction => "agent_diff.compact",
+            Self::DatabaseCliRuntimeEventCompaction => "cli_runtime_event.compact",
+            Self::DatabaseTurnItemAttemptPayloadCompaction => "turn_item_attempt_payload.compact",
+            Self::DatabasePayloadCompression => "payload.compress",
+            Self::DatabaseThreadEpisodicRefill => "thread_episodic.refill",
+            Self::ThreadTreeConnectionWorkspaceSet => "connection_workspace.set",
+            Self::ThreadTreePersistedThreadsLoad => "threads.persisted.load",
+            Self::ThreadTreeRuntimeThreadsLoad => "threads.runtime.load",
+            Self::ThreadTreeMerge => "threads.merge",
+            Self::ThreadTreeFoldersLoad => "folders.load",
+            Self::ThreadTreePlacementsLoad => "placements.load",
+            Self::ThreadTreeUnreadLoad => "unread.load",
+            Self::ThreadTreeAgentsDocsLoad => "agents_docs.load",
+            Self::ThreadTreeResponseEncode => "response.encode",
+            Self::ThreadTreeResponseSend => "response.send",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GatewayOperationStageRecord {
+    name: &'static str,
+    started_at: SystemTime,
+    elapsed: Duration,
+    outcome: OperationStageOutcome,
+}
+
+#[derive(Debug)]
+struct GatewayOperationState {
+    operation: GatewayOperation,
+    consent_generation: Option<u64>,
+    started_at: SystemTime,
+    started_instant: Instant,
+    stages: Vec<GatewayOperationStageRecord>,
+    finalized: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayOperationTimeline {
+    inner: Arc<Mutex<GatewayOperationState>>,
+}
+
+impl GatewayOperationTimeline {
+    fn start(operation: GatewayOperation) -> Self {
+        let (telemetry_enabled, consent_generation) = super::telemetry_consent_snapshot();
+        Self {
+            inner: Arc::new(Mutex::new(GatewayOperationState {
+                operation,
+                consent_generation: telemetry_enabled.then_some(consent_generation),
+                started_at: SystemTime::now(),
+                started_instant: Instant::now(),
+                stages: Vec::new(),
+                finalized: false,
+            })),
+        }
+    }
+
+    fn stage(&self, stage: GatewayOperationStage) -> GatewayOperationStageGuard {
+        GatewayOperationStageGuard {
+            timeline: self.clone(),
+            name: stage.as_str(),
+            started_at: SystemTime::now(),
+            started_instant: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn record_stage(
+        &self,
+        name: &'static str,
+        started_at: SystemTime,
+        elapsed: Duration,
+        outcome: OperationStageOutcome,
+    ) {
+        let mut state = self.lock();
+        if !state.finalized {
+            state.stages.push(GatewayOperationStageRecord {
+                name,
+                started_at,
+                elapsed,
+                outcome,
+            });
+        }
+    }
+
+    fn finish(&self, outcome: &'static str, failed: bool) {
+        let snapshot = {
+            let mut state = self.lock();
+            if state.finalized {
+                return;
+            }
+            state.finalized = true;
+            GatewayOperationSnapshot {
+                operation: state.operation,
+                consent_generation: state.consent_generation,
+                started_at: state.started_at,
+                elapsed: state.started_instant.elapsed(),
+                stages: state.stages.clone(),
+                outcome,
+                failed,
+            }
+        };
+        emit_gateway_operation(&snapshot);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, GatewayOperationState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Records one bounded Gateway operation and all of its diagnostic stages.
+#[must_use = "the Gateway operation trace must be completed"]
+pub struct GatewayOperationTrace {
+    timeline: GatewayOperationTimeline,
+    finished: bool,
+}
+
+impl GatewayOperationTrace {
+    pub fn start(operation: GatewayOperation) -> Self {
+        Self {
+            timeline: GatewayOperationTimeline::start(operation),
+            finished: false,
+        }
+    }
+
+    pub fn stage(&self, stage: GatewayOperationStage) -> GatewayOperationStageGuard {
+        self.timeline.stage(stage)
+    }
+
+    pub fn finish_success(mut self) {
+        self.timeline.finish("ok", false);
+        self.finished = true;
+    }
+
+    pub fn finish_failure(mut self) {
+        self.timeline.finish("error", true);
+        self.finished = true;
+    }
+
+    pub fn finish_cancelled(mut self) {
+        self.timeline.finish("cancelled", false);
+        self.finished = true;
+    }
+}
+
+impl Drop for GatewayOperationTrace {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.timeline.finish("cancelled", false);
+            self.finished = true;
+        }
+    }
+}
+
+#[must_use = "an operation stage must be marked successful; dropping it records a failure"]
+pub struct GatewayOperationStageGuard {
+    timeline: GatewayOperationTimeline,
+    name: &'static str,
+    started_at: SystemTime,
+    started_instant: Instant,
+    finished: bool,
+}
+
+impl GatewayOperationStageGuard {
+    pub fn succeed(mut self) {
+        self.finish(OperationStageOutcome::Ok);
+    }
+
+    pub fn cancel(mut self) {
+        self.finish(OperationStageOutcome::Cancelled);
+    }
+
+    fn finish(&mut self, outcome: OperationStageOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.timeline.record_stage(
+            self.name,
+            self.started_at,
+            self.started_instant.elapsed(),
+            outcome,
+        );
+    }
+}
+
+impl Drop for GatewayOperationStageGuard {
+    fn drop(&mut self) {
+        self.finish(OperationStageOutcome::Error);
+    }
+}
+
+struct GatewayOperationSnapshot {
+    operation: GatewayOperation,
+    consent_generation: Option<u64>,
+    started_at: SystemTime,
+    elapsed: Duration,
+    stages: Vec<GatewayOperationStageRecord>,
+    outcome: &'static str,
+    failed: bool,
+}
+
+impl GatewayOperationSnapshot {
+    fn failed_stage(&self) -> &'static str {
+        self.stages
+            .iter()
+            .rev()
+            .find(|stage| stage.outcome == OperationStageOutcome::Error)
+            .map(|stage| stage.name)
+            .unwrap_or("unknown")
+    }
+}
+
+fn emit_gateway_operation(snapshot: &GatewayOperationSnapshot) {
+    if !super::telemetry_sample_allowed(snapshot.consent_generation) {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    if state.target != TelemetryTarget::Gateway {
+        return;
+    }
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return;
+    };
+
+    let failed_stage = if snapshot.failed {
+        snapshot.failed_stage()
+    } else {
+        "none"
+    };
+    let attributes = [
+        KeyValue::new("operation.name", snapshot.operation.as_str()),
+        KeyValue::new("outcome", snapshot.outcome),
+        KeyValue::new("operation.failed_stage", failed_stage),
+    ];
+    metrics
+        .gateway_operation_duration
+        .record(snapshot.elapsed.as_secs_f64() * 1_000.0, &attributes);
+    if snapshot.failed {
+        metrics.gateway_operation_failures.add(1, &attributes);
+    }
+    for stage in &snapshot.stages {
+        metrics.gateway_operation_stage_duration.record(
+            stage.elapsed.as_secs_f64() * 1_000.0,
+            &[
+                KeyValue::new("operation.name", snapshot.operation.as_str()),
+                KeyValue::new("operation.stage", stage.name),
+                KeyValue::new("outcome", stage.outcome.as_str()),
+            ],
+        );
+    }
+
+    let root_builder = SpanBuilder::from_name(snapshot.operation.span_name())
+        .with_kind(SpanKind::Internal)
+        .with_start_time(snapshot.started_at)
+        .with_attributes(attributes);
+    let root_span = state.tracer.build(root_builder);
+    let root_context = Context::new().with_span(root_span);
+    for stage in &snapshot.stages {
+        let builder = SpanBuilder::from_name(stage.name)
+            .with_kind(SpanKind::Internal)
+            .with_start_time(stage.started_at)
+            .with_attributes([
+                KeyValue::new("operation.name", snapshot.operation.as_str()),
+                KeyValue::new("operation.stage", stage.name),
+                KeyValue::new("outcome", stage.outcome.as_str()),
+            ]);
+        let mut span = state.tracer.build_with_context(builder, &root_context);
+        span.set_status(stage.outcome.status());
+        span.end_with_timestamp(end_timestamp(stage.started_at, stage.elapsed));
+    }
+    root_context.span().set_status(if snapshot.failed {
+        Status::Error {
+            description: std::borrow::Cow::Borrowed("Gateway operation failed"),
+        }
+    } else if snapshot.outcome == "cancelled" {
+        Status::Unset
+    } else {
+        Status::Ok
+    });
+    root_context
+        .span()
+        .end_with_timestamp(end_timestamp(snapshot.started_at, snapshot.elapsed));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayCliRuntimeKind, GatewayProviderReadinessState, GatewayProviderWarmupScope,
-        GatewayProviderWarmupStage, GatewayProviderWarmupTrace, OperationStageOutcome,
+        GatewayCliRuntimeKind, GatewayOperation, GatewayOperationStage, GatewayOperationTrace,
+        GatewayProviderReadinessState, GatewayProviderWarmupScope, GatewayProviderWarmupStage,
+        GatewayProviderWarmupTrace, OperationStageOutcome,
     };
+
+    #[test]
+    fn gateway_operations_use_stable_bounded_names() {
+        assert_eq!(
+            GatewayOperation::ResilienceInitialize.as_str(),
+            "services.resilience.initialize"
+        );
+        assert_eq!(
+            GatewayOperation::ThreadTreeLoad.span_name(),
+            "gateway.thread_tree.load"
+        );
+        assert_eq!(
+            GatewayOperationStage::ThreadTreePersistedThreadsLoad.as_str(),
+            "threads.persisted.load"
+        );
+        assert_eq!(
+            GatewayOperationStage::DatabasePayloadCompression.as_str(),
+            "payload.compress"
+        );
+    }
+
+    #[test]
+    fn gateway_operation_supports_repeated_stages_and_explicit_failure() {
+        let trace = GatewayOperationTrace::start(GatewayOperation::McpWorkspaceInitialize);
+        trace
+            .stage(GatewayOperationStage::McpWorkspaceReload)
+            .succeed();
+        drop(trace.stage(GatewayOperationStage::McpWorkspaceReload));
+        let timeline = trace.timeline.clone();
+
+        trace.finish_failure();
+
+        let state = timeline.lock();
+        assert!(state.finalized);
+        assert_eq!(state.stages.len(), 2);
+        assert_eq!(state.stages[0].outcome, OperationStageOutcome::Ok);
+        assert_eq!(state.stages[1].outcome, OperationStageOutcome::Error);
+    }
 
     #[test]
     fn stages_use_stable_names_and_bounded_runtime_kinds() {

@@ -11,7 +11,10 @@ use pioneer_client::gateway::types::GatewayEndpointKind;
 use tracing::info;
 
 use super::discovery::ensure_managed_gateway_up_to_date;
-use super::{ActiveGatewayState, GatewayRuntime, LocalGatewayRecovery, LocalGatewayStartOutcome};
+use super::{
+    ActiveGatewayState, GatewayRuntime, LocalGatewayRecovery, LocalGatewayStartOutcome,
+    observe_startup_stage,
+};
 
 impl GatewayRuntime {
     pub fn active_gateway_state(&self) -> Result<ActiveGatewayState> {
@@ -36,16 +39,40 @@ impl GatewayRuntime {
         })
     }
 
-    pub fn try_recover_active_local_gateway_once(&mut self) -> Result<LocalGatewayRecovery> {
-        let local_gateway_id = self.local_gateway_id();
+    pub fn try_recover_active_local_gateway_once(
+        &mut self,
+        trace: &pioneer_observability::DesktopStartupTrace,
+    ) -> Result<LocalGatewayRecovery> {
+        observe_startup_stage(
+            trace,
+            pioneer_observability::DesktopStartupStage::GatewayRuntimeLocalRecovery,
+            || self.try_recover_active_local_gateway_once_inner(trace),
+        )
+    }
 
-        if self.registry.active_gateway_id.as_deref() != Some(local_gateway_id) {
+    fn try_recover_active_local_gateway_once_inner(
+        &mut self,
+        trace: &pioneer_observability::DesktopStartupTrace,
+    ) -> Result<LocalGatewayRecovery> {
+        let local_gateway_id = self.local_gateway_id().to_owned();
+
+        if self.registry.active_gateway_id.as_deref() != Some(local_gateway_id.as_str()) {
             return Ok(LocalGatewayRecovery::NotNeeded);
         }
 
-        let service_name = self.config.gateway.service_name.as_str();
-        let listen_addr = self.config.gateway.listen_addr.as_str();
-        let warnings = ensure_managed_gateway_up_to_date(service_name, listen_addr, &self.timings)?;
+        let service_name = self.config.gateway.service_name.clone();
+        let listen_addr = self.config.gateway.listen_addr.clone();
+        let warnings = observe_startup_stage(
+            trace,
+            pioneer_observability::DesktopStartupStage::GatewayRuntimeVersionReconcile,
+            || {
+                ensure_managed_gateway_up_to_date(
+                    service_name.as_str(),
+                    listen_addr.as_str(),
+                    &self.timings,
+                )
+            },
+        )?;
         for warning in warnings {
             info!(
                 warning_code = %warning.code,
@@ -53,25 +80,47 @@ impl GatewayRuntime {
                 "managed local gateway auto-update warning"
             );
         }
-        let reachable = is_local_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
-        let service_active = is_configured_service_active(service_name)?;
+        let reachable = observe_startup_stage(
+            trace,
+            pioneer_observability::DesktopStartupStage::GatewayRuntimeReachabilityCheck,
+            || is_local_gateway_reachable(listen_addr.as_str(), self.timings.connect_timeout),
+        )?;
+        let service_active = observe_startup_stage(
+            trace,
+            pioneer_observability::DesktopStartupStage::GatewayRuntimeServiceStatusCheck,
+            || is_configured_service_active(service_name.as_str()),
+        )?;
         let service_active = normalize_local_service_active(reachable, service_active);
 
         match classify_local_gateway_state(reachable, service_active) {
             ActiveGatewayState::Connected => {
-                self.ensure_local_gateway_session()?;
+                observe_startup_stage(
+                    trace,
+                    pioneer_observability::DesktopStartupStage::GatewayRuntimeSessionEnsure,
+                    || self.ensure_local_gateway_session(),
+                )?;
                 Ok(LocalGatewayRecovery::AlreadyRunning)
             }
             ActiveGatewayState::LocalAddressConflict => bail!(
                 "{}",
                 t!(
                     "errors.gateway.address_conflict_inactive_service",
-                    listen_addr = listen_addr,
-                    service_name = service_name
+                    listen_addr = listen_addr.as_str(),
+                    service_name = service_name.as_str()
                 )
             ),
             ActiveGatewayState::Unreachable => {
-                let warnings = start_gateway_service(service_name, listen_addr, &self.timings)?;
+                let warnings = observe_startup_stage(
+                    trace,
+                    pioneer_observability::DesktopStartupStage::GatewayRuntimeServiceStart,
+                    || {
+                        start_gateway_service(
+                            service_name.as_str(),
+                            listen_addr.as_str(),
+                            &self.timings,
+                        )
+                    },
+                )?;
                 for warning in warnings {
                     info!(
                         warning_code = %warning.code,
@@ -80,9 +129,13 @@ impl GatewayRuntime {
                     );
                 }
 
-                self.registry.active_gateway_id = Some(local_gateway_id.to_owned());
+                self.registry.active_gateway_id = Some(local_gateway_id);
                 save_registry(&self.registry_path, &self.registry)?;
-                self.ensure_local_gateway_session()?;
+                observe_startup_stage(
+                    trace,
+                    pioneer_observability::DesktopStartupStage::GatewayRuntimeSessionEnsure,
+                    || self.ensure_local_gateway_session(),
+                )?;
                 Ok(LocalGatewayRecovery::Started)
             }
             ActiveGatewayState::NotConfigured => Ok(LocalGatewayRecovery::NotNeeded),

@@ -1836,33 +1836,21 @@ impl MessageProcessor {
         }
     }
 
-    pub async fn start_resilience_workers(self: &Arc<Self>) {
-        self.authorization_invalidation_hub
-            .current_generation()
-            .await
-            .expect("Gateway startup requires durable authorization policy generation");
-        self.bind_agent_tool_bridges().await;
-        let processor = Arc::downgrade(self);
-        self.recovery_coordinator
-            .set_listener_starter(Arc::new(move |thread_id| {
-                let processor = processor.clone();
-                Box::pin(async move {
-                    let processor = processor.upgrade().ok_or_else(|| {
-                        "message processor stopped before recovery listener startup".to_owned()
-                    })?;
-                    processor
-                        .ensure_agent_listener_task(thread_id.as_str())
-                        .await
-                        .map_err(|error| format!("{error:#}"))
-                })
-            }))
-            .await;
+    async fn initialize_resilience_workers(self: &Arc<Self>) {
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::ResilienceInitialize,
+        );
+        let mut failed = false;
+
+        let repair_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ResilienceReadModelRepair);
         match self
             .crud_store
             .repair_deterministic_read_model_violations()
             .await
         {
             Ok(summary) => {
+                repair_stage.succeed();
                 if summary.remaining > 0 {
                     warn!(
                         detected = summary.detected,
@@ -1879,18 +1867,24 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
+                drop(repair_stage);
+                failed = true;
                 warn!(
                     error = %format!("{error:#}"),
                     "read-model invariant verification failed at startup"
                 );
             }
         }
+
+        let deadline_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ResilienceDeadlineBackfill);
         match self
             .timeout_supervisor
             .backfill_missing_deadlines(1024)
             .await
         {
             Ok(backfilled) => {
+                deadline_stage.succeed();
                 if backfilled > 0 {
                     warn!(
                         backfilled,
@@ -1899,35 +1893,97 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
+                drop(deadline_stage);
+                failed = true;
                 warn!(
                     error = %format!("{error:#}"),
                     "failed to backfill missing running item deadlines during startup"
                 );
             }
         }
+
+        let admission_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ResilienceAdmissionLeaseReconcile);
         match self.crud_store.reconcile_execution_admission_leases().await {
-            Ok(reconciled) if reconciled > 0 => warn!(
-                reconciled,
-                "released stale execution admission quota leases during startup"
-            ),
-            Ok(_) => {}
-            Err(error) => warn!(
-                error = %format!("{error:#}"),
-                "failed to reconcile execution admission quota leases at startup"
-            ),
+            Ok(reconciled) => {
+                admission_stage.succeed();
+                if reconciled > 0 {
+                    warn!(
+                        reconciled,
+                        "released stale execution admission quota leases during startup"
+                    );
+                }
+            }
+            Err(error) => {
+                drop(admission_stage);
+                failed = true;
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to reconcile execution admission quota leases at startup"
+                );
+            }
         }
+
+        let task_runtime_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
         if let Err(error) = self.task_runtime.start().await {
+            drop(task_runtime_stage);
+            failed = true;
             error!(error = %format!("{error:#}"), "failed to start task runtime");
+        } else {
+            task_runtime_stage.succeed();
         }
+
+        let task_events_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ResilienceTaskEventListenerStart);
         self.start_task_event_listener().await;
+        task_events_stage.succeed();
+
+        let hook_recovery_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ResilienceHookRecoveryStart);
         self.start_hook_recovery_worker().await;
+        hook_recovery_stage.succeed();
+
+        if failed {
+            trace.finish_failure();
+        } else {
+            trace.finish_success();
+        }
+    }
+
+    pub async fn start_resilience_workers(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.authorization_invalidation_hub
+            .current_generation()
+            .await
+            .context("Gateway startup requires durable authorization policy generation")?;
+        let processor = Arc::downgrade(self);
+        self.recovery_coordinator
+            .set_listener_starter(Arc::new(move |thread_id| {
+                let processor = processor.clone();
+                Box::pin(async move {
+                    let processor = processor.upgrade().ok_or_else(|| {
+                        "message processor stopped before recovery listener startup".to_owned()
+                    })?;
+                    processor
+                        .ensure_agent_listener_task(thread_id.as_str())
+                        .await
+                        .map_err(|error| format!("{error:#}"))
+                })
+            }))
+            .await;
         let mut guard = self.resilience_worker.lock().await;
         if guard.is_some() {
-            return;
+            return Ok(());
         }
 
         let processor = Arc::downgrade(self);
         let handle = tokio::spawn(async move {
+            let Some(this) = processor.upgrade() else {
+                return;
+            };
+            this.initialize_resilience_workers().await;
+            drop(this);
+
             struct IsolatedWorkerGuard(Vec<JoinHandle<()>>);
 
             impl Drop for IsolatedWorkerGuard {
@@ -2175,6 +2231,7 @@ impl MessageProcessor {
         });
 
         *guard = Some(handle);
+        Ok(())
     }
 
     async fn update_cli_runtime_command_item_registry(

@@ -249,6 +249,8 @@ impl PioneerDesktop {
 
         self.startup
             .begin(pioneer_observability::DesktopStartupStage::ThreadTreeLoad);
+        self.startup
+            .begin(pioneer_observability::DesktopStartupStage::ThreadTreeRequest);
         self.thread_list_loading = true;
         let ws_sender = self.gateway.ws_command_sender.clone();
 
@@ -288,6 +290,12 @@ impl PioneerDesktop {
 
                     match result {
                         Ok(response) => {
+                            view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::ThreadTreeRequest,
+                            );
+                            view.startup.begin(
+                                pioneer_observability::DesktopStartupStage::ThreadTreeResponseApply,
+                            );
                             let active_thread_id =
                                 view.current_active_thread_id().map(str::to_owned);
                             let active_thread_workspace_id = active_thread_id
@@ -329,6 +337,9 @@ impl PioneerDesktop {
                                 pioneer_observability::DesktopStartupStage::ActiveThreadResolve,
                             );
                             view.startup.succeed(
+                                pioneer_observability::DesktopStartupStage::ThreadTreeResponseApply,
+                            );
+                            view.startup.succeed(
                                 pioneer_observability::DesktopStartupStage::ThreadTreeLoad,
                             );
                             if let Some(thread_id) =
@@ -347,6 +358,9 @@ impl PioneerDesktop {
                             }
                         }
                         Err(error) => {
+                            view.startup.fail(
+                                pioneer_observability::DesktopStartupStage::ThreadTreeRequest,
+                            );
                             warn!(
                                 error = %format!("{error:#}"),
                                 "failed to refresh thread tree"

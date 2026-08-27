@@ -281,18 +281,10 @@ impl SelfImprovementSupervisor {
         }
     }
 
-    /// Reconciles the durable enabled state before exposing the supervisor to
-    /// turns, then starts exactly one tracked task.
+    /// Registers exactly one tracked worker and returns without waiting for
+    /// the durable initial reconciliation. The worker owns that reconciliation
+    /// and records it as a background Gateway operation.
     pub(crate) async fn start(self: &Arc<Self>) -> Result<()> {
-        {
-            // The listener may already be reachable while Gateway finishes
-            // startup. Serialize startup reconciliation with both live
-            // Settings updates and new-turn overlay materialization so a
-            // stale startup snapshot cannot overwrite a newer desired state.
-            let _transition = self.transition_gate.write().await;
-            self.reconcile_all(Utc::now().timestamp()).await?;
-        }
-
         let mut task = self.task.lock().await;
         if task.is_some() {
             bail!("self-improvement supervisor is already started");
@@ -315,15 +307,29 @@ impl SelfImprovementSupervisor {
     }
 
     async fn run(self: Arc<Self>) {
-        loop {
-            if let Err(error) = self.wake_once(Utc::now().timestamp()).await {
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::SelfImprovementInitialize,
+        );
+        let stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::SelfImprovementInitialWake);
+        match self.wake_once(Utc::now().timestamp()).await {
+            Ok(()) => {
+                stage.succeed();
+                trace.finish_success();
+            }
+            Err(error) => {
+                drop(stage);
+                trace.finish_failure();
                 let failure = classify_execution_failure(&error);
                 error!(
                     error_class = failure.error_class,
                     reason_code = failure.reason_code,
-                    "self-improvement supervisor wake failed"
+                    "self-improvement supervisor initial wake failed"
                 );
             }
+        }
+
+        loop {
             let now = Utc::now();
             let retry_at_unix = match self.store.get_next_self_improvement_retry_at().await {
                 Ok(retry_at) => retry_at,
@@ -343,6 +349,14 @@ impl SelfImprovementSupervisor {
                 () = self.cancellation.cancelled() => return,
                 () = self.wake.notified() => {},
                 () = &mut timer => {},
+            }
+            if let Err(error) = self.wake_once(Utc::now().timestamp()).await {
+                let failure = classify_execution_failure(&error);
+                error!(
+                    error_class = failure.error_class,
+                    reason_code = failure.reason_code,
+                    "self-improvement supervisor wake failed"
+                );
             }
         }
     }
@@ -5174,7 +5188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_reconciliation_uses_the_live_settings_transition_gate() {
+    async fn background_startup_reconciliation_uses_the_live_settings_transition_gate() {
         let (_database, store, workspace_manager) = test_store().await;
         let provider = Arc::new(ScriptedLearningProvider::new());
         let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
@@ -5187,11 +5201,10 @@ mod tests {
         ));
 
         let overlay_transition = supervisor.transition_gate.read().await;
-        let mut startup = Box::pin(supervisor.start());
-        assert!(
-            timeout(Duration::from_secs(1), &mut startup).await.is_err(),
-            "startup must remain blocked while a new-turn transition is active"
-        );
+        timeout(Duration::from_secs(1), supervisor.start())
+            .await
+            .expect("worker registration must not wait for reconciliation")
+            .expect("self-improvement worker must start");
         assert!(
             store
                 .get_self_improvement_workspace_state(WORKSPACE)
@@ -5202,17 +5215,21 @@ mod tests {
         );
 
         drop(overlay_transition);
-        timeout(Duration::from_secs(5), startup)
-            .await
-            .expect("startup must resume after the transition finishes")
-            .expect("startup reconciliation must succeed");
-        assert!(
-            store
-                .get_self_improvement_workspace_state(WORKSPACE)
-                .await
-                .expect("reconciled workspace state query must succeed")
-                .is_some()
-        );
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .expect("workspace state query must succeed")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background reconciliation must resume after the transition finishes");
         supervisor.shutdown().await;
     }
 

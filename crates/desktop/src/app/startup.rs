@@ -17,6 +17,9 @@ pub(super) struct DesktopStartupCoordinator {
     active: HashMap<DesktopStartupStage, DesktopStartupStageGuard>,
     completed: HashSet<DesktopStartupStage>,
     failed: HashSet<DesktopStartupStage>,
+    gateway_session_attempt: Option<DesktopStartupStageGuard>,
+    gateway_session_backoff: Option<DesktopStartupStageGuard>,
+    gateway_session_identity_verify: Option<DesktopStartupStageGuard>,
     frame_scheduled: bool,
     finalized: bool,
 }
@@ -28,9 +31,16 @@ impl DesktopStartupCoordinator {
             active: HashMap::new(),
             completed: HashSet::new(),
             failed: HashSet::new(),
+            gateway_session_attempt: None,
+            gateway_session_backoff: None,
+            gateway_session_identity_verify: None,
             frame_scheduled: false,
             finalized: false,
         }
+    }
+
+    pub(super) fn diagnostic_trace(&self) -> DesktopStartupTrace {
+        self.trace.clone()
     }
 
     pub(super) fn begin(&mut self, stage: DesktopStartupStage) {
@@ -92,6 +102,92 @@ impl DesktopStartupCoordinator {
         for (stage, guard) in active {
             guard.cancel();
             self.completed.insert(stage);
+        }
+        self.cancel_gateway_session_diagnostics();
+    }
+
+    fn tracks_gateway_session_startup(&self) -> bool {
+        !self.finalized
+            && self
+                .active
+                .contains_key(&DesktopStartupStage::GatewaySessionConnect)
+    }
+
+    pub(super) fn gateway_session_attempt_started(&mut self) {
+        if !self.tracks_gateway_session_startup() {
+            return;
+        }
+        if let Some(backoff) = self.gateway_session_backoff.take() {
+            backoff.succeed();
+        }
+        if self.gateway_session_attempt.is_none() {
+            self.gateway_session_attempt =
+                Some(self.trace.stage(DesktopStartupStage::GatewaySessionAttempt));
+        }
+    }
+
+    pub(super) fn gateway_session_retry_scheduled(&mut self) {
+        if !self.tracks_gateway_session_startup() {
+            return;
+        }
+        // A retry event means the preceding attempt failed. Dropping the
+        // guard deliberately records an error child span while the aggregate
+        // session stage remains active and can still complete successfully.
+        drop(self.gateway_session_attempt.take());
+        if self.gateway_session_backoff.is_none() {
+            self.gateway_session_backoff =
+                Some(self.trace.stage(DesktopStartupStage::GatewaySessionBackoff));
+        }
+    }
+
+    pub(super) fn gateway_session_transport_connected(&mut self) {
+        if !self.tracks_gateway_session_startup() {
+            return;
+        }
+        if let Some(backoff) = self.gateway_session_backoff.take() {
+            backoff.succeed();
+        }
+        if let Some(attempt) = self.gateway_session_attempt.take() {
+            attempt.succeed();
+        }
+        if self.gateway_session_identity_verify.is_none() {
+            self.gateway_session_identity_verify = Some(
+                self.trace
+                    .stage(DesktopStartupStage::GatewaySessionIdentityVerify),
+            );
+        }
+    }
+
+    pub(super) fn gateway_session_transport_failed(&mut self) {
+        if !self.tracks_gateway_session_startup() {
+            return;
+        }
+        drop(self.gateway_session_attempt.take());
+        if let Some(backoff) = self.gateway_session_backoff.take() {
+            backoff.cancel();
+        }
+        drop(self.gateway_session_identity_verify.take());
+    }
+
+    pub(super) fn gateway_session_identity_verified(&mut self) {
+        if let Some(stage) = self.gateway_session_identity_verify.take() {
+            stage.succeed();
+        }
+    }
+
+    pub(super) fn gateway_session_identity_failed(&mut self) {
+        drop(self.gateway_session_identity_verify.take());
+    }
+
+    fn cancel_gateway_session_diagnostics(&mut self) {
+        if let Some(stage) = self.gateway_session_attempt.take() {
+            stage.cancel();
+        }
+        if let Some(stage) = self.gateway_session_backoff.take() {
+            stage.cancel();
+        }
+        if let Some(stage) = self.gateway_session_identity_verify.take() {
+            stage.cancel();
         }
     }
 
@@ -284,5 +380,42 @@ mod tests {
                 .failed
                 .contains(&DesktopStartupStage::GatewaySessionConnect)
         );
+    }
+
+    #[test]
+    fn gateway_session_diagnostics_follow_attempt_backoff_and_identity_phases() {
+        let mut startup = DesktopStartupCoordinator::new(DesktopStartupTrace::start());
+        startup.begin(DesktopStartupStage::GatewaySessionConnect);
+
+        startup.gateway_session_attempt_started();
+        assert!(startup.gateway_session_attempt.is_some());
+
+        startup.gateway_session_retry_scheduled();
+        assert!(startup.gateway_session_attempt.is_none());
+        assert!(startup.gateway_session_backoff.is_some());
+
+        startup.gateway_session_attempt_started();
+        assert!(startup.gateway_session_backoff.is_none());
+        assert!(startup.gateway_session_attempt.is_some());
+
+        startup.gateway_session_transport_connected();
+        assert!(startup.gateway_session_attempt.is_none());
+        assert!(startup.gateway_session_identity_verify.is_some());
+
+        startup.gateway_session_identity_verified();
+        assert!(startup.gateway_session_identity_verify.is_none());
+    }
+
+    #[test]
+    fn cancelling_startup_clears_gateway_session_diagnostics() {
+        let mut startup = DesktopStartupCoordinator::new(DesktopStartupTrace::start());
+        startup.begin(DesktopStartupStage::GatewaySessionConnect);
+        startup.gateway_session_attempt_started();
+
+        startup.cancel_active_stages();
+
+        assert!(startup.gateway_session_attempt.is_none());
+        assert!(startup.gateway_session_backoff.is_none());
+        assert!(startup.gateway_session_identity_verify.is_none());
     }
 }

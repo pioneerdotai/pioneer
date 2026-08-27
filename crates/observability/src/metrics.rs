@@ -79,6 +79,9 @@ pub(crate) struct GatewayMetrics {
     pub(crate) provider_warmup_stage_duration: Histogram<f64>,
     pub(crate) provider_warmup_failures: Counter<u64>,
     pub(crate) provider_readiness_checks: Counter<u64>,
+    pub(crate) gateway_operation_duration: Histogram<f64>,
+    pub(crate) gateway_operation_stage_duration: Histogram<f64>,
+    pub(crate) gateway_operation_failures: Counter<u64>,
     pub(crate) patch_operations: Counter<u64>,
     pub(crate) patch_operation_duration: Histogram<f64>,
     pub(crate) patch_committed_files: Counter<u64>,
@@ -136,6 +139,23 @@ impl GatewayMetrics {
             )
             .with_unit("{check}")
             .build();
+        let gateway_operation_duration = meter
+            .f64_histogram("pioneer.gateway.operation.duration")
+            .with_description("End-to-end duration of a bounded Gateway operation")
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let gateway_operation_stage_duration = meter
+            .f64_histogram("pioneer.gateway.operation.stage.duration")
+            .with_description("Duration of a stable stage within a bounded Gateway operation")
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let gateway_operation_failures = meter
+            .u64_counter("pioneer.gateway.operation.failures")
+            .with_description("Number of failed bounded Gateway operations")
+            .with_unit("{failure}")
+            .build();
         let patch_operations = meter
             .u64_counter("pioneer.patch.operations")
             .with_description(
@@ -181,6 +201,9 @@ impl GatewayMetrics {
             provider_warmup_stage_duration,
             provider_warmup_failures,
             provider_readiness_checks,
+            gateway_operation_duration,
+            gateway_operation_stage_duration,
+            gateway_operation_failures,
             patch_operations,
             patch_operation_duration,
             patch_committed_files,
