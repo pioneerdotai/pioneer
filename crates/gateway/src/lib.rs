@@ -131,6 +131,21 @@ pub use crate::settings::{
 };
 
 const HOME_DIRECTORY_TOKEN: &str = "{homeDirectory}";
+const GATEWAY_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Builds the multi-thread runtime used by every Gateway executable.
+///
+/// The Gateway composes several legitimate, non-recursive async state machines
+/// (authorization, persistence, projection, and SQL execution). Their combined
+/// poll stack can exceed Tokio's 2 MiB default in debug builds, so the runtime
+/// uses a bounded 8 MiB worker stack. Keeping this policy here prevents the
+/// standalone and service entry points from drifting apart.
+pub fn build_gateway_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(GATEWAY_WORKER_STACK_SIZE)
+        .build()
+}
 
 fn create_voice_input_supervisor(
     installer: Arc<dyn VoiceModelInstaller>,

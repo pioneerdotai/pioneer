@@ -11,9 +11,7 @@ fn main() -> anyhow::Result<()> {
     pioneer_observability::init_tracing(sentry_guard.is_some());
 
     let runtime_stage = startup.stage(pioneer_observability::GatewayStartupStage::RuntimeBuild);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
+    let runtime = pioneer_gateway::build_gateway_runtime()
         .context("failed to build gateway Tokio runtime")?;
     runtime_stage.succeed();
 
