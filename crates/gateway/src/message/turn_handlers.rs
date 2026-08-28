@@ -490,25 +490,36 @@ async fn persist_admitted_turn_start(
         params.execution_backend.as_ref(),
         materialization,
     )?;
-    crud_store
-        .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
-            &materialization.thread,
-            materialization.sandbox_mode,
-            &materialization.turn,
-            &materialization.input,
-            reasoning_effort,
-            actor,
-            audit_event,
-            authority_envelope_json.as_str(),
-            runtime_draft,
-            Some(admission),
-            Some(execution),
-            execution_security_snapshot,
-            security_audit_events,
-            execution_graph,
-            agent_turn_response,
-        )
-        .await
+    // The admitted Turn and its execution graph form one durable transaction,
+    // but the transaction does not need to inherit the RPC dispatch poll stack.
+    // Own its inputs and poll the complete commit from a fresh runtime task.
+    let crud_store = crud_store.clone();
+    let materialization = materialization.clone();
+    let reasoning_effort = reasoning_effort.map(str::to_owned);
+    let execution_security_snapshot = execution_security_snapshot.clone();
+    message_fresh_task(async move {
+        crud_store
+            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                &materialization.thread,
+                materialization.sandbox_mode,
+                &materialization.turn,
+                &materialization.input,
+                reasoning_effort.as_deref(),
+                actor,
+                audit_event,
+                authority_envelope_json.as_str(),
+                runtime_draft,
+                Some(admission),
+                Some(execution),
+                &execution_security_snapshot,
+                security_audit_events,
+                execution_graph,
+                agent_turn_response,
+            )
+            .await
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("admitted turn/start persistence task failed: {error}"))?
 }
 
 pub(super) fn new_turn_execution(

@@ -4,14 +4,6 @@
 //! providers continue through `pioneer-agent`, while local `CLIAgentRuntime`
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
-/// Native stack reserved for each Gateway Tokio worker.
-///
-/// Gateway message and Task workflows compose large generated async poll
-/// frames. Keep the production runtime aligned with the stack contract used by
-/// the Gateway message-test runtime instead of relying on Tokio's smaller
-/// platform default.
-pub const GATEWAY_WORKER_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
-
 mod administrative_audit;
 mod artifact_delivery;
 mod artifact_prompt_refs;

@@ -12,7 +12,6 @@ fn main() -> anyhow::Result<()> {
 
     let runtime_stage = startup.stage(pioneer_observability::GatewayStartupStage::RuntimeBuild);
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .thread_stack_size(pioneer_gateway::GATEWAY_WORKER_STACK_SIZE_BYTES)
         .enable_all()
         .build()
         .context("failed to build gateway Tokio runtime")?;

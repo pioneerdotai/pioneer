@@ -1724,7 +1724,6 @@ where
 {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
@@ -8879,16 +8878,21 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         Some(true),
         "self-improvement source regression requires an explicitly workspace-visible root"
     );
+    let connection_context = processor
+        .session_manager
+        .connection_context(connection_id)
+        .await
+        .expect("test connection must keep its authenticated context");
 
     for (turn_id, command) in [
         ("turn_concurrent_task_a", "ASYNC_TASK_A"),
         ("turn_concurrent_task_b", "ASYNC_TASK_B"),
     ] {
         let request_id = generate_test_request_id("frozen", turn_id);
-        processor
-            .process_request_for_connection(
-                connection_id,
-                &json!({
+        Arc::clone(&processor)
+            .process_owned_request(
+                connection_context.clone(),
+                json!({
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "method": "turn/start",
@@ -10655,18 +10659,23 @@ fn test_gateway_voice_supervisor() -> Arc<crate::voice::supervisor::VoiceInputSu
 }
 
 async fn submit_test_voice_turn(
-    processor: &MessageProcessor,
+    processor: &Arc<MessageProcessor>,
     connection_id: ConnectionId,
     rx: &mut mpsc::Receiver<Message>,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
 ) -> VoiceSessionResultNotification {
+    let connection_context = processor
+        .session_manager
+        .connection_context(connection_id)
+        .await
+        .expect("test voice connection must keep its authenticated context");
     let start_request_id = generate_test_request_id("voice_policy", turn_id);
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
+    Arc::clone(processor)
+        .process_owned_request(
+            connection_context.clone(),
+            json!({
                 "jsonrpc": "2.0",
                 "id": start_request_id,
                 "method": "voice/session/start",
@@ -10701,10 +10710,10 @@ async fn submit_test_voice_turn(
     let _ = recv_notification_by_method(rx, events::VOICE_CHUNK_ACK).await;
 
     let finalize_request_id = generate_test_request_id("voice_policy_finalize", turn_id);
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
+    Arc::clone(processor)
+        .process_owned_request(
+            connection_context,
+            json!({
                 "jsonrpc": "2.0",
                 "id": finalize_request_id,
                 "method": "voice/session/finalize",
@@ -10737,18 +10746,20 @@ async fn first_voice_turn_materializes_runtime_draft() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let processor = MessageProcessor::new(
-        thread_manager,
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor("first voice message"));
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_voice_input_supervisor(ready_gateway_voice_supervisor("first voice message")),
+    );
     let thread_id = "thr_first_voice_runtime_draft";
     let turn_id = "turn_first_voice_runtime_draft";
 
@@ -10827,21 +10838,23 @@ async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CaptureSummaryProvider::new("voice replay answer"));
-    let processor = MessageProcessor::new(
-        thread_manager.clone(),
-        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "openai",
-            provider.clone(),
-        )),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor("same durable voice request"));
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager.clone(),
+            Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                "openai",
+                provider.clone(),
+            )),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_voice_input_supervisor(ready_gateway_voice_supervisor("same durable voice request")),
+    );
     let thread_id = "thr_voice_admission_replay";
     let turn_id = "turn_voice_admission_replay";
     let started = thread_manager
@@ -10935,23 +10948,25 @@ async fn collaborative_voice_composer_admits_detached_task() {
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CaptureSummaryProvider::new("must run in child"));
-    let processor = MessageProcessor::new(
-        thread_manager.clone(),
-        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "openai",
-            provider.clone(),
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager.clone(),
+            Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                "openai",
+                provider.clone(),
+            )),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_voice_input_supervisor(ready_gateway_voice_supervisor(
+            "run this voice command asynchronously",
         )),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor(
-        "run this voice command asynchronously",
-    ));
+    );
     let parent_thread_id = "thr_voice_collaborative";
     let started = thread_manager
         .thread_start_seeded(
@@ -11036,21 +11051,23 @@ async fn task_run_voice_composer_stays_foreground() {
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider = Arc::new(CaptureSummaryProvider::new("foreground child result"));
-    let processor = MessageProcessor::new(
-        thread_manager.clone(),
-        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "openai",
-            provider.clone(),
-        )),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child"));
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager.clone(),
+            Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                "openai",
+                provider.clone(),
+            )),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child")),
+    );
     let root_thread_id = "thr_voice_task_root";
     let root_turn_id = "turn_voice_task_root";
     ensure_test_superuser_execution_turn(
@@ -16989,6 +17006,18 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
     );
 }
 
+async fn dispatch_revision_turn_for_test(
+    processor: &Arc<MessageProcessor>,
+    response: TaskReviseResponse,
+) -> anyhow::Result<TaskReviseResponse> {
+    let executor = Arc::clone(&processor.task_agent_executor);
+    crate::message::message_fresh_task(
+        async move { executor.dispatch_revision_turn(response).await },
+    )
+    .await
+    .context("test task revision dispatch task did not finish")?
+}
+
 #[test]
 fn task_revise_dispatch_failure_blocks_revision_turn_and_run() {
     run_standard_stack_message_test(
@@ -17073,9 +17102,7 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
         .expect("test should delete child thread to force dispatch failure");
     assert_eq!(deleted.rows_affected, 1);
 
-    processor
-        .task_agent_executor
-        .dispatch_revision_turn(revised.clone())
+    dispatch_revision_turn_for_test(&processor, revised.clone())
         .await
         .expect("dispatch failure should be converted into blocked task recovery");
 
@@ -17223,9 +17250,7 @@ async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
         .await
         .expect("revise should reserve revision turn");
 
-    let dispatched = processor
-        .task_agent_executor
-        .dispatch_revision_turn(revised)
+    let dispatched = dispatch_revision_turn_for_test(&processor, revised)
         .await
         .expect("revision dispatch should start");
     assert_eq!(
@@ -17236,9 +17261,7 @@ async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
     provider.wait_for_revision_call().await;
     assert_eq!(provider.revision_call_count(), 1);
 
-    let recovered = processor
-        .task_agent_executor
-        .dispatch_revision_turn(dispatched.clone())
+    let recovered = dispatch_revision_turn_for_test(&processor, dispatched.clone())
         .await
         .expect("restart recovery should reuse existing turn");
     sleep(Duration::from_millis(50)).await;
@@ -20319,10 +20342,15 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
         cli_session
             .set_next_native_turn_id(format!("native_dynamic_turn_{runtime_id}"))
             .await;
-        processor
-            .process_request_for_connection(
-                connection_id,
-                &json!({
+        let connection_context = processor
+            .session_manager
+            .connection_context(connection_id)
+            .await
+            .expect("test connection must keep its authenticated context");
+        Arc::clone(&processor)
+            .process_owned_request(
+                connection_context,
+                json!({
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "method": "turn/start",
@@ -31764,11 +31792,16 @@ async fn run_vertical_collaborative_source_exchange(
     expected_previous_sources: usize,
 ) -> pioneer_crud::SelfImprovementSourceTurnRecord {
     let request_id = generate_test_request_id("verticalsource", parent_turn_id);
-    harness
+    let connection_context = harness
         .processor
-        .process_request_for_connection(
-            harness.connection_id,
-            &json!({
+        .session_manager
+        .connection_context(harness.connection_id)
+        .await
+        .expect("vertical E2E connection must keep its authenticated context");
+    Arc::clone(&harness.processor)
+        .process_owned_request(
+            connection_context.clone(),
+            json!({
                 "jsonrpc": "2.0",
                 "id": request_id.clone(),
                 "method": "turn/start",
@@ -31878,11 +31911,16 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
         .insert("learning", learning_provider.clone());
 
     let enable_id = generate_test_request_id("vertical", "enable");
-    harness
+    let connection_context = harness
         .processor
-        .process_request_for_connection(
-            harness.connection_id,
-            &json!({
+        .session_manager
+        .connection_context(harness.connection_id)
+        .await
+        .expect("vertical E2E connection must keep its authenticated context");
+    Arc::clone(&harness.processor)
+        .process_owned_request(
+            connection_context.clone(),
+            json!({
                 "jsonrpc": "2.0",
                 "id": enable_id.clone(),
                 "method": "settings/update",
@@ -31941,11 +31979,10 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
         .insert("vertical-sibling", sibling_provider.clone());
     let sibling_turn_id = "turn_agent_skill_unfinished_sibling";
     let sibling_request_id = generate_test_request_id("vertical", "unfinished-sibling");
-    harness
-        .processor
-        .process_request_for_connection(
-            harness.connection_id,
-            &json!({
+    Arc::clone(&harness.processor)
+        .process_owned_request(
+            connection_context.clone(),
+            json!({
                 "jsonrpc": "2.0",
                 "id": sibling_request_id.clone(),
                 "method": "turn/start",
@@ -32230,11 +32267,10 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
     )
     .await;
     let native_request_id = generate_test_request_id("vertical", "native");
-    harness
-        .processor
-        .process_request_for_connection(
-            harness.connection_id,
-            &json!({
+    Arc::clone(&harness.processor)
+        .process_owned_request(
+            connection_context.clone(),
+            json!({
                 "jsonrpc": "2.0",
                 "id": native_request_id.clone(),
                 "method": "turn/start",
@@ -32506,11 +32542,10 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
             ),
             cli_runtime_options: None,
         };
-        harness
-            .processor
-            .process_request_for_connection(
-                harness.connection_id,
-                &json!({
+        Arc::clone(&harness.processor)
+            .process_owned_request(
+                connection_context.clone(),
+                json!({
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "method": "turn/start",
@@ -33900,6 +33935,69 @@ async fn start_loaded_thread_and_turn_for_cli_runtime_test(
         recv_response_and_notification_by_id_method(rx, turn_start_id, events::TURN_STARTED).await;
 }
 
+async fn start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
+    processor: &Arc<MessageProcessor>,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let thread_start_id = "cliruntestthread00001";
+    let thread_start_payload = json!({
+        "jsonrpc": "2.0",
+        "id": thread_start_id,
+        "method": "thread/start",
+        "params": {
+            "thread_id": thread_id,
+            "workspace_id": workspace_id,
+            "name": "Codex steer"
+        }
+    })
+    .to_string();
+    Arc::clone(processor)
+        .process_owned_request(
+            processor
+                .session_manager
+                .connection_context(connection_id)
+                .await
+                .expect("test connection must be registered with a principal"),
+            thread_start_payload,
+        )
+        .await;
+    let _thread_response = recv_response_by_id(rx, thread_start_id).await;
+    let _thread_started = recv_notification_by_method(rx, events::THREAD_STARTED).await;
+
+    let turn_start_id = "cliruntestturn0000001";
+    let turn_start_payload = json!({
+        "jsonrpc": "2.0",
+        "id": turn_start_id,
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "mode": "Agent",
+            "input": [{
+                "type": "text",
+                "text": "start"
+            }]
+        }
+    })
+    .to_string();
+    Arc::clone(processor)
+        .process_owned_request(
+            processor
+                .session_manager
+                .connection_context(connection_id)
+                .await
+                .expect("test connection must be registered with a principal"),
+            turn_start_payload,
+        )
+        .await;
+    let _ =
+        recv_response_and_notification_by_id_method(rx, turn_start_id, events::TURN_STARTED).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
     let (tx, mut rx) = mpsc::channel(32);
@@ -34248,20 +34346,22 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
     ));
     let cli_session = Arc::new(RecordingCliRuntimeSession::default());
     let cli_manager = test_cli_runtime_manager(cli_session.clone());
-    let processor = MessageProcessor::new(
-        thread_manager,
-        provider_registry,
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
-    start_loaded_thread_and_turn_for_cli_runtime_test(
+    start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
         &processor,
         connection_id,
         &mut rx,
@@ -35368,25 +35468,27 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
             text: "late".to_owned(),
         }),
     ));
-    let processor = MessageProcessor::new(
-        thread_manager,
-        provider_registry,
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    )
-    .with_cli_runtime_manager_for_tests(cli_manager.clone());
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
     let thread_id = "thread_codex_goal_segments";
     let turn_id = "turn_codex_goal_segments";
     let native_thread_id = "native_thread_codex_goal_segments";
     let submission_id = "native_submission_codex_goal_segments";
     let first_segment_id = "native_turn_codex_goal_segment_1";
     let second_segment_id = "native_turn_codex_goal_segment_2";
-    start_loaded_thread_and_turn_for_cli_runtime_test(
+    start_loaded_thread_and_turn_for_cli_runtime_test_on_fresh_tasks(
         &processor,
         connection_id,
         &mut rx,
@@ -36267,7 +36369,6 @@ fn run_interrupted_cli_runtime_turn_recovery_test(
 ) {
     let thread = std::thread::Builder::new()
         .name(name.to_owned())
-        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -44881,7 +44982,6 @@ where
 {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_stack_size(8 * 1024 * 1024)
         .thread_name(name)
         .enable_all()
         .build()

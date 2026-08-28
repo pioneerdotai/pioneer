@@ -246,6 +246,28 @@ fn vector_provider_key_name(
 }
 
 impl MessageProcessor {
+    /// Process one owned RPC request from a fresh Tokio task.
+    ///
+    /// Connection readers await this method, so requests remain ordered. The
+    /// task boundary prevents a handler's generated poll stack from inheriting
+    /// the WebSocket reader or another orchestration future, and aborts the
+    /// handler if the awaiting connection workflow is cancelled.
+    pub(crate) async fn process_owned_request(
+        self: Arc<Self>,
+        connection: crate::request_context::ConnectionContext,
+        payload: String,
+    ) {
+        match message_fresh_task(async move {
+            self.process_request(&connection, payload.as_str()).await;
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => warn!(error = %error, "RPC request task did not finish"),
+        }
+    }
+
     pub fn process_request<'a>(
         &'a self,
         connection: &'a crate::request_context::ConnectionContext,
@@ -350,10 +372,12 @@ impl MessageProcessor {
                 }
             };
 
-            // turn/start already exposes its handler future directly, so keep its parsing path
-            // separate from the large dispatch match after central admission.
+            // Large start workflows expose dedicated erased futures so constructing them does
+            // not share one native stack frame with every branch in the dispatch match.
             let handler = if request.method == methods::TURN_START {
                 self.dispatch_turn_start(context, request, admission)
+            } else if request.method == methods::THREAD_START {
+                self.dispatch_thread_start(context, request, admission)
             } else if request.method == methods::SETTINGS_UPDATE {
                 self.dispatch_settings_update(context, request)
             } else {
@@ -3298,6 +3322,45 @@ impl MessageProcessor {
         })
     }
 
+    fn dispatch_thread_start<'a>(
+        &'a self,
+        context: crate::request_context::RequestContext,
+        request: JsonRpcRequest,
+        admission: RequestAdmission,
+    ) -> MessageFuture<'a, ()> {
+        let connection_id = context.connection_id();
+        let params_value = request.params.unwrap_or_else(empty_object_value);
+        match serde_json::from_value::<ThreadStartParams>(params_value) {
+            Ok(params) => message_future(async move {
+                if let Some(proof) = admission.thread_create() {
+                    self.thread_create_and_start(&context, proof, request.id, params)
+                        .await;
+                } else {
+                    self.thread_open(
+                        &context,
+                        admission
+                            .thread_open()
+                            .expect("central admission supplies exact thread proof"),
+                        request.id,
+                        params,
+                    )
+                    .await;
+                }
+            }),
+            Err(error) => message_future(async move {
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(
+                        Some(request.id),
+                        INVALID_PARAMS_CODE,
+                        format!("invalid params for `{}`: {error}", methods::THREAD_START),
+                    ),
+                )
+                .await;
+            }),
+        }
+    }
+
     fn process_request_inner<'a>(
         &'a self,
         context: crate::request_context::RequestContext,
@@ -4237,46 +4300,6 @@ impl MessageProcessor {
                         request.params,
                     )
                     .await;
-                }
-                methods::THREAD_START => {
-                    let params_value = request.params.unwrap_or_else(empty_object_value);
-                    match serde_json::from_value::<ThreadStartParams>(params_value) {
-                        Ok(params) => {
-                            if let Some(proof) = admission.thread_create() {
-                                self.thread_create_and_start(
-                                    &context,
-                                    proof,
-                                    request.id,
-                                    params,
-                                )
-                                .await;
-                            } else {
-                                self.thread_open(
-                                    &context,
-                                    admission
-                                        .thread_open()
-                                        .expect("central admission supplies exact thread proof"),
-                                    request.id,
-                                    params,
-                                )
-                                .await;
-                            }
-                        }
-                        Err(error) => {
-                            self.send_error(
-                                connection_id,
-                                JsonRpcErrorResponse::new(
-                                    Some(request.id),
-                                    INVALID_PARAMS_CODE,
-                                    format!(
-                                        "invalid params for `{}`: {error}",
-                                        methods::THREAD_START
-                                    ),
-                                ),
-                            )
-                            .await;
-                        }
-                    }
                 }
                 methods::THREAD_TREE => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);

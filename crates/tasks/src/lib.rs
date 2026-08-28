@@ -12,6 +12,7 @@ mod reconciliation;
 mod review;
 mod scheduler;
 mod service;
+mod task_boundary;
 mod trigger;
 mod wait;
 

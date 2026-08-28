@@ -3,6 +3,7 @@ use crate::event_bus::TaskEventBus;
 use crate::executor::{TaskExecutionContext, TaskExecutionHandle, TaskExecutorRegistry};
 use crate::projector::TaskProjector;
 use crate::scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskSchedulerHandle};
+use crate::task_boundary::task_fresh_task;
 use anyhow::Context;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::{
@@ -222,18 +223,26 @@ impl TaskStartupReconciler {
             run.task_id.clone(),
             run.id.clone(),
         );
-        if let Err(error) = executor
-            .recover_run(
-                TaskExecutionContext {
-                    workspace_id: task_response.task.workspace_id,
-                    task_id: run.task_id.clone(),
-                    execution_id: Some(execution.id),
-                    worker_id,
-                },
-                run.clone(),
-                handle,
-            )
-            .await
+        let recovery_context = TaskExecutionContext {
+            workspace_id: task_response.task.workspace_id,
+            task_id: run.task_id.clone(),
+            execution_id: Some(execution.id),
+            worker_id,
+        };
+        let recovery_run = run.clone();
+        // A recovered executor run is an independently owned durable unit of
+        // work. Keep its (potentially deep) implementation out of the startup
+        // reconciler's poll stack while still awaiting it in deterministic
+        // order and cancelling it if reconciliation is cancelled.
+        if let Err(error) = task_fresh_task(
+            async move {
+                executor
+                    .recover_run(recovery_context, recovery_run, handle)
+                    .await
+            },
+            "task executor recovery task did not finish",
+        )
+        .await
         {
             warn!(
                 task_id = %run.task_id,

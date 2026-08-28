@@ -313,7 +313,8 @@ async fn run_normal_connection(
                         break;
                     }
                     let outcome = await_message_processing(
-                        message_processor.process_request(&connection_context, payload.as_ref()),
+                        Arc::clone(&message_processor)
+                            .process_owned_request(connection_context.clone(), payload.to_string()),
                         &mut termination_rx,
                         &mut server_cancellation,
                         &mut access_expired_rx,
@@ -570,6 +571,16 @@ mod tests {
 
     use super::*;
 
+    struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropNotifier {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
     #[test]
     fn access_deadline_uses_exact_expiry_boundary() {
         assert_eq!(
@@ -654,15 +665,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_shutdown_interrupts_in_flight_message_processing() {
+    async fn server_shutdown_aborts_in_flight_owned_message_task() {
         let (_termination_tx, mut termination_rx) = watch::channel(None);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (_expired_tx, mut expired_rx) = watch::channel(false);
         let mut writer_task = tokio::spawn(std::future::pending::<Result<()>>());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
 
-        shutdown_tx.send(true).unwrap();
+        let processing = async move {
+            crate::message::message_fresh_task(async move {
+                let _drop_notifier = DropNotifier(Some(dropped_tx));
+                started_tx.send(()).expect("report message task start");
+                std::future::pending::<()>().await;
+            })
+            .await
+            .expect("owned message task should remain pending until shutdown");
+        };
+        let shutdown_task = tokio::spawn(async move {
+            started_rx.await.expect("observe message task start");
+            shutdown_tx.send(true).expect("signal server shutdown");
+        });
+
         let outcome = await_message_processing(
-            std::future::pending(),
+            processing,
             &mut termination_rx,
             &mut shutdown_rx,
             &mut expired_rx,
@@ -671,6 +697,11 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, MessageProcessingOutcome::ServerShutdown));
+        shutdown_task.await.expect("join shutdown signal task");
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("owned message task should be aborted promptly")
+            .expect("observe owned message future drop");
         writer_task.abort();
         let _ = writer_task.await;
     }

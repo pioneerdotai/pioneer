@@ -2530,7 +2530,7 @@ impl TaskAgentExecutor {
     }
 
     pub(crate) async fn dispatch_revision_turn(
-        &self,
+        self: &Arc<Self>,
         response: TaskReviseResponse,
     ) -> Result<TaskReviseResponse> {
         let processor = self.processor()?;
@@ -2571,16 +2571,64 @@ impl TaskAgentExecutor {
             run.task_id.clone(),
             run.id.clone(),
         );
-        message_future(self.dispatch_existing_revision_turn(
-            &processor,
-            &task_response,
-            &run,
-            &agent_spec,
-            &execution,
-            child_runtime,
-            handle,
-        ))
-        .await?;
+        let authority_processor = Arc::clone(&processor);
+        let authority_task_response = task_response.clone();
+        let root_still_has_authority = message_fresh_task(async move {
+            Self::root_collaboration_still_has_task_authority(
+                &authority_processor,
+                &authority_task_response,
+            )
+            .await
+        })
+        .await
+        .context("task revision authority revalidation task did not finish")??;
+        if !root_still_has_authority {
+            self.block_revision_dispatch_turn(
+                &processor,
+                child_runtime,
+                handle,
+                task_error(
+                    "task_root_access_revoked",
+                    "task continuation was blocked after root-thread access was revoked".to_owned(),
+                    TaskErrorClass::Policy,
+                    Some(run.id.clone()),
+                ),
+            )
+            .await?;
+            return message_future(task_revise_response_from_store(&processor, response)).await;
+        }
+        let lock_processor = Arc::clone(&processor);
+        let lock_task = task_response.task.clone();
+        let lock_run = run.clone();
+        let lock_handle = handle.clone();
+        let lock_outcome = message_fresh_task(async move {
+            Self::acquire_write_locks_owned(lock_processor, lock_task, lock_run, lock_handle).await
+        })
+        .await
+        .context("task revision write-lock phase did not finish")??;
+        match lock_outcome {
+            TaskExecutorStartOutcome::Started => {}
+            TaskExecutorStartOutcome::Queued | TaskExecutorStartOutcome::Rejected => {
+                return message_future(task_revise_response_from_store(&processor, response)).await;
+            }
+        }
+        let revision_executor = Arc::clone(self);
+        let revision_processor = Arc::clone(&processor);
+        message_fresh_task(async move {
+            revision_executor
+                .dispatch_existing_revision_turn(
+                    &revision_processor,
+                    &task_response,
+                    &run,
+                    &agent_spec,
+                    &execution,
+                    child_runtime,
+                    handle,
+                )
+                .await
+        })
+        .await
+        .context("existing task revision turn task did not finish")??;
         message_future(task_revise_response_from_store(&processor, response)).await
     }
 
@@ -2597,27 +2645,6 @@ impl TaskAgentExecutor {
         let task = &task_response.task;
         let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
         let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
-        if !Self::root_collaboration_still_has_task_authority(processor, task_response).await? {
-            self.block_revision_dispatch_turn(
-                processor,
-                child_runtime,
-                handle,
-                task_error(
-                    "task_root_access_revoked",
-                    "task continuation was blocked after root-thread access was revoked".to_owned(),
-                    TaskErrorClass::Policy,
-                    Some(run.id.clone()),
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-        match message_future(self.acquire_write_locks(processor, task, run, handle.clone())).await?
-        {
-            TaskExecutorStartOutcome::Started => {}
-            TaskExecutorStartOutcome::Queued => return Ok(()),
-            TaskExecutorStartOutcome::Rejected => return Ok(()),
-        }
         if let Some((_, turn)) = processor
             .crud_store
             .get_turn(child_thread_id.as_str(), child_turn_id.as_str())
@@ -3172,39 +3199,51 @@ impl TaskAgentExecutor {
                 return Ok(());
             }
         };
-        if let Err(error) = processor
-            .crud_store
-            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
-                &turn_outcome.materialization.thread,
-                turn_outcome.materialization.sandbox_mode,
-                &turn_outcome.materialization.turn,
-                &turn_outcome.materialization.input,
-                turn_settings
-                    .reasoning
-                    .as_ref()
-                    .map(|reasoning| reasoning.effort.as_str()),
-                action_actor,
-                profile_selected_audit,
-                child_authority_json.as_str(),
-                None,
-                Some(child_turn_admission),
-                Some(super::turn_handlers::new_turn_execution(
-                    processor.turn_execution_owner_id.as_ref(),
-                    Some(&turn_settings.execution_backend),
-                    &turn_outcome.materialization,
-                )?),
-                &child_security_snapshot,
-                processor.turn_security_audit_events_for_turn(
-                    task.workspace_id.as_str(),
-                    child_thread_id.as_str(),
-                    child_turn_id.as_str(),
-                    &child_security_snapshot,
-                ),
-                None,
-                Some(turn_response),
-            )
-            .await
-        {
+        let materialization_store = processor.crud_store.clone();
+        let materialization_thread = turn_outcome.materialization.thread.clone();
+        let materialization_sandbox_mode = turn_outcome.materialization.sandbox_mode;
+        let materialization_turn = turn_outcome.materialization.turn.clone();
+        let materialization_input = turn_outcome.materialization.input.clone();
+        let materialization_reasoning_effort = turn_settings
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort.clone());
+        let materialization_execution = super::turn_handlers::new_turn_execution(
+            processor.turn_execution_owner_id.as_ref(),
+            Some(&turn_settings.execution_backend),
+            &turn_outcome.materialization,
+        )?;
+        let materialization_security_snapshot = child_security_snapshot.clone();
+        let materialization_security_audit_events = processor.turn_security_audit_events_for_turn(
+            task.workspace_id.as_str(),
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            &child_security_snapshot,
+        );
+        let materialization_result = message_fresh_task(async move {
+            materialization_store
+                .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                    &materialization_thread,
+                    materialization_sandbox_mode,
+                    &materialization_turn,
+                    &materialization_input,
+                    materialization_reasoning_effort.as_deref(),
+                    action_actor,
+                    profile_selected_audit,
+                    child_authority_json.as_str(),
+                    None,
+                    Some(child_turn_admission),
+                    Some(materialization_execution),
+                    &materialization_security_snapshot,
+                    materialization_security_audit_events,
+                    None,
+                    Some(turn_response),
+                )
+                .await
+        })
+        .await
+        .context("task revision turn materialization task did not finish")?;
+        if let Err(error) = materialization_result {
             processor
                 .thread_manager
                 .rollback_turn_start(turn_outcome.rollback_context)
@@ -4076,6 +4115,22 @@ impl TaskAgentExecutor {
         processor: &Arc<MessageProcessor>,
         task: &Task,
         run: &TaskRun,
+        handle: TaskExecutionHandle,
+    ) -> Result<TaskExecutorStartOutcome> {
+        let processor = Arc::clone(processor);
+        let task = task.clone();
+        let run = run.clone();
+        message_fresh_task(Self::acquire_write_locks_owned(
+            processor, task, run, handle,
+        ))
+        .await
+        .context("task write-lock acquisition task did not finish")?
+    }
+
+    async fn acquire_write_locks_owned(
+        processor: Arc<MessageProcessor>,
+        task: Task,
+        run: TaskRun,
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
         match processor
@@ -5894,6 +5949,20 @@ impl TaskAgentExecutor {
         processor: &Arc<MessageProcessor>,
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
+        error: TaskError,
+    ) -> Result<()> {
+        let processor = Arc::clone(processor);
+        message_fresh_task(async move {
+            Self::block_revision_dispatch_turn_owned(processor, child_runtime, handle, error).await
+        })
+        .await
+        .context("task revision block transition task did not finish")?
+    }
+
+    async fn block_revision_dispatch_turn_owned(
+        processor: Arc<MessageProcessor>,
+        child_runtime: TaskRunChildRuntime,
+        handle: TaskExecutionHandle,
         mut error: TaskError,
     ) -> Result<()> {
         let blocked_at = now_timestamp_secs();
@@ -5909,7 +5978,7 @@ impl TaskAgentExecutor {
             )
             .await?;
         handle.block_run(Some(error), blocked_at).await?;
-        mark_task_run_occurrence_turn_blocked(processor, &child_runtime.lineage, message.as_str())
+        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, message.as_str())
             .await?;
         Ok(())
     }

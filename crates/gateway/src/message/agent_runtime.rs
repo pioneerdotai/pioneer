@@ -2212,15 +2212,30 @@ impl MessageProcessor {
         event_timestamp_secs: i64,
         item_started_deadlines: Option<pioneer_crud::TurnItemAttemptDeadlines>,
     ) -> Result<()> {
-        let result = self
-            .crud_store
-            .materialize_native_agent_turn_event_owned(
-                event,
-                event_timestamp_secs,
-                item_started_deadlines,
-                self.turn_execution_owner_id.as_ref(),
-            )
-            .await;
+        let crud_store = Arc::clone(&self.crud_store);
+        let turn_execution_owner_id = Arc::clone(&self.turn_execution_owner_id);
+        // Projection is one durable transaction, but it is reached from several
+        // already-deep orchestration paths (including terminal recovery).  Keep
+        // it in an awaited, abort-on-drop task so SeaORM does not inherit the
+        // caller's poll stack.  Awaiting preserves event order; cancellation
+        // still rolls back an in-flight transaction.
+        let result = match message_fresh_task(async move {
+            crud_store
+                .materialize_native_agent_turn_event_owned(
+                    event,
+                    event_timestamp_secs,
+                    item_started_deadlines,
+                    turn_execution_owner_id.as_ref(),
+                )
+                .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "native turn event materialization task did not finish: {error}"
+            )),
+        };
         match result {
             Ok(()) => {
                 self.kick_native_turn_event_deliveries();
@@ -6122,18 +6137,42 @@ impl MessageProcessor {
             );
         }
 
-        let task_reconciliation_succeeded = match self
-            .task_agent_executor
-            .reconcile_child_turn_completed(thread_id.as_str(), turn_id.as_str())
+        // Turn completion and Task aggregate reconciliation are separate durable
+        // boundaries. Poll the latter from a fresh runtime task so its CRUD
+        // projection does not inherit the complete native-event listener stack.
+        // Abort-on-drop is safe here: an interrupted reconciliation remains
+        // discoverable by the durable terminal-child reconciler.
+        let task_reconciliation = {
+            let executor = Arc::clone(&self.task_agent_executor);
+            let reconciliation_thread_id = thread_id.clone();
+            let reconciliation_turn_id = turn_id.clone();
+            message_fresh_task(async move {
+                executor
+                    .reconcile_child_turn_completed(
+                        reconciliation_thread_id.as_str(),
+                        reconciliation_turn_id.as_str(),
+                    )
+                    .await
+            })
             .await
-        {
-            Ok(reconciled) => reconciled,
-            Err(error) => {
+        };
+        let task_reconciliation_succeeded = match task_reconciliation {
+            Ok(Ok(reconciled)) => reconciled,
+            Ok(Err(error)) => {
                 warn!(
                     thread_id,
                     turn_id,
                     error = %format!("{error:#}"),
                     "completed child task reconciliation is pending durable retry"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %error,
+                    "completed child task reconciliation task did not finish"
                 );
                 false
             }
