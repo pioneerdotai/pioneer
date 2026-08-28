@@ -76,7 +76,6 @@ mod catalog;
 mod lifecycle;
 mod policy;
 mod storage_relocation;
-mod storage_startup;
 mod upload;
 mod watcher;
 pub(crate) mod workspace;

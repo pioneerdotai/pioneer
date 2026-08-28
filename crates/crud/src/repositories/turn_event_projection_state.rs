@@ -273,16 +273,6 @@ pub async fn find_by_event_id<C: ConnectionTrait>(
         })
 }
 
-pub async fn delete_by_event_id<C: ConnectionTrait>(db: &C, event_id: &str) -> Result<u64> {
-    turn_event_projection_state::Entity::delete_by_id(event_id.to_owned())
-        .exec(db)
-        .await
-        .with_context(|| {
-            format!("failed to delete turn_event_projection_state for event `{event_id}`")
-        })
-        .map(|result| result.rows_affected)
-}
-
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,

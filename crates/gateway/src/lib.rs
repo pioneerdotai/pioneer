@@ -787,12 +787,6 @@ async fn run_gateway_until_shutdown_inner(
     message_processor = message_processor.with_auth_service(auth_service.clone());
     let message_processor = Arc::new(message_processor);
     services_initialize_stage.succeed();
-    let agent_domain_upgrade_stage =
-        startup.stage(pioneer_observability::GatewayStartupStage::AgentDomainUpgrade);
-    database::startup::upgrade_agent_domain_data(message_processor.as_ref())
-        .await
-        .context("failed to complete the blocking Agent domain data upgrade")?;
-    agent_domain_upgrade_stage.succeed();
     let services_prepare_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ServicesPrepare);
     auth_service.set_invitation_accept_post_commit_hook(message_processor.clone());
@@ -966,14 +960,13 @@ async fn run_gateway_until_shutdown_inner(
                     }
                     post_readiness.set_status(GatewayReadinessStatus::Operational);
 
-                    // Phase 2: all legacy maintenance is best-effort and
+                    // Phase 2: post-startup maintenance is best-effort and
                     // cooperative. It runs only after the operational runtime
-                    // exists, one bounded batch at a time, and is the sole
-                    // owner of periodic database maintenance afterwards.
+                    // exists and is the sole owner of periodic database
+                    // maintenance afterwards.
                     let maintenance = tokio::select! {
                         _ = cancellation.cancelled() => return,
                         result = database::startup::run(
-                            post_message_processor.clone(),
                             post_crud_store.clone(),
                             post_thread_episodic_storage_root,
                             startup_thread_episodic_vector_search_config,
@@ -982,7 +975,6 @@ async fn run_gateway_until_shutdown_inner(
                             post_runtime_home,
                             Some(post_message_processor.thread_episodic_vector_refill_status_sender()),
                             post_message_processor.thread_episodic_workspace_refill_supervisor(),
-                            context_compaction_timeout_config,
                             cancellation.clone(),
                         ) => result,
                     };

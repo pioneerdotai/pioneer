@@ -7,8 +7,8 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, JoinType,
-    Order, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, Order, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 
 use crate::convention::{
@@ -60,16 +60,6 @@ pub struct TimedOutAttemptSnapshot {
     pub lease_expires_at: Option<DateTimeWithTimeZone>,
     pub idle_deadline_at: Option<DateTimeWithTimeZone>,
     pub hard_deadline_at: Option<DateTimeWithTimeZone>,
-}
-
-#[derive(Debug, Clone, FromQueryResult)]
-pub struct UnclassifiedAttemptExecutionCandidate {
-    pub attempt_id: String,
-    pub turn_id: String,
-    pub item_id: String,
-    pub item_type: String,
-    pub item_payload: String,
-    pub started_at: DateTimeWithTimeZone,
 }
 
 pub async fn create_running_attempt<C: ConnectionTrait>(
@@ -795,100 +785,6 @@ pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
             })
         })
         .collect()
-}
-
-pub async fn list_unclassified_execution_attempts<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<UnclassifiedAttemptExecutionCandidate>> {
-    turn_item_attempt::Entity::find()
-        .select_only()
-        .column_as(turn_item_attempt::Column::Id, "attempt_id")
-        .column(turn_item_attempt::Column::TurnId)
-        .column(turn_item_attempt::Column::ItemId)
-        .column(turn_item_attempt::Column::ItemType)
-        .column_as(turn_item::Column::Payload, "item_payload")
-        .column(turn_item_attempt::Column::StartedAt)
-        .join(
-            JoinType::InnerJoin,
-            turn_item_attempt::Entity::belongs_to(turn_item::Entity)
-                .from((
-                    turn_item_attempt::Column::TurnId,
-                    turn_item_attempt::Column::ItemId,
-                ))
-                .to((turn_item::Column::TurnId, turn_item::Column::ItemId))
-                .into(),
-        )
-        .filter(turn_item_attempt::Column::ExecutionClass.is_null())
-        .order_by_asc(turn_item_attempt::Column::Id)
-        .limit(std::cmp::max(limit, 1))
-        .into_model::<UnclassifiedAttemptExecutionCandidate>()
-        .all(db)
-        .await
-        .context("failed to list attempts missing an execution class")
-}
-
-pub async fn classify_execution_attempt<C: ConnectionTrait>(
-    db: &C,
-    candidate: &UnclassifiedAttemptExecutionCandidate,
-    execution_class: TurnItemExecutionClass,
-    context_compaction_deadlines: Option<AttemptDeadlines>,
-) -> Result<bool> {
-    let mut update = turn_item_attempt::Entity::update_many().col_expr(
-        turn_item_attempt::Column::ExecutionClass,
-        Expr::value(Some(
-            turn_item_execution_class_to_db(execution_class).to_owned(),
-        )),
-    );
-    if let Some(deadlines) = &context_compaction_deadlines {
-        update = update
-            .col_expr(
-                turn_item_attempt::Column::LeaseExpiresAt,
-                Expr::value(deadlines.lease_expires_at),
-            )
-            .col_expr(
-                turn_item_attempt::Column::IdleDeadlineAt,
-                Expr::value(deadlines.idle_deadline_at),
-            )
-            .col_expr(
-                turn_item_attempt::Column::HardDeadlineAt,
-                Expr::value(deadlines.hard_deadline_at),
-            );
-    }
-    let changed = update
-        .filter(turn_item_attempt::Column::Id.eq(candidate.attempt_id.clone()))
-        .filter(turn_item_attempt::Column::ExecutionClass.is_null())
-        .exec(db)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to classify execution for attempt `{}`",
-                candidate.attempt_id
-            )
-        })?
-        .rows_affected
-        > 0;
-
-    if changed && let Some(deadlines) = context_compaction_deadlines {
-        turn_item::Entity::update_many()
-            .col_expr(
-                turn_item::Column::LeaseExpiresAt,
-                Expr::value(deadlines.lease_expires_at),
-            )
-            .filter(turn_item::Column::TurnId.eq(candidate.turn_id.clone()))
-            .filter(turn_item::Column::ItemId.eq(candidate.item_id.clone()))
-            .filter(turn_item::Column::ActiveAttemptId.eq(candidate.attempt_id.clone()))
-            .exec(db)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to synchronize context compaction item `{}` deadline",
-                    candidate.item_id
-                )
-            })?;
-    }
-
-    Ok(changed)
 }
 
 fn running_snapshot_from_model(row: turn_item_attempt::Model) -> Result<RunningAttemptSnapshot> {

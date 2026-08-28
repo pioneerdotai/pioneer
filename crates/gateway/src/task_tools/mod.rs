@@ -5169,20 +5169,6 @@ pub(crate) async fn task_turn_item_from_response_for_run_with_progress(
     .await
 }
 
-pub(crate) async fn task_turn_item_from_response_with_store(
-    crud_store: &CrudStore,
-    response: &TaskGetResponse,
-    run_id: Option<&str>,
-    item_id: String,
-    progress_preview: Option<String>,
-) -> anyhow::Result<TaskTurnItem> {
-    let run = run_id
-        .and_then(|run_id| response.runs.iter().find(|run| run.id == run_id))
-        .or_else(|| select_task_anchor_run(response));
-    task_turn_item_from_response_with_run(crud_store, response, run, item_id, progress_preview)
-        .await
-}
-
 pub(crate) fn task_anchor_id(task_id: &str) -> String {
     format!("task_{task_id}")
 }

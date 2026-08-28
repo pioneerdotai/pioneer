@@ -1,22 +1,11 @@
-mod agent_diff_event_compaction;
-mod agent_domain_upgrade;
-mod authorization_legacy_backfill;
-mod cli_runtime_native_event_compaction;
+mod authorization_integrity_audit;
 mod execution_authority_integrity;
-mod stable_skill_id_backfill;
-mod task_anchor_backfill;
-mod task_event_fanout_cursor_backfill;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
-mod timeline_pagination_backfill;
 mod turn_event_projection_stream_state_backfill;
-mod turn_item_attempt_payload_compaction;
-mod turn_item_execution_class_backfill;
 mod turn_permission_profile_backfill;
 mod zstd_payload_compression;
 
-use pioneer_config::{
-    GatewayContextCompactionTimeoutConfig, GatewayThreadEpisodicVectorSearchConfig,
-};
+use pioneer_config::GatewayThreadEpisodicVectorSearchConfig;
 use pioneer_crud::CrudStore;
 use pioneer_provider::ProviderRegistry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -98,15 +87,6 @@ pub(crate) async fn enforce_execution_authority_integrity(
     crud_store: &CrudStore,
 ) -> anyhow::Result<()> {
     execution_authority_integrity::run(crud_store).await
-}
-
-/// Converts all pre-Agent-domain Task data before the Gateway listener or any
-/// task worker can observe the database. The runtime only supports the final
-/// representation produced by this upgrade.
-pub(crate) async fn upgrade_agent_domain_data(
-    message_processor: &crate::message::MessageProcessor,
-) -> anyhow::Result<()> {
-    agent_domain_upgrade::apply(message_processor).await
 }
 
 impl ThreadEpisodicWorkspaceRefillSupervisor {
@@ -295,7 +275,6 @@ impl Drop for ThreadEpisodicWorkspaceRefillLease {
 }
 
 pub(crate) async fn run(
-    message_processor: Arc<crate::message::MessageProcessor>,
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -307,14 +286,12 @@ pub(crate) async fn run(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
-    context_compaction_timeout_config: GatewayContextCompactionTimeoutConfig,
     cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
     STARTUP_MAINTENANCE_CANCELLATION
         .scope(
             cancellation,
             run_inner(
-                message_processor,
                 crud_store,
                 thread_episodic_storage_root,
                 thread_episodic_vector_search_config,
@@ -323,14 +300,12 @@ pub(crate) async fn run(
                 runtime_home,
                 refill_status_sender,
                 refill_supervisor,
-                context_compaction_timeout_config,
             ),
         )
         .await
 }
 
 async fn run_inner(
-    message_processor: Arc<crate::message::MessageProcessor>,
     crud_store: Arc<CrudStore>,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -342,7 +317,6 @@ async fn run_inner(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
-    context_compaction_timeout_config: GatewayContextCompactionTimeoutConfig,
 ) -> anyhow::Result<()> {
     let crud_store = Arc::new(crud_store.with_background_write_admission());
     let interrupted_before_unix = chrono::Utc::now().timestamp();
@@ -373,51 +347,16 @@ async fn run_inner(
         }};
     }
     run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseTurnItemExecutionClassBackfill,
-        turn_item_execution_class_backfill::run(
-            crud_store.as_ref(),
-            context_compaction_timeout_config,
-        )
-    );
-    run_stage!(
         pioneer_observability::GatewayOperationStage::DatabaseTurnEventProjectionBackfill,
         turn_event_projection_stream_state_backfill::run(crud_store.as_ref())
     );
     run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseTaskEventFanoutCursorBackfill,
-        task_event_fanout_cursor_backfill::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseAuthorizationLegacyBackfill,
-        authorization_legacy_backfill::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseStableSkillIdBackfill,
-        stable_skill_id_backfill::run(crud_store.as_ref(), message_processor.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseTaskAnchorBackfill,
-        task_anchor_backfill::run(crud_store.as_ref())
+        pioneer_observability::GatewayOperationStage::DatabaseAuthorizationIntegrityAudit,
+        authorization_integrity_audit::run(crud_store.as_ref())
     );
     run_stage!(
         pioneer_observability::GatewayOperationStage::DatabaseTurnPermissionProfileBackfill,
         turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseTimelinePaginationBackfill,
-        timeline_pagination_backfill::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseAgentDiffCompaction,
-        agent_diff_event_compaction::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseCliRuntimeEventCompaction,
-        cli_runtime_native_event_compaction::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseTurnItemAttemptPayloadCompaction,
-        turn_item_attempt_payload_compaction::run(crud_store.as_ref())
     );
     run_stage!(
         pioneer_observability::GatewayOperationStage::DatabasePayloadCompression,
@@ -591,11 +530,6 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
     )
     .await;
 }
-
-#[cfg(test)]
-pub(crate) use task_event_fanout_cursor_backfill::backfill_once as backfill_task_event_fanout_cursors_once;
-#[cfg(test)]
-pub(crate) use timeline_pagination_backfill::backfill_once as backfill_timeline_pagination_once;
 
 #[cfg(test)]
 mod tests {

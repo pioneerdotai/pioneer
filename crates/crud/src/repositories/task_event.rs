@@ -7,8 +7,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
@@ -315,43 +314,6 @@ pub async fn advance_fanout_cursor<C: ConnectionTrait>(
         })?;
 
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
-pub struct MissingFanoutCursorHighWatermark {
-    pub task_id: String,
-    pub last_sequence: i64,
-}
-
-pub async fn list_missing_fanout_cursor_high_watermarks<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<MissingFanoutCursorHighWatermark>> {
-    let tasks_with_cursors = Query::select()
-        .column(task_event_fanout_cursor::Column::TaskId)
-        .from(task_event_fanout_cursor::Entity)
-        .to_owned();
-    let materialized_tasks = Query::select()
-        .column(task::Column::Id)
-        .from(task::Entity)
-        .to_owned();
-
-    task_event::Entity::find()
-        .select_only()
-        .column(task_event::Column::TaskId)
-        .column_as(
-            Expr::col(task_event::Column::Sequence).max(),
-            "last_sequence",
-        )
-        .filter(task_event::Column::TaskId.in_subquery(materialized_tasks))
-        .filter(task_event::Column::TaskId.not_in_subquery(tasks_with_cursors))
-        .group_by(task_event::Column::TaskId)
-        .order_by_asc(task_event::Column::TaskId)
-        .limit(std::cmp::max(limit, 1))
-        .into_model::<MissingFanoutCursorHighWatermark>()
-        .all(db)
-        .await
-        .context("failed to list task event fanout cursor backfill candidates")
 }
 
 pub async fn list_events_for_run<C: ConnectionTrait>(

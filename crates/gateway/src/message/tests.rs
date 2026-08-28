@@ -15980,12 +15980,6 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
     assert!(event_types.contains(&events::TASK_COMPLETED));
     assert!(!event_types.contains(&events::TASK_RUN_ENTERED_REVIEW));
     assert!(!event_types.contains(&events::TASK_RESULT_CANDIDATE_CANCELLED));
-
-    crate::database::startup::upgrade_agent_domain_data(processor.as_ref())
-        .await
-        .expect(
-            "startup Agent-domain verification must accept a successful review-disabled delivery",
-        );
 }
 
 #[test]
@@ -16619,23 +16613,6 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
         )
         .await,
         TurnStatus::Completed
-    );
-
-    crud_store
-        .database_connection()
-        .execute_unprepared(&format!(
-            "UPDATE task_delivery_authority SET reviewer_json = NULL WHERE delivery_id = '{}'",
-            deliveries.deliveries[0].id
-        ))
-        .await
-        .expect("test must be able to corrupt the required delivery reviewer");
-    let startup_error = crate::database::startup::upgrade_agent_domain_data(processor.as_ref())
-        .await
-        .expect_err("startup verification must reject a missing required reviewer");
-    assert!(
-        format!("{startup_error:#}")
-            .contains("review-required successful Task deliveries without exact reviewers"),
-        "unexpected startup verification error: {startup_error:#}"
     );
 }
 
@@ -22491,9 +22468,6 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         "only the event appended after restart should be emitted"
     );
 
-    let updated_high_watermark = params["context"]["sequence"]
-        .as_i64()
-        .expect("updated event should expose its sequence");
     while rx.try_recv().is_ok() {}
     pioneer_entity::task_event_fanout_cursor::Entity::delete_by_id(task_id.clone())
         .exec(&crud_store.database_connection())
@@ -22514,24 +22488,6 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
     assert!(
         rx.try_recv().is_err(),
         "an invariant failure must not replay historical task events"
-    );
-    let backfilled =
-        crate::database::startup::backfill_task_event_fanout_cursors_once(crud_store.as_ref())
-            .await
-            .expect("background cursor backfill should complete");
-    assert_eq!(backfilled.tasks_initialized, 1);
-    assert_eq!(
-        crud_store
-            .get_task_event_fanout_cursor(task_id.as_str())
-            .await
-            .expect("backfilled cursor should load"),
-        Some(updated_high_watermark)
-    );
-    assert!(
-        crate::database::startup::backfill_task_event_fanout_cursors_once(crud_store.as_ref())
-            .await
-            .expect("completed cursor backfill should be idempotent")
-            .skipped
     );
 }
 
@@ -29981,173 +29937,6 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
                 .is_none()
         );
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn message_timeline_pagination_is_stable_batched_and_repairable() {
-    let (tx, mut rx) = mpsc::channel(256);
-    let session_manager = Arc::new(SessionManager::new());
-    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    let (workspace_manager, crud_store, workspace_id, select_count) =
-        setup_workspace_manager_with_query_counter().await;
-    let processor = MessageProcessor::new(
-        Arc::new(ThreadManager::new("o4-mini", "openai")),
-        test_provider(),
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_context_budget(),
-        test_tool_loop_config(),
-    );
-    const THREAD_ID: &str = "thrE6TimelineBatch001";
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": "epic6batchthread00010",
-                "method": "thread/start",
-                "params": {"thread_id": THREAD_ID, "workspace_id": workspace_id}
-            })
-            .to_string(),
-        )
-        .await;
-    let _ = recv_response_by_id(&mut rx, "epic6batchthread00010").await;
-    let _ = recv_notification_by_method(&mut rx, events::THREAD_STARTED).await;
-
-    for index in 0..20 {
-        send_epic6_test_message(
-            &processor,
-            connection_id,
-            &mut rx,
-            THREAD_ID,
-            format!("trnE6Batch{index:011}").as_str(),
-            format!("message {index}").as_str(),
-        )
-        .await;
-    }
-
-    select_count.store(0, Ordering::SeqCst);
-    let one = request_thread_timeline_page_with_anchor_and_limit(
-        &processor,
-        connection_id,
-        &mut rx,
-        THREAD_ID,
-        "epic6batchpageone0010",
-        json!({"kind": "oldest"}),
-        1,
-    )
-    .await;
-    let one_selects = select_count.load(Ordering::SeqCst);
-    assert_eq!(one.blocks.len(), 1);
-
-    select_count.store(0, Ordering::SeqCst);
-    let first_page = request_thread_timeline_page_with_anchor_and_limit(
-        &processor,
-        connection_id,
-        &mut rx,
-        THREAD_ID,
-        "epic6batchpagefive010",
-        json!({"kind": "oldest"}),
-        5,
-    )
-    .await;
-    let five_selects = select_count.load(Ordering::SeqCst);
-    assert_eq!(first_page.blocks.len(), 5);
-    assert!(
-        five_selects <= one_selects.saturating_add(1),
-        "user-message page queries must be bounded, one={one_selects}, five={five_selects}"
-    );
-    assert!(first_page.blocks.windows(2).all(|window| {
-        (window[0].sort_key.as_str(), window[0].block_id.as_str())
-            < (window[1].sort_key.as_str(), window[1].block_id.as_str())
-    }));
-    let boundary = first_page
-        .page
-        .after_cursor
-        .clone()
-        .expect("first page should expose an after cursor");
-
-    send_epic6_test_message(
-        &processor,
-        connection_id,
-        &mut rx,
-        THREAD_ID,
-        "trnE6Batch00000000020",
-        "concurrent message",
-    )
-    .await;
-    let second_page = request_thread_timeline_page_with_anchor_and_limit(
-        &processor,
-        connection_id,
-        &mut rx,
-        THREAD_ID,
-        "epic6batchpageafter01",
-        json!({"kind": "after", "cursor": boundary}),
-        100,
-    )
-    .await;
-    let first_ids = first_page
-        .blocks
-        .iter()
-        .map(|block| block.block_id.as_str())
-        .collect::<HashSet<_>>();
-    assert!(
-        second_page
-            .blocks
-            .iter()
-            .all(|block| !first_ids.contains(block.block_id.as_str()))
-    );
-    assert!(second_page.blocks.iter().any(|block| {
-        block.turn_id.as_deref() == Some("trnE6Batch00000000020")
-            && matches!(
-                &block.kind,
-                pioneer_protocol::TimelineBlockKind::UserMessage {
-                    mode: ThreadMode::Message,
-                    ..
-                }
-            )
-    }));
-    assert!(second_page.blocks.iter().all(|block| {
-        matches!(
-            &block.kind,
-            pioneer_protocol::TimelineBlockKind::UserMessage { .. }
-        )
-    }));
-
-    let before_repair = first_page
-        .blocks
-        .iter()
-        .chain(second_page.blocks.iter())
-        .map(|block| (block.block_id.clone(), block.sort_key.clone()))
-        .collect::<Vec<_>>();
-    let _ = crate::database::startup::backfill_timeline_pagination_once(crud_store.as_ref(), 16)
-        .await
-        .expect("Message timeline repair should succeed");
-    let repaired = request_thread_timeline_page_with_anchor_and_limit(
-        &processor,
-        connection_id,
-        &mut rx,
-        THREAD_ID,
-        "epic6batchpagerepair1",
-        json!({"kind": "oldest"}),
-        100,
-    )
-    .await;
-    assert_eq!(
-        repaired
-            .blocks
-            .iter()
-            .map(|block| (block.block_id.clone(), block.sort_key.clone()))
-            .collect::<Vec<_>>(),
-        before_repair
-    );
-    assert!(repaired.blocks.iter().all(|block| matches!(
-        &block.kind,
-        pioneer_protocol::TimelineBlockKind::UserMessage { .. }
-    )));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -46986,126 +46775,6 @@ async fn historical_task_snapshot_does_not_refresh_terminal_work_summary() {
         panic!("updated anchor should stay a task item");
     };
     assert_eq!(item.updated_at, snapshot_update_at);
-
-    crate::database::startup::backfill_timeline_pagination_once(
-        harness.processor.crud_store.as_ref(),
-        16,
-    )
-    .await
-    .expect("semantic timeline v8 backfill should repair historical projections");
-    let after_backfill = harness
-        .processor
-        .crud_store
-        .get_turn_work_projection(harness.turn_id.as_str())
-        .await
-        .expect("backfilled work summary should load")
-        .expect("backfilled work summary should remain");
-    assert_eq!(after_backfill.elapsed_ms, before.elapsed_ms);
-    assert_eq!(after_backfill.completed_at, before.completed_at);
-    let backfilled_item = harness
-        .processor
-        .crud_store
-        .get_turn_work_item_projection(work_item_id.as_str())
-        .await
-        .expect("backfilled task work item should load")
-        .expect("backfilled task work item should remain");
-    assert_eq!(backfilled_item.completed_at, before_item.completed_at);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn timeline_backfill_preserves_native_running_and_cli_queue_states() {
-    let (_workspace_manager, store, workspace_id) = setup_workspace_manager().await;
-    let base = super::now_timestamp_secs();
-    let native_thread_id = "thr_backfill_native_state";
-    let native_turn_id = "turn_backfill_native_state";
-    let cli_thread_id = "thr_backfill_cli_state";
-    let cli_turn_id = "turn_backfill_cli_state";
-
-    let native_thread = semantic_fixture_thread(
-        workspace_id.as_str(),
-        native_thread_id,
-        Some("Native backfill state"),
-        base,
-    );
-    store
-        .materialize_turn_start(
-            &native_thread,
-            SandboxMode::FullAccess,
-            &semantic_fixture_turn(native_turn_id, TurnStatus::InProgress),
-            &[],
-            pioneer_protocol::PersistedActorRef::System,
-        )
-        .await
-        .expect("native Turn should persist");
-
-    let cli_thread = semantic_fixture_thread(
-        workspace_id.as_str(),
-        cli_thread_id,
-        Some("CLI backfill state"),
-        base + 1,
-    );
-    store
-        .materialize_turn_start(
-            &cli_thread,
-            SandboxMode::FullAccess,
-            &semantic_fixture_turn(cli_turn_id, TurnStatus::InProgress),
-            &[],
-            pioneer_protocol::PersistedActorRef::System,
-        )
-        .await
-        .expect("CLI Turn should persist");
-    let prepared_at = chrono::Utc::now().fixed_offset();
-    store
-        .prepare_cli_runtime_initial_turn_attempt(
-            NewCliRuntimeTurnBinding {
-                turn_id: cli_turn_id.to_owned(),
-                thread_id: cli_thread_id.to_owned(),
-                continuation_thread_id: cli_thread_id.to_owned(),
-                workspace_id: workspace_id.clone(),
-                runtime_id: "codex".to_owned(),
-                runtime_kind: "codex".to_owned(),
-                native_thread_id: "native-thread-backfill-cli-state".to_owned(),
-                native_turn_id: None,
-                request_id: None,
-                status: "starting".to_owned(),
-                model: Some("gpt-5.6".to_owned()),
-                cwd: None,
-                sandbox_json: None,
-                approval_policy: Some("on-request".to_owned()),
-                input_mapping_json: "{}".to_owned(),
-                created_at: prepared_at,
-                updated_at: prepared_at,
-            },
-            "attempt-backfill-cli-state".to_owned(),
-            1,
-        )
-        .await
-        .expect("queued CLI attempt should persist");
-
-    crate::database::startup::backfill_timeline_pagination_once(store.as_ref(), 16)
-        .await
-        .expect("semantic timeline v9 backfill should succeed");
-
-    assert_eq!(
-        store
-            .get_turn_work_projection(native_turn_id)
-            .await
-            .expect("native projection should load")
-            .expect("native projection should exist")
-            .state,
-        "running",
-        "backfill must not infer a native queue from a gap between work items"
-    );
-    assert_eq!(
-        store
-            .get_turn_work_projection(cli_turn_id)
-            .await
-            .expect("CLI projection should load")
-            .expect("CLI projection should exist")
-            .state,
-        "starting",
-        "backfill must preserve a CLI queue until the native provider starts"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -47209,17 +46878,6 @@ async fn detached_task_wrapper_diagnostics_do_not_persist_parent_work_group() {
             .expect("wrapper work summary should query")
             .is_none(),
         "detached wrapper diagnostics must not create a parent Worked group"
-    );
-    crate::database::startup::backfill_timeline_pagination_once(store.as_ref(), 16)
-        .await
-        .expect("semantic timeline v8 backfill should rebuild detached wrapper projections");
-    assert!(
-        store
-            .get_turn_work_projection(turn_id)
-            .await
-            .expect("backfilled wrapper work summary should query")
-            .is_none(),
-        "backfill must preserve the parent-card-only detached Task presentation"
     );
 }
 
@@ -47704,15 +47362,6 @@ async fn setup_semantic_timeline_query_harness_inner(
     )
     .await;
 
-    let summary =
-        crate::database::startup::backfill_timeline_pagination_once(crud_store.as_ref(), 16)
-            .await
-            .expect("semantic timeline backfill should succeed for fixture");
-    assert!(
-        !summary.skipped,
-        "fixture backfill should build projection rows"
-    );
-
     let mut synthetic_large_thread_id = String::new();
     let mut synthetic_large_turn_id = String::new();
     let mut synthetic_long_thread_id = String::new();
@@ -48091,35 +47740,6 @@ async fn request_thread_timeline_page_for_test(
     serde_json::from_value(response.result).expect("thread/timeline/page should decode")
 }
 
-async fn request_thread_timeline_page_with_anchor_and_limit(
-    processor: &MessageProcessor,
-    connection_id: ConnectionId,
-    rx: &mut mpsc::Receiver<Message>,
-    thread_id: &str,
-    request_id: &str,
-    anchor: JsonValue,
-    limit: u32,
-) -> pioneer_protocol::ThreadTimelinePageResponse {
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "thread/timeline/page",
-                "params": {
-                    "threadId": thread_id,
-                    "anchor": anchor,
-                    "limit": limit
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let response = recv_response_by_id(rx, request_id).await;
-    serde_json::from_value(response.result).expect("thread/timeline/page should decode")
-}
-
 async fn send_epic6_test_message(
     processor: &MessageProcessor,
     connection_id: ConnectionId,
@@ -48348,12 +47968,16 @@ async fn materialize_semantic_site_fixture(
         .await
         .expect("site final answer should persist");
 
+    let mut blocked_turn = semantic_fixture_turn(turn_id, TurnStatus::Blocked);
+    blocked_turn.error = Some("fixture blocked after final".to_owned());
     store
-        .update_turn_status(
-            thread_id,
-            turn_id,
-            TurnStatus::Blocked,
-            Some("fixture blocked after final"),
+        .materialize_turn_blocked(
+            pioneer_protocol::TurnBlockedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn: blocked_turn,
+                resume: None,
+            },
             timestamp + 4,
         )
         .await
@@ -57570,52 +57194,6 @@ async fn setup_workspace_manager_with_connection(
     .await
     .expect("test workspace should include the reserved Pioneer identity");
     (workspace_manager, crud_store, workspace_id)
-}
-
-async fn setup_workspace_manager_with_query_counter() -> (
-    Arc<WorkspaceManager>,
-    Arc<CrudStore>,
-    String,
-    Arc<AtomicUsize>,
-) {
-    let mut connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("must connect to sqlite memory");
-    Migrator::up(&connection, None)
-        .await
-        .expect("migrations must succeed");
-    bootstrap(&connection)
-        .await
-        .expect("gateway bootstrap should create default workspace");
-    let select_count = Arc::new(AtomicUsize::new(0));
-    let callback_count = select_count.clone();
-    connection.set_metric_callback(move |info| {
-        if info
-            .statement
-            .sql
-            .trim_start()
-            .to_ascii_uppercase()
-            .starts_with("SELECT")
-        {
-            callback_count.fetch_add(1, Ordering::SeqCst);
-        }
-    });
-    let crud_store = Arc::new(CrudStore::new(connection.clone()));
-    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
-    let workspace_manager = Arc::new(WorkspaceManager::new(connection));
-    let workspaces = workspace_manager
-        .list_workspaces()
-        .await
-        .expect("workspace/list should succeed in tests");
-    let workspace_id = workspaces
-        .iter()
-        .find(|workspace| workspace.is_active && workspace.is_current)
-        .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
-        .or_else(|| workspaces.first())
-        .expect("default workspace should exist after bootstrap")
-        .id
-        .clone();
-    (workspace_manager, crud_store, workspace_id, select_count)
 }
 
 async fn setup_workspace_message_processor() -> (

@@ -20,13 +20,6 @@ const IMPORT_PATH_PREFIX: &str = "import-path:";
 const RELOCATION_ATTEMPT_SUFFIX: &str = ".pioneer-relocation-attempt";
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExistingInstallationRelocationConfig {
-    pub(crate) user_root_templates: Vec<String>,
-    pub(crate) registry_root_templates: Vec<String>,
-    pub(crate) max_skill_file_bytes: usize,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct ConfiguredSkillImportRoot {
     pub(crate) source_kind: SkillSourceKind,
     pub(crate) scope_key: String,
@@ -85,12 +78,6 @@ pub(crate) struct ManagedRootScanSummary {
     pub(crate) failed: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SkillStorageCandidateMode {
-    ExistingRelocation,
-    ImportOrRefresh,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedSkillStorageMetadata {
     pub(crate) owner: Option<String>,
@@ -101,22 +88,8 @@ pub(crate) struct PreparedSkillStorageMetadata {
     pub(crate) source_ref: String,
 }
 
-impl PreparedSkillStorageMetadata {
-    pub(crate) fn from_row(row: &SkillInstallationRecord) -> Self {
-        Self {
-            owner: row.owner.clone(),
-            slug: row.slug.clone(),
-            version: row.version.clone(),
-            trust_level: row.trust_level.clone(),
-            fingerprint: row.fingerprint.clone(),
-            source_ref: row.source_ref.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct SkillStorageRelocationCandidate {
-    pub(crate) mode: SkillStorageCandidateMode,
     pub(crate) expected_row: SkillInstallationRecord,
     pub(crate) source_path: PathBuf,
     pub(crate) install_root: PathBuf,
@@ -138,17 +111,6 @@ struct PreparedSkillStorageCopy {
 pub(crate) enum SkillStorageRelocationOutcome {
     Switched,
     Stale,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ExistingInstallationRelocationSummary {
-    pub(crate) rows_seen: usize,
-    pub(crate) skipped_canonical: usize,
-    pub(crate) skipped_pending_import: usize,
-    pub(crate) skipped_unsupported: usize,
-    pub(crate) switched: usize,
-    pub(crate) stale: usize,
-    pub(crate) failed: usize,
 }
 
 impl MessageProcessor {
@@ -268,103 +230,6 @@ fn configured_workspace_import_root(
         managed_root: managed_root.to_path_buf(),
         source_is_pioneer_managed,
     }
-}
-
-pub(crate) async fn relocate_existing_installations(
-    crud_store: &CrudStore,
-    skills_write_lock: &Arc<Mutex<()>>,
-    config: &ExistingInstallationRelocationConfig,
-) -> Result<ExistingInstallationRelocationSummary> {
-    let rows = crud_store.list_skill_installations().await?;
-    let mut summary = ExistingInstallationRelocationSummary::default();
-
-    for row in rows {
-        summary.rows_seen = summary.rows_seen.saturating_add(1);
-        if row.source_ref.starts_with(IMPORT_PATH_PREFIX) {
-            summary.skipped_pending_import = summary.skipped_pending_import.saturating_add(1);
-            continue;
-        }
-
-        let Some(install_root_template) = install_root_template_for_row(&row, config) else {
-            summary.skipped_unsupported = summary.skipped_unsupported.saturating_add(1);
-            continue;
-        };
-        let install_root = resolve_root_path(install_root_template, row.scope_key.as_str());
-        let destination = match canonical_skill_install_path(
-            install_root.as_path(),
-            &row.skill_id,
-            row.slug.as_str(),
-        )
-        .and_then(|path| normalize_absolute_path(path.as_path()))
-        {
-            Ok(destination) => destination,
-            Err(error) => {
-                summary.failed = summary.failed.saturating_add(1);
-                warn!(
-                    skill_id = %row.skill_id,
-                    error = %format!("{error:#}"),
-                    "failed to derive canonical skill relocation destination"
-                );
-                continue;
-            }
-        };
-        let source_path = match normalize_absolute_path(Path::new(row.install_path.as_str())) {
-            Ok(source_path) => source_path,
-            Err(error) => {
-                summary.failed = summary.failed.saturating_add(1);
-                warn!(
-                    skill_id = %row.skill_id,
-                    source_path = %row.install_path,
-                    error = %format!("{error:#}"),
-                    "failed to normalize skill relocation source"
-                );
-                continue;
-            }
-        };
-        if source_path == destination {
-            summary.skipped_canonical = summary.skipped_canonical.saturating_add(1);
-            continue;
-        }
-
-        let remove_managed_source_after_switch =
-            path_is_existing_descendant(install_root.as_path(), source_path.as_path());
-        let prepared_metadata = PreparedSkillStorageMetadata::from_row(&row);
-        let skill_id = row.skill_id.clone();
-        let stored_source_path = row.install_path.clone();
-        let managed_lock_path = install_root.join("skills-lock.toml");
-        let candidate = SkillStorageRelocationCandidate {
-            mode: SkillStorageCandidateMode::ExistingRelocation,
-            expected_row: row,
-            source_path,
-            install_root,
-            destination,
-            prepared_metadata,
-            remove_managed_source_after_switch,
-            managed_path_to_remove_after_switch: None,
-            managed_lock_path: Some(managed_lock_path),
-            max_skill_file_bytes: config.max_skill_file_bytes.max(1),
-        };
-
-        match copy_and_switch_candidate(crud_store, skills_write_lock, candidate).await {
-            Ok(SkillStorageRelocationOutcome::Switched) => {
-                summary.switched = summary.switched.saturating_add(1);
-            }
-            Ok(SkillStorageRelocationOutcome::Stale) => {
-                summary.stale = summary.stale.saturating_add(1);
-            }
-            Err(error) => {
-                summary.failed = summary.failed.saturating_add(1);
-                warn!(
-                    skill_id = %skill_id,
-                    source_path = %stored_source_path,
-                    error = %format!("{error:#}"),
-                    "failed to relocate installed skill"
-                );
-            }
-        }
-    }
-
-    Ok(summary)
 }
 
 pub(crate) async fn import_configured_skill_roots(
@@ -694,7 +559,6 @@ async fn refresh_managed_installation(
     max_skill_file_bytes: usize,
 ) -> Result<SkillStorageRelocationOutcome> {
     let candidate = SkillStorageRelocationCandidate {
-        mode: SkillStorageCandidateMode::ImportOrRefresh,
         expected_row,
         source_path,
         install_root: destination
@@ -901,8 +765,8 @@ async fn import_one_configured_package(
         }
     };
     if !created && root.source_is_pioneer_managed && row.source_ref != source_ref {
-        // This is an existing working legacy/canonical row discovered through the managed root.
-        // Existing-row relocation owns it and must preserve its current provenance metadata.
+        // This is an existing working row discovered through the managed root. Preserve its
+        // current provenance metadata instead of treating its managed path as an external import.
         return Ok(ImportOneOutcome::Unchanged);
     }
     if mode == ConfiguredRootImportMode::RegisterOnly {
@@ -969,7 +833,6 @@ async fn import_one_configured_package(
     .then_some(current_path);
     let skill_id = row.skill_id.clone();
     let candidate = SkillStorageRelocationCandidate {
-        mode: SkillStorageCandidateMode::ImportOrRefresh,
         expected_row: row,
         source_path,
         install_root: root.managed_root.clone(),
@@ -1148,17 +1011,6 @@ fn trust_level_value(level: &SkillTrustLevel) -> &'static str {
     }
 }
 
-fn install_root_template_for_row<'a>(
-    row: &SkillInstallationRecord,
-    config: &'a ExistingInstallationRelocationConfig,
-) -> Option<&'a str> {
-    match row.source_kind.as_str() {
-        "user" => config.user_root_templates.first().map(String::as_str),
-        "registry" => config.registry_root_templates.first().map(String::as_str),
-        _ => None,
-    }
-}
-
 pub(crate) async fn copy_and_switch_candidate(
     crud_store: &CrudStore,
     skills_write_lock: &Arc<Mutex<()>>,
@@ -1312,21 +1164,15 @@ fn publish_candidate_files(
 
 fn candidate_database_patch(candidate: &SkillStorageRelocationCandidate) -> SkillInstallationPatch {
     let install_path = Some(candidate.destination.display().to_string());
-    match candidate.mode {
-        SkillStorageCandidateMode::ExistingRelocation => SkillInstallationPatch {
-            install_path,
-            ..Default::default()
-        },
-        SkillStorageCandidateMode::ImportOrRefresh => SkillInstallationPatch {
-            owner: Some(candidate.prepared_metadata.owner.clone()),
-            slug: Some(candidate.prepared_metadata.slug.clone()),
-            version: Some(candidate.prepared_metadata.version.clone()),
-            source_ref: Some(candidate.prepared_metadata.source_ref.clone()),
-            install_path,
-            trust_level: Some(candidate.prepared_metadata.trust_level.clone()),
-            fingerprint: Some(candidate.prepared_metadata.fingerprint.clone()),
-            ..Default::default()
-        },
+    SkillInstallationPatch {
+        owner: Some(candidate.prepared_metadata.owner.clone()),
+        slug: Some(candidate.prepared_metadata.slug.clone()),
+        version: Some(candidate.prepared_metadata.version.clone()),
+        source_ref: Some(candidate.prepared_metadata.source_ref.clone()),
+        install_path,
+        trust_level: Some(candidate.prepared_metadata.trust_level.clone()),
+        fingerprint: Some(candidate.prepared_metadata.fingerprint.clone()),
+        ..Default::default()
     }
 }
 
@@ -1680,13 +1526,14 @@ mod tests {
         }
     }
 
-    fn config(root: &Path) -> ExistingInstallationRelocationConfig {
-        ExistingInstallationRelocationConfig {
-            user_root_templates: vec![root.join("{workspaceId}/user").display().to_string()],
-            registry_root_templates: vec![
-                root.join("{workspaceId}/registry").display().to_string(),
-            ],
-            max_skill_file_bytes: 64 * 1024,
+    fn metadata_from_row(row: &SkillInstallationRecord) -> PreparedSkillStorageMetadata {
+        PreparedSkillStorageMetadata {
+            owner: row.owner.clone(),
+            slug: row.slug.clone(),
+            version: row.version.clone(),
+            trust_level: row.trust_level.clone(),
+            fingerprint: row.fingerprint.clone(),
+            source_ref: row.source_ref.clone(),
         }
     }
 
@@ -1698,12 +1545,11 @@ mod tests {
             canonical_skill_install_path(install_root, &row.skill_id, row.slug.as_str())
                 .expect("canonical destination");
         SkillStorageRelocationCandidate {
-            mode: SkillStorageCandidateMode::ExistingRelocation,
             expected_row: row.clone(),
             source_path: PathBuf::from(row.install_path.as_str()),
             install_root: install_root.to_path_buf(),
             destination,
-            prepared_metadata: PreparedSkillStorageMetadata::from_row(&row),
+            prepared_metadata: metadata_from_row(&row),
             remove_managed_source_after_switch: true,
             managed_path_to_remove_after_switch: None,
             managed_lock_path: None,
@@ -1788,184 +1634,6 @@ mod tests {
             pack_id: None,
             pack_member_key: None,
         }
-    }
-
-    #[tokio::test]
-    async fn relocates_user_and_registry_rows_and_cleans_empty_legacy_owner() {
-        let temp = TempDir::new().expect("tempdir");
-        let store = test_store().await;
-        for (id, kind) in [('A', "user"), ('B', "registry")] {
-            let install_root = temp.path().join("workspace-one").join(kind);
-            let source = install_root.join("owner/test-skill");
-            let fingerprint = write_package(source.as_path(), kind);
-            let row = row(
-                id,
-                kind,
-                "workspace-one",
-                source.as_path(),
-                fingerprint.as_str(),
-            );
-            store
-                .insert_skill_installation(&row, row.updated_at_unix)
-                .await
-                .expect("insert row");
-        }
-
-        let summary = relocate_existing_installations(
-            &store,
-            &Arc::new(Mutex::new(())),
-            &config(temp.path()),
-        )
-        .await
-        .expect("relocation pass");
-        assert_eq!(summary.switched, 2);
-        for (id, kind) in [('A', "user"), ('B', "registry")] {
-            let current = store
-                .find_skill_installation(&test_id(id))
-                .await
-                .expect("find row")
-                .expect("row");
-            let expected = temp
-                .path()
-                .join("workspace-one")
-                .join(kind)
-                .join(id.to_string().repeat(21))
-                .join("test-skill");
-            assert_eq!(PathBuf::from(current.install_path), expected);
-            assert!(expected.join("assets/value.txt").is_file());
-            assert!(
-                !temp
-                    .path()
-                    .join("workspace-one")
-                    .join(kind)
-                    .join("owner")
-                    .exists()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn overwrites_existing_destination_from_scratch() {
-        let temp = TempDir::new().expect("tempdir");
-        let store = test_store().await;
-        let root = temp.path().join("workspace-one/user");
-        let source = root.join("owner/test-skill");
-        let fingerprint = write_package(source.as_path(), "fresh");
-        let row = row(
-            'C',
-            "user",
-            "workspace-one",
-            source.as_path(),
-            fingerprint.as_str(),
-        );
-        let destination = canonical_skill_install_path(root.as_path(), &row.skill_id, "test-skill")
-            .expect("destination");
-        fs::create_dir_all(destination.as_path()).expect("create stale destination");
-        fs::write(destination.join("stale.txt"), "stale").expect("write stale file");
-        store
-            .insert_skill_installation(&row, row.updated_at_unix)
-            .await
-            .expect("insert row");
-
-        let summary = relocate_existing_installations(
-            &store,
-            &Arc::new(Mutex::new(())),
-            &config(temp.path()),
-        )
-        .await
-        .expect("relocate");
-        assert_eq!(summary.switched, 1);
-        assert!(!destination.join("stale.txt").exists());
-        assert_eq!(
-            fs::read_to_string(destination.join("assets/value.txt")).expect("read asset"),
-            "fresh"
-        );
-    }
-
-    #[tokio::test]
-    async fn copy_failure_keeps_old_row_and_retry_uses_persisted_state() {
-        let temp = TempDir::new().expect("tempdir");
-        let store = test_store().await;
-        let source = temp.path().join("workspace-one/user/owner/test-skill");
-        let row = row(
-            'D',
-            "user",
-            "workspace-one",
-            source.as_path(),
-            "missing-fingerprint",
-        );
-        store
-            .insert_skill_installation(&row, row.updated_at_unix)
-            .await
-            .expect("insert row");
-        let first = relocate_existing_installations(
-            &store,
-            &Arc::new(Mutex::new(())),
-            &config(temp.path()),
-        )
-        .await
-        .expect("first pass");
-        assert_eq!(first.failed, 1);
-        assert_eq!(
-            store
-                .find_skill_installation(&row.skill_id)
-                .await
-                .expect("find row")
-                .expect("row")
-                .install_path,
-            row.install_path
-        );
-
-        let fingerprint = write_package(source.as_path(), "restored");
-        store
-            .update_skill_installation(
-                &row.skill_id,
-                &SkillInstallationPatch {
-                    fingerprint: Some(fingerprint),
-                    ..Default::default()
-                },
-                1_700_000_001,
-            )
-            .await
-            .expect("refresh fingerprint");
-        let second = relocate_existing_installations(
-            &store,
-            &Arc::new(Mutex::new(())),
-            &config(temp.path()),
-        )
-        .await
-        .expect("retry pass");
-        assert_eq!(second.switched, 1);
-    }
-
-    #[tokio::test]
-    async fn canonical_row_is_skipped() {
-        let temp = TempDir::new().expect("tempdir");
-        let store = test_store().await;
-        let root = temp.path().join("workspace-one/user");
-        let id = test_id('E');
-        let source = root.join(id.as_str()).join("test-skill");
-        let fingerprint = write_package(source.as_path(), "canonical");
-        let row = row(
-            'E',
-            "user",
-            "workspace-one",
-            source.as_path(),
-            fingerprint.as_str(),
-        );
-        store
-            .insert_skill_installation(&row, row.updated_at_unix)
-            .await
-            .expect("insert row");
-        let summary = relocate_existing_installations(
-            &store,
-            &Arc::new(Mutex::new(())),
-            &config(temp.path()),
-        )
-        .await
-        .expect("pass");
-        assert_eq!(summary.skipped_canonical, 1);
-        assert_eq!(summary.switched, 0);
     }
 
     #[tokio::test]
@@ -2260,43 +1928,6 @@ mod tests {
         let destination = root.join(row.skill_id.as_str()).join("test-skill");
         assert!(!destination.join("abandoned.txt").exists());
         assert!(source.parent().is_some_and(|parent| !parent.exists()));
-    }
-
-    #[tokio::test]
-    async fn external_source_is_preserved_after_switch() {
-        let temp = TempDir::new().expect("tempdir");
-        let store = test_store().await;
-        let managed = temp.path().join("managed/workspace-one/user");
-        let external = temp.path().join("external/test-skill");
-        let fingerprint = write_package(external.as_path(), "external");
-        let row = row(
-            'J',
-            "user",
-            "workspace-one",
-            external.as_path(),
-            fingerprint.as_str(),
-        );
-        store
-            .insert_skill_installation(&row, row.updated_at_unix)
-            .await
-            .expect("insert row");
-        let cfg = ExistingInstallationRelocationConfig {
-            user_root_templates: vec![managed.display().to_string()],
-            registry_root_templates: Vec::new(),
-            max_skill_file_bytes: 64 * 1024,
-        };
-
-        let summary = relocate_existing_installations(&store, &Arc::new(Mutex::new(())), &cfg)
-            .await
-            .expect("relocate external row");
-        assert_eq!(summary.switched, 1);
-        assert!(external.exists());
-        assert!(
-            managed
-                .join(row.skill_id.as_str())
-                .join("test-skill")
-                .exists()
-        );
     }
 
     #[tokio::test]
@@ -2977,7 +2608,7 @@ mod tests {
             Path::new(row.install_path.as_str()),
             "manual edit before concurrent update",
         );
-        let mut metadata = PreparedSkillStorageMetadata::from_row(&row);
+        let mut metadata = metadata_from_row(&row);
         metadata.fingerprint = edited_fingerprint;
         store
             .update_skill_installation(
@@ -3045,7 +2676,7 @@ mod tests {
             row.clone(),
             PathBuf::from(row.install_path.as_str()),
             PathBuf::from(row.install_path.as_str()),
-            PreparedSkillStorageMetadata::from_row(&row),
+            metadata_from_row(&row),
             managed.join("skills-lock.toml"),
             64 * 1024,
         )

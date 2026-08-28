@@ -202,15 +202,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::convention::{
-    ATTEMPT_STATUS_CANCELLED, ATTEMPT_STATUS_COMPLETED, ATTEMPT_STATUS_EXHAUSTED,
-    ATTEMPT_STATUS_FAILED, ATTEMPT_STATUS_INTERRUPTED, ATTEMPT_STATUS_RUNNING, DB_ID_LEN,
-    MEMORY_EVENT_ACCESSED, MEMORY_EVENT_CANDIDATE_APPROVED, MEMORY_EVENT_CANDIDATE_CREATED,
+    ATTEMPT_STATUS_INTERRUPTED, ATTEMPT_STATUS_RUNNING, DB_ID_LEN, MEMORY_EVENT_ACCESSED,
+    MEMORY_EVENT_CANDIDATE_APPROVED, MEMORY_EVENT_CANDIDATE_CREATED,
     MEMORY_EVENT_CANDIDATE_EXPIRED, MEMORY_EVENT_CANDIDATE_REJECTED,
     MEMORY_EVENT_CAPSULE_REPAIR_STATUS_CHANGED, MEMORY_EVENT_CREATED, MEMORY_EVENT_EXPIRED,
     MEMORY_EVENT_FORGOTTEN, MEMORY_EVENT_QUARANTINED, MEMORY_EVENT_REPAIR_STATUS_CHANGED,
@@ -809,19 +806,6 @@ pub struct TaskRuntimeInvariantStaleAttemptRecord {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TurnEventCompactionSummary {
-    pub dry_run: bool,
-    pub batch_limit: u64,
-    pub candidate_rows: u64,
-    pub deleted_rows: u64,
-    pub payload_bytes: u64,
-    pub turns_touched: u64,
-    pub latest_snapshots_kept: u64,
-    pub skipped_unprojected: u64,
-    pub skipped_failed: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliRuntimeNativeEventCompactionSummary {
     pub dry_run: bool,
     pub batch_limit: u64,
@@ -832,39 +816,7 @@ pub struct CliRuntimeNativeEventCompactionSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TurnItemAttemptPayloadCompactionSummary {
-    pub dry_run: bool,
-    pub batch_limit: u64,
-    pub candidate_rows: u64,
-    pub updated_rows: u64,
-    pub payload_bytes: u64,
-    pub turns_touched: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AgentDiffCompactionCandidate {
-    event_id: String,
-    turn_id: String,
-    item_id: String,
-    payload_bytes: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct AgentDiffCompactionStats {
-    latest_snapshots_kept: u64,
-    skipped_unprojected: u64,
-    skipped_failed: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CliRuntimeNativeEventCompactionStats {
-    candidate_rows: u64,
-    payload_bytes: u64,
-    turns_touched: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TurnItemAttemptPayloadCompactionStats {
     candidate_rows: u64,
     payload_bytes: u64,
     turns_touched: u64,
@@ -1525,19 +1477,6 @@ pub struct RunningTurnItemAttempt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TurnItemAttemptTimeoutDurations {
-    pub lease_secs: u64,
-    pub idle_secs: u64,
-    pub hard_secs: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TurnItemExecutionClassBackfillBatch {
-    pub attempts_classified: usize,
-    pub context_compactions_classified: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadModelInvariantKind {
     TerminalToolPayloadInProgress,
     TimedOutToolPayloadInProgress,
@@ -2118,84 +2057,6 @@ pub struct CrudStore {
     task_projector: TaskProjector,
     write_coordinator: SqliteWriteCoordinator,
     write_admission_class: SqliteAdmissionClass,
-    semantic_timeline_revisions: SemanticTimelineRevisionRegistry,
-}
-
-#[derive(Clone, Default)]
-struct SemanticTimelineRevisionRegistry {
-    inner: Arc<Mutex<HashMap<String, SemanticTimelineRevisionEntry>>>,
-}
-
-struct SemanticTimelineRevisionEntry {
-    generation: Arc<AtomicU64>,
-    registrations: usize,
-}
-
-/// Short-lived per-Turn fence used by startup maintenance to detect a
-/// concurrent live semantic-timeline projection without rescanning the Turn's
-/// source tables before every bounded write.
-pub struct SemanticTimelineRevisionFence {
-    registry: SemanticTimelineRevisionRegistry,
-    turn_id: String,
-    generation: Arc<AtomicU64>,
-}
-
-impl SemanticTimelineRevisionRegistry {
-    fn register(&self, turn_id: &str) -> SemanticTimelineRevisionFence {
-        let mut entries = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry =
-            entries
-                .entry(turn_id.to_owned())
-                .or_insert_with(|| SemanticTimelineRevisionEntry {
-                    generation: Arc::new(AtomicU64::new(0)),
-                    registrations: 0,
-                });
-        entry.registrations = entry.registrations.saturating_add(1);
-        SemanticTimelineRevisionFence {
-            registry: self.clone(),
-            turn_id: turn_id.to_owned(),
-            generation: Arc::clone(&entry.generation),
-        }
-    }
-
-    fn advance_if_registered(&self, turn_id: &str) {
-        let entries = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = entries.get(turn_id) {
-            entry.generation.fetch_add(1, Ordering::Release);
-        }
-    }
-}
-
-impl SemanticTimelineRevisionFence {
-    pub fn current(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-}
-
-impl Drop for SemanticTimelineRevisionFence {
-    fn drop(&mut self) {
-        let mut entries = self
-            .registry
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let remove = entries.get_mut(self.turn_id.as_str()).is_some_and(|entry| {
-            if !Arc::ptr_eq(&entry.generation, &self.generation) {
-                return false;
-            }
-            entry.registrations = entry.registrations.saturating_sub(1);
-            entry.registrations == 0
-        });
-        if remove {
-            entries.remove(self.turn_id.as_str());
-        }
-    }
 }
 
 /// Complete durable write-set for one Task creation.  Task events, frozen
@@ -3625,7 +3486,6 @@ impl CrudStore {
             task_projector: TaskProjector::new(),
             write_coordinator,
             write_admission_class: SqliteAdmissionClass::Foreground,
-            semantic_timeline_revisions: SemanticTimelineRevisionRegistry::default(),
         }
     }
 
@@ -3639,27 +3499,6 @@ impl CrudStore {
         self.write_coordinator.clone()
     }
 
-    pub fn register_semantic_timeline_revision_fence(
-        &self,
-        turn_id: &str,
-    ) -> SemanticTimelineRevisionFence {
-        self.semantic_timeline_revisions.register(turn_id)
-    }
-
-    fn advance_semantic_timeline_revision(&self, turn_id: &str) {
-        self.semantic_timeline_revisions
-            .advance_if_registered(turn_id);
-    }
-
-    fn advance_semantic_timeline_pending_request_revision(
-        &self,
-        request: &CliRuntimePendingRequestRecord,
-    ) {
-        if let Some(turn_id) = request.turn_id.as_deref() {
-            self.advance_semantic_timeline_revision(turn_id);
-        }
-    }
-
     async fn project_semantic_timeline_live_turn_event(
         &self,
         transaction: &DatabaseTransaction,
@@ -3670,7 +3509,6 @@ impl CrudStore {
             event,
         )
         .await?;
-        self.advance_semantic_timeline_revision(event.turn_id.as_str());
         Ok(())
     }
 
@@ -3681,7 +3519,6 @@ impl CrudStore {
     ) -> Result<()> {
         crate::timeline_live_projection::project_cli_runtime_pending_request(transaction, request)
             .await?;
-        self.advance_semantic_timeline_pending_request_revision(request);
         Ok(())
     }
 
@@ -3697,7 +3534,6 @@ impl CrudStore {
             refreshed_at,
         )
         .await?;
-        self.advance_semantic_timeline_revision(turn_id);
         Ok(())
     }
 
@@ -3717,7 +3553,6 @@ impl CrudStore {
             refreshed_at,
         )
         .await?;
-        self.advance_semantic_timeline_revision(turn_id);
         Ok(())
     }
 
@@ -4364,10 +4199,6 @@ impl CrudStore {
         self.run_serialized_write(|| async {
             let stored =
                 cli_runtime_binding::upsert_turn_binding(&self.connection, binding.clone()).await?;
-            // This low-level path intentionally does not synthesize a live
-            // projection, but startup backfill still reads binding status and
-            // must discard any plan assembled across this mutation.
-            self.advance_semantic_timeline_revision(stored.turn_id.as_str());
             Ok(stored)
         })
         .await
@@ -5566,7 +5397,6 @@ impl CrudStore {
                 }
                 opened
             };
-            self.advance_semantic_timeline_pending_request_revision(&record);
             transaction
                 .commit()
                 .await
@@ -5589,9 +5419,6 @@ impl CrudStore {
             let record =
                 cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
                     .await?;
-            if let Some(record) = &record {
-                self.advance_semantic_timeline_pending_request_revision(record);
-            }
             transaction
                 .commit()
                 .await
@@ -5616,9 +5443,6 @@ impl CrudStore {
                 response.clone(),
             )
             .await?;
-            if let Some(record) = &record {
-                self.advance_semantic_timeline_pending_request_revision(record);
-            }
             transaction
                 .commit()
                 .await
@@ -5643,9 +5467,6 @@ impl CrudStore {
                 transition.clone(),
             )
             .await?;
-            if let Some(record) = &record {
-                self.advance_semantic_timeline_pending_request_revision(record);
-            }
             transaction
                 .commit()
                 .await
@@ -5862,15 +5683,6 @@ impl CrudStore {
         cli_runtime_binding::latest_native_event(&self.connection, filter).await
     }
 
-    pub async fn compact_terminal_cli_runtime_native_events(
-        &self,
-        batch_limit: u64,
-        dry_run: bool,
-    ) -> Result<CliRuntimeNativeEventCompactionSummary> {
-        self.compact_terminal_cli_runtime_native_events_internal(None, batch_limit, dry_run)
-            .await
-    }
-
     pub async fn compact_terminal_cli_runtime_native_events_for_turn(
         &self,
         turn_id: &str,
@@ -5951,79 +5763,6 @@ impl CrudStore {
                             .commit()
                             .await
                             .context("failed to commit CLI runtime native event compaction")?;
-                        Ok(summary)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
-        .await
-    }
-
-    pub async fn compact_terminal_turn_item_attempt_payloads(
-        &self,
-        batch_limit: u64,
-        dry_run: bool,
-    ) -> Result<TurnItemAttemptPayloadCompactionSummary> {
-        let batch_limit = batch_limit.max(1);
-        if dry_run {
-            let stats = Self::terminal_turn_item_attempt_payload_compaction_stats(
-                &self.connection,
-                batch_limit,
-            )
-            .await?;
-            return Ok(TurnItemAttemptPayloadCompactionSummary {
-                dry_run,
-                batch_limit,
-                candidate_rows: stats.candidate_rows,
-                updated_rows: 0,
-                payload_bytes: stats.payload_bytes,
-                turns_touched: stats.turns_touched,
-            });
-        }
-
-        self.run_serialized_write(|| {
-            let connection = self.connection.clone();
-            async move {
-                let transaction = connection
-                    .begin()
-                    .await
-                    .context("failed to begin turn_item_attempt payload compaction transaction")?;
-                let result: Result<TurnItemAttemptPayloadCompactionSummary> = async {
-                    let stats = Self::terminal_turn_item_attempt_payload_compaction_stats(
-                        &transaction,
-                        batch_limit,
-                    )
-                    .await?;
-                    let updated_rows = if stats.candidate_rows == 0 {
-                        0
-                    } else {
-                        Self::clear_terminal_turn_item_attempt_payload_compaction_batch(
-                            &transaction,
-                            batch_limit,
-                        )
-                        .await?
-                    };
-                    Ok(TurnItemAttemptPayloadCompactionSummary {
-                        dry_run,
-                        batch_limit,
-                        candidate_rows: stats.candidate_rows,
-                        updated_rows,
-                        payload_bytes: stats.payload_bytes,
-                        turns_touched: stats.turns_touched,
-                    })
-                }
-                .await;
-
-                match result {
-                    Ok(summary) => {
-                        transaction
-                            .commit()
-                            .await
-                            .context("failed to commit turn_item_attempt payload compaction")?;
                         Ok(summary)
                     }
                     Err(error) => {
@@ -12529,11 +12268,6 @@ impl CrudStore {
         .await
     }
 
-    pub async fn backfill_task_event_fanout_cursors_batch(&self, limit: u64) -> Result<usize> {
-        self.run_serialized_write(|| self.backfill_task_event_fanout_cursors_batch_once(limit))
-            .await
-    }
-
     pub async fn list_task_events_for_thread_turn(
         &self,
         thread_id: &str,
@@ -15552,216 +15286,6 @@ impl CrudStore {
         }))
     }
 
-    pub async fn compact_superseded_agent_diff_turn_events(
-        &self,
-        batch_limit: u64,
-        dry_run: bool,
-    ) -> Result<TurnEventCompactionSummary> {
-        let batch_limit = batch_limit.max(1);
-        let stats = self.agent_diff_turn_event_compaction_stats().await?;
-        let candidates = self
-            .superseded_agent_diff_turn_event_candidates(batch_limit)
-            .await?;
-        let turns_touched = candidates
-            .iter()
-            .map(|candidate| candidate.turn_id.as_str())
-            .collect::<HashSet<_>>()
-            .len() as u64;
-        let mut summary = TurnEventCompactionSummary {
-            dry_run,
-            batch_limit,
-            candidate_rows: candidates.len() as u64,
-            deleted_rows: 0,
-            payload_bytes: candidates
-                .iter()
-                .map(|candidate| candidate.payload_bytes)
-                .sum(),
-            turns_touched,
-            latest_snapshots_kept: stats.latest_snapshots_kept,
-            skipped_unprojected: stats.skipped_unprojected,
-            skipped_failed: stats.skipped_failed,
-        };
-
-        if dry_run || candidates.is_empty() {
-            return Ok(summary);
-        }
-
-        let deleted_rows = self
-            .run_serialized_write(|| {
-                let candidates = candidates.clone();
-                let connection = self.connection.clone();
-                async move {
-                    let transaction = connection
-                        .begin()
-                        .await
-                        .context("failed to begin turn_event compaction transaction")?;
-
-                    let result: Result<u64> = async {
-                        let mut deleted_rows = 0u64;
-                        for candidate in candidates {
-                            turn_event_projection_state::delete_by_event_id(
-                                &transaction,
-                                candidate.event_id.as_str(),
-                            )
-                            .await?;
-                            deleted_rows = deleted_rows.saturating_add(
-                                turn_event::delete_event_by_id(
-                                    &transaction,
-                                    candidate.event_id.as_str(),
-                                )
-                                .await?,
-                            );
-                        }
-                        Ok(deleted_rows)
-                    }
-                    .await;
-
-                    match result {
-                        Ok(deleted_rows) => {
-                            transaction
-                                .commit()
-                                .await
-                                .context("failed to commit turn_event compaction transaction")?;
-                            Ok(deleted_rows)
-                        }
-                        Err(error) => {
-                            let _ = transaction.rollback().await;
-                            Err(error)
-                        }
-                    }
-                }
-            })
-            .await?;
-
-        summary.deleted_rows = deleted_rows;
-        Ok(summary)
-    }
-
-    async fn superseded_agent_diff_turn_event_candidates(
-        &self,
-        batch_limit: u64,
-    ) -> Result<Vec<AgentDiffCompactionCandidate>> {
-        let rows = self
-            .connection
-            .query_all_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                r#"
-WITH ranked_diff_events AS (
-    SELECT
-        e.id AS event_id,
-        e.turn_id AS turn_id,
-        e.sequence AS sequence,
-        json_extract(e.payload, '$.payload.item.id') AS item_id,
-        length(e.payload) AS payload_bytes,
-        COALESCE(ps.status, 'missing') AS projection_status,
-        ROW_NUMBER() OVER (
-            PARTITION BY e.turn_id, json_extract(e.payload, '$.payload.item.id')
-            ORDER BY e.sequence DESC, e.id DESC
-        ) AS row_rank
-    FROM turn_event e
-    LEFT JOIN turn_event_projection_state ps ON ps.event_id = e.id
-    WHERE json_extract(e.payload, '$.kind') = 'item_completed'
-      AND json_extract(e.payload, '$.payload.item.type') = 'systemEvent'
-      AND json_extract(e.payload, '$.payload.item.code') = 'agent_diff_updated'
-      AND json_extract(e.payload, '$.payload.item.id') IS NOT NULL
-)
-SELECT event_id, turn_id, item_id, payload_bytes
-FROM ranked_diff_events
-WHERE row_rank > 1
-  AND projection_status = 'projected'
-ORDER BY turn_id ASC, sequence ASC
-LIMIT ?
-"#,
-                [batch_limit.into()],
-            ))
-            .await
-            .context("failed to query superseded agent diff turn events")?;
-
-        rows.into_iter()
-            .map(|row| {
-                let event_id = row
-                    .try_get::<String>("", "event_id")
-                    .context("failed to decode compactable turn_event id")?;
-                let turn_id = row
-                    .try_get::<String>("", "turn_id")
-                    .context("failed to decode compactable turn_event turn id")?;
-                let item_id = row
-                    .try_get::<String>("", "item_id")
-                    .context("failed to decode compactable turn_event item id")?;
-                let payload_bytes = row
-                    .try_get::<i64>("", "payload_bytes")
-                    .context("failed to decode compactable turn_event payload size")?
-                    .max(0) as u64;
-                Ok(AgentDiffCompactionCandidate {
-                    event_id,
-                    turn_id,
-                    item_id,
-                    payload_bytes,
-                })
-            })
-            .collect()
-    }
-
-    async fn agent_diff_turn_event_compaction_stats(&self) -> Result<AgentDiffCompactionStats> {
-        let Some(row) = self
-            .connection
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                r#"
-WITH ranked_diff_events AS (
-    SELECT
-        e.id AS event_id,
-        e.turn_id AS turn_id,
-        e.sequence AS sequence,
-        json_extract(e.payload, '$.payload.item.id') AS item_id,
-        COALESCE(ps.status, 'missing') AS projection_status,
-        ROW_NUMBER() OVER (
-            PARTITION BY e.turn_id, json_extract(e.payload, '$.payload.item.id')
-            ORDER BY e.sequence DESC, e.id DESC
-        ) AS row_rank
-    FROM turn_event e
-    LEFT JOIN turn_event_projection_state ps ON ps.event_id = e.id
-    WHERE json_extract(e.payload, '$.kind') = 'item_completed'
-      AND json_extract(e.payload, '$.payload.item.type') = 'systemEvent'
-      AND json_extract(e.payload, '$.payload.item.code') = 'agent_diff_updated'
-      AND json_extract(e.payload, '$.payload.item.id') IS NOT NULL
-)
-SELECT
-    COALESCE(SUM(CASE WHEN row_rank = 1 THEN 1 ELSE 0 END), 0) AS latest_snapshots_kept,
-    COALESCE(SUM(CASE
-        WHEN row_rank > 1
-         AND projection_status IN ('pending', 'projecting', 'missing')
-        THEN 1 ELSE 0 END), 0) AS skipped_unprojected,
-    COALESCE(SUM(CASE
-        WHEN row_rank > 1
-         AND projection_status IN ('failed', 'exhausted')
-        THEN 1 ELSE 0 END), 0) AS skipped_failed
-FROM ranked_diff_events
-"#
-                .to_owned(),
-            ))
-            .await
-            .context("failed to query agent diff compaction stats")?
-        else {
-            return Ok(AgentDiffCompactionStats::default());
-        };
-
-        Ok(AgentDiffCompactionStats {
-            latest_snapshots_kept: row
-                .try_get::<i64>("", "latest_snapshots_kept")
-                .context("failed to decode latest agent diff snapshots kept")?
-                .max(0) as u64,
-            skipped_unprojected: row
-                .try_get::<i64>("", "skipped_unprojected")
-                .context("failed to decode skipped unprojected agent diff snapshots")?
-                .max(0) as u64,
-            skipped_failed: row
-                .try_get::<i64>("", "skipped_failed")
-                .context("failed to decode skipped failed agent diff snapshots")?
-                .max(0) as u64,
-        })
-    }
-
     async fn terminal_cli_runtime_native_event_compaction_stats<C: ConnectionTrait>(
         db: &C,
         turn_id: Option<&str>,
@@ -15827,69 +15351,6 @@ WHERE id IN (SELECT event_id FROM candidates)
             ))
             .await
             .context("failed to delete compactable CLI runtime native events")?;
-        Ok(result.rows_affected())
-    }
-
-    async fn terminal_turn_item_attempt_payload_compaction_stats<C: ConnectionTrait>(
-        db: &C,
-        batch_limit: u64,
-    ) -> Result<TurnItemAttemptPayloadCompactionStats> {
-        let sql = terminal_turn_item_attempt_payload_compaction_sql(
-            r#"
-SELECT
-    COUNT(*) AS candidate_rows,
-    COALESCE(SUM(payload_bytes), 0) AS payload_bytes,
-    COUNT(DISTINCT turn_id) AS turns_touched
-FROM candidates
-"#,
-        );
-        let Some(row) = db
-            .query_one_raw(terminal_turn_item_attempt_payload_compaction_statement(
-                db.get_database_backend(),
-                sql,
-                batch_limit,
-            ))
-            .await
-            .context("failed to query turn_item_attempt payload compaction stats")?
-        else {
-            return Ok(TurnItemAttemptPayloadCompactionStats::default());
-        };
-
-        Ok(TurnItemAttemptPayloadCompactionStats {
-            candidate_rows: row
-                .try_get::<i64>("", "candidate_rows")
-                .context("failed to decode compactable turn_item_attempt payload count")?
-                .max(0) as u64,
-            payload_bytes: row
-                .try_get::<i64>("", "payload_bytes")
-                .context("failed to decode compactable turn_item_attempt payload size")?
-                .max(0) as u64,
-            turns_touched: row
-                .try_get::<i64>("", "turns_touched")
-                .context("failed to decode compactable turn_item_attempt turn count")?
-                .max(0) as u64,
-        })
-    }
-
-    async fn clear_terminal_turn_item_attempt_payload_compaction_batch<C: ConnectionTrait>(
-        db: &C,
-        batch_limit: u64,
-    ) -> Result<u64> {
-        let sql = terminal_turn_item_attempt_payload_compaction_sql(
-            r#"
-UPDATE turn_item_attempt
-SET payload = '{}'
-WHERE id IN (SELECT attempt_id FROM candidates)
-"#,
-        );
-        let result = db
-            .execute_raw(terminal_turn_item_attempt_payload_compaction_statement(
-                db.get_database_backend(),
-                sql,
-                batch_limit,
-            ))
-            .await
-            .context("failed to clear compactable turn_item_attempt payloads")?;
         Ok(result.rows_affected())
     }
 
@@ -20292,117 +19753,6 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             .collect::<Result<Vec<_>>>()?)
     }
 
-    pub async fn backfill_turn_item_execution_classes_batch(
-        &self,
-        limit: u64,
-        context_compaction: TurnItemAttemptTimeoutDurations,
-    ) -> Result<TurnItemExecutionClassBackfillBatch> {
-        self.run_serialized_write(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin turn item execution-class backfill transaction")?;
-            let result = async {
-                let candidates =
-                    turn_item_attempt::list_unclassified_execution_attempts(&transaction, limit)
-                        .await?;
-                let mut summary = TurnItemExecutionClassBackfillBatch::default();
-                for candidate in candidates {
-                    let item = serde_json::from_str::<TurnItem>(candidate.item_payload.as_str())
-                        .with_context(|| {
-                            format!(
-                                "failed to decode item `{}` for attempt `{}` execution classification",
-                                candidate.item_id, candidate.attempt_id
-                            )
-                        })?;
-                    if item.item_id() != candidate.item_id {
-                        bail!(
-                            "attempt `{}` references item `{}`, but payload contains `{}`",
-                            candidate.attempt_id,
-                            candidate.item_id,
-                            item.item_id()
-                        );
-                    }
-                    let stored_item_type = turn_item_type_from_db(candidate.item_type.as_str())
-                        .with_context(|| {
-                            format!(
-                                "attempt `{}` has unknown item type `{}`",
-                                candidate.attempt_id, candidate.item_type
-                            )
-                        })?;
-                    if item.item_type() != stored_item_type {
-                        bail!(
-                            "attempt `{}` item type `{:?}` does not match payload type `{:?}`",
-                            candidate.attempt_id,
-                            stored_item_type,
-                            item.item_type()
-                        );
-                    }
-
-                    let execution_class = item.execution_class();
-                    let deadlines = if execution_class == TurnItemExecutionClass::ContextCompaction
-                    {
-                        Some(turn_item_attempt::AttemptDeadlines {
-                            lease_expires_at: Some(unix_to_datetime(
-                                candidate.started_at.timestamp().saturating_add(
-                                    i64::try_from(context_compaction.lease_secs)
-                                        .unwrap_or(i64::MAX),
-                                ),
-                            )),
-                            idle_deadline_at: Some(unix_to_datetime(
-                                candidate.started_at.timestamp().saturating_add(
-                                    i64::try_from(context_compaction.idle_secs)
-                                        .unwrap_or(i64::MAX),
-                                ),
-                            )),
-                            hard_deadline_at: Some(unix_to_datetime(
-                                candidate.started_at.timestamp().saturating_add(
-                                    i64::try_from(context_compaction.hard_secs)
-                                        .unwrap_or(i64::MAX),
-                                ),
-                            )),
-                        })
-                    } else {
-                        None
-                    };
-                    if turn_item_attempt::classify_execution_attempt(
-                        &transaction,
-                        &candidate,
-                        execution_class,
-                        deadlines,
-                    )
-                    .await?
-                    {
-                        summary.attempts_classified =
-                            summary.attempts_classified.saturating_add(1);
-                        if execution_class == TurnItemExecutionClass::ContextCompaction {
-                            summary.context_compactions_classified = summary
-                                .context_compactions_classified
-                                .saturating_add(1);
-                        }
-                    }
-                }
-                Ok(summary)
-            }
-            .await;
-
-            match result {
-                Ok(summary) => {
-                    transaction.commit().await.context(
-                        "failed to commit turn item execution-class backfill transaction",
-                    )?;
-                    Ok(summary)
-                }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    Err(error)
-                }
-            }
-        })
-        .await
-    }
-
     pub async fn list_running_turn_item_attempts_for_turn(
         &self,
         turn_id: &str,
@@ -20801,7 +20151,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
 
             let repairs_for_write = repairs.clone();
             let cursor_for_write = next_cursor.clone();
-            let (repaired, revised_turn_ids) = self
+            let repaired = self
                 .run_background_database_quantum(|| {
                     let repairs = repairs_for_write.clone();
                     let cursor = cursor_for_write.clone();
@@ -20810,7 +20160,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                             self.connection.begin().await.context(
                                 "failed to begin terminal turn_item full-scan transaction",
                             )?;
-                        let (repaired, revised_turn_ids) = self
+                        let repaired = self
                             .apply_terminal_turn_item_payload_repairs(&transaction, repairs)
                             .await?;
                         read_model_repair::advance_full_scan_cursor(
@@ -20824,7 +20174,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                             .commit()
                             .await
                             .context("failed to commit terminal turn_item full-scan transaction")?;
-                        Ok((repaired, revised_turn_ids))
+                        Ok(repaired)
                     }
                 })
                 .await?;
@@ -20832,9 +20182,6 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             summary.remaining = summary
                 .remaining
                 .saturating_add(repairs.len().saturating_sub(repaired));
-            for turn_id in revised_turn_ids {
-                self.advance_semantic_timeline_revision(turn_id.as_str());
-            }
             cursor = Some(next_cursor);
         }
 
@@ -20962,7 +20309,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             let dirty_for_write = dirty_rows.clone();
             let repairs_for_write = repairs.clone();
             let previous_cursor = cursor;
-            let (repaired, revised_turn_ids) = self
+            let repaired = self
                 .run_background_database_quantum(|| {
                     let dirty_rows = dirty_for_write.clone();
                     let repairs = repairs_for_write.clone();
@@ -20971,10 +20318,9 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                             "failed to begin incremental terminal payload repair transaction",
                         )?;
                         let mut repaired = 0usize;
-                        let mut revised_turn_ids = Vec::new();
                         for dirty in &dirty_rows {
                             if let Some((row, payload_json)) = repairs.get(&dirty.turn_item_id) {
-                                let (applied, revised_turn_id) = self
+                                let applied = self
                                     .apply_one_terminal_turn_item_payload_repair(
                                         &transaction,
                                         row,
@@ -20983,9 +20329,6 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                                     .await?;
                                 if applied {
                                     repaired = repaired.saturating_add(1);
-                                    if let Some(turn_id) = revised_turn_id {
-                                        revised_turn_ids.push(turn_id);
-                                    }
                                     // The repair UPDATE itself fires the dirty
                                     // trigger. No other writer can interleave
                                     // inside this transaction, so remove that
@@ -21028,7 +20371,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                         transaction.commit().await.context(
                             "failed to commit incremental terminal payload repair transaction",
                         )?;
-                        Ok((repaired, revised_turn_ids))
+                        Ok(repaired)
                     }
                 })
                 .await?;
@@ -21036,9 +20379,6 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             summary.remaining = summary
                 .remaining
                 .saturating_add(repairs.len().saturating_sub(repaired));
-            for turn_id in revised_turn_ids {
-                self.advance_semantic_timeline_revision(turn_id.as_str());
-            }
             cursor = next_cursor;
         }
 
@@ -21069,21 +20409,17 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         &self,
         transaction: &DatabaseTransaction,
         repairs: Vec<(pioneer_entity::turn_item::Model, String)>,
-    ) -> Result<(usize, Vec<String>)> {
+    ) -> Result<usize> {
         let mut repaired = 0usize;
-        let mut revised_turn_ids = Vec::new();
         for (row, payload_json) in repairs {
-            let (applied, revised_turn_id) = self
+            let applied = self
                 .apply_one_terminal_turn_item_payload_repair(transaction, &row, &payload_json)
                 .await?;
             if applied {
                 repaired = repaired.saturating_add(1);
-                if let Some(turn_id) = revised_turn_id {
-                    revised_turn_ids.push(turn_id);
-                }
             }
         }
-        Ok((repaired, revised_turn_ids))
+        Ok(repaired)
     }
 
     async fn apply_one_terminal_turn_item_payload_repair(
@@ -21091,7 +20427,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         transaction: &DatabaseTransaction,
         row: &pioneer_entity::turn_item::Model,
         payload_json: &str,
-    ) -> Result<(bool, Option<String>)> {
+    ) -> Result<bool> {
         let now: DateTimeWithTimeZone = chrono::Utc::now().into();
         pioneer_entity::turn_item::Entity::update_many()
             .filter(pioneer_entity::turn_item::Column::Id.eq(row.id.clone()))
@@ -21120,7 +20456,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 current.status.as_deref() == row.status.as_deref()
                     && current.payload == payload_json
             });
-        Ok((applied, applied.then(|| row.turn_id.clone())))
+        Ok(applied)
     }
 
     async fn repair_terminal_turn_running_attempts(&self) -> Result<RepairSummary> {
@@ -21209,7 +20545,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
 
             if !candidates.is_empty() {
                 let candidates_for_write = candidates.clone();
-                let (repaired_rows, resolved, revised_turn_ids) = self
+                let (repaired_rows, resolved) = self
                     .run_background_database_quantum(|| {
                         let candidates = candidates_for_write.clone();
                         async move {
@@ -21237,7 +20573,6 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                             let now: DateTimeWithTimeZone = chrono::Utc::now().into();
                             let mut repaired_rows = 0usize;
                             let mut resolved = 0usize;
-                            let mut revised_turn_ids = Vec::new();
 
                             for attempt in candidates {
                                 if !still_terminal.contains(attempt.turn_id.as_str()) {
@@ -21312,13 +20647,12 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                                     .context("failed to repair active turn_item attempt status")?;
                                 if item_result.rows_affected > 0 {
                                     repaired_rows = repaired_rows.saturating_add(1);
-                                    revised_turn_ids.push(attempt.turn_id);
                                 }
                             }
                             transaction.commit().await.context(
                                 "failed to commit running attempt repair transaction",
                             )?;
-                            Ok((repaired_rows, resolved, revised_turn_ids))
+                            Ok((repaired_rows, resolved))
                         }
                     })
                     .await?;
@@ -21326,9 +20660,6 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 summary.remaining = summary
                     .remaining
                     .saturating_add(candidates.len().saturating_sub(resolved));
-                for turn_id in revised_turn_ids {
-                    self.advance_semantic_timeline_revision(turn_id.as_str());
-                }
             }
         }
         Ok(summary)
@@ -25433,44 +24764,6 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         Ok(appended_events)
     }
 
-    async fn backfill_task_event_fanout_cursors_batch_once(&self, limit: u64) -> Result<usize> {
-        let transaction = self
-            .connection
-            .begin()
-            .await
-            .context("failed to begin task event fanout cursor backfill transaction")?;
-        let result = async {
-            let candidates =
-                task_event::list_missing_fanout_cursor_high_watermarks(&transaction, limit).await?;
-            let initialized_at = chrono::Utc::now().fixed_offset();
-            for candidate in &candidates {
-                task_event::initialize_fanout_cursor(
-                    &transaction,
-                    candidate.task_id.as_str(),
-                    candidate.last_sequence,
-                    initialized_at,
-                )
-                .await?;
-            }
-            Ok::<_, anyhow::Error>(candidates.len())
-        }
-        .await;
-
-        match result {
-            Ok(processed) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit task event fanout cursor backfill transaction")?;
-                Ok(processed)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
     async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
@@ -26579,49 +25872,6 @@ fn terminal_cli_runtime_native_event_compaction_statement(
     Statement::from_sql_and_values(backend, sql, values)
 }
 
-fn terminal_turn_item_attempt_payload_compaction_sql(result_sql: &str) -> String {
-    format!(
-        r#"
-WITH candidates AS (
-    SELECT
-        id AS attempt_id,
-        turn_id,
-        length(COALESCE(payload, '')) AS payload_bytes
-    FROM turn_item_attempt
-    WHERE status IN (
-        '{completed}',
-        '{failed}',
-        '{interrupted}',
-        '{cancelled}',
-        '{exhausted}'
-    )
-      AND payload <> '{{}}'
-    ORDER BY updated_at ASC, id ASC
-    LIMIT ?
-)
-{result_sql}
-"#,
-        completed = ATTEMPT_STATUS_COMPLETED,
-        failed = ATTEMPT_STATUS_FAILED,
-        interrupted = ATTEMPT_STATUS_INTERRUPTED,
-        cancelled = ATTEMPT_STATUS_CANCELLED,
-        exhausted = ATTEMPT_STATUS_EXHAUSTED,
-        result_sql = result_sql
-    )
-}
-
-fn terminal_turn_item_attempt_payload_compaction_statement(
-    backend: DatabaseBackend,
-    sql: String,
-    batch_limit: u64,
-) -> Statement {
-    Statement::from_sql_and_values(
-        backend,
-        sql,
-        [(batch_limit.min(i64::MAX as u64) as i64).into()],
-    )
-}
-
 fn contains_any_key(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     match value {
         serde_json::Value::Object(map) => {
@@ -26920,15 +26170,15 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTEMPT_STATUS_COMPLETED, AgentExecutionInput, AgentResourceStateInput,
-        ArtifactBindingTargetRecord, BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE,
-        BlockedTurnRecoveryResumeOutcome, CanonicalTurnEventPayload, ClaimedRecoveryActivation,
-        CliRuntimeExecutionSegmentStatus, CliRuntimeNativeEventListFilter,
-        CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
-        CliRuntimeProviderSessionLifecycle, CliRuntimeRequestAuthorizationBinding,
-        CliRuntimeThreadMcpMetadata, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
-        CliRuntimeTurnMcpMetadata, CompletedMessageTurnWrite, ConversationArtifactRefLimits,
-        CrudStore, DeleteTurnMessageRequest, EditTurnMessageRequest, IngestArtifactMetadataRecord,
+        AgentExecutionInput, AgentResourceStateInput, ArtifactBindingTargetRecord,
+        BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE, BlockedTurnRecoveryResumeOutcome,
+        CanonicalTurnEventPayload, ClaimedRecoveryActivation, CliRuntimeExecutionSegmentStatus,
+        CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
+        CliRuntimePendingRequestStatus, CliRuntimeProviderSessionLifecycle,
+        CliRuntimeRequestAuthorizationBinding, CliRuntimeThreadMcpMetadata,
+        CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter, CliRuntimeTurnMcpMetadata,
+        CompletedMessageTurnWrite, ConversationArtifactRefLimits, CrudStore,
+        DeleteTurnMessageRequest, EditTurnMessageRequest, IngestArtifactMetadataRecord,
         McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
         NativeExecutionWindowTransition, NewArtifactBlobRecord, NewCliRuntimeInstructionProjection,
         NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
@@ -26960,6 +26210,7 @@ mod tests {
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
         tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
     };
+    use crate::convention::ATTEMPT_STATUS_COMPLETED;
     use crate::repositories::{read_model_repair, thread, turn, turn_finalization};
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -31143,7 +30394,7 @@ mod tests {
         }
 
         let dry_run = store
-            .compact_terminal_cli_runtime_native_events(100, true)
+            .compact_terminal_cli_runtime_native_events_for_turn(terminal_turn_id, 100, true)
             .await
             .expect("dry run should succeed");
         assert_eq!(dry_run.candidate_rows, 5);
@@ -31151,7 +30402,7 @@ mod tests {
         assert_eq!(dry_run.turns_touched, 1);
 
         let compacted = store
-            .compact_terminal_cli_runtime_native_events(100, false)
+            .compact_terminal_cli_runtime_native_events_for_turn(terminal_turn_id, 100, false)
             .await
             .expect("compaction should succeed");
         assert_eq!(compacted.candidate_rows, 5);
@@ -32590,15 +31841,6 @@ mod tests {
             .append_task_events(events, timestamp + 10)
             .await
             .expect("legacy replay should be idempotent");
-        assert_eq!(
-            store
-                .backfill_task_event_fanout_cursors_batch(256)
-                .await
-                .expect("orphaned legacy events should not stall cursor backfill"),
-            0,
-            "events without a materialized task are not fanout candidates"
-        );
-
         let binding = store
             .get_task_run_primary_thread_binding(run.id.as_str())
             .await
@@ -33758,39 +33000,6 @@ mod tests {
             .advance_task_event_fanout_cursor(task.id.as_str(), updated.sequence)
             .await
             .expect("new legacy task event should be acknowledged");
-
-        pioneer_entity::task_event_fanout_cursor::Entity::delete_by_id(task.id.clone())
-            .exec(&store.database_connection())
-            .await
-            .expect("background backfill fixture should delete");
-        assert_eq!(
-            store
-                .get_task_event_fanout_cursor(task.id.as_str())
-                .await
-                .expect("missing legacy cursor should load"),
-            None
-        );
-        assert_eq!(
-            store
-                .backfill_task_event_fanout_cursors_batch(256)
-                .await
-                .expect("legacy cursor should backfill"),
-            1
-        );
-        assert_eq!(
-            store
-                .get_task_event_fanout_cursor(task.id.as_str())
-                .await
-                .expect("backfilled cursor should load"),
-            Some(updated.sequence)
-        );
-        assert_eq!(
-            store
-                .backfill_task_event_fanout_cursors_batch(256)
-                .await
-                .expect("completed cursor backfill should be a no-op"),
-            0
-        );
     }
 
     fn sample_mcp_installation(name: &str) -> McpServerInstallationRecord {
@@ -34041,304 +33250,6 @@ mod tests {
             raw_events.len(),
             2,
             "turn/start plus one final diff snapshot should remain"
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_superseded_agent_diff_events_removes_only_old_projected_snapshots() {
-        let workspace_id = "ws_diff_compaction";
-        let thread_id = "thr_diff_compaction";
-        let turn_id = "turn_diff_compaction";
-        let timestamp = 1_700_000_000;
-        let store = test_store_with_workspace(workspace_id).await;
-        let thread = Thread {
-            workspace_id: workspace_id.to_owned(),
-            id: thread_id.to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            id: turn_id.to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-
-        for (index, payload) in ["first diff", "second diff", "third diff"]
-            .into_iter()
-            .enumerate()
-        {
-            store
-                .materialize_item_completed(
-                    ItemCompletedNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item: TurnItem::SystemEvent {
-                            id: "agent_diff_native_turn".to_owned(),
-                            level: SystemEventLevel::Info,
-                            message: "Diff updated".to_owned(),
-                            code: Some("agent_diff_updated".to_owned()),
-                            details: Some(serde_json::json!({"payload": payload})),
-                        },
-                    },
-                    timestamp + 1 + index as i64,
-                )
-                .await
-                .expect("historical diff event should persist");
-        }
-
-        let dry_run = store
-            .compact_superseded_agent_diff_turn_events(100, true)
-            .await
-            .expect("dry run should succeed");
-        assert_eq!(dry_run.candidate_rows, 2);
-        assert_eq!(dry_run.deleted_rows, 0);
-        assert!(dry_run.payload_bytes > 0);
-        assert_eq!(dry_run.latest_snapshots_kept, 1);
-        assert_eq!(dry_run.skipped_unprojected, 0);
-        assert_eq!(dry_run.skipped_failed, 0);
-
-        let compacted = store
-            .compact_superseded_agent_diff_turn_events(100, false)
-            .await
-            .expect("compaction should succeed");
-        assert_eq!(compacted.candidate_rows, 2);
-        assert_eq!(compacted.deleted_rows, 2);
-        assert_eq!(compacted.latest_snapshots_kept, 1);
-
-        let raw_events = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
-            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
-            .all(&store.connection)
-            .await
-            .expect("raw events should query");
-        assert_eq!(
-            raw_events.len(),
-            2,
-            "turn/start and the latest diff event should remain"
-        );
-
-        let response = store
-            .get_turn_item_events(thread_id, turn_id)
-            .await
-            .expect("turn items should load")
-            .expect("turn should exist");
-        assert_eq!(response.events.len(), 1);
-        let TurnItemEventPayload::ItemCompleted { item, .. } = &response.events[0].payload else {
-            panic!("latest historical diff should remain durable");
-        };
-        let TurnItem::SystemEvent { details, .. } = item else {
-            panic!("latest diff should be a system event");
-        };
-        assert_eq!(
-            details.as_ref().and_then(|details| details.get("payload")),
-            Some(&serde_json::json!("third diff"))
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_agent_diff_summary_counts_skipped_projection_states() {
-        let workspace_id = "ws_diff_compaction_skips";
-        let thread_id = "thr_diff_compaction_skips";
-        let turn_id = "turn_diff_compaction_skips";
-        let timestamp = 1_700_000_000;
-        let store = test_store_with_workspace(workspace_id).await;
-        let thread = Thread {
-            workspace_id: workspace_id.to_owned(),
-            id: thread_id.to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            id: turn_id.to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-
-        for (index, payload) in [
-            "failed old diff",
-            "pending old diff",
-            "projected old diff",
-            "latest diff",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            store
-                .materialize_item_completed(
-                    ItemCompletedNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item: TurnItem::SystemEvent {
-                            id: "agent_diff_native_turn".to_owned(),
-                            level: SystemEventLevel::Info,
-                            message: "Diff updated".to_owned(),
-                            code: Some("agent_diff_updated".to_owned()),
-                            details: Some(serde_json::json!({"payload": payload})),
-                        },
-                    },
-                    timestamp + 1 + index as i64,
-                )
-                .await
-                .expect("historical diff event should persist");
-        }
-
-        let raw_events = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
-            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
-            .all(&store.connection)
-            .await
-            .expect("raw events should query");
-        assert_eq!(raw_events.len(), 5);
-
-        for (event, status) in [
-            (
-                &raw_events[1],
-                crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED,
-            ),
-            (
-                &raw_events[2],
-                crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PENDING,
-            ),
-        ] {
-            pioneer_entity::turn_event_projection_state::Entity::update_many()
-                .col_expr(
-                    pioneer_entity::turn_event_projection_state::Column::Status,
-                    sea_orm::sea_query::Expr::value(status.to_owned()),
-                )
-                .filter(
-                    pioneer_entity::turn_event_projection_state::Column::EventId
-                        .eq(event.id.clone()),
-                )
-                .exec(&store.connection)
-                .await
-                .expect("projection state status should update");
-        }
-
-        let dry_run = store
-            .compact_superseded_agent_diff_turn_events(100, true)
-            .await
-            .expect("dry run should succeed");
-        assert_eq!(dry_run.candidate_rows, 1);
-        assert_eq!(dry_run.deleted_rows, 0);
-        assert_eq!(dry_run.latest_snapshots_kept, 1);
-        assert_eq!(dry_run.skipped_unprojected, 1);
-        assert_eq!(dry_run.skipped_failed, 1);
-
-        let compacted = store
-            .compact_superseded_agent_diff_turn_events(100, false)
-            .await
-            .expect("compaction should succeed");
-        assert_eq!(compacted.candidate_rows, 1);
-        assert_eq!(compacted.deleted_rows, 1);
-        assert_eq!(compacted.skipped_unprojected, 1);
-        assert_eq!(compacted.skipped_failed, 1);
-
-        let remaining_events = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
-            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
-            .all(&store.connection)
-            .await
-            .expect("remaining raw events should query");
-        let sequences = remaining_events
-            .iter()
-            .map(|event| event.sequence)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            sequences,
-            vec![1, 2, 3, 5],
-            "compaction must leave sequence gaps instead of renumbering"
-        );
-
-        let response = store
-            .get_turn_item_events(thread_id, turn_id)
-            .await
-            .expect("turn items should load")
-            .expect("turn should exist");
-        assert_eq!(response.events.len(), 3);
-        let TurnItemEventPayload::ItemCompleted { item, .. } = &response
-            .events
-            .last()
-            .expect("latest event should exist")
-            .payload
-        else {
-            panic!("latest raw snapshot should remain durable");
-        };
-        let TurnItem::SystemEvent { details, .. } = item else {
-            panic!("latest diff should be a system event");
-        };
-        assert_eq!(
-            details.as_ref().and_then(|details| details.get("payload")),
-            Some(&serde_json::json!("latest diff"))
         );
     }
 
@@ -36793,7 +35704,7 @@ mod tests {
             .begin()
             .await
             .expect("repair transaction should begin");
-        let (applied, _) = store
+        let applied = store
             .apply_one_terminal_turn_item_payload_repair(
                 &transaction,
                 &stale_row,
