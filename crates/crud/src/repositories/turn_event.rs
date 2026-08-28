@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use pioneer_entity::turn_event;
+use pioneer_protocol::TurnItem;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
@@ -134,6 +135,150 @@ pub async fn delete_event_by_id<C: ConnectionTrait>(db: &C, event_id: &str) -> R
         .await
         .with_context(|| format!("failed to delete turn_event `{event_id}`"))
         .map(|result| result.rows_affected)
+}
+
+/// Repairs a legacy final agent-diff snapshot whose denormalized thread owner
+/// came from the reusable CLI session instead of the Turn binding. The raw
+/// event column, canonical payload, and payload-derived idempotency key must
+/// move together or subsequent idempotent appends would no longer recognize
+/// the repaired event.
+pub async fn repair_legacy_agent_diff_thread_owner<C: ConnectionTrait>(
+    db: &C,
+    event_id: &str,
+    turn_id: &str,
+    legacy_thread_id: &str,
+    canonical_thread_id: &str,
+) -> Result<bool> {
+    let model = turn_event::Entity::find_by_id(event_id.to_owned())
+        .one(db)
+        .await
+        .with_context(|| format!("failed to load legacy agent diff event `{event_id}`"))?
+        .with_context(|| format!("legacy agent diff event `{event_id}` is missing"))?;
+
+    if model.turn_id != turn_id {
+        anyhow::bail!(
+            "legacy agent diff event `{event_id}` belongs to Turn `{}`, not `{turn_id}`",
+            model.turn_id
+        );
+    }
+    if model.thread_id == canonical_thread_id {
+        let payload = appended_event_from_model(model)?;
+        if payload.payload.thread_id() != canonical_thread_id {
+            anyhow::bail!(
+                "legacy agent diff event `{event_id}` has a canonical row owner but a mismatched payload owner"
+            );
+        }
+        return Ok(false);
+    }
+    if model.thread_id != legacy_thread_id {
+        anyhow::bail!(
+            "legacy agent diff event `{event_id}` belongs to thread `{}`, not expected legacy thread `{legacy_thread_id}`",
+            model.thread_id
+        );
+    }
+    if model.event_type != pioneer_protocol::constants::events::ITEM_COMPLETED {
+        anyhow::bail!(
+            "cross-thread event `{event_id}` has unsupported type `{}`",
+            model.event_type
+        );
+    }
+
+    let mut payload = serde_json::from_str::<TurnEventPayload>(model.payload.as_str())
+        .with_context(|| format!("failed to decode legacy agent diff event `{event_id}`"))?;
+    let TurnEventPayload::ItemCompleted(notification) = &mut payload else {
+        anyhow::bail!("cross-thread event `{event_id}` is not an item/completed payload");
+    };
+    if notification.turn_id != turn_id || notification.thread_id != legacy_thread_id {
+        anyhow::bail!(
+            "cross-thread agent diff event `{event_id}` payload ownership does not match its persisted row"
+        );
+    }
+    if !matches!(
+        &notification.item,
+        TurnItem::SystemEvent {
+            code: Some(code),
+            ..
+        } if code == "agent_diff_updated"
+    ) {
+        anyhow::bail!(
+            "cross-thread event `{event_id}` is not a repairable final agent diff snapshot"
+        );
+    }
+    notification.thread_id = canonical_thread_id.to_owned();
+
+    let repaired_payload = serde_json::to_string(&payload)
+        .with_context(|| format!("failed to encode repaired agent diff event `{event_id}`"))?;
+    let repaired_idempotency_key = payload.idempotency_key().with_context(|| {
+        format!("failed to derive repaired agent diff event `{event_id}` identity")
+    })?;
+    if let Some(conflict) = turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_event::Column::IdempotencyKey.eq(repaired_idempotency_key.clone()))
+        .filter(turn_event::Column::Id.ne(event_id.to_owned()))
+        .one(db)
+        .await
+        .with_context(|| {
+            format!("failed to check repaired agent diff event `{event_id}` identity")
+        })?
+    {
+        anyhow::bail!(
+            "cannot repair agent diff event `{event_id}` because event `{}` already owns its canonical identity",
+            conflict.id
+        );
+    }
+
+    let original_payload = model.payload;
+    let original_idempotency_key = model.idempotency_key;
+    let mut update = turn_event::Entity::update_many()
+        .col_expr(
+            turn_event::Column::ThreadId,
+            Expr::value(canonical_thread_id.to_owned()),
+        )
+        .col_expr(
+            turn_event::Column::Payload,
+            Expr::value(repaired_payload.clone()),
+        )
+        .col_expr(
+            turn_event::Column::IdempotencyKey,
+            Expr::value(Some(repaired_idempotency_key.clone())),
+        )
+        .filter(turn_event::Column::Id.eq(event_id.to_owned()))
+        .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_event::Column::ThreadId.eq(legacy_thread_id.to_owned()))
+        .filter(turn_event::Column::Payload.eq(original_payload));
+    update = match original_idempotency_key {
+        Some(idempotency_key) => {
+            update.filter(turn_event::Column::IdempotencyKey.eq(idempotency_key))
+        }
+        None => update.filter(turn_event::Column::IdempotencyKey.is_null()),
+    };
+
+    let changed = update
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to repair legacy agent diff event `{event_id}`"))?
+        .rows_affected;
+    if changed > 1 {
+        anyhow::bail!(
+            "legacy agent diff event `{event_id}` ownership repair changed {changed} rows"
+        );
+    }
+
+    // SQLite reports zero affected rows for a successful UPDATE routed through
+    // the INSTEAD OF trigger on the transparent Zstd view. Verify the durable
+    // result instead of interpreting that driver count as a failed compare-and-set.
+    let repaired = turn_event::Entity::find_by_id(event_id.to_owned())
+        .one(db)
+        .await
+        .with_context(|| format!("failed to verify repaired agent diff event `{event_id}`"))?
+        .with_context(|| format!("repaired agent diff event `{event_id}` disappeared"))?;
+    if repaired.thread_id != canonical_thread_id
+        || repaired.payload != repaired_payload
+        || repaired.idempotency_key.as_deref() != Some(repaired_idempotency_key.as_str())
+    {
+        anyhow::bail!("legacy agent diff event `{event_id}` changed during ownership repair");
+    }
+    Ok(true)
 }
 
 pub async fn latest_event_for_turn<C: ConnectionTrait>(

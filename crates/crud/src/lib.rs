@@ -1471,6 +1471,8 @@ pub struct TurnProjectionStreamStateRecord {
 pub struct TurnProjectionStreamBackfillBatch {
     pub streams_scanned: usize,
     pub streams_quarantined: usize,
+    pub streams_repaired: usize,
+    pub events_repaired: usize,
     pub last_turn_id: Option<String>,
 }
 
@@ -24323,14 +24325,39 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 let streams_scanned = candidates.len();
                 let last_turn_id = candidates.last().map(|candidate| candidate.turn_id.clone());
                 let mut streams_quarantined = 0usize;
+                let mut streams_repaired = 0usize;
+                let mut events_repaired = 0usize;
                 for candidate in candidates {
-                    if candidate.first_thread_id != candidate.last_thread_id {
-                        bail!(
-                            "projection stream for Turn `{}` spans threads `{}` and `{}`",
-                            candidate.turn_id,
-                            candidate.first_thread_id,
-                            candidate.last_thread_id
-                        );
+                    let turn_model = turn::find_turn_by_id(
+                        &transaction,
+                        candidate.turn_id.as_str(),
+                    )
+                    .await?
+                    .with_context(|| {
+                        format!(
+                            "projection stream state backfill cannot find Turn `{}`",
+                            candidate.turn_id
+                        )
+                    })?;
+                    let canonical_thread_id = turn_model.thread_id;
+                    if candidate.first_thread_id != canonical_thread_id
+                        || candidate.last_thread_id != canonical_thread_id
+                    {
+                        let repaired = turn_event_projection_state::repair_legacy_agent_diff_thread_owners_for_turn(
+                            &transaction,
+                            candidate.turn_id.as_str(),
+                            canonical_thread_id.as_str(),
+                        )
+                        .await?;
+                        if repaired == 0 {
+                            bail!(
+                                "projection stream for Turn `{}` does not belong to canonical thread `{}` and has no repairable legacy agent diff events",
+                                candidate.turn_id,
+                                canonical_thread_id
+                            );
+                        }
+                        streams_repaired = streams_repaired.saturating_add(1);
+                        events_repaired = events_repaired.saturating_add(repaired);
                     }
 
                     if let Some(blocker) = blockers_by_turn.remove(candidate.turn_id.as_str()) {
@@ -24340,7 +24367,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                         });
                         if turn_event_projection_stream_state::quarantine(
                             &transaction,
-                            candidate.first_thread_id.as_str(),
+                            canonical_thread_id.as_str(),
                             candidate.turn_id.as_str(),
                             blocker.event_id.as_str(),
                             error_message,
@@ -24353,17 +24380,17 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                     } else {
                         let stream = turn_event_projection_stream_state::ensure_healthy(
                             &transaction,
-                            candidate.first_thread_id.as_str(),
+                            canonical_thread_id.as_str(),
                             candidate.turn_id.as_str(),
                             candidate.created_at,
                         )
                         .await?;
-                        if stream.thread_id != candidate.first_thread_id {
+                        if stream.thread_id != canonical_thread_id {
                             bail!(
                                 "projection stream `{}` belongs to thread `{}`, not `{}`",
                                 candidate.turn_id,
                                 stream.thread_id,
-                                candidate.first_thread_id
+                                canonical_thread_id
                             );
                         }
                     }
@@ -24372,6 +24399,8 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 Ok(TurnProjectionStreamBackfillBatch {
                     streams_scanned,
                     streams_quarantined,
+                    streams_repaired,
+                    events_repaired,
                     last_turn_id,
                 })
             }

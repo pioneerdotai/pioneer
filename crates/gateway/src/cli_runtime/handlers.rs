@@ -6177,8 +6177,8 @@ impl MessageProcessor {
             self.crud_store
                 .materialize_agent_diff_final_snapshot_if_changed(
                     ItemCompletedNotification {
-                        workspace_id: key.workspace_id.clone(),
-                        thread_id: key.thread_id.clone(),
+                        workspace_id: turn_binding.workspace_id.clone(),
+                        thread_id: turn_binding.thread_id.clone(),
                         turn_id: turn_binding.turn_id.clone(),
                         item,
                     },

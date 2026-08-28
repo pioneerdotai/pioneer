@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
-use pioneer_entity::turn_event_projection_state;
+use pioneer_entity::{
+    turn_event_delivery, turn_event_projection_state,
+    turn_event_projection_stream_state as stream_state_entity, turn_liveness,
+};
 use pioneer_protocol::generate_id;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::ExprTrait;
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
@@ -103,6 +106,122 @@ pub async fn list_exhausted_causal_heads_for_turns<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list exhausted projection stream causal heads")
+}
+
+/// Canonicalizes the narrow legacy corruption produced by final CLI agent-diff
+/// snapshots that used the reusable session thread instead of their Turn's
+/// durable thread binding. Unsupported cross-thread events remain hard errors;
+/// this repair must never guess ownership for arbitrary event payloads.
+pub async fn repair_legacy_agent_diff_thread_owners_for_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    canonical_thread_id: &str,
+) -> Result<usize> {
+    let mismatches = turn_event_projection_state::Entity::find()
+        .filter(turn_event_projection_state::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_event_projection_state::Column::ThreadId.ne(canonical_thread_id.to_owned()))
+        .order_by_asc(turn_event_projection_state::Column::Sequence)
+        .order_by_asc(turn_event_projection_state::Column::EventId)
+        .all(db)
+        .await
+        .with_context(|| {
+            format!("failed to load cross-thread projection events for Turn `{turn_id}`")
+        })?;
+
+    for mismatch in &mismatches {
+        super::turn_event::repair_legacy_agent_diff_thread_owner(
+            db,
+            mismatch.event_id.as_str(),
+            turn_id,
+            mismatch.thread_id.as_str(),
+            canonical_thread_id,
+        )
+        .await?;
+
+        let changed = turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                turn_event_projection_state::Column::ThreadId,
+                Expr::value(canonical_thread_id.to_owned()),
+            )
+            .filter(turn_event_projection_state::Column::EventId.eq(mismatch.event_id.clone()))
+            .filter(turn_event_projection_state::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(turn_event_projection_state::Column::ThreadId.eq(mismatch.thread_id.clone()))
+            .exec(db)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to repair projection owner for event `{}`",
+                    mismatch.event_id
+                )
+            })?
+            .rows_affected;
+        if changed != 1 {
+            anyhow::bail!(
+                "projection event `{}` changed during ownership repair",
+                mismatch.event_id
+            );
+        }
+
+        turn_event_delivery::Entity::update_many()
+            .col_expr(
+                turn_event_delivery::Column::ThreadId,
+                Expr::value(canonical_thread_id.to_owned()),
+            )
+            .filter(turn_event_delivery::Column::EventId.eq(mismatch.event_id.clone()))
+            .filter(turn_event_delivery::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(turn_event_delivery::Column::ThreadId.eq(mismatch.thread_id.clone()))
+            .exec(db)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to repair delivery owner for event `{}`",
+                    mismatch.event_id
+                )
+            })?;
+    }
+
+    if mismatches.is_empty() {
+        return Ok(0);
+    }
+
+    if let Some(remaining) = turn_event_projection_state::Entity::find()
+        .filter(turn_event_projection_state::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_event_projection_state::Column::ThreadId.ne(canonical_thread_id.to_owned()))
+        .one(db)
+        .await
+        .with_context(|| {
+            format!("failed to verify repaired projection stream for Turn `{turn_id}`")
+        })?
+    {
+        anyhow::bail!(
+            "projection event `{}` still has a non-canonical thread after repair",
+            remaining.event_id
+        );
+    }
+
+    turn_liveness::Entity::update_many()
+        .col_expr(
+            turn_liveness::Column::ThreadId,
+            Expr::value(canonical_thread_id.to_owned()),
+        )
+        .filter(turn_liveness::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_liveness::Column::ThreadId.ne(canonical_thread_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to repair liveness owner for Turn `{turn_id}`"))?;
+
+    stream_state_entity::Entity::update_many()
+        .col_expr(
+            stream_state_entity::Column::ThreadId,
+            Expr::value(canonical_thread_id.to_owned()),
+        )
+        .filter(stream_state_entity::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(stream_state_entity::Column::ThreadId.ne(canonical_thread_id.to_owned()))
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to repair stream-state owner for Turn `{turn_id}`"))?;
+
+    Ok(mismatches.len())
 }
 
 pub async fn insert_claimed<C: ConnectionTrait>(
