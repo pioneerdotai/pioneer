@@ -933,18 +933,19 @@ use crate::repositories::{
     agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_quarantine,
     agent_memory_repair_job, artifact as artifact_repository, cli_runtime_binding,
     execution_admission_lease, hook_run, mcp_audit_event, mcp_server_catalog_snapshot,
-    mcp_server_installation, policy, recovery_job, recovery_terminalization_outbox,
-    skill_audit_event, skill_dependency_snapshot, skill_installation, skill_pack_installation,
-    skill_upload_session, skill_workspace_policy, task as task_repository, task_actor_contract,
-    task_agent_spec, task_delivery, task_dependency, task_event, task_execution_admission,
-    task_result_candidate, task_result_review_event, task_run, task_run_conversation_snapshot,
-    task_run_execution, task_run_thread_binding, task_run_turn, task_trigger, task_write_lock,
-    thread, thread_agents_doc, thread_episodic as thread_episodic_repository, thread_lineage,
-    thread_tree, turn, turn_admission, turn_cli_runtime_instruction, turn_event,
-    turn_event_delivery, turn_event_projection_state, turn_event_projection_stream_state,
-    turn_execution, turn_execution_window, turn_finalization, turn_item_attempt, turn_liveness,
-    turn_llm_context, turn_mcp_binding, turn_mcp_projection, turn_runtime_snapshot,
-    turn_skill_binding, user_notification_outbox,
+    mcp_server_installation, policy, read_model_repair, recovery_job,
+    recovery_terminalization_outbox, skill_audit_event, skill_dependency_snapshot,
+    skill_installation, skill_pack_installation, skill_upload_session, skill_workspace_policy,
+    task as task_repository, task_actor_contract, task_agent_spec, task_delivery, task_dependency,
+    task_event, task_execution_admission, task_result_candidate, task_result_review_event,
+    task_run, task_run_conversation_snapshot, task_run_execution, task_run_thread_binding,
+    task_run_turn, task_trigger, task_write_lock, thread, thread_agents_doc,
+    thread_episodic as thread_episodic_repository, thread_lineage, thread_tree, turn,
+    turn_admission, turn_cli_runtime_instruction, turn_event, turn_event_delivery,
+    turn_event_projection_state, turn_event_projection_stream_state, turn_execution,
+    turn_execution_window, turn_finalization, turn_item_attempt, turn_liveness, turn_llm_context,
+    turn_mcp_binding, turn_mcp_projection, turn_runtime_snapshot, turn_skill_binding,
+    user_notification_outbox,
 };
 
 pub use crate::repositories::execution_admission_lease::{
@@ -1558,6 +1559,52 @@ pub struct RepairSummary {
 }
 
 const READ_MODEL_REPAIR_BATCH_SIZE: u64 = 32;
+const READ_MODEL_REPAIR_ALGORITHM_VERSION: i64 = 1;
+
+fn is_terminal_turn_item_status(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some(
+            TURN_ITEM_STATUS_COMPLETED
+                | TURN_ITEM_STATUS_FAILED
+                | TURN_ITEM_STATUS_TIMED_OUT
+                | TURN_ITEM_STATUS_CANCELLED
+        )
+    )
+}
+
+fn repaired_terminal_turn_item_payload(
+    row: &pioneer_entity::turn_item::Model,
+) -> Result<Option<String>> {
+    if !is_terminal_turn_item_status(row.status.as_deref()) {
+        return Ok(None);
+    }
+    let mut item: TurnItem = serde_json::from_str(row.payload.as_str()).with_context(|| {
+        format!(
+            "failed to decode turn_item payload during repair (turn `{}` item `{}`)",
+            row.turn_id, row.item_id
+        )
+    })?;
+    if tool_call_status(&item) != Some(ToolCallStatus::InProgress) {
+        return Ok(None);
+    }
+    let terminal_state = match row.status.as_deref() {
+        Some(TURN_ITEM_STATUS_COMPLETED) => TurnItemTerminalState::Completed,
+        Some(TURN_ITEM_STATUS_TIMED_OUT) => TurnItemTerminalState::TimedOut {
+            reason: TurnItemTimeoutReason::HardDeadlineExceeded,
+        },
+        Some(TURN_ITEM_STATUS_CANCELLED) => TurnItemTerminalState::Cancelled {
+            reason: Some("read_model_invariant_repair".to_owned()),
+        },
+        _ => TurnItemTerminalState::Failed {
+            reason: Some("read_model_invariant_repair".to_owned()),
+        },
+    };
+    terminalize_turn_item_payload(&mut item, terminal_state);
+    serde_json::to_string(&item)
+        .context("failed to encode repaired turn_item payload")
+        .map(Some)
+}
 
 impl RepairSummary {
     fn merge(&mut self, phase: Self) {
@@ -20573,28 +20620,135 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     }
 
     async fn repair_terminal_turn_item_payloads(&self) -> Result<RepairSummary> {
-        let high_watermark = self
-            .run_background_database_quantum(|| async {
-                pioneer_entity::turn_item::Entity::find()
-                    .filter(pioneer_entity::turn_item::Column::Status.is_in([
-                        TURN_ITEM_STATUS_COMPLETED,
-                        TURN_ITEM_STATUS_FAILED,
-                        TURN_ITEM_STATUS_TIMED_OUT,
-                        TURN_ITEM_STATUS_CANCELLED,
-                    ]))
-                    .order_by_desc(pioneer_entity::turn_item::Column::Id)
-                    .one(&self.connection)
+        let mut summary = RepairSummary::default();
+        let checkpoint = self.ensure_terminal_payload_repair_checkpoint().await?;
+        if checkpoint.full_scan_status == read_model_repair::STATUS_RUNNING {
+            summary.merge(self.run_terminal_payload_full_scan(checkpoint).await?);
+        } else if checkpoint.full_scan_status != read_model_repair::STATUS_COMPLETED {
+            bail!(
+                "unsupported read-model repair full-scan status `{}`",
+                checkpoint.full_scan_status
+            );
+        }
+
+        let checkpoint = self
+            .load_terminal_payload_repair_checkpoint()
+            .await?
+            .context("terminal payload repair checkpoint disappeared after full scan")?;
+        let resumed_incremental =
+            checkpoint.incremental_status == read_model_repair::STATUS_RUNNING;
+        if resumed_incremental {
+            summary.merge(
+                self.run_terminal_payload_incremental_pass(checkpoint)
+                    .await?,
+            );
+        } else if checkpoint.incremental_status != read_model_repair::STATUS_COMPLETED {
+            bail!(
+                "unsupported read-model repair incremental status `{}`",
+                checkpoint.incremental_status
+            );
+        }
+
+        // A crashed process may have left a pass whose high-watermark predates
+        // later writes. Finish that pass first, then take one fresh snapshot in
+        // the same startup so those writes do not wait for another restart.
+        summary.merge(self.start_terminal_payload_incremental_pass().await?);
+        Ok(summary)
+    }
+
+    async fn load_terminal_payload_repair_checkpoint(
+        &self,
+    ) -> Result<Option<read_model_repair::Checkpoint>> {
+        self.run_background_database_quantum(|| async {
+            read_model_repair::load_checkpoint(
+                &self.connection,
+                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn ensure_terminal_payload_repair_checkpoint(
+        &self,
+    ) -> Result<read_model_repair::Checkpoint> {
+        let existing = self.load_terminal_payload_repair_checkpoint().await?;
+        if existing.as_ref().is_some_and(|checkpoint| {
+            checkpoint.algorithm_version == READ_MODEL_REPAIR_ALGORITHM_VERSION
+        }) {
+            return existing.context("checked read-model repair checkpoint is missing");
+        }
+
+        self.run_background_database_quantum(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin read-model repair checkpoint transaction")?;
+            let high_watermark = pioneer_entity::turn_item::Entity::find()
+                .filter(pioneer_entity::turn_item::Column::Status.is_in([
+                    TURN_ITEM_STATUS_COMPLETED,
+                    TURN_ITEM_STATUS_FAILED,
+                    TURN_ITEM_STATUS_TIMED_OUT,
+                    TURN_ITEM_STATUS_CANCELLED,
+                ]))
+                .order_by_desc(pioneer_entity::turn_item::Column::Id)
+                .one(&transaction)
+                .await
+                .context("failed to load terminal turn_item repair high-watermark")?
+                .map(|row| row.id);
+            read_model_repair::reset_full_scan(
+                &transaction,
+                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                high_watermark.as_deref(),
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit read-model repair checkpoint transaction")?;
+            Ok(())
+        })
+        .await?;
+
+        self.load_terminal_payload_repair_checkpoint()
+            .await?
+            .context("initialized read-model repair checkpoint is missing")
+    }
+
+    async fn run_terminal_payload_full_scan(
+        &self,
+        checkpoint: read_model_repair::Checkpoint,
+    ) -> Result<RepairSummary> {
+        if checkpoint.algorithm_version != READ_MODEL_REPAIR_ALGORITHM_VERSION {
+            bail!("cannot run terminal payload full scan for a stale algorithm version");
+        }
+        let Some(high_watermark) = checkpoint.full_scan_high_watermark_id else {
+            self.run_background_database_quantum(|| async {
+                let transaction = self
+                    .connection
+                    .begin()
                     .await
-                    .context("failed to load terminal turn_item repair high-watermark")
-                    .map(|row| row.map(|row| row.id))
+                    .context("failed to begin empty read-model full-scan completion")?;
+                read_model_repair::complete_full_scan(
+                    &transaction,
+                    read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                    READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit empty read-model full scan")?;
+                Ok(())
             })
             .await?;
-        let Some(high_watermark) = high_watermark else {
             return Ok(RepairSummary::default());
         };
 
         let mut summary = RepairSummary::default();
-        let mut cursor: Option<String> = None;
+        let mut cursor = checkpoint.full_scan_cursor_id;
         loop {
             let cursor_for_query = cursor.clone();
             let high_watermark_for_query = high_watermark.clone();
@@ -20628,106 +20782,343 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             if rows.is_empty() {
                 break;
             }
-            cursor = rows.last().map(|row| row.id.clone());
+            let next_cursor = rows
+                .last()
+                .map(|row| row.id.clone())
+                .context("non-empty terminal turn_item repair batch has no cursor")?;
 
             // JSON decoding and terminalization are deliberately outside the
             // database quantum so foreground requests can use SQLite.
             let mut repairs = Vec::new();
             for row in rows {
-                let mut item: TurnItem =
-                    serde_json::from_str(row.payload.as_str()).with_context(|| {
-                        format!(
-                            "failed to decode turn_item payload during repair (turn `{}` item `{}`)",
-                            row.turn_id, row.item_id
-                        )
-                    })?;
-                if tool_call_status(&item) != Some(ToolCallStatus::InProgress) {
-                    continue;
+                if let Some(payload_json) = repaired_terminal_turn_item_payload(&row)? {
+                    repairs.push((row, payload_json));
                 }
-                let terminal_state = match row.status.as_deref() {
-                    Some(TURN_ITEM_STATUS_COMPLETED) => TurnItemTerminalState::Completed,
-                    Some(TURN_ITEM_STATUS_TIMED_OUT) => TurnItemTerminalState::TimedOut {
-                        reason: TurnItemTimeoutReason::HardDeadlineExceeded,
-                    },
-                    Some(TURN_ITEM_STATUS_CANCELLED) => TurnItemTerminalState::Cancelled {
-                        reason: Some("read_model_invariant_repair".to_owned()),
-                    },
-                    _ => TurnItemTerminalState::Failed {
-                        reason: Some("read_model_invariant_repair".to_owned()),
-                    },
-                };
-                terminalize_turn_item_payload(&mut item, terminal_state);
-                let payload_json = serde_json::to_string(&item)
-                    .context("failed to encode repaired turn_item payload")?;
-                repairs.push((row, payload_json));
             }
             summary.detected = summary.detected.saturating_add(repairs.len());
 
-            if !repairs.is_empty() {
-                let repairs_for_write = repairs.clone();
-                let (repaired, revised_turn_ids) = self
-                    .run_background_database_quantum(|| {
-                        let repairs = repairs_for_write.clone();
-                        async move {
-                            let transaction =
-                                self.connection.begin().await.context(
-                                    "failed to begin terminal turn_item repair transaction",
-                                )?;
-                            let now: DateTimeWithTimeZone = chrono::Utc::now().into();
-                            let mut repaired = 0usize;
-                            let mut revised_turn_ids = Vec::new();
-                            for (row, payload_json) in repairs {
-                                let result = pioneer_entity::turn_item::Entity::update_many()
-                                    .filter(
-                                        pioneer_entity::turn_item::Column::Id.eq(row.id.clone()),
-                                    )
-                                    .filter(pioneer_entity::turn_item::Column::Status.is_in([
-                                        TURN_ITEM_STATUS_COMPLETED,
-                                        TURN_ITEM_STATUS_FAILED,
-                                        TURN_ITEM_STATUS_TIMED_OUT,
-                                        TURN_ITEM_STATUS_CANCELLED,
-                                    ]))
-                                    .filter(
-                                        pioneer_entity::turn_item::Column::Payload
-                                            .eq(row.payload.clone()),
-                                    )
-                                    .filter(
-                                        pioneer_entity::turn_item::Column::UpdatedAt
-                                            .eq(row.updated_at.clone()),
-                                    )
-                                    .col_expr(
-                                        pioneer_entity::turn_item::Column::Payload,
-                                        Expr::value(payload_json),
-                                    )
-                                    .col_expr(
-                                        pioneer_entity::turn_item::Column::UpdatedAt,
-                                        Expr::value(now.clone()),
-                                    )
-                                    .exec(&transaction)
-                                    .await
-                                    .context("failed to conditionally repair turn_item payload")?;
-                                if result.rows_affected > 0 {
-                                    repaired = repaired.saturating_add(1);
-                                    revised_turn_ids.push(row.turn_id);
-                                }
-                            }
-                            transaction.commit().await.context(
-                                "failed to commit terminal turn_item repair transaction",
+            let repairs_for_write = repairs.clone();
+            let cursor_for_write = next_cursor.clone();
+            let (repaired, revised_turn_ids) = self
+                .run_background_database_quantum(|| {
+                    let repairs = repairs_for_write.clone();
+                    let cursor = cursor_for_write.clone();
+                    async move {
+                        let transaction =
+                            self.connection.begin().await.context(
+                                "failed to begin terminal turn_item full-scan transaction",
                             )?;
-                            Ok((repaired, revised_turn_ids))
+                        let (repaired, revised_turn_ids) = self
+                            .apply_terminal_turn_item_payload_repairs(&transaction, repairs)
+                            .await?;
+                        read_model_repair::advance_full_scan_cursor(
+                            &transaction,
+                            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                            READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                            cursor.as_str(),
+                        )
+                        .await?;
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit terminal turn_item full-scan transaction")?;
+                        Ok((repaired, revised_turn_ids))
+                    }
+                })
+                .await?;
+            summary.repaired = summary.repaired.saturating_add(repaired);
+            summary.remaining = summary
+                .remaining
+                .saturating_add(repairs.len().saturating_sub(repaired));
+            for turn_id in revised_turn_ids {
+                self.advance_semantic_timeline_revision(turn_id.as_str());
+            }
+            cursor = Some(next_cursor);
+        }
+
+        self.run_background_database_quantum(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin read-model full-scan completion")?;
+            read_model_repair::complete_full_scan(
+                &transaction,
+                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                READ_MODEL_REPAIR_ALGORITHM_VERSION,
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit read-model full-scan completion")?;
+            Ok(())
+        })
+        .await?;
+        Ok(summary)
+    }
+
+    async fn start_terminal_payload_incremental_pass(&self) -> Result<RepairSummary> {
+        let checkpoint = self
+            .load_terminal_payload_repair_checkpoint()
+            .await?
+            .context("terminal payload repair checkpoint is missing")?;
+        if checkpoint.incremental_status != read_model_repair::STATUS_COMPLETED {
+            bail!("cannot start an incremental repair pass while another pass is running");
+        }
+        self.run_background_database_quantum(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin incremental repair checkpoint transaction")?;
+            let high_watermark = read_model_repair::current_change_generation(&transaction).await?;
+            read_model_repair::begin_incremental_pass(
+                &transaction,
+                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                high_watermark,
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit incremental repair checkpoint transaction")?;
+            Ok(())
+        })
+        .await?;
+        let checkpoint = self
+            .load_terminal_payload_repair_checkpoint()
+            .await?
+            .context("started incremental repair checkpoint is missing")?;
+        self.run_terminal_payload_incremental_pass(checkpoint).await
+    }
+
+    async fn run_terminal_payload_incremental_pass(
+        &self,
+        checkpoint: read_model_repair::Checkpoint,
+    ) -> Result<RepairSummary> {
+        if checkpoint.algorithm_version != READ_MODEL_REPAIR_ALGORITHM_VERSION
+            || checkpoint.incremental_status != read_model_repair::STATUS_RUNNING
+        {
+            bail!("cannot resume an incompatible incremental read-model repair pass");
+        }
+        let high_watermark = checkpoint
+            .incremental_high_watermark_generation
+            .context("running incremental repair has no high-watermark")?;
+        let mut cursor = checkpoint
+            .incremental_cursor_generation
+            .unwrap_or(checkpoint.last_completed_generation);
+        let mut summary = RepairSummary::default();
+
+        loop {
+            let dirty_rows = self
+                .run_background_database_quantum(|| async {
+                    read_model_repair::list_dirty_turn_items(
+                        &self.connection,
+                        cursor,
+                        high_watermark,
+                        READ_MODEL_REPAIR_BATCH_SIZE,
+                    )
+                    .await
+                })
+                .await?;
+            if dirty_rows.is_empty() {
+                break;
+            }
+            let next_cursor = dirty_rows
+                .last()
+                .map(|row| row.generation)
+                .context("non-empty dirty repair batch has no cursor")?;
+            let ids = dirty_rows
+                .iter()
+                .map(|row| row.turn_item_id.clone())
+                .collect::<Vec<_>>();
+            let source_rows = self
+                .run_background_database_quantum(|| {
+                    let ids = ids.clone();
+                    async move {
+                        pioneer_entity::turn_item::Entity::find()
+                            .filter(pioneer_entity::turn_item::Column::Id.is_in(ids))
+                            .all(&self.connection)
+                            .await
+                            .context("failed to load dirty turn_items for incremental repair")
+                    }
+                })
+                .await?;
+
+            // Payload parsing remains outside both the SQLite permit and the
+            // write transaction. Only dirty terminal rows pay this CPU cost.
+            let mut repairs = HashMap::new();
+            for row in source_rows {
+                if let Some(payload_json) = repaired_terminal_turn_item_payload(&row)? {
+                    repairs.insert(row.id.clone(), (row, payload_json));
+                }
+            }
+            summary.detected = summary.detected.saturating_add(repairs.len());
+
+            let dirty_for_write = dirty_rows.clone();
+            let repairs_for_write = repairs.clone();
+            let previous_cursor = cursor;
+            let (repaired, revised_turn_ids) = self
+                .run_background_database_quantum(|| {
+                    let dirty_rows = dirty_for_write.clone();
+                    let repairs = repairs_for_write.clone();
+                    async move {
+                        let transaction = self.connection.begin().await.context(
+                            "failed to begin incremental terminal payload repair transaction",
+                        )?;
+                        let mut repaired = 0usize;
+                        let mut revised_turn_ids = Vec::new();
+                        for dirty in &dirty_rows {
+                            if let Some((row, payload_json)) = repairs.get(&dirty.turn_item_id) {
+                                let (applied, revised_turn_id) = self
+                                    .apply_one_terminal_turn_item_payload_repair(
+                                        &transaction,
+                                        row,
+                                        payload_json,
+                                    )
+                                    .await?;
+                                if applied {
+                                    repaired = repaired.saturating_add(1);
+                                    if let Some(turn_id) = revised_turn_id {
+                                        revised_turn_ids.push(turn_id);
+                                    }
+                                    // The repair UPDATE itself fires the dirty
+                                    // trigger. No other writer can interleave
+                                    // inside this transaction, so remove that
+                                    // self-generated entry as well.
+                                    read_model_repair::clear_dirty_turn_item(
+                                        &transaction,
+                                        dirty.turn_item_id.as_str(),
+                                    )
+                                    .await?;
+                                }
+                            } else {
+                                read_model_repair::clear_dirty_turn_item_if_unchanged(
+                                    &transaction,
+                                    dirty.turn_item_id.as_str(),
+                                    dirty.generation,
+                                )
+                                .await?;
+                            }
                         }
-                    })
-                    .await?;
-                summary.repaired = summary.repaired.saturating_add(repaired);
-                summary.remaining = summary
-                    .remaining
-                    .saturating_add(repairs.len().saturating_sub(repaired));
-                for turn_id in revised_turn_ids {
-                    self.advance_semantic_timeline_revision(turn_id.as_str());
+                        let unconsumed =
+                            read_model_repair::count_dirty_turn_items_in_window(
+                                &transaction,
+                                previous_cursor,
+                                next_cursor,
+                            )
+                            .await?;
+                        if unconsumed != 0 {
+                            bail!(
+                                "incremental terminal payload repair retained {unconsumed} rows before its next cursor"
+                            );
+                        }
+                        read_model_repair::advance_incremental_cursor(
+                            &transaction,
+                            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                            READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                            high_watermark,
+                            next_cursor,
+                        )
+                        .await?;
+                        transaction.commit().await.context(
+                            "failed to commit incremental terminal payload repair transaction",
+                        )?;
+                        Ok((repaired, revised_turn_ids))
+                    }
+                })
+                .await?;
+            summary.repaired = summary.repaired.saturating_add(repaired);
+            summary.remaining = summary
+                .remaining
+                .saturating_add(repairs.len().saturating_sub(repaired));
+            for turn_id in revised_turn_ids {
+                self.advance_semantic_timeline_revision(turn_id.as_str());
+            }
+            cursor = next_cursor;
+        }
+
+        self.run_background_database_quantum(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin incremental repair completion")?;
+            read_model_repair::complete_incremental_pass(
+                &transaction,
+                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                high_watermark,
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit incremental repair completion")?;
+            Ok(())
+        })
+        .await?;
+        Ok(summary)
+    }
+
+    async fn apply_terminal_turn_item_payload_repairs(
+        &self,
+        transaction: &DatabaseTransaction,
+        repairs: Vec<(pioneer_entity::turn_item::Model, String)>,
+    ) -> Result<(usize, Vec<String>)> {
+        let mut repaired = 0usize;
+        let mut revised_turn_ids = Vec::new();
+        for (row, payload_json) in repairs {
+            let (applied, revised_turn_id) = self
+                .apply_one_terminal_turn_item_payload_repair(transaction, &row, &payload_json)
+                .await?;
+            if applied {
+                repaired = repaired.saturating_add(1);
+                if let Some(turn_id) = revised_turn_id {
+                    revised_turn_ids.push(turn_id);
                 }
             }
         }
-        Ok(summary)
+        Ok((repaired, revised_turn_ids))
+    }
+
+    async fn apply_one_terminal_turn_item_payload_repair(
+        &self,
+        transaction: &DatabaseTransaction,
+        row: &pioneer_entity::turn_item::Model,
+        payload_json: &str,
+    ) -> Result<(bool, Option<String>)> {
+        let now: DateTimeWithTimeZone = chrono::Utc::now().into();
+        pioneer_entity::turn_item::Entity::update_many()
+            .filter(pioneer_entity::turn_item::Column::Id.eq(row.id.clone()))
+            .filter(pioneer_entity::turn_item::Column::Status.eq(row.status.clone()))
+            .filter(pioneer_entity::turn_item::Column::Payload.eq(row.payload.clone()))
+            .col_expr(
+                pioneer_entity::turn_item::Column::Payload,
+                Expr::value(payload_json.to_owned()),
+            )
+            .col_expr(
+                pioneer_entity::turn_item::Column::UpdatedAt,
+                Expr::value(now),
+            )
+            .exec(transaction)
+            .await
+            .context("failed to conditionally repair turn_item payload")?;
+
+        // sqlite-zstd exposes turn_item as an INSTEAD OF-triggered view, for
+        // which SQLite reports zero affected rows even when the backing row was
+        // updated. Verify the stored payload instead of trusting changes().
+        let applied = pioneer_entity::turn_item::Entity::find_by_id(row.id.clone())
+            .one(transaction)
+            .await
+            .context("failed to verify conditionally repaired turn_item payload")?
+            .is_some_and(|current| {
+                current.status.as_deref() == row.status.as_deref()
+                    && current.payload == payload_json
+            });
+        Ok((applied, applied.then(|| row.turn_id.clone())))
     }
 
     async fn repair_terminal_turn_running_attempts(&self) -> Result<RepairSummary> {
@@ -26540,7 +26931,7 @@ mod tests {
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
         tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
     };
-    use crate::repositories::{thread, turn, turn_finalization};
+    use crate::repositories::{read_model_repair, thread, turn, turn_finalization};
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::{
@@ -36065,6 +36456,338 @@ mod tests {
             panic!("expected web_fetch payload");
         };
         assert_ne!(status, ToolCallStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn read_model_repair_resumes_incremental_pass_and_catches_up_same_startup() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection.clone());
+        let timestamp = unix_to_datetime(1_700_000_000);
+
+        let insert_inconsistent = |id: &str, item_id: &str| {
+            let id = id.to_owned();
+            let item_id = item_id.to_owned();
+            let timestamp = timestamp.clone();
+            let connection = connection.clone();
+            async move {
+                let item = safe_web_fetch_item(item_id.as_str());
+                pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
+                    id: Set(id),
+                    turn_id: Set("turn_incremental_repair".to_owned()),
+                    item_id: Set(item_id),
+                    item_type: Set("web_fetch".to_owned()),
+                    status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
+                    payload: Set(serde_json::to_string(&item).expect("turn item should serialize")),
+                    active_attempt_number: Set(0),
+                    active_attempt_status: Set(None),
+                    active_attempt_id: Set(None),
+                    last_heartbeat_at: Set(None),
+                    lease_expires_at: Set(None),
+                    created_at: Set(timestamp.clone()),
+                    updated_at: Set(timestamp),
+                })
+                .exec(&connection)
+                .await
+                .expect("inconsistent turn_item should insert");
+            }
+        };
+
+        insert_inconsistent("row_incremental_seed", "item_incremental_seed").await;
+        store
+            .repair_deterministic_read_model_violations()
+            .await
+            .expect("initial full repair should succeed");
+
+        insert_inconsistent("row_incremental_resume", "item_incremental_resume").await;
+        let interrupted_high_watermark = read_model_repair::current_change_generation(&connection)
+            .await
+            .expect("change generation should load");
+        read_model_repair::begin_incremental_pass(
+            &connection,
+            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+            super::READ_MODEL_REPAIR_ALGORITHM_VERSION,
+            interrupted_high_watermark,
+        )
+        .await
+        .expect("interrupted incremental pass should start");
+
+        // This row is newer than the interrupted pass's high-watermark. The
+        // same startup must finish the old pass and then take a fresh snapshot.
+        insert_inconsistent("row_incremental_catchup", "item_incremental_catchup").await;
+        let summary = store
+            .repair_deterministic_read_model_violations()
+            .await
+            .expect("resumed and catch-up repair should succeed");
+        assert_eq!(summary.remaining, 0);
+        assert!(summary.repaired >= 2);
+
+        for id in ["row_incremental_resume", "row_incremental_catchup"] {
+            let row = pioneer_entity::turn_item::Entity::find_by_id(id)
+                .one(&connection)
+                .await
+                .expect("repaired turn_item should query")
+                .expect("repaired turn_item should exist");
+            let item: TurnItem =
+                serde_json::from_str(row.payload.as_str()).expect("payload should decode");
+            assert_ne!(tool_call_status(&item), Some(ToolCallStatus::InProgress));
+        }
+
+        let checkpoint = read_model_repair::load_checkpoint(
+            &connection,
+            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+        )
+        .await
+        .expect("checkpoint should query")
+        .expect("checkpoint should exist");
+        assert_eq!(
+            checkpoint.incremental_status,
+            read_model_repair::STATUS_COMPLETED
+        );
+        let dirty_count = connection
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS value FROM read_model_repair_dirty_turn_item".to_owned(),
+            ))
+            .await
+            .expect("dirty count should query")
+            .expect("dirty count should return a row")
+            .try_get::<i64>("", "value")
+            .expect("dirty count should decode");
+        assert_eq!(dirty_count, 0);
+    }
+
+    #[tokio::test]
+    async fn read_model_repair_version_bump_forces_a_new_full_scan() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection.clone());
+        store
+            .repair_deterministic_read_model_violations()
+            .await
+            .expect("empty initial full repair should succeed");
+
+        let timestamp = unix_to_datetime(1_700_000_000);
+        pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
+            id: Set("row_repair_version_probe".to_owned()),
+            turn_id: Set("turn_repair_version_probe".to_owned()),
+            item_id: Set("item_repair_version_probe".to_owned()),
+            item_type: Set("web_fetch".to_owned()),
+            status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
+            payload: Set("{malformed-json".to_owned()),
+            active_attempt_number: Set(0),
+            active_attempt_status: Set(None),
+            active_attempt_id: Set(None),
+            last_heartbeat_at: Set(None),
+            lease_expires_at: Set(None),
+            created_at: Set(timestamp.clone()),
+            updated_at: Set(timestamp),
+        })
+        .exec(&connection)
+        .await
+        .expect("version probe row should insert");
+
+        // Simulate a historical row that predates the exact dirty journal.
+        connection
+            .execute_unprepared("DELETE FROM read_model_repair_dirty_turn_item")
+            .await
+            .expect("test should clear the exact-change journal");
+        store
+            .repair_deterministic_read_model_violations()
+            .await
+            .expect("same-version startup should not repeat the historical full scan");
+
+        connection
+            .execute_unprepared("UPDATE read_model_repair_checkpoint SET algorithm_version = 0")
+            .await
+            .expect("test should age the repair algorithm version");
+        let error = store
+            .repair_deterministic_read_model_violations()
+            .await
+            .expect_err("version bump must force a new historical full scan");
+        assert!(format!("{error:#}").contains("failed to decode turn_item payload"));
+    }
+
+    #[tokio::test]
+    async fn read_model_repair_updates_compressed_turn_item_and_then_uses_dirty_journal() {
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .expect("sqlite-zstd extension should register");
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        let migration_index = Migrator::migrations()
+            .iter()
+            .position(|migration| {
+                migration.name() == "m20260828_000001_incremental_read_model_repair"
+            })
+            .expect("incremental repair migration must remain registered");
+        Migrator::up(&connection, Some(migration_index as u32))
+            .await
+            .expect("migrations before incremental repair should apply");
+
+        let timestamp = unix_to_datetime(1_700_000_000);
+        let item = safe_web_fetch_item("item_compressed_repair");
+        let in_progress_payload = serde_json::to_string(&item).expect("turn item should serialize");
+        pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
+            id: Set("row_compressed_repair".to_owned()),
+            turn_id: Set("turn_compressed_repair".to_owned()),
+            item_id: Set("item_compressed_repair".to_owned()),
+            item_type: Set("web_fetch".to_owned()),
+            status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
+            payload: Set(in_progress_payload.clone()),
+            active_attempt_number: Set(0),
+            active_attempt_status: Set(None),
+            active_attempt_id: Set(None),
+            last_heartbeat_at: Set(None),
+            lease_expires_at: Set(None),
+            created_at: Set(timestamp.clone()),
+            updated_at: Set(timestamp),
+        })
+        .exec(&connection)
+        .await
+        .expect("compressed repair seed should insert");
+
+        let config = serde_json::json!({
+            "table": "turn_item",
+            "column": "payload",
+            "compression_level": 3,
+            "dict_chooser": "'[nodict]'",
+        });
+        connection
+            .query_one_raw(Statement::from_sql_and_values(
+                connection.get_database_backend(),
+                "SELECT zstd_enable_transparent(?) AS value",
+                [config.to_string().into()],
+            ))
+            .await
+            .expect("turn_item compression should enable");
+        Migrator::up(&connection, None)
+            .await
+            .expect("incremental repair migration should apply on compressed storage");
+
+        let store = CrudStore::new(connection.clone());
+        let full_summary = store
+            .repair_deterministic_read_model_violations()
+            .await
+            .expect("compressed full repair should succeed");
+        assert_eq!(full_summary.remaining, 0);
+        assert_eq!(full_summary.repaired, 1);
+
+        connection
+            .execute_raw(Statement::from_sql_and_values(
+                connection.get_database_backend(),
+                "UPDATE turn_item SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                vec![
+                    in_progress_payload.into(),
+                    "row_compressed_repair".to_owned().into(),
+                ],
+            ))
+            .await
+            .expect("logical payload regression should update through compressed view");
+        let incremental_summary = store
+            .repair_deterministic_read_model_violations()
+            .await
+            .expect("compressed incremental repair should succeed");
+        assert_eq!(incremental_summary.remaining, 0);
+        assert_eq!(incremental_summary.repaired, 1);
+
+        let repaired = pioneer_entity::turn_item::Entity::find_by_id("row_compressed_repair")
+            .one(&connection)
+            .await
+            .expect("compressed repaired row should query")
+            .expect("compressed repaired row should exist");
+        let repaired_item: TurnItem =
+            serde_json::from_str(repaired.payload.as_str()).expect("payload should decode");
+        assert_ne!(
+            tool_call_status(&repaired_item),
+            Some(ToolCallStatus::InProgress)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_model_repair_never_applies_payload_for_a_stale_terminal_status() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection.clone());
+        let timestamp = unix_to_datetime(1_700_000_000);
+        let item = safe_web_fetch_item("item_repair_status_fence");
+        pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
+            id: Set("row_repair_status_fence".to_owned()),
+            turn_id: Set("turn_repair_status_fence".to_owned()),
+            item_id: Set("item_repair_status_fence".to_owned()),
+            item_type: Set("web_fetch".to_owned()),
+            status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
+            payload: Set(serde_json::to_string(&item).expect("turn item should serialize")),
+            active_attempt_number: Set(0),
+            active_attempt_status: Set(None),
+            active_attempt_id: Set(None),
+            last_heartbeat_at: Set(None),
+            lease_expires_at: Set(None),
+            created_at: Set(timestamp.clone()),
+            updated_at: Set(timestamp),
+        })
+        .exec(&connection)
+        .await
+        .expect("status-fence seed should insert");
+        let stale_row = pioneer_entity::turn_item::Entity::find_by_id("row_repair_status_fence")
+            .one(&connection)
+            .await
+            .expect("status-fence seed should query")
+            .expect("status-fence seed should exist");
+        let stale_repair = super::repaired_terminal_turn_item_payload(&stale_row)
+            .expect("stale payload should decode")
+            .expect("stale payload should need repair");
+
+        pioneer_entity::turn_item::Entity::update_many()
+            .filter(pioneer_entity::turn_item::Column::Id.eq("row_repair_status_fence".to_owned()))
+            .col_expr(
+                pioneer_entity::turn_item::Column::Status,
+                Expr::value(Some(super::TURN_ITEM_STATUS_FAILED)),
+            )
+            .exec(&connection)
+            .await
+            .expect("live writer should change terminal status");
+
+        let transaction = connection
+            .begin()
+            .await
+            .expect("repair transaction should begin");
+        let (applied, _) = store
+            .apply_one_terminal_turn_item_payload_repair(
+                &transaction,
+                &stale_row,
+                stale_repair.as_str(),
+            )
+            .await
+            .expect("stale conditional repair should execute safely");
+        transaction
+            .commit()
+            .await
+            .expect("repair transaction should commit");
+        assert!(!applied);
+
+        let current = pioneer_entity::turn_item::Entity::find_by_id("row_repair_status_fence")
+            .one(&connection)
+            .await
+            .expect("status-fence row should query")
+            .expect("status-fence row should exist");
+        assert_eq!(
+            current.status.as_deref(),
+            Some(super::TURN_ITEM_STATUS_FAILED)
+        );
+        assert_eq!(current.payload, stale_row.payload);
     }
 
     #[tokio::test]

@@ -55,6 +55,7 @@ mod m20260820_000001_agent_domain_foundation;
 mod m20260820_000002_agent_domain_relational_integrity;
 mod m20260820_000003_agent_authorship_and_scheduling;
 mod m20260822_000001_patch_history;
+mod m20260828_000001_incremental_read_model_repair;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -111,6 +112,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260820_000002_agent_domain_relational_integrity::Migration),
             Box::new(m20260820_000003_agent_authorship_and_scheduling::Migration),
             Box::new(m20260822_000001_patch_history::Migration),
+            Box::new(m20260828_000001_incremental_read_model_repair::Migration),
         ]
     }
 }
