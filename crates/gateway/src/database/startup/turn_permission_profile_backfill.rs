@@ -285,46 +285,37 @@ async fn run_low_priority_batch(
     crud_store: &CrudStore,
     operation: PermissionBackfillBatch,
 ) -> Result<u64> {
-    loop {
-        let database = crud_store.database_connection();
-        match crud_store
-            .try_run_low_priority_write(|| {
-                let database = database.clone();
-                let operation = operation.clone();
-                async move {
-                    let transaction = database
-                        .begin()
-                        .await
-                        .context("failed to begin permission backfill batch transaction")?;
-                    let result = operation.run(&transaction).await;
-                    match result {
-                        Ok(updated) => {
-                            transaction
-                                .commit()
-                                .await
-                                .context("failed to commit permission backfill batch")?;
-                            Ok(updated)
-                        }
-                        Err(error) => {
-                            let _ = transaction.rollback().await;
-                            Err(error)
-                        }
+    let database = crud_store.database_connection();
+    let result = crud_store
+        .run_background_database_quantum(|| {
+            let database = database.clone();
+            let operation = operation.clone();
+            async move {
+                let transaction = database
+                    .begin()
+                    .await
+                    .context("failed to begin permission backfill batch transaction")?;
+                let result = operation.run(&transaction).await;
+                match result {
+                    Ok(updated) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit permission backfill batch")?;
+                        Ok(updated)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
                     }
                 }
-            })
-            .await?
-        {
-            Some(result) => {
-                // The transaction is committed and its pool connection has
-                // been released. Yield here, rather than after a whole sweep
-                // of unrelated repairs, so foreground auth and mutations get
-                // an admission opportunity at every durable batch boundary.
-                super::maintenance_checkpoint().await?;
-                return Ok(result);
             }
-            None => super::maintenance_checkpoint().await?,
-        }
-    }
+        })
+        .await?;
+    // The transaction is committed and its pool connection has been
+    // released. Pause at every durable batch boundary.
+    super::maintenance_checkpoint().await?;
+    Ok(result)
 }
 
 async fn repair_regressed_turn_security_snapshot_batch(db: &DatabaseTransaction) -> Result<u64> {

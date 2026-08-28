@@ -201,8 +201,8 @@ async fn run_periodic_maintenance(
     verify_sqlite_zstd_registered(&db).await?;
 
     let configs = configs.to_vec();
-    let Some(before) = crud_store
-        .try_run_low_priority_write(|| {
+    let before = crud_store
+        .run_background_database_quantum(|| {
             let db = db.clone();
             let configs = configs.clone();
             async move {
@@ -218,14 +218,7 @@ async fn run_periodic_maintenance(
                 Ok(before)
             }
         })
-        .await?
-    else {
-        return Ok(ZstdPeriodicMaintenanceOutcome {
-            summaries: Vec::new(),
-            deferred: true,
-            cancelled: false,
-        });
-    };
+        .await?;
 
     let should_run_maintenance = before
         .iter()
@@ -286,23 +279,16 @@ async fn run_cooperative_maintenance(
     cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<CooperativeMaintenanceOutcome> {
     let Some(total_seconds) = maintenance_seconds else {
-        let result = crud_store
-            .try_run_low_priority_write(|| {
+        let more_pending = crud_store
+            .run_background_database_quantum(|| {
                 let db = db.clone();
                 async move { run_maintenance(&db, None, target_db_load).await }
             })
             .await?;
-        return Ok(match result {
-            Some(more_pending) => CooperativeMaintenanceOutcome {
-                more_pending,
-                deferred: false,
-                cancelled: false,
-            },
-            None => CooperativeMaintenanceOutcome {
-                more_pending: true,
-                deferred: true,
-                cancelled: false,
-            },
+        return Ok(CooperativeMaintenanceOutcome {
+            more_pending,
+            deferred: false,
+            cancelled: false,
         });
     };
 
@@ -324,19 +310,12 @@ async fn run_cooperative_maintenance(
         let slice_seconds = remaining
             .as_secs_f64()
             .min(PERIODIC_MAINTENANCE_SLICE_SECONDS);
-        let result = crud_store
-            .try_run_low_priority_write(|| {
+        let slice_more_pending = crud_store
+            .run_background_database_quantum(|| {
                 let db = db.clone();
                 async move { run_maintenance(&db, Some(slice_seconds), target_db_load).await }
             })
             .await?;
-        let Some(slice_more_pending) = result else {
-            return Ok(CooperativeMaintenanceOutcome {
-                more_pending: true,
-                deferred: true,
-                cancelled: false,
-            });
-        };
         more_pending = slice_more_pending;
         if more_pending {
             if let Some(cancellation) = cancellation {
@@ -1149,7 +1128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_maintenance_defers_while_foreground_write_is_active() {
+    async fn periodic_maintenance_queues_behind_foreground_and_then_progresses() {
         pioneer_sqlite::zstd::register_auto_extension_once()
             .expect("sqlite-zstd auto-extension should register");
         let connection = Database::connect("sqlite::memory:")
@@ -1168,36 +1147,38 @@ mod tests {
             let entered = entered.clone();
             let release = release.clone();
             async move {
-                foreground_store
-                    .try_run_low_priority_write(|| async {
-                        entered.notify_one();
-                        release.notified().await;
-                        Ok(())
-                    })
-                    .await
+                let permit = foreground_store
+                    .write_coordinator()
+                    .acquire_foreground()
+                    .await;
+                entered.notify_one();
+                release.notified().await;
+                drop(permit);
             }
         });
 
         entered.notified().await;
-        let outcome = run_periodic_maintenance_once(
-            &store,
-            ZSTD_PAYLOAD_COLUMNS,
-            Some(PERIODIC_MAINTENANCE_SLICE_SECONDS),
-            1.0,
-        )
-        .await
-        .expect("busy foreground writer should defer periodic maintenance");
-        assert!(outcome.deferred);
-        assert!(outcome.summaries.is_empty());
+        let maintenance_store = store.clone();
+        let maintenance = tokio::spawn(async move {
+            run_periodic_maintenance_once(
+                &maintenance_store,
+                ZSTD_PAYLOAD_COLUMNS,
+                Some(PERIODIC_MAINTENANCE_SLICE_SECONDS),
+                1.0,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!maintenance.is_finished());
 
         release.notify_one();
-        assert_eq!(
-            foreground
-                .await
-                .expect("foreground task should join")
-                .expect("foreground write should succeed"),
-            Some(())
-        );
+        foreground.await.expect("foreground task should join");
+        let outcome = maintenance
+            .await
+            .expect("maintenance task should join")
+            .expect("queued periodic maintenance should succeed");
+        assert!(!outcome.deferred);
+        assert!(!outcome.summaries.is_empty());
     }
 
     #[tokio::test]

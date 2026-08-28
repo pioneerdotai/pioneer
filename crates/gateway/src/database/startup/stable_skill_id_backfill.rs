@@ -220,15 +220,11 @@ async fn backfill_installations(crud_store: &CrudStore) -> Result<u64> {
     loop {
         let db = crud_store.database_connection();
         let outcome = crud_store
-            .try_run_low_priority_write(|| {
+            .run_background_database_quantum(|| {
                 let db = db.clone();
                 async move { migrate_installation_batch(&db).await }
             })
             .await?;
-        let Some(outcome) = outcome else {
-            super::maintenance_checkpoint().await?;
-            continue;
-        };
         migrated = migrated.saturating_add(outcome.processed);
         if outcome.complete {
             return Ok(migrated);
@@ -245,7 +241,7 @@ async fn backfill_policies(
     loop {
         let db = crud_store.database_connection();
         let outcome = crud_store
-            .try_run_low_priority_write(|| {
+            .run_background_database_quantum(|| {
                 let db = db.clone();
                 let resolver = resolver.clone();
                 async move {
@@ -254,10 +250,6 @@ async fn backfill_policies(
                 }
             })
             .await?;
-        let Some(outcome) = outcome else {
-            super::maintenance_checkpoint().await?;
-            continue;
-        };
         migrated = migrated.saturating_add(outcome.processed);
         if outcome.complete {
             return Ok(migrated);
@@ -275,7 +267,7 @@ async fn backfill_history(
     loop {
         let db = crud_store.database_connection();
         let outcome = crud_store
-            .try_run_low_priority_write(|| {
+            .run_background_database_quantum(|| {
                 let db = db.clone();
                 let resolver = resolver.clone();
                 async move {
@@ -284,10 +276,6 @@ async fn backfill_history(
                 }
             })
             .await?;
-        let Some(outcome) = outcome else {
-            super::maintenance_checkpoint().await?;
-            continue;
-        };
         migrated = migrated.saturating_add(outcome.processed);
         if outcome.complete {
             return Ok(migrated);
@@ -311,23 +299,17 @@ async fn backfill_json(
             return Ok(migrated);
         }
 
-        let processed = loop {
-            let outcome = crud_store
-                .try_run_low_priority_write(|| {
-                    let batch = batch.clone();
-                    let db = db.clone();
-                    let resolver = resolver.clone();
-                    async move {
-                        let mut resolver = resolver.lock().await;
-                        migrate_json_batch(&db, &mut resolver, batch.as_ref()).await
-                    }
-                })
-                .await?;
-            if let Some(processed) = outcome {
-                break processed;
-            }
-            super::maintenance_checkpoint().await?;
-        };
+        let processed = crud_store
+            .run_background_database_quantum(|| {
+                let batch = batch.clone();
+                let db = db.clone();
+                let resolver = resolver.clone();
+                async move {
+                    let mut resolver = resolver.lock().await;
+                    migrate_json_batch(&db, &mut resolver, batch.as_ref()).await
+                }
+            })
+            .await?;
         migrated = migrated.saturating_add(processed);
         super::maintenance_checkpoint().await?;
     }

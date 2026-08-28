@@ -146,6 +146,7 @@ impl MemberService {
             return Err(scope_mismatch());
         }
         let database = self.store.database_connection();
+        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -269,6 +270,7 @@ impl MemberService {
             return Err(scope_mismatch());
         }
         let database = self.store.database_connection();
+        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -384,6 +386,7 @@ impl MemberService {
             return Err(scope_mismatch());
         }
         let database = self.store.database_connection();
+        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -788,6 +791,7 @@ impl MemberService {
             return Err(MemberServiceError::RateLimited);
         }
         let database = self.store.database_connection();
+        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -890,6 +894,7 @@ impl MemberService {
             return Err(scope_mismatch());
         }
         let database = self.store.database_connection();
+        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),

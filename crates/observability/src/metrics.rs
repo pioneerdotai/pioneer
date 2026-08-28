@@ -70,11 +70,29 @@ pub struct DatabasePoolSnapshot {
     pub idle: u64,
 }
 
+/// One low-cardinality observation emitted by the Gateway's fair SQLite
+/// admission controller. Values are selected from finite runtime enums; no
+/// SQL, IDs, paths, or error text are accepted here.
+#[derive(Clone, Copy, Debug)]
+pub struct DatabaseAdmissionMetric {
+    pub event: &'static str,
+    pub class: &'static str,
+    pub reason: &'static str,
+    pub foreground_queue: u64,
+    pub background_queue: u64,
+    pub waited: Option<Duration>,
+    pub held: Option<Duration>,
+}
+
 pub(crate) struct GatewayMetrics {
     pub(crate) meter: Meter,
     pub(crate) database_operations: Counter<u64>,
     pub(crate) database_operation_duration: Histogram<f64>,
     pub(crate) database_pool_acquire_duration: Histogram<f64>,
+    pub(crate) database_admission_events: Counter<u64>,
+    pub(crate) database_admission_wait_duration: Histogram<f64>,
+    pub(crate) database_admission_quantum_duration: Histogram<f64>,
+    pub(crate) database_admission_queue_depth: Histogram<u64>,
     pub(crate) provider_warmup_duration: Histogram<f64>,
     pub(crate) provider_warmup_stage_duration: Histogram<f64>,
     pub(crate) provider_warmup_failures: Counter<u64>,
@@ -114,6 +132,41 @@ impl GatewayMetrics {
             .with_boundaries(vec![
                 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
                 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+            ])
+            .build();
+        let database_admission_events = meter
+            .u64_counter("pioneer.gateway.db.admission.events")
+            .with_description(
+                "Fair SQLite admission events by bounded class, event, and grant reason",
+            )
+            .with_unit("{event}")
+            .build();
+        let database_admission_wait_duration = meter
+            .f64_histogram("pioneer.gateway.db.admission.wait.duration")
+            .with_description(
+                "Time a foreground or background database quantum waits for fair admission",
+            )
+            .with_unit("ms")
+            .with_boundaries(vec![
+                0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
+                1_000.0, 2_000.0, 5_000.0, 10_000.0, 30_000.0,
+            ])
+            .build();
+        let database_admission_quantum_duration = meter
+            .f64_histogram("pioneer.gateway.db.admission.quantum.duration")
+            .with_description("Time SQLite admission is retained by one bounded database quantum")
+            .with_unit("ms")
+            .with_boundaries(vec![
+                0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
+                1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+            ])
+            .build();
+        let database_admission_queue_depth = meter
+            .u64_histogram("pioneer.gateway.db.admission.queue.depth")
+            .with_description("Foreground and background queue depth at SQLite admission events")
+            .with_unit("{request}")
+            .with_boundaries(vec![
+                0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_024.0,
             ])
             .build();
         let provider_warmup_duration = meter
@@ -204,6 +257,10 @@ impl GatewayMetrics {
             database_operations,
             database_operation_duration,
             database_pool_acquire_duration,
+            database_admission_events,
+            database_admission_wait_duration,
+            database_admission_quantum_duration,
+            database_admission_queue_depth,
             provider_warmup_duration,
             provider_warmup_stage_duration,
             provider_warmup_failures,
@@ -672,6 +729,51 @@ pub fn record_database_operation(
     metrics
         .database_operation_duration
         .record(elapsed.as_secs_f64() * 1_000.0, &attributes);
+}
+
+pub fn record_database_admission(metric: DatabaseAdmissionMetric) {
+    if !super::telemetry_enabled() {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return;
+    };
+    let attributes = [
+        KeyValue::new("db.system.name", "sqlite"),
+        KeyValue::new("db.admission.event", metric.event),
+        KeyValue::new("db.admission.class", metric.class),
+        KeyValue::new("db.admission.reason", metric.reason),
+    ];
+    metrics.database_admission_events.add(1, &attributes);
+    metrics.database_admission_queue_depth.record(
+        metric.foreground_queue,
+        &[
+            attributes[0].clone(),
+            attributes[1].clone(),
+            KeyValue::new("db.admission.queue.class", "foreground"),
+        ],
+    );
+    metrics.database_admission_queue_depth.record(
+        metric.background_queue,
+        &[
+            attributes[0].clone(),
+            attributes[1].clone(),
+            KeyValue::new("db.admission.queue.class", "background"),
+        ],
+    );
+    if let Some(waited) = metric.waited {
+        metrics
+            .database_admission_wait_duration
+            .record(waited.as_secs_f64() * 1_000.0, &attributes);
+    }
+    if let Some(held) = metric.held {
+        metrics
+            .database_admission_quantum_duration
+            .record(held.as_secs_f64() * 1_000.0, &attributes);
+    }
 }
 
 pub fn register_database_pool_observer<F>(

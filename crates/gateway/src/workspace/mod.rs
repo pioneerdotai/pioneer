@@ -52,10 +52,18 @@ pub struct WorkspaceManager {
 }
 
 impl WorkspaceManager {
+    #[cfg(test)]
     pub fn new(connection: DatabaseConnection) -> Self {
+        Self::new_with_write_coordinator(connection, SqliteWriteCoordinator::default())
+    }
+
+    pub fn new_with_write_coordinator(
+        connection: DatabaseConnection,
+        write_coordinator: SqliteWriteCoordinator,
+    ) -> Self {
         Self {
             connection,
-            write_coordinator: SqliteWriteCoordinator::default(),
+            write_coordinator,
         }
     }
 

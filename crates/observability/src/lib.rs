@@ -29,9 +29,9 @@ mod startup;
 mod telemetry;
 
 pub use metrics::{
-    DatabaseOperation, DatabasePoolSnapshot, DatabaseRole, PatchOperationMetric,
-    record_database_operation, record_patch_mutation_fallback, record_patch_operation,
-    register_database_pool_observer,
+    DatabaseAdmissionMetric, DatabaseOperation, DatabasePoolSnapshot, DatabaseRole,
+    PatchOperationMetric, record_database_admission, record_database_operation,
+    record_patch_mutation_fallback, record_patch_operation, register_database_pool_observer,
 };
 pub use operations::{
     GatewayCliRuntimeKind, GatewayOperation, GatewayOperationItemKind, GatewayOperationStage,

@@ -130,6 +130,11 @@ impl InvitationService {
     ) -> Result<InvitationPreviewResponse, Error> {
         let started = std::time::Instant::now();
         let now = chrono::Utc::now().fixed_offset();
+        let _write_admission = if let Some(auth_service) = auth_service {
+            Some(auth_service.write_coordinator().acquire_foreground().await)
+        } else {
+            None
+        };
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -205,6 +210,7 @@ impl InvitationService {
         let now_unix = u64::try_from(now.timestamp())
             .context("accept clock predates Unix epoch")
             .map_err(InvitationAcceptServiceError::Storage)?;
+        let _write_admission = auth_service.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -379,6 +385,7 @@ impl InvitationService {
             .context("invitation expiry overflow")
             .map_err(InvitationServiceError::Unavailable)?;
         let database = self.store.database_connection();
+        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -546,6 +553,7 @@ impl InvitationService {
             .map_err(|_| InvitationServiceError::InvalidParams)?;
         let now = chrono::Utc::now().fixed_offset();
         let database = self.store.database_connection();
+        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -677,6 +685,7 @@ impl InvitationService {
         }
         let now = chrono::Utc::now().fixed_offset();
         let database = self.store.database_connection();
+        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -850,6 +859,7 @@ async fn preflight_accept_admission(
 ) -> Result<(), InvitationAcceptServiceError> {
     let started = std::time::Instant::now();
     let now = chrono::Utc::now().fixed_offset();
+    let _write_admission = auth_service.write_coordinator().acquire_foreground().await;
     let transaction = database
         .begin_with_options(TransactionOptions {
             sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),

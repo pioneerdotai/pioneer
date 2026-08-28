@@ -344,6 +344,7 @@ async fn run_inner(
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
     context_compaction_timeout_config: GatewayContextCompactionTimeoutConfig,
 ) -> anyhow::Result<()> {
+    let crud_store = Arc::new(crud_store.with_background_write_admission());
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let trace = pioneer_observability::GatewayOperationTrace::start(
         pioneer_observability::GatewayOperation::DatabaseStartupMaintenance,

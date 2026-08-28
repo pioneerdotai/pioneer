@@ -26,13 +26,9 @@ pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
     let database = crud_store.database_connection();
     let mut updated_threads = 0_u64;
     loop {
-        let Some(updated) = crud_store
-            .try_run_low_priority_write(|| backfill_once(&database))
-            .await?
-        else {
-            super::maintenance_checkpoint().await?;
-            continue;
-        };
+        let updated = crud_store
+            .run_background_database_quantum(|| backfill_once(&database))
+            .await?;
         updated_threads = updated_threads.saturating_add(updated);
         if updated == 0 {
             break;

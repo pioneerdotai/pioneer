@@ -236,6 +236,7 @@ async fn run_gateway_until_shutdown_inner(
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
     secrets_open_stage.succeed();
     let database = initialize_database(&runtime_home, &config, startup).await?;
+    let write_coordinator = database::new_write_coordinator();
 
     let database_bootstrap_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::DatabaseBootstrap);
@@ -270,12 +271,13 @@ async fn run_gateway_until_shutdown_inner(
     let auth = AuthAdmissionService::new(&config, &access_jwt_material, identity_snapshot.as_ref())
         .context("failed to initialize Gateway auth admission")?;
     let auth_service = Arc::new(
-        GatewayAuthService::new(
+        GatewayAuthService::new_with_write_coordinator(
             database.clone(),
             config.gateway.auth.clone(),
             identity_snapshot.clone(),
             &access_jwt_material,
             &credential_hmac_material,
+            write_coordinator.clone(),
         )
         .context("failed to initialize Gateway auth service")?,
     );
@@ -345,8 +347,14 @@ async fn run_gateway_until_shutdown_inner(
     )?);
     let session_manager = Arc::new(SessionManager::new());
     auth_service.set_disconnect_hook(session_manager.clone());
-    let workspace_manager = Arc::new(WorkspaceManager::new(database.clone()));
-    let crud_store = Arc::new(CrudStore::new(database.clone()));
+    let workspace_manager = Arc::new(WorkspaceManager::new_with_write_coordinator(
+        database.clone(),
+        write_coordinator.clone(),
+    ));
+    let crud_store = Arc::new(CrudStore::new_with_write_coordinator(
+        database.clone(),
+        write_coordinator,
+    ));
     let configured_agent_runtimes =
         crate::cli_runtime::config::load_effective_cli_runtime_instances(runtime_home.as_path())
             .context("failed to load CLI runtime catalog during Gateway startup")?;

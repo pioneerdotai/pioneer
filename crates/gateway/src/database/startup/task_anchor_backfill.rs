@@ -6,9 +6,9 @@ use pioneer_crud::{
 use pioneer_entity::turn_item;
 use pioneer_protocol::TurnItem;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
+use sea_orm::prelude::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use tracing::{info, warn};
 
@@ -137,15 +137,30 @@ pub(crate) async fn backfill_once(crud_store: &CrudStore) -> Result<TaskAnchorBa
                 continue;
             }
 
-            let mut active: turn_item::ActiveModel = row.into();
-            active.payload = Set(serde_json::to_string(&TurnItem::Task { item: refreshed })
-                .context("failed to serialize refreshed task anchor payload")?);
-            active.updated_at = Set(now_datetime());
-            active
-                .update(&db)
-                .await
-                .context("failed to update task anchor payload")?;
-            summary.anchors_updated = summary.anchors_updated.saturating_add(1);
+            let refreshed_payload = serde_json::to_string(&TurnItem::Task { item: refreshed })
+                .context("failed to serialize refreshed task anchor payload")?;
+            let row_for_update = row.clone();
+            let updated = crud_store
+                .run_background_database_quantum(|| {
+                    let db = db.clone();
+                    let row = row_for_update.clone();
+                    let refreshed_payload = refreshed_payload.clone();
+                    async move {
+                        turn_item::Entity::update_many()
+                            .filter(turn_item::Column::Id.eq(row.id))
+                            .filter(turn_item::Column::Payload.eq(row.payload))
+                            .filter(turn_item::Column::UpdatedAt.eq(row.updated_at))
+                            .col_expr(turn_item::Column::Payload, Expr::value(refreshed_payload))
+                            .col_expr(turn_item::Column::UpdatedAt, Expr::value(now_datetime()))
+                            .exec(&db)
+                            .await
+                            .context("failed to conditionally update task anchor payload")
+                    }
+                })
+                .await?;
+            summary.anchors_updated = summary
+                .anchors_updated
+                .saturating_add(updated.rows_affected as usize);
         }
         super::maintenance_checkpoint().await?;
     }

@@ -1,8 +1,10 @@
+mod admission;
 mod connection;
 pub(crate) mod maintenance;
 pub(crate) mod startup;
 mod zstd_column;
 
+pub(crate) use admission::new_write_coordinator;
 #[cfg(test)]
 pub(crate) use connection::initialize;
 pub(crate) use connection::{

@@ -612,29 +612,23 @@ async fn load_turn_backfill_source_revision(
     revision_fence: &SemanticTimelineRevisionFence,
     turn_id: &str,
 ) -> Result<Option<TurnBackfillSourceRevision>> {
-    loop {
-        let revision = crud_store
-            .try_run_low_priority_write(|| {
-                let db = db.clone();
-                async move {
-                    let turn = turn::Entity::find_by_id(turn_id.to_owned())
-                        .one(&db)
-                        .await
-                        .with_context(|| {
-                            format!("failed to load semantic timeline source turn `{turn_id}`")
-                        })?;
-                    Ok(turn.map(|turn| TurnBackfillSourceRevision {
-                        turn,
-                        live_generation: revision_fence.current(),
-                    }))
-                }
-            })
-            .await?;
-        if let Some(revision) = revision {
-            return Ok(revision);
-        }
-        super::maintenance_checkpoint().await?;
-    }
+    crud_store
+        .run_background_database_quantum(|| {
+            let db = db.clone();
+            async move {
+                let turn = turn::Entity::find_by_id(turn_id.to_owned())
+                    .one(&db)
+                    .await
+                    .with_context(|| {
+                        format!("failed to load semantic timeline source turn `{turn_id}`")
+                    })?;
+                Ok(turn.map(|turn| TurnBackfillSourceRevision {
+                    turn,
+                    live_generation: revision_fence.current(),
+                }))
+            }
+        })
+        .await
 }
 
 async fn build_turn_backfill_plan(
@@ -1158,36 +1152,30 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    loop {
-        let guarded = crud_store
-            .try_run_low_priority_write(|| {
-                let expected = revision.clone();
-                let db = db.clone();
-                let operation = operation();
-                async move {
-                    let current_turn = turn::Entity::find_by_id(expected.turn.id.clone())
-                        .one(&db)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to validate semantic timeline source turn `{}`",
-                                expected.turn.id
-                            )
-                        })?;
-                    if revision_fence.current() != expected.live_generation
-                        || current_turn != Some(expected.turn)
-                    {
-                        return Ok(None);
-                    }
-                    operation.await.map(Some)
+    crud_store
+        .run_background_database_quantum(|| {
+            let expected = revision.clone();
+            let db = db.clone();
+            let operation = operation();
+            async move {
+                let current_turn = turn::Entity::find_by_id(expected.turn.id.clone())
+                    .one(&db)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to validate semantic timeline source turn `{}`",
+                            expected.turn.id
+                        )
+                    })?;
+                if revision_fence.current() != expected.live_generation
+                    || current_turn != Some(expected.turn)
+                {
+                    return Ok(None);
                 }
-            })
-            .await?;
-        if let Some(result) = guarded {
-            return Ok(result);
-        }
-        super::maintenance_checkpoint().await?;
-    }
+                operation.await.map(Some)
+            }
+        })
+        .await
 }
 
 async fn delete_stale_work_items(

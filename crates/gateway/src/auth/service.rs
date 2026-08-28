@@ -31,6 +31,7 @@ use pioneer_protocol::{
     DeviceId, DeviceStatus, InvitationId, PrincipalKind, PrincipalStatus, RefreshCredentialId,
     RequestId, RoleKey, TokenFamilyId, WorkspaceId, format_device_activation_code, generate_id,
 };
+use pioneer_sqlite::SqliteWriteCoordinator;
 use sea_orm::{
     DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
     TransactionTrait,
@@ -64,6 +65,7 @@ const AUTH_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from
 
 pub(crate) struct GatewayAuthService {
     database: DatabaseConnection,
+    write_coordinator: SqliteWriteCoordinator,
     config: GatewayAuthConfig,
     identity: Arc<IdentityBootstrapSnapshot>,
     access_issuer: AccessJwtIssuer,
@@ -181,6 +183,24 @@ impl GatewayAuthService {
         access_key: &AuthKeyMaterial,
         credential_hmac_key: &AuthKeyMaterial,
     ) -> Result<Self, AuthError> {
+        Self::new_with_write_coordinator(
+            database,
+            config,
+            identity,
+            access_key,
+            credential_hmac_key,
+            SqliteWriteCoordinator::default(),
+        )
+    }
+
+    pub(crate) fn new_with_write_coordinator(
+        database: DatabaseConnection,
+        config: GatewayAuthConfig,
+        identity: Arc<IdentityBootstrapSnapshot>,
+        access_key: &AuthKeyMaterial,
+        credential_hmac_key: &AuthKeyMaterial,
+        write_coordinator: SqliteWriteCoordinator,
+    ) -> Result<Self, AuthError> {
         Ok(Self {
             access_issuer: AccessJwtIssuer::new(
                 access_key.as_bytes(),
@@ -189,6 +209,7 @@ impl GatewayAuthService {
             )?,
             opaque_credentials: OpaqueCredentialFactory::new(credential_hmac_key.as_bytes())?,
             database,
+            write_coordinator,
             config,
             identity,
             disconnect_hooks: std::sync::RwLock::new(Vec::new()),
@@ -203,6 +224,10 @@ impl GatewayAuthService {
 
     pub(crate) fn epic5_rate_limits(&self) -> Arc<Epic5RateLimits> {
         self.epic5_rate_limits.clone()
+    }
+
+    pub(crate) fn write_coordinator(&self) -> SqliteWriteCoordinator {
+        self.write_coordinator.clone()
     }
 
     pub(crate) async fn exchange_refresh(
@@ -262,8 +287,16 @@ impl GatewayAuthService {
         let transaction_acquire_stage = trace.stage(
             pioneer_observability::GatewayOperationStage::AuthRefreshDatabaseTransactionAcquire,
         );
-        let transaction = tokio::time::timeout(
-            Duration::from_millis(self.config.database_acquire_timeout_ms),
+        let transaction_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(self.config.database_acquire_timeout_ms);
+        let _write_admission = tokio::time::timeout_at(
+            transaction_deadline,
+            self.write_coordinator.acquire_foreground(),
+        )
+        .await
+        .map_err(|_| AuthError::new(AuthErrorCode::TemporarilyUnavailable))?;
+        let transaction = tokio::time::timeout_at(
+            transaction_deadline,
             self.database.begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
                 ..Default::default()
@@ -650,6 +683,7 @@ impl GatewayAuthService {
         principal: &AuthenticatedSessionPrincipal,
     ) -> Result<(), AuthError> {
         let now = chrono::Utc::now().fixed_offset();
+        let _write_admission = self.write_coordinator.acquire_foreground().await;
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -987,6 +1021,7 @@ impl GatewayAuthService {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let now = datetime(now_unix)?;
+        let _write_admission = self.write_coordinator.acquire_foreground().await;
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -1122,6 +1157,7 @@ impl GatewayAuthService {
         now_unix: u64,
         batch_size: u64,
     ) -> Result<u64, AuthError> {
+        let _write_admission = self.write_coordinator.acquire_background().await;
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -1157,6 +1193,7 @@ impl GatewayAuthService {
         now_unix: u64,
         batch_size: u64,
     ) -> Result<u64, AuthError> {
+        let _write_admission = self.write_coordinator.acquire_background().await;
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -1298,6 +1335,7 @@ impl GatewayAuthService {
         reason: AuthSessionRevokeReason,
     ) -> Result<AuthSessionRevokeResponse, AuthError> {
         self.validate_session_lease(current).await?;
+        let _write_admission = self.write_coordinator.acquire_foreground().await;
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -1489,6 +1527,7 @@ impl GatewayAuthService {
             .checked_add(self.config.device_activation_code_ttl_seconds)
             .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let expires_at = datetime(expires_at_unix)?;
+        let _write_admission = self.write_coordinator.acquire_foreground().await;
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -1971,6 +2010,7 @@ impl GatewayAuthService {
             .checked_add(self.config.access_token_ttl_seconds)
             .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let refresh_expires_at = datetime(refresh_expires_at_unix)?;
+        let _write_admission = self.write_coordinator.acquire_foreground().await;
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -3032,6 +3072,61 @@ mod tests {
             .await,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_waits_for_one_background_quantum_without_becoming_unavailable() {
+        let (service, _identity) = fixture().await;
+        let initial = service
+            .create_initial_session_with_ids(
+                params("bounded-background-refresh", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .expect("initial session should be created");
+        let coordinator = service.write_coordinator();
+        let database = service.database.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let background = tokio::spawn({
+            let entered = entered.clone();
+            async move {
+                coordinator
+                    .run_background_serialized_with_retry(
+                        || {
+                            let database = database.clone();
+                            let entered = entered.clone();
+                            async move {
+                                let transaction = database.begin().await?;
+                                entered.notify_one();
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                transaction.commit().await?;
+                                Ok::<_, sea_orm::DbErr>(())
+                            }
+                        },
+                        |_| false,
+                    )
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let started = std::time::Instant::now();
+        let rotated = service
+            .exchange_refresh(
+                refresh_admission(initial.refresh_token.expose_secret()),
+                refresh_params(1),
+            )
+            .await
+            .expect("refresh should enter after the bounded background quantum");
+        assert_eq!(rotated.refresh_generation, 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(service.config.database_acquire_timeout_ms),
+            "foreground refresh exceeded its unchanged database acquisition deadline"
+        );
+        background
+            .await
+            .expect("background task should join")
+            .expect("background transaction should succeed");
     }
 
     #[tokio::test]

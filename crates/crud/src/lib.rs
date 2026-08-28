@@ -188,8 +188,8 @@ use pioneer_protocol::{
     TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
-    is_anyhow_sqlite_lock, retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteAdmissionClass,
+    SqliteWriteCoordinator, is_anyhow_sqlite_lock, retry_with_backoff,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -1557,6 +1557,16 @@ pub struct RepairSummary {
     pub remaining: usize,
 }
 
+const READ_MODEL_REPAIR_BATCH_SIZE: u64 = 32;
+
+impl RepairSummary {
+    fn merge(&mut self, phase: Self) {
+        self.detected = self.detected.saturating_add(phase.detected);
+        self.repaired = self.repaired.saturating_add(phase.repaired);
+        self.remaining = self.remaining.saturating_add(phase.remaining);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecoveryJobRecord {
     pub id: String,
@@ -2058,6 +2068,7 @@ pub struct CrudStore {
     projector: TurnProjector,
     task_projector: TaskProjector,
     write_coordinator: SqliteWriteCoordinator,
+    write_admission_class: SqliteAdmissionClass,
     semantic_timeline_revisions: SemanticTimelineRevisionRegistry,
 }
 
@@ -3552,13 +3563,31 @@ impl CrudStore {
     }
 
     pub fn new(connection: DatabaseConnection) -> Self {
+        Self::new_with_write_coordinator(connection, SqliteWriteCoordinator::default())
+    }
+
+    pub fn new_with_write_coordinator(
+        connection: DatabaseConnection,
+        write_coordinator: SqliteWriteCoordinator,
+    ) -> Self {
         Self {
             connection,
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
-            write_coordinator: SqliteWriteCoordinator::default(),
+            write_coordinator,
+            write_admission_class: SqliteAdmissionClass::Foreground,
             semantic_timeline_revisions: SemanticTimelineRevisionRegistry::default(),
         }
+    }
+
+    pub fn with_background_write_admission(&self) -> Self {
+        let mut background = self.clone();
+        background.write_admission_class = SqliteAdmissionClass::Background;
+        background
+    }
+
+    pub fn write_coordinator(&self) -> SqliteWriteCoordinator {
+        self.write_coordinator.clone()
     }
 
     pub fn register_semantic_timeline_revision_fence(
@@ -3732,12 +3761,33 @@ impl CrudStore {
     {
         match self
             .write_coordinator
-            .try_run_serialized_with_retry(operation, is_anyhow_sqlite_lock)
+            .try_run_background_serialized_with_retry(operation, is_anyhow_sqlite_lock)
             .await
         {
             Some(result) => result.map(Some),
             None => Ok(None),
         }
+    }
+
+    pub async fn run_background_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        self.run_background_database_quantum(operation).await
+    }
+
+    /// Runs one bounded background database quantum through the shared fair
+    /// admission controller. CPU-heavy work must happen after this future
+    /// returns so the sole SQLite connection is not retained during analysis.
+    pub async fn run_background_database_quantum<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        self.write_coordinator
+            .run_background_serialized_with_retry(operation, is_anyhow_sqlite_lock)
+            .await
     }
 
     pub async fn insert_turn_llm_context(
@@ -20463,7 +20513,7 @@ WHERE id IN (SELECT attempt_id FROM candidates)
             };
             if matches!(
                 turn_model.status.as_str(),
-                "completed" | "failed" | "interrupted"
+                "completed" | "failed" | "interrupted" | "blocked"
             ) {
                 violations.push(ReadModelInvariantViolation {
                     kind: ReadModelInvariantKind::TerminalTurnHasRunningAttempts,
@@ -20514,32 +20564,83 @@ WHERE id IN (SELECT attempt_id FROM candidates)
     }
 
     pub async fn repair_deterministic_read_model_violations(&self) -> Result<RepairSummary> {
-        self.run_serialized_write(|| async {
-            let before = self.list_read_model_invariant_violations().await?;
-            let mut repaired = 0usize;
-            let now: sea_orm::entity::prelude::DateTimeWithTimeZone =
-                chrono::Utc::now().into();
+        let mut summary = RepairSummary::default();
+        summary.merge(self.repair_terminal_turn_item_payloads().await?);
+        summary.merge(self.repair_terminal_turn_running_attempts().await?);
+        summary.merge(self.repair_terminal_tasks_missing_completed_at().await?);
+        summary.merge(self.repair_terminal_runs_missing_completed_at().await?);
+        Ok(summary)
+    }
 
-            let terminal_turn_item_rows = pioneer_entity::turn_item::Entity::find()
-                .filter(
-                    pioneer_entity::turn_item::Column::Status.is_in([
+    async fn repair_terminal_turn_item_payloads(&self) -> Result<RepairSummary> {
+        let high_watermark = self
+            .run_background_database_quantum(|| async {
+                pioneer_entity::turn_item::Entity::find()
+                    .filter(pioneer_entity::turn_item::Column::Status.is_in([
                         TURN_ITEM_STATUS_COMPLETED,
                         TURN_ITEM_STATUS_FAILED,
                         TURN_ITEM_STATUS_TIMED_OUT,
                         TURN_ITEM_STATUS_CANCELLED,
-                    ]),
-                )
-                .all(&self.connection)
-                .await
-                .context("failed to list terminal turn_item rows for repair")?;
+                    ]))
+                    .order_by_desc(pioneer_entity::turn_item::Column::Id)
+                    .one(&self.connection)
+                    .await
+                    .context("failed to load terminal turn_item repair high-watermark")
+                    .map(|row| row.map(|row| row.id))
+            })
+            .await?;
+        let Some(high_watermark) = high_watermark else {
+            return Ok(RepairSummary::default());
+        };
 
-            for row in terminal_turn_item_rows {
-                let mut item: TurnItem = serde_json::from_str(row.payload.as_str()).with_context(|| {
-                    format!(
-                        "failed to decode turn_item payload during repair (turn `{}` item `{}`)",
-                        row.turn_id, row.item_id
-                    )
-                })?;
+        let mut summary = RepairSummary::default();
+        let mut cursor: Option<String> = None;
+        loop {
+            let cursor_for_query = cursor.clone();
+            let high_watermark_for_query = high_watermark.clone();
+            let rows = self
+                .run_background_database_quantum(|| {
+                    let cursor = cursor_for_query.clone();
+                    let high_watermark = high_watermark_for_query.clone();
+                    async move {
+                        let query = pioneer_entity::turn_item::Entity::find()
+                            .filter(pioneer_entity::turn_item::Column::Status.is_in([
+                                TURN_ITEM_STATUS_COMPLETED,
+                                TURN_ITEM_STATUS_FAILED,
+                                TURN_ITEM_STATUS_TIMED_OUT,
+                                TURN_ITEM_STATUS_CANCELLED,
+                            ]))
+                            .filter(pioneer_entity::turn_item::Column::Id.lte(high_watermark))
+                            .order_by_asc(pioneer_entity::turn_item::Column::Id)
+                            .limit(READ_MODEL_REPAIR_BATCH_SIZE);
+                        let query = if let Some(cursor) = cursor {
+                            query.filter(pioneer_entity::turn_item::Column::Id.gt(cursor))
+                        } else {
+                            query
+                        };
+                        query
+                            .all(&self.connection)
+                            .await
+                            .context("failed to load terminal turn_item repair batch")
+                    }
+                })
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows.last().map(|row| row.id.clone());
+
+            // JSON decoding and terminalization are deliberately outside the
+            // database quantum so foreground requests can use SQLite.
+            let mut repairs = Vec::new();
+            for row in rows {
+                let mut item: TurnItem =
+                    serde_json::from_str(row.payload.as_str()).with_context(|| {
+                        format!(
+                            "failed to decode turn_item payload during repair (turn `{}` item `{}`)",
+                            row.turn_id, row.item_id
+                        )
+                    })?;
                 if tool_call_status(&item) != Some(ToolCallStatus::InProgress) {
                     continue;
                 }
@@ -20558,143 +20659,487 @@ WHERE id IN (SELECT attempt_id FROM candidates)
                 terminalize_turn_item_payload(&mut item, terminal_state);
                 let payload_json = serde_json::to_string(&item)
                     .context("failed to encode repaired turn_item payload")?;
-
-                let result = pioneer_entity::turn_item::Entity::update_many()
-                    .filter(pioneer_entity::turn_item::Column::Id.eq(row.id.clone()))
-                    .col_expr(
-                        pioneer_entity::turn_item::Column::Payload,
-                        sea_orm::sea_query::Expr::value(payload_json),
-                    )
-                    .col_expr(
-                        pioneer_entity::turn_item::Column::UpdatedAt,
-                        sea_orm::sea_query::Expr::value(now),
-                    )
-                    .exec(&self.connection)
-                    .await
-                    .context("failed to update repaired turn_item payload")?;
-                if result.rows_affected > 0 {
-                    self.advance_semantic_timeline_revision(row.turn_id.as_str());
-                }
-                repaired = repaired.saturating_add(result.rows_affected as usize);
+                repairs.push((row, payload_json));
             }
+            summary.detected = summary.detected.saturating_add(repairs.len());
 
-            let running_attempt_rows = pioneer_entity::turn_item_attempt::Entity::find()
-                .filter(
-                    pioneer_entity::turn_item_attempt::Column::Status.eq(ATTEMPT_STATUS_RUNNING),
-                )
-                .all(&self.connection)
-                .await
-                .context("failed to list running attempts for repair")?;
-
-            for running_attempt in running_attempt_rows {
-                let Some(turn_model) =
-                    pioneer_entity::turn::Entity::find_by_id(running_attempt.turn_id.clone())
-                        .one(&self.connection)
-                        .await
-                        .context("failed to load turn for running-attempt repair")?
-                else {
-                    continue;
-                };
-                if !matches!(
-                    turn_model.status.as_str(),
-                    "completed" | "failed" | "interrupted" | "blocked"
-                ) {
-                    continue;
+            if !repairs.is_empty() {
+                let repairs_for_write = repairs.clone();
+                let (repaired, revised_turn_ids) = self
+                    .run_background_database_quantum(|| {
+                        let repairs = repairs_for_write.clone();
+                        async move {
+                            let transaction =
+                                self.connection.begin().await.context(
+                                    "failed to begin terminal turn_item repair transaction",
+                                )?;
+                            let now: DateTimeWithTimeZone = chrono::Utc::now().into();
+                            let mut repaired = 0usize;
+                            let mut revised_turn_ids = Vec::new();
+                            for (row, payload_json) in repairs {
+                                let result = pioneer_entity::turn_item::Entity::update_many()
+                                    .filter(
+                                        pioneer_entity::turn_item::Column::Id.eq(row.id.clone()),
+                                    )
+                                    .filter(pioneer_entity::turn_item::Column::Status.is_in([
+                                        TURN_ITEM_STATUS_COMPLETED,
+                                        TURN_ITEM_STATUS_FAILED,
+                                        TURN_ITEM_STATUS_TIMED_OUT,
+                                        TURN_ITEM_STATUS_CANCELLED,
+                                    ]))
+                                    .filter(
+                                        pioneer_entity::turn_item::Column::Payload
+                                            .eq(row.payload.clone()),
+                                    )
+                                    .filter(
+                                        pioneer_entity::turn_item::Column::UpdatedAt
+                                            .eq(row.updated_at.clone()),
+                                    )
+                                    .col_expr(
+                                        pioneer_entity::turn_item::Column::Payload,
+                                        Expr::value(payload_json),
+                                    )
+                                    .col_expr(
+                                        pioneer_entity::turn_item::Column::UpdatedAt,
+                                        Expr::value(now.clone()),
+                                    )
+                                    .exec(&transaction)
+                                    .await
+                                    .context("failed to conditionally repair turn_item payload")?;
+                                if result.rows_affected > 0 {
+                                    repaired = repaired.saturating_add(1);
+                                    revised_turn_ids.push(row.turn_id);
+                                }
+                            }
+                            transaction.commit().await.context(
+                                "failed to commit terminal turn_item repair transaction",
+                            )?;
+                            Ok((repaired, revised_turn_ids))
+                        }
+                    })
+                    .await?;
+                summary.repaired = summary.repaired.saturating_add(repaired);
+                summary.remaining = summary
+                    .remaining
+                    .saturating_add(repairs.len().saturating_sub(repaired));
+                for turn_id in revised_turn_ids {
+                    self.advance_semantic_timeline_revision(turn_id.as_str());
                 }
+            }
+        }
+        Ok(summary)
+    }
 
-                let attempt_result = pioneer_entity::turn_item_attempt::Entity::update_many()
-                    .filter(
-                        pioneer_entity::turn_item_attempt::Column::Id.eq(running_attempt.id.clone()),
-                    )
+    async fn repair_terminal_turn_running_attempts(&self) -> Result<RepairSummary> {
+        let high_watermark = self
+            .run_background_database_quantum(|| async {
+                pioneer_entity::turn_item_attempt::Entity::find()
                     .filter(
                         pioneer_entity::turn_item_attempt::Column::Status
                             .eq(ATTEMPT_STATUS_RUNNING),
                     )
-                    .col_expr(
-                        pioneer_entity::turn_item_attempt::Column::Status,
-                        sea_orm::sea_query::Expr::value(ATTEMPT_STATUS_INTERRUPTED),
-                    )
-                    .col_expr(
-                        pioneer_entity::turn_item_attempt::Column::FailureReason,
-                        sea_orm::sea_query::Expr::value(Some(
-                            "read_model_invariant_repair".to_owned(),
-                        )),
-                    )
-                    .col_expr(
-                        pioneer_entity::turn_item_attempt::Column::UpdatedAt,
-                        sea_orm::sea_query::Expr::value(now),
-                    )
-                    .exec(&self.connection)
+                    .order_by_desc(pioneer_entity::turn_item_attempt::Column::Id)
+                    .one(&self.connection)
                     .await
-                    .context("failed to interrupt running attempt during repair")?;
-                if attempt_result.rows_affected == 0 {
-                    continue;
-                }
-                repaired = repaired.saturating_add(attempt_result.rows_affected as usize);
-
-                let item_result = pioneer_entity::turn_item::Entity::update_many()
-                    .filter(
-                        pioneer_entity::turn_item::Column::TurnId.eq(running_attempt.turn_id.clone()),
-                    )
-                    .filter(
-                        pioneer_entity::turn_item::Column::ItemId.eq(running_attempt.item_id.clone()),
-                    )
-                    .col_expr(
-                        pioneer_entity::turn_item::Column::ActiveAttemptStatus,
-                        sea_orm::sea_query::Expr::value(Some(ATTEMPT_STATUS_INTERRUPTED)),
-                    )
-                    .col_expr(
-                        pioneer_entity::turn_item::Column::UpdatedAt,
-                        sea_orm::sea_query::Expr::value(now),
-                    )
-                    .exec(&self.connection)
-                    .await
-                    .context("failed to repair turn_item active attempt status")?;
-                if item_result.rows_affected > 0 {
-                    self.advance_semantic_timeline_revision(running_attempt.turn_id.as_str());
-                }
-                repaired = repaired.saturating_add(item_result.rows_affected as usize);
-            }
-
-            let task_result = pioneer_entity::task::Entity::update_many()
-                .filter(
-                    pioneer_entity::task::Column::Status
-                        .is_in(["completed", "failed", "cancelled"]),
-                )
-                .filter(pioneer_entity::task::Column::CompletedAt.is_null())
-                .col_expr(
-                    pioneer_entity::task::Column::CompletedAt,
-                    sea_orm::sea_query::Expr::value(Some(now)),
-                )
-                .exec(&self.connection)
-                .await
-                .context("failed to repair terminal tasks missing completed_at")?;
-            repaired = repaired.saturating_add(task_result.rows_affected as usize);
-
-            let run_result = pioneer_entity::task_run::Entity::update_many()
-                .filter(
-                    pioneer_entity::task_run::Column::Status
-                        .is_in(["succeeded", "failed", "cancelled", "timed_out"]),
-                )
-                .filter(pioneer_entity::task_run::Column::CompletedAt.is_null())
-                .col_expr(
-                    pioneer_entity::task_run::Column::CompletedAt,
-                    sea_orm::sea_query::Expr::value(Some(now)),
-                )
-                .exec(&self.connection)
-                .await
-                .context("failed to repair terminal runs missing completed_at")?;
-            repaired = repaired.saturating_add(run_result.rows_affected as usize);
-
-            let after = self.list_read_model_invariant_violations().await?;
-
-            Ok(RepairSummary {
-                detected: before.len(),
-                repaired,
-                remaining: after.len(),
+                    .context("failed to load running attempt repair high-watermark")
+                    .map(|row| row.map(|row| row.id))
             })
-        })
-        .await
+            .await?;
+        let Some(high_watermark) = high_watermark else {
+            return Ok(RepairSummary::default());
+        };
+
+        let mut summary = RepairSummary::default();
+        let mut cursor: Option<String> = None;
+        loop {
+            let cursor_for_query = cursor.clone();
+            let high_watermark_for_query = high_watermark.clone();
+            let (rows, terminal_turn_ids) = self
+                .run_background_database_quantum(|| {
+                    let cursor = cursor_for_query.clone();
+                    let high_watermark = high_watermark_for_query.clone();
+                    async move {
+                        let query = pioneer_entity::turn_item_attempt::Entity::find()
+                            .filter(
+                                pioneer_entity::turn_item_attempt::Column::Status
+                                    .eq(ATTEMPT_STATUS_RUNNING),
+                            )
+                            .filter(
+                                pioneer_entity::turn_item_attempt::Column::Id.lte(high_watermark),
+                            )
+                            .order_by_asc(pioneer_entity::turn_item_attempt::Column::Id)
+                            .limit(READ_MODEL_REPAIR_BATCH_SIZE);
+                        let query = if let Some(cursor) = cursor {
+                            query.filter(pioneer_entity::turn_item_attempt::Column::Id.gt(cursor))
+                        } else {
+                            query
+                        };
+                        let rows = query
+                            .all(&self.connection)
+                            .await
+                            .context("failed to load running attempt repair batch")?;
+                        let turn_ids = rows
+                            .iter()
+                            .map(|row| row.turn_id.clone())
+                            .collect::<HashSet<_>>();
+                        let terminal_turn_ids = if turn_ids.is_empty() {
+                            HashSet::new()
+                        } else {
+                            pioneer_entity::turn::Entity::find()
+                                .filter(pioneer_entity::turn::Column::Id.is_in(turn_ids))
+                                .filter(pioneer_entity::turn::Column::Status.is_in([
+                                    "completed",
+                                    "failed",
+                                    "interrupted",
+                                    "blocked",
+                                ]))
+                                .all(&self.connection)
+                                .await
+                                .context("failed to load terminal turns for attempt repair")?
+                                .into_iter()
+                                .map(|turn| turn.id)
+                                .collect()
+                        };
+                        Ok((rows, terminal_turn_ids))
+                    }
+                })
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows.last().map(|row| row.id.clone());
+            let candidates = rows
+                .into_iter()
+                .filter(|row| terminal_turn_ids.contains(row.turn_id.as_str()))
+                .collect::<Vec<_>>();
+            summary.detected = summary.detected.saturating_add(candidates.len());
+
+            if !candidates.is_empty() {
+                let candidates_for_write = candidates.clone();
+                let (repaired_rows, resolved, revised_turn_ids) = self
+                    .run_background_database_quantum(|| {
+                        let candidates = candidates_for_write.clone();
+                        async move {
+                            let transaction = self.connection.begin().await.context(
+                                "failed to begin running attempt repair transaction",
+                            )?;
+                            let turn_ids = candidates
+                                .iter()
+                                .map(|row| row.turn_id.clone())
+                                .collect::<HashSet<_>>();
+                            let still_terminal = pioneer_entity::turn::Entity::find()
+                                .filter(pioneer_entity::turn::Column::Id.is_in(turn_ids))
+                                .filter(pioneer_entity::turn::Column::Status.is_in([
+                                    "completed",
+                                    "failed",
+                                    "interrupted",
+                                    "blocked",
+                                ]))
+                                .all(&transaction)
+                                .await
+                                .context("failed to revalidate terminal turns for repair")?
+                                .into_iter()
+                                .map(|turn| turn.id)
+                                .collect::<HashSet<_>>();
+                            let now: DateTimeWithTimeZone = chrono::Utc::now().into();
+                            let mut repaired_rows = 0usize;
+                            let mut resolved = 0usize;
+                            let mut revised_turn_ids = Vec::new();
+
+                            for attempt in candidates {
+                                if !still_terminal.contains(attempt.turn_id.as_str()) {
+                                    // The parent is live again, so the invariant no longer applies.
+                                    resolved = resolved.saturating_add(1);
+                                    continue;
+                                }
+                                let attempt_result =
+                                    pioneer_entity::turn_item_attempt::Entity::update_many()
+                                        .filter(
+                                            pioneer_entity::turn_item_attempt::Column::Id
+                                                .eq(attempt.id.clone()),
+                                        )
+                                        .filter(
+                                            pioneer_entity::turn_item_attempt::Column::Status
+                                                .eq(ATTEMPT_STATUS_RUNNING),
+                                        )
+                                        .col_expr(
+                                            pioneer_entity::turn_item_attempt::Column::Status,
+                                            Expr::value(ATTEMPT_STATUS_INTERRUPTED),
+                                        )
+                                        .col_expr(
+                                            pioneer_entity::turn_item_attempt::Column::FailureReason,
+                                            Expr::value(Some(
+                                                "read_model_invariant_repair".to_owned(),
+                                            )),
+                                        )
+                                        .col_expr(
+                                            pioneer_entity::turn_item_attempt::Column::UpdatedAt,
+                                            Expr::value(now.clone()),
+                                        )
+                                        .exec(&transaction)
+                                        .await
+                                        .context(
+                                            "failed to interrupt running attempt during repair",
+                                        )?;
+                                if attempt_result.rows_affected == 0 {
+                                    // A foreground writer already moved the attempt out of running.
+                                    resolved = resolved.saturating_add(1);
+                                    continue;
+                                }
+                                repaired_rows = repaired_rows.saturating_add(1);
+                                resolved = resolved.saturating_add(1);
+
+                                let item_result = pioneer_entity::turn_item::Entity::update_many()
+                                    .filter(
+                                        pioneer_entity::turn_item::Column::TurnId
+                                            .eq(attempt.turn_id.clone()),
+                                    )
+                                    .filter(
+                                        pioneer_entity::turn_item::Column::ItemId
+                                            .eq(attempt.item_id.clone()),
+                                    )
+                                    .filter(
+                                        pioneer_entity::turn_item::Column::ActiveAttemptId
+                                            .eq(Some(attempt.id.clone())),
+                                    )
+                                    .filter(
+                                        pioneer_entity::turn_item::Column::ActiveAttemptStatus
+                                            .eq(Some(ATTEMPT_STATUS_RUNNING)),
+                                    )
+                                    .col_expr(
+                                        pioneer_entity::turn_item::Column::ActiveAttemptStatus,
+                                        Expr::value(Some(ATTEMPT_STATUS_INTERRUPTED)),
+                                    )
+                                    .col_expr(
+                                        pioneer_entity::turn_item::Column::UpdatedAt,
+                                        Expr::value(now.clone()),
+                                    )
+                                    .exec(&transaction)
+                                    .await
+                                    .context("failed to repair active turn_item attempt status")?;
+                                if item_result.rows_affected > 0 {
+                                    repaired_rows = repaired_rows.saturating_add(1);
+                                    revised_turn_ids.push(attempt.turn_id);
+                                }
+                            }
+                            transaction.commit().await.context(
+                                "failed to commit running attempt repair transaction",
+                            )?;
+                            Ok((repaired_rows, resolved, revised_turn_ids))
+                        }
+                    })
+                    .await?;
+                summary.repaired = summary.repaired.saturating_add(repaired_rows);
+                summary.remaining = summary
+                    .remaining
+                    .saturating_add(candidates.len().saturating_sub(resolved));
+                for turn_id in revised_turn_ids {
+                    self.advance_semantic_timeline_revision(turn_id.as_str());
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    async fn repair_terminal_tasks_missing_completed_at(&self) -> Result<RepairSummary> {
+        let terminal_statuses = ["completed", "failed", "blocked", "cancelled"];
+        let high_watermark = self
+            .run_background_database_quantum(|| async {
+                pioneer_entity::task::Entity::find()
+                    .filter(pioneer_entity::task::Column::Status.is_in(terminal_statuses))
+                    .filter(pioneer_entity::task::Column::CompletedAt.is_null())
+                    .order_by_desc(pioneer_entity::task::Column::Id)
+                    .one(&self.connection)
+                    .await
+                    .context("failed to load terminal task repair high-watermark")
+                    .map(|row| row.map(|row| row.id))
+            })
+            .await?;
+        let Some(high_watermark) = high_watermark else {
+            return Ok(RepairSummary::default());
+        };
+
+        let mut summary = RepairSummary::default();
+        let mut cursor: Option<String> = None;
+        loop {
+            let cursor_for_query = cursor.clone();
+            let high_watermark_for_query = high_watermark.clone();
+            let rows = self
+                .run_background_database_quantum(|| {
+                    let cursor = cursor_for_query.clone();
+                    let high_watermark = high_watermark_for_query.clone();
+                    async move {
+                        let query = pioneer_entity::task::Entity::find()
+                            .filter(pioneer_entity::task::Column::Status.is_in([
+                                "completed",
+                                "failed",
+                                "blocked",
+                                "cancelled",
+                            ]))
+                            .filter(pioneer_entity::task::Column::CompletedAt.is_null())
+                            .filter(pioneer_entity::task::Column::Id.lte(high_watermark))
+                            .order_by_asc(pioneer_entity::task::Column::Id)
+                            .limit(READ_MODEL_REPAIR_BATCH_SIZE);
+                        let query = if let Some(cursor) = cursor {
+                            query.filter(pioneer_entity::task::Column::Id.gt(cursor))
+                        } else {
+                            query
+                        };
+                        query
+                            .all(&self.connection)
+                            .await
+                            .context("failed to load terminal task repair batch")
+                    }
+                })
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows.last().map(|row| row.id.clone());
+            summary.detected = summary.detected.saturating_add(rows.len());
+            let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+            let ids_for_write = ids.clone();
+            let repaired = self
+                .run_background_database_quantum(|| {
+                    let ids = ids_for_write.clone();
+                    async move {
+                        let transaction = self
+                            .connection
+                            .begin()
+                            .await
+                            .context("failed to begin terminal task repair transaction")?;
+                        let now: DateTimeWithTimeZone = chrono::Utc::now().into();
+                        let result = pioneer_entity::task::Entity::update_many()
+                            .filter(pioneer_entity::task::Column::Id.is_in(ids))
+                            .filter(pioneer_entity::task::Column::Status.is_in([
+                                "completed",
+                                "failed",
+                                "blocked",
+                                "cancelled",
+                            ]))
+                            .filter(pioneer_entity::task::Column::CompletedAt.is_null())
+                            .col_expr(
+                                pioneer_entity::task::Column::CompletedAt,
+                                Expr::value(Some(now)),
+                            )
+                            .exec(&transaction)
+                            .await
+                            .context("failed to repair terminal tasks missing completed_at")?;
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit terminal task repair transaction")?;
+                        Ok(result.rows_affected as usize)
+                    }
+                })
+                .await?;
+            summary.repaired = summary.repaired.saturating_add(repaired);
+        }
+        Ok(summary)
+    }
+
+    async fn repair_terminal_runs_missing_completed_at(&self) -> Result<RepairSummary> {
+        let high_watermark = self
+            .run_background_database_quantum(|| async {
+                pioneer_entity::task_run::Entity::find()
+                    .filter(pioneer_entity::task_run::Column::Status.is_in([
+                        "succeeded",
+                        "failed",
+                        "blocked",
+                        "cancelled",
+                        "timed_out",
+                    ]))
+                    .filter(pioneer_entity::task_run::Column::CompletedAt.is_null())
+                    .order_by_desc(pioneer_entity::task_run::Column::Id)
+                    .one(&self.connection)
+                    .await
+                    .context("failed to load terminal task_run repair high-watermark")
+                    .map(|row| row.map(|row| row.id))
+            })
+            .await?;
+        let Some(high_watermark) = high_watermark else {
+            return Ok(RepairSummary::default());
+        };
+
+        let mut summary = RepairSummary::default();
+        let mut cursor: Option<String> = None;
+        loop {
+            let cursor_for_query = cursor.clone();
+            let high_watermark_for_query = high_watermark.clone();
+            let rows = self
+                .run_background_database_quantum(|| {
+                    let cursor = cursor_for_query.clone();
+                    let high_watermark = high_watermark_for_query.clone();
+                    async move {
+                        let query = pioneer_entity::task_run::Entity::find()
+                            .filter(pioneer_entity::task_run::Column::Status.is_in([
+                                "succeeded",
+                                "failed",
+                                "blocked",
+                                "cancelled",
+                                "timed_out",
+                            ]))
+                            .filter(pioneer_entity::task_run::Column::CompletedAt.is_null())
+                            .filter(pioneer_entity::task_run::Column::Id.lte(high_watermark))
+                            .order_by_asc(pioneer_entity::task_run::Column::Id)
+                            .limit(READ_MODEL_REPAIR_BATCH_SIZE);
+                        let query = if let Some(cursor) = cursor {
+                            query.filter(pioneer_entity::task_run::Column::Id.gt(cursor))
+                        } else {
+                            query
+                        };
+                        query
+                            .all(&self.connection)
+                            .await
+                            .context("failed to load terminal task_run repair batch")
+                    }
+                })
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows.last().map(|row| row.id.clone());
+            summary.detected = summary.detected.saturating_add(rows.len());
+            let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+            let ids_for_write = ids.clone();
+            let repaired = self
+                .run_background_database_quantum(|| {
+                    let ids = ids_for_write.clone();
+                    async move {
+                        let transaction = self
+                            .connection
+                            .begin()
+                            .await
+                            .context("failed to begin terminal task_run repair transaction")?;
+                        let now: DateTimeWithTimeZone = chrono::Utc::now().into();
+                        let result = pioneer_entity::task_run::Entity::update_many()
+                            .filter(pioneer_entity::task_run::Column::Id.is_in(ids))
+                            .filter(pioneer_entity::task_run::Column::Status.is_in([
+                                "succeeded",
+                                "failed",
+                                "blocked",
+                                "cancelled",
+                                "timed_out",
+                            ]))
+                            .filter(pioneer_entity::task_run::Column::CompletedAt.is_null())
+                            .col_expr(
+                                pioneer_entity::task_run::Column::CompletedAt,
+                                Expr::value(Some(now)),
+                            )
+                            .exec(&transaction)
+                            .await
+                            .context("failed to repair terminal runs missing completed_at")?;
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit terminal task_run repair transaction")?;
+                        Ok(result.rows_affected as usize)
+                    }
+                })
+                .await?;
+            summary.repaired = summary.repaired.saturating_add(repaired);
+        }
+        Ok(summary)
     }
 
     pub async fn transition_timeout_candidate(
@@ -24611,9 +25056,18 @@ WHERE id IN (SELECT attempt_id FROM candidates)
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        self.write_coordinator
-            .run_serialized_with_retry(operation, is_anyhow_sqlite_lock)
-            .await
+        match self.write_admission_class {
+            SqliteAdmissionClass::Foreground => {
+                self.write_coordinator
+                    .run_serialized_with_retry(operation, is_anyhow_sqlite_lock)
+                    .await
+            }
+            SqliteAdmissionClass::Background => {
+                self.write_coordinator
+                    .run_background_serialized_with_retry(operation, is_anyhow_sqlite_lock)
+                    .await
+            }
+        }
     }
 }
 
@@ -35547,6 +36001,34 @@ mod tests {
             .await
             .expect("status mutation should succeed");
 
+        // Exceed one repair quantum so the test also proves keyset progress
+        // and durable processing across batch boundaries.
+        for index in 0..=super::READ_MODEL_REPAIR_BATCH_SIZE {
+            let extra_item_id = format!("item_invariant_repair_{index:03}");
+            let extra_item = safe_web_fetch_item(extra_item_id.as_str());
+            let item_timestamp = unix_to_datetime(timestamp + 1);
+            pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
+                id: Set(format!("row_invariant_repair_{index:03}")),
+                turn_id: Set(turn_id.to_owned()),
+                item_id: Set(extra_item_id),
+                item_type: Set("web_fetch".to_owned()),
+                status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
+                payload: Set(
+                    serde_json::to_string(&extra_item).expect("extra item should serialize")
+                ),
+                active_attempt_number: Set(0),
+                active_attempt_status: Set(None),
+                active_attempt_id: Set(None),
+                last_heartbeat_at: Set(None),
+                lease_expires_at: Set(None),
+                created_at: Set(item_timestamp),
+                updated_at: Set(item_timestamp),
+            })
+            .exec(&store.connection)
+            .await
+            .expect("extra terminal turn_item should insert");
+        }
+
         let violations = store
             .list_read_model_invariant_violations()
             .await
@@ -35562,8 +36044,16 @@ mod tests {
             .repair_deterministic_read_model_violations()
             .await
             .expect("repair should succeed");
-        assert!(summary.detected >= 1);
+        assert!(summary.detected > super::READ_MODEL_REPAIR_BATCH_SIZE as usize);
         assert_eq!(summary.remaining, 0);
+
+        assert!(
+            store
+                .list_read_model_invariant_violations()
+                .await
+                .expect("post-repair invariant list should succeed")
+                .is_empty()
+        );
 
         let row = crate::repositories::turn::find_turn_item(&store.connection, turn_id, item_id)
             .await
