@@ -363,6 +363,7 @@ impl PioneerDesktop {
                                         && !raw_text.trim().is_empty(),
                                     |this| {
                                         this.child(self.render_markdown_auto(
+                                            item_view.id.as_str(),
                                             raw_text,
                                             item_view.partial_markdown.as_ref(),
                                             CodeHighlightPolicy::Disabled,

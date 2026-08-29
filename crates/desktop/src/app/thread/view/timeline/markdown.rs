@@ -1,6 +1,8 @@
-use crate::app::PioneerDesktop;
+use crate::{app::PioneerDesktop, assets::PioneerIconName};
 use gpui::{prelude::*, *};
-use gpui_component::{StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex};
+use gpui_component::{
+    IconNamed, StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex,
+};
 use pioneer_client::conversation::TimelineEntryStatus;
 use pioneer_protocol::{
     MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList, MarkdownMark, MarkdownMarkKind,
@@ -11,6 +13,8 @@ use super::layout::TIMELINE_ROW_MEASUREMENT_GUARD;
 
 const TIMELINE_MESSAGE_FONT_SIZE_REM: f32 = 0.875;
 const TIMELINE_MESSAGE_LINE_HEIGHT_RATIO: f32 = 1.65;
+const MARKDOWN_LINK_ICON_PLACEHOLDER: &str = "\u{2007}\u{2007}";
+const MARKDOWN_LINK_ICON_FONT_SCALE: f32 = 0.85;
 
 pub(super) fn timeline_message_text_bottom_inset(window: &Window) -> Pixels {
     let font_size = px(window.rem_size().as_f32() * TIMELINE_MESSAGE_FONT_SIZE_REM);
@@ -52,16 +56,141 @@ impl CodeHighlightPolicy {
     }
 }
 
+struct MarkdownLinkText {
+    id: ElementId,
+    text: InteractiveText,
+    text_layout: TextLayout,
+    icon_offsets: Vec<usize>,
+    icon_path: SharedString,
+    icon_color: Hsla,
+    accessible_text: SharedString,
+}
+
+impl IntoElement for MarkdownLinkText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for MarkdownLinkText {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn a11y_role(&self) -> Option<Role> {
+        Some(Role::Label)
+    }
+
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        node.set_value(self.accessible_text.to_string());
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        self.text
+            .request_layout(global_id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.text
+            .prepaint(global_id, inspector_id, bounds, request_layout, window, cx)
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.text.paint(
+            global_id,
+            inspector_id,
+            bounds,
+            request_layout,
+            hitbox,
+            window,
+            cx,
+        );
+
+        let line_height = self.text_layout.line_height();
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        for offset in &self.icon_offsets {
+            let Some(start) = self.text_layout.position_for_index(*offset) else {
+                continue;
+            };
+            let Some(end) = self
+                .text_layout
+                .position_for_index(offset.saturating_add(MARKDOWN_LINK_ICON_PLACEHOLDER.len()))
+            else {
+                continue;
+            };
+            if start.y != end.y {
+                continue;
+            }
+
+            let reserved_width = end.x - start.x;
+            let icon_size =
+                px((font_size.as_f32() * MARKDOWN_LINK_ICON_FONT_SCALE)
+                    .min(reserved_width.as_f32()));
+            if icon_size <= px(0.) {
+                continue;
+            }
+            let icon_bounds = Bounds::new(
+                point(
+                    start.x + (reserved_width - icon_size) / 2.,
+                    start.y + (line_height - icon_size) / 1.9,
+                ),
+                size(icon_size, icon_size),
+            );
+            let _ = window.paint_svg(
+                icon_bounds,
+                self.icon_path.clone(),
+                None,
+                TransformationMatrix::default(),
+                self.icon_color,
+                cx,
+            );
+        }
+    }
+}
+
 impl PioneerDesktop {
     pub(super) fn render_markdown_auto(
         &self,
+        interaction_scope: &str,
         text: &str,
         document: Option<&MarkdownDocument>,
         code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(document) = document {
-            self.render_markdown_document(document, code_highlight_policy, cx)
+            self.render_markdown_document(interaction_scope, document, code_highlight_policy, cx)
         } else {
             self.render_markdown_plain(text, cx)
         }
@@ -94,6 +223,7 @@ impl PioneerDesktop {
 
     pub(super) fn render_markdown_document(
         &self,
+        interaction_scope: &str,
         document: &MarkdownDocument,
         code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
@@ -122,12 +252,18 @@ impl PioneerDesktop {
 
         let mut content = v_flex().w_full().overflow_hidden().gap_0();
         let mut previous_block: Option<&MarkdownBlock> = None;
+        let interaction_root = markdown_interaction_root_id(interaction_scope);
         for (index, block) in document.blocks.iter().enumerate() {
             let top_spacing = Self::markdown_block_spacing(previous_block, block, index);
             if top_spacing > px(0.) {
                 content = content.child(div().w_full().h(top_spacing));
             }
-            content = content.child(self.render_markdown_block(block, code_highlight_policy, cx));
+            content = content.child(self.render_markdown_block(
+                block,
+                code_highlight_policy,
+                markdown_child_interaction_id(interaction_root, index),
+                cx,
+            ));
             previous_block = Some(block);
         }
         let element = content.into_any_element();
@@ -170,18 +306,27 @@ impl PioneerDesktop {
         &self,
         block: &MarkdownBlock,
         code_highlight_policy: CodeHighlightPolicy,
+        interaction_id: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match block {
-            MarkdownBlock::Paragraph(inline) => {
-                self.render_markdown_inline(inline, MarkdownTextVariant::Paragraph, cx)
+            MarkdownBlock::Paragraph(inline) => self.render_markdown_inline(
+                inline,
+                MarkdownTextVariant::Paragraph,
+                interaction_id,
+                cx,
+            ),
+            MarkdownBlock::Heading { level, content } => self.render_markdown_inline(
+                content,
+                MarkdownTextVariant::Heading(*level),
+                interaction_id,
+                cx,
+            ),
+            MarkdownBlock::List(list) => {
+                self.render_markdown_list(list, code_highlight_policy, interaction_id, cx)
             }
-            MarkdownBlock::Heading { level, content } => {
-                self.render_markdown_inline(content, MarkdownTextVariant::Heading(*level), cx)
-            }
-            MarkdownBlock::List(list) => self.render_markdown_list(list, code_highlight_policy, cx),
             MarkdownBlock::Quote { blocks } => {
-                self.render_markdown_quote(blocks, code_highlight_policy, cx)
+                self.render_markdown_quote(blocks, code_highlight_policy, interaction_id, cx)
             }
             MarkdownBlock::Code { language, text } => self.render_markdown_code_block(
                 language.as_deref(),
@@ -202,30 +347,57 @@ impl PioneerDesktop {
         &self,
         inline: &MarkdownInline,
         variant: MarkdownTextVariant,
+        interaction_id: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let text = if inline.text.is_empty() {
-            SharedString::new_static(" ")
+        let base = div().w_full().overflow_hidden().whitespace_normal();
+        let links = normalized_markdown_links(inline.text.as_str(), &inline.marks);
+        let base = if links.is_empty() {
+            base.child(self.styled_markdown_inline_text(inline.text.as_str(), &inline.marks, cx))
         } else {
-            SharedString::new(Arc::<str>::from(inline.text.as_str()))
+            let presentation =
+                markdown_inline_with_link_icons(inline.text.as_str(), &inline.marks, links);
+            let styled_text = self.styled_markdown_inline_text(
+                presentation.text.as_str(),
+                &presentation.marks,
+                cx,
+            );
+            let text_layout = styled_text.layout().clone();
+            let ranges = presentation
+                .links
+                .iter()
+                .map(|link| link.range.clone())
+                .collect();
+            let urls: Vec<_> = presentation
+                .links
+                .into_iter()
+                .map(|link| link.url)
+                .collect();
+            let element_id: ElementId = ("timeline-markdown-inline", interaction_id).into();
+            let text = InteractiveText::new(element_id.clone(), styled_text).on_click(
+                ranges,
+                move |range_index, _, _| {
+                    let Some(url) = urls.get(range_index) else {
+                        return;
+                    };
+                    if let Err(error) = webbrowser::open(url.as_ref()) {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to open timeline markdown link"
+                        );
+                    }
+                },
+            );
+            base.child(MarkdownLinkText {
+                id: element_id,
+                text,
+                text_layout,
+                icon_offsets: presentation.icon_offsets,
+                icon_path: PioneerIconName::Globe.path(),
+                icon_color: cx.theme().link,
+                accessible_text: SharedString::new(Arc::<str>::from(inline.text.as_str())),
+            })
         };
-
-        let highlights =
-            normalized_markdown_highlights(inline.text.as_str(), &inline.marks, |mark| {
-                self.markdown_highlight(mark, cx)
-            });
-
-        let styled_text = if highlights.is_empty() {
-            StyledText::new(text)
-        } else {
-            StyledText::new(text).with_highlights(highlights)
-        };
-
-        let base = div()
-            .w_full()
-            .overflow_hidden()
-            .whitespace_normal()
-            .child(styled_text);
         let styled = match variant {
             MarkdownTextVariant::Paragraph => base.text_sm().line_height(relative(1.65)),
             MarkdownTextVariant::Heading(level) => match level {
@@ -238,6 +410,27 @@ impl PioneerDesktop {
         };
 
         styled.into_any_element()
+    }
+
+    fn styled_markdown_inline_text(
+        &self,
+        text: &str,
+        marks: &[MarkdownMark],
+        cx: &mut Context<Self>,
+    ) -> StyledText {
+        let shared_text = if text.is_empty() {
+            SharedString::new_static(" ")
+        } else {
+            SharedString::new(Arc::<str>::from(text))
+        };
+        let highlights =
+            normalized_markdown_highlights(text, marks, |mark| self.markdown_highlight(mark, cx));
+
+        if highlights.is_empty() {
+            StyledText::new(shared_text)
+        } else {
+            StyledText::new(shared_text).with_highlights(highlights)
+        }
     }
 
     fn markdown_highlight(&self, mark: &MarkdownMark, cx: &mut Context<Self>) -> HighlightStyle {
@@ -263,11 +456,7 @@ impl PioneerDesktop {
             },
             MarkdownMarkKind::Link { url: _ } => HighlightStyle {
                 color: Some(cx.theme().link),
-                underline: Some(UnderlineStyle {
-                    thickness: px(1.),
-                    color: Some(cx.theme().link),
-                    wavy: false,
-                }),
+                font_weight: Some(FontWeight::MEDIUM),
                 ..Default::default()
             },
         }
@@ -277,6 +466,7 @@ impl PioneerDesktop {
         &self,
         list: &MarkdownList,
         code_highlight_policy: CodeHighlightPolicy,
+        interaction_id: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut rows = v_flex().w_full().overflow_hidden().gap_1();
@@ -294,9 +484,14 @@ impl PioneerDesktop {
             };
 
             let mut content = v_flex().w_full().gap_2();
-            for block in &item.blocks {
-                content =
-                    content.child(self.render_markdown_block(block, code_highlight_policy, cx));
+            let item_interaction_id = markdown_child_interaction_id(interaction_id, index);
+            for (block_index, block) in item.blocks.iter().enumerate() {
+                content = content.child(self.render_markdown_block(
+                    block,
+                    code_highlight_policy,
+                    markdown_child_interaction_id(item_interaction_id, block_index),
+                    cx,
+                ));
             }
 
             rows = rows.child(
@@ -324,11 +519,17 @@ impl PioneerDesktop {
         &self,
         blocks: &[MarkdownBlock],
         code_highlight_policy: CodeHighlightPolicy,
+        interaction_id: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut content = v_flex().w_full().gap_2();
-        for block in blocks {
-            content = content.child(self.render_markdown_block(block, code_highlight_policy, cx));
+        for (index, block) in blocks.iter().enumerate() {
+            content = content.child(self.render_markdown_block(
+                block,
+                code_highlight_policy,
+                markdown_child_interaction_id(interaction_id, index),
+                cx,
+            ));
         }
 
         div()
@@ -440,6 +641,131 @@ fn normalize_mark_range(text: &str, mark: &MarkdownMark) -> (usize, usize) {
     (start, end)
 }
 
+fn markdown_interaction_root_id(scope: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scope.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn markdown_child_interaction_id(parent: u64, index: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    parent.hash(&mut hasher);
+    index.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MarkdownLink {
+    range: Range<usize>,
+    url: Arc<str>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MarkdownInlineWithLinkIcons {
+    text: String,
+    marks: Vec<MarkdownMark>,
+    links: Vec<MarkdownLink>,
+    icon_offsets: Vec<usize>,
+}
+
+fn normalized_markdown_links(text: &str, marks: &[MarkdownMark]) -> Vec<MarkdownLink> {
+    let mut links: Vec<_> = marks
+        .iter()
+        .filter_map(|mark| {
+            let MarkdownMarkKind::Link { url } = &mark.kind else {
+                return None;
+            };
+            let (start, end) = normalize_mark_range(text, mark);
+            (start < end).then(|| MarkdownLink {
+                range: start..end,
+                url: Arc::from(url.as_str()),
+            })
+        })
+        .collect();
+    links.sort_by_key(|link| (link.range.start, link.range.end));
+
+    let mut previous_end = 0;
+    links.retain(|link| {
+        if link.range.start < previous_end {
+            return false;
+        }
+        previous_end = link.range.end;
+        true
+    });
+    links
+}
+
+fn markdown_inline_with_link_icons(
+    text: &str,
+    marks: &[MarkdownMark],
+    links: Vec<MarkdownLink>,
+) -> MarkdownInlineWithLinkIcons {
+    let link_starts: Vec<_> = links.iter().map(|link| link.range.start).collect();
+    let mut rendered_text = String::with_capacity(
+        text.len()
+            + links
+                .len()
+                .saturating_mul(MARKDOWN_LINK_ICON_PLACEHOLDER.len()),
+    );
+    let mut cursor = 0;
+    let mut icon_offsets = Vec::with_capacity(links.len());
+    for link in &links {
+        rendered_text.push_str(&text[cursor..link.range.start]);
+        icon_offsets.push(rendered_text.len());
+        rendered_text.push_str(MARKDOWN_LINK_ICON_PLACEHOLDER);
+        cursor = link.range.start;
+    }
+    rendered_text.push_str(&text[cursor..]);
+
+    let rendered_marks = marks
+        .iter()
+        .filter_map(|mark| {
+            let (start, end) = normalize_mark_range(text, mark);
+            (start < end).then(|| MarkdownMark {
+                start: markdown_index_after_link_icons(start, &link_starts),
+                end: markdown_range_end_after_link_icons(end, &link_starts),
+                kind: mark.kind.clone(),
+            })
+        })
+        .collect();
+    let rendered_links = links
+        .into_iter()
+        .map(|link| {
+            let text_start = markdown_index_after_link_icons(link.range.start, &link_starts);
+            MarkdownLink {
+                range: text_start.saturating_sub(MARKDOWN_LINK_ICON_PLACEHOLDER.len())
+                    ..markdown_range_end_after_link_icons(link.range.end, &link_starts),
+                url: link.url,
+            }
+        })
+        .collect();
+
+    MarkdownInlineWithLinkIcons {
+        text: rendered_text,
+        marks: rendered_marks,
+        links: rendered_links,
+        icon_offsets,
+    }
+}
+
+fn markdown_index_after_link_icons(index: usize, link_starts: &[usize]) -> usize {
+    index
+        + link_starts
+            .partition_point(|link_start| *link_start <= index)
+            .saturating_mul(MARKDOWN_LINK_ICON_PLACEHOLDER.len())
+}
+
+fn markdown_range_end_after_link_icons(index: usize, link_starts: &[usize]) -> usize {
+    index
+        + link_starts
+            .partition_point(|link_start| *link_start < index)
+            .saturating_mul(MARKDOWN_LINK_ICON_PLACEHOLDER.len())
+}
+
 fn normalized_markdown_highlights(
     text: &str,
     marks: &[MarkdownMark],
@@ -476,8 +802,13 @@ fn snap_to_char_boundary_forward(text: &str, mut index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodeHighlightPolicy, sanitized_language_label};
+    use super::{
+        CodeHighlightPolicy, MARKDOWN_LINK_ICON_PLACEHOLDER, MarkdownLink,
+        markdown_inline_with_link_icons, normalized_markdown_links, sanitized_language_label,
+    };
     use pioneer_client::conversation::TimelineEntryStatus;
+    use pioneer_protocol::{MarkdownMark, MarkdownMarkKind};
+    use std::sync::Arc;
 
     #[test]
     fn code_highlighting_is_limited_to_completed_timeline_items() {
@@ -517,5 +848,100 @@ mod tests {
                 .len()
                 <= 64
         );
+    }
+
+    #[test]
+    fn markdown_links_keep_urls_and_normalize_clickable_ranges() {
+        let text = "go to café now";
+        let marks = vec![
+            MarkdownMark {
+                start: 6,
+                end: 10,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/cafe".to_owned(),
+                },
+            },
+            MarkdownMark {
+                start: 0,
+                end: 2,
+                kind: MarkdownMarkKind::Bold,
+            },
+            MarkdownMark {
+                start: text.len(),
+                end: text.len() + 10,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/empty".to_owned(),
+                },
+            },
+        ];
+
+        assert_eq!(
+            normalized_markdown_links(text, &marks),
+            vec![MarkdownLink {
+                range: 6..11,
+                url: Arc::from("https://example.com/cafe"),
+            }]
+        );
+    }
+
+    #[test]
+    fn markdown_links_do_not_create_overlapping_click_targets() {
+        let marks = vec![
+            MarkdownMark {
+                start: 0,
+                end: 5,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/first".to_owned(),
+                },
+            },
+            MarkdownMark {
+                start: 3,
+                end: 8,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/second".to_owned(),
+                },
+            },
+        ];
+
+        let links = normalized_markdown_links("overlaps", &marks);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url.as_ref(), "https://example.com/first");
+    }
+
+    #[test]
+    fn markdown_link_icons_precede_links_and_shift_marks_and_click_targets() {
+        let text = "one and two";
+        let marks = vec![
+            MarkdownMark {
+                start: 0,
+                end: 3,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/one".to_owned(),
+                },
+            },
+            MarkdownMark {
+                start: 8,
+                end: 11,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/two".to_owned(),
+                },
+            },
+        ];
+        let links = normalized_markdown_links(text, &marks);
+
+        let presentation = markdown_inline_with_link_icons(text, &marks, links);
+
+        assert_eq!(
+            presentation.text,
+            format!("{MARKDOWN_LINK_ICON_PLACEHOLDER}one and {MARKDOWN_LINK_ICON_PLACEHOLDER}two")
+        );
+        assert_eq!(presentation.icon_offsets, vec![0, 14]);
+        assert_eq!(presentation.marks[0].start..presentation.marks[0].end, 6..9);
+        assert_eq!(
+            presentation.marks[1].start..presentation.marks[1].end,
+            20..23
+        );
+        assert_eq!(presentation.links[0].range, 0..9);
+        assert_eq!(presentation.links[1].range, 14..23);
     }
 }

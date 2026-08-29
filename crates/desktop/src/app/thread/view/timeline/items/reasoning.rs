@@ -36,6 +36,7 @@ impl PioneerDesktop {
 
         let code_highlight_policy = CodeHighlightPolicy::for_timeline_status(item_view.status);
         let body_element = self.render_markdown_auto(
+            item_view.id.as_str(),
             body.as_str(),
             item_view.partial_markdown.as_ref(),
             code_highlight_policy,

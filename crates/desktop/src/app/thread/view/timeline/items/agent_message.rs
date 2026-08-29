@@ -61,9 +61,20 @@ impl PioneerDesktop {
         if is_task_timeline_agent_message(item_view) {
             let body_element =
                 if let Some(document) = markdown.or(item_view.partial_markdown.as_ref()) {
-                    self.render_markdown_document(document, code_highlight_policy, cx)
+                    self.render_markdown_document(
+                        item_view.id.as_str(),
+                        document,
+                        code_highlight_policy,
+                        cx,
+                    )
                 } else {
-                    self.render_markdown_auto(text, None, CodeHighlightPolicy::Disabled, cx)
+                    self.render_markdown_auto(
+                        item_view.id.as_str(),
+                        text,
+                        None,
+                        CodeHighlightPolicy::Disabled,
+                        cx,
+                    )
                 };
             let open = self
                 .thread_timeline_item_expanded
@@ -187,9 +198,20 @@ impl PioneerDesktop {
                 })
                 .child(div().w_full().overflow_hidden().child(
                     if let Some(document) = markdown.or(item_view.partial_markdown.as_ref()) {
-                        self.render_markdown_document(document, code_highlight_policy, cx)
+                        self.render_markdown_document(
+                            item_view.id.as_str(),
+                            document,
+                            code_highlight_policy,
+                            cx,
+                        )
                     } else {
-                        self.render_markdown_auto(text, None, CodeHighlightPolicy::Disabled, cx)
+                        self.render_markdown_auto(
+                            item_view.id.as_str(),
+                            text,
+                            None,
+                            CodeHighlightPolicy::Disabled,
+                            cx,
+                        )
                     },
                 )),
         )

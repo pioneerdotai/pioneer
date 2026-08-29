@@ -53,6 +53,7 @@ pub enum PioneerIconName {
     FolderPlus,
     FolderTree,
     GalleryVerticalEnd,
+    Globe,
     Infinity,
     Leaf,
     Lightbulb,
@@ -91,6 +92,7 @@ impl IconNamed for PioneerIconName {
             Self::FolderPlus => "icons/folder-plus.svg",
             Self::FolderTree => "icons/folder-tree.svg",
             Self::GalleryVerticalEnd => "icons/gallery-vertical-end.svg",
+            Self::Globe => "icons/globe.svg",
             Self::Infinity => "icons/infinity.svg",
             Self::Leaf => "icons/leaf.svg",
             Self::Lightbulb => "icons/lightbulb.svg",
@@ -136,5 +138,15 @@ mod tests {
         let assets = PioneerAssetsSource;
         assert!(assets.load("dino-dark.webp").unwrap().is_some());
         assert!(assets.load("dino-light.webp").unwrap().is_some());
+    }
+
+    #[test]
+    fn serves_timeline_link_icon() {
+        assert!(
+            PioneerAssetsSource
+                .load("icons/globe.svg")
+                .unwrap()
+                .is_some()
+        );
     }
 }
