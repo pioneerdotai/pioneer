@@ -968,6 +968,10 @@ description = "Elige el idioma usado en la interfaz."
 label = "Tema de color"
 description = "Elige el modo de apariencia preferido."
 
+[settings.option.file_opener]
+label = "Abrir archivos"
+description = "Elige la aplicación predeterminada para abrir archivos."
+
 [settings.option.keepawake]
 label = "Evitar reposo por inactividad"
 description = "Evita que el equipo entre en reposo por inactividad mientras el gateway está en ejecución. No garantiza que siga funcionando al cerrar la tapa del portátil; para eso usa el modo clamshell o una máquina siempre encendida."
@@ -1681,6 +1685,9 @@ nickname_unavailable = "Ese alias ya está en uso."
 avatar = "Elige una imagen de hasta 256 KB."
 storage = "No se pudo guardar de forma segura la nueva sesión. Inténtalo de nuevo."
 transport = "No se pudo contactar con el Gateway. Inténtalo de nuevo."
+
+[thread.file_opener]
+use_workspace = "Predeterminado"
 
 [thread.scope]
 title = "Acceso al hilo"

@@ -8,6 +8,7 @@ mod assets;
 mod audio;
 mod code_highlight;
 mod components;
+mod file_opener;
 mod gateway;
 mod menu;
 mod settings;

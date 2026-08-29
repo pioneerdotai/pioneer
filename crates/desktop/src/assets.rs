@@ -131,6 +131,7 @@ impl RenderOnce for PioneerIconName {
 #[cfg(test)]
 mod tests {
     use super::PioneerAssetsSource;
+    use crate::file_opener::FILE_OPENER_CANDIDATES;
     use gpui::AssetSource as _;
 
     #[test]
@@ -148,5 +149,24 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn serves_every_file_opener_logo() {
+        let assets = PioneerAssetsSource;
+        for opener in FILE_OPENER_CANDIDATES {
+            let Some(path) = opener.logo_path() else {
+                continue;
+            };
+            assert!(assets.load(path).unwrap().is_some(), "missing logo: {path}");
+        }
+
+        for path in [
+            "logos/editors/finder.svg",
+            "logos/editors/explorer.svg",
+            "logos/editors/files.svg",
+        ] {
+            assert!(assets.load(path).unwrap().is_some(), "missing logo: {path}");
+        }
     }
 }

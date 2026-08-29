@@ -968,6 +968,10 @@ description = "インターフェースで使用する言語を選択します�
 label = "カラーテーマ"
 description = "表示モードを選択します。"
 
+[settings.option.file_opener]
+label = "ファイルを開く"
+description = "ファイルを開く既定のアプリを選択します。"
+
 [settings.option.keepawake]
 label = "アイドルスリープを防止"
 description = "ゲートウェイの実行中、アイドル状態によるシステムスリープを防ぎます。ノートPCのフタを閉じた状態での動作は保証されません。その場合はクラムシェルモードを使うか、常時稼働のマシンでゲートウェイを実行してください。"
@@ -1681,6 +1685,9 @@ nickname_unavailable = "そのニックネームはすでに使用されてい�
 avatar = "256 KB以下の画像を選択してください。"
 storage = "新しいセッションを安全に保存できませんでした。もう一度お試しください。"
 transport = "Gatewayに接続できませんでした。もう一度お試しください。"
+
+[thread.file_opener]
+use_workspace = "デフォルト"
 
 [thread.scope]
 title = "スレッドへのアクセス"

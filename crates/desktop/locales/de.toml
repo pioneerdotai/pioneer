@@ -968,6 +968,10 @@ description = "Wählen Sie die Sprache der Benutzeroberfläche."
 label = "Farbschema"
 description = "Wählen Sie den bevorzugten Darstellungsmodus."
 
+[settings.option.file_opener]
+label = "Dateien öffnen"
+description = "Wählen Sie die Standard-App zum Öffnen von Dateien."
+
 [settings.option.keepawake]
 label = "Ruhezustand bei Inaktivität verhindern"
 description = "Verhindert, dass der Computer bei Inaktivität in den Ruhezustand wechselt, solange das Gateway läuft. Beim Zuklappen eines Laptops ist das nicht garantiert; dafür brauchen Sie den Clamshell-Modus oder einen dauerhaft laufenden Rechner."
@@ -1681,6 +1685,9 @@ nickname_unavailable = "Dieser Kurzname wird bereits verwendet."
 avatar = "Wähle ein Bild mit höchstens 256 KB."
 storage = "Die neue Sitzung konnte nicht sicher gespeichert werden. Versuche es erneut."
 transport = "Das Gateway konnte nicht erreicht werden. Versuche es erneut."
+
+[thread.file_opener]
+use_workspace = "Standard"
 
 [thread.scope]
 title = "Thread-Zugriff"

@@ -1,7 +1,11 @@
-use crate::{app::PioneerDesktop, assets::PioneerIconName};
+use crate::{
+    app::PioneerDesktop,
+    assets::PioneerIconName,
+    file_opener::{LocalFileTarget, local_file_target, open_local_file},
+};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    IconNamed, StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex,
+    IconName, IconNamed, StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex,
 };
 use pioneer_client::conversation::TimelineEntryStatus;
 use pioneer_protocol::{
@@ -60,10 +64,14 @@ struct MarkdownLinkText {
     id: ElementId,
     text: InteractiveText,
     text_layout: TextLayout,
-    icon_offsets: Vec<usize>,
-    icon_path: SharedString,
+    icons: Vec<MarkdownLinkIcon>,
     icon_color: Hsla,
     accessible_text: SharedString,
+}
+
+struct MarkdownLinkIcon {
+    offset: usize,
+    path: SharedString,
 }
 
 impl IntoElement for MarkdownLinkText {
@@ -140,14 +148,14 @@ impl Element for MarkdownLinkText {
 
         let line_height = self.text_layout.line_height();
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-        for offset in &self.icon_offsets {
-            let Some(start) = self.text_layout.position_for_index(*offset) else {
+        for icon in &self.icons {
+            let Some(start) = self.text_layout.position_for_index(icon.offset) else {
                 continue;
             };
-            let Some(end) = self
-                .text_layout
-                .position_for_index(offset.saturating_add(MARKDOWN_LINK_ICON_PLACEHOLDER.len()))
-            else {
+            let Some(end) = self.text_layout.position_for_index(
+                icon.offset
+                    .saturating_add(MARKDOWN_LINK_ICON_PLACEHOLDER.len()),
+            ) else {
                 continue;
             };
             if start.y != end.y {
@@ -170,7 +178,7 @@ impl Element for MarkdownLinkText {
             );
             let _ = window.paint_svg(
                 icon_bounds,
-                self.icon_path.clone(),
+                icon.path.clone(),
                 None,
                 TransformationMatrix::default(),
                 self.icon_color,
@@ -368,21 +376,40 @@ impl PioneerDesktop {
                 .iter()
                 .map(|link| link.range.clone())
                 .collect();
-            let urls: Vec<_> = presentation
+            let targets: Vec<_> = presentation
                 .links
-                .into_iter()
-                .map(|link| link.url)
+                .iter()
+                .map(|link| MarkdownClickTarget::from_url(link.url.clone()))
                 .collect();
+            let icons = presentation
+                .icon_offsets
+                .iter()
+                .copied()
+                .zip(targets.iter())
+                .map(|(offset, target)| MarkdownLinkIcon {
+                    offset,
+                    path: target.icon_path(),
+                })
+                .collect();
+            let selected_file_opener = self.active_thread_file_opener(cx);
             let element_id: ElementId = ("timeline-markdown-inline", interaction_id).into();
             let text = InteractiveText::new(element_id.clone(), styled_text).on_click(
                 ranges,
                 move |range_index, _, _| {
-                    let Some(url) = urls.get(range_index) else {
+                    let Some(target) = targets.get(range_index) else {
                         return;
                     };
-                    if let Err(error) = webbrowser::open(url.as_ref()) {
+                    let result = match target {
+                        MarkdownClickTarget::Web(url) => {
+                            webbrowser::open(url.as_ref()).map_err(anyhow::Error::from)
+                        }
+                        MarkdownClickTarget::LocalFile(target) => {
+                            open_local_file(selected_file_opener, target)
+                        }
+                    };
+                    if let Err(error) = result {
                         tracing::warn!(
-                            error = %error,
+                            error = %format!("{error:#}"),
                             "failed to open timeline markdown link"
                         );
                     }
@@ -392,8 +419,7 @@ impl PioneerDesktop {
                 id: element_id,
                 text,
                 text_layout,
-                icon_offsets: presentation.icon_offsets,
-                icon_path: PioneerIconName::Globe.path(),
+                icons,
                 icon_color: cx.theme().link,
                 accessible_text: SharedString::new(Arc::<str>::from(inline.text.as_str())),
             })
@@ -664,6 +690,29 @@ struct MarkdownLink {
     url: Arc<str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarkdownClickTarget {
+    Web(Arc<str>),
+    LocalFile(LocalFileTarget),
+}
+
+impl MarkdownClickTarget {
+    fn from_url(url: Arc<str>) -> Self {
+        if let Some(target) = local_file_target(url.as_ref()) {
+            Self::LocalFile(target)
+        } else {
+            Self::Web(url)
+        }
+    }
+
+    fn icon_path(&self) -> SharedString {
+        match self {
+            Self::Web(_) => PioneerIconName::Globe.path(),
+            Self::LocalFile(_) => IconName::File.path(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct MarkdownInlineWithLinkIcons {
     text: String,
@@ -803,7 +852,7 @@ fn snap_to_char_boundary_forward(text: &str, mut index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodeHighlightPolicy, MARKDOWN_LINK_ICON_PLACEHOLDER, MarkdownLink,
+        CodeHighlightPolicy, MARKDOWN_LINK_ICON_PLACEHOLDER, MarkdownClickTarget, MarkdownLink,
         markdown_inline_with_link_icons, normalized_markdown_links, sanitized_language_label,
     };
     use pioneer_client::conversation::TimelineEntryStatus;
@@ -943,5 +992,18 @@ mod tests {
         );
         assert_eq!(presentation.links[0].range, 0..9);
         assert_eq!(presentation.links[1].range, 14..23);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn markdown_click_targets_distinguish_local_files_from_web_urls() {
+        assert!(matches!(
+            MarkdownClickTarget::from_url(Arc::from("/tmp/example.rs:4:2")),
+            MarkdownClickTarget::LocalFile(_)
+        ));
+        assert_eq!(
+            MarkdownClickTarget::from_url(Arc::from("https://example.com")),
+            MarkdownClickTarget::Web(Arc::from("https://example.com"))
+        );
     }
 }

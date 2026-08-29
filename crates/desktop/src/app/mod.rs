@@ -2,6 +2,7 @@ mod administration;
 mod bottom_bar;
 mod conversation;
 mod editor;
+mod file_openers;
 mod flow;
 mod gateway_setup;
 mod initial;

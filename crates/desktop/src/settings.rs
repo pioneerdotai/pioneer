@@ -1,3 +1,4 @@
+use crate::file_opener::FileOpenerId;
 use anyhow::{Context as _, Result};
 use gpui::{App, Global};
 use pioneer_config::AppConfig;
@@ -13,6 +14,10 @@ struct DesktopSettingsFile {
     version: u32,
     #[serde(default)]
     general: GeneralSettings,
+    #[serde(default)]
+    workspace_file_openers: Vec<WorkspaceFileOpenerPreference>,
+    #[serde(default)]
+    thread_file_openers: Vec<ThreadFileOpenerPreference>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -61,6 +66,36 @@ struct GeneralSettings {
     theme: WindowThemePreference,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileOpenerWorkspaceScope {
+    pub(crate) principal_id: String,
+    pub(crate) gateway_id: String,
+    pub(crate) workspace_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileOpenerThreadScope {
+    pub(crate) workspace: FileOpenerWorkspaceScope,
+    pub(crate) thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceFileOpenerPreference {
+    principal_id: String,
+    gateway_id: String,
+    workspace_id: String,
+    opener: FileOpenerId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThreadFileOpenerPreference {
+    principal_id: String,
+    gateway_id: String,
+    workspace_id: String,
+    thread_id: String,
+    opener: FileOpenerId,
+}
+
 struct DesktopSettingsState {
     path: PathBuf,
     settings: DesktopSettingsFile,
@@ -93,6 +128,33 @@ pub(crate) fn app_language(cx: &App) -> AppLanguagePreference {
         .unwrap_or_default()
 }
 
+pub(crate) fn workspace_file_opener(cx: &App, scope: &FileOpenerWorkspaceScope) -> FileOpenerId {
+    cx.try_global::<DesktopSettingsState>()
+        .and_then(|state| {
+            state
+                .settings
+                .workspace_file_openers
+                .iter()
+                .find(|preference| preference.matches(scope))
+                .map(|preference| preference.opener)
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn thread_file_opener_override(
+    cx: &App,
+    scope: &FileOpenerThreadScope,
+) -> Option<FileOpenerId> {
+    cx.try_global::<DesktopSettingsState>().and_then(|state| {
+        state
+            .settings
+            .thread_file_openers
+            .iter()
+            .find(|preference| preference.matches(scope))
+            .map(|preference| preference.opener)
+    })
+}
+
 pub(crate) fn set_app_language(cx: &mut App, language: AppLanguagePreference) -> Result<()> {
     ensure_loaded(cx)?;
 
@@ -119,6 +181,71 @@ pub(crate) fn set_window_theme(cx: &mut App, theme: WindowThemePreference) -> Re
 
     write_settings_file(path.as_path(), serialized)?;
     Ok(())
+}
+
+pub(crate) fn set_workspace_file_opener(
+    cx: &mut App,
+    scope: &FileOpenerWorkspaceScope,
+    opener: FileOpenerId,
+) -> Result<()> {
+    ensure_loaded(cx)?;
+
+    let (path, serialized) = {
+        let state = cx.global_mut::<DesktopSettingsState>();
+        state.settings.version = DESKTOP_SETTINGS_VERSION;
+        if let Some(preference) = state
+            .settings
+            .workspace_file_openers
+            .iter_mut()
+            .find(|preference| preference.matches(scope))
+        {
+            preference.opener = opener;
+        } else {
+            state
+                .settings
+                .workspace_file_openers
+                .push(WorkspaceFileOpenerPreference::from_scope(scope, opener));
+        }
+        (state.path.clone(), serialize_settings(&state.settings)?)
+    };
+
+    write_settings_file(path.as_path(), serialized)
+}
+
+pub(crate) fn set_thread_file_opener_override(
+    cx: &mut App,
+    scope: &FileOpenerThreadScope,
+    opener: Option<FileOpenerId>,
+) -> Result<()> {
+    ensure_loaded(cx)?;
+
+    let (path, serialized) = {
+        let state = cx.global_mut::<DesktopSettingsState>();
+        state.settings.version = DESKTOP_SETTINGS_VERSION;
+        if let Some(opener) = opener {
+            if let Some(preference) = state
+                .settings
+                .thread_file_openers
+                .iter_mut()
+                .find(|preference| preference.matches(scope))
+            {
+                preference.opener = opener;
+            } else {
+                state
+                    .settings
+                    .thread_file_openers
+                    .push(ThreadFileOpenerPreference::from_scope(scope, opener));
+            }
+        } else {
+            state
+                .settings
+                .thread_file_openers
+                .retain(|preference| !preference.matches(scope));
+        }
+        (state.path.clone(), serialize_settings(&state.settings)?)
+    };
+
+    write_settings_file(path.as_path(), serialized)
 }
 
 pub(crate) fn load_app_language_preference() -> Option<AppLanguagePreference> {
@@ -155,6 +282,42 @@ impl AppLanguagePreference {
             Self::French => Some("fr"),
             Self::Japanese => Some("jp"),
         }
+    }
+}
+
+impl WorkspaceFileOpenerPreference {
+    fn from_scope(scope: &FileOpenerWorkspaceScope, opener: FileOpenerId) -> Self {
+        Self {
+            principal_id: scope.principal_id.clone(),
+            gateway_id: scope.gateway_id.clone(),
+            workspace_id: scope.workspace_id.clone(),
+            opener,
+        }
+    }
+
+    fn matches(&self, scope: &FileOpenerWorkspaceScope) -> bool {
+        self.principal_id == scope.principal_id
+            && self.gateway_id == scope.gateway_id
+            && self.workspace_id == scope.workspace_id
+    }
+}
+
+impl ThreadFileOpenerPreference {
+    fn from_scope(scope: &FileOpenerThreadScope, opener: FileOpenerId) -> Self {
+        Self {
+            principal_id: scope.workspace.principal_id.clone(),
+            gateway_id: scope.workspace.gateway_id.clone(),
+            workspace_id: scope.workspace.workspace_id.clone(),
+            thread_id: scope.thread_id.clone(),
+            opener,
+        }
+    }
+
+    fn matches(&self, scope: &FileOpenerThreadScope) -> bool {
+        self.principal_id == scope.workspace.principal_id
+            && self.gateway_id == scope.workspace.gateway_id
+            && self.workspace_id == scope.workspace.workspace_id
+            && self.thread_id == scope.thread_id
     }
 }
 
@@ -284,7 +447,12 @@ fn normalize_locale(raw: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopSettingsFile, load_settings_file_from_path, serialize_settings};
+    use super::{
+        DesktopSettingsFile, FileOpenerThreadScope, FileOpenerWorkspaceScope,
+        ThreadFileOpenerPreference, WorkspaceFileOpenerPreference, load_settings_file_from_path,
+        serialize_settings,
+    };
+    use crate::file_opener::FileOpenerId;
     use std::fs;
 
     #[test]
@@ -325,5 +493,67 @@ enabled = false
         let settings = load_settings_file_from_path(path.as_path()).expect("settings load");
         let serialized = serialize_settings(&settings).expect("settings should serialize");
         assert!(!serialized.contains("[memory]"));
+    }
+
+    #[test]
+    fn file_opener_preferences_are_scoped_by_principal_gateway_workspace_and_thread() {
+        let workspace = FileOpenerWorkspaceScope {
+            principal_id: "principal-a".to_owned(),
+            gateway_id: "gateway-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
+        };
+        let other_workspace = FileOpenerWorkspaceScope {
+            workspace_id: "workspace-b".to_owned(),
+            ..workspace.clone()
+        };
+        let thread = FileOpenerThreadScope {
+            workspace: workspace.clone(),
+            thread_id: "thread-a".to_owned(),
+        };
+
+        let workspace_preference =
+            WorkspaceFileOpenerPreference::from_scope(&workspace, FileOpenerId::Pycharm);
+        assert!(workspace_preference.matches(&workspace));
+        assert!(!workspace_preference.matches(&other_workspace));
+
+        let thread_preference =
+            ThreadFileOpenerPreference::from_scope(&thread, FileOpenerId::Webstorm);
+        assert!(thread_preference.matches(&thread));
+        assert!(!thread_preference.matches(&FileOpenerThreadScope {
+            thread_id: "thread-b".to_owned(),
+            ..thread
+        }));
+    }
+
+    #[test]
+    fn file_opener_preferences_round_trip_in_desktop_settings() {
+        let raw = r#"
+version = 1
+
+[[workspace_file_openers]]
+principal_id = "principal-a"
+gateway_id = "gateway-a"
+workspace_id = "workspace-a"
+opener = "pycharm"
+
+[[thread_file_openers]]
+principal_id = "principal-a"
+gateway_id = "gateway-a"
+workspace_id = "workspace-a"
+thread_id = "thread-a"
+opener = "webstorm"
+"#;
+        let settings = toml::from_str::<DesktopSettingsFile>(raw).expect("settings should parse");
+        assert_eq!(
+            settings.workspace_file_openers[0].opener,
+            FileOpenerId::Pycharm
+        );
+        assert_eq!(
+            settings.thread_file_openers[0].opener,
+            FileOpenerId::Webstorm
+        );
+        let serialized = serialize_settings(&settings).expect("settings should serialize");
+        assert!(serialized.contains("opener = \"pycharm\""));
+        assert!(serialized.contains("opener = \"webstorm\""));
     }
 }

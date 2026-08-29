@@ -158,7 +158,7 @@ impl Render for PioneerDesktop {
                                 .child(
                                     h_flex()
                                         .h_full()
-                                        .gap_0p5()
+                                        .gap_1()
                                         .items_center()
                                         .child(if show_task_notifications {
                                             self.render_task_user_notifications_button(cx)
@@ -172,7 +172,7 @@ impl Render for PioneerDesktop {
                                         })
                                         .child(
                                             h_flex()
-                                                .gap_0p5()
+                                                .gap_1()
                                                 .child(if !is_gateway_setup_required {
                                                     Button::new("toggle-keepawake")
                                                         .ghost()

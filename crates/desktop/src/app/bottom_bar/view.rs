@@ -40,7 +40,7 @@ impl PioneerDesktop {
             .child(
                 h_flex()
                     .items_center()
-                    .gap_0p5()
+                    .gap_1()
                     .child(
                         Button::new("bottom-bar-open-threads")
                             .ghost()
@@ -187,7 +187,7 @@ impl PioneerDesktop {
             .child(
                 h_flex()
                     .items_center()
-                    .gap_0p5()
+                    .gap_1()
                     .child(if show_status_button {
                         self.render_active_thread_status_button()
                     } else {

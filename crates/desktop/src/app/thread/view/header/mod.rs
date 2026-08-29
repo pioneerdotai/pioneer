@@ -1,9 +1,11 @@
 use crate::{
     app::{
+        file_openers::{file_opener_menu_row, file_opener_trigger},
         root::{GatewayConnectionState, PioneerDesktop},
         thread::thread_display_title,
     },
     assets::PioneerIconName,
+    file_opener::{FileOpenerId, available_file_openers},
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -30,6 +32,10 @@ impl PioneerDesktop {
                         .map(|_| thread_id.to_owned())
                 })
         };
+        let file_opener_thread_id = self
+            .current_active_thread_id()
+            .filter(|thread_id| self.draft_thread_id() != Some(*thread_id))
+            .map(str::to_owned);
         h_flex()
             .justify_between()
             .items_center()
@@ -71,8 +77,78 @@ impl PioneerDesktop {
                 h_flex()
                     .items_center()
                     .gap_1()
+                    .child(self.render_thread_file_opener_picker(file_opener_thread_id, cx))
                     .child(self.render_thread_title_menu(active_thread_id, cx)),
             )
+            .into_any_element()
+    }
+
+    fn render_thread_file_opener_picker(
+        &self,
+        thread_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(thread_id) = thread_id else {
+            return div().into_any_element();
+        };
+        let selected_opener = self.effective_file_opener_for_thread(thread_id.as_str(), cx);
+        let workspace_opener = self.workspace_file_opener_for_thread(thread_id.as_str(), cx);
+        let thread_override = self.thread_file_opener_override(thread_id.as_str(), cx);
+        let desktop_entity = cx.entity().clone();
+
+        file_opener_trigger("thread-file-opener-trigger", selected_opener)
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let workspace_thread_id = thread_id.clone();
+                let workspace_desktop_entity = desktop_entity.clone();
+                let workspace_label = t!("thread.file_opener.use_workspace").to_string();
+                let mut menu = menu
+                    .min_w(px(220.))
+                    .scrollable(true)
+                    .item(
+                        PopupMenuItem::element(move |_, cx| {
+                            file_opener_menu_row(
+                                workspace_opener,
+                                workspace_label.clone().into(),
+                                thread_override.is_none(),
+                                cx,
+                            )
+                        })
+                        .on_click(move |_, _, cx| {
+                            let _ = workspace_desktop_entity.update(cx, |view, cx| {
+                                view.apply_thread_file_opener_override(
+                                    workspace_thread_id.as_str(),
+                                    None,
+                                    cx,
+                                );
+                                cx.notify();
+                            });
+                        }),
+                    )
+                    .separator();
+
+                for available in available_file_openers() {
+                    let opener: FileOpenerId = available.id;
+                    let option_thread_id = thread_id.clone();
+                    let option_desktop_entity = desktop_entity.clone();
+                    let option_selected = thread_override == Some(opener);
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            file_opener_menu_row(opener, opener.label().into(), option_selected, cx)
+                        })
+                        .on_click(move |_, _, cx| {
+                            let _ = option_desktop_entity.update(cx, |view, cx| {
+                                view.apply_thread_file_opener_override(
+                                    option_thread_id.as_str(),
+                                    Some(opener),
+                                    cx,
+                                );
+                                cx.notify();
+                            });
+                        }),
+                    );
+                }
+                menu
+            })
             .into_any_element()
     }
 

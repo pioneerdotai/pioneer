@@ -968,6 +968,10 @@ description = "Choisissez la langue utilisée dans l'interface."
 label = "Thème de couleur"
 description = "Choisissez le mode d'apparence préféré."
 
+[settings.option.file_opener]
+label = "Ouvrir les fichiers"
+description = "Choisissez l’application par défaut pour ouvrir les fichiers."
+
 [settings.option.keepawake]
 label = "Empêcher la veille d'inactivité"
 description = "Empêche l'ordinateur de passer en veille pour cause d'inactivité tant que la gateway est en cours d'exécution. Cela ne garantit pas le fonctionnement capot fermé ; pour ce cas, utilisez le mode clamshell ou une machine toujours en marche."
@@ -1681,6 +1685,9 @@ nickname_unavailable = "Ce pseudo est déjà utilisé."
 avatar = "Choisissez une image de 256 Ko maximum."
 storage = "La nouvelle session n’a pas pu être enregistrée de façon sécurisée. Réessayez."
 transport = "Le Gateway est inaccessible. Réessayez."
+
+[thread.file_opener]
+use_workspace = "Par défaut"
 
 [thread.scope]
 title = "Accès au fil"

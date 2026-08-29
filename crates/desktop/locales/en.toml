@@ -1260,6 +1260,10 @@ description = "Choose the language used in the interface."
 label = "Color theme"
 description = "Pick a preferred appearance mode."
 
+[settings.option.file_opener]
+label = "Open files"
+description = "Choose the default app for opening files."
+
 [settings.option.keepawake]
 label = "Prevent idle sleep"
 description = "Prevents idle sleep while the gateway is running. Closing a laptop lid is not covered; use closed-display mode with power and an external display, or run the gateway on an always-on machine."
@@ -1681,6 +1685,9 @@ nickname_unavailable = "That nickname is already in use."
 avatar = "Choose an image no larger than 256 KB."
 storage = "The secure session could not be saved. Try again."
 transport = "The Gateway could not be reached. Try again."
+
+[thread.file_opener]
+use_workspace = "Default"
 
 [thread.scope]
 title = "Thread access"

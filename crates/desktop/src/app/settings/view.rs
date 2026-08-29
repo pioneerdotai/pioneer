@@ -1,5 +1,6 @@
 use crate::{
     app::{
+        file_openers::{file_opener_menu_row, file_opener_trigger},
         root::{PioneerDesktop, SettingsContentView},
         settings::{
             MemoryModelSetting, MemorySettingToggle, SelfImprovementModelSetting,
@@ -12,12 +13,14 @@ use crate::{
         model_selector::{ModelSelectorDialogOptions, ModelSelectorSelection},
         progress_circle::ProgressCircle,
     },
+    file_opener::{FileOpenerId, available_file_openers},
     settings::{self, AppLanguagePreference, WindowThemePreference},
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::*,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
     popover::{Popover, PopoverState},
     switch::Switch,
     theme::ActiveTheme,
@@ -84,6 +87,7 @@ impl PioneerDesktop {
     fn render_settings_general(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let selected_language = settings::app_language(cx);
         let selected_theme = settings::window_theme(cx);
+        let selected_file_opener = self.active_workspace_file_opener(cx);
         let desktop_entity = cx.entity().clone();
 
         let mut general_settings = v_flex()
@@ -103,6 +107,12 @@ impl PioneerDesktop {
             .child(Self::render_settings_divider(cx))
             .child(Self::render_theme_setting(
                 selected_theme,
+                desktop_entity.clone(),
+                cx,
+            ))
+            .child(Self::render_settings_divider(cx))
+            .child(Self::render_file_opener_setting(
+                selected_file_opener,
                 desktop_entity.clone(),
                 cx,
             ));
@@ -635,6 +645,69 @@ impl PioneerDesktop {
                                     })
                             },
                         ))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_file_opener_setting(
+        selected_opener: FileOpenerId,
+        desktop_entity: Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .gap_6()
+            .py_3()
+            .justify_between()
+            .items_center()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.option.file_opener.label").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.option.file_opener.description").to_string()),
+                    ),
+            )
+            .child(
+                file_opener_trigger("settings-file-opener-trigger", selected_opener)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        available_file_openers().iter().fold(
+                            menu.min_w(px(180.)).scrollable(true),
+                            |menu, available| {
+                                let opener = available.id;
+                                let option_desktop_entity = desktop_entity.clone();
+                                let option_selected = opener == selected_opener;
+
+                                menu.item(
+                                    PopupMenuItem::element(move |_, cx| {
+                                        file_opener_menu_row(
+                                            opener,
+                                            opener.label().into(),
+                                            option_selected,
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            let _ = option_desktop_entity.update(cx, |view, cx| {
+                                                view.apply_workspace_file_opener(opener, cx);
+                                                cx.notify();
+                                            });
+                                        },
+                                    ),
+                                )
+                            },
+                        )
                     }),
             )
             .into_any_element()
