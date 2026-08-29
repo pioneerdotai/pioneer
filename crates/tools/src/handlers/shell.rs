@@ -15,6 +15,7 @@ use crate::{
 use async_trait::async_trait;
 use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
 use std::collections::{BTreeMap, HashMap};
+use std::future::pending;
 use std::io;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -24,7 +25,7 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant as TokioInstant, sleep, sleep_until};
 
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_YIELD_MS: u64 = 120;
@@ -36,6 +37,7 @@ const ONE_SHOT_ABSOLUTE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ONE_SHOT_CHUNK_CHANNEL_CAPACITY: usize = 64;
 const SESSION_TTL_MS: u64 = if cfg!(test) { 500 } else { 10 * 60 * 1000 };
 const PROCESS_KILL_GRACE_MS: u64 = 300;
+const ONE_SHOT_PIPE_DRAIN_GRACE_MS: u64 = 5_000;
 const ONE_SHOT_STREAM_LIMIT_ENV: &str = "PIONEER_EXEC_ONE_SHOT_MAX_STREAM_BYTES";
 const ONE_SHOT_TOTAL_LIMIT_ENV: &str = "PIONEER_EXEC_ONE_SHOT_MAX_TOTAL_BYTES";
 
@@ -575,6 +577,7 @@ async fn run_one_shot(
     let (stream_limit, total_limit) =
         one_shot_output_limits(args.max_output_tokens, configured_limits);
     let output_budget = Arc::new(OneShotOutputBudget::new(stream_limit, total_limit));
+    let reader_shutdown = tokio_util::sync::CancellationToken::new();
     let (chunk_tx, mut chunk_rx) =
         mpsc::channel::<ShellChunkEvent>(ONE_SHOT_CHUNK_CHANNEL_CAPACITY);
     let stdout_task = tokio::spawn(read_stream_with_chunks(
@@ -582,12 +585,14 @@ async fn run_one_shot(
         "stdout",
         chunk_tx.clone(),
         output_budget.clone(),
+        reader_shutdown.child_token(),
     ));
     let stderr_task = tokio::spawn(read_stream_with_chunks(
         stderr_reader,
         "stderr",
         chunk_tx,
         output_budget,
+        reader_shutdown.child_token(),
     ));
 
     let mut stdout_buf = String::new();
@@ -601,6 +606,7 @@ async fn run_one_shot(
     let mut limit_termination_started = false;
     let mut stdout_truncated = false;
     let mut stderr_truncated = false;
+    let mut pipe_drain_deadline: Option<TokioInstant> = None;
 
     loop {
         if status_opt.is_some()
@@ -611,6 +617,7 @@ async fn run_one_shot(
             break;
         }
 
+        let active_pipe_drain_deadline = pipe_drain_deadline;
         tokio::select! {
             _ = cancellation.cancelled() => {
                 cancelled = true;
@@ -619,6 +626,7 @@ async fn run_one_shot(
                 } else {
                     kill_process_tree(process_id, true);
                 }
+                reader_shutdown.cancel();
                 stdout_task.abort();
                 stderr_task.abort();
                 break;
@@ -626,6 +634,9 @@ async fn run_one_shot(
             _ = &mut wait_deadline, if status_opt.is_none() => {
                 timed_out = true;
                 status_opt = Some(terminate_child_process(&mut child).await?);
+                pipe_drain_deadline.get_or_insert_with(|| {
+                    TokioInstant::now() + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
+                });
             }
             wait_result = child.wait(), if status_opt.is_none() => {
                 let status = wait_result.map_err(|error| {
@@ -636,6 +647,9 @@ async fn run_one_shot(
                 // let a detached descendant retain stdout/stderr indefinitely
                 // after the direct child exits.
                 kill_process_tree(process_id, true);
+                pipe_drain_deadline.get_or_insert_with(|| {
+                    TokioInstant::now() + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
+                });
             }
             chunk = chunk_rx.recv() => {
                 match chunk {
@@ -662,6 +676,10 @@ async fn run_one_shot(
                         if status_opt.is_none() && !limit_termination_started {
                             limit_termination_started = true;
                             status_opt = Some(terminate_child_process(&mut child).await?);
+                            pipe_drain_deadline.get_or_insert_with(|| {
+                                TokioInstant::now()
+                                    + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
+                            });
                         }
                     }
                     Some(ShellChunkEvent::Closed { stream }) => {
@@ -673,6 +691,23 @@ async fn run_one_shot(
                         }
                     }
                 }
+            }
+            _ = async {
+                if let Some(deadline) = active_pipe_drain_deadline {
+                    sleep_until(deadline).await;
+                } else {
+                    pending::<()>().await;
+                }
+            } => {
+                // A descendant may retain inherited pipes even after the
+                // direct child and its nominal process group are gone. EOF is
+                // controlled by that untrusted descendant, so it cannot be
+                // the terminal condition for a one-shot invocation.
+                reader_shutdown.cancel();
+                // Keep consuming the bounded channel until both readers have
+                // observed cancellation. This preserves every chunk that was
+                // already admitted before the fence fired.
+                pipe_drain_deadline = None;
             }
         }
     }
@@ -798,6 +833,7 @@ async fn read_stream_with_chunks<R>(
     stream: &'static str,
     tx: mpsc::Sender<ShellChunkEvent>,
     budget: Arc<OneShotOutputBudget>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<StreamReadSummary>
 where
     R: AsyncRead + Unpin,
@@ -805,28 +841,56 @@ where
     let mut summary = StreamReadSummary::default();
     let mut chunk = [0u8; 4096];
     loop {
-        let read = reader.read(&mut chunk).await?;
+        let read = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                summary.truncated = true;
+                break;
+            },
+            read = reader.read(&mut chunk) => read?,
+        };
         if read == 0 {
-            let _ = tx.send(ShellChunkEvent::Closed { stream }).await;
+            let _ = send_shell_chunk(&tx, ShellChunkEvent::Closed { stream }, &shutdown).await;
             break;
         }
         summary.bytes_seen = summary.bytes_seen.saturating_add(read);
         let (retained, exceeded) = budget.claim(summary.bytes_seen.saturating_sub(read), read);
         if retained > 0 {
-            summary.bytes_retained = summary.bytes_retained.saturating_add(retained);
-            let _ = tx
-                .send(ShellChunkEvent::Data {
+            if !send_shell_chunk(
+                &tx,
+                ShellChunkEvent::Data {
                     stream,
                     text: chunk[..retained].to_vec(),
-                })
-                .await;
+                },
+                &shutdown,
+            )
+            .await
+            {
+                summary.truncated = true;
+                break;
+            }
+            summary.bytes_retained = summary.bytes_retained.saturating_add(retained);
         }
         if exceeded && !summary.truncated {
             summary.truncated = true;
-            let _ = tx.send(ShellChunkEvent::LimitExceeded { stream }).await;
+            if !send_shell_chunk(&tx, ShellChunkEvent::LimitExceeded { stream }, &shutdown).await {
+                break;
+            }
         }
     }
     Ok(summary)
+}
+
+async fn send_shell_chunk(
+    tx: &mpsc::Sender<ShellChunkEvent>,
+    event: ShellChunkEvent,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => false,
+        result = tx.send(event) => result.is_ok(),
+    }
 }
 
 fn apply_shell_sandbox_backend(
@@ -986,7 +1050,6 @@ fn configure_process_group(command: &mut Command) -> Result<(), ToolError> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
@@ -1772,10 +1835,15 @@ mod tests {
                     command: Some(vec![
                         "sh".to_owned(),
                         "-c".to_owned(),
-                        "(trap '' TERM; sleep 30) & exit 0".to_owned(),
+                        "printf 'parent-finished\\n'; (trap '' TERM; sleep 120) & exit 0"
+                            .to_owned(),
                     ]),
                     workdir: None,
-                    timeout_ms: Some(5_000),
+                    // Keep the command's own timeout well outside the outer
+                    // assertion window. The test must prove cleanup after the
+                    // direct child exits, not race that cleanup against the
+                    // ordinary command-timeout path under suite load.
+                    timeout_ms: Some(60_000),
                     max_output_tokens: None,
                     yield_time_ms: None,
                     tty: Some(false),
@@ -1783,10 +1851,21 @@ mod tests {
             ),
             trace("exec_command"),
         );
-        tokio::time::timeout(Duration::from_secs(5), run)
+        // A leaked descendant would retain both pipes for 120 seconds. Keep
+        // the assertion far below that lifetime while allowing heavily
+        // parallel CI suites enough scheduling headroom.
+        let output = tokio::time::timeout(Duration::from_secs(20), run)
             .await
             .expect("descendant pipe ownership must have a bounded terminal path")
             .expect("process tree cleanup should produce a result");
+        assert_eq!(
+            output
+                .raw_json()
+                .get("stdout")
+                .and_then(serde_json::Value::as_str),
+            Some("parent-finished\n"),
+            "output admitted before the terminal pipe fence must be preserved"
+        );
     }
 
     #[tokio::test]

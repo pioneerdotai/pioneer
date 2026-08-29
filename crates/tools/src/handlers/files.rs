@@ -637,7 +637,6 @@ fn list_directory_tree_secure(
         let mut paths = BTreeSet::new();
         for entry in std::fs::read_dir(directory.as_path())? {
             let entry = entry?;
-            let name = entry.file_name();
             if paths.len() >= candidate_limit {
                 truncated = true;
                 break;

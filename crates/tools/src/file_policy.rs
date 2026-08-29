@@ -7,7 +7,9 @@ use pioneer_protocol::{
     TurnFilesystemSandboxKind, TurnFilesystemSandboxPath,
 };
 use std::collections::BTreeSet;
-use std::fs::{File, Metadata};
+use std::fs::File;
+#[cfg(not(windows))]
+use std::fs::Metadata;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -91,6 +93,13 @@ impl FilePolicyCapability {
                 "filesystem policy target is not a regular file or directory",
             ));
         };
+        // On Windows `open_regular_file`/`open_directory` validates the final
+        // handle path and deliberately omits FILE_SHARE_DELETE. That makes the
+        // opened handle itself the authoritative, name-pinning capability.
+        // Rust's MetadataExt file-index accessors are unstable, so the
+        // metadata identity comparison is only needed on platforms where the
+        // stable metadata API exposes an object identity.
+        #[cfg(not(windows))]
         if !same_filesystem_object(&metadata, &target.metadata()?) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -143,10 +152,12 @@ impl FilePolicyCapability {
 
     fn capture_write(path: &Path) -> Result<Self, FilePolicyDenyReason> {
         let anchor_path = resolve_existing_write_anchor(path)?;
+        #[cfg(not(windows))]
         let anchor_metadata = std::fs::symlink_metadata(anchor_path.as_path())
             .map_err(|_| FilePolicyDenyReason::InvalidRoot)?;
         let anchor =
             open_directory(anchor_path.as_path()).map_err(|_| FilePolicyDenyReason::InvalidRoot)?;
+        #[cfg(not(windows))]
         if !same_filesystem_object(
             &anchor_metadata,
             &anchor
@@ -225,6 +236,7 @@ impl FilePolicyCapability {
     }
 }
 
+#[cfg(not(windows))]
 fn same_filesystem_object(expected: &Metadata, actual: &Metadata) -> bool {
     if expected.is_dir() != actual.is_dir() || expected.is_file() != actual.is_file() {
         return false;
@@ -234,13 +246,7 @@ fn same_filesystem_object(expected: &Metadata, actual: &Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         return expected.dev() == actual.dev() && expected.ino() == actual.ino();
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        return expected.volume_serial_number() == actual.volume_serial_number()
-            && expected.file_index() == actual.file_index();
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         expected.len() == actual.len() && expected.modified().ok() == actual.modified().ok()
     }
