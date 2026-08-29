@@ -285,10 +285,16 @@ impl OllamaProvider {
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read error body>".into());
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
         anyhow!("Ollama API error ({status}): {body}")
     }
 }
@@ -362,7 +368,12 @@ impl crate::traits::Provider for OllamaProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: OllamaChatResponse = response.json().await?;
+        let api_response: OllamaChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
         let usage = match (api_response.prompt_eval_count, api_response.eval_count) {
             (None, None) => None,
             (input, output) => Some(TokenUsage {
@@ -437,7 +448,11 @@ impl crate::traits::Provider for OllamaProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
@@ -454,7 +469,9 @@ impl crate::traits::Provider for OllamaProvider {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow!(e))).await;
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -462,7 +479,9 @@ impl crate::traits::Provider for OllamaProvider {
                 let lines = match decoder.push(bytes.as_ref()) {
                     Ok(lines) => lines,
                     Err(error) => {
-                        let _ = tx.send(Err(error)).await;
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -493,7 +512,13 @@ impl crate::traits::Provider for OllamaProvider {
                                 }
                                 if !new_calls.is_empty() {
                                     saw_tool_calls = true;
-                                    let _ = tx.send(Ok(StreamChunk::tool_calls(new_calls))).await;
+                                    if tx
+                                        .send(Ok(StreamChunk::tool_calls(new_calls)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                             if chunk.done {
@@ -508,26 +533,39 @@ impl crate::traits::Provider for OllamaProvider {
                                             ProviderTermination::Complete
                                         }
                                     });
-                                let _ = tx
+                                if tx
                                     .send(Ok(StreamChunk::final_chunk_with(termination)))
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                                 return;
                             }
                             if let Some(thinking) = thinking {
                                 if !thinking.is_empty() {
-                                    let _ = tx.send(Ok(StreamChunk::reasoning(thinking))).await;
+                                    if tx.send(Ok(StreamChunk::reasoning(thinking))).await.is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                             if let Some(content) = content {
                                 if !content.is_empty() {
-                                    let _ = tx.send(Ok(StreamChunk::delta(content))).await;
+                                    if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
-                            let _ = tx
+                            if tx
                                 .send(Err(anyhow!("malformed Ollama NDJSON frame: {e}")))
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                             return;
                         }
                     }
@@ -538,7 +576,9 @@ impl crate::traits::Provider for OllamaProvider {
                 .finish()
                 .err()
                 .unwrap_or_else(|| anyhow!("Ollama stream ended before done=true"));
-            let _ = tx.send(Err(error)).await;
+            if tx.send(Err(error)).await.is_err() {
+                return;
+            }
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -555,7 +595,12 @@ impl crate::traits::Provider for OllamaProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: OllamaTagsResponse = response.json().await?;
+        let api_response: OllamaTagsResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
 
         Ok(api_response
             .models

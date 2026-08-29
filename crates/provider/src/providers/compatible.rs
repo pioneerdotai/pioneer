@@ -6,7 +6,7 @@ use crate::{
         ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
-    tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
+    tools::parse::parse_tool_calls,
     tools::stream::{IncrementalLineDecoder, sse_data},
     types::{
         ChatMessage, ChatRequest, ChatResponse, InputContentType, InputTypeSupport,
@@ -1010,10 +1010,16 @@ impl OpenAiCompatibleProvider {
 
     async fn api_error(&self, response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read error body>".into());
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
         anyhow!("{} API error ({status}): {body}", self.name)
     }
 }
@@ -1078,7 +1084,12 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             return Err(self.api_error(response).await);
         }
 
-        let api_response: ApiChatResponse = response.json().await?;
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
         let usage = api_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -1097,22 +1108,10 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         let message = choice.message;
 
         let raw_content = message.content.clone();
-        let mut text = message.effective_content();
-        let mut tool_calls =
+        let text = message.effective_content();
+        let tool_calls =
             parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
-        let mut reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if tool_calls.is_empty() {
-            if let Some(content) = raw_content.as_deref() {
-                if let Some(parsed) = parse_embedded_tool_payload(content)? {
-                    text = parsed.text;
-                    if reasoning_content.is_none() {
-                        reasoning_content = parsed.reasoning_content;
-                    }
-                    tool_calls = parsed.tool_calls;
-                }
-            }
-        }
+        let reasoning_content = message.reasoning_content.or(message.reasoning);
 
         if text.is_empty()
             && tool_calls.is_empty()
@@ -1157,7 +1156,11 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             return Err(self.api_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
         let provider_name = self.name.clone();
         let replay_reasoning_content = self.replay_reasoning_content;
 
@@ -1175,7 +1178,9 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow!(e))).await;
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -1183,7 +1188,9 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                 let lines = match decoder.push(bytes.as_ref()) {
                     Ok(lines) => lines,
                     Err(error) => {
-                        let _ = tx.send(Err(error)).await;
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -1198,25 +1205,33 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                     };
 
                     if data.trim() == "[DONE]" {
-                        let _ = tx
+                        if tx
                             .send(Err(anyhow!(
                                 "{} stream ended without a finish_reason",
                                 provider_name
                             )))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                         return;
                     }
 
                     match serde_json::from_str::<StreamResponse>(data) {
                         Ok(resp) => {
                             if let Some(error) = resp.error {
-                                let _ = tx
+                                if tx
                                     .send(Err(anyhow!(
                                         "{} stream error: {}",
                                         provider_name,
                                         error.description()
                                     )))
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                                 return;
                             }
                             for choice in resp.choices {
@@ -1227,7 +1242,9 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                         .get_or_insert_with(String::new)
                                         .push_str(rc.as_str());
                                     if !rc.is_empty() {
-                                        let _ = tx.send(Ok(StreamChunk::reasoning(rc))).await;
+                                        if tx.send(Ok(StreamChunk::reasoning(rc))).await.is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                                 if let Some(content) = choice.delta.content {
@@ -1235,7 +1252,9 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                         .get_or_insert_with(String::new)
                                         .push_str(content.as_str());
                                     if !content.is_empty() {
-                                        let _ = tx.send(Ok(StreamChunk::delta(content))).await;
+                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                                 if let Some(tool_calls) = choice.delta.tool_calls {
@@ -1261,21 +1280,29 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                     ) {
                                         Ok(chunks) => chunks,
                                         Err(error) => {
-                                            let _ = tx.send(Err(error)).await;
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
                                             return;
                                         }
                                     };
                                     for chunk in chunks {
-                                        let _ = tx.send(Ok(chunk)).await;
+                                        if tx.send(Ok(chunk)).await.is_err() {
+                                            return;
+                                        }
                                     }
                                     return;
                                 }
                             }
                         }
                         Err(e) => {
-                            let _ = tx
+                            if tx
                                 .send(Err(anyhow!("malformed {} SSE frame: {e}", provider_name)))
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                             return;
                         }
                     }
@@ -1288,7 +1315,9 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                     provider_name
                 )
             });
-            let _ = tx.send(Err(error)).await;
+            if tx.send(Err(error)).await.is_err() {
+                return;
+            }
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -1305,7 +1334,12 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
             return Err(self.api_error(response).await);
         }
 
-        let api_response: ModelsListResponse = response.json().await?;
+        let api_response: ModelsListResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
         let provider_name = self.name.clone();
 
         Ok(api_response

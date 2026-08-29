@@ -4,7 +4,7 @@ use crate::{
         ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
-    tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
+    tools::parse::parse_tool_calls,
     tools::stream::{IncrementalLineDecoder, sse_data},
     types::{
         ChatRequest, ChatResponse, InputContentType, ProviderCapabilities,
@@ -490,10 +490,16 @@ impl TelnyxProvider {
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read error body>".into());
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
         anyhow!("Telnyx API error ({status}): {body}")
     }
 }
@@ -550,7 +556,12 @@ impl crate::traits::Provider for TelnyxProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ApiChatResponse = response.json().await?;
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
         let usage = api_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -567,23 +578,10 @@ impl crate::traits::Provider for TelnyxProvider {
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
         let message = choice.message;
-        let raw_content = message.content.clone();
-        let mut text = message.effective_content();
-        let mut tool_calls =
+        let text = message.effective_content();
+        let tool_calls =
             parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
-        let mut reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if tool_calls.is_empty() {
-            if let Some(content) = raw_content.as_deref() {
-                if let Some(parsed) = parse_embedded_tool_payload(content)? {
-                    text = parsed.text;
-                    if reasoning_content.is_none() {
-                        reasoning_content = parsed.reasoning_content;
-                    }
-                    tool_calls = parsed.tool_calls;
-                }
-            }
-        }
+        let reasoning_content = message.reasoning_content.or(message.reasoning);
 
         if text.is_empty()
             && tool_calls.is_empty()
@@ -639,7 +637,11 @@ impl crate::traits::Provider for TelnyxProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
@@ -653,7 +655,9 @@ impl crate::traits::Provider for TelnyxProvider {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow!(e))).await;
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -661,7 +665,9 @@ impl crate::traits::Provider for TelnyxProvider {
                 let lines = match decoder.push(bytes.as_ref()) {
                     Ok(lines) => lines,
                     Err(error) => {
-                        let _ = tx.send(Err(error)).await;
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -676,21 +682,29 @@ impl crate::traits::Provider for TelnyxProvider {
                     };
 
                     if data.trim() == "[DONE]" {
-                        let _ = tx
+                        if tx
                             .send(Err(anyhow!("Telnyx stream ended without a finish_reason")))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                         return;
                     }
 
                     match serde_json::from_str::<StreamResponse>(data) {
                         Ok(resp) => {
                             if let Some(error) = resp.error {
-                                let _ = tx
+                                if tx
                                     .send(Err(anyhow!(
                                         "Telnyx stream error: {}",
                                         error.description()
                                     )))
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                                 return;
                             }
                             for choice in resp.choices {
@@ -698,13 +712,20 @@ impl crate::traits::Provider for TelnyxProvider {
                                     choice.delta.reasoning_content.or(choice.delta.reasoning)
                                 {
                                     if !reasoning.is_empty() {
-                                        let _ =
-                                            tx.send(Ok(StreamChunk::reasoning(reasoning))).await;
+                                        if tx
+                                            .send(Ok(StreamChunk::reasoning(reasoning)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
                                     }
                                 }
                                 if let Some(content) = choice.delta.content {
                                     if !content.is_empty() {
-                                        let _ = tx.send(Ok(StreamChunk::delta(content))).await;
+                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                                 if let Some(tool_calls) = choice.delta.tool_calls {
@@ -725,25 +746,40 @@ impl crate::traits::Provider for TelnyxProvider {
                                     let tool_calls = match tool_call_accumulator.take_tool_calls() {
                                         Ok(calls) => calls,
                                         Err(error) => {
-                                            let _ = tx.send(Err(error)).await;
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
                                             return;
                                         }
                                     };
                                     if !tool_calls.is_empty() {
-                                        let _ =
-                                            tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
+                                        if tx
+                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
                                     }
-                                    let _ = tx
+                                    if tx
                                         .send(Ok(StreamChunk::final_chunk_with(termination)))
-                                        .await;
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                     return;
                                 }
                             }
                         }
                         Err(e) => {
-                            let _ = tx
+                            if tx
                                 .send(Err(anyhow!("malformed Telnyx SSE frame: {e}")))
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                             return;
                         }
                     }
@@ -753,7 +789,9 @@ impl crate::traits::Provider for TelnyxProvider {
             let error = decoder.finish().err().unwrap_or_else(|| {
                 anyhow!("Telnyx stream ended before a provider terminal marker")
             });
-            let _ = tx.send(Err(error)).await;
+            if tx.send(Err(error)).await.is_err() {
+                return;
+            }
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -773,7 +811,12 @@ impl crate::traits::Provider for TelnyxProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ModelsListResponse = response.json().await?;
+        let api_response: ModelsListResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
 
         Ok(api_response
             .data

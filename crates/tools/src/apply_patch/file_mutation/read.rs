@@ -5,7 +5,8 @@ use crate::apply_patch::file_mutation::{
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::{BufRead, BufReader};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReadRequest {
@@ -147,6 +148,25 @@ impl<A: ReadAccess> PaginatedReader<A> {
         request: ReadRequest,
         cursor: Option<&str>,
     ) -> Result<ReadPage, ReadError> {
+        let file = crate::apply_patch::file_mutation::open_regular_file(target.absolute())
+            .map_err(|error| ReadError {
+                code: ReadErrorCode::Io,
+                source: Some(error),
+            })?;
+        self.read_target_with_file(target, file, request, cursor)
+    }
+
+    /// Read from a file descriptor captured by the file-policy check.  The
+    /// descriptor, rather than the target pathname, is authoritative for both
+    /// snapshotting and page extraction, so a check->swap->use race cannot
+    /// redirect this read to a replacement object.
+    pub fn read_target_with_file(
+        &self,
+        target: &CanonicalTarget,
+        file: File,
+        request: ReadRequest,
+        cursor: Option<&str>,
+    ) -> Result<ReadPage, ReadError> {
         self.access.authorize(target)?;
         if request.max_lines == 0 {
             return Err(ReadError::new(ReadErrorCode::InvalidRequest));
@@ -154,8 +174,7 @@ impl<A: ReadAccess> PaginatedReader<A> {
         if request.max_bytes == 0 {
             return Err(ReadError::new(ReadErrorCode::InvalidRequest));
         }
-        let snapshot =
-            TextSnapshot::from_file(target.absolute(), self.limits).map_err(ReadError::snapshot)?;
+        let snapshot = snapshot_from_file(&file, self.limits).map_err(ReadError::snapshot)?;
         let token = snapshot.version.token;
         if request.start_byte.is_some() && request.start_line != 0 {
             return Err(ReadError::new(ReadErrorCode::InvalidRequest));
@@ -178,20 +197,24 @@ impl<A: ReadAccess> PaginatedReader<A> {
         } else {
             (request.start_line, request.start_byte)
         };
-        let file = crate::apply_patch::file_mutation::open_regular_file(target.absolute())
-            .map_err(|error| ReadError {
-                code: ReadErrorCode::Io,
-                source: Some(error),
-            })?;
+        let mut file = file;
+        file.seek(SeekFrom::Start(0)).map_err(|error| ReadError {
+            code: ReadErrorCode::Io,
+            source: Some(error),
+        })?;
+        let page_file = file.try_clone().map_err(|error| ReadError {
+            code: ReadErrorCode::Io,
+            source: Some(error),
+        })?;
         let selection = match start_byte {
             Some(start_byte) => read_page_streaming_from_byte(
-                BufReader::new(file),
+                BufReader::new(page_file),
                 start_byte,
                 request.max_lines as u64,
                 request.max_bytes,
             )?,
             None => read_page_streaming(
-                BufReader::new(file),
+                BufReader::new(page_file),
                 start_line,
                 request.max_lines as u64,
                 request.max_bytes,
@@ -202,9 +225,8 @@ impl<A: ReadAccess> PaginatedReader<A> {
         // concurrent writer between the metadata pass and the streaming page
         // pass is rejected rather than returning a page paired with a stale
         // whole-file token.
-        let after_token = crate::apply_patch::file_mutation::version_on_disk(target, self.limits)
-            .map_err(|_| ReadError::new(ReadErrorCode::Io))?;
-        if after_token != Some(token) {
+        let after_snapshot = snapshot_from_file(&file, self.limits).map_err(ReadError::snapshot)?;
+        if after_snapshot.version.token != token {
             return Err(ReadError::new(ReadErrorCode::StaleCursor));
         }
         let cursor = selection
@@ -224,6 +246,20 @@ impl<A: ReadAccess> PaginatedReader<A> {
             end_byte: selection.end_byte,
         })
     }
+}
+
+fn snapshot_from_file(file: &File, limits: SnapshotLimits) -> Result<TextSnapshot, SnapshotError> {
+    let mut source = file.try_clone().map_err(|error| SnapshotError {
+        code: SnapshotErrorCode::Io,
+        source: Some(error),
+    })?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| SnapshotError {
+            code: SnapshotErrorCode::Io,
+            source: Some(error),
+        })?;
+    TextSnapshot::from_reader(source, limits)
 }
 
 struct PageSelection {

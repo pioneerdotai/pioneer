@@ -2558,7 +2558,7 @@ const fn default_provider_attachments_enforce_path_allowlist() -> bool {
 }
 
 const fn default_provider_attachments_allow_url_sources() -> bool {
-    true
+    false
 }
 
 const fn default_provider_attachments_allow_http() -> bool {
@@ -4347,7 +4347,7 @@ active_recall_model = { source = "custom", model_provider = "legacy-provider", m
             config.gateway.provider.attachments.upload_registry_ttl_secs,
             7 * 24 * 3600
         );
-        assert!(config.gateway.provider.attachments.allow_url_sources);
+        assert!(!config.gateway.provider.attachments.allow_url_sources);
         assert!(!config.gateway.provider.attachments.allow_http);
         assert!(!config.gateway.provider.attachments.allow_private_network);
         assert_eq!(config.gateway.provider.attachments.max_url_redirects, 3);

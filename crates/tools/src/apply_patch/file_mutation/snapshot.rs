@@ -85,6 +85,58 @@ pub fn open_directory(path: impl AsRef<Path>) -> io::Result<File> {
     Ok(directory)
 }
 
+/// Open a regular file relative to an already-authorized directory handle.
+///
+/// The relative path is deliberately interpreted only by descriptor-relative
+/// operations on Unix.  This is the use-side half of a file-policy grant: a
+/// pathname may be replaced after authorization, but the opened object and
+/// every parent component remain anchored to the handle captured at check
+/// time.
+pub(crate) fn open_regular_file_at(parent: &File, relative: impl AsRef<Path>) -> io::Result<File> {
+    let relative = relative.as_ref();
+    #[cfg(unix)]
+    let file = open_regular_file_at_unix(parent, relative)?;
+    #[cfg(windows)]
+    let file = open_regular_file_at_windows(parent, relative)?;
+    #[cfg(not(any(unix, windows)))]
+    let file = return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-relative file access is unavailable on this platform",
+    ));
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace target is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Open a directory relative to an already-authorized directory handle.
+pub(crate) fn open_directory_at(parent: &File, relative: impl AsRef<Path>) -> io::Result<File> {
+    let relative = relative.as_ref();
+    #[cfg(unix)]
+    let directory = open_directory_at_unix(parent, relative)?;
+    #[cfg(windows)]
+    let directory = open_directory_at_windows(parent, relative)?;
+    #[cfg(not(any(unix, windows)))]
+    let directory = return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-relative directory access is unavailable on this platform",
+    ));
+
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace target is not a directory",
+        ));
+    }
+    Ok(directory)
+}
+
 /// Resolve only immutable macOS compatibility aliases that precede the
 /// application-owned path.  Never canonicalize the workspace descendants:
 /// doing so would follow an attacker-controlled symlink before `openat` gets
@@ -224,11 +276,131 @@ fn open_directory_unix(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
+#[cfg(unix)]
+fn relative_components(path: &Path) -> io::Result<Vec<&std::ffi::OsStr>> {
+    use std::path::Component;
+
+    if path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor-relative path must not be absolute",
+        ));
+    }
+    path.components()
+        .map(|component| match component {
+            Component::Normal(value) => Ok(value),
+            Component::CurDir => Ok(std::ffi::OsStr::new(".")),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "descriptor-relative path is not normalized",
+                ))
+            }
+        })
+        .filter(|component| !matches!(component, Ok(value) if *value == std::ffi::OsStr::new(".")))
+        .collect()
+}
+
+#[cfg(unix)]
+fn open_regular_file_at_unix(parent: &File, relative: &Path) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let components = relative_components(relative)?;
+    let Some(final_component) = components.last() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor-relative file path has no file component",
+        ));
+    };
+    let mut directory = parent.try_clone()?;
+    for component in &components[..components.len() - 1] {
+        let name = CString::new(component.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "workspace path contains NUL")
+        })?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+    let name = CString::new(final_component.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "workspace path contains NUL"))?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn open_directory_at_unix(parent: &File, relative: &Path) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let components = relative_components(relative)?;
+    let mut directory = parent.try_clone()?;
+    for component in components {
+        let name = CString::new(component.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "workspace path contains NUL")
+        })?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = unsafe { File::from_raw_fd(descriptor) };
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn open_regular_file_at_windows(_parent: &File, _relative: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-relative file access is not implemented for Windows handles",
+    ))
+}
+
+#[cfg(windows)]
+fn open_directory_at_windows(_parent: &File, _relative: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-relative directory access is not implemented for Windows handles",
+    ))
+}
+
 #[cfg(windows)]
 fn open_regular_file_windows(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    // Omit FILE_SHARE_DELETE so the authorized name cannot be replaced while
+    // this capability is live.
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     let file = options.open(path)?;
     verify_windows_handle_path(&file, path)?;
@@ -240,6 +412,8 @@ fn open_directory_windows(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     options.custom_flags(
         windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
             | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,

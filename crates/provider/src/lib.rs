@@ -41,7 +41,8 @@ pub use types::{
     ChatRequest, ChatResponse, CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse,
     InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, ModelInputItem,
     ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
-    ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
+    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderReplayState,
+    ProviderResponseLimits, ProviderResponseTooLarge, ProviderTermination, ProviderTimeoutPolicy,
     ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
     ToolDefinition,
 };

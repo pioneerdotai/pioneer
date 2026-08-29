@@ -17,6 +17,7 @@ mod output_projection;
 mod permissions;
 mod process_policy;
 mod registry;
+mod resource_budget;
 mod retry_controller;
 mod router;
 mod runtime;

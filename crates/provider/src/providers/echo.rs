@@ -1,6 +1,5 @@
 use crate::{
     attachments::{ensure_no_unrendered_attachments, prepare_messages_for_provider_async},
-    tools::parse::parse_embedded_tool_payload,
     types::{
         ChatMessage, ChatRequest, ChatResponse, ProviderCapabilities, ProviderInputCapabilities,
         Role, StreamChunk,
@@ -47,16 +46,10 @@ impl crate::traits::Provider for EchoProvider {
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
         let rendered_messages = prepared.messages;
         let raw_text = extract_last_user_text(rendered_messages.as_slice());
-        let parsed = parse_embedded_tool_payload(&raw_text)?;
-        let (text, reasoning_content, tool_calls) = match parsed {
-            Some(payload) => (payload.text, payload.reasoning_content, payload.tool_calls),
-            None => (raw_text, None, Vec::new()),
-        };
-        let termination = if tool_calls.is_empty() {
-            crate::ProviderTermination::Complete
-        } else {
-            crate::ProviderTermination::ToolCalls
-        };
+        let text = raw_text;
+        let reasoning_content = None;
+        let tool_calls = Vec::new();
+        let termination = crate::ProviderTermination::Complete;
         Ok(ChatResponse {
             text,
             usage: None,

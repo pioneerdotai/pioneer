@@ -53,6 +53,33 @@ pub struct CanonicalTarget {
 }
 
 impl CanonicalTarget {
+    pub(crate) fn from_authorized_path(
+        root: &Path,
+        absolute: PathBuf,
+        role: TargetRole,
+        expectation: TargetExpectation,
+    ) -> Result<Self, TargetResolutionError> {
+        let root = normalize_absolute_root(root)?;
+        let absolute = normalize_absolute_path(&absolute)?;
+        if !absolute.starts_with(&root) {
+            return Err(TargetResolutionError::new(
+                TargetResolutionErrorCode::EscapesRoot,
+            ));
+        }
+        let relative = absolute
+            .strip_prefix(&root)
+            .map(Path::to_path_buf)
+            .map_err(|_| TargetResolutionError::new(TargetResolutionErrorCode::EscapesRoot))?;
+        let identity = identity_for(&absolute, detect_case_sensitivity(&root));
+        Ok(Self {
+            relative,
+            absolute,
+            identity,
+            role,
+            expectation,
+        })
+    }
+
     pub fn relative(&self) -> &Path {
         &self.relative
     }

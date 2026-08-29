@@ -78,6 +78,8 @@ pub struct DownloadModelPayload {
     pub content_type: Option<String>,
     pub elapsed_ms: u64,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability_warning: Option<String>,
 }
 
 pub fn render_web_search_ui_text(payload: &WebSearchModelPayload) -> String {

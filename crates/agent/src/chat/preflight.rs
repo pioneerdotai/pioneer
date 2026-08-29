@@ -13,7 +13,10 @@ use pioneer_promt::{
     TurnPreflightPromptInput, render_turn_preflight_prompt,
 };
 use pioneer_protocol::ThreadMode;
-use pioneer_provider::{ChatMessage, ChatRequest, Provider, ProviderRegistry, ReasoningConfig};
+use pioneer_provider::{
+    ChatMessage, ChatRequest, Provider, ProviderRegistry, ProviderResponseLimits,
+    ProviderResponseTooLarge, ReasoningConfig,
+};
 use pioneer_tools::{BuiltinToolDomain, PreflightToolIndex};
 use serde::de::{self, Error as _, Visitor};
 use serde::ser::SerializeStruct;
@@ -536,7 +539,7 @@ async fn call_turn_preflight_provider_once(
     let request = turn_preflight_chat_request(endpoint.model.as_str(), prompt.to_owned());
     let response = tokio::time::timeout(
         Duration::from_millis(timeout_ms.max(1)),
-        request_turn_preflight_provider_json(endpoint.provider.as_ref(), request),
+        request_turn_preflight_provider_json(endpoint.provider.as_ref(), request, max_output_chars),
     )
     .await;
 
@@ -645,12 +648,28 @@ fn turn_preflight_chat_request(model: &str, prompt: String) -> ChatRequest {
 async fn request_turn_preflight_provider_json(
     provider: &dyn Provider,
     request: ChatRequest,
+    max_output_chars: usize,
 ) -> anyhow::Result<String> {
+    let request = super::provider::bounded_provider_request(request);
+    let limits = ProviderResponseLimits::default();
     if provider.capabilities().streaming {
         let mut stream = provider.stream_chat(request).await?;
         let mut text = String::new();
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
             let chunk = chunk?;
+            limits.validate_stream_chunk(&chunk)?;
+            let next_chars = text
+                .chars()
+                .count()
+                .saturating_add(chunk.delta.chars().count());
+            if next_chars > max_output_chars {
+                return Err(ProviderResponseTooLarge::new(
+                    "preflight_response_text",
+                    max_output_chars,
+                    next_chars,
+                )
+                .into());
+            }
             text.push_str(chunk.delta.as_str());
             if chunk.is_final {
                 break;
@@ -659,7 +678,18 @@ async fn request_turn_preflight_provider_json(
         return Ok(text);
     }
 
-    provider.chat(request).await.map(|response| response.text)
+    let response = provider.chat(request).await?;
+    limits.validate_chat_response(&response)?;
+    let output_chars = response.text.chars().count();
+    if output_chars > max_output_chars {
+        return Err(ProviderResponseTooLarge::new(
+            "preflight_response_text",
+            max_output_chars,
+            output_chars,
+        )
+        .into());
+    }
+    Ok(response.text)
 }
 
 fn parse_provider_turn_preflight_plan_json_classified(

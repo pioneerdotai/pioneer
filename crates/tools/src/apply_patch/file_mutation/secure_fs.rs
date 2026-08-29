@@ -330,7 +330,10 @@ pub(crate) struct StagedFile {
     #[cfg(unix)]
     destination_name: CString,
     #[cfg(unix)]
-    target: CanonicalTarget,
+    /// Pathname-bound staging retains the original target as a final binding
+    /// fence. Descriptor-backed staging deliberately has no pathname fence:
+    /// the captured directory capability is its authoritative destination.
+    target: Option<CanonicalTarget>,
     #[cfg(unix)]
     active_name: bool,
     #[cfg(not(unix))]
@@ -379,44 +382,7 @@ impl StagedFile {
         #[cfg(unix)]
         {
             let (parent, destination_name) = open_target_parent(target)?;
-            let status = fstat(parent.as_raw_fd())?;
-            for _ in 0..128 {
-                let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-                let temporary_name =
-                    CString::new(format!(".pioneer-patch-{}-{sequence}", std::process::id()))
-                        .map_err(|_| invalid_path("temporary filename contains NUL"))?;
-                let descriptor = unsafe {
-                    libc::openat(
-                        parent.as_raw_fd(),
-                        temporary_name.as_ptr(),
-                        libc::O_WRONLY
-                            | libc::O_CREAT
-                            | libc::O_EXCL
-                            | libc::O_NOFOLLOW
-                            | libc::O_CLOEXEC,
-                        0o600,
-                    )
-                };
-                if descriptor >= 0 {
-                    return Ok(Self {
-                        file: Some(unsafe { File::from_raw_fd(descriptor) }),
-                        parent: Some(parent),
-                        parent_identity: (status.st_dev, status.st_ino),
-                        temporary_name,
-                        destination_name,
-                        target: target.clone(),
-                        active_name: true,
-                    });
-                }
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(error);
-                }
-            }
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "could not allocate a unique staging file",
-            ))
+            stage_in_parent(parent, destination_name, Some(target))
         }
         #[cfg(windows)]
         {
@@ -453,6 +419,58 @@ impl StagedFile {
                 file: Some(NamedTempFile::new_in(parent)?),
                 destination: target.absolute().to_path_buf(),
             })
+        }
+    }
+
+    /// Stage a file relative to an already-authorized directory descriptor.
+    /// The destination pathname is never reopened to find its parent, so a
+    /// replacement of an authorized root or ancestor cannot redirect the
+    /// temporary file or its later atomic publish.
+    pub(crate) fn create_at(
+        anchor: &File,
+        relative_destination: &Path,
+        target: &CanonicalTarget,
+        create_dirs: bool,
+    ) -> io::Result<Self> {
+        #[cfg(unix)]
+        let _ = target;
+        #[cfg(unix)]
+        {
+            let (parent, destination_name) =
+                open_relative_target_parent(anchor, relative_destination, create_dirs)?;
+            stage_in_parent(parent, destination_name, None)
+        }
+        #[cfg(windows)]
+        {
+            // Windows has no openat(2). The authorized anchor handle is kept
+            // open while the path is materialized, and every opened parent is
+            // verified by file identity/final handle path and opened without
+            // delete sharing. That pins the destination parent against rename
+            // before the temporary file is created and later renamed by
+            // SetFileInformationByHandle relative to that parent handle.
+            let _anchor_guard = anchor;
+            if relative_destination.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            }) {
+                return Err(invalid_path(
+                    "relative destination escapes its authorized anchor",
+                ));
+            }
+            if create_dirs {
+                ensure_parent_directories(target).map_err(|failure| failure.source)?;
+            }
+            Self::create(target)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (anchor, relative_destination, target, create_dirs);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "descriptor-relative staging is unavailable on this platform",
+            ))
         }
     }
 
@@ -691,10 +709,22 @@ impl StagedFile {
 
     #[cfg(unix)]
     fn verify_parent_binding(&self) -> io::Result<()> {
-        let (current, current_name) = open_target_parent(&self.target)?;
-        let status = fstat(current.as_raw_fd())?;
+        // The descriptor is authoritative for the actual rename. Re-open the
+        // original parent only as a fence: if the visible pathname was
+        // replaced after staging, fail closed instead of publishing into a
+        // now-hidden stale directory object.
+        let Some(target) = self.target.as_ref() else {
+            return Ok(());
+        };
+        let (current, current_name) = open_target_parent(target)?;
+        let parent = self.parent.as_ref().expect("staged parent is present");
+        let status = fstat(parent.as_raw_fd())?;
         if (status.st_dev, status.st_ino) != self.parent_identity
             || current_name != self.destination_name
+            || fstat(current.as_raw_fd())
+                .map(|status| (status.st_dev, status.st_ino))
+                .ok()
+                != Some(self.parent_identity)
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -727,6 +757,83 @@ impl StagedFile {
             let _ = file.into_temp_path().keep();
         }
     }
+}
+
+#[cfg(unix)]
+fn stage_in_parent(
+    parent: File,
+    destination_name: CString,
+    target: Option<&CanonicalTarget>,
+) -> io::Result<StagedFile> {
+    let status = fstat(parent.as_raw_fd())?;
+    for _ in 0..128 {
+        let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary_name =
+            CString::new(format!(".pioneer-patch-{}-{sequence}", std::process::id()))
+                .map_err(|_| invalid_path("temporary filename contains NUL"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                temporary_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor >= 0 {
+            return Ok(StagedFile {
+                file: Some(unsafe { File::from_raw_fd(descriptor) }),
+                parent: Some(parent),
+                parent_identity: (status.st_dev, status.st_ino),
+                temporary_name,
+                destination_name,
+                target: target.cloned(),
+                active_name: true,
+            });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique staging file",
+    ))
+}
+
+#[cfg(unix)]
+fn open_relative_target_parent(
+    anchor: &File,
+    relative_destination: &Path,
+    create_dirs: bool,
+) -> io::Result<(File, CString)> {
+    let mut components = relative_destination.components().collect::<Vec<_>>();
+    let Some(Component::Normal(final_component)) = components.pop() else {
+        return Err(invalid_path(
+            "staged destination has no normalized file component",
+        ));
+    };
+    let mut current = anchor.try_clone()?;
+    for component in components {
+        let Component::Normal(component) = component else {
+            return Err(invalid_path("staged destination is not normalized"));
+        };
+        let name = os_name(component)?;
+        match open_directory_at(&current, &name) {
+            Ok(next) => current = next,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create_dirs => {
+                if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
+                    let mkdir_error = io::Error::last_os_error();
+                    if mkdir_error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(mkdir_error);
+                    }
+                }
+                current = open_directory_at(&current, &name)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((current, os_name(final_component)?))
 }
 
 impl Drop for StagedFile {

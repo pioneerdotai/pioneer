@@ -187,6 +187,7 @@ fn prepare_messages_impl(
     }
     let mut prepared_messages = Vec::with_capacity(messages.len());
     let mut attachments = Vec::with_capacity(attachment_count);
+    let mut materialized_total_bytes = 0usize;
 
     for (message_index, message) in messages.iter().enumerate() {
         let mut rendered_parts = Vec::new();
@@ -195,6 +196,7 @@ fn prepare_messages_impl(
         }
 
         for (part_index, part) in message.content_parts.iter().enumerate() {
+            let attachment_count_before = attachments.len();
             match part {
                 MessageContentPart::Text { text } => {
                     if !text.trim().is_empty() {
@@ -210,6 +212,7 @@ fn prepare_messages_impl(
                         InputContentType::File,
                         file,
                         config,
+                        materialized_total_bytes,
                     )?);
                 }
                 MessageContentPart::Image { image } => {
@@ -221,6 +224,7 @@ fn prepare_messages_impl(
                         InputContentType::Image,
                         image,
                         config,
+                        materialized_total_bytes,
                     )?);
                 }
                 MessageContentPart::Audio { audio } => {
@@ -232,6 +236,7 @@ fn prepare_messages_impl(
                         InputContentType::Audio,
                         audio,
                         config,
+                        materialized_total_bytes,
                     )?);
                 }
                 MessageContentPart::Video { video } => {
@@ -243,19 +248,23 @@ fn prepare_messages_impl(
                         InputContentType::Video,
                         video,
                         config,
+                        materialized_total_bytes,
                     )?);
                 }
             }
-            let materialized_total_bytes = attachments
-                .iter()
-                .map(|attachment| attachment.bytes.as_ref().map_or(0, Vec::len))
-                .sum();
-            if materialized_total_bytes > config.max_total_bytes_per_request {
-                return Err(AttachmentPipelineError::attachment_total_budget_exceeded(
-                    materialized_total_bytes,
-                    config.max_total_bytes_per_request,
-                )
-                .into());
+            if attachments.len() > attachment_count_before {
+                let latest = attachments
+                    .last()
+                    .map(|attachment| attachment.size_bytes)
+                    .unwrap_or_default();
+                materialized_total_bytes = materialized_total_bytes.saturating_add(latest);
+                if materialized_total_bytes > config.max_total_bytes_per_request {
+                    return Err(AttachmentPipelineError::attachment_total_budget_exceeded(
+                        materialized_total_bytes,
+                        config.max_total_bytes_per_request,
+                    )
+                    .into());
+                }
             }
         }
 
@@ -308,6 +317,7 @@ fn resolve_attachment(
     kind: InputContentType,
     attachment: &MessageAttachment,
     config: &AttachmentPipelineConfig,
+    materialized_total_bytes: usize,
 ) -> Result<PreparedAttachment> {
     let support = capabilities.input_types.support_for(kind);
     if !support.is_supported() {
@@ -318,13 +328,29 @@ fn resolve_attachment(
         .into());
     }
 
-    let resolved_source = resolve_attachment_source(
-        provider_name,
-        attachment,
-        kind,
-        config,
-        config.max_bytes_per_attachment,
-    )?;
+    let remaining_total_bytes = config
+        .max_total_bytes_per_request
+        .saturating_sub(materialized_total_bytes);
+    let source_limit = config.max_bytes_per_attachment.min(remaining_total_bytes);
+    let resolved_source =
+        match resolve_attachment_source(provider_name, attachment, kind, config, source_limit) {
+            Ok(source) => source,
+            Err(error)
+                if source_limit < config.max_bytes_per_attachment
+                    && error
+                        .downcast_ref::<AttachmentPipelineError>()
+                        .is_some_and(|error| error.code() == "ATTACHMENT_TOO_LARGE") =>
+            {
+                return Err(AttachmentPipelineError::attachment_total_budget_exceeded(
+                    materialized_total_bytes
+                        .saturating_add(source_limit)
+                        .saturating_add(1),
+                    config.max_total_bytes_per_request,
+                )
+                .into());
+            }
+            Err(error) => return Err(error),
+        };
     let mime = reconcile_mime(
         attachment.mime_type.as_str(),
         resolved_source.bytes.as_deref(),
@@ -338,11 +364,41 @@ fn resolve_attachment(
         &config.normalization,
     )?;
 
-    let size_bytes = attachment
-        .size_bytes
-        .and_then(|value| usize::try_from(value).ok())
-        .or_else(|| resolved_source.bytes.as_ref().map(Vec::len))
-        .unwrap_or_default();
+    let size_bytes = if let Some(bytes) = resolved_source.bytes.as_ref() {
+        let actual_size = bytes.len();
+        if let Some(declared_size) = attachment.size_bytes
+            && usize::try_from(declared_size).ok() != Some(actual_size)
+        {
+            return Err(AttachmentPipelineError::declared_size_mismatch(
+                declared_size,
+                actual_size,
+                resolved_source.source_label.as_str(),
+            )
+            .into());
+        }
+        actual_size
+    } else {
+        attachment
+            .size_bytes
+            .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+            .unwrap_or_default()
+    };
+
+    if size_bytes > config.max_bytes_per_attachment {
+        return Err(AttachmentPipelineError::attachment_too_large(
+            size_bytes,
+            config.max_bytes_per_attachment,
+            resolved_source.source_label.as_str(),
+        )
+        .into());
+    }
+    if size_bytes > remaining_total_bytes {
+        return Err(AttachmentPipelineError::attachment_total_budget_exceeded(
+            materialized_total_bytes.saturating_add(size_bytes),
+            config.max_total_bytes_per_request,
+        )
+        .into());
+    }
 
     let sha256 = resolve_sha256(
         attachment.sha256.as_deref(),
@@ -545,6 +601,64 @@ mod tests {
         .expect_err("total budget should fail");
 
         assert!(err.to_string().contains("ATTACHMENT_TOTAL_BUDGET_EXCEEDED"));
+    }
+
+    #[test]
+    fn declared_attachment_size_must_match_materialized_bytes() {
+        let message = ChatMessage::user_parts(vec![MessageContentPart::file(MessageAttachment {
+            mime_type: "application/octet-stream".to_owned(),
+            name: Some("payload.bin".to_owned()),
+            size_bytes: Some(99),
+            sha256: None,
+            source: AttachmentDataSource::Bytes {
+                base64_data: BASE64.encode([1_u8, 2, 3]),
+            },
+            artifact: None,
+        })]);
+
+        let error = prepare_messages_for_provider("mock", &caps_with_native_declared(), &[message])
+            .expect_err("a false declared size must be rejected");
+
+        assert!(error.to_string().contains("ATTACHMENT_SIZE_MISMATCH"));
+    }
+
+    #[test]
+    fn sparse_path_is_rejected_by_metadata_before_reading_content() {
+        let root =
+            std::env::temp_dir().join(format!("pioneer-attachment-sparse-{}", std::process::id()));
+        std::fs::create_dir(&root).expect("create sparse attachment test directory");
+        let path = root.join("oversized.bin");
+        let result = (|| {
+            let file = std::fs::File::create(&path).expect("create sparse file");
+            file.set_len(65).expect("extend sparse file");
+
+            let message =
+                ChatMessage::user_parts(vec![MessageContentPart::file(MessageAttachment {
+                    mime_type: "application/octet-stream".to_owned(),
+                    name: Some("oversized.bin".to_owned()),
+                    size_bytes: None,
+                    sha256: None,
+                    source: AttachmentDataSource::Path {
+                        path: path.display().to_string(),
+                    },
+                    artifact: None,
+                })]);
+            let mut config = AttachmentPipelineConfig::default();
+            config.max_bytes_per_attachment = 64;
+            config.max_total_bytes_per_request = 128;
+
+            let error = prepare_messages_for_provider_with_config(
+                "mock",
+                &caps_with_native_declared(),
+                &[message],
+                &config,
+            )
+            .expect_err("sparse path beyond the hard limit must be rejected");
+            assert!(error.to_string().contains("ATTACHMENT_TOO_LARGE"));
+            Ok::<(), anyhow::Error>(())
+        })();
+        let _ = std::fs::remove_dir_all(&root);
+        result.expect("sparse attachment regression");
     }
 
     #[test]

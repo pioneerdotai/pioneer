@@ -1,6 +1,7 @@
 use pioneer_protocol::ProviderFailureClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
 pub use pioneer_protocol::ReasoningEffort;
@@ -28,6 +29,62 @@ impl ProviderFailureClassification {
         }
     }
 }
+
+/// A provider-controlled response exceeded a hard runtime boundary.
+///
+/// This error deliberately contains only bounded metadata.  It is used for
+/// both transport bodies and the logical response envelope retained by the
+/// agent, so callers can classify it as non-retryable without inspecting a
+/// provider-supplied body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderResponseTooLarge {
+    pub component: &'static str,
+    pub limit: usize,
+    pub observed: usize,
+}
+
+impl ProviderResponseTooLarge {
+    pub const fn new(component: &'static str, limit: usize, observed: usize) -> Self {
+        Self {
+            component,
+            limit,
+            observed,
+        }
+    }
+}
+
+impl Display for ProviderResponseTooLarge {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider response exceeds {} limit (limit={} bytes, observed_at_least={} bytes)",
+            self.component, self.limit, self.observed
+        )
+    }
+}
+
+impl std::error::Error for ProviderResponseTooLarge {}
+
+/// An oversized HTTP error body. The status is retained even though the
+/// untrusted body is discarded, so retry/cooldown policy can still distinguish
+/// rate limits and provider failures from oversized successful responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHttpErrorBodyTooLarge {
+    pub status: u16,
+    pub limit: ProviderResponseTooLarge,
+}
+
+impl Display for ProviderHttpErrorBodyTooLarge {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider HTTP error {}: {}",
+            self.status, self.limit
+        )
+    }
+}
+
+impl std::error::Error for ProviderHttpErrorBodyTooLarge {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -908,6 +965,217 @@ impl StreamChunk {
     }
 }
 
+/// Hard limits for data originating at a provider boundary.  These values
+/// bound both the decoded transport body and the fields which the agent keeps
+/// across a streamed or replayed round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderResponseLimits {
+    pub max_transport_bytes: usize,
+    pub max_text_bytes: usize,
+    pub max_reasoning_bytes: usize,
+    pub max_tool_calls: usize,
+    pub max_tool_arguments_bytes: usize,
+    pub max_replay_bytes: usize,
+    pub max_retained_bytes: usize,
+}
+
+impl Default for ProviderResponseLimits {
+    fn default() -> Self {
+        Self {
+            max_transport_bytes: 16 * 1024 * 1024,
+            max_text_bytes: 4 * 1024 * 1024,
+            max_reasoning_bytes: 4 * 1024 * 1024,
+            max_tool_calls: 64,
+            max_tool_arguments_bytes: 4 * 1024 * 1024,
+            max_replay_bytes: 2 * 1024 * 1024,
+            max_retained_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl ProviderResponseLimits {
+    pub fn validate_chat_response(
+        &self,
+        response: &ChatResponse,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_accumulated(
+            response.text.as_str(),
+            response.reasoning_content.as_deref().unwrap_or_default(),
+            response.tool_calls.as_slice(),
+            response.provider_replay_state.as_ref(),
+        )
+    }
+
+    pub fn validate_accumulated(
+        &self,
+        text: &str,
+        reasoning: &str,
+        tool_calls: &[ProviderToolCall],
+        replay_state: Option<&ProviderReplayState>,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_text(text, "response_text")?;
+        self.validate_reasoning(reasoning)?;
+        self.validate_tool_calls(tool_calls)?;
+        if let Some(state) = replay_state {
+            self.validate_replay_state(state)?;
+        }
+        self.validate_retained_bytes(
+            text.len()
+                .saturating_add(reasoning.len())
+                .saturating_add(tool_calls_bytes(tool_calls))
+                .saturating_add(replay_state.map_or(0, replay_state_bytes)),
+        )
+    }
+
+    pub fn validate_stream_chunk(
+        &self,
+        chunk: &StreamChunk,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_text(chunk.delta.as_str(), "stream_text_delta")?;
+        if let Some(reasoning) = chunk.reasoning_delta.as_deref() {
+            self.validate_reasoning(reasoning)?;
+        }
+        self.validate_tool_calls(chunk.tool_calls.as_slice())?;
+        if let Some(state) = chunk.provider_replay_state.as_ref() {
+            self.validate_replay_state(state)?;
+        }
+        self.validate_retained_bytes(
+            chunk
+                .delta
+                .len()
+                .saturating_add(chunk.reasoning_delta.as_deref().map_or(0, str::len))
+                .saturating_add(tool_calls_bytes(chunk.tool_calls.as_slice()))
+                .saturating_add(
+                    chunk
+                        .provider_replay_state
+                        .as_ref()
+                        .map_or(0, replay_state_bytes),
+                ),
+        )
+    }
+
+    pub fn validate_text(
+        &self,
+        text: &str,
+        component: &'static str,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_text_bytes(text.len(), component)
+    }
+
+    pub fn validate_text_bytes(
+        &self,
+        bytes: usize,
+        component: &'static str,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        if bytes > self.max_text_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                component,
+                self.max_text_bytes,
+                bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_reasoning(&self, reasoning: &str) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_reasoning_bytes(reasoning.len())
+    }
+
+    pub fn validate_reasoning_bytes(&self, bytes: usize) -> Result<(), ProviderResponseTooLarge> {
+        if bytes > self.max_reasoning_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                "reasoning_content",
+                self.max_reasoning_bytes,
+                bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_tool_calls(
+        &self,
+        calls: &[ProviderToolCall],
+    ) -> Result<(), ProviderResponseTooLarge> {
+        if calls.len() > self.max_tool_calls {
+            return Err(ProviderResponseTooLarge::new(
+                "tool_calls",
+                self.max_tool_calls,
+                calls.len(),
+            ));
+        }
+        let arguments_bytes = calls.iter().fold(0usize, |total, call| {
+            total.saturating_add(call.arguments.len())
+        });
+        if arguments_bytes > self.max_tool_arguments_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                "tool_call_arguments",
+                self.max_tool_arguments_bytes,
+                arguments_bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_replay_state(
+        &self,
+        state: &ProviderReplayState,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        let bytes = replay_state_bytes(state);
+        if bytes > self.max_replay_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                "provider_replay_state",
+                self.max_replay_bytes,
+                bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_retained_bytes(&self, bytes: usize) -> Result<(), ProviderResponseTooLarge> {
+        if bytes > self.max_retained_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                "retained_response_envelope",
+                self.max_retained_bytes,
+                bytes,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn tool_calls_bytes(calls: &[ProviderToolCall]) -> usize {
+    calls.iter().fold(0usize, |total, call| {
+        total
+            .saturating_add(call.id.len())
+            .saturating_add(call.name.len())
+            .saturating_add(call.arguments.len())
+    })
+}
+
+fn replay_state_bytes(state: &ProviderReplayState) -> usize {
+    let mut counter = JsonByteCounter::default();
+    if serde_json::to_writer(&mut counter, &state.payload).is_err() {
+        return usize::MAX;
+    }
+    state.provider.len().saturating_add(counter.bytes)
+}
+
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     pub streaming: bool,
@@ -1071,6 +1339,54 @@ mod tests {
         assert!(resp.usage.is_none());
         assert!(resp.reasoning_content.is_none());
         assert!(resp.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn provider_response_limits_reject_oversized_logical_fields() {
+        let mut limits = ProviderResponseLimits::default();
+        limits.max_text_bytes = 3;
+        let error = limits
+            .validate_stream_chunk(&StreamChunk::delta("abcd"))
+            .expect_err("stream text must be bounded before retention");
+        assert_eq!(error.component, "stream_text_delta");
+        assert_eq!(error.limit, 3);
+
+        limits.max_text_bytes = usize::MAX;
+        limits.max_tool_calls = 1;
+        let calls = vec![
+            ProviderToolCall {
+                id: "one".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            ProviderToolCall {
+                id: "two".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        ];
+        let error = limits
+            .validate_accumulated("", "", calls.as_slice(), None)
+            .expect_err("tool-call count must be bounded");
+        assert_eq!(error.component, "tool_calls");
+    }
+
+    #[test]
+    fn provider_response_limits_bound_replay_and_retained_bytes() {
+        let mut limits = ProviderResponseLimits::default();
+        limits.max_replay_bytes = 4;
+        let replay = ProviderReplayState::new("provider", serde_json::json!({"value": "large"}));
+        let error = limits
+            .validate_accumulated("", "", &[], Some(&replay))
+            .expect_err("replay state must be bounded");
+        assert_eq!(error.component, "provider_replay_state");
+
+        limits.max_replay_bytes = usize::MAX;
+        limits.max_retained_bytes = 2;
+        let error = limits
+            .validate_accumulated("abc", "", &[], None)
+            .expect_err("retained response envelope must be bounded");
+        assert_eq!(error.component, "retained_response_envelope");
     }
 
     #[test]

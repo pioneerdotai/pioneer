@@ -177,7 +177,9 @@ impl DeepSeekProvider {
                 let mut chunk = match result {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        let _ = tx.send(Err(error)).await;
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -192,7 +194,9 @@ impl DeepSeekProvider {
                         model.as_str(),
                         pending_replay_state.as_ref(),
                     ) {
-                        let _ = tx.send(Err(error)).await;
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                     if let Some(state) = pending_replay_state.take() {

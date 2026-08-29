@@ -430,10 +430,16 @@ impl AnthropicProvider {
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read error body>".into());
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
         anyhow!("Anthropic API error ({status}): {body}")
     }
 }
@@ -528,7 +534,12 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ApiChatResponse = response.json().await?;
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
         let termination = api_response
             .stop_reason
             .as_deref()
@@ -657,7 +668,11 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
@@ -677,7 +692,9 @@ impl crate::traits::Provider for AnthropicProvider {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow!(e))).await;
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -685,7 +702,9 @@ impl crate::traits::Provider for AnthropicProvider {
                 let lines = match decoder.push(bytes.as_ref()) {
                     Ok(lines) => lines,
                     Err(error) => {
-                        let _ = tx.send(Err(error)).await;
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -709,27 +728,38 @@ impl crate::traits::Provider for AnthropicProvider {
                                 let remaining_calls = match remaining_calls {
                                     Ok(calls) => calls,
                                     Err(error) => {
-                                        let _ = tx.send(Err(error)).await;
+                                        if tx.send(Err(error)).await.is_err() {
+                                            return;
+                                        }
                                         return;
                                     }
                                 };
                                 if !remaining_calls.is_empty() {
-                                    let _ =
-                                        tx.send(Ok(StreamChunk::tool_calls(remaining_calls))).await;
+                                    if tx
+                                        .send(Ok(StreamChunk::tool_calls(remaining_calls)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                                 if !replay_thinking_blocks.is_empty() {
                                     let blocks =
                                         replay_thinking_blocks.into_values().collect::<Vec<_>>();
-                                    let _ = tx
+                                    if tx
                                         .send(Ok(StreamChunk::provider_replay_state(
                                             ProviderReplayState::new(
                                                 "anthropic",
                                                 serde_json::json!({ "blocks": blocks }),
                                             ),
                                         )))
-                                        .await;
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
-                                let _ = tx
+                                if tx
                                     .send(Ok(StreamChunk::final_chunk_with(
                                         termination.take().unwrap_or_else(|| {
                                             ProviderTermination::Unknown(
@@ -737,7 +767,11 @@ impl crate::traits::Provider for AnthropicProvider {
                                             )
                                         }),
                                     )))
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                                 return;
                             }
 
@@ -820,12 +854,18 @@ impl crate::traits::Provider for AnthropicProvider {
                                 if let Some(call) = pending_tool_uses.remove(&index) {
                                     match call.finalize() {
                                         Ok(call) => {
-                                            let _ = tx
+                                            if tx
                                                 .send(Ok(StreamChunk::tool_calls(vec![call])))
-                                                .await;
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
                                         }
                                         Err(error) => {
-                                            let _ = tx.send(Err(error)).await;
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
                                             return;
                                         }
                                     }
@@ -846,9 +886,13 @@ impl crate::traits::Provider for AnthropicProvider {
                                                 {
                                                     replay_thinking.push_str(&thinking);
                                                 }
-                                                let _ = tx
+                                                if tx
                                                     .send(Ok(StreamChunk::reasoning(thinking)))
-                                                    .await;
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
                                             }
                                         }
                                         if let Some(signature) = delta.signature
@@ -869,16 +913,23 @@ impl crate::traits::Provider for AnthropicProvider {
                                         }
                                     } else if let Some(text) = delta.text {
                                         if !text.is_empty() {
-                                            let _ = tx.send(Ok(StreamChunk::delta(text))).await;
+                                            if tx.send(Ok(StreamChunk::delta(text))).await.is_err()
+                                            {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            let _ = tx
+                            if tx
                                 .send(Err(anyhow!("malformed Anthropic SSE frame: {e}")))
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                             return;
                         }
                     }
@@ -889,7 +940,9 @@ impl crate::traits::Provider for AnthropicProvider {
                 .finish()
                 .err()
                 .unwrap_or_else(|| anyhow!("Anthropic stream ended before message_stop"));
-            let _ = tx.send(Err(error)).await;
+            if tx.send(Err(error)).await.is_err() {
+                return;
+            }
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -910,7 +963,12 @@ impl crate::traits::Provider for AnthropicProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ModelsListResponse = response.json().await?;
+        let api_response: ModelsListResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
 
         Ok(api_response
             .data

@@ -640,10 +640,16 @@ impl GeminiProvider {
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read error body>".into());
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
         anyhow!("Gemini API error ({status}): {body}")
     }
 }
@@ -701,7 +707,12 @@ impl crate::traits::Provider for GeminiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ApiGenerateResponse = response.json().await?;
+        let api_response: ApiGenerateResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
         let usage = Self::extract_usage(&api_response);
 
         let text = Self::extract_text(&api_response).unwrap_or_default();
@@ -762,7 +773,11 @@ impl crate::traits::Provider for GeminiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
@@ -777,7 +792,9 @@ impl crate::traits::Provider for GeminiProvider {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow!(e))).await;
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -785,7 +802,9 @@ impl crate::traits::Provider for GeminiProvider {
                 let lines = match decoder.push(bytes.as_ref()) {
                     Ok(lines) => lines,
                     Err(error) => {
-                        let _ = tx.send(Err(error)).await;
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
                         return;
                     }
                 };
@@ -806,18 +825,32 @@ impl crate::traits::Provider for GeminiProvider {
                             }
                             if let Some(reasoning) = Self::extract_reasoning(&resp) {
                                 if !reasoning.is_empty() {
-                                    let _ = tx.send(Ok(StreamChunk::reasoning(reasoning))).await;
+                                    if tx
+                                        .send(Ok(StreamChunk::reasoning(reasoning)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                             if let Some(text) = Self::extract_text(&resp) {
                                 if !text.is_empty() {
-                                    let _ = tx.send(Ok(StreamChunk::delta(text))).await;
+                                    if tx.send(Ok(StreamChunk::delta(text))).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
                             let tool_calls = Self::extract_tool_calls(&resp);
                             if !tool_calls.is_empty() && tool_calls != last_tool_calls {
                                 last_tool_calls = tool_calls.clone();
-                                let _ = tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
+                                if tx
+                                    .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
                             if let Some(reason) = resp
                                 .candidates
@@ -825,9 +858,13 @@ impl crate::traits::Provider for GeminiProvider {
                                 .and_then(|candidate| candidate.finish_reason.as_deref())
                             {
                                 if let Some(state) = provider_replay_state.take() {
-                                    let _ = tx
+                                    if tx
                                         .send(Ok(StreamChunk::provider_replay_state(state)))
-                                        .await;
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                                 let mut termination =
                                     ProviderTermination::from_openai_reason(reason);
@@ -836,16 +873,24 @@ impl crate::traits::Provider for GeminiProvider {
                                 {
                                     termination = ProviderTermination::ToolCalls;
                                 }
-                                let _ = tx
+                                if tx
                                     .send(Ok(StreamChunk::final_chunk_with(termination)))
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                                 return;
                             }
                         }
                         Err(e) => {
-                            let _ = tx
+                            if tx
                                 .send(Err(anyhow!("malformed Gemini SSE frame: {e}")))
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                             return;
                         }
                     }
@@ -856,7 +901,9 @@ impl crate::traits::Provider for GeminiProvider {
                 .finish()
                 .err()
                 .unwrap_or_else(|| anyhow!("Gemini stream ended before finishReason"));
-            let _ = tx.send(Err(error)).await;
+            if tx.send(Err(error)).await.is_err() {
+                return;
+            }
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -873,7 +920,12 @@ impl crate::traits::Provider for GeminiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: GeminiModelsListResponse = response.json().await?;
+        let api_response: GeminiModelsListResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
 
         Ok(api_response
             .models

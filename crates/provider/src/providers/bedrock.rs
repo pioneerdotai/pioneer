@@ -772,10 +772,16 @@ impl BedrockProvider {
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read error body>".into());
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
         anyhow!("Bedrock API error ({status}): {body}")
     }
 }
@@ -901,7 +907,12 @@ impl crate::traits::Provider for BedrockProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: BedrockResponse = response.json().await?;
+        let api_response: BedrockResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
         let termination = api_response
             .stop_reason
             .as_deref()
@@ -1035,7 +1046,12 @@ impl crate::traits::Provider for BedrockProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: BedrockModelsResponse = response.json().await?;
+        let api_response: BedrockModelsResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
 
         Ok(api_response
             .model_summaries

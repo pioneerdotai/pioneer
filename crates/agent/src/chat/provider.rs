@@ -7,11 +7,24 @@ use pioneer_protocol::{
     ProviderTransportKind, TurnItem, TurnItemType,
 };
 use pioneer_provider::{
-    ChatRequest, Provider, ProviderFailureClassification, ProviderTermination,
-    ProviderTimeoutPolicy, ProviderToolCall, StreamChunk, TokenUsage,
+    ChatRequest, Provider, ProviderFailureClassification, ProviderResponseLimits,
+    ProviderResponseTooLarge, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
+    StreamChunk, TokenUsage,
 };
 use std::sync::Arc;
 use tokio::time::timeout;
+
+const HARD_MAX_PROVIDER_OUTPUT_TOKENS: u32 = 8_192;
+
+pub(super) fn bounded_provider_request(mut request: ChatRequest) -> ChatRequest {
+    request.max_tokens = Some(
+        request
+            .max_tokens
+            .unwrap_or(HARD_MAX_PROVIDER_OUTPUT_TOKENS)
+            .min(HARD_MAX_PROVIDER_OUTPUT_TOKENS),
+    );
+    request
+}
 
 #[derive(Clone, Copy)]
 struct FailureTarget<'a> {
@@ -50,6 +63,7 @@ pub(super) async fn request_agent_round(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
+    let request = bounded_provider_request(request);
     if provider.capabilities().streaming && !force_non_stream {
         let provider_name = provider.name().to_owned();
         let model_name = request.model.clone();
@@ -73,6 +87,7 @@ pub(super) async fn request_agent_round(
         let mut provider_replay_state = None;
         let mut termination = None;
         let mut seen_any_chunk = false;
+        let response_limits = ProviderResponseLimits::default();
 
         while let Some(chunk) = read_next_stream_chunk(
             &mut stream,
@@ -84,10 +99,31 @@ pub(super) async fn request_agent_round(
         )
         .await?
         {
+            if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
+                return Err(provider_response_limit_error(
+                    target,
+                    provider_name.as_str(),
+                    model_name.as_str(),
+                    ProviderTransportKind::Stream,
+                    error,
+                ));
+            }
             if chunk.is_final {
                 termination = chunk.termination;
                 break;
             }
+
+            validate_stream_append_limits(
+                &response_limits,
+                full_text.len(),
+                full_reasoning.len(),
+                chunk.delta.as_str(),
+                chunk.reasoning_delta.as_deref(),
+                target,
+                provider_name.as_str(),
+                model_name.as_str(),
+                ProviderTransportKind::Stream,
+            )?;
 
             if let Some(reasoning_delta) = chunk.reasoning_delta
                 && !reasoning_delta.is_empty()
@@ -129,6 +165,20 @@ pub(super) async fn request_agent_round(
             if chunk.provider_replay_state.is_some() {
                 provider_replay_state = chunk.provider_replay_state;
             }
+            if let Err(error) = response_limits.validate_accumulated(
+                full_text.as_str(),
+                full_reasoning.as_str(),
+                tool_calls.as_slice(),
+                provider_replay_state.as_ref(),
+            ) {
+                return Err(provider_response_limit_error(
+                    target,
+                    provider_name.as_str(),
+                    model_name.as_str(),
+                    ProviderTransportKind::Stream,
+                    error,
+                ));
+            }
         }
 
         let termination = require_round_termination(
@@ -162,6 +212,17 @@ pub(super) async fn request_agent_round(
             &error,
         )
     })?;
+
+    let response_limits = ProviderResponseLimits::default();
+    if let Err(error) = response_limits.validate_chat_response(&response) {
+        return Err(provider_response_limit_error(
+            FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+            provider.name(),
+            model_name.as_str(),
+            ProviderTransportKind::NonStream,
+            error,
+        ));
+    }
 
     let provider_token_count = total_token_usage(response.usage.as_ref());
     let reasoning = response.reasoning_content.unwrap_or_default();
@@ -215,6 +276,7 @@ pub(super) async fn stream_provider_response(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<String, ChatTurnError> {
+    let request = bounded_provider_request(request);
     let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
 
@@ -232,11 +294,12 @@ pub(super) async fn stream_provider_response(
     })?;
 
     let mut full_text = String::new();
-    let mut reasoning_parts = Vec::new();
+    let mut reasoning_parts = String::new();
     let mut message_started = false;
     let mut stream_tool_calls = Vec::new();
     let mut termination = None;
     let mut seen_any_chunk = false;
+    let response_limits = ProviderResponseLimits::default();
 
     while let Some(chunk) = read_next_stream_chunk(
         &mut stream,
@@ -248,6 +311,15 @@ pub(super) async fn stream_provider_response(
     )
     .await?
     {
+        if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
+            return Err(provider_response_limit_error(
+                response_stream_target(message_started, thinking_item_id, message_item_id),
+                provider_name.as_str(),
+                model_name.as_str(),
+                ProviderTransportKind::Stream,
+                error,
+            ));
+        }
         let StreamChunk {
             delta,
             reasoning_delta,
@@ -262,9 +334,22 @@ pub(super) async fn stream_provider_response(
             break;
         }
 
+        let target = response_stream_target(message_started, thinking_item_id, message_item_id);
+        validate_stream_append_limits(
+            &response_limits,
+            full_text.len(),
+            reasoning_parts.len(),
+            delta.as_str(),
+            reasoning_delta.as_deref(),
+            target,
+            provider_name.as_str(),
+            model_name.as_str(),
+            ProviderTransportKind::Stream,
+        )?;
+
         validate_provider_tool_calls(
             tool_calls.as_slice(),
-            response_stream_target(message_started, thinking_item_id, message_item_id),
+            target,
             provider_name.as_str(),
             model_name.as_str(),
             ProviderTransportKind::Stream,
@@ -276,7 +361,7 @@ pub(super) async fn stream_provider_response(
         if let Some(reasoning) = reasoning_delta
             && !reasoning.is_empty()
         {
-            reasoning_parts.push(reasoning.clone());
+            reasoning_parts.push_str(reasoning.as_str());
 
             super::emit_progress_event(
                 event_tx,
@@ -300,7 +385,7 @@ pub(super) async fn stream_provider_response(
         if !delta.is_empty() {
             if !message_started {
                 message_started = true;
-                let reasoning_text = reasoning_parts.join("");
+                let reasoning_text = reasoning_parts.clone();
 
                 super::emit_durable_event(
                     event_tx,
@@ -362,6 +447,21 @@ pub(super) async fn stream_provider_response(
             )
             .await?;
         }
+
+        if let Err(error) = response_limits.validate_accumulated(
+            full_text.as_str(),
+            reasoning_parts.as_str(),
+            stream_tool_calls.as_slice(),
+            None,
+        ) {
+            return Err(provider_response_limit_error(
+                response_stream_target(message_started, thinking_item_id, message_item_id),
+                provider_name.as_str(),
+                model_name.as_str(),
+                ProviderTransportKind::Stream,
+                error,
+            ));
+        }
     }
 
     require_round_termination(
@@ -417,7 +517,7 @@ pub(super) async fn stream_provider_response(
     }
 
     if !message_started {
-        let reasoning_text = reasoning_parts.join("");
+        let reasoning_text = reasoning_parts;
 
         super::emit_durable_event(
             event_tx,
@@ -496,6 +596,7 @@ pub(super) async fn non_stream_provider_response(
     message_item_id: &str,
     event_tx: &AgentEventHub,
 ) -> Result<String, ChatTurnError> {
+    let request = bounded_provider_request(request);
     let model_name = request.model.clone();
 
     let response = provider.chat(request).await.map_err(|error| {
@@ -509,6 +610,17 @@ pub(super) async fn non_stream_provider_response(
             &error,
         )
     })?;
+
+    let response_limits = ProviderResponseLimits::default();
+    if let Err(error) = response_limits.validate_chat_response(&response) {
+        return Err(provider_response_limit_error(
+            FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+            provider.name(),
+            model_name.as_str(),
+            ProviderTransportKind::NonStream,
+            error,
+        ));
+    }
 
     require_round_termination(
         Some(response.termination.clone()),
@@ -644,6 +756,24 @@ fn adapter_error_for_target(
     prefix: &str,
     error: &anyhow::Error,
 ) -> ChatTurnError {
+    let classification = if let Some(http_error) =
+        error.downcast_ref::<pioneer_provider::ProviderHttpErrorBodyTooLarge>()
+    {
+        let class = match http_error.status {
+            429 => ProviderFailureClass::RateLimit,
+            500..=599 => ProviderFailureClass::Provider5xx,
+            _ => ProviderFailureClass::ProviderRejected,
+        };
+        let mut classification = ProviderFailureClassification::new(class);
+        classification.http_status = Some(http_error.status);
+        Some(classification)
+    } else if error.downcast_ref::<ProviderResponseTooLarge>().is_some() {
+        Some(ProviderFailureClassification::new(
+            ProviderFailureClass::ProviderRejected,
+        ))
+    } else {
+        provider.classify_failure(error)
+    };
     provider_failure_error_with_classification(
         target.item_id,
         target.item_type,
@@ -652,8 +782,58 @@ fn adapter_error_for_target(
         transport,
         stage,
         format!("{prefix}: {error}"),
-        provider.classify_failure(error),
+        classification,
     )
+}
+
+fn provider_response_limit_error(
+    target: FailureTarget<'_>,
+    provider: &str,
+    model: &str,
+    transport: ProviderTransportKind,
+    error: ProviderResponseTooLarge,
+) -> ChatTurnError {
+    provider_failure_error_with_classification(
+        target.item_id,
+        target.item_type,
+        provider,
+        model,
+        transport,
+        ProviderFailureStage::Finalize,
+        error.to_string(),
+        Some(ProviderFailureClassification::new(
+            ProviderFailureClass::ProviderRejected,
+        )),
+    )
+}
+
+fn validate_stream_append_limits(
+    limits: &ProviderResponseLimits,
+    text_bytes: usize,
+    reasoning_bytes: usize,
+    text_delta: &str,
+    reasoning_delta: Option<&str>,
+    target: FailureTarget<'_>,
+    provider: &str,
+    model: &str,
+    transport: ProviderTransportKind,
+) -> Result<(), ChatTurnError> {
+    if let Err(error) =
+        limits.validate_text_bytes(text_bytes.saturating_add(text_delta.len()), "response_text")
+    {
+        return Err(provider_response_limit_error(
+            target, provider, model, transport, error,
+        ));
+    }
+    if let Some(reasoning_delta) = reasoning_delta
+        && let Err(error) =
+            limits.validate_reasoning_bytes(reasoning_bytes.saturating_add(reasoning_delta.len()))
+    {
+        return Err(provider_response_limit_error(
+            target, provider, model, transport, error,
+        ));
+    }
+    Ok(())
 }
 
 fn require_round_termination(
@@ -1183,6 +1363,41 @@ fn extract_retry_after_ms(message_lower: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_provider_request_never_allows_a_model_supplied_output_ceiling() {
+        let request = ChatRequest {
+            model: "model".to_owned(),
+            messages: Vec::new(),
+            temperature: None,
+            max_tokens: Some(u32::MAX),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        assert_eq!(
+            bounded_provider_request(request).max_tokens,
+            Some(HARD_MAX_PROVIDER_OUTPUT_TOKENS)
+        );
+
+        let request = ChatRequest {
+            model: "model".to_owned(),
+            messages: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        assert_eq!(
+            bounded_provider_request(request).max_tokens,
+            Some(HARD_MAX_PROVIDER_OUTPUT_TOKENS)
+        );
+    }
 
     #[test]
     fn openrouter_image_input_endpoint_error_is_recoverable_capability_rejection() {

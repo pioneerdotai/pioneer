@@ -1,11 +1,11 @@
 use crate::apply_patch::file_mutation::{
     AllowAllReadAccess, PaginatedReader, ReadError, ReadErrorCode, ReadRequest, SnapshotLimits,
-    TargetResolver,
 };
 use crate::context::{
     ExecCommandArgs, FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload,
 };
 use crate::error::ToolError;
+use crate::file_policy::FilePolicyCapability;
 use crate::registry::ToolHandler;
 use crate::{
     FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation,
@@ -19,7 +19,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::io::ErrorKind;
+use std::fs::File;
+use std::io::{self, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -121,7 +122,7 @@ impl ToolHandler for ReadFileHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-        _trace: crate::events::ToolEventTrace,
+        trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<ReadFileArgs>(invocation.payload)?;
         let resolved = resolve_authorized_tool_path(
@@ -131,27 +132,10 @@ impl ToolHandler for ReadFileHandler {
             args.path.as_str(),
         )?;
         let file_path = resolved.absolute.clone();
-        let reader_root = if file_path.starts_with(resolved.authorized_root.as_path())
-            && file_path != resolved.authorized_root
-        {
-            resolved.authorized_root.clone()
-        } else {
-            file_path
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or_else(|| ToolError::invalid_arguments("read_file path has no parent"))?
-        };
-        let name = file_path
-            .strip_prefix(reader_root.as_path())
-            .map_err(|_| ToolError::invalid_arguments("read_file path could not be resolved"))?
-            .to_string_lossy()
-            .into_owned();
-        if name.is_empty() {
-            return Err(ToolError::invalid_arguments(
-                "read_file path has no file name",
-            ));
-        }
-        let root = reader_root;
+        let capability = resolved.capability.clone();
+        let target = capability.canonical_target().cloned().ok_or_else(|| {
+            ToolError::Rejected("read_file capability has no target object".to_owned())
+        })?;
         let max_bytes = args
             .max_bytes
             .unwrap_or(DEFAULT_READ_MAX_BYTES)
@@ -169,9 +153,17 @@ impl ToolHandler for ReadFileHandler {
         let start_byte = args.start_byte;
         let cursor = args.cursor;
         let requested_path = file_path.clone();
+        let filesystem_permit = trace
+            // Snapshot validation may read the object before and after the
+            // selected page. Account for all three bounded passes.
+            .acquire_filesystem_io_budget("read_file", HARD_MAX_READ_FILE_BYTES.saturating_mul(3))
+            .await
+            .map_err(ToolError::Rejected)?;
         let page = tokio::task::spawn_blocking(move || {
-            let resolver =
-                TargetResolver::new(root).map_err(|_| ReadError::new(ReadErrorCode::PathDenied))?;
+            let _filesystem_permit = filesystem_permit;
+            let file = capability
+                .open_regular_file()
+                .map_err(|_| ReadError::new(ReadErrorCode::PathDenied))?;
             let reader = PaginatedReader::new(
                 SnapshotLimits {
                     max_file_bytes: HARD_MAX_READ_FILE_BYTES,
@@ -180,9 +172,9 @@ impl ToolHandler for ReadFileHandler {
                 AllowAllReadAccess,
             );
             reader
-                .read_path(
-                    &resolver,
-                    name.as_str(),
+                .read_target_with_file(
+                    &target,
+                    file,
                     ReadRequest {
                         start_line,
                         start_byte,
@@ -305,7 +297,7 @@ impl ToolHandler for ListDirHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-        _trace: crate::events::ToolEventTrace,
+        trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<ListDirArgs>(invocation.payload)?;
         let base = args.path.unwrap_or_else(|| ".".to_owned());
@@ -325,10 +317,22 @@ impl ToolHandler for ListDirHandler {
             .unwrap_or(DEFAULT_LIST_LIMIT)
             .clamp(1, HARD_MAX_LIST_LIMIT);
         let include_hidden = args.include_hidden.unwrap_or(false);
+        let filesystem_permit = trace
+            .acquire_filesystem_io_budget("list_dir", (limit as u64).saturating_mul(4 * 1024))
+            .await
+            .map_err(ToolError::Rejected)?;
 
         let scan_root = root.clone();
+        let capability = resolved.capability.clone();
         let (items, truncated) = tokio::task::spawn_blocking(move || {
-            list_directory_tree_secure(scan_root.as_path(), depth_limit, limit, include_hidden)
+            let _filesystem_permit = filesystem_permit;
+            list_directory_tree_secure_with_capability(
+                scan_root.as_path(),
+                &capability,
+                depth_limit,
+                limit,
+                include_hidden,
+            )
         })
         .await
         .map_err(|error| ToolError::internal(format!("directory listing task failed: {error}")))?
@@ -359,13 +363,31 @@ impl ToolHandler for ListDirHandler {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn list_directory_tree_secure(
     root: &Path,
     depth_limit: usize,
     limit: usize,
     include_hidden: bool,
 ) -> std::io::Result<(Vec<DirEntryView>, bool)> {
-    use crate::apply_patch::file_mutation::open_directory;
+    let root_descriptor = crate::apply_patch::file_mutation::open_directory(root)?;
+    list_directory_tree_secure_from_descriptor(
+        root,
+        root_descriptor,
+        depth_limit,
+        limit,
+        include_hidden,
+    )
+}
+
+#[cfg(unix)]
+fn list_directory_tree_secure_from_descriptor(
+    root: &Path,
+    root_descriptor: std::fs::File,
+    depth_limit: usize,
+    limit: usize,
+    include_hidden: bool,
+) -> std::io::Result<(Vec<DirEntryView>, bool)> {
     use std::ffi::{CStr, CString, OsString};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -420,14 +442,26 @@ fn list_directory_tree_secure(
             if name == b"." || name == b".." {
                 continue;
             }
+            // A directory is untrusted input. Once the bounded candidate
+            // window is full, one additional eligible entry is enough to
+            // prove that the result is incomplete; do not scan the rest of
+            // a high-cardinality directory merely to improve lexical order.
+            if names.len() >= candidate_limit {
+                *truncated = true;
+                break;
+            }
             if !include_hidden && name.first() == Some(&b'.') {
+                // Hidden entries still consume the bounded scan window.
+                // Otherwise a directory containing only hidden names can
+                // force an unbounded traversal.
+                if names.len().saturating_add(1) >= candidate_limit {
+                    *truncated = true;
+                    break;
+                }
+                names.insert(OsString::from_vec(name.to_vec()));
                 continue;
             }
             names.insert(OsString::from_vec(name.to_vec()));
-            if names.len() > candidate_limit {
-                names.pop_last();
-                *truncated = true;
-            }
         }
         Ok(names)
     }
@@ -481,7 +515,6 @@ fn list_directory_tree_secure(
         Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
     }
 
-    let root_descriptor = open_directory(root)?;
     let mut queue = VecDeque::from([PendingDirectory {
         descriptor: root_descriptor,
         display_path: root.to_path_buf(),
@@ -515,6 +548,9 @@ fn list_directory_tree_secure(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
+            if !include_hidden && name.as_bytes().first() == Some(&b'.') {
+                continue;
+            }
             let file_type = metadata.st_mode & libc::S_IFMT;
             let entry_path = directory.display_path.join(&name);
             let kind = if file_type == libc::S_IFLNK {
@@ -554,6 +590,33 @@ fn list_directory_tree_secure(
     Ok((items, truncated))
 }
 
+fn list_directory_tree_secure_with_capability(
+    root: &Path,
+    capability: &FilePolicyCapability,
+    depth_limit: usize,
+    limit: usize,
+    include_hidden: bool,
+) -> std::io::Result<(Vec<DirEntryView>, bool)> {
+    #[cfg(unix)]
+    {
+        return list_directory_tree_secure_from_descriptor(
+            root,
+            capability.open_directory()?,
+            depth_limit,
+            limit,
+            include_hidden,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        // The capability retains the checked directory object. On Windows
+        // that handle denies rename/delete sharing, so the verified pathname
+        // cannot be redirected while enumeration is in progress.
+        let _directory_guard = capability.open_directory()?;
+        list_directory_tree_secure(root, depth_limit, limit, include_hidden)
+    }
+}
+
 #[cfg(not(unix))]
 fn list_directory_tree_secure(
     root: &Path,
@@ -575,14 +638,11 @@ fn list_directory_tree_secure(
         for entry in std::fs::read_dir(directory.as_path())? {
             let entry = entry?;
             let name = entry.file_name();
-            if !include_hidden && name.to_string_lossy().starts_with('.') {
-                continue;
+            if paths.len() >= candidate_limit {
+                truncated = true;
+                break;
             }
             paths.insert(entry.path());
-            if paths.len() > candidate_limit {
-                paths.pop_last();
-                truncated = true;
-            }
         }
         for path in paths {
             if items.len() >= limit {
@@ -590,6 +650,13 @@ fn list_directory_tree_secure(
                 break;
             }
             let metadata = std::fs::symlink_metadata(path.as_path())?;
+            if !include_hidden
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            {
+                continue;
+            }
             let file_type = metadata.file_type();
             let kind = if file_type.is_symlink() {
                 "symlink"
@@ -621,7 +688,7 @@ impl ToolHandler for GrepHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-        _trace: crate::events::ToolEventTrace,
+        trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<GrepArgs>(invocation.payload)?;
         let base = args.path.as_deref().unwrap_or(".");
@@ -632,6 +699,38 @@ impl ToolHandler for GrepHandler {
             base,
         )?;
         let search_path = resolved.absolute;
+        #[cfg(unix)]
+        let (search_descriptor, command_search_path) = {
+            let target = resolved.capability.open_target().map_err(|error| {
+                ToolError::Rejected(format!(
+                    "grep_files could not retain the authorized search object: {error}"
+                ))
+            })?;
+            let target_is_directory = target
+                .metadata()
+                .map(|metadata| metadata.is_dir())
+                .map_err(|error| {
+                    ToolError::Rejected(format!(
+                        "grep_files could not inspect the authorized search object: {error}"
+                    ))
+                })?;
+            let (descriptor, path) = inherited_descriptor_path(target)?;
+            let command_path = if target_is_directory {
+                PathBuf::from(".")
+            } else {
+                path
+            };
+            (Some(descriptor), command_path)
+        };
+        #[cfg(not(unix))]
+        let (search_descriptor, command_search_path): (Option<File>, PathBuf) = (
+            Some(resolved.capability.open_target().map_err(|error| {
+                ToolError::Rejected(format!(
+                    "grep_files could not retain the authorized search object: {error}"
+                ))
+            })?),
+            search_path.clone(),
+        );
 
         let max_results = args
             .max_results
@@ -646,6 +745,17 @@ impl ToolHandler for GrepHandler {
             .timeout_ms
             .unwrap_or(DEFAULT_GREP_TIMEOUT_MS)
             .clamp(1, HARD_MAX_GREP_TIMEOUT_MS);
+        let _filesystem_permit = trace
+            // `rg` performs filesystem reads outside this process, so reserve
+            // the entire Turn I/O allowance up front. This makes the external
+            // scan a single bounded operation instead of pretending its small
+            // output size measures the bytes searched.
+            .acquire_filesystem_io_budget(
+                "grep_files",
+                crate::resource_budget::TURN_FILESYSTEM_MAX_BYTES,
+            )
+            .await
+            .map_err(ToolError::Rejected)?;
         let workspace_root = resolved.cwd;
         let is_broad_workspace_search = args.glob.is_none()
             && (args.path.is_none()
@@ -655,10 +765,11 @@ impl ToolHandler for GrepHandler {
                     == workspace_root);
         if is_broad_workspace_search {
             match count_rg_search_files(
-                search_path.as_path(),
+                command_search_path.as_path(),
                 invocation.workdir.as_path(),
                 invocation.execution_security_snapshot.as_ref(),
                 timeout_ms.min(3_000),
+                search_descriptor.as_ref(),
             )
             .await?
             {
@@ -698,10 +809,11 @@ impl ToolHandler for GrepHandler {
             args.glob.as_deref(),
             case_sensitive,
             max_results,
-            search_path.as_path(),
+            command_search_path.as_path(),
             invocation.workdir.as_path(),
             invocation.execution_security_snapshot.as_ref(),
             timeout_ms,
+            search_descriptor.as_ref(),
         )
         .await;
         let (output, backend_note, used_fallback) = match rg_search {
@@ -737,10 +849,11 @@ impl ToolHandler for GrepHandler {
                 let fallback = run_grep_fallback(
                     args.pattern.as_str(),
                     case_sensitive,
-                    search_path.as_path(),
+                    command_search_path.as_path(),
                     invocation.workdir.as_path(),
                     invocation.execution_security_snapshot.as_ref(),
                     timeout_ms,
+                    search_descriptor.as_ref(),
                 )
                 .await;
                 let output = match fallback {
@@ -904,6 +1017,7 @@ async fn run_rg_search(
     workdir: &Path,
     snapshot: Option<&TurnExecutionSecuritySnapshot>,
     timeout_ms: u64,
+    search_descriptor: Option<&File>,
 ) -> Result<Option<BoundedCommandOutput>, ToolError> {
     let mut command = Command::new("rg");
     command.arg("--line-number");
@@ -924,6 +1038,7 @@ async fn run_rg_search(
     command.arg(pattern);
     command.arg(command_path(workdir, search_path));
     let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
+    configure_descriptor_search(&mut command, search_path, search_descriptor);
 
     run_bounded_command(
         command,
@@ -942,6 +1057,7 @@ async fn run_grep_fallback(
     workdir: &Path,
     snapshot: Option<&TurnExecutionSecuritySnapshot>,
     timeout_ms: u64,
+    search_descriptor: Option<&File>,
 ) -> Result<BoundedCommandOutput, ToolError> {
     let mut command = Command::new("grep");
     // Lower-case `-r` deliberately does not follow descendant symlinks.  The
@@ -959,6 +1075,7 @@ async fn run_grep_fallback(
     command.arg(pattern);
     command.arg(command_path(workdir, search_path));
     let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
+    configure_descriptor_search(&mut command, search_path, search_descriptor);
 
     run_bounded_command(
         command,
@@ -976,6 +1093,7 @@ async fn count_rg_search_files(
     workdir: &Path,
     snapshot: Option<&TurnExecutionSecuritySnapshot>,
     timeout_ms: u64,
+    search_descriptor: Option<&File>,
 ) -> Result<Option<usize>, ToolError> {
     let mut command = Command::new("rg");
     command.arg("--files");
@@ -983,6 +1101,7 @@ async fn count_rg_search_files(
     command.arg("--");
     command.arg(command_path(workdir, search_path));
     let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
+    configure_descriptor_search(&mut command, search_path, search_descriptor);
 
     let Some(output) = run_bounded_command(
         command,
@@ -1275,6 +1394,73 @@ fn command_path(_workdir: &Path, path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[cfg(unix)]
+fn inherited_descriptor_path(file: File) -> Result<(File, PathBuf), ToolError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(ToolError::Rejected(format!(
+            "failed to duplicate authorized filesystem descriptor: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let flags = unsafe { libc::fcntl(duplicate, libc::F_GETFD) };
+    if flags < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(ToolError::Rejected(format!(
+            "failed to inspect authorized filesystem descriptor: {error}"
+        )));
+    }
+    if unsafe { libc::fcntl(duplicate, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } != 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(ToolError::Rejected(format!(
+            "failed to retain authorized filesystem descriptor for search: {error}"
+        )));
+    }
+    let path = PathBuf::from(format!("/dev/fd/{duplicate}"));
+    Ok((unsafe { File::from_raw_fd(duplicate) }, path))
+}
+
+#[cfg(unix)]
+fn configure_descriptor_search(
+    command: &mut Command,
+    search_path: &Path,
+    descriptor: Option<&File>,
+) {
+    use std::os::fd::AsRawFd;
+
+    if search_path != Path::new(".") {
+        return;
+    }
+    let Some(descriptor) = descriptor else {
+        return;
+    };
+    let fd = descriptor.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(fd) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_descriptor_search(
+    _command: &mut Command,
+    _search_path: &Path,
+    _descriptor: Option<&File>,
+) {
+}
+
 fn display_workspace_path(_workdir: &Path, path: &Path) -> String {
     display_absolute_path(path)
 }
@@ -1316,6 +1502,7 @@ struct ResolvedToolPath {
     absolute: PathBuf,
     cwd: PathBuf,
     authorized_root: PathBuf,
+    capability: FilePolicyCapability,
 }
 
 fn resolve_authorized_tool_path(
@@ -1329,10 +1516,18 @@ fn resolve_authorized_tool_path(
             .canonicalize()
             .unwrap_or_else(|_| fallback_workdir.to_path_buf());
         let absolute = resolve_path_within_workdir(cwd.as_path(), requested_path)?;
+        let capability = FilePolicyCapability::capture_unchecked(operation, absolute.as_path())
+            .map_err(|reason| {
+                ToolError::Rejected(format!(
+                    "filesystem capability could not be captured for `{}`: {reason:?}",
+                    absolute.display()
+                ))
+            })?;
         return Ok(ResolvedToolPath {
             absolute,
             cwd: cwd.clone(),
             authorized_root: cwd,
+            capability,
         });
     };
 
@@ -1356,6 +1551,7 @@ fn resolve_authorized_tool_path(
                 absolute: grant.resolved_path,
                 cwd,
                 authorized_root,
+                capability: grant.capability,
             })
         }
         FilePolicyDecision::Denied(deny) => {
@@ -1773,6 +1969,25 @@ mod tests {
             !entries
                 .iter()
                 .any(|entry| entry.path.ends_with("/escape/secret.txt"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_stops_after_bounded_candidate_window() {
+        let root = tempfile::tempdir().expect("listing root");
+        for index in 0..1_000 {
+            std::fs::write(root.path().join(format!("entry-{index:04}.txt")), b"x")
+                .expect("high-cardinality entry");
+        }
+
+        let (entries, truncated) =
+            list_directory_tree_secure(root.path(), HARD_MAX_LIST_DEPTH, 2, true)
+                .expect("bounded listing");
+        assert_eq!(entries.len(), 2);
+        assert!(
+            truncated,
+            "the candidate window must report omitted entries"
         );
     }
 

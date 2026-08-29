@@ -35,11 +35,14 @@ pub use read::{
     AllowAllReadAccess, PaginatedReader, ReadAccess, ReadCursor, ReadError, ReadErrorCode,
     ReadPage, ReadRequest,
 };
-pub(crate) use secure_fs::{StagedFile, ensure_parent_directories};
+pub(crate) use secure_fs::StagedFile;
+#[cfg(feature = "computer-use")]
+pub(crate) use secure_fs::ensure_parent_directories;
 pub use snapshot::{
     SnapshotEncoding, SnapshotError, SnapshotErrorCode, SnapshotLimits, SnapshotLineEnding,
     SnapshotLineEndings, SnapshotStorage, TextSnapshot, open_directory, open_regular_file,
 };
+pub(crate) use snapshot::{open_directory_at, open_regular_file_at};
 pub use target::{
     CanonicalTarget, TargetExpectation, TargetKind, TargetManifest, TargetMetadataFingerprint,
     TargetResolutionError, TargetResolutionErrorCode, TargetResolver, TargetRole,
