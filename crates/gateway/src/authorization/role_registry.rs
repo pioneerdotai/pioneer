@@ -6,7 +6,7 @@ use pioneer_protocol::{
 };
 use sha2::{Digest, Sha256};
 
-use pioneer_cli_agent_runtime::NativeEventBudget;
+use pioneer_cli_agent_runtime::{NativeEventBudget, codex::CODEX_MAX_RECOVERY_FRAME_BYTES};
 use pioneer_crud::{ExecutionAdmissionQuotaPolicy, ExecutionQuotaCeilings};
 
 use crate::human_interaction::HumanInteractionBudget;
@@ -404,7 +404,10 @@ const DEFAULT_MCP_INVOCATION_RESOURCES: McpInvocationResourceLimits = McpInvocat
 const DEFAULT_NATIVE_EVENT_RESOURCES: NativeEventBudget = NativeEventBudget {
     profile_version: 2,
     max_frame_bytes: 1024 * 1024,
-    max_recovery_frame_bytes: 64 * 1024 * 1024,
+    // This is the authorization ceiling. Each provider adapter intersects it
+    // with its own transport ceiling; Claude remains at the provider-neutral
+    // 64 MiB default while Codex may use the larger disk-only recovery path.
+    max_recovery_frame_bytes: CODEX_MAX_RECOVERY_FRAME_BYTES,
 };
 
 #[cfg(test)]

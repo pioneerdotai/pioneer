@@ -3534,7 +3534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_thread_resume_preserves_spooled_history() {
+    async fn codex_thread_resume_does_not_materialize_spooled_history() {
         let mut fake = FakeCodexIsolationServer::new();
         let client = fake.client.clone();
         let resume = tokio::spawn(async move {
@@ -3576,13 +3576,11 @@ mod tests {
         let opened = resume
             .await
             .expect("resume task should join")
-            .expect("spooled history should be preserved");
+            .expect("spooled thread metadata should be recovered");
         assert_eq!(opened.native_thread_id, "native-thread");
         assert_eq!(opened.cwd.as_deref(), Some("/persisted-cwd"));
-        assert_eq!(
-            opened.raw["thread"]["turns"][0],
-            json!("x".repeat(1024 * 1024 + 256))
-        );
+        assert!(opened.raw["thread"].get("turns").is_none());
+        assert_eq!(opened.raw["_pioneerStreamedThreadOpen"], json!(true));
     }
 
     #[tokio::test]

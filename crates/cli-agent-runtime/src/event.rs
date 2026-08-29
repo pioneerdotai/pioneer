@@ -1484,6 +1484,24 @@ fn changed_files_from_value(value: &JsonValue) -> Vec<String> {
     if !changed_files.is_empty() {
         return changed_files;
     }
+    if let Some(changes) = value.get("changes") {
+        let mut changed_files = match changes {
+            JsonValue::Array(changes) => changes
+                .iter()
+                .filter_map(|change| string_path(change, &["path"]))
+                .collect::<Vec<_>>(),
+            // Older rollout projections represented file changes as a map
+            // keyed by path. Accept that shape without retaining any diff or
+            // file content stored in the values.
+            JsonValue::Object(changes) => changes.keys().cloned().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        changed_files.sort();
+        changed_files.dedup();
+        if !changed_files.is_empty() {
+            return changed_files;
+        }
+    }
     string_path(value, &["path"]).into_iter().collect()
 }
 

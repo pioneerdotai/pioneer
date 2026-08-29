@@ -41,6 +41,6 @@ mod tests {
 }
 mod native_event;
 pub use native_event::{
-    BoundedNativeEventCodec, NativeEventBudget, NativeIngressError, NativeIngressErrorKind,
-    SpooledNativeFrame,
+    BoundedNativeEventCodec, DEFAULT_MAX_RECOVERY_FRAME_BYTES, NativeEventBudget,
+    NativeIngressError, NativeIngressErrorKind, SpooledNativeFrame,
 };

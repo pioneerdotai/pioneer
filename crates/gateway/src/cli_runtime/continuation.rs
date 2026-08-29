@@ -78,7 +78,7 @@ impl CliSessionLaunchSpec {
             options,
             mcp,
             continuation: CliProviderContinuation::CodexRpcThread { native_thread_id },
-            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
+            native_event_budget: pioneer_cli_agent_runtime::codex::codex_native_event_budget(),
         }
     }
 
@@ -125,7 +125,17 @@ impl CliSessionLaunchSpec {
         mut self,
         budget: pioneer_cli_agent_runtime::NativeEventBudget,
     ) -> Self {
-        self.native_event_budget = budget;
+        // The role budget is an upper authorization ceiling, not a reason to
+        // make every provider accept the broadest transport allowance. The
+        // constructor installed the provider-specific ceiling, so intersect
+        // the two and fail closed on an impossible profile mismatch.
+        self.native_event_budget = self.native_event_budget.intersect(budget).unwrap_or(
+            pioneer_cli_agent_runtime::NativeEventBudget {
+                profile_version: self.native_event_budget.profile_version,
+                max_frame_bytes: 1,
+                max_recovery_frame_bytes: 1,
+            },
+        );
         self
     }
 }
@@ -231,6 +241,47 @@ mod tests {
                     ..pioneer_cli_agent_runtime::NativeEventBudget::default()
                 });
         assert!(requires_restart(&first, &narrowed));
+    }
+
+    #[test]
+    fn authorized_native_event_budget_is_clamped_per_provider() {
+        let authorized = pioneer_cli_agent_runtime::NativeEventBudget {
+            max_recovery_frame_bytes:
+                pioneer_cli_agent_runtime::codex::CODEX_MAX_RECOVERY_FRAME_BYTES,
+            ..pioneer_cli_agent_runtime::NativeEventBudget::default()
+        };
+        let codex =
+            CliSessionLaunchSpec::unmanaged_codex(CLIAgentRuntimeSessionStartOptions::default())
+                .with_native_event_budget(authorized);
+        assert_eq!(
+            codex.native_event_budget.max_recovery_frame_bytes,
+            pioneer_cli_agent_runtime::codex::CODEX_MAX_RECOVERY_FRAME_BYTES,
+        );
+
+        let claude = CliSessionLaunchSpec::claude_new(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Disabled,
+            Uuid::new_v4(),
+        )
+        .with_native_event_budget(authorized);
+        assert_eq!(
+            claude.native_event_budget.max_recovery_frame_bytes,
+            pioneer_cli_agent_runtime::DEFAULT_MAX_RECOVERY_FRAME_BYTES,
+        );
+    }
+
+    #[test]
+    fn incompatible_native_event_budget_profile_fails_closed() {
+        let launch =
+            CliSessionLaunchSpec::unmanaged_codex(CLIAgentRuntimeSessionStartOptions::default())
+                .with_native_event_budget(pioneer_cli_agent_runtime::NativeEventBudget {
+                    profile_version: u32::MAX,
+                    max_frame_bytes: 1024 * 1024,
+                    max_recovery_frame_bytes:
+                        pioneer_cli_agent_runtime::codex::CODEX_MAX_RECOVERY_FRAME_BYTES,
+                });
+        assert_eq!(launch.native_event_budget.max_frame_bytes, 1);
+        assert_eq!(launch.native_event_budget.max_recovery_frame_bytes, 1);
     }
 
     #[test]
