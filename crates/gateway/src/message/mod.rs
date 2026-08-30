@@ -35,6 +35,7 @@ mod tasks;
 #[cfg(test)]
 mod tests;
 mod thread_agents_doc_handlers;
+mod thread_file_handlers;
 mod thread_handlers;
 mod timeline_cursor;
 mod timeline_handlers;

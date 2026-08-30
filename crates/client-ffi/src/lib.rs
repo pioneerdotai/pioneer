@@ -18,6 +18,7 @@ mod presentation;
 pub mod schema;
 mod skills;
 mod telemetry;
+mod thread_files;
 mod threads;
 mod timeline;
 mod workspaces;
@@ -177,6 +178,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use thread_files::{ClientThreadFileViewOpenRequest, ClientThreadFileViewOpenResult};
 use threads::{
     ClientThreadTreeLevel, ClientThreadTreeQueryData, ThreadTreeLevelRequest,
     ThreadTreeRefreshRequest, client_thread_tree_level, refresh_thread_tree,
@@ -1307,6 +1309,21 @@ impl ClientFfiRuntime {
                 )
             })?;
         artifacts::open_artifact_view(&self.client_runtime.ws_command_sender(), request)
+    }
+
+    fn thread_file_view_open(
+        &self,
+        input_json: &str,
+    ) -> Result<ClientThreadFileViewOpenResult, ClientFfiError> {
+        self.require_initialized_and_connected()?;
+        let request =
+            serde_json::from_str::<ClientThreadFileViewOpenRequest>(input_json).map_err(|_| {
+                ClientFfiError::new(
+                    "invalid workspace file view request",
+                    thread_files::INVALID_THREAD_FILE_ACTION_CODE,
+                )
+            })?;
+        thread_files::open_thread_file_view(&self.client_runtime.ws_command_sender(), request)
     }
 
     fn artifact_download(
@@ -2999,6 +3016,10 @@ ffi_client_json_typed_method!(
     gateway_settings_update
 );
 ffi_client_json_typed_method!(pioneer_client_ffi_artifact_view_open, artifact_view_open);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_thread_file_view_open,
+    thread_file_view_open
+);
 ffi_client_json_typed_method!(pioneer_client_ffi_artifact_download, artifact_download);
 ffi_client_json_typed_method!(
     pioneer_client_ffi_artifact_download_progress,

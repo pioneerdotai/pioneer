@@ -28,11 +28,11 @@ use pioneer_protocol::{
     TaskTreeParams as TaskTreeTaskParams, TaskUserNotificationAcknowledgeParams,
     TaskUserNotificationListParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocGetParams, ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocSaveParams,
-    ThreadFilePatchHistoryPageParams, ThreadPatchStepsPageParams, ThreadReadParams,
-    ThreadTimelinePageParams, TurnCancelParams, TurnMessageDeleteParams, TurnMessageEditParams,
-    TurnMessageRevisionsPageParams, TurnPatchDiffGetParams, TurnPatchRecordGetParams,
-    TurnPatchStepsPageParams, TurnPermissionRequestRespondParams, TurnResumeParams,
-    TurnWorkItemsGetParams, TurnWorkPageParams, VoiceSessionCancelParams,
+    ThreadFilePatchHistoryPageParams, ThreadFileViewGrantCreateParams, ThreadPatchStepsPageParams,
+    ThreadReadParams, ThreadTimelinePageParams, TurnCancelParams, TurnMessageDeleteParams,
+    TurnMessageEditParams, TurnMessageRevisionsPageParams, TurnPatchDiffGetParams,
+    TurnPatchRecordGetParams, TurnPatchStepsPageParams, TurnPermissionRequestRespondParams,
+    TurnResumeParams, TurnWorkItemsGetParams, TurnWorkPageParams, VoiceSessionCancelParams,
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
     WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
 };
@@ -1770,6 +1770,7 @@ impl MessageProcessor {
                         | methods::THREAD_TIMELINE_PAGE
                         | methods::THREAD_PATCH_STEPS_PAGE
                         | methods::THREAD_FILE_PATCH_HISTORY_PAGE
+                        | methods::THREAD_FILE_VIEW_GRANT_CREATE
                         | methods::THREAD_READ
                         | methods::THREAD_UNSUBSCRIBE
                         | methods::TURN_START
@@ -4749,6 +4750,38 @@ impl MessageProcessor {
                                     format!(
                                         "invalid params for `{}`: {error}",
                                         methods::THREAD_FILE_PATCH_HISTORY_PAGE
+                                    ),
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                methods::THREAD_FILE_VIEW_GRANT_CREATE => {
+                    let params_value = request.params.unwrap_or_else(empty_object_value);
+                    match serde_json::from_value::<ThreadFileViewGrantCreateParams>(params_value) {
+                        Ok(params) => {
+                            let proof = admission
+                                .thread()
+                                .expect("central admission supplies thread proof");
+                            debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
+                            self.thread_file_view_grant_create(
+                                &context,
+                                proof,
+                                request.id,
+                                params,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            self.send_error(
+                                connection_id,
+                                JsonRpcErrorResponse::new(
+                                    Some(request.id),
+                                    INVALID_PARAMS_CODE,
+                                    format!(
+                                        "invalid params for `{}`: {error}",
+                                        methods::THREAD_FILE_VIEW_GRANT_CREATE
                                     ),
                                 ),
                             )

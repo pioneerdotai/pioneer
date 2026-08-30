@@ -398,6 +398,13 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     ),
     method_entry(THREAD_GET, ThreadRead, Thread, NotFound, Read),
     method_entry(THREAD_TIMELINE_PAGE, ThreadRead, Thread, NotFound, Read),
+    method_entry(
+        THREAD_FILE_VIEW_GRANT_CREATE,
+        ThreadRead,
+        Thread,
+        NotFound,
+        Read,
+    ),
     method_entry(THREAD_PATCH_STEPS_PAGE, ThreadRead, Thread, NotFound, Read),
     method_entry(
         THREAD_FILE_PATCH_HISTORY_PAGE,

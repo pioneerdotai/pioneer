@@ -36,6 +36,7 @@ mod task_actor;
 mod thread;
 mod thread_agents_doc;
 mod thread_episodic;
+mod thread_file;
 mod timeline;
 mod turn;
 mod turn_permissions;
@@ -414,6 +415,9 @@ pub use thread_episodic::{
     ThreadEpisodicSearchMode, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceContext,
     ThreadEpisodicSourceProvenance, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
     ThreadEpisodicVisibility, ThreadEpisodicWorkspaceId,
+};
+pub use thread_file::{
+    THREAD_FILE_VIEW_MAX_BYTES, ThreadFileViewGrantCreateParams, ThreadFileViewGrantCreateResponse,
 };
 pub use timeline::{
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,

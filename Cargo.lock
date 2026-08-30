@@ -8834,6 +8834,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "transcribe-rs",
+ "url",
  "uuid",
  "zeroize",
 ]

@@ -57,7 +57,8 @@ use pioneer_protocol::{
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
     ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocResolveForThreadResponse,
     ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFilePatchHistoryPageParams,
-    ThreadFilePatchHistoryPageResponse, ThreadFolderCreateParams, ThreadFolderCreateResponse,
+    ThreadFilePatchHistoryPageResponse, ThreadFileViewGrantCreateParams,
+    ThreadFileViewGrantCreateResponse, ThreadFolderCreateParams, ThreadFolderCreateResponse,
     ThreadFolderDeleteParams, ThreadFolderDeleteResponse, ThreadFolderMoveParams,
     ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse, ThreadMoveParams,
     ThreadMoveResponse, ThreadParticipantMutationParams, ThreadParticipantsListParams,
@@ -2704,6 +2705,38 @@ where
     send_json_rpc_request_typed(
         transport,
         methods::ARTIFACT_VIEW_GRANT_CREATE,
+        &params,
+        RPC_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn thread_file_view_grant_create<TTransport>(
+    transport: &TTransport,
+    params: ThreadFileViewGrantCreateParams,
+) -> Result<ThreadFileViewGrantCreateResponse>
+where
+    TTransport: JsonRpcRequestTransport + ?Sized,
+{
+    for (value, field) in [
+        (params.thread_id.as_str(), "thread_id"),
+        (params.turn_id.as_str(), "turn_id"),
+        (params.item_id.as_str(), "item_id"),
+        (params.href.as_str(), "href"),
+    ] {
+        require_non_empty_field(value, field, methods::THREAD_FILE_VIEW_GRANT_CREATE)?;
+    }
+    require_condition(
+        params.thread_id.len() <= 128
+            && params.turn_id.len() <= 128
+            && params.item_id.len() <= 128
+            && params.href.len() <= 4096
+            && params.href.trim() == params.href
+            && !params.href.chars().any(char::is_control),
+        "thread file view fields exceed their allowed bounds",
+    )?;
+    send_json_rpc_request_typed(
+        transport,
+        methods::THREAD_FILE_VIEW_GRANT_CREATE,
         &params,
         RPC_REQUEST_TIMEOUT,
     )

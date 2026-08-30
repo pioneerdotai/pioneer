@@ -31,6 +31,14 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::artifacts::ClientArtifactViewOpenResult
         ),
         schema_doc!(
+            "client_thread_file_view_open_request.json",
+            crate::thread_files::ClientThreadFileViewOpenRequest
+        ),
+        schema_doc!(
+            "client_thread_file_view_open_result.json",
+            crate::thread_files::ClientThreadFileViewOpenResult
+        ),
+        schema_doc!(
             "client_artifact_download_request.json",
             crate::artifacts::ClientArtifactDownloadRequest
         ),

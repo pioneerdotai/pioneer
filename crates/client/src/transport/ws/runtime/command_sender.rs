@@ -830,6 +830,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::artifact_view_grant_create(self, params)
     }
 
+    pub fn thread_file_view_grant_create(
+        &self,
+        params: ThreadFileViewGrantCreateParams,
+    ) -> Result<ThreadFileViewGrantCreateResponse> {
+        client_ws_commands::thread_file_view_grant_create(self, params)
+    }
+
     pub fn artifact_delete(&self, params: ArtifactDeleteParams) -> Result<ArtifactDeleteResponse> {
         client_ws_commands::artifact_delete(self, params)
     }

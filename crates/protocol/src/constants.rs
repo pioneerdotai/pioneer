@@ -49,6 +49,7 @@ pub mod methods {
     pub const THREAD_TIMELINE_PAGE: &str = "thread/timeline/page";
     pub const THREAD_PATCH_STEPS_PAGE: &str = "thread/patch_steps/page";
     pub const THREAD_FILE_PATCH_HISTORY_PAGE: &str = "thread/file_patch_history/page";
+    pub const THREAD_FILE_VIEW_GRANT_CREATE: &str = "thread/file/view_grant/create";
     pub const THREAD_READ: &str = "thread/read";
     pub const THREAD_UNSUBSCRIBE: &str = "thread/unsubscribe";
     pub const TURN_START: &str = "turn/start";

@@ -6,7 +6,9 @@ use pioneer_protocol::{
 
 use super::super::*;
 use crate::authorization::{AuthorizationExternalError, AuthorizedArtifact};
-use crate::view_grants::{ViewGrantDisposition, ViewGrantError, ViewGrantScope};
+use crate::view_grants::{
+    ArtifactViewGrantScope, ViewGrantDisposition, ViewGrantError, ViewGrantScope, ViewGrantSubject,
+};
 
 const MAX_VIEW_GRANT_SCOPE_ID_BYTES: usize = 128;
 
@@ -123,15 +125,17 @@ impl MessageProcessor {
             gateway_id: request_context.principal().gateway_id.clone(),
             principal_id: request_context.principal().principal_id.clone(),
             auth_session_id: request_context.principal().session_id.clone(),
-            workspace_id: workspace_id.to_owned(),
-            artifact_id: artifact_id.to_owned(),
-            version_id: version_id.to_owned(),
-            artifact_sha256,
-            projection_kind: params.projection_kind,
             disposition: match params.disposition {
                 ArtifactViewGrantDisposition::Inline => ViewGrantDisposition::Inline,
                 ArtifactViewGrantDisposition::Attachment => ViewGrantDisposition::Attachment,
             },
+            subject: ViewGrantSubject::Artifact(ArtifactViewGrantScope {
+                workspace_id: workspace_id.to_owned(),
+                artifact_id: artifact_id.to_owned(),
+                version_id: version_id.to_owned(),
+                artifact_sha256,
+                projection_kind: params.projection_kind,
+            }),
         });
         let issued = match issued {
             Ok(issued) => issued,

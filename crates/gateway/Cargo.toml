@@ -55,6 +55,7 @@ markdown.workspace = true
 chrono.workspace = true
 schemars.workspace = true
 mime_guess.workspace = true
+url.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 tiktoken-rs.workspace = true
 flate2.workspace = true

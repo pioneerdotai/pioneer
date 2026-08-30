@@ -36,6 +36,7 @@ use crate::artifact::{
     ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse, ArtifactViewGrantDisposition,
     ThreadArtifactsChangedNotification,
 };
+use crate::thread_file::{ThreadFileViewGrantCreateParams, ThreadFileViewGrantCreateResponse};
 
 use crate::{
     AccessChangeKind, AccessChangedNotification, AdministrativeActorRef, AgentActionId,
@@ -673,6 +674,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("artifact_list_response.json", ArtifactListResponse),
         schema_doc!("artifact_get_params.json", ArtifactGetParams),
         schema_doc!("artifact_get_response.json", ArtifactGetResponse),
+        schema_doc!(
+            "thread_file_view_grant_create_params.json",
+            ThreadFileViewGrantCreateParams
+        ),
+        schema_doc!(
+            "thread_file_view_grant_create_response.json",
+            ThreadFileViewGrantCreateResponse
+        ),
         schema_doc!(
             "artifact_view_grant_disposition.json",
             ArtifactViewGrantDisposition

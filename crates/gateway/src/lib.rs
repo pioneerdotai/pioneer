@@ -55,6 +55,7 @@ mod thread;
 mod thread_episodic;
 mod thread_episodic_embedding;
 mod thread_episodic_hooks;
+mod thread_file_delivery;
 mod tokenizer;
 mod transport;
 mod turn_mcp;
