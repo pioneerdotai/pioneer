@@ -6,7 +6,8 @@ use crate::apply_patch::history::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::patch_history as crud;
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::TransactionTrait;
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::Digest;
 use std::collections::HashMap;
@@ -82,7 +83,7 @@ pub enum BeginNextOutcome {
 /// filesystem executor and is safe to replay or terminalize as a gap.
 #[derive(Clone)]
 pub struct SqliteCommitIntentStore {
-    db: DatabaseConnection,
+    db: SqliteDatabase,
 }
 
 #[derive(Clone, Debug)]
@@ -99,8 +100,8 @@ struct PendingKey {
 }
 
 impl SqliteCommitIntentStore {
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+        Self { db: db.into() }
     }
 
     /// Allocate the ordinal and persist the exact under-lock intent.  Unlike

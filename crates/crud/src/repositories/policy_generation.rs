@@ -3,11 +3,11 @@ use pioneer_protocol::{
     AuthorizationChangeKind, AuthorizationChangeScope, AuthorizationProjectionChangedNotification,
     PolicyGeneration,
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, DbBackend, Statement, TransactionTrait};
 
 const STATE_ROW: &str = "SELECT generation, code_policy_fingerprint FROM authorization_policy_state WHERE singleton_id = 1";
 
-pub async fn current_policy_generation(db: &DatabaseConnection) -> Result<PolicyGeneration> {
+pub async fn current_policy_generation<C: ConnectionTrait>(db: &C) -> Result<PolicyGeneration> {
     current_policy_generation_on(db).await
 }
 
@@ -23,10 +23,13 @@ pub async fn current_policy_generation_on<C: ConnectionTrait>(db: &C) -> Result<
     generation_from_i64(row.try_get("", "generation")?)
 }
 
-pub async fn ensure_code_policy_generation(
-    db: &DatabaseConnection,
+pub async fn ensure_code_policy_generation<D>(
+    db: &D,
     fingerprint: &str,
-) -> Result<AuthorizationProjectionChangedNotification> {
+) -> Result<AuthorizationProjectionChangedNotification>
+where
+    D: TransactionTrait<Transaction = DatabaseTransaction>,
+{
     if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("authorization policy fingerprint must be a SHA-256 hex digest");
     }
@@ -69,11 +72,14 @@ pub async fn ensure_code_policy_generation(
     Ok(notification)
 }
 
-pub async fn append_authorization_change(
-    db: &DatabaseConnection,
+pub async fn append_authorization_change<D>(
+    db: &D,
     change: AuthorizationChangeKind,
     affected: AuthorizationChangeScope,
-) -> Result<AuthorizationProjectionChangedNotification> {
+) -> Result<AuthorizationProjectionChangedNotification>
+where
+    D: TransactionTrait<Transaction = DatabaseTransaction>,
+{
     let transaction = db
         .begin()
         .await
@@ -106,8 +112,8 @@ pub async fn append_authorization_change(
 
 /// Reads the durable, ordered change feed for missed-event reconciliation.
 /// The feed carries only typed, payload-safe invalidation scopes.
-pub async fn list_authorization_changes_after(
-    db: &DatabaseConnection,
+pub async fn list_authorization_changes_after<C: ConnectionTrait>(
+    db: &C,
     after: Option<PolicyGeneration>,
     limit: usize,
 ) -> Result<Vec<AuthorizationProjectionChangedNotification>> {

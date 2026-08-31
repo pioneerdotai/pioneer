@@ -7,19 +7,20 @@ use pioneer_crud::{
     TurnDiffStateRow, TurnDiffStateWrite, find_turn_diff_state, list_turn_diff_states_for_threads,
     upsert_turn_diff_state,
 };
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::TransactionTrait;
 
 const MAX_PROJECTION_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROJECTION_ID_BYTES: usize = 4096;
 
 #[derive(Clone)]
 pub struct SqliteTurnDiffStore {
-    db: DatabaseConnection,
+    db: SqliteDatabase,
 }
 
 impl SqliteTurnDiffStore {
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+        Self { db: db.into() }
     }
 
     pub async fn upsert(&self, state: &TurnDiffState) -> Result<bool> {

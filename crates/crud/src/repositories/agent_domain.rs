@@ -24,12 +24,14 @@ use pioneer_protocol::{
     AgentWorkNodeProjection, AgentWorkNodeState, PersistedActorRef, SafeRouteProvenance,
     TaskActorContract, TaskOccurrenceContract, TaskOccurrenceStatus, Thread,
 };
+#[cfg(test)]
+use sea_orm::DatabaseConnection;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{OnConflict, Query};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, ExprTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, Statement, TransactionTrait, TryGetable,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    ExprTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait, TryGetable,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -4462,11 +4464,14 @@ pub async fn commit_native_agent_config_mutation(
 /// window and only for a terminal, complete action tuple. Immutable action,
 /// receipt and outbox ownership facts remain queryable; exact payload hashes
 /// still fence a late direct replay without retaining provider-sized blobs.
-pub async fn compact_terminal_agent_action_ledger(
-    db: &DatabaseConnection,
+pub async fn compact_terminal_agent_action_ledger<C>(
+    db: &C,
     now: DateTimeWithTimeZone,
     limit: u64,
-) -> Result<AgentActionLedgerCompactionSummary> {
+) -> Result<AgentActionLedgerCompactionSummary>
+where
+    C: ConnectionTrait + TransactionTrait<Transaction = DatabaseTransaction>,
+{
     if limit == 0 {
         return Ok(AgentActionLedgerCompactionSummary::default());
     }

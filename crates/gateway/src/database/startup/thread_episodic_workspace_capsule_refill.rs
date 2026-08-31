@@ -33,6 +33,7 @@ use pioneer_memory::{
 };
 use pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus;
 use pioneer_provider::ProviderRegistry;
+use sea_orm::ConnectionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -1997,8 +1998,8 @@ async fn delete_capsule_file(storage_uri: &str) -> Result<CapsuleFileDeleteOutco
     }
 }
 
-async fn mark_refill_preparing(
-    db: &sea_orm::DatabaseConnection,
+async fn mark_refill_preparing<C: ConnectionTrait>(
+    db: &C,
     workspace_id: &str,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
 ) -> Result<()> {
@@ -2013,8 +2014,8 @@ async fn mark_refill_preparing(
     .await
 }
 
-async fn mark_refill_backfilling(
-    db: &sea_orm::DatabaseConnection,
+async fn mark_refill_backfilling<C: ConnectionTrait>(
+    db: &C,
     workspace_id: &str,
     summary: &ThreadEpisodicWorkspaceCapsuleRefillSummary,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
@@ -2030,8 +2031,8 @@ async fn mark_refill_backfilling(
     .await
 }
 
-async fn mark_refill_preparation_failed(
-    db: &sea_orm::DatabaseConnection,
+async fn mark_refill_preparation_failed<C: ConnectionTrait>(
+    db: &C,
     workspace_id: &str,
     error: &anyhow::Error,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
@@ -2047,8 +2048,8 @@ async fn mark_refill_preparation_failed(
     .await
 }
 
-async fn upsert_refill_progress_marker(
-    db: &sea_orm::DatabaseConnection,
+async fn upsert_refill_progress_marker<C: ConnectionTrait>(
+    db: &C,
     workspace_id: &str,
     status: &str,
     summary: Option<&ThreadEpisodicWorkspaceCapsuleRefillSummary>,
@@ -2078,8 +2079,8 @@ async fn upsert_refill_progress_marker(
     .await
 }
 
-async fn mark_refill_complete(
-    db: &sea_orm::DatabaseConnection,
+async fn mark_refill_complete<C: ConnectionTrait>(
+    db: &C,
     workspace_id: &str,
     summary: &ThreadEpisodicWorkspaceCapsuleRefillSummary,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,
@@ -2114,8 +2115,8 @@ fn saturating_i64_from_u64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
-async fn mark_refill_failed(
-    db: &sea_orm::DatabaseConnection,
+async fn mark_refill_failed<C: ConnectionTrait>(
+    db: &C,
     workspace_id: &str,
     error: &anyhow::Error,
     projection_target: &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget,

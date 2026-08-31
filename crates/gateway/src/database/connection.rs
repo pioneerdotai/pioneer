@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use migration::{Migrator, MigratorTrait};
 use pioneer_config::AppConfig;
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, apply_sqlite_pragmas,
-    is_anyhow_sqlite_lock, normalize_relative_database_file_name, retry_with_backoff,
-    sqlite_connection_url,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+    SqliteDatabase, apply_sqlite_pragmas, is_anyhow_sqlite_lock,
+    normalize_relative_database_file_name, retry_with_backoff, sqlite_connection_url,
+    sqlite_read_only_connection_url,
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::path::{Path, PathBuf};
@@ -54,7 +55,9 @@ impl GatewayDatabaseRuntimeConfig {
     }
 }
 
-pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<DatabaseConnection> {
+const WRITER_MAX_CONNECTIONS: u32 = 1;
+
+pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<SqliteDatabase> {
     initialize_inner(runtime_home, app_config, None).await
 }
 
@@ -62,7 +65,7 @@ pub async fn initialize_with_startup(
     runtime_home: &Path,
     app_config: &AppConfig,
     startup: &pioneer_observability::GatewayStartupTrace,
-) -> Result<DatabaseConnection> {
+) -> Result<SqliteDatabase> {
     initialize_inner(runtime_home, app_config, Some(startup)).await
 }
 
@@ -70,7 +73,7 @@ async fn initialize_inner(
     runtime_home: &Path,
     app_config: &AppConfig,
     startup: Option<&pioneer_observability::GatewayStartupTrace>,
-) -> Result<DatabaseConnection> {
+) -> Result<SqliteDatabase> {
     let database_open_stage =
         startup.map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseOpen));
     let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
@@ -78,54 +81,34 @@ async fn initialize_inner(
         .context("failed to register sqlite-zstd gateway database extension")?;
 
     let database_path = runtime_home.join(config.file_name.as_str());
-    let database_url = sqlite_connection_url(database_path.as_path());
+    let writer_url = sqlite_connection_url(database_path.as_path());
 
-    let mut options = ConnectOptions::new(database_url.clone());
-    options.max_connections(config.max_connections);
-    options.connect_timeout(config.connect_timeout);
-    options.acquire_timeout(config.acquire_timeout);
-    options.idle_timeout(config.idle_timeout);
-    options.sqlx_logging(config.sqlx_logging);
-    // SQLx measures the complete wait for a pool permit/connection. A TRACE
-    // event keeps normal logs quiet and is consumed by the observability layer.
-    options.map_sqlx_sqlite_pool_opts(|pool_options| {
-        pool_options.acquire_time_level(log::LevelFilter::Trace)
-    });
-
-    let mut connection = Database::connect(options)
-        .await
-        .with_context(|| format!("failed to connect to gateway database `{database_url}`"))?;
+    let mut writer = Database::connect(connect_options(
+        writer_url.clone(),
+        WRITER_MAX_CONNECTIONS,
+        &config,
+    ))
+    .await
+    .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
     if let Some(stage) = database_open_stage {
         stage.succeed();
     }
 
     let database_configure_stage = startup
         .map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseConfigure));
-    connection.set_metric_callback(|info| {
-        pioneer_observability::record_database_operation(
-            pioneer_observability::DatabaseRole::Shared,
-            sqlite_operation(info.statement.sql.as_str()),
-            info.elapsed,
-            info.failed,
-        );
-    });
-    let pool = connection.get_sqlite_connection_pool().clone();
-    pioneer_observability::register_database_pool_observer(
-        pioneer_observability::DatabaseRole::Shared,
-        u64::from(config.max_connections),
-        move || pioneer_observability::DatabasePoolSnapshot {
-            size: u64::from(pool.size()),
-            idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
-        },
+    configure_observability(
+        &mut writer,
+        pioneer_observability::DatabaseRole::Writer,
+        WRITER_MAX_CONNECTIONS,
     );
 
-    connection
+    writer
         .ping()
         .await
-        .context("failed to ping gateway database")?;
+        .context("failed to ping gateway writer")?;
 
     retry_with_backoff(
-        || apply_sqlite_pragmas(&connection),
+        || apply_sqlite_pragmas(&writer),
         is_anyhow_sqlite_lock,
         DEFAULT_LOCK_RETRY_ATTEMPTS,
         Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
@@ -139,7 +122,7 @@ async fn initialize_inner(
         .map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseMigrate));
     retry_with_backoff(
         || async {
-            Migrator::up(&connection, None)
+            Migrator::up(&writer, None)
                 .await
                 .context("failed to apply gateway database migrations")
         },
@@ -152,12 +135,81 @@ async fn initialize_inner(
         stage.succeed();
     }
 
+    let reader_url = sqlite_read_only_connection_url(database_path.as_path());
+    let mut reader_options = connect_options(reader_url.clone(), config.max_connections, &config);
+    reader_options.map_sqlx_sqlite_opts(|options| {
+        options
+            .read_only(true)
+            .create_if_missing(false)
+            .pragma("query_only", "ON")
+    });
+    let mut reader = Database::connect(reader_options)
+        .await
+        .with_context(|| format!("failed to connect to gateway read pool `{reader_url}`"))?;
+    configure_observability(
+        &mut reader,
+        pioneer_observability::DatabaseRole::Reader,
+        config.max_connections,
+    );
+    reader
+        .ping()
+        .await
+        .context("failed to ping gateway read pool")?;
+
     info!(
         database_path = %database_path.display(),
+        reader_connections = config.max_connections,
+        writer_connections = WRITER_MAX_CONNECTIONS,
         "gateway database is ready"
     );
 
-    Ok(connection)
+    Ok(SqliteDatabase::new(reader, writer))
+}
+
+fn connect_options(
+    database_url: String,
+    max_connections: u32,
+    config: &GatewayDatabaseRuntimeConfig,
+) -> ConnectOptions {
+    let mut options = ConnectOptions::new(database_url);
+    options.max_connections(max_connections);
+    options.connect_timeout(config.connect_timeout);
+    options.acquire_timeout(config.acquire_timeout);
+    options.idle_timeout(config.idle_timeout);
+    options.sqlx_logging(config.sqlx_logging);
+    // SQLx measures the complete wait for a pool permit/connection. A TRACE
+    // event keeps normal logs quiet and is consumed by the observability layer.
+    options.map_sqlx_sqlite_pool_opts(|pool_options| {
+        pool_options.acquire_time_level(log::LevelFilter::Trace)
+    });
+    options.map_sqlx_sqlite_opts(|sqlite_options| {
+        sqlite_options.busy_timeout(Duration::from_millis(DEFAULT_SQLITE_BUSY_TIMEOUT_MS))
+    });
+    options
+}
+
+fn configure_observability(
+    connection: &mut DatabaseConnection,
+    role: pioneer_observability::DatabaseRole,
+    max_connections: u32,
+) {
+    connection.set_metric_callback(move |info| {
+        pioneer_observability::record_database_operation(
+            role,
+            sqlite_operation(info.statement.sql.as_str()),
+            info.elapsed,
+            info.failed,
+        );
+    });
+    let pool = connection.get_sqlite_connection_pool().clone();
+    pioneer_observability::register_database_pool_observer(
+        role,
+        u64::from(max_connections),
+        move || pioneer_observability::DatabasePoolSnapshot {
+            size: u64::from(pool.size()),
+            idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
+        },
+    );
 }
 
 fn sqlite_operation(sql: &str) -> pioneer_observability::DatabaseOperation {
@@ -213,7 +265,7 @@ pub(crate) fn gateway_database_path(
 pub(crate) async fn initialize_existing_for_operations(
     runtime_home: &Path,
     app_config: &AppConfig,
-) -> Result<Option<DatabaseConnection>> {
+) -> Result<Option<SqliteDatabase>> {
     let database_path = gateway_database_path(runtime_home, app_config)?;
     if !database_path.exists() {
         return Ok(None);
@@ -224,8 +276,13 @@ pub(crate) async fn initialize_existing_for_operations(
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
     use pioneer_observability::DatabaseOperation;
-    use pioneer_sqlite::{normalize_relative_database_file_name, sqlite_connection_url};
+    use pioneer_sqlite::{
+        normalize_relative_database_file_name, sqlite_connection_url,
+        sqlite_read_only_connection_url,
+    };
+    use sea_orm::{ConnectionTrait, DbBackend, Statement, StreamTrait, TransactionTrait};
     use std::path::Path;
 
     #[test]
@@ -264,6 +321,13 @@ mod tests {
     }
 
     #[test]
+    fn builds_read_only_sqlite_connection_url() {
+        let path = Path::new("/tmp/gateway.db");
+        let url = sqlite_read_only_connection_url(path);
+        assert_eq!(url, "sqlite:///tmp/gateway.db?mode=ro");
+    }
+
+    #[test]
     fn classifies_sql_without_exporting_statement_text() {
         assert_eq!(
             super::sqlite_operation(" SELECT * FROM thread"),
@@ -285,5 +349,160 @@ mod tests {
             super::sqlite_operation("WITH rows AS (...) SELECT 1"),
             DatabaseOperation::Other
         );
+    }
+
+    #[tokio::test]
+    async fn initializes_independent_read_only_reader_and_single_writer() {
+        let runtime = tempfile::tempdir().expect("temporary Gateway runtime");
+        let mut config = pioneer_config::AppConfig::load().expect("load test config");
+        config.gateway.database.file_name = "routing-test.db".to_owned();
+        config.gateway.database.max_connections = 4;
+
+        let database = super::initialize(runtime.path(), &config)
+            .await
+            .expect("initialize split Gateway database");
+        assert_eq!(database.reader().max_connections(), 4);
+        assert_eq!(database.writer().max_connections(), 1);
+        assert!(
+            database
+                .reader()
+                .query_only_enabled()
+                .await
+                .expect("read query_only state")
+        );
+
+        database
+            .execute_unprepared(
+                "CREATE TABLE routing_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+            )
+            .await
+            .expect("create probe through writer");
+        let inserted = database
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "INSERT INTO routing_probe(value) VALUES ('ok') RETURNING value".to_owned(),
+            ))
+            .await
+            .expect("route INSERT RETURNING through writer")
+            .expect("inserted probe row");
+        assert_eq!(inserted.try_get::<String>("", "value").unwrap(), "ok");
+
+        let selected = database
+            .reader()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT value FROM routing_probe".to_owned(),
+            ))
+            .await
+            .expect("query probe through reader")
+            .expect("selected probe row");
+        assert_eq!(selected.try_get::<String>("", "value").unwrap(), "ok");
+
+        let mut selected_stream = database
+            .stream_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT value FROM routing_probe".to_owned(),
+            ))
+            .await
+            .expect("route streaming SELECT through reader");
+        let streamed = selected_stream
+            .next()
+            .await
+            .expect("streamed probe row")
+            .expect("read streamed probe row");
+        assert_eq!(streamed.try_get::<String>("", "value").unwrap(), "ok");
+        drop(selected_stream);
+
+        let mut inserted_stream = database
+            .stream_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "INSERT INTO routing_probe(value) VALUES ('streamed') RETURNING value".to_owned(),
+            ))
+            .await
+            .expect("route streaming INSERT RETURNING through writer");
+        let streamed_insert = inserted_stream
+            .next()
+            .await
+            .expect("streamed inserted row")
+            .expect("read streamed inserted row");
+        assert_eq!(
+            streamed_insert.try_get::<String>("", "value").unwrap(),
+            "streamed"
+        );
+        drop(inserted_stream);
+
+        let extension_probe = database
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT length(zstd_compress('reader-extension-probe', 1)) AS value".to_owned(),
+            ))
+            .await
+            .expect("sqlite-zstd must be registered on read connections")
+            .expect("sqlite-zstd probe row");
+        assert!(extension_probe.try_get::<i64>("", "value").unwrap() > 0);
+
+        let transaction = database.writer().begin().await.expect("begin writer probe");
+        transaction
+            .execute_unprepared("UPDATE routing_probe SET value = 'uncommitted'")
+            .await
+            .expect("hold writer with an uncommitted update");
+        let transaction_value = transaction
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT value FROM routing_probe".to_owned(),
+            ))
+            .await
+            .expect("read inside write transaction")
+            .expect("transaction probe row");
+        assert_eq!(
+            transaction_value.try_get::<String>("", "value").unwrap(),
+            "uncommitted"
+        );
+        let concurrent_read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            database.query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT value FROM routing_probe".to_owned(),
+            )),
+        )
+        .await
+        .expect("ordinary read must not wait for the occupied writer")
+        .expect("query through independent reader")
+        .expect("concurrent probe row");
+        assert_eq!(
+            concurrent_read.try_get::<String>("", "value").unwrap(),
+            "ok"
+        );
+        transaction.rollback().await.expect("rollback writer probe");
+
+        let execute_error = database
+            .reader()
+            .execute_unprepared("DELETE FROM routing_probe")
+            .await
+            .expect_err("reader execution API must reject writes");
+        assert!(execute_error.to_string().contains("SQLite read pool"));
+        let returning_error = database
+            .reader()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "DELETE FROM routing_probe RETURNING id".to_owned(),
+            ))
+            .await
+            .expect_err("reader query API must reject write-returning statements");
+        assert!(returning_error.to_string().contains("SQLite read pool"));
+        let streaming_error = match database
+            .reader()
+            .stream_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "DELETE FROM routing_probe RETURNING id".to_owned(),
+            ))
+            .await
+        {
+            Ok(_) => panic!("reader streaming API must reject write-returning statements"),
+            Err(error) => error,
+        };
+        assert!(streaming_error.to_string().contains("SQLite read pool"));
+
+        database.close().await.expect("close both Gateway pools");
     }
 }

@@ -18,7 +18,7 @@ use pioneer_protocol::{
     generate_id,
 };
 use sea_orm::{
-    DatabaseConnection, SqliteTransactionMode, TransactionOptions, TransactionTrait,
+    DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait,
     entity::prelude::DateTimeWithTimeZone,
 };
 
@@ -102,13 +102,16 @@ impl Deref for InvitationRevokeCommitted {
 
 impl InvitationService {
     #[cfg(test)]
-    pub(crate) async fn preview_restricted(
-        database: &DatabaseConnection,
+    pub(crate) async fn preview_restricted<D>(
+        database: &D,
         credentials: &OpaqueCredentialFactory,
         gateway_id: &pioneer_protocol::GatewayId,
         raw_credential: &str,
         transport: InvitationTransportSecurity,
-    ) -> Result<InvitationPreviewResponse, Error> {
+    ) -> Result<InvitationPreviewResponse, Error>
+    where
+        D: TransactionTrait<Transaction = DatabaseTransaction>,
+    {
         Self::preview_restricted_with_lifecycle(
             database,
             credentials,
@@ -120,14 +123,17 @@ impl InvitationService {
         .await
     }
 
-    pub(crate) async fn preview_restricted_with_lifecycle(
-        database: &DatabaseConnection,
+    pub(crate) async fn preview_restricted_with_lifecycle<D>(
+        database: &D,
         credentials: &OpaqueCredentialFactory,
         auth_service: Option<&GatewayAuthService>,
         gateway_id: &pioneer_protocol::GatewayId,
         raw_credential: &str,
         transport: InvitationTransportSecurity,
-    ) -> Result<InvitationPreviewResponse, Error> {
+    ) -> Result<InvitationPreviewResponse, Error>
+    where
+        D: TransactionTrait<Transaction = DatabaseTransaction>,
+    {
         let started = std::time::Instant::now();
         let now = chrono::Utc::now().fixed_offset();
         let _write_admission = if let Some(auth_service) = auth_service {
@@ -184,14 +190,17 @@ impl InvitationService {
         }
     }
 
-    pub(crate) async fn accept_restricted(
-        database: &DatabaseConnection,
+    pub(crate) async fn accept_restricted<D>(
+        database: &D,
         credentials: &OpaqueCredentialFactory,
         auth_service: &GatewayAuthService,
         gateway_id: &pioneer_protocol::GatewayId,
         raw_credential: &str,
         params: InvitationAcceptParams,
-    ) -> Result<InvitationAcceptResponse, InvitationAcceptServiceError> {
+    ) -> Result<InvitationAcceptResponse, InvitationAcceptServiceError>
+    where
+        D: TransactionTrait<Transaction = DatabaseTransaction>,
+    {
         let started = std::time::Instant::now();
         let credential = InvitationCredential::parse(raw_credential.to_owned())
             .map_err(|_| InvitationAcceptServiceError::Unavailable)?;
@@ -850,13 +859,16 @@ enum InvitationAdmission {
     },
 }
 
-async fn preflight_accept_admission(
-    database: &DatabaseConnection,
+async fn preflight_accept_admission<D>(
+    database: &D,
     credentials: &OpaqueCredentialFactory,
     auth_service: &GatewayAuthService,
     gateway_id: &pioneer_protocol::GatewayId,
     raw_credential: &str,
-) -> Result<(), InvitationAcceptServiceError> {
+) -> Result<(), InvitationAcceptServiceError>
+where
+    D: TransactionTrait<Transaction = DatabaseTransaction>,
+{
     let started = std::time::Instant::now();
     let now = chrono::Utc::now().fixed_offset();
     let _write_admission = auth_service.write_coordinator().acquire_foreground().await;

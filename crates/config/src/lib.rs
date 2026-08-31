@@ -2840,6 +2840,8 @@ const fn default_skills_runtime_allow_function_proxy_tools() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayDatabaseConfig {
     pub file_name: String,
+    /// Maximum number of parallel read-only Gateway database connections.
+    /// The writer is a separate, fixed single-connection contour.
     pub max_connections: u32,
     pub connect_timeout_ms: u64,
     pub acquire_timeout_ms: u64,

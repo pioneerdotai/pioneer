@@ -2,12 +2,12 @@ use pioneer_crud::list_active_workspaces_for_principal;
 use pioneer_entity::workspace;
 use pioneer_protocol::Workspace;
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
-    is_sqlite_lock_message, retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+    SqliteWriteCoordinator, is_sqlite_lock_message, retry_with_backoff,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait,
 };
 use sea_orm::{ConnectionTrait, prelude::Expr};
 use std::future::Future;
@@ -47,22 +47,22 @@ impl std::error::Error for WorkspaceError {}
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
-    connection: DatabaseConnection,
+    connection: SqliteDatabase,
     write_coordinator: SqliteWriteCoordinator,
 }
 
 impl WorkspaceManager {
     #[cfg(test)]
-    pub fn new(connection: DatabaseConnection) -> Self {
+    pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self::new_with_write_coordinator(connection, SqliteWriteCoordinator::default())
     }
 
     pub fn new_with_write_coordinator(
-        connection: DatabaseConnection,
+        connection: impl Into<SqliteDatabase>,
         write_coordinator: SqliteWriteCoordinator,
     ) -> Self {
         Self {
-            connection,
+            connection: connection.into(),
             write_coordinator,
         }
     }

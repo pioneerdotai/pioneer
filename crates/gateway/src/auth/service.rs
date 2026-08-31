@@ -31,11 +31,8 @@ use pioneer_protocol::{
     DeviceId, DeviceStatus, InvitationId, PrincipalKind, PrincipalStatus, RefreshCredentialId,
     RequestId, RoleKey, TokenFamilyId, WorkspaceId, format_device_activation_code, generate_id,
 };
-use pioneer_sqlite::SqliteWriteCoordinator;
-use sea_orm::{
-    DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
-    TransactionTrait,
-};
+use pioneer_sqlite::{SqliteDatabase, SqliteWriteCoordinator};
+use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
 use serde_json::{Value as JsonValue, to_value};
 use subtle::ConstantTimeEq;
 
@@ -64,7 +61,7 @@ const AUTH_MAINTENANCE_BATCH_SIZE: u64 = 256;
 const AUTH_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 pub(crate) struct GatewayAuthService {
-    database: DatabaseConnection,
+    database: SqliteDatabase,
     write_coordinator: SqliteWriteCoordinator,
     config: GatewayAuthConfig,
     identity: Arc<IdentityBootstrapSnapshot>,
@@ -177,7 +174,7 @@ fn typed_id<T, E>(
 
 impl GatewayAuthService {
     pub(crate) fn new(
-        database: DatabaseConnection,
+        database: impl Into<SqliteDatabase>,
         config: GatewayAuthConfig,
         identity: Arc<IdentityBootstrapSnapshot>,
         access_key: &AuthKeyMaterial,
@@ -194,7 +191,7 @@ impl GatewayAuthService {
     }
 
     pub(crate) fn new_with_write_coordinator(
-        database: DatabaseConnection,
+        database: impl Into<SqliteDatabase>,
         config: GatewayAuthConfig,
         identity: Arc<IdentityBootstrapSnapshot>,
         access_key: &AuthKeyMaterial,
@@ -208,7 +205,7 @@ impl GatewayAuthService {
                 identity.gateway.id.clone(),
             )?,
             opaque_credentials: OpaqueCredentialFactory::new(credential_hmac_key.as_bytes())?,
-            database,
+            database: database.into(),
             write_coordinator,
             config,
             identity,
@@ -6077,7 +6074,7 @@ mod tests {
         }
     }
 
-    async fn count(database: &DatabaseConnection, table: &str) -> i64 {
+    async fn count(database: &impl ConnectionTrait, table: &str) -> i64 {
         database
             .query_one_raw(Statement::from_string(
                 database.get_database_backend(),
@@ -6090,7 +6087,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn count_where(database: &DatabaseConnection, table: &str, condition: &str) -> i64 {
+    async fn count_where(database: &impl ConnectionTrait, table: &str, condition: &str) -> i64 {
         scalar_i64(
             database,
             format!("SELECT COUNT(*) AS value FROM {table} WHERE {condition}").as_str(),
@@ -6098,7 +6095,7 @@ mod tests {
         .await
     }
 
-    async fn scalar_i64(database: &DatabaseConnection, query: &str) -> i64 {
+    async fn scalar_i64(database: &impl ConnectionTrait, query: &str) -> i64 {
         database
             .query_one_raw(Statement::from_string(
                 database.get_database_backend(),
@@ -6111,7 +6108,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn scalar_text(database: &DatabaseConnection, query: &str) -> String {
+    async fn scalar_text(database: &impl ConnectionTrait, query: &str) -> String {
         database
             .query_one_raw(Statement::from_string(
                 database.get_database_backend(),
@@ -6124,7 +6121,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn database_text(database: &DatabaseConnection) -> String {
+    async fn database_text(database: &impl ConnectionTrait) -> String {
         let rows = database
             .query_all_raw(Statement::from_string(
                 database.get_database_backend(),

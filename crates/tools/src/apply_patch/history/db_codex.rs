@@ -10,7 +10,8 @@ use pioneer_crud::{
     find_codex_aggregate_state, find_first_codex_aggregate_state_for_thread,
     upsert_codex_aggregate_state,
 };
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::TransactionTrait;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
@@ -20,12 +21,12 @@ static CODEX_PROJECTION_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 /// intentionally never written here: Codex remains an AggregateOnly source.
 #[derive(Clone)]
 pub struct SqliteCodexAggregateStore {
-    db: DatabaseConnection,
+    db: SqliteDatabase,
 }
 
 impl SqliteCodexAggregateStore {
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+        Self { db: db.into() }
     }
 
     /// Ingest one normalized `turn/diff/updated` event into the durable

@@ -20,7 +20,8 @@ use crate::apply_patch::history::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::patch_history as crud;
-use sea_orm::{DatabaseConnection, DatabaseTransaction, TransactionTrait};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 #[cfg(test)]
@@ -64,15 +65,15 @@ pub(crate) fn decode_persisted_record_delta(
 
 #[derive(Clone)]
 pub struct SqliteAppliedPatchStore {
-    db: DatabaseConnection,
+    db: SqliteDatabase,
     #[cfg(test)]
     fail_next_record_insert: Arc<AtomicBool>,
 }
 
 impl SqliteAppliedPatchStore {
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
         Self {
-            db,
+            db: db.into(),
             #[cfg(test)]
             fail_next_record_insert: Arc::new(AtomicBool::new(false)),
         }
@@ -83,7 +84,7 @@ impl SqliteAppliedPatchStore {
         self.fail_next_record_insert.store(true, Ordering::SeqCst);
     }
 
-    pub fn database(&self) -> &DatabaseConnection {
+    pub fn database(&self) -> &SqliteDatabase {
         &self.db
     }
 
@@ -1581,7 +1582,7 @@ fn combined_history_coverage(
 }
 
 async fn query_index_rows(
-    db: &DatabaseConnection,
+    db: &SqliteDatabase,
     thread_id: &str,
     aliases: &BTreeSet<String>,
     cursor: Option<&IndexCursor>,

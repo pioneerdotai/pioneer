@@ -3,7 +3,7 @@ use anyhow::anyhow;
 use pioneer_entity::{thread, turn, turn_mcp_projection};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    DatabaseConnection, EntityTrait, Set, TransactionTrait, entity::prelude::DateTimeWithTimeZone,
+    DatabaseTransaction, EntityTrait, Set, TransactionTrait, entity::prelude::DateTimeWithTimeZone,
 };
 use std::error::Error;
 use std::fmt;
@@ -120,19 +120,25 @@ impl Error for TurnMcpProjectionPersistenceError {
     }
 }
 
-pub async fn replace_turn_mcp_projection(
-    db: &DatabaseConnection,
+pub async fn replace_turn_mcp_projection<D>(
+    db: &D,
     replacement: &TurnMcpProjectionReplacement,
-) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
+) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
+where
+    D: TransactionTrait<Transaction = DatabaseTransaction>,
+{
     replace_turn_mcp_projection_inner(db, replacement, None, AtomicProjectionReplaceFault::None)
         .await
 }
 
-pub async fn replace_turn_mcp_projection_with_authorization_context(
-    db: &DatabaseConnection,
+pub async fn replace_turn_mcp_projection_with_authorization_context<D>(
+    db: &D,
     replacement: &TurnMcpProjectionReplacement,
     authorization_context_json: &str,
-) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
+) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
+where
+    D: TransactionTrait<Transaction = DatabaseTransaction>,
+{
     replace_turn_mcp_projection_inner(
         db,
         replacement,
@@ -152,19 +158,22 @@ pub(crate) enum AtomicProjectionReplaceFault {
 
 #[cfg(test)]
 pub(crate) async fn replace_turn_mcp_projection_with_fault(
-    db: &DatabaseConnection,
+    db: &impl TransactionTrait<Transaction = DatabaseTransaction>,
     replacement: &TurnMcpProjectionReplacement,
     fault: AtomicProjectionReplaceFault,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
     replace_turn_mcp_projection_inner(db, replacement, None, fault).await
 }
 
-async fn replace_turn_mcp_projection_inner(
-    db: &DatabaseConnection,
+async fn replace_turn_mcp_projection_inner<D>(
+    db: &D,
     replacement: &TurnMcpProjectionReplacement,
     authorization_context_json: Option<&str>,
     fault: AtomicProjectionReplaceFault,
-) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
+) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
+where
+    D: TransactionTrait<Transaction = DatabaseTransaction>,
+{
     validate_replacement_shape(replacement)?;
     let transaction = db
         .begin()

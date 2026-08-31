@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
+mod database;
+
+pub use database::{SqliteDatabase, SqliteReadPool, SqliteWriter};
+
 pub mod zstd;
 
 pub const DEFAULT_LOCK_RETRY_ATTEMPTS: usize = 5;
@@ -721,6 +725,14 @@ pub async fn apply_sqlite_pragmas(connection: &DatabaseConnection) -> Result<()>
 }
 
 pub fn sqlite_connection_url(path: &Path) -> String {
+    sqlite_connection_url_with_mode(path, "rwc")
+}
+
+pub fn sqlite_read_only_connection_url(path: &Path) -> String {
+    sqlite_connection_url_with_mode(path, "ro")
+}
+
+fn sqlite_connection_url_with_mode(path: &Path, mode: &str) -> String {
     let normalized_path = path.to_string_lossy().replace('\\', "/");
     let has_windows_drive_prefix = normalized_path
         .as_bytes()
@@ -735,7 +747,7 @@ pub fn sqlite_connection_url(path: &Path) -> String {
         normalized_path
     };
 
-    format!("sqlite://{path_part}?mode=rwc")
+    format!("sqlite://{path_part}?mode={mode}")
 }
 
 pub fn normalize_relative_database_file_name(value: &str, field_name: &str) -> Result<String> {

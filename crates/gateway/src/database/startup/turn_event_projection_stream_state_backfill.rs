@@ -4,6 +4,7 @@ use pioneer_crud::{
     PROJECTION_META_STATUS_FAILED, ProjectionMetaRecord, find_projection_meta,
     upsert_projection_meta,
 };
+use sea_orm::ConnectionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use tracing::{info, warn};
 
@@ -130,7 +131,7 @@ async fn backfill_all_batches(
     Ok(summary)
 }
 
-async fn backfill_is_current(db: &sea_orm::DatabaseConnection) -> Result<bool> {
+async fn backfill_is_current<C: ConnectionTrait>(db: &C) -> Result<bool> {
     let Some(meta) = find_projection_meta(db, PROJECTION_STREAM_STATE_BACKFILL_KEY).await? else {
         return Ok(false);
     };
@@ -140,8 +141,8 @@ async fn backfill_is_current(db: &sea_orm::DatabaseConnection) -> Result<bool> {
     )
 }
 
-async fn mark_backfill_complete(
-    db: &sea_orm::DatabaseConnection,
+async fn mark_backfill_complete<C: ConnectionTrait>(
+    db: &C,
     started_at: DateTimeWithTimeZone,
     summary: &ProjectionStreamStateBackfillSummary,
 ) -> Result<()> {
@@ -166,8 +167,8 @@ async fn mark_backfill_complete(
     .await
 }
 
-async fn mark_backfill_failed(
-    db: &sea_orm::DatabaseConnection,
+async fn mark_backfill_failed<C: ConnectionTrait>(
+    db: &C,
     started_at: DateTimeWithTimeZone,
     error: &anyhow::Error,
 ) -> Result<()> {

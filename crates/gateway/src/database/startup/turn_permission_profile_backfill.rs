@@ -11,8 +11,8 @@ use pioneer_protocol::{
     TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
 };
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, FromQueryResult, Statement,
-    TransactionTrait, entity::prelude::DateTimeWithTimeZone,
+    ConnectionTrait, DatabaseTransaction, FromQueryResult, Statement, TransactionTrait,
+    entity::prelude::DateTimeWithTimeZone,
 };
 use serde_json::Value as JsonValue;
 use std::path::Path;
@@ -910,7 +910,7 @@ async fn backfill_turn_batch(db: &DatabaseTransaction) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
-async fn backfill_is_current(db: &DatabaseConnection) -> Result<bool> {
+async fn backfill_is_current<C: ConnectionTrait>(db: &C) -> Result<bool> {
     let Some(meta) = find_projection_meta(db, TURN_PERMISSION_PROFILE_BACKFILL_KEY).await? else {
         return Ok(false);
     };
@@ -920,8 +920,8 @@ async fn backfill_is_current(db: &DatabaseConnection) -> Result<bool> {
     )
 }
 
-async fn mark_backfill_complete(
-    db: &DatabaseConnection,
+async fn mark_backfill_complete<C: ConnectionTrait>(
+    db: &C,
     summary: &TurnPermissionProfileBackfillSummary,
 ) -> Result<()> {
     let now = now_datetime();
@@ -948,7 +948,7 @@ async fn mark_backfill_complete(
     .await
 }
 
-async fn mark_backfill_failed(db: &DatabaseConnection, error: &anyhow::Error) -> Result<()> {
+async fn mark_backfill_failed<C: ConnectionTrait>(db: &C, error: &anyhow::Error) -> Result<()> {
     let now = now_datetime();
     upsert_projection_meta(
         db,

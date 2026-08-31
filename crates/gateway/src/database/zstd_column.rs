@@ -4,9 +4,8 @@ use pioneer_crud::{
     PROJECTION_META_STATUS_FAILED, ProjectionMetaRecord, find_projection_meta,
     upsert_projection_meta,
 };
-use sea_orm::{
-    ConnectionTrait, DatabaseConnection, Statement, entity::prelude::DateTimeWithTimeZone,
-};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::{ConnectionTrait, Statement, entity::prelude::DateTimeWithTimeZone};
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -273,7 +272,7 @@ async fn run_periodic_maintenance(
 
 async fn run_cooperative_maintenance(
     crud_store: &CrudStore,
-    db: &DatabaseConnection,
+    db: &SqliteDatabase,
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
     cancellation: Option<&tokio_util::sync::CancellationToken>,
@@ -343,7 +342,7 @@ async fn run_cooperative_maintenance(
 }
 
 async fn ensure_compression_enabled(
-    db: &DatabaseConnection,
+    db: &SqliteDatabase,
     config: ZstdColumnConfig,
     row_inspection: RowInspection,
 ) -> Result<EnsureCompressionResult> {
@@ -364,7 +363,7 @@ async fn ensure_compression_enabled(
             skipped_empty = true;
         } else {
             mark_compression_backfilling(db, config).await?;
-            if let Err(error) = enable_transparent_compression(db, config).await {
+            if let Err(error) = enable_transparent_compression(db.writer(), config).await {
                 mark_compression_failed(db, config, &error).await?;
                 return Err(error);
             }
@@ -403,7 +402,7 @@ fn summary_without_maintenance(
     }
 }
 
-async fn verify_sqlite_zstd_registered(db: &DatabaseConnection) -> Result<()> {
+async fn verify_sqlite_zstd_registered(db: &SqliteDatabase) -> Result<()> {
     query_i64(
         db,
         "SELECT length(zstd_compress('pioneer-sqlite', 1)) AS value",
@@ -413,7 +412,7 @@ async fn verify_sqlite_zstd_registered(db: &DatabaseConnection) -> Result<()> {
     .map(|_| ())
 }
 
-async fn compression_is_enabled(db: &DatabaseConnection, config: ZstdColumnConfig) -> Result<bool> {
+async fn compression_is_enabled(db: &SqliteDatabase, config: ZstdColumnConfig) -> Result<bool> {
     let backing_table = query_i64(
         db,
         format!(
@@ -468,7 +467,7 @@ where
 }
 
 async fn run_maintenance(
-    db: &DatabaseConnection,
+    db: &SqliteDatabase,
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
 ) -> Result<bool> {
@@ -478,14 +477,16 @@ async fn run_maintenance(
         }
         None => format!("SELECT zstd_incremental_maintenance(NULL, {target_db_load}) AS value"),
     };
-    let result = query_i64(db, sql.as_str(), "failed to run sqlite-zstd maintenance").await?;
+    let result = query_i64(
+        db.writer(),
+        sql.as_str(),
+        "failed to run sqlite-zstd maintenance",
+    )
+    .await?;
     Ok(result != 0)
 }
 
-async fn pending_uncompressed_rows(
-    db: &DatabaseConnection,
-    config: ZstdColumnConfig,
-) -> Result<u64> {
+async fn pending_uncompressed_rows(db: &SqliteDatabase, config: ZstdColumnConfig) -> Result<u64> {
     if !compression_is_enabled(db, config).await? {
         return Ok(0);
     }
@@ -502,7 +503,7 @@ async fn pending_uncompressed_rows(
     .map(|value| value.max(0) as u64)
 }
 
-async fn row_count(db: &DatabaseConnection, config: ZstdColumnConfig) -> Result<u64> {
+async fn row_count(db: &SqliteDatabase, config: ZstdColumnConfig) -> Result<u64> {
     query_i64(
         db,
         format!("SELECT COUNT(*) AS value FROM {}", config.table).as_str(),
@@ -512,7 +513,7 @@ async fn row_count(db: &DatabaseConnection, config: ZstdColumnConfig) -> Result<
     .map(|value| value.max(0) as u64)
 }
 
-async fn table_has_rows(db: &DatabaseConnection, config: ZstdColumnConfig) -> Result<bool> {
+async fn table_has_rows(db: &SqliteDatabase, config: ZstdColumnConfig) -> Result<bool> {
     query_i64(
         db,
         format!(
@@ -586,8 +587,8 @@ where
     .await
 }
 
-async fn mark_existing_compression_complete(
-    db: &DatabaseConnection,
+async fn mark_existing_compression_complete<C: ConnectionTrait>(
+    db: &C,
     config: ZstdColumnConfig,
     total_rows: u64,
 ) -> Result<()> {
@@ -604,8 +605,8 @@ async fn mark_existing_compression_complete(
     mark_compression_complete(db, config, total_rows).await
 }
 
-async fn mark_compression_failed(
-    db: &DatabaseConnection,
+async fn mark_compression_failed<C: ConnectionTrait>(
+    db: &C,
     config: ZstdColumnConfig,
     error: &anyhow::Error,
 ) -> Result<()> {

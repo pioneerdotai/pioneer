@@ -10,6 +10,7 @@
 //! journaled and the immutable record is promoted before releasing them.
 
 use anyhow::{Context, Result, anyhow, bail};
+use pioneer_sqlite::SqliteDatabase;
 use pioneer_tools::apply_patch::history::IntentStatus;
 use pioneer_tools::apply_patch::history::{
     AppliedPatchDelta, AppliedPatchRecord, AppliedPatchRecordOutcome, CommitOrdinal,
@@ -21,7 +22,6 @@ use pioneer_tools::apply_patch::{
     CommitAdmission, CommitObserver, DurableCommitObserver, ExecutionReport, ExecutionStatus,
     ObserverAdmission, ObserverError, ObserverErrorCode, patch_telemetry,
 };
-use sea_orm::DatabaseConnection;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -56,7 +56,7 @@ async fn reserve_patch_history_capacity_from(
 
 #[derive(Clone)]
 pub(crate) struct SqlitePatchObserver {
-    db: DatabaseConnection,
+    db: SqliteDatabase,
     identity: InvocationIdentity,
     _admission_permit: Arc<OwnedSemaphorePermit>,
     inner: DurableCommitObserver,
@@ -64,12 +64,12 @@ pub(crate) struct SqlitePatchObserver {
 
 impl SqlitePatchObserver {
     pub(crate) fn new(
-        db: DatabaseConnection,
+        db: impl Into<SqliteDatabase>,
         identity: InvocationIdentity,
         admission_permit: OwnedSemaphorePermit,
     ) -> Self {
         Self {
-            db,
+            db: db.into(),
             identity,
             _admission_permit: Arc::new(admission_permit),
             inner: DurableCommitObserver::new(
@@ -134,7 +134,7 @@ impl SqlitePatchObserver {
     }
 
     pub(crate) async fn project_live(
-        db: DatabaseConnection,
+        db: SqliteDatabase,
         thread_id: String,
         turn_id: String,
         authority: TurnDiffAuthority,
@@ -883,10 +883,10 @@ fn replay_diagnostic(
     }
 }
 
-fn run_sync_db<T, F, Fut>(db: DatabaseConnection, operation: F) -> Result<T>
+fn run_sync_db<T, F, Fut>(db: SqliteDatabase, operation: F) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(DatabaseConnection) -> Fut + Send + 'static,
+    F: FnOnce(SqliteDatabase) -> Fut + Send + 'static,
     Fut: Future<Output = Result<T>> + Send + 'static,
 {
     let join = std::thread::Builder::new()

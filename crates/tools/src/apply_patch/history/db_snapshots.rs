@@ -7,7 +7,8 @@ use crate::apply_patch::history::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::patch_history as crud;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, TransactionTrait};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use sha2::Digest;
 const RECONCILIATION_PAGE_SIZE: u64 = 256;
 const MAX_RECORD_JSON_BYTES: usize = 8 * 1024 * 1024;
@@ -24,20 +25,23 @@ pub struct SnapshotReconciliationReport {
 
 #[derive(Clone)]
 pub struct SqliteSnapshotStore {
-    db: DatabaseConnection,
+    db: SqliteDatabase,
     limits: SnapshotStoreLimits,
 }
 
 impl SqliteSnapshotStore {
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
         Self {
-            db,
+            db: db.into(),
             limits: SnapshotStoreLimits::default(),
         }
     }
 
-    pub fn with_limits(db: DatabaseConnection, limits: SnapshotStoreLimits) -> Self {
-        Self { db, limits }
+    pub fn with_limits(db: impl Into<SqliteDatabase>, limits: SnapshotStoreLimits) -> Self {
+        Self {
+            db: db.into(),
+            limits,
+        }
     }
 
     pub fn limits(&self) -> SnapshotStoreLimits {

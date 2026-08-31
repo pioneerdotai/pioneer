@@ -10,13 +10,10 @@ use pioneer_protocol::{
     generate_id,
 };
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_anyhow_sqlite_lock,
-    retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+    is_anyhow_sqlite_lock, retry_with_backoff,
 };
-use sea_orm::{
-    DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
-    TransactionTrait,
-};
+use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
 use std::time::Duration;
 
 use super::invariants::validate_identity_invariants;
@@ -109,9 +106,10 @@ impl IdentityBootstrapTransaction {
 }
 
 pub(crate) async fn bootstrap_identity(
-    connection: &DatabaseConnection,
+    connection: impl Into<SqliteDatabase>,
 ) -> Result<IdentityBootstrapOutcome> {
-    let mut bootstrap = begin_identity_bootstrap(connection).await?;
+    let connection = connection.into();
+    let mut bootstrap = begin_identity_bootstrap(&connection).await?;
     let (gateway_created, superuser_created) = bootstrap.created_flags();
     let work = async {
         let backfill_counts = bootstrap.backfill_legacy_actors().await?;
@@ -137,9 +135,10 @@ pub(crate) async fn bootstrap_identity(
     }
 }
 
-async fn begin_identity_bootstrap(
-    connection: &DatabaseConnection,
-) -> Result<IdentityBootstrapTransaction> {
+async fn begin_identity_bootstrap<D>(connection: &D) -> Result<IdentityBootstrapTransaction>
+where
+    D: TransactionTrait<Transaction = DatabaseTransaction>,
+{
     retry_with_backoff(
         || begin_identity_bootstrap_once(connection),
         is_anyhow_sqlite_lock,
@@ -149,9 +148,10 @@ async fn begin_identity_bootstrap(
     .await
 }
 
-async fn begin_identity_bootstrap_once(
-    connection: &DatabaseConnection,
-) -> Result<IdentityBootstrapTransaction> {
+async fn begin_identity_bootstrap_once<D>(connection: &D) -> Result<IdentityBootstrapTransaction>
+where
+    D: TransactionTrait<Transaction = DatabaseTransaction>,
+{
     let transaction = connection
         .begin_with_options(TransactionOptions {
             sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),

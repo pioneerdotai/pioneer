@@ -189,13 +189,12 @@ use pioneer_protocol::{
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteAdmissionClass,
-    SqliteWriteCoordinator, is_anyhow_sqlite_lock, retry_with_backoff,
+    SqliteDatabase, SqliteWriteCoordinator, is_anyhow_sqlite_lock, retry_with_backoff,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
-    TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2093,7 +2092,7 @@ pub struct TurnMcpProjectionRecord {
 
 #[derive(Clone)]
 pub struct CrudStore {
-    connection: DatabaseConnection,
+    connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
     write_coordinator: SqliteWriteCoordinator,
@@ -3513,16 +3512,16 @@ impl CrudStore {
         .await
     }
 
-    pub fn new(connection: DatabaseConnection) -> Self {
+    pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self::new_with_write_coordinator(connection, SqliteWriteCoordinator::default())
     }
 
     pub fn new_with_write_coordinator(
-        connection: DatabaseConnection,
+        connection: impl Into<SqliteDatabase>,
         write_coordinator: SqliteWriteCoordinator,
     ) -> Self {
         Self {
-            connection,
+            connection: connection.into(),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
             write_coordinator,
@@ -3597,7 +3596,7 @@ impl CrudStore {
         Ok(())
     }
 
-    pub fn database_connection(&self) -> DatabaseConnection {
+    pub fn database_connection(&self) -> SqliteDatabase {
         self.connection.clone()
     }
 
