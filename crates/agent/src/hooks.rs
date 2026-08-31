@@ -1,12 +1,12 @@
 use pioneer_hooks::{
-    HookActor, HookActorId, HookActorKind, HookAgentId, HookContext, HookContextMode,
-    HookContribution, HookContributionHash, HookContributionId, HookDiagnostic, HookFeatureFlag,
-    HookId, HookIdError, HookInput, HookInputKind, HookPhase, HookPhaseRequest, HookPolicySet,
-    HookPromptContextLimits, HookPromptContextSet, HookPromptSectionLimits, HookPromptSectionSet,
-    HookRunStatus, HookRunSummary, HookRuntime, HookRuntimeError, HookSectionId,
-    HookSubscriptionId, HookTaskId, HookThreadId, HookToolBundleId, HookToolBundleSet,
-    HookToolName, HookTurnId, HookWorkspaceId, PromptContextContribution,
-    PromptManifestDiagnosticContribution, ToolBundleContribution,
+    HookActor, HookActorId, HookActorKind, HookAgentId, HookCapability, HookContext,
+    HookContextMode, HookContribution, HookContributionHash, HookContributionId, HookDiagnostic,
+    HookFeatureFlag, HookHandlerDescriptor, HookId, HookIdError, HookInput, HookInputKind,
+    HookPhase, HookPhaseRequest, HookPolicySet, HookPromptContextLimits, HookPromptContextSet,
+    HookPromptSectionLimits, HookPromptSectionSet, HookRunStatus, HookRunSummary, HookRuntime,
+    HookRuntimeError, HookSectionId, HookSubscription, HookSubscriptionId, HookTaskId,
+    HookThreadId, HookToolBundleId, HookToolBundleSet, HookToolName, HookTurnId, HookWorkspaceId,
+    PromptContextContribution, PromptManifestDiagnosticContribution, ToolBundleContribution,
     TurnPostPreflightPromptContextHookInput, TurnPostTurnDomainEventSummary, TurnPostTurnHookInput,
     TurnPostTurnHookInputLimits, TurnPostTurnStatus, TurnPostTurnToolEventSummary,
     TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
@@ -17,10 +17,9 @@ use pioneer_memory::hooks::{
 };
 use pioneer_tools::ToolExtensionBundle;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 const HOOK_MANIFEST_MESSAGE_MAX_CHARS: usize = 512;
@@ -28,7 +27,104 @@ const REDACTED_HOOK_DIAGNOSTIC_MESSAGE: &str = "Hook diagnostic redacted.";
 const HOOK_BEST_EFFORT_FAILED_MESSAGE: &str = "Best-effort hook failed before prompt compilation.";
 const TOOL_BUNDLE_MISSING_ARTIFACT_DIAGNOSTIC_CODE: &str = "tool_bundle.missing_artifact";
 const MEMORY_THREAD_CONTEXT_CONTRIBUTION_ID: &str = "memory.active_recall.thread_context";
-const DEFERRED_TASK_POST_TURN_MARKER_LIMIT: usize = 4_096;
+const DURABLE_POST_TURN_HOOK_SNAPSHOT_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct DurablePostTurnHookRuntimeSnapshot {
+    schema_version: u16,
+    subscriptions: Vec<HookSubscription>,
+    handlers: Vec<HookHandlerDescriptor>,
+}
+
+impl DurablePostTurnHookRuntimeSnapshot {
+    pub(super) fn capture(
+        runtime: &HookRuntime,
+        subscriptions: Vec<HookSubscription>,
+    ) -> Result<Self, String> {
+        let idempotency_capability =
+            HookCapability::new("idempotent_side_effect").map_err(|error| error.to_string())?;
+        let mut handlers = Vec::new();
+        for subscription in &subscriptions {
+            if handlers.iter().any(|descriptor: &HookHandlerDescriptor| {
+                descriptor.hook_id == subscription.hook_id
+            }) {
+                continue;
+            }
+            let descriptor = runtime
+                .handlers()
+                .descriptor(&subscription.hook_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "durable hook subscription `{}` has no registered handler `{}`",
+                        subscription.subscription_id, subscription.hook_id
+                    )
+                })?;
+            if !descriptor.capabilities.contains(&idempotency_capability) {
+                return Err(format!(
+                    "durable hook handler `{}` does not declare the `idempotent_side_effect` capability",
+                    subscription.hook_id
+                ));
+            }
+            handlers.push(descriptor);
+        }
+        Ok(Self {
+            schema_version: DURABLE_POST_TURN_HOOK_SNAPSHOT_VERSION,
+            subscriptions,
+            handlers,
+        })
+    }
+
+    pub(super) fn validate_and_take_subscriptions(
+        self,
+        runtime: &HookRuntime,
+    ) -> Result<Vec<HookSubscription>, String> {
+        if self.schema_version != DURABLE_POST_TURN_HOOK_SNAPSHOT_VERSION {
+            return Err(format!(
+                "unsupported durable hook snapshot schema version {}",
+                self.schema_version
+            ));
+        }
+        let expected_handler_count = self
+            .subscriptions
+            .iter()
+            .map(|subscription| &subscription.hook_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if self.handlers.len() != expected_handler_count {
+            return Err("durable hook snapshot handler set is incomplete or duplicated".to_owned());
+        }
+        for subscription in &self.subscriptions {
+            let captured = self
+                .handlers
+                .iter()
+                .find(|descriptor| descriptor.hook_id == subscription.hook_id)
+                .ok_or_else(|| {
+                    format!(
+                        "durable hook snapshot omitted handler `{}`",
+                        subscription.hook_id
+                    )
+                })?;
+            let current = runtime
+                .handlers()
+                .descriptor(&subscription.hook_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "durable hook handler `{}` is unavailable",
+                        subscription.hook_id
+                    )
+                })?;
+            if current != *captured {
+                return Err(format!(
+                    "durable hook handler `{}` no longer matches the captured contract",
+                    subscription.hook_id
+                ));
+            }
+        }
+        Ok(self.subscriptions)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,147 +411,28 @@ impl AgentTurnPostTurnHookDispatch {
         self.summary.status()
     }
 
-    fn deferred_task_result_key(&self) -> Option<(String, String)> {
-        (self.summary.status() == TurnPostTurnStatus::Succeeded
+    pub(super) fn awaits_task_result_acceptance(&self) -> bool {
+        self.summary.status() == TurnPostTurnStatus::Succeeded
             && self.context.runtime_context.post_turn_dispatch_mode
-                == AgentTurnPostTurnDispatchMode::AwaitTaskResultAcceptance)
-            .then(|| (self.context.thread_id.clone(), self.context.turn_id.clone()))
+                == AgentTurnPostTurnDispatchMode::AwaitTaskResultAcceptance
     }
 
-    fn mark_task_result_accepted(&mut self) {
-        self.context.runtime_context.post_turn_dispatch_mode =
-            AgentTurnPostTurnDispatchMode::AcceptedTaskResult;
-    }
-}
-
-struct DeferredTaskPostTurnDispatch {
-    runtime: Option<Arc<HookRuntime>>,
-    dispatch: AgentTurnPostTurnHookDispatch,
-}
-
-enum DeferredTaskPostTurnState {
-    Waiting(DeferredTaskPostTurnDispatch),
-    AcceptedBeforeDispatch,
-    Resolved,
-}
-
-#[derive(Default)]
-pub(super) struct DeferredTaskPostTurnDispatchStore {
-    states: AsyncMutex<HashMap<(String, String), DeferredTaskPostTurnState>>,
-}
-
-impl DeferredTaskPostTurnDispatchStore {
-    pub(super) async fn defer(
-        &self,
-        runtime: Option<Arc<HookRuntime>>,
-        dispatch: AgentTurnPostTurnHookDispatch,
-    ) {
-        let Some(key) = dispatch.deferred_task_result_key() else {
-            spawn_agent_turn_post_turn_hook(runtime, dispatch);
-            return;
-        };
-        let pending = DeferredTaskPostTurnDispatch { runtime, dispatch };
-        let ready = {
-            use std::collections::hash_map::Entry;
-
-            let mut states = self.states.lock().await;
-            let ready = match states.entry(key.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(DeferredTaskPostTurnState::Waiting(pending));
-                    None
-                }
-                Entry::Occupied(mut entry) => match entry.get() {
-                    DeferredTaskPostTurnState::AcceptedBeforeDispatch => {
-                        entry.insert(DeferredTaskPostTurnState::Resolved);
-                        Some(pending)
-                    }
-                    DeferredTaskPostTurnState::Waiting(_) | DeferredTaskPostTurnState::Resolved => {
-                        None
-                    }
-                },
-            };
-            prune_deferred_task_post_turn_markers(&mut states, &key);
-            ready
-        };
-        if let Some(ready) = ready {
-            dispatch_accepted_task_result_post_turn(ready);
+    pub(super) fn into_durable_phase_request(mut self) -> Result<HookPhaseRequest, HookIdError> {
+        if self.awaits_task_result_acceptance() {
+            // The durable outbox gate guarantees this request cannot run until
+            // the candidate is accepted. Persist the accepted-result feature
+            // flag now so restart replay builds the exact same hook request.
+            self.context.runtime_context.post_turn_dispatch_mode =
+                AgentTurnPostTurnDispatchMode::AcceptedTaskResult;
         }
+        build_phase_request_with_input(
+            &self.context,
+            HookPhase::TurnPostTurn,
+            &self.policy_set,
+            &self.prompt_context_set,
+            HookInput::turn_post_turn(self.summary.into_hook_input()),
+        )
     }
-
-    pub(super) async fn accept(&self, thread_id: &str, turn_id: &str) {
-        let key = (thread_id.to_owned(), turn_id.to_owned());
-        let ready = {
-            use std::collections::hash_map::Entry;
-
-            let mut states = self.states.lock().await;
-            let ready = match states.entry(key.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(DeferredTaskPostTurnState::AcceptedBeforeDispatch);
-                    None
-                }
-                Entry::Occupied(mut entry) => match entry.get() {
-                    DeferredTaskPostTurnState::Waiting(_) => {
-                        let prior = entry.insert(DeferredTaskPostTurnState::Resolved);
-                        let DeferredTaskPostTurnState::Waiting(pending) = prior else {
-                            unreachable!("waiting state checked before replacement");
-                        };
-                        Some(pending)
-                    }
-                    DeferredTaskPostTurnState::AcceptedBeforeDispatch
-                    | DeferredTaskPostTurnState::Resolved => None,
-                },
-            };
-            prune_deferred_task_post_turn_markers(&mut states, &key);
-            ready
-        };
-        if let Some(ready) = ready {
-            dispatch_accepted_task_result_post_turn(ready);
-        }
-    }
-
-    pub(super) async fn discard(&self, thread_id: &str, turn_id: &str) {
-        let key = (thread_id.to_owned(), turn_id.to_owned());
-        let mut states = self.states.lock().await;
-        states.insert(key.clone(), DeferredTaskPostTurnState::Resolved);
-        prune_deferred_task_post_turn_markers(&mut states, &key);
-    }
-}
-
-fn prune_deferred_task_post_turn_markers(
-    states: &mut HashMap<(String, String), DeferredTaskPostTurnState>,
-    protected_key: &(String, String),
-) {
-    let excess = states
-        .len()
-        .saturating_sub(DEFERRED_TASK_POST_TURN_MARKER_LIMIT);
-    if excess == 0 {
-        return;
-    }
-    let removable = states
-        .iter()
-        .filter_map(|(key, state)| {
-            (key != protected_key && !matches!(state, DeferredTaskPostTurnState::Waiting(_)))
-                .then(|| key.clone())
-        })
-        .take(excess)
-        .collect::<Vec<_>>();
-    for key in removable {
-        states.remove(&key);
-    }
-}
-
-fn dispatch_accepted_task_result_post_turn(mut pending: DeferredTaskPostTurnDispatch) {
-    pending.dispatch.mark_task_result_accepted();
-    spawn_agent_turn_post_turn_hook(pending.runtime, pending.dispatch);
-}
-
-fn spawn_agent_turn_post_turn_hook(
-    runtime: Option<Arc<HookRuntime>>,
-    dispatch: AgentTurnPostTurnHookDispatch,
-) {
-    tokio::spawn(async move {
-        run_agent_turn_post_turn_hook_phase(runtime.as_ref(), dispatch).await;
-    });
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1451,6 +1428,7 @@ pub(super) async fn run_noop_agent_turn_hook_phase(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn run_agent_turn_post_turn_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     dispatch: AgentTurnPostTurnHookDispatch,
@@ -1863,6 +1841,35 @@ fn warn_hook_policy_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
                 "agent turn policy hook phase failed; failing turn"
             );
         }
+        HookRuntimeError::DurablePersistenceUnavailable {
+            phase: error_phase,
+            operation,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                operation = *operation,
+                error_kind = "durable_persistence_unavailable",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::DurableExecutionIncomplete {
+            phase: error_phase,
+            failed_runs,
+            timed_out_runs,
+            incomplete_runs,
+            ..
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                failed_runs,
+                timed_out_runs,
+                incomplete_runs,
+                error_kind = "durable_execution_incomplete",
+                "agent turn policy hook phase failed; failing turn"
+            );
+        }
     }
 }
 
@@ -1994,6 +2001,35 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 error_phase = %error_phase,
                 subscription_count = subscription_ids.len(),
                 error_kind = "dependency_cycle",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::DurablePersistenceUnavailable {
+            phase: error_phase,
+            operation,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                operation = *operation,
+                error_kind = "durable_persistence_unavailable",
+                "agent turn prompt context hook phase failed; continuing with empty context"
+            );
+        }
+        HookRuntimeError::DurableExecutionIncomplete {
+            phase: error_phase,
+            failed_runs,
+            timed_out_runs,
+            incomplete_runs,
+            ..
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                failed_runs,
+                timed_out_runs,
+                incomplete_runs,
+                error_kind = "durable_execution_incomplete",
                 "agent turn prompt context hook phase failed; continuing with empty context"
             );
         }
@@ -2131,6 +2167,35 @@ fn warn_hook_prompt_section_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 "agent turn prompt section hook phase failed; failing turn"
             );
         }
+        HookRuntimeError::DurablePersistenceUnavailable {
+            phase: error_phase,
+            operation,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                operation = *operation,
+                error_kind = "durable_persistence_unavailable",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
+        HookRuntimeError::DurableExecutionIncomplete {
+            phase: error_phase,
+            failed_runs,
+            timed_out_runs,
+            incomplete_runs,
+            ..
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                failed_runs,
+                timed_out_runs,
+                incomplete_runs,
+                error_kind = "durable_execution_incomplete",
+                "agent turn prompt section hook phase failed; failing turn"
+            );
+        }
     }
 }
 
@@ -2262,6 +2327,35 @@ fn warn_hook_runtime_error(phase: HookPhase, error: &HookRuntimeError) {
                 error_phase = %error_phase,
                 subscription_count = subscription_ids.len(),
                 error_kind = "dependency_cycle",
+                "agent turn hook phase failed; continuing"
+            );
+        }
+        HookRuntimeError::DurablePersistenceUnavailable {
+            phase: error_phase,
+            operation,
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                operation = *operation,
+                error_kind = "durable_persistence_unavailable",
+                "agent turn hook phase failed; continuing"
+            );
+        }
+        HookRuntimeError::DurableExecutionIncomplete {
+            phase: error_phase,
+            failed_runs,
+            timed_out_runs,
+            incomplete_runs,
+            ..
+        } => {
+            warn!(
+                phase = %phase,
+                error_phase = %error_phase,
+                failed_runs,
+                timed_out_runs,
+                incomplete_runs,
+                error_kind = "durable_execution_incomplete",
                 "agent turn hook phase failed; continuing"
             );
         }
@@ -2448,78 +2542,28 @@ mod tests {
         assert_eq!(runtime.queued_background_len().expect("queue length"), 0);
     }
 
-    #[tokio::test]
-    async fn duplicate_acceptance_before_deferred_dispatch_releases_post_turn_once() {
+    #[test]
+    fn durable_post_turn_snapshot_rejects_non_idempotent_handler() {
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        let calls = Arc::new(AtomicUsize::new(0));
         handlers
             .register_handler(Arc::new(TestPostTurnBackgroundHook {
-                calls: calls.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
             }))
             .expect("handler registers");
+        let subscription = HookSubscription::new(
+            HookSubscriptionId::new("sub.post_turn.non_idempotent").expect("valid subscription id"),
+            HookId::new("test.post_turn_background").expect("valid hook id"),
+            HookPhase::TurnPostTurn,
+        );
         subscriptions
-            .register_subscription(
-                handlers.as_ref(),
-                HookSubscription::new(
-                    HookSubscriptionId::new("sub.accepted_task_result")
-                        .expect("valid subscription id"),
-                    HookId::new("test.post_turn_background").expect("valid hook id"),
-                    HookPhase::TurnPostTurn,
-                )
-                .with_execution_policy(HookExecutionPolicy {
-                    await_policy: HookAwaitPolicy::Blocking,
-                    timeout_ms: Some(1_000),
-                    max_parallelism: None,
-                })
-                .with_failure_policy(HookFailurePolicy::BestEffort),
-            )
+            .register_subscription(handlers.as_ref(), subscription.clone())
             .expect("subscription registers");
-        let runtime = Arc::new(HookRuntime::new(handlers, subscriptions));
-        let store = DeferredTaskPostTurnDispatchStore::default();
+        let runtime = HookRuntime::new(handlers, subscriptions);
 
-        store.accept("thread-child", "turn-child").await;
-        store.accept("thread-child", "turn-child").await;
-        let dispatch = AgentTurnPostTurnHookDispatch::new(
-            AgentTurnHookContext::with_runtime_context(
-                "workspace",
-                "thread-child",
-                "turn-child",
-                AgentTurnHookRuntimeContext::accepted_result_candidate_in_conversation(
-                    "task-1",
-                    "thread-parent",
-                ),
-            ),
-            EffectiveTurnPolicySet::empty(),
-            EffectiveTurnPromptContextSet::empty(),
-            AgentTurnPostTurnSummary::succeeded_with_model(
-                Some("model".to_owned()),
-                Some("provider".to_owned()),
-                "user".to_owned(),
-                "assistant".to_owned(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        );
-        store.defer(Some(runtime), dispatch).await;
+        let error = DurablePostTurnHookRuntimeSnapshot::capture(&runtime, vec![subscription])
+            .expect_err("durable snapshot must reject a non-idempotent handler");
 
-        for _ in 0..100 {
-            if calls.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "duplicate durable acceptance events must preserve the pending release marker"
-        );
-        store.accept("thread-child", "turn-child").await;
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "acceptance replay after dispatch must remain idempotent"
-        );
+        assert!(error.contains("idempotent_side_effect"));
     }
 }

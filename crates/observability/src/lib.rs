@@ -30,8 +30,12 @@ mod telemetry;
 
 pub use metrics::{
     DatabaseAdmissionMetric, DatabaseOperation, DatabasePoolSnapshot, DatabaseRole,
+    NativeLifecycleDepthKind, NativeLifecycleEventMetric, NativeLifecycleOutcome,
+    NativeLifecycleStage, NativeProviderClass, NativeReadinessComponent, NativeReadinessState,
     PatchOperationMetric, record_database_admission, record_database_operation,
-    record_patch_mutation_fallback, record_patch_operation, register_database_pool_observer,
+    record_native_lifecycle_depth, record_native_lifecycle_event,
+    record_native_readiness_component, record_patch_mutation_fallback, record_patch_operation,
+    register_database_pool_observer,
 };
 pub use operations::{
     GatewayCliRuntimeKind, GatewayOperation, GatewayOperationItemKind, GatewayOperationStage,

@@ -24,6 +24,7 @@ pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub(crate) mod membership;
+pub mod native_terminal_effect_outbox;
 pub mod patch_history;
 pub mod policy;
 pub(crate) mod policy_generation;

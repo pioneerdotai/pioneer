@@ -392,6 +392,13 @@ pub struct MemoryPostTurnExtractorContext {
     pub mode: ThreadMode,
     pub model: Option<String>,
     pub model_provider: Option<String>,
+    pub durable_terminal_effect: Option<MemoryDurableTerminalEffectClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDurableTerminalEffectClaim {
+    pub effect_id: String,
+    pub claim_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

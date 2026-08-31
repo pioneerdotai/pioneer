@@ -14,6 +14,7 @@ pub(super) fn memory_post_turn_extractor_context_from_turn(
     context: &MemoryTurnContext,
     model: Option<String>,
     model_provider: Option<String>,
+    durable_terminal_effect: Option<MemoryDurableTerminalEffectClaim>,
 ) -> MemoryPostTurnExtractorContext {
     MemoryPostTurnExtractorContext {
         workspace_id: context.workspace_id.clone(),
@@ -22,6 +23,47 @@ pub(super) fn memory_post_turn_extractor_context_from_turn(
         mode: context.mode,
         model,
         model_provider,
+        durable_terminal_effect,
+    }
+}
+
+pub(super) fn memory_durable_terminal_effect_claim(
+    context: &pioneer_hooks::HookContext,
+) -> HookResult<Option<MemoryDurableTerminalEffectClaim>> {
+    let effect_key = HookMetadataKey::new("native_terminal_effect_id")
+        .expect("static terminal-effect metadata key is valid");
+    let claim_key = HookMetadataKey::new("native_terminal_effect_claim_token")
+        .expect("static terminal-effect metadata key is valid");
+    let effect_id = match context.metadata.get(&effect_key) {
+        Some(HookValue::Text(value)) if !value.trim().is_empty() => Some(value.trim()),
+        Some(_) => {
+            return Err(memory_hook_error(
+                "memory.post_turn_extractor.invalid_terminal_effect",
+                "memory post-turn extractor received an invalid terminal-effect identity",
+            ));
+        }
+        None => None,
+    };
+    let claim_token = match context.metadata.get(&claim_key) {
+        Some(HookValue::Text(value)) if !value.trim().is_empty() => Some(value.trim()),
+        Some(_) => {
+            return Err(memory_hook_error(
+                "memory.post_turn_extractor.invalid_terminal_effect_claim",
+                "memory post-turn extractor received an invalid terminal-effect claim",
+            ));
+        }
+        None => None,
+    };
+    match (effect_id, claim_token) {
+        (None, None) => Ok(None),
+        (Some(effect_id), Some(claim_token)) => Ok(Some(MemoryDurableTerminalEffectClaim {
+            effect_id: effect_id.to_owned(),
+            claim_token: claim_token.to_owned(),
+        })),
+        _ => Err(memory_hook_error(
+            "memory.post_turn_extractor.incomplete_terminal_effect_claim",
+            "memory post-turn extractor requires a complete terminal-effect claim",
+        )),
     }
 }
 

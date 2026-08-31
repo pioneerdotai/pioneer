@@ -137,6 +137,12 @@ pub enum AgentDurableEvent {
         turn_id: String,
         recovery: RecoveryAttemptContext,
     },
+    /// Immutable terminal side-effect preparation. Gateway persists this
+    /// bounded batch before acknowledging it; the subsequent canonical Turn
+    /// terminal projection atomically makes the current batch runnable.
+    NativeTerminalEffectsPrepared {
+        preparation: NativeTerminalEffectPreparation,
+    },
     TurnCompleted {
         thread_id: String,
         turn_id: String,
@@ -170,6 +176,76 @@ pub enum AgentDurableEvent {
     ThreadLineageCreated {
         lineage: ThreadLineage,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTerminalEffectKind {
+    PostTurnHook,
+    AttachedTaskCleanup,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTerminalEffectGate {
+    TerminalCommit,
+    AcceptedTaskResult,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTerminalEffectPreparationFailure {
+    InvalidHookRequest,
+    HookRuntimeUnavailable,
+    SubscriptionSnapshotUnavailable,
+    HandlerSnapshotUnavailable,
+    SnapshotSerializationFailed,
+    PayloadSerializationFailed,
+    PayloadTooLarge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeTerminalEffectPayload {
+    PostTurnHook {
+        request: JsonValue,
+        /// Versioned immutable subscriptions and handler descriptors captured
+        /// by the Turn. The outbox schema is new, so there is no valid legacy
+        /// row whose execution may fall back to mutable process configuration.
+        runtime_snapshot: JsonValue,
+    },
+    PostTurnHookPreparationFailed {
+        failure: NativeTerminalEffectPreparationFailure,
+    },
+    AttachedTaskCleanup {
+        reason: String,
+        /// Immutable semantic contract of the cleanup adapter captured by the
+        /// originating Turn. A worker may rebind the durable obligation to a
+        /// current provider after restart only when this value matches.
+        runtime_contract: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTerminalEffectSpec {
+    pub effect_id: String,
+    pub effect_kind: NativeTerminalEffectKind,
+    pub gate: NativeTerminalEffectGate,
+    pub payload: NativeTerminalEffectPayload,
+    pub max_attempts: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTerminalEffectPreparation {
+    pub batch_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub runtime_generation: u64,
+    #[serde(default)]
+    pub effects: Vec<NativeTerminalEffectSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
@@ -354,6 +430,9 @@ impl AgentDurableEvent {
             | Self::TurnInterrupted { turn_id, .. } => DurableEventCausalityKey::Turn {
                 turn_id: turn_id.clone(),
             },
+            Self::NativeTerminalEffectsPrepared { preparation } => DurableEventCausalityKey::Turn {
+                turn_id: preparation.turn_id.clone(),
+            },
             Self::TurnPermissionAudit { event } => DurableEventCausalityKey::Turn {
                 turn_id: event.turn_id.clone(),
             },
@@ -419,6 +498,7 @@ impl AgentDurableEvent {
             | Self::TurnPermissionAudit { .. }
             | Self::TurnLlmContextAppended { .. }
             | Self::TurnProviderHistoryAppended { .. }
+            | Self::NativeTerminalEffectsPrepared { .. }
             | Self::ItemStarted { .. }
             | Self::ItemToolRetryScheduled { .. }
             | Self::ItemToolRetryResolved { .. }

@@ -8022,7 +8022,7 @@ async fn resolve_task_child_execution_authorization_context(
         _ => Some(
             processor
                 .provider_registry()
-                .authority_fingerprint_for_workspace(task.workspace_id.as_str(), provider)
+                .authority_fingerprint_for_workspace(task.workspace_id.as_str(), provider)?
                 .as_str()
                 .to_owned(),
         ),

@@ -59,8 +59,10 @@ pub use agent_authorship::{
 };
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ItemHeartbeatSource,
-    ProgressCoalescingKey, ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent,
-    ToolResultView, TurnAcceptedCapability, TurnCapabilityAcceptedReason,
+    NativeTerminalEffectGate, NativeTerminalEffectKind, NativeTerminalEffectPayload,
+    NativeTerminalEffectPreparation, NativeTerminalEffectPreparationFailure,
+    NativeTerminalEffectSpec, ProgressCoalescingKey, ProtocolEventClass, RecoveryAttemptContext,
+    SkillAuditEvent, ToolResultView, TurnAcceptedCapability, TurnCapabilityAcceptedReason,
     TurnCapabilityRejectedReason, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
     TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnRejectedCapability,
     TurnSkillBinding,
@@ -168,7 +170,9 @@ pub use client_projection::{
     CrossThreadSourceVisibility, SafeExecutionProfileMetadata, SafeRouteProvenance,
 };
 pub use gateway_endpoint::{
-    DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError, GatewayReadinessSnapshot,
+    DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError,
+    GatewayNativeLifecycleReadinessReport, GatewayReadinessComponent,
+    GatewayReadinessComponentSnapshot, GatewayReadinessComponentState, GatewayReadinessSnapshot,
     GatewayReadinessStatus, GatewayTransportSecurity, PIONEER_PROTOCOL_VERSION,
     PIONEER_PROTOCOL_VERSION_HEADER, PIONEER_PROTOCOL_VERSION_NUMBER, canonical_storage_path,
 };

@@ -22,6 +22,31 @@ const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
 
+fn remove_agent_listener_task_if_generation(
+    listeners: &mut HashMap<String, AgentListenerTask>,
+    thread_id: &str,
+    listener_generation: u64,
+) -> bool {
+    let owned = listeners
+        .get(thread_id)
+        .is_some_and(|listener| listener.listener_generation == listener_generation);
+    if owned {
+        listeners.remove(thread_id);
+    }
+    owned
+}
+
+async fn abort_agent_listener_task_and_wait(mut listener: AgentListenerTask) -> Result<()> {
+    listener.handle.abort();
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut listener.handle)
+        .await
+        .is_err()
+    {
+        bail!("stale native durable listener did not stop within its replacement deadline");
+    }
+    Ok(())
+}
+
 enum TitleAttemptOutcome {
     Succeeded,
     EmptyTitle,
@@ -267,6 +292,9 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { thread_id, .. }
         | AgentDurableEvent::TurnBlocked { thread_id, .. }
         | AgentDurableEvent::TurnInterrupted { thread_id, .. } => Some(thread_id.as_str()),
+        AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
+            Some(preparation.thread_id.as_str())
+        }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.thread_id.as_str()),
         AgentDurableEvent::ItemStarted { notification } => Some(notification.thread_id.as_str()),
         AgentDurableEvent::ItemCompleted { notification }
@@ -320,6 +348,9 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { turn_id, .. }
         | AgentDurableEvent::TurnBlocked { turn_id, .. }
         | AgentDurableEvent::TurnInterrupted { turn_id, .. } => Some(turn_id.as_str()),
+        AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
+            Some(preparation.turn_id.as_str())
+        }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.turn_id.as_str()),
         AgentDurableEvent::ItemStarted { notification } => Some(notification.turn_id.as_str()),
         AgentDurableEvent::ItemCompleted { notification }
@@ -356,6 +387,34 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         AgentDurableEvent::TaskEvent { .. } | AgentDurableEvent::ThreadLineageCreated { .. } => {
             None
         }
+    }
+}
+
+fn native_lifecycle_event_metric(
+    event: &AgentDurableEvent,
+) -> Option<(
+    pioneer_observability::NativeLifecycleStage,
+    pioneer_observability::NativeLifecycleOutcome,
+)> {
+    use pioneer_observability::{NativeLifecycleOutcome as Outcome, NativeLifecycleStage as Stage};
+    match event {
+        AgentDurableEvent::ItemToolRetryScheduled { .. } => {
+            Some((Stage::ToolRetry, Outcome::Started))
+        }
+        AgentDurableEvent::ItemToolRetryResolved { .. } => {
+            Some((Stage::ToolRetry, Outcome::Recovered))
+        }
+        AgentDurableEvent::ItemToolRetryExhausted { .. } => {
+            Some((Stage::ToolRetry, Outcome::Exhausted))
+        }
+        AgentDurableEvent::NativeTerminalEffectsPrepared { .. } => {
+            Some((Stage::Terminalization, Outcome::Started))
+        }
+        AgentDurableEvent::TurnCompleted { .. } => Some((Stage::Turn, Outcome::Succeeded)),
+        AgentDurableEvent::TurnFailed { .. } => Some((Stage::Turn, Outcome::Failed)),
+        AgentDurableEvent::TurnBlocked { .. } => Some((Stage::Turn, Outcome::Blocked)),
+        AgentDurableEvent::TurnInterrupted { .. } => Some((Stage::Turn, Outcome::Interrupted)),
+        _ => None,
     }
 }
 
@@ -615,42 +674,6 @@ impl MessageProcessor {
     }
 
     pub(super) async fn ensure_agent_listener_task(&self, thread_id: &str) -> Result<()> {
-        // Keep reservation, receiver lease, and handle publication under one
-        // lock. Concurrent start/recovery/supervisor callers must observe the
-        // same listener rather than letting the loser mistake an already leased
-        // healthy receiver for a fatal closed lane.
-        let mut listeners = self.agent_listener_tasks.lock().await;
-        let has_live_listener = listeners
-            .get(thread_id)
-            .is_some_and(|handle| !handle.is_finished());
-        // A stale actor replacement creates a fresh AgentEventHub while the
-        // old listener may still be draining the old hub.  A live listener is
-        // therefore not sufficient proof that the current hub is leased. If
-        // the current hub offers a receiver, fence the old listener and lease
-        // the new generation under the same mutex.
-        let replacement_receiver = if has_live_listener {
-            let receiver = self.agent_manager.take_durable_receiver(thread_id).await;
-            if receiver.is_none() {
-                return Ok(());
-            }
-            if let Some(handle) = listeners.remove(thread_id) {
-                handle.abort();
-            }
-            receiver
-        } else {
-            listeners.remove(thread_id);
-            None
-        };
-
-        let Some(mut durable_receiver) = (match replacement_receiver {
-            Some(receiver) => Some(receiver),
-            None => self.agent_manager.take_durable_receiver(thread_id).await,
-        }) else {
-            bail!("native durable listener receiver is already leased for thread `{thread_id}`");
-        };
-
-        let mut live_receiver = self.agent_manager.subscribe_progress(thread_id).await;
-
         let this = self.task_agent_executor.processor_weak().ok();
         #[cfg(test)]
         let raw_this = (!this.is_some()).then_some(self as *const MessageProcessor as usize);
@@ -658,6 +681,43 @@ impl MessageProcessor {
         if this.is_none() {
             bail!("task agent executor is not bound");
         }
+
+        // Keep reservation, receiver lease, and handle publication under one
+        // lock. Concurrent start/recovery/supervisor callers must observe the
+        // same listener rather than letting the loser mistake an already leased
+        // healthy receiver for a fatal closed lane.
+        let mut listeners = self.agent_listener_tasks.lock().await;
+        let current_actor_generation = self
+            .agent_manager
+            .thread_generation(thread_id)
+            .await
+            .with_context(|| format!("native actor is missing for thread `{thread_id}`"))?;
+        if listeners.get(thread_id).is_some_and(|listener| {
+            listener.actor_generation == current_actor_generation && !listener.handle.is_finished()
+        }) {
+            return Ok(());
+        }
+        if let Some(stale) = listeners.remove(thread_id) {
+            abort_agent_listener_task_and_wait(stale)
+                .await
+                .with_context(|| {
+                    format!("failed to retire stale native listener for thread `{thread_id}`")
+                })?;
+        }
+
+        let Some((actor_generation, mut durable_receiver)) = self
+            .agent_manager
+            .take_durable_receiver_with_generation(thread_id)
+            .await
+        else {
+            bail!("native durable listener receiver is already leased for thread `{thread_id}`");
+        };
+        let listener_generation = self
+            .agent_listener_generation
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mut live_receiver = self.agent_manager.subscribe_progress(thread_id).await;
+
         let thread_id_owned = thread_id.to_owned();
         let handle = tokio::spawn(async move {
             loop {
@@ -667,7 +727,11 @@ impl MessageProcessor {
                         let Some(event) = durable else {
                             break;
                         };
-                        let committed = match AssertUnwindSafe(async {
+                        let terminal_event = terminal_durable_event_turn_id(&event).is_some();
+                        let terminal_enqueue_age =
+                            durable_receiver.pending_enqueue_age().unwrap_or_default();
+                        let projection_started = Instant::now();
+                        let (committed, listener_failed) = match AssertUnwindSafe(async {
                             if let Some(weak) = &this {
                                 let Some(this) = weak.upgrade() else { return false; };
                                 this.handle_durable_agent_event(event).await
@@ -681,20 +745,47 @@ impl MessageProcessor {
                         .catch_unwind()
                         .await
                         {
-                            Ok(committed) => committed,
+                            Ok(committed) => (committed, false),
                             Err(_) => {
                                 warn!(
                                     thread_id = %thread_id_owned,
                                     "contained panic while projecting durable agent event"
                                 );
-                                false
+                                (false, true)
                             }
                         };
+                        if terminal_event {
+                            pioneer_observability::record_native_lifecycle_event(
+                                pioneer_observability::NativeLifecycleEventMetric {
+                                    stage: pioneer_observability::NativeLifecycleStage::TerminalCommit,
+                                    outcome: if committed {
+                                        pioneer_observability::NativeLifecycleOutcome::Succeeded
+                                    } else {
+                                        pioneer_observability::NativeLifecycleOutcome::Failed
+                                    },
+                                    provider_class: pioneer_observability::NativeProviderClass::Api,
+                                    elapsed: Some(
+                                        terminal_enqueue_age.saturating_add(projection_started.elapsed()),
+                                    ),
+                                },
+                            );
+                        }
                         durable_receiver.acknowledge_last(if committed {
                             Ok(())
                         } else {
                             Err("gateway failed to commit durable agent event".to_owned())
                         });
+                        if listener_failed {
+                            pioneer_observability::record_native_lifecycle_event(
+                                pioneer_observability::NativeLifecycleEventMetric {
+                                    stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                                    outcome: pioneer_observability::NativeLifecycleOutcome::Closed,
+                                    provider_class: pioneer_observability::NativeProviderClass::Api,
+                                    elapsed: None,
+                                },
+                            );
+                            break;
+                        }
                     }
                     live = async {
                         match live_receiver.as_mut() {
@@ -724,6 +815,14 @@ impl MessageProcessor {
                                 }
                             }
                             Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                                pioneer_observability::record_native_lifecycle_event(
+                                    pioneer_observability::NativeLifecycleEventMetric {
+                                        stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                                        outcome: pioneer_observability::NativeLifecycleOutcome::Saturated,
+                                        provider_class: pioneer_observability::NativeProviderClass::Api,
+                                        elapsed: None,
+                                    },
+                                );
                                 warn!(
                                     thread_id = %thread_id_owned,
                                     skipped,
@@ -738,14 +837,23 @@ impl MessageProcessor {
                 }
             }
             if let Some(this) = this.and_then(|weak| weak.upgrade()) {
-                this.agent_listener_tasks
-                    .lock()
-                    .await
-                    .remove(thread_id_owned.as_str());
+                let mut listeners = this.agent_listener_tasks.lock().await;
+                remove_agent_listener_task_if_generation(
+                    &mut listeners,
+                    thread_id_owned.as_str(),
+                    listener_generation,
+                );
             }
         });
 
-        listeners.insert(thread_id.to_owned(), handle);
+        listeners.insert(
+            thread_id.to_owned(),
+            AgentListenerTask {
+                actor_generation,
+                listener_generation,
+                handle,
+            },
+        );
         Ok(())
     }
 
@@ -936,8 +1044,14 @@ impl MessageProcessor {
     }
 
     pub(super) async fn teardown_agent_thread(&self, thread_id: &str) {
-        if let Some(listener_handle) = self.agent_listener_tasks.lock().await.remove(thread_id) {
-            listener_handle.abort();
+        if let Some(listener) = self.agent_listener_tasks.lock().await.remove(thread_id) {
+            if let Err(error) = abort_agent_listener_task_and_wait(listener).await {
+                warn!(
+                    thread_id,
+                    error = %format!("{error:#}"),
+                    "native durable listener did not stop cleanly during thread teardown"
+                );
+            }
         }
         self.agent_manager.remove_thread(thread_id).await;
         let prefix = format!("{thread_id}:");
@@ -992,16 +1106,65 @@ impl MessageProcessor {
             } => self.handle_turn_skills_resolved_event(thread_id, turn_id, bindings),
             event => message_future(async move {
                 let thread_id = durable_event_thread_id(&event).map(str::to_owned);
+                let turn_id = durable_event_turn_id(&event).map(str::to_owned);
                 let terminal_turn_id = terminal_durable_event_turn_id(&event).map(str::to_owned);
+                let lifecycle_event = native_lifecycle_event_metric(&event);
                 if let Some(turn_id) = durable_event_turn_id(&event)
                     && self.guard_execution_commit(turn_id).await.is_err()
                 {
+                    pioneer_observability::record_native_lifecycle_event(
+                        pioneer_observability::NativeLifecycleEventMetric {
+                            stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                            outcome: pioneer_observability::NativeLifecycleOutcome::Rejected,
+                            provider_class: pioneer_observability::NativeProviderClass::Api,
+                            elapsed: None,
+                        },
+                    );
                     return false;
                 }
+                let commit_started = Instant::now();
                 let committed = self.persist_durable_agent_event(event.clone()).await;
+                pioneer_observability::record_native_lifecycle_event(
+                    pioneer_observability::NativeLifecycleEventMetric {
+                        stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                        outcome: if committed {
+                            pioneer_observability::NativeLifecycleOutcome::Succeeded
+                        } else {
+                            pioneer_observability::NativeLifecycleOutcome::Failed
+                        },
+                        provider_class: pioneer_observability::NativeProviderClass::Api,
+                        elapsed: Some(commit_started.elapsed()),
+                    },
+                );
                 if committed {
+                    if let Some((stage, outcome)) = lifecycle_event {
+                        pioneer_observability::record_native_lifecycle_event(
+                            pioneer_observability::NativeLifecycleEventMetric {
+                                stage,
+                                outcome,
+                                provider_class: pioneer_observability::NativeProviderClass::Api,
+                                elapsed: None,
+                            },
+                        );
+                    }
                     if let Some(turn_id) = terminal_turn_id.as_deref() {
                         self.execution_leases.finish(turn_id).await;
+                    }
+                    if let (Some(thread_id), Some(turn_id)) =
+                        (thread_id.as_deref(), turn_id.as_deref())
+                        && let Some(elapsed) = self
+                            .agent_manager
+                            .observe_first_durable_event_latency(thread_id, turn_id)
+                            .await
+                    {
+                        pioneer_observability::record_native_lifecycle_event(
+                            pioneer_observability::NativeLifecycleEventMetric {
+                                stage: pioneer_observability::NativeLifecycleStage::FirstEvent,
+                                outcome: pioneer_observability::NativeLifecycleOutcome::Succeeded,
+                                provider_class: pioneer_observability::NativeProviderClass::Api,
+                                elapsed: Some(elapsed),
+                            },
+                        );
                     }
                     self.kick_native_turn_event_deliveries();
                     if let Some(thread_id) = thread_id {
@@ -1022,7 +1185,16 @@ impl MessageProcessor {
         bindings: Vec<pioneer_protocol::TurnSkillBinding>,
     ) -> MessageFuture<'a, bool> {
         message_future(async move {
+            let commit_started = Instant::now();
             if self.guard_execution_commit(turn_id.as_str()).await.is_err() {
+                pioneer_observability::record_native_lifecycle_event(
+                    pioneer_observability::NativeLifecycleEventMetric {
+                        stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                        outcome: pioneer_observability::NativeLifecycleOutcome::Rejected,
+                        provider_class: pioneer_observability::NativeProviderClass::Api,
+                        elapsed: Some(commit_started.elapsed()),
+                    },
+                );
                 return false;
             }
             if let Err(error) = self
@@ -1038,6 +1210,14 @@ impl MessageProcessor {
                     turn_id,
                     error = %format!("{error:#}"),
                     "failed to confirm Agent skill exposure before provider execution"
+                );
+                pioneer_observability::record_native_lifecycle_event(
+                    pioneer_observability::NativeLifecycleEventMetric {
+                        stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                        outcome: pioneer_observability::NativeLifecycleOutcome::Failed,
+                        provider_class: pioneer_observability::NativeProviderClass::Api,
+                        elapsed: Some(commit_started.elapsed()),
+                    },
                 );
                 return false;
             }
@@ -1055,7 +1235,37 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to persist and authorize exact turn skill projection"
                 );
+                pioneer_observability::record_native_lifecycle_event(
+                    pioneer_observability::NativeLifecycleEventMetric {
+                        stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                        outcome: pioneer_observability::NativeLifecycleOutcome::Failed,
+                        provider_class: pioneer_observability::NativeProviderClass::Api,
+                        elapsed: Some(commit_started.elapsed()),
+                    },
+                );
                 return false;
+            }
+            pioneer_observability::record_native_lifecycle_event(
+                pioneer_observability::NativeLifecycleEventMetric {
+                    stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                    outcome: pioneer_observability::NativeLifecycleOutcome::Succeeded,
+                    provider_class: pioneer_observability::NativeProviderClass::Api,
+                    elapsed: Some(commit_started.elapsed()),
+                },
+            );
+            if let Some(elapsed) = self
+                .agent_manager
+                .observe_first_durable_event_latency(thread_id.as_str(), turn_id.as_str())
+                .await
+            {
+                pioneer_observability::record_native_lifecycle_event(
+                    pioneer_observability::NativeLifecycleEventMetric {
+                        stage: pioneer_observability::NativeLifecycleStage::FirstEvent,
+                        outcome: pioneer_observability::NativeLifecycleOutcome::Succeeded,
+                        provider_class: pioneer_observability::NativeProviderClass::Api,
+                        elapsed: Some(elapsed),
+                    },
+                );
             }
             let committed_event = AgentDurableEvent::TurnSkillsResolved {
                 thread_id: thread_id.clone(),
@@ -1851,6 +2061,62 @@ impl MessageProcessor {
         });
     }
 
+    /// Wake durable terminal work without lending handler latency to the
+    /// process-wide resilience loop. One bounded claim wave runs at a time;
+    /// terminal commits and the periodic worker provide subsequent kicks.
+    pub(super) fn kick_native_terminal_effects(&self) {
+        // Retain a wakeup that arrives while the bounded worker is already
+        // running. Without this bit, a terminal commit racing an earlier
+        // preparation kick can leave a newly eligible effect asleep until the
+        // periodic recovery sweep.
+        self.native_terminal_effect_kick_pending
+            .store(true, Ordering::Release);
+        if self
+            .native_terminal_effect_kick_running
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                this.native_terminal_effect_kick_pending
+                    .store(false, Ordering::Release);
+                if let Err(error) = this
+                    .process_due_native_terminal_effects(now_timestamp_secs(), 8)
+                    .await
+                {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        "native terminal-effect kick failed"
+                    );
+                }
+
+                if this
+                    .native_terminal_effect_kick_pending
+                    .load(Ordering::Acquire)
+                {
+                    continue;
+                }
+
+                this.native_terminal_effect_kick_running
+                    .store(false, Ordering::Release);
+                // Close the release/reacquire race: a caller that published a
+                // wake immediately before `running` became false observed the
+                // old true value and did not spawn a replacement worker.
+                if !this
+                    .native_terminal_effect_kick_pending
+                    .swap(false, Ordering::AcqRel)
+                    || this
+                        .native_terminal_effect_kick_running
+                        .swap(true, Ordering::AcqRel)
+                {
+                    break;
+                }
+            }
+        });
+    }
+
     async fn persist_native_patch_history(
         &self,
         thread_id: &str,
@@ -2212,6 +2478,12 @@ impl MessageProcessor {
         event_timestamp_secs: i64,
         item_started_deadlines: Option<pioneer_crud::TurnItemAttemptDeadlines>,
     ) -> Result<()> {
+        let activates_terminal_effects = matches!(
+            &event,
+            pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(_)
+                | pioneer_crud::CanonicalTurnEventPayload::TurnFailed(_)
+                | pioneer_crud::CanonicalTurnEventPayload::TurnBlocked(_)
+        );
         let crud_store = Arc::clone(&self.crud_store);
         let turn_execution_owner_id = Arc::clone(&self.turn_execution_owner_id);
         // Projection is one durable transaction, but it is reached from several
@@ -2239,6 +2511,9 @@ impl MessageProcessor {
         match result {
             Ok(()) => {
                 self.kick_native_turn_event_deliveries();
+                if activates_terminal_effects {
+                    self.kick_native_terminal_effects();
+                }
                 Ok(())
             }
             Err(error) if pioneer_crud::turn_event_was_appended_before_error(&error) => {
@@ -2246,6 +2521,9 @@ impl MessageProcessor {
                 // predecessor backlog is recoverable projection work and must
                 // neither reject the producer ACK nor start a second execution.
                 self.kick_native_turn_event_deliveries();
+                if activates_terminal_effects {
+                    self.kick_native_terminal_effects();
+                }
                 warn!(
                     error = %format!("{error:#}"),
                     "native event committed while its ordered projection remains pending"
@@ -3390,6 +3668,26 @@ impl MessageProcessor {
                             return false;
                         }
                     } else if !self.mark_turn_blocked(thread_id, turn_id, reason).await {
+                        return false;
+                    }
+                    true
+                })
+            }
+            AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
+                message_future(async move {
+                    let thread_id = preparation.thread_id.clone();
+                    let turn_id = preparation.turn_id.clone();
+                    if let Err(error) = self
+                        .crud_store
+                        .prepare_native_terminal_effects(preparation, now_timestamp_secs())
+                        .await
+                    {
+                        warn!(
+                            thread_id,
+                            turn_id,
+                            error = %format!("{error:#}"),
+                            "failed to persist native terminal-effect preparation"
+                        );
                         return false;
                     }
                     true
@@ -4565,12 +4863,22 @@ impl MessageProcessor {
         if !self.agent_manager.has_thread(thread_id.as_str()).await {
             return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
         }
-        let Some(observation) = self
+        let observation = match self
             .agent_manager
             .observe_turn(thread_id.as_str(), turn_id)
             .await
-        else {
-            return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
+        {
+            Ok(Some(observation)) => observation,
+            Ok(None) => return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable),
+            Err(error) => {
+                debug!(
+                    thread_id,
+                    turn_id,
+                    error = %error,
+                    "native runtime control-plane observation is unavailable"
+                );
+                return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
+            }
         };
         self.ensure_agent_listener_task(thread_id.as_str()).await?;
         if observation.status != pioneer_agent::ExecutionTurnStatus::InProgress {
@@ -4770,11 +5078,23 @@ impl MessageProcessor {
             }
             .await;
             let applied = match resume {
-                Ok(resume) => {
-                    self.crud_store
-                        .apply_claimed_recovery_terminalization(&record, resume, now_unix)
-                        .await
-                }
+                Ok(resume) => match self.agent_manager.terminal_cleanup_runtime_binding().await {
+                    Ok((runtime_generation, runtime_contract)) => {
+                        let cleanup_plan = pioneer_crud::RecoveryTerminalCleanupPlan {
+                            runtime_generation,
+                            runtime_contract,
+                        };
+                        self.crud_store
+                            .apply_claimed_recovery_terminalization(
+                                &record,
+                                resume,
+                                cleanup_plan,
+                                now_unix,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(anyhow::anyhow!(error)),
+                },
                 Err(error) => Err(error),
             };
             match applied {
@@ -4823,6 +5143,147 @@ impl MessageProcessor {
         Ok(count)
     }
 
+    pub(super) async fn process_due_native_terminal_effects(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<u64> {
+        const CLAIM_LEASE_SECS: u64 = 90;
+        const MAX_CONCURRENCY: usize = 8;
+        const POST_TURN_TIMEOUT_SECS: u64 = 60;
+        const CLEANUP_TIMEOUT_SECS: u64 = 15;
+
+        let records = self
+            .crud_store
+            .claim_due_native_terminal_effects(
+                now_unix,
+                CLAIM_LEASE_SECS,
+                limit.min(MAX_CONCURRENCY as u64),
+            )
+            .await?;
+        let count = records.len() as u64;
+        futures_util::stream::iter(records)
+            .for_each_concurrent(MAX_CONCURRENCY, |record| async move {
+                let effect_started = Instant::now();
+                let timeout_secs = match &record.payload {
+                    pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { .. } => {
+                        POST_TURN_TIMEOUT_SECS
+                    }
+                    pioneer_protocol::NativeTerminalEffectPayload::PostTurnHookPreparationFailed {
+                        ..
+                    } => POST_TURN_TIMEOUT_SECS,
+                    pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup { .. } => {
+                        CLEANUP_TIMEOUT_SECS
+                    }
+                };
+                let execution = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    self.agent_manager.execute_terminal_effect(
+                        record.effect_id.as_str(),
+                        record.claim_token.as_str(),
+                        record.runtime_generation,
+                        record.workspace_id.as_str(),
+                        record.thread_id.as_str(),
+                        record.turn_id.as_str(),
+                        record.payload,
+                    ),
+                )
+                .await;
+                match execution {
+                    Ok(Ok(())) => {
+                        pioneer_observability::record_native_lifecycle_event(
+                            pioneer_observability::NativeLifecycleEventMetric {
+                                stage: pioneer_observability::NativeLifecycleStage::Terminalization,
+                                outcome: pioneer_observability::NativeLifecycleOutcome::Succeeded,
+                                provider_class: pioneer_observability::NativeProviderClass::Api,
+                                elapsed: Some(effect_started.elapsed()),
+                            },
+                        );
+                        match self
+                            .crud_store
+                            .complete_native_terminal_effect(
+                                record.effect_id.as_str(),
+                                record.claim_token.as_str(),
+                                chrono::Utc::now().timestamp(),
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => warn!(
+                                effect_id = record.effect_id,
+                                turn_id = record.turn_id,
+                                "native terminal-effect success lost its claim fence"
+                            ),
+                            Err(error) => warn!(
+                                effect_id = record.effect_id,
+                                turn_id = record.turn_id,
+                                error = %format!("{error:#}"),
+                                "failed to persist native terminal-effect success"
+                            ),
+                        }
+                    }
+                    outcome => {
+                        pioneer_observability::record_native_lifecycle_event(
+                            pioneer_observability::NativeLifecycleEventMetric {
+                                stage: pioneer_observability::NativeLifecycleStage::Terminalization,
+                                outcome: if outcome.is_err() {
+                                    pioneer_observability::NativeLifecycleOutcome::TimedOut
+                                } else {
+                                    pioneer_observability::NativeLifecycleOutcome::Failed
+                                },
+                                provider_class: pioneer_observability::NativeProviderClass::Api,
+                                elapsed: Some(effect_started.elapsed()),
+                            },
+                        );
+                        let (code, message, retryable) = match outcome {
+                            Ok(Err(error)) => {
+                                (error.code(), error.to_string(), error.retryable())
+                            }
+                            Err(_) => (
+                                "effect_timeout",
+                                format!(
+                                    "native terminal effect exceeded its {timeout_secs}s execution deadline"
+                                ),
+                                true,
+                            ),
+                            Ok(Ok(())) => unreachable!("success handled above"),
+                        };
+                        let completed_at = chrono::Utc::now().timestamp();
+                        let exponent = u32::from(record.attempt_count.saturating_sub(1)).min(8);
+                        let retry_delay = 1_i64.checked_shl(exponent).unwrap_or(256).min(300);
+                        match self
+                            .crud_store
+                            .fail_native_terminal_effect(
+                                record.effect_id.as_str(),
+                                record.claim_token.as_str(),
+                                code,
+                                message.as_str(),
+                                retryable,
+                                completed_at.saturating_add(retry_delay),
+                                completed_at,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => warn!(
+                                effect_id = record.effect_id,
+                                turn_id = record.turn_id,
+                                "native terminal-effect failure lost its claim fence"
+                            ),
+                            Err(error) => warn!(
+                                effect_id = record.effect_id,
+                                turn_id = record.turn_id,
+                                error = %format!("{error:#}"),
+                                "failed to persist native terminal-effect failure"
+                            ),
+                        }
+                    }
+                }
+            })
+            .await;
+        Ok(count)
+    }
+
     /// Completes prepared provider outcomes and synchronizes any loaded
     /// in-memory Turn from the authoritative transaction. Bootstrap performs
     /// the same database repair before threads are loaded; this path covers a
@@ -4862,7 +5323,22 @@ impl MessageProcessor {
         event_timestamp: i64,
     ) -> MessageFuture<'a, bool> {
         message_future(async move {
-            match event {
+            use pioneer_observability::NativeLifecycleOutcome as Outcome;
+
+            let expected_outcome = match &event {
+                crate::resilience::RecoveryCoordinatorEvent::RecoverySucceeded { .. } => {
+                    Outcome::Recovered
+                }
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked { .. } => {
+                    Outcome::Blocked
+                }
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryExhausted(_) => {
+                    Outcome::Exhausted
+                }
+                _ => Outcome::Started,
+            };
+            let started = Instant::now();
+            let committed = match event {
                 crate::resilience::RecoveryCoordinatorEvent::RecoveryOpened {
                     job_id,
                     turn_id,
@@ -5002,7 +5478,20 @@ impl MessageProcessor {
                     message_future(self.handle_recovery_exhausted_event(outcome, event_timestamp))
                         .await
                 }
-            }
+            };
+            pioneer_observability::record_native_lifecycle_event(
+                pioneer_observability::NativeLifecycleEventMetric {
+                    stage: pioneer_observability::NativeLifecycleStage::Recovery,
+                    outcome: if committed {
+                        expected_outcome
+                    } else {
+                        Outcome::Failed
+                    },
+                    provider_class: pioneer_observability::NativeProviderClass::Unknown,
+                    elapsed: Some(started.elapsed()),
+                },
+            );
+            committed
         })
     }
 
@@ -5994,6 +6483,10 @@ impl MessageProcessor {
         turn_id: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        let terminal_actor_generation = self
+            .agent_manager
+            .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
+            .await;
         if let Some((workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
@@ -6230,9 +6723,15 @@ impl MessageProcessor {
                 .unload_orphaned_thread_if_idle(thread_id.as_str())
                 .await
         {
-            self.agent_manager
-                .retire_thread_after_terminal_commit(thread_id.as_str())
-                .await;
+            if let Some(terminal_actor_generation) = terminal_actor_generation {
+                self.agent_manager
+                    .retire_thread_after_terminal_commit(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        terminal_actor_generation,
+                    )
+                    .await;
+            }
         }
         true
     }
@@ -6648,6 +7147,10 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
     ) -> bool {
+        let terminal_actor_generation = self
+            .agent_manager
+            .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
+            .await;
         let turn_loaded_in_memory = if let Some((_workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
@@ -6870,9 +7373,15 @@ impl MessageProcessor {
                 .unload_orphaned_thread_if_idle(thread_id.as_str())
                 .await
         {
-            self.agent_manager
-                .retire_thread_after_terminal_commit(thread_id.as_str())
-                .await;
+            if let Some(terminal_actor_generation) = terminal_actor_generation {
+                self.agent_manager
+                    .retire_thread_after_terminal_commit(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        terminal_actor_generation,
+                    )
+                    .await;
+            }
         }
 
         true
@@ -7182,6 +7691,10 @@ impl MessageProcessor {
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
         user_cancellation: bool,
     ) -> bool {
+        let terminal_actor_generation = self
+            .agent_manager
+            .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
+            .await;
         if let Some((workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
@@ -7439,9 +7952,15 @@ impl MessageProcessor {
                 .unload_orphaned_thread_if_idle(thread_id.as_str())
                 .await
         {
-            self.agent_manager
-                .retire_thread_after_terminal_commit(thread_id.as_str())
-                .await;
+            if let Some(terminal_actor_generation) = terminal_actor_generation {
+                self.agent_manager
+                    .retire_thread_after_terminal_commit(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        terminal_actor_generation,
+                    )
+                    .await;
+            }
         }
         true
     }
@@ -7453,6 +7972,10 @@ impl MessageProcessor {
         error_message: String,
         recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
     ) -> bool {
+        let terminal_actor_generation = self
+            .agent_manager
+            .turn_owner_generation(thread_id.as_str(), turn_id.as_str())
+            .await;
         if let Some((workspace_id, current_turn)) = self
             .thread_manager
             .turn_get(thread_id.as_str(), turn_id.as_str())
@@ -7664,9 +8187,15 @@ impl MessageProcessor {
                 .unload_orphaned_thread_if_idle(thread_id.as_str())
                 .await
         {
-            self.agent_manager
-                .retire_thread_after_terminal_commit(thread_id.as_str())
-                .await;
+            if let Some(terminal_actor_generation) = terminal_actor_generation {
+                self.agent_manager
+                    .retire_thread_after_terminal_commit(
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        terminal_actor_generation,
+                    )
+                    .await;
+            }
         }
         true
     }
@@ -8170,6 +8699,74 @@ fn has_native_patch_projection_source(
     status_ordinal: Option<pioneer_tools::apply_patch::history::CommitOrdinal>,
 ) -> bool {
     existing_projection || record_count != 0 || status_ordinal.is_some()
+}
+
+#[cfg(test)]
+mod listener_registry_tests {
+    use super::*;
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_listener_releases_owned_lease_before_replacement() {
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let lease = DropSignal(Some(released_tx));
+        let listener = AgentListenerTask {
+            actor_generation: 9,
+            listener_generation: 21,
+            handle: tokio::spawn(async move {
+                let _lease = lease;
+                std::future::pending::<()>().await;
+            }),
+        };
+
+        abort_agent_listener_task_and_wait(listener)
+            .await
+            .expect("aborted listener should join before replacement");
+        released_rx
+            .await
+            .expect("joining the listener must release its receiver lease");
+    }
+
+    #[tokio::test]
+    async fn stale_listener_completion_cannot_remove_replacement_generation() {
+        let mut listeners = HashMap::new();
+        listeners.insert(
+            "thread-listener-generation".to_owned(),
+            AgentListenerTask {
+                actor_generation: 9,
+                listener_generation: 22,
+                handle: tokio::spawn(async {}),
+            },
+        );
+
+        assert!(!remove_agent_listener_task_if_generation(
+            &mut listeners,
+            "thread-listener-generation",
+            21,
+        ));
+        assert_eq!(
+            listeners
+                .get("thread-listener-generation")
+                .map(|listener| (listener.actor_generation, listener.listener_generation)),
+            Some((9, 22)),
+            "completion of listener 21 must leave replacement listener 22 visible"
+        );
+        assert!(remove_agent_listener_task_if_generation(
+            &mut listeners,
+            "thread-listener-generation",
+            22,
+        ));
+        assert!(listeners.is_empty());
+    }
 }
 
 #[cfg(test)]

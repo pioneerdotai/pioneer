@@ -2078,6 +2078,7 @@ async fn dispatch_agent_action_outbox_row(
         .agent_manager
         .observe_turn(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
         .await
+        .map_err(|error| anyhow::anyhow!("native control-plane observation failed: {error}"))?
         .is_some()
     {
         return Ok(AgentActionOutboxDispatch::Delivered);
@@ -2683,7 +2684,13 @@ impl AgentActionToolHandler {
                     self.context.workspace_id.as_str(),
                     child.grant.profile.provider_id.as_str(),
                 )
-        });
+        })
+        .transpose()
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "child provider authority could not be resolved: {error:#}"
+            ))
+        })?;
         let child_authority = parent_authority
             .derive_agent_continuation(
                 child.grant.home_root_thread_id.as_str(),

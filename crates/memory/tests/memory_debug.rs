@@ -577,6 +577,7 @@ async fn memory_debug_inspects_recall_hook_audit_trace() {
     store
         .append_hook_audit_events(
             vec![NewHookAuditEventRecord {
+                id: None,
                 hook_run_id: run.id.clone(),
                 hook_run_attempt_id: None,
                 subscription_id: run.subscription_id.clone(),

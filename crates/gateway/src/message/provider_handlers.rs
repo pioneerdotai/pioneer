@@ -805,11 +805,8 @@ impl MessageProcessor {
         }
 
         if api_key_updated || proxy_updated || proxy_deleted {
-            self.provider_registry.invalidate(raw_provider.as_str());
-            if raw_provider != normalized_provider {
-                self.provider_registry
-                    .invalidate(normalized_provider.as_str());
-            }
+            self.provider_registry
+                .invalidate_workspace_provider(workspace_id.as_str(), normalized_provider.as_str());
             self.publish_resource_selector_change(workspace_id.as_str())
                 .await;
             self.request_api_provider_warmup(workspace_id.clone());
@@ -940,10 +937,8 @@ impl MessageProcessor {
             }
         };
 
-        self.provider_registry.invalidate(&raw_provider);
-        if raw_provider != normalized_provider {
-            self.provider_registry.invalidate(&normalized_provider);
-        }
+        self.provider_registry
+            .invalidate_workspace_provider(workspace_id.as_str(), &normalized_provider);
         self.publish_resource_selector_change(workspace_id.as_str())
             .await;
         self.request_api_provider_warmup(workspace_id.clone());
@@ -1053,10 +1048,8 @@ impl MessageProcessor {
         };
 
         if deleted {
-            self.provider_registry.invalidate(&raw_provider);
-            if raw_provider != normalized_provider {
-                self.provider_registry.invalidate(&normalized_provider);
-            }
+            self.provider_registry
+                .invalidate_workspace_provider(workspace_id.as_str(), &normalized_provider);
             self.publish_resource_selector_change(workspace_id.as_str())
                 .await;
             self.request_api_provider_warmup(workspace_id.clone());

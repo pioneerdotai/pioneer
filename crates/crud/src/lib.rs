@@ -885,8 +885,8 @@ use crate::repositories::{
     agent_memory_policy_decision, agent_memory_quality_decision, agent_memory_quarantine,
     agent_memory_repair_job, artifact as artifact_repository, cli_runtime_binding,
     execution_admission_lease, hook_run, mcp_audit_event, mcp_server_catalog_snapshot,
-    mcp_server_installation, policy, read_model_repair, recovery_job,
-    recovery_terminalization_outbox, skill_audit_event, skill_dependency_snapshot,
+    mcp_server_installation, native_terminal_effect_outbox, policy, read_model_repair,
+    recovery_job, recovery_terminalization_outbox, skill_audit_event, skill_dependency_snapshot,
     skill_installation, skill_pack_installation, skill_upload_session, skill_workspace_policy,
     task as task_repository, task_actor_contract, task_agent_spec, task_delivery, task_dependency,
     task_event, task_execution_admission, task_result_candidate, task_result_review_event,
@@ -904,6 +904,7 @@ pub use crate::repositories::execution_admission_lease::{
     ExecutionAdmissionClass, ExecutionAdmissionQuotaPolicy, ExecutionQuotaBucket,
     ExecutionQuotaCeilings, NewExecutionAdmissionLease,
 };
+pub use crate::repositories::native_terminal_effect_outbox::NativeTerminalEffectStats;
 pub use crate::repositories::turn_admission::NewTurnAdmission;
 pub use crate::repositories::turn_execution::{
     NewTurnExecution, TurnExecutionRecord, TurnExecutionStatus, TurnExecutorKind,
@@ -937,12 +938,52 @@ pub struct ClaimedRecoveryTerminalizationRecord {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ClaimedNativeTerminalEffectRecord {
+    pub effect_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub runtime_generation: u64,
+    pub payload: pioneer_protocol::NativeTerminalEffectPayload,
+    pub attempt_count: u16,
+    pub max_attempts: u16,
+    pub claim_token: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeLifecycleDurableHealthSnapshot {
+    pub active_turns: u64,
+    pub stale_running_turns: u64,
+    pub active_recovery_jobs: u64,
+    pub oldest_recovery_age_secs: Option<u64>,
+    pub terminal_effects: NativeTerminalEffectStats,
+    pub oldest_terminal_effect_age_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeTerminalEffectStatusRecord {
+    pub effect_id: String,
+    pub status: String,
+    pub attempt_count: u16,
+    pub max_attempts: u16,
+    pub accepted_candidate_id: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppliedRecoveryTerminalization {
     pub recovery_job_id: String,
     pub thread_id: String,
     pub final_item: Option<pioneer_protocol::ItemCompletedNotification>,
     pub turn: Turn,
     pub already_terminal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryTerminalCleanupPlan {
+    pub runtime_generation: u64,
+    pub runtime_contract: String,
 }
 
 fn terminal_turn_execution_status(status: TurnStatus) -> Option<TurnExecutionStatus> {
@@ -13072,32 +13113,53 @@ impl CrudStore {
         candidate: TaskResultCandidate,
     ) -> Result<TaskResultCandidate> {
         self.run_serialized_write(|| async {
-            task_result_candidate::upsert_candidate(
-                &self.connection,
-                task_result_candidate::NewTaskResultCandidate {
-                    id: candidate.id.clone(),
-                    task_id: candidate.task_id.clone(),
-                    run_id: candidate.run_id.clone(),
-                    task_run_turn_id: candidate.task_run_turn_id.clone(),
-                    thread_id: candidate.thread_id.clone(),
-                    turn_id: candidate.turn_id.clone(),
-                    round: candidate.round,
-                    status: candidate.status,
-                    result: candidate.result.clone(),
-                    extraction_error: candidate.extraction_error.clone(),
-                    summary: candidate.summary.clone(),
-                    diagnostics: candidate.diagnostics.clone(),
-                    final_review_event_id: candidate.final_review_event_id.clone(),
-                    created_at: candidate.created_at,
-                    updated_at: candidate.updated_at,
-                    resolved_at: candidate.resolved_at,
-                },
-            )
-            .await?;
-            let row = task_result_candidate::find_candidate_by_id(&self.connection, &candidate.id)
-                .await?
-                .context("task result candidate missing after upsert")?;
-            task_result_candidate_from_db_model(row)
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin task result candidate upsert transaction")?;
+            let result = async {
+                task_result_candidate::upsert_candidate(
+                    &transaction,
+                    task_result_candidate::NewTaskResultCandidate {
+                        id: candidate.id.clone(),
+                        task_id: candidate.task_id.clone(),
+                        run_id: candidate.run_id.clone(),
+                        task_run_turn_id: candidate.task_run_turn_id.clone(),
+                        thread_id: candidate.thread_id.clone(),
+                        turn_id: candidate.turn_id.clone(),
+                        round: candidate.round,
+                        status: candidate.status,
+                        result: candidate.result.clone(),
+                        extraction_error: candidate.extraction_error.clone(),
+                        summary: candidate.summary.clone(),
+                        diagnostics: candidate.diagnostics.clone(),
+                        final_review_event_id: candidate.final_review_event_id.clone(),
+                        created_at: candidate.created_at,
+                        updated_at: candidate.updated_at,
+                        resolved_at: candidate.resolved_at,
+                    },
+                )
+                .await?;
+                let row = task_result_candidate::find_candidate_by_id(&transaction, &candidate.id)
+                    .await?
+                    .context("task result candidate missing after upsert")?;
+                task_result_candidate_from_db_model(row)
+            }
+            .await;
+            match result {
+                Ok(candidate) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit task result candidate upsert transaction")?;
+                    Ok(candidate)
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
         })
         .await
     }
@@ -13167,17 +13229,38 @@ impl CrudStore {
         updated_at: i64,
     ) -> Result<Option<TaskResultCandidate>> {
         self.run_serialized_write(|| async {
-            task_result_candidate::update_candidate_resolution(
-                &self.connection,
-                id,
-                status,
-                final_review_event_id,
-                resolved_at,
-                updated_at,
-            )
-            .await?
-            .map(task_result_candidate_from_db_model)
-            .transpose()
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin task result candidate resolution transaction")?;
+            let result = async {
+                task_result_candidate::update_candidate_resolution(
+                    &transaction,
+                    id,
+                    status,
+                    final_review_event_id,
+                    resolved_at,
+                    updated_at,
+                )
+                .await?
+                .map(task_result_candidate_from_db_model)
+                .transpose()
+            }
+            .await;
+            match result {
+                Ok(candidate) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit task result candidate resolution transaction")?;
+                    Ok(candidate)
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
         })
         .await
     }
@@ -21436,6 +21519,400 @@ WHERE id IN (SELECT event_id FROM candidates)
         .await
     }
 
+    pub async fn prepare_native_terminal_effects(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        now_unix: i64,
+    ) -> Result<()> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin native terminal-effect preparation transaction")?;
+            let result = native_terminal_effect_outbox::prepare(
+                &transaction,
+                &preparation,
+                unix_to_datetime(now_unix),
+            )
+            .await;
+            match result {
+                Ok(()) => transaction
+                    .commit()
+                    .await
+                    .context("failed to commit native terminal-effect preparation"),
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+
+    pub async fn claim_due_native_terminal_effects(
+        &self,
+        now_unix: i64,
+        claim_lease_secs: u64,
+        limit: u64,
+    ) -> Result<Vec<ClaimedNativeTerminalEffectRecord>> {
+        let limit = limit.min(100);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.run_serialized_write(|| async {
+            let now = unix_to_datetime(now_unix);
+            native_terminal_effect_outbox::reconcile_waiting_gates(&self.connection, now, limit)
+                .await?;
+            let claim_expires_at = unix_to_datetime(
+                now_unix.saturating_add(i64::try_from(claim_lease_secs.max(1)).unwrap_or(i64::MAX)),
+            );
+            let claimed = native_terminal_effect_outbox::claim_due(
+                &self.connection,
+                now,
+                claim_expires_at,
+                limit,
+                || generate_id(DB_ID_LEN),
+            )
+            .await?;
+            let mut valid = Vec::with_capacity(claimed.len());
+            for claimed in claimed {
+                let row = claimed.row;
+                let effect_id = row.effect_id.clone();
+                let decoded = (|| -> Result<ClaimedNativeTerminalEffectRecord> {
+                    if row.payload_json.len()
+                        > native_terminal_effect_outbox::MAX_EFFECT_PAYLOAD_BYTES
+                    {
+                        bail!("native terminal-effect payload exceeds its durable byte limit");
+                    }
+                    if !native_terminal_effect_outbox::payload_integrity_matches(
+                        row.payload_json.as_str(),
+                        row.payload_sha256.as_str(),
+                        row.payload_identity_sha256.as_str(),
+                    ) {
+                        bail!("native terminal-effect payload identity mismatch");
+                    }
+                    let payload: pioneer_protocol::NativeTerminalEffectPayload =
+                        serde_json::from_str(row.payload_json.as_str())
+                            .context("native terminal-effect payload is invalid")?;
+                    if !native_terminal_effect_outbox::payload_matches_db_kind(
+                        row.effect_kind.as_str(),
+                        &payload,
+                    ) {
+                        bail!("native terminal-effect kind does not match its payload");
+                    }
+                    match (
+                        row.handler_checkpoint_json.as_deref(),
+                        row.handler_checkpoint_sha256.as_deref(),
+                    ) {
+                        (None, None) => {}
+                        (Some(checkpoint), Some(expected_sha256))
+                            if row.effect_kind == "post_turn_hook"
+                                && checkpoint.len()
+                                    <= native_terminal_effect_outbox::MAX_EFFECT_HANDLER_CHECKPOINT_BYTES
+                                && native_terminal_effect_outbox::payload_sha256_hex(checkpoint)
+                                    == expected_sha256 => {}
+                        _ => {
+                            bail!(
+                                "native terminal-effect handler checkpoint failed integrity validation"
+                            );
+                        }
+                    }
+                    if !matches!(
+                        row.gate_kind.as_str(),
+                        "terminal_commit" | "accepted_task_result"
+                    ) {
+                        bail!("native terminal-effect gate is invalid");
+                    }
+                    if matches!(
+                        payload,
+                        pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup { .. }
+                    ) && row.gate_kind != "terminal_commit"
+                    {
+                        bail!("attached-task cleanup has an invalid execution gate");
+                    }
+                    let runtime_generation = u64::try_from(row.runtime_generation)
+                        .context("native terminal-effect runtime generation is invalid")?;
+                    if runtime_generation == 0 {
+                        bail!("native terminal-effect runtime generation is zero");
+                    }
+                    let attempt_count = u16::try_from(row.attempt_count)
+                        .context("native terminal-effect attempt count is invalid")?;
+                    let max_attempts = u16::try_from(row.max_attempts)
+                        .context("native terminal-effect retry budget is invalid")?;
+                    if attempt_count == 0
+                        || max_attempts == 0
+                        || max_attempts > native_terminal_effect_outbox::MAX_EFFECT_ATTEMPTS
+                        || attempt_count > max_attempts
+                    {
+                        bail!("native terminal-effect retry state is invalid");
+                    }
+                    Ok(ClaimedNativeTerminalEffectRecord {
+                        effect_id: row.effect_id,
+                        workspace_id: row.workspace_id,
+                        thread_id: row.thread_id,
+                        turn_id: row.turn_id,
+                        runtime_generation,
+                        payload,
+                        attempt_count,
+                        max_attempts,
+                        claim_token: claimed.claim_token.clone(),
+                    })
+                })();
+                match decoded {
+                    Ok(record) => valid.push(record),
+                    Err(_error) => {
+                        // One malformed durable row must not poison every
+                        // valid claim in the bounded batch. Quarantine it with
+                        // a typed, non-payload diagnostic under the same claim
+                        // fence, then continue processing healthy obligations.
+                        let quarantined = native_terminal_effect_outbox::mark_failed(
+                            &self.connection,
+                            effect_id.as_str(),
+                            claimed.claim_token.as_str(),
+                            "invalid_persisted_effect",
+                            "persisted native terminal-effect row failed schema validation",
+                            false,
+                            now,
+                            now,
+                        )
+                        .await?;
+                        if !quarantined {
+                            bail!("malformed native terminal-effect row lost its quarantine claim");
+                        }
+                    }
+                }
+            }
+            Ok(valid)
+        })
+        .await
+    }
+
+    pub async fn complete_native_terminal_effect(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| {
+            native_terminal_effect_outbox::mark_succeeded(
+                &self.connection,
+                effect_id,
+                claim_token,
+                unix_to_datetime(now_unix),
+            )
+        })
+        .await
+    }
+
+    pub async fn native_terminal_effect_handler_checkpoint(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+    ) -> Result<Option<String>> {
+        native_terminal_effect_outbox::load_handler_checkpoint(
+            &self.connection,
+            effect_id,
+            claim_token,
+        )
+        .await
+    }
+
+    pub async fn store_native_terminal_effect_handler_checkpoint(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+        checkpoint_json: &str,
+        now_unix: i64,
+    ) -> Result<()> {
+        self.run_serialized_write(|| {
+            native_terminal_effect_outbox::store_handler_checkpoint(
+                &self.connection,
+                effect_id,
+                claim_token,
+                checkpoint_json,
+                unix_to_datetime(now_unix),
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fail_native_terminal_effect(
+        &self,
+        effect_id: &str,
+        claim_token: &str,
+        error_code: &str,
+        error_message: &str,
+        retryable: bool,
+        retry_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| {
+            native_terminal_effect_outbox::mark_failed(
+                &self.connection,
+                effect_id,
+                claim_token,
+                error_code,
+                error_message,
+                retryable,
+                unix_to_datetime(retry_at_unix),
+                unix_to_datetime(now_unix),
+            )
+        })
+        .await
+    }
+
+    pub async fn native_terminal_effect_stats(&self) -> Result<NativeTerminalEffectStats> {
+        native_terminal_effect_outbox::load_stats(&self.connection).await
+    }
+
+    pub async fn purge_resolved_native_terminal_effects_before(
+        &self,
+        cutoff_unix: i64,
+        limit: u64,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            native_terminal_effect_outbox::purge_resolved_before(
+                &self.connection,
+                unix_to_datetime(cutoff_unix),
+                limit,
+            )
+        })
+        .await
+    }
+
+    /// Bounded end-to-end database canary for process readiness. The update
+    /// intentionally matches no rows: SQLite must still admit and commit a
+    /// write transaction, while the probe mutates no domain state.
+    pub async fn native_lifecycle_read_write_probe(&self) -> Result<()> {
+        self.run_serialized_write(|| async {
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin native lifecycle readiness transaction")?;
+            transaction
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT 1 AS ready".to_owned(),
+                ))
+                .await
+                .context("failed native lifecycle readiness read probe")?
+                .context("native lifecycle readiness read probe returned no row")?;
+            transaction
+                .execute_unprepared("UPDATE workspace SET id = id WHERE 0")
+                .await
+                .context("failed native lifecycle readiness write probe")?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit native lifecycle readiness probe")
+        })
+        .await
+    }
+
+    pub async fn native_lifecycle_durable_health_snapshot(
+        &self,
+        now_unix: i64,
+        stale_after_secs: u64,
+    ) -> Result<NativeLifecycleDurableHealthSnapshot> {
+        let stale_cutoff = unix_to_datetime(
+            now_unix.saturating_sub(i64::try_from(stale_after_secs).unwrap_or(i64::MAX)),
+        );
+        let native_turn_counts = self
+            .connection
+            .query_one_raw(Statement::from_sql_and_values(
+                self.connection.get_database_backend(),
+                "SELECT COUNT(*) AS active_turns, \
+                        COALESCE(SUM(CASE WHEN t.updated_at <= ? THEN 1 ELSE 0 END), 0) \
+                            AS stale_running_turns \
+                 FROM \"turn\" t \
+                 WHERE t.status = 'in_progress' \
+                   AND ( \
+                     EXISTS ( \
+                       SELECT 1 FROM turn_execution e \
+                       WHERE e.turn_id = t.id \
+                         AND e.executor_kind IN ('native_agent', 'api_provider') \
+                     ) \
+                     OR ( \
+                       NOT EXISTS (SELECT 1 FROM turn_execution e WHERE e.turn_id = t.id) \
+                       AND t.turn_kind = 'conversation' \
+                       AND EXISTS (SELECT 1 FROM turn_runtime_snapshot s WHERE s.turn_id = t.id) \
+                       AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_binding c WHERE c.turn_id = t.id) \
+                     ) \
+                   )"
+                    .to_owned(),
+                [stale_cutoff.into()],
+            ))
+            .await
+            .context("failed to count active native Turns")?
+            .context("native Turn health query returned no row")?;
+        let active_turns = u64::try_from(native_turn_counts.try_get::<i64>("", "active_turns")?)
+            .context("active native Turn count is invalid")?;
+        let stale_running_turns =
+            u64::try_from(native_turn_counts.try_get::<i64>("", "stale_running_turns")?)
+                .context("stale native Turn count is invalid")?;
+        let active_recovery_jobs = self.list_active_recovery_jobs(101).await?;
+        let oldest_recovery_age_secs = active_recovery_jobs
+            .iter()
+            .map(|job| job.scheduled_at_unix)
+            .min()
+            .map(|oldest| u64::try_from(now_unix.saturating_sub(oldest)).unwrap_or(0));
+        let terminal_effects = self.native_terminal_effect_stats().await?;
+        let oldest_terminal_effect = pioneer_entity::native_terminal_effect_outbox::Entity::find()
+            .filter(
+                pioneer_entity::native_terminal_effect_outbox::Column::Status.is_in([
+                    "prepared",
+                    "waiting_acceptance",
+                    "ready",
+                    "running",
+                    "retry_wait",
+                    "unresolved",
+                ]),
+            )
+            .order_by_asc(pioneer_entity::native_terminal_effect_outbox::Column::PreparedAt)
+            .one(&self.connection)
+            .await
+            .context("failed to load oldest native terminal effect")?;
+        let oldest_terminal_effect_age_secs = oldest_terminal_effect.map(|effect| {
+            u64::try_from(now_unix.saturating_sub(effect.prepared_at.timestamp())).unwrap_or(0)
+        });
+        Ok(NativeLifecycleDurableHealthSnapshot {
+            active_turns,
+            stale_running_turns,
+            active_recovery_jobs: u64::try_from(active_recovery_jobs.len()).unwrap_or(u64::MAX),
+            oldest_recovery_age_secs,
+            terminal_effects,
+            oldest_terminal_effect_age_secs,
+        })
+    }
+
+    pub async fn native_terminal_effect_status(
+        &self,
+        effect_id: &str,
+    ) -> Result<Option<NativeTerminalEffectStatusRecord>> {
+        let row =
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id.to_owned())
+                .one(&self.connection)
+                .await
+                .context("failed to load native terminal-effect status")?;
+        row.map(|row| {
+            Ok(NativeTerminalEffectStatusRecord {
+                effect_id: row.effect_id,
+                status: row.status,
+                attempt_count: u16::try_from(row.attempt_count)
+                    .context("native terminal-effect attempt count is invalid")?,
+                max_attempts: u16::try_from(row.max_attempts)
+                    .context("native terminal-effect retry budget is invalid")?,
+                accepted_candidate_id: row.accepted_candidate_id,
+                last_error_code: row.last_error_code,
+                last_error_message: row.last_error_message,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn claim_due_recovery_terminalizations(
         &self,
         now_unix: i64,
@@ -21567,6 +22044,7 @@ WHERE id IN (SELECT event_id FROM candidates)
         &self,
         record: &ClaimedRecoveryTerminalizationRecord,
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
+        cleanup_plan: RecoveryTerminalCleanupPlan,
         event_timestamp_secs: i64,
     ) -> Result<AppliedRecoveryTerminalization> {
         let record = record.clone();
@@ -21669,6 +22147,43 @@ WHERE id IN (SELECT event_id FROM candidates)
                         record.item_id, record.error_message
                     )
                 };
+                let already_terminal = current_status == desired_status;
+                let created_at = unix_to_datetime(event_timestamp_secs);
+                let claim_expires_at = unix_to_datetime(
+                    event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
+                );
+                let cleanup_reason = terminal_error.chars().take(4_096).collect::<String>();
+                native_terminal_effect_outbox::prepare_supplemental(
+                    &transaction,
+                    &pioneer_protocol::NativeTerminalEffectPreparation {
+                        batch_id: format!(
+                            "{}:terminal-effects:recovery:{}",
+                            record.turn_id, cleanup_plan.runtime_generation
+                        ),
+                        workspace_id: thread_model.workspace_id.clone(),
+                        thread_id: turn_model.thread_id.clone(),
+                        turn_id: record.turn_id.clone(),
+                        runtime_generation: cleanup_plan.runtime_generation,
+                        effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: format!(
+                                "{}:terminal-effect:attached-task-cleanup",
+                                record.turn_id
+                            ),
+                            effect_kind:
+                                pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup,
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload:
+                                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                                    reason: cleanup_reason,
+                                    runtime_contract: cleanup_plan.runtime_contract.clone(),
+                                },
+                            max_attempts: 5,
+                        }],
+                    },
+                    created_at,
+                )
+                .await
+                .context("failed to ensure recovery terminal cleanup")?;
                 let terminal_turn = Turn {
                     id: turn_model.id.clone(),
                     status: desired_status,
@@ -21684,12 +22199,7 @@ WHERE id IN (SELECT event_id FROM candidates)
                     prompt_manifest,
                     permission_profile,
                 };
-                let already_terminal = current_status == desired_status;
                 let mut final_item = None;
-                let created_at = unix_to_datetime(event_timestamp_secs);
-                let claim_expires_at = unix_to_datetime(
-                    event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
-                );
                 // Compatibility workers from an older Gateway may have
                 // committed the Turn failure while losing the synthetic item
                 // completion. Repair that half-state even when the desired
@@ -23183,6 +23693,13 @@ WHERE id IN (SELECT event_id FROM candidates)
                 created_at,
             )
             .await?;
+            native_terminal_effect_outbox::activate_for_terminal(
+                transaction,
+                appended_event.turn_id.as_str(),
+                created_at,
+            )
+            .await
+            .context("failed to atomically activate native terminal effects")?;
         }
         if matches!(
             &event,
@@ -23358,17 +23875,29 @@ WHERE id IN (SELECT event_id FROM candidates)
             let _ = transaction.rollback().await;
             return Err(error);
         }
-        if let Some(status) = terminal_turn_execution_status_for_event(&appended_event.payload)
-            && let Err(error) = turn_execution::mark_terminal(
+        if let Some(status) = terminal_turn_execution_status_for_event(&appended_event.payload) {
+            if let Err(error) = turn_execution::mark_terminal(
                 &transaction,
                 appended_event.turn_id.as_str(),
                 status,
                 projected_at,
             )
             .await
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            if let Err(error) = native_terminal_effect_outbox::activate_for_terminal(
+                &transaction,
+                appended_event.turn_id.as_str(),
+                projected_at,
+            )
+            .await
+            .context("failed to atomically activate native terminal effects")
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
         }
         if matches!(
             &appended_event.payload,
@@ -26187,10 +26716,10 @@ mod tests {
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
         NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
         PrepareTurnFinalizationOutcome, PreparedClaudeProviderSessionMode, ProjectionPageAnchor,
-        RecoveryJobRecord, ResolveCliRuntimePendingRequest, RestoreTurnProjectionStreamOutcome,
-        SkillAuditEventRecord, SkillDependencySnapshotRecord, SkillInstallationPatch,
-        SkillInstallationRecord, SkillPackChildDiff, SkillPackInstallationRecord,
-        THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+        RecoveryJobRecord, RecoveryTerminalCleanupPlan, ResolveCliRuntimePendingRequest,
+        RestoreTurnProjectionStreamOutcome, SkillAuditEventRecord, SkillDependencySnapshotRecord,
+        SkillInstallationPatch, SkillInstallationRecord, SkillPackChildDiff,
+        SkillPackInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
         THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
         TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES, TaskEventPayload, TaskOwnedTurnResumeOutcome,
         TaskRunChildAnchor, TaskRunOccurrenceTerminalizationOutcome, ThreadAgentsDocError,
@@ -26211,7 +26740,9 @@ mod tests {
         tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
     };
     use crate::convention::ATTEMPT_STATUS_COMPLETED;
-    use crate::repositories::{read_model_repair, thread, turn, turn_finalization};
+    use crate::repositories::{
+        native_terminal_effect_outbox, read_model_repair, thread, turn, turn_finalization,
+    };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::{
@@ -26246,11 +26777,12 @@ mod tests {
         ToolStoragePayload, Turn, TurnBlockedResumeMetadata, TurnCompletedNotification,
         TurnExecutionSecuritySnapshot, TurnExecutionWindowCheckpointedNotification,
         TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-        TurnExecutionWindowStartedNotification, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
-        TurnItem, TurnItemEventPayload, TurnItemTimeoutReason, TurnItemType, TurnKind, TurnMention,
-        TurnOrigin, TurnPermissionAuditEventKind, TurnPermissionMode,
-        TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnSandboxMode, TurnStatus,
-        TurnToolLoopBudgetExceededNotification, UserInput, generate_id,
+        TurnExecutionWindowStartedNotification, TurnFailedNotification, TurnFilesystemAccess,
+        TurnFilesystemSandboxEntry, TurnItem, TurnItemEventPayload, TurnItemTimeoutReason,
+        TurnItemType, TurnKind, TurnMention, TurnOrigin, TurnPermissionAuditEventKind,
+        TurnPermissionMode, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
+        TurnSandboxMode, TurnStatus, TurnToolLoopBudgetExceededNotification, UserInput,
+        generate_id,
     };
     use sea_orm::sea_query::Expr;
     use sea_orm::{
@@ -26262,6 +26794,7 @@ mod tests {
     const NATIVE_DELIVERY_MIGRATION: &str = "m20260805_000001_native_durable_delivery";
     const ATOMIC_TERMINALIZATION_MIGRATION: &str = "m20260806_000001_atomic_turn_terminalization";
     const EXECUTION_WINDOW_MIGRATION: &str = "m20260603_000001_turn_execution_window";
+    const NATIVE_TERMINAL_EFFECT_MIGRATION: &str = "m20260829_000001_native_terminal_effect_outbox";
     const INITIAL_SCHEMA_MIGRATION: &str = "m20260313_125253_create_workspace_table";
     fn migrations_before(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
         let migrations = Migrator::migrations();
@@ -26320,6 +26853,22 @@ mod tests {
     impl MigratorTrait for AtomicTerminalizationMigrator {
         fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
             migrations_through(ATOMIC_TERMINALIZATION_MIGRATION)
+        }
+    }
+
+    struct PreNativeTerminalEffectMigrator;
+
+    impl MigratorTrait for PreNativeTerminalEffectMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            migrations_before(NATIVE_TERMINAL_EFFECT_MIGRATION)
+        }
+    }
+
+    struct NativeTerminalEffectMigrator;
+
+    impl MigratorTrait for NativeTerminalEffectMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            migrations_through(NATIVE_TERMINAL_EFFECT_MIGRATION)
         }
     }
 
@@ -26653,6 +27202,224 @@ mod tests {
                 ))
                 .await
                 .expect("outbox table lookup after rollback should succeed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_terminal_effect_outbox_migration_guards_pending_data_and_rolls_back_resolved_rows()
+     {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        PreNativeTerminalEffectMigrator::up(&connection, None)
+            .await
+            .expect("baseline migrations must succeed");
+        assert!(
+            connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'native_terminal_effect_outbox'"
+                        .to_owned(),
+                ))
+                .await
+                .expect("pre-expansion table lookup should succeed")
+                .is_none()
+        );
+
+        NativeTerminalEffectMigrator::up(&connection, None)
+            .await
+            .expect("terminal-effect outbox expansion must succeed");
+        assert!(
+            connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'native_terminal_effect_outbox'"
+                        .to_owned(),
+                ))
+                .await
+                .expect("outbox table lookup should succeed")
+                .is_some()
+        );
+        let indexes = connection
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA index_list('native_terminal_effect_outbox')".to_owned(),
+            ))
+            .await
+            .expect("outbox index lookup should succeed")
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "name").expect("index name"))
+            .collect::<Vec<_>>();
+        for expected in [
+            "uidx_native_terminal_effect_turn_kind",
+            "idx_native_terminal_effect_due",
+            "idx_native_terminal_effect_completed",
+        ] {
+            assert!(
+                indexes.iter().any(|name| name == expected),
+                "missing terminal-effect outbox index {expected}"
+            );
+        }
+        let columns = connection
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA table_info('native_terminal_effect_outbox')".to_owned(),
+            ))
+            .await
+            .expect("outbox column lookup should succeed")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get::<String>("", "name").expect("column name"),
+                    row.try_get::<String>("", "type").expect("column type"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            columns
+                .iter()
+                .any(|(name, _)| name == "payload_identity_sha256"),
+            "immutable payload identity must survive terminal payload compaction"
+        );
+        let candidate_reference_type = columns
+            .iter()
+            .find_map(|(name, column_type)| {
+                (name == "accepted_candidate_id").then_some(column_type.as_str())
+            })
+            .expect("accepted candidate reference column");
+        assert_eq!(
+            candidate_reference_type.to_ascii_lowercase(),
+            "varchar(96)",
+            "outbox candidate reference must accept every task_result_candidate id"
+        );
+        let outbox_foreign_keys = connection
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA foreign_key_list('native_terminal_effect_outbox')".to_owned(),
+            ))
+            .await
+            .expect("outbox foreign-key lookup should succeed");
+        let turn_delete_action = outbox_foreign_keys
+            .iter()
+            .find_map(|row| {
+                let table = row.try_get::<String>("", "table").ok()?;
+                (table == "turn").then(|| {
+                    row.try_get::<String>("", "on_delete")
+                        .expect("delete action")
+                })
+            })
+            .expect("outbox Turn foreign key");
+        assert_eq!(
+            turn_delete_action.to_ascii_lowercase(),
+            "cascade",
+            "explicit Turn/workspace deletion must not be blocked by retained terminal effects"
+        );
+
+        connection
+            .execute_unprepared("PRAGMA foreign_keys = OFF")
+            .await
+            .expect("state-constraint fixture should disable foreign keys");
+        let invalid_ready = connection
+            .execute_unprepared(
+                "INSERT INTO native_terminal_effect_outbox (\
+                    effect_id, batch_id, workspace_id, thread_id, turn_id, runtime_generation, \
+                    effect_kind, gate_kind, payload_json, payload_sha256, payload_identity_sha256, status, attempt_count, \
+                    max_attempts, terminal_committed_at, prepared_at, created_at, updated_at\
+                 ) VALUES (\
+                    'effect_invalid_ready', 'batch_invalid_ready', 'workspace_missing', \
+                    'thread_missing', 'turn_missing', 1, 'attached_task_cleanup', \
+                    'terminal_commit', '{}', \
+                    '0000000000000000000000000000000000000000000000000000000000000000', \
+                    '0000000000000000000000000000000000000000000000000000000000000000', \
+                    'ready', 0, 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP\
+                 )",
+            )
+            .await;
+        assert!(
+            invalid_ready.is_err(),
+            "a runnable obligation without next_run_at must be rejected instead of becoming invisible to the worker"
+        );
+        let invalid_attempts = connection
+            .execute_unprepared(
+                "INSERT INTO native_terminal_effect_outbox (\
+                    effect_id, batch_id, workspace_id, thread_id, turn_id, runtime_generation, \
+                    effect_kind, gate_kind, payload_json, payload_sha256, payload_identity_sha256, status, attempt_count, \
+                    max_attempts, prepared_at, created_at, updated_at\
+                 ) VALUES (\
+                    'effect_invalid_attempts', 'batch_invalid_attempts', 'workspace_missing', \
+                    'thread_missing', 'turn_missing', 1, 'attached_task_cleanup', \
+                    'terminal_commit', '{}', \
+                    '0000000000000000000000000000000000000000000000000000000000000000', \
+                    '0000000000000000000000000000000000000000000000000000000000000000', \
+                    'prepared', 4, 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP\
+                 )",
+            )
+            .await;
+        assert!(
+            invalid_attempts.is_err(),
+            "attempt_count above max_attempts must be rejected at the durable boundary"
+        );
+
+        connection
+            .execute_unprepared(
+                "INSERT INTO native_terminal_effect_outbox (\
+                    effect_id, batch_id, workspace_id, thread_id, turn_id, runtime_generation, \
+                    effect_kind, gate_kind, payload_json, payload_sha256, payload_identity_sha256, status, attempt_count, \
+                    max_attempts, prepared_at, created_at, updated_at\
+                 ) VALUES (\
+                    'effect_pending_rollback', 'batch_pending_rollback', 'workspace_missing', \
+                    'thread_missing', 'turn_missing', 1, 'attached_task_cleanup', \
+                    'terminal_commit', '{}', \
+                    '0000000000000000000000000000000000000000000000000000000000000000', \
+                    '0000000000000000000000000000000000000000000000000000000000000000', \
+                    'prepared', 0, 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP\
+                 )",
+            )
+            .await
+            .expect("pending rollback fixture should insert");
+        connection
+            .execute_unprepared("PRAGMA foreign_keys = ON")
+            .await
+            .expect("test fixture should restore foreign keys");
+
+        let rollback = NativeTerminalEffectMigrator::down(&connection, Some(1)).await;
+        assert!(
+            rollback.is_err(),
+            "rollback must refuse to discard pending obligations"
+        );
+        assert!(
+            connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'native_terminal_effect_outbox'"
+                        .to_owned(),
+                ))
+                .await
+                .expect("outbox table lookup after refused rollback should succeed")
+                .is_some()
+        );
+
+        connection
+            .execute_unprepared(
+                "UPDATE native_terminal_effect_outbox \
+                 SET status = 'succeeded', terminal_committed_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP \
+                 WHERE effect_id = 'effect_pending_rollback'",
+            )
+            .await
+            .expect("rollback fixture should become resolved");
+        NativeTerminalEffectMigrator::down(&connection, Some(1))
+            .await
+            .expect("rollback may discard only fully resolved retained history");
+        assert!(
+            connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'native_terminal_effect_outbox'"
+                        .to_owned(),
+                ))
+                .await
+                .expect("outbox table lookup after safe rollback should succeed")
                 .is_none()
         );
     }
@@ -27093,6 +27860,1472 @@ mod tests {
         );
     }
 
+    fn cleanup_effect_preparation(
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        batch_suffix: &str,
+    ) -> pioneer_protocol::NativeTerminalEffectPreparation {
+        pioneer_protocol::NativeTerminalEffectPreparation {
+            batch_id: format!("{turn_id}:batch:{batch_suffix}"),
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            runtime_generation: 1,
+            effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                effect_id: format!("{turn_id}:terminal-effect:attached-task-cleanup"),
+                effect_kind: pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup,
+                gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                payload: pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                    reason: "parent turn failed".to_owned(),
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                },
+                max_attempts: 3,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn native_lifecycle_health_probe_commits_and_reports_stale_turn_and_terminal_backlog() {
+        let workspace_id = "ws_native_health";
+        let thread_id = "thr_native_health";
+        let turn_id = "turn_native_health";
+        let (store, thread, turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let created_at = unix_to_datetime(1_700_000_000);
+        crate::repositories::turn_execution::insert_immutable(
+            &store.connection,
+            crate::NewTurnExecution {
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                executor_kind: crate::TurnExecutorKind::NativeAgent,
+                executor_key: Some("openai".to_owned()),
+                status: crate::TurnExecutionStatus::Running,
+                owner_id: "native-health-owner".to_owned(),
+                lease_until: unix_to_datetime(1_700_000_100),
+                created_at,
+            },
+        )
+        .await
+        .expect("native execution identity should persist");
+
+        let mut cli_turn = turn;
+        cli_turn.id = "turn_cli_health_control".to_owned();
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &cli_turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("CLI control Turn should persist");
+        crate::repositories::turn_execution::insert_immutable(
+            &store.connection,
+            crate::NewTurnExecution {
+                turn_id: cli_turn.id.clone(),
+                thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                executor_kind: crate::TurnExecutorKind::CliRuntime,
+                executor_key: Some("codex".to_owned()),
+                status: crate::TurnExecutionStatus::Running,
+                owner_id: "cli-health-owner".to_owned(),
+                lease_until: unix_to_datetime(1_700_000_100),
+                created_at,
+            },
+        )
+        .await
+        .expect("CLI execution identity should persist");
+        store
+            .prepare_native_terminal_effects(
+                cleanup_effect_preparation(workspace_id, thread_id, turn_id, "health"),
+                1_700_000_100,
+            )
+            .await
+            .expect("terminal obligation should be visible to readiness");
+
+        store
+            .native_lifecycle_read_write_probe()
+            .await
+            .expect("read/write canary transaction should commit without domain mutation");
+        let snapshot = store
+            .native_lifecycle_durable_health_snapshot(1_700_000_601, 300)
+            .await
+            .expect("bounded lifecycle snapshot should load");
+
+        assert_eq!(snapshot.active_turns, 1);
+        assert_eq!(snapshot.stale_running_turns, 1);
+        assert_eq!(snapshot.active_recovery_jobs, 0);
+        assert_eq!(snapshot.terminal_effects.prepared, 1);
+        assert_eq!(snapshot.oldest_terminal_effect_age_secs, Some(501));
+    }
+
+    #[tokio::test]
+    async fn native_terminal_effect_outbox_activates_atomically_and_recovers_expired_claim_after_restart()
+     {
+        let workspace_id = "ws_terminal_effect_atomic";
+        let thread_id = "thr_terminal_effect_atomic";
+        let turn_id = "turn_terminal_effect_atomic";
+        let (store, _, mut turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let preparation =
+            cleanup_effect_preparation(workspace_id, thread_id, turn_id, "generation-1");
+        let effect_id = preparation.effects[0].effect_id.clone();
+        store
+            .prepare_native_terminal_effects(preparation.clone(), 1_700_000_100)
+            .await
+            .expect("terminal effect should prepare");
+        store
+            .prepare_native_terminal_effects(preparation.clone(), 1_700_000_100)
+            .await
+            .expect("exact preparation replay should be idempotent");
+        assert_eq!(
+            store
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("effect status should load")
+                .expect("effect should exist")
+                .status,
+            "prepared"
+        );
+
+        store
+            .connection
+            .execute_unprepared(
+                "CREATE TRIGGER reject_terminal_effect_commit \
+                 BEFORE UPDATE OF status ON turn \
+                 WHEN NEW.id = 'turn_terminal_effect_atomic' AND NEW.status = 'completed' \
+                 BEGIN SELECT RAISE(ABORT, 'injected terminal commit failure'); END",
+            )
+            .await
+            .expect("fault trigger should install");
+        turn.status = TurnStatus::Completed;
+        assert!(
+            store
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn: turn.clone(),
+                    },
+                    1_700_000_101,
+                )
+                .await
+                .is_err(),
+            "terminal projection fault must roll back outbox activation"
+        );
+        assert_eq!(
+            store
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("effect status should load after rollback")
+                .expect("effect should remain")
+                .status,
+            "prepared"
+        );
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_terminal_effect_commit")
+            .await
+            .expect("fault trigger should uninstall");
+        let replay = store
+            .replay_due_turn_event_projections(1_700_000_103, 10)
+            .await
+            .expect("durable terminal projection should recover after the fault");
+        assert_eq!(replay.projected, 1);
+        assert_eq!(
+            store
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("effect status should load after terminal commit")
+                .expect("effect should remain")
+                .status,
+            "ready"
+        );
+        let committed_row =
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id.clone())
+                .one(&store.connection)
+                .await
+                .expect("committed effect lookup should succeed")
+                .expect("committed effect should exist");
+        let immutable_payload_hash = committed_row.payload_identity_sha256.clone();
+
+        let late_effect = pioneer_protocol::NativeTerminalEffectPreparation {
+            batch_id: format!("{turn_id}:batch:late"),
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            runtime_generation: 1,
+            effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                effect_id: format!("{turn_id}:terminal-effect:post-turn"),
+                effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                payload:
+                    pioneer_protocol::NativeTerminalEffectPayload::PostTurnHookPreparationFailed {
+                        failure: pioneer_protocol::NativeTerminalEffectPreparationFailure::HookRuntimeUnavailable,
+                    },
+                max_attempts: 3,
+            }],
+        };
+        assert!(
+            store
+                .prepare_native_terminal_effects(late_effect, 1_700_000_103)
+                .await
+                .is_err(),
+            "new obligations cannot be invented after the canonical terminal commit"
+        );
+
+        let first_claim = store
+            .claim_due_native_terminal_effects(1_700_000_103, 5, 10)
+            .await
+            .expect("ready effect should claim");
+        assert_eq!(first_claim.len(), 1);
+        assert_eq!(first_claim[0].attempt_count, 1);
+
+        // A fresh store models restart after the side-effect worker claimed
+        // the row but before it acknowledged an outcome.
+        let restarted = CrudStore::new(store.database_connection());
+        assert!(
+            restarted
+                .claim_due_native_terminal_effects(1_700_000_106, 5, 10)
+                .await
+                .expect("unexpired claim lookup should succeed")
+                .is_empty()
+        );
+        let reclaimed = restarted
+            .claim_due_native_terminal_effects(1_700_000_109, 5, 10)
+            .await
+            .expect("expired claim should recover after restart");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].effect_id, effect_id);
+        assert_eq!(reclaimed[0].attempt_count, 2);
+        assert!(
+            restarted
+                .complete_native_terminal_effect(
+                    reclaimed[0].effect_id.as_str(),
+                    reclaimed[0].claim_token.as_str(),
+                    1_700_000_109,
+                )
+                .await
+                .expect("effect completion should persist")
+        );
+        assert!(
+            restarted
+                .claim_due_native_terminal_effects(1_700_000_200, 5, 10)
+                .await
+                .expect("succeeded effect lookup should succeed")
+                .is_empty(),
+            "a succeeded obligation must never be claimed twice"
+        );
+        let compacted =
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id.clone())
+                .one(&restarted.connection)
+                .await
+                .expect("compacted effect lookup should succeed")
+                .expect("compacted effect should remain");
+        assert_eq!(compacted.payload_json, r#"{"compacted":true}"#);
+        assert_eq!(
+            compacted.payload_sha256,
+            native_terminal_effect_outbox::payload_sha256_hex(compacted.payload_json.as_str())
+        );
+        assert_eq!(compacted.payload_identity_sha256, immutable_payload_hash);
+        assert_eq!(compacted.payload_sha256.len(), 64);
+
+        restarted
+            .prepare_native_terminal_effects(preparation.clone(), 1_700_000_201)
+            .await
+            .expect("exact committed replay must use the retained payload hash");
+        let mut conflicting = preparation;
+        conflicting.effects[0].payload =
+            pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                reason: "conflicting cleanup reason".to_owned(),
+                runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+            };
+        assert!(
+            restarted
+                .prepare_native_terminal_effects(conflicting, 1_700_000_202)
+                .await
+                .is_err(),
+            "compaction must not weaken immutable replay conflict detection"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_terminal_effect_handler_checkpoint_is_bounded_immutable_and_claim_fenced() {
+        let timestamp = 1_700_003_000;
+        let workspace_id = "ws_terminal_effect_checkpoint";
+        let thread_id = "thr_terminal_effect_checkpoint";
+        let turn_id = "turn_terminal_effect_checkpoint";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        store
+            .prepare_native_terminal_effects(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:batch:checkpoint"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                        effect_id: effect_id.clone(),
+                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                        gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                            request: serde_json::json!({"phase": "turn.post_turn"}),
+                            runtime_snapshot: serde_json::json!({"schema_version": 1}),
+                        },
+                        max_attempts: 3,
+                    }],
+                },
+                timestamp,
+            )
+            .await
+            .expect("post-turn effect should prepare");
+        terminal_turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal commit should activate the post-turn effect");
+        let first = store
+            .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+            .await
+            .expect("post-turn effect should claim")
+            .pop()
+            .expect("post-turn claim");
+        assert!(
+            store
+                .store_native_terminal_effect_handler_checkpoint(
+                    effect_id.as_str(),
+                    first.claim_token.as_str(),
+                    &"x".repeat(
+                        native_terminal_effect_outbox::MAX_EFFECT_HANDLER_CHECKPOINT_BYTES + 1
+                    ),
+                    timestamp + 1,
+                )
+                .await
+                .is_err(),
+            "oversized handler output must be rejected before persistence"
+        );
+        let checkpoint = r#"{"schema_version":1,"facts":[]}"#;
+        store
+            .store_native_terminal_effect_handler_checkpoint(
+                effect_id.as_str(),
+                first.claim_token.as_str(),
+                checkpoint,
+                timestamp + 1,
+            )
+            .await
+            .expect("first checkpoint should publish");
+        store
+            .store_native_terminal_effect_handler_checkpoint(
+                effect_id.as_str(),
+                first.claim_token.as_str(),
+                checkpoint,
+                timestamp + 1,
+            )
+            .await
+            .expect("exact checkpoint replay should be idempotent");
+        assert!(
+            store
+                .store_native_terminal_effect_handler_checkpoint(
+                    effect_id.as_str(),
+                    first.claim_token.as_str(),
+                    r#"{"schema_version":1,"facts":[{}]}"#,
+                    timestamp + 1,
+                )
+                .await
+                .is_err(),
+            "a second provider result must not replace replay authority"
+        );
+        assert!(
+            store
+                .native_terminal_effect_handler_checkpoint(effect_id.as_str(), "stale-claim")
+                .await
+                .is_err(),
+            "a stale worker must not read the current checkpoint"
+        );
+        assert!(
+            store
+                .fail_native_terminal_effect(
+                    effect_id.as_str(),
+                    first.claim_token.as_str(),
+                    "retry",
+                    "injected retry",
+                    true,
+                    timestamp + 2,
+                    timestamp + 1,
+                )
+                .await
+                .expect("retry transition should retain the checkpoint")
+        );
+        let second = store
+            .claim_due_native_terminal_effects(timestamp + 2, 10, 1)
+            .await
+            .expect("retry should claim")
+            .pop()
+            .expect("retry claim");
+        assert_eq!(
+            store
+                .native_terminal_effect_handler_checkpoint(
+                    effect_id.as_str(),
+                    second.claim_token.as_str(),
+                )
+                .await
+                .expect("new lease should load the immutable checkpoint")
+                .as_deref(),
+            Some(checkpoint)
+        );
+        assert!(
+            store
+                .complete_native_terminal_effect(
+                    effect_id.as_str(),
+                    second.claim_token.as_str(),
+                    timestamp + 2,
+                )
+                .await
+                .expect("completion should commit")
+        );
+        let completed =
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id)
+                .one(&store.connection)
+                .await
+                .expect("completed effect lookup should succeed")
+                .expect("completed effect should remain inspectable");
+        assert!(completed.handler_checkpoint_json.is_none());
+        assert!(completed.handler_checkpoint_sha256.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_effect_preparation_failure_becomes_explicit_unresolved_obligation() {
+        let timestamp = 1_700_004_000;
+        let workspace_id = "ws_terminal_effect_prepare_failure";
+        let thread_id = "thr_terminal_effect_prepare_failure";
+        let turn_id = "turn_terminal_effect_prepare_failure";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        store
+            .prepare_native_terminal_effects(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:batch:prepare-failure"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                        effect_id: effect_id.clone(),
+                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                        gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHookPreparationFailed {
+                            failure: pioneer_protocol::NativeTerminalEffectPreparationFailure::PayloadTooLarge,
+                        },
+                        max_attempts: 3,
+                    }],
+                },
+                timestamp,
+            )
+            .await
+            .expect("typed preparation failure must persist before terminal commit");
+        terminal_turn.status = TurnStatus::Failed;
+        store
+            .materialize_turn_failed(
+                TurnFailedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal commit should activate failure accounting");
+
+        let status = store
+            .native_terminal_effect_status(effect_id.as_str())
+            .await
+            .expect("failure status should load")
+            .expect("failure obligation should remain inspectable");
+        assert_eq!(status.status, "unresolved");
+        assert_eq!(
+            status.last_error_code.as_deref(),
+            Some("terminal_effect_preparation_failed")
+        );
+        assert!(
+            store
+                .claim_due_native_terminal_effects(timestamp + 2, 10, 10)
+                .await
+                .expect("failure claim scan should succeed")
+                .is_empty(),
+            "a preparation failure is diagnostic state, never an executable fake request"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_gated_preparation_failure_waits_for_authoritative_acceptance() {
+        let timestamp = 1_700_004_100;
+        let workspace_id = "ws_terminal_effect_gated_prepare_failure";
+        let thread_id = "thr_terminal_effect_gated_prepare_failure";
+        let turn_id = "turn_terminal_effect_gated_prepare_failure";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        store
+            .prepare_native_terminal_effects(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:batch:gated-prepare-failure"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                        effect_id: effect_id.clone(),
+                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                        gate: pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult,
+                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHookPreparationFailed {
+                            failure: pioneer_protocol::NativeTerminalEffectPreparationFailure::HandlerSnapshotUnavailable,
+                        },
+                        max_attempts: 3,
+                    }],
+                },
+                timestamp,
+            )
+            .await
+            .expect("gated preparation failure should persist");
+        terminal_turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal commit should preserve the unresolved gate");
+        assert_eq!(
+            store
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("gated failure status should load")
+                .expect("gated failure should exist")
+                .status,
+            "waiting_acceptance"
+        );
+
+        native_terminal_effect_outbox::resolve_gate_for_candidate(
+            &store.connection,
+            "candidate_gated_prepare_failure",
+            thread_id,
+            turn_id,
+            "accepted",
+            unix_to_datetime(timestamp + 2),
+        )
+        .await
+        .expect("authoritative acceptance should resolve the failure gate");
+        let status = store
+            .native_terminal_effect_status(effect_id.as_str())
+            .await
+            .expect("resolved failure status should load")
+            .expect("resolved failure should remain inspectable");
+        assert_eq!(status.status, "unresolved");
+        assert_eq!(
+            status.last_error_code.as_deref(),
+            Some("terminal_effect_preparation_failed")
+        );
+        assert!(
+            store
+                .claim_due_native_terminal_effects(timestamp + 3, 10, 1)
+                .await
+                .expect("preparation failure scan should succeed")
+                .is_empty(),
+            "a typed preparation failure must never become executable work"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_terminal_effect_is_quarantined_without_poisoning_valid_batch_claims() {
+        let timestamp = 1_700_005_000;
+        let workspace_id = "ws_terminal_effect_malformed";
+        let thread_id = "thr_terminal_effect_malformed";
+        let turn_id = "turn_terminal_effect_malformed";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let mut preparation =
+            cleanup_effect_preparation(workspace_id, thread_id, turn_id, "malformed");
+        let cleanup_effect_id = preparation.effects[0].effect_id.clone();
+        let malformed_effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        preparation
+            .effects
+            .push(pioneer_protocol::NativeTerminalEffectSpec {
+                effect_id: malformed_effect_id.clone(),
+                effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                    request: serde_json::json!({"validAtAdmission": true}),
+                    runtime_snapshot: serde_json::json!({
+                        "schema_version": 1,
+                        "subscriptions": [],
+                        "handlers": []
+                    }),
+                },
+                max_attempts: 3,
+            });
+        store
+            .prepare_native_terminal_effects(preparation, timestamp)
+            .await
+            .expect("both effects should pass admission before injected corruption");
+        terminal_turn.status = TurnStatus::Failed;
+        store
+            .materialize_turn_failed(
+                TurnFailedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal commit should activate both effects");
+
+        pioneer_entity::native_terminal_effect_outbox::Entity::update_many()
+            .col_expr(
+                pioneer_entity::native_terminal_effect_outbox::Column::PayloadIdentitySha256,
+                Expr::value("0".repeat(64)),
+            )
+            .filter(
+                pioneer_entity::native_terminal_effect_outbox::Column::EffectId
+                    .eq(malformed_effect_id.clone()),
+            )
+            .exec(&store.connection)
+            .await
+            .expect("fault injection should corrupt exactly one immutable payload identity");
+
+        let claims = store
+            .claim_due_native_terminal_effects(timestamp + 1, 10, 10)
+            .await
+            .expect("malformed row should be isolated from valid claims");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].effect_id, cleanup_effect_id);
+        let malformed = store
+            .native_terminal_effect_status(malformed_effect_id.as_str())
+            .await
+            .expect("malformed effect status should load")
+            .expect("malformed effect should remain inspectable");
+        assert_eq!(malformed.status, "unresolved");
+        assert_eq!(
+            malformed.last_error_code.as_deref(),
+            Some("invalid_persisted_effect")
+        );
+        assert!(
+            store
+                .complete_native_terminal_effect(
+                    claims[0].effect_id.as_str(),
+                    claims[0].claim_token.as_str(),
+                    timestamp + 2,
+                )
+                .await
+                .expect("valid claim completion should persist")
+        );
+        let stats = store
+            .native_terminal_effect_stats()
+            .await
+            .expect("outbox stats should load");
+        assert_eq!(stats.running, 0);
+        assert_eq!(stats.succeeded, 1);
+        assert_eq!(stats.unresolved, 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_terminal_effect_checkpoint_is_quarantined_before_handler_execution() {
+        let timestamp = 1_700_005_250;
+        let workspace_id = "ws_terminal_effect_bad_checkpoint";
+        let thread_id = "thr_terminal_effect_bad_checkpoint";
+        let turn_id = "turn_terminal_effect_bad_checkpoint";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        store
+            .prepare_native_terminal_effects(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:batch:bad-checkpoint"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                        effect_id: effect_id.clone(),
+                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                        gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                            request: serde_json::json!({"phase": "turn.post_turn"}),
+                            runtime_snapshot: serde_json::json!({"schema_version": 1}),
+                        },
+                        max_attempts: 3,
+                    }],
+                },
+                timestamp,
+            )
+            .await
+            .expect("post-turn effect should prepare");
+        terminal_turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal commit should activate the effect");
+
+        pioneer_entity::native_terminal_effect_outbox::Entity::update_many()
+            .col_expr(
+                pioneer_entity::native_terminal_effect_outbox::Column::HandlerCheckpointJson,
+                Expr::value(Some(r#"{"schema_version":1}"#.to_owned())),
+            )
+            .col_expr(
+                pioneer_entity::native_terminal_effect_outbox::Column::HandlerCheckpointSha256,
+                Expr::value(Some("0".repeat(64))),
+            )
+            .filter(
+                pioneer_entity::native_terminal_effect_outbox::Column::EffectId
+                    .eq(effect_id.clone()),
+            )
+            .exec(&store.connection)
+            .await
+            .expect("fault injection should corrupt the durable checkpoint hash");
+
+        assert!(
+            store
+                .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+                .await
+                .expect("corrupt checkpoint should be quarantined")
+                .is_empty(),
+            "a corrupt checkpoint must never reach a hook handler"
+        );
+        let quarantined = store
+            .native_terminal_effect_status(effect_id.as_str())
+            .await
+            .expect("quarantined effect status should load")
+            .expect("quarantined effect should remain inspectable");
+        assert_eq!(quarantined.status, "unresolved");
+        assert_eq!(
+            quarantined.last_error_code.as_deref(),
+            Some("invalid_persisted_effect")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_terminal_cleanup_activates_for_interrupted_turn() {
+        let timestamp = 1_700_005_500;
+        let workspace_id = "ws_interrupted_cleanup";
+        let thread_id = "thr_interrupted_cleanup";
+        let turn_id = "turn_interrupted_cleanup";
+        let (store, _, mut interrupted_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let preparation = cleanup_effect_preparation(workspace_id, thread_id, turn_id, "cancelled");
+        let effect_id = preparation.effects[0].effect_id.clone();
+        store
+            .prepare_native_terminal_effects(preparation, timestamp)
+            .await
+            .expect("cancel cleanup should prepare before terminal commit");
+
+        interrupted_turn.status = TurnStatus::Interrupted;
+        interrupted_turn.error = Some("cancelled by user".to_owned());
+        store
+            .materialize_turn_failed(
+                TurnFailedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: interrupted_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("interrupted canonical terminal transaction should commit");
+
+        let claim = store
+            .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+            .await
+            .expect("interrupted cleanup should become claimable")
+            .pop()
+            .expect("interrupted cleanup claim");
+        assert_eq!(claim.effect_id, effect_id);
+        assert!(matches!(
+            claim.payload,
+            pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovered_turn_supersedes_prepared_provider_failure_cleanup_before_terminal_commit() {
+        let timestamp = 1_700_006_000;
+        let workspace_id = "ws_recovered_cleanup";
+        let thread_id = "thr_recovered_cleanup";
+        let turn_id = "turn_recovered_cleanup";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let preparation =
+            cleanup_effect_preparation(workspace_id, thread_id, turn_id, "provider-failure");
+        let cleanup_effect_id = preparation.effects[0].effect_id.clone();
+        store
+            .prepare_native_terminal_effects(preparation, timestamp)
+            .await
+            .expect("provider failure cleanup should prepare");
+
+        store
+            .prepare_native_terminal_effects(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:batch:recovered-success"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 2,
+                    effects: Vec::new(),
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("recovered terminal plan should supersede stale cleanup");
+        assert_eq!(
+            store
+                .native_terminal_effect_status(cleanup_effect_id.as_str())
+                .await
+                .expect("cleanup status should load")
+                .expect("superseded cleanup should remain inspectable")
+                .status,
+            "superseded"
+        );
+
+        terminal_turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("recovered Turn should commit successfully");
+        assert!(
+            store
+                .claim_due_native_terminal_effects(timestamp + 2, 10, 10)
+                .await
+                .expect("stale cleanup scan should succeed")
+                .is_empty(),
+            "successful recovery must not cancel attached tasks using the stale provider-failure plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_terminal_effect_outbox_converges_for_acceptance_before_completion() {
+        let timestamp = 1_700_010_000;
+        let workspace_id = "ws_terminal_effect_accept";
+        let thread_id = "thr_terminal_effect_accept";
+        let turn_id = "turn_terminal_effect_accept";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+
+        let mut task = sample_task(timestamp);
+        task.id = "task_terminal_effect_accept".to_owned();
+        task.workspace_id = workspace_id.to_owned();
+        task.created_by_thread_id = Some("parent_thread".to_owned());
+        task.created_by_turn_id = Some("parent_turn".to_owned());
+        let mut run = sample_task_run(timestamp);
+        run.id = "run_terminal_effect_accept".to_owned();
+        run.task_id = task.id.clone();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("task aggregate should persist");
+        let task_run_turn = TaskRunTurn {
+            id: "task_run_turn_effect_accept".to_owned(),
+            task_id: task.id.clone(),
+            run_id: run.id.clone(),
+            execution_id: None,
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: timestamp,
+            started_at: Some(timestamp),
+            completed_at: Some(timestamp),
+        };
+        store
+            .upsert_task_run_turn(task_run_turn.clone())
+            .await
+            .expect("task-run Turn should persist");
+        let candidate_id = "candidate_effect_accept";
+        store
+            .upsert_task_result_candidate(TaskResultCandidate {
+                id: candidate_id.to_owned(),
+                task_id: task.id,
+                run_id: run.id,
+                task_run_turn_id: task_run_turn.id,
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                round: 0,
+                status: TaskResultCandidateStatus::Accepted,
+                result: Some(TaskResult {
+                    summary: Some("accepted before completion".to_owned()),
+                    data: None,
+                    artifacts: Vec::new(),
+                    completed_by_run_id: Some("run_terminal_effect_accept".to_owned()),
+                }),
+                extraction_error: None,
+                summary: Some("accepted before completion".to_owned()),
+                diagnostics: Vec::new(),
+                final_review_event_id: Some("review_effect_accept".to_owned()),
+                created_at: timestamp,
+                updated_at: timestamp,
+                resolved_at: Some(timestamp),
+            })
+            .await
+            .expect("accepted candidate should persist before outbox preparation");
+
+        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        let preparation = pioneer_protocol::NativeTerminalEffectPreparation {
+            batch_id: format!("{turn_id}:batch:accepted"),
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            runtime_generation: 1,
+            effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                effect_id: effect_id.clone(),
+                effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                gate: pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult,
+                payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                    request: serde_json::json!({"durable": true}),
+                    runtime_snapshot: serde_json::json!({
+                        "schema_version": 1,
+                        "subscriptions": [],
+                        "handlers": []
+                    }),
+                },
+                max_attempts: 5,
+            }],
+        };
+        store
+            .prepare_native_terminal_effects(preparation.clone(), timestamp + 1)
+            .await
+            .expect("candidate-gated effect should prepare");
+        terminal_turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("terminal commit should observe prior durable acceptance");
+        let status = store
+            .native_terminal_effect_status(effect_id.as_str())
+            .await
+            .expect("effect status should load")
+            .expect("effect should exist");
+        assert_eq!(status.status, "ready");
+        assert_eq!(status.accepted_candidate_id.as_deref(), Some(candidate_id));
+        store
+            .prepare_native_terminal_effects(preparation, timestamp + 3)
+            .await
+            .expect("exact preparation after terminal commit should be idempotent");
+        let status = store
+            .native_terminal_effect_status(effect_id.as_str())
+            .await
+            .expect("effect status should reload")
+            .expect("effect should remain");
+        assert_eq!(status.status, "ready");
+        assert_eq!(status.attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn native_terminal_effect_outbox_converges_for_completion_before_acceptance_after_restart()
+     {
+        let timestamp = 1_700_020_000;
+        let workspace_id = "ws_effect_late_accept";
+        let thread_id = "thr_effect_late_accept";
+        let turn_id = "turn_effect_late_accept";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        store
+            .prepare_native_terminal_effects(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:batch:waiting"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                        effect_id: effect_id.clone(),
+                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                        gate: pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult,
+                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                            request: serde_json::json!({"durable": true}),
+                            runtime_snapshot: serde_json::json!({
+                                "schema_version": 1,
+                                "subscriptions": [],
+                                "handlers": []
+                            }),
+                        },
+                        max_attempts: 5,
+                    }],
+                },
+                timestamp,
+            )
+            .await
+            .expect("candidate-gated effect should prepare before acceptance");
+        terminal_turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal commit should preserve the waiting gate");
+        assert_eq!(
+            store
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("effect status should load")
+                .expect("effect should exist")
+                .status,
+            "waiting_acceptance"
+        );
+
+        // Restart before the durable candidate exists. Candidate projection
+        // must wake the already-terminal obligation without an in-memory
+        // rendezvous or a second completion event.
+        let restarted = CrudStore::new(store.database_connection());
+        let mut task = sample_task(timestamp + 2);
+        task.id = "task_effect_late_accept".to_owned();
+        task.workspace_id = workspace_id.to_owned();
+        task.created_by_thread_id = Some("parent_thread_late".to_owned());
+        task.created_by_turn_id = Some("parent_turn_late".to_owned());
+        let mut run = sample_task_run(timestamp + 2);
+        run.id = "run_effect_late_accept".to_owned();
+        run.task_id = task.id.clone();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+        restarted
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                timestamp + 2,
+            )
+            .await
+            .expect("late-acceptance task aggregate should persist");
+        let task_run_turn = TaskRunTurn {
+            id: "task_run_turn_late_accept".to_owned(),
+            task_id: task.id.clone(),
+            run_id: run.id.clone(),
+            execution_id: None,
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: timestamp + 2,
+            started_at: Some(timestamp + 2),
+            completed_at: Some(timestamp + 2),
+        };
+        restarted
+            .upsert_task_run_turn(task_run_turn.clone())
+            .await
+            .expect("late-acceptance task-run Turn should persist");
+        let candidate_id = "candidate_effect_late_accept";
+        let extraction_failed = TaskResultCandidate {
+            id: candidate_id.to_owned(),
+            task_id: task.id,
+            run_id: run.id,
+            task_run_turn_id: task_run_turn.id,
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            round: 0,
+            // Extraction failure is recoverable and must not discard the
+            // acceptance-gated terminal effect before a durable review can
+            // accept the candidate.
+            status: TaskResultCandidateStatus::ExtractionFailed,
+            result: Some(TaskResult {
+                summary: Some("accepted after restart".to_owned()),
+                data: None,
+                artifacts: Vec::new(),
+                completed_by_run_id: Some("run_effect_late_accept".to_owned()),
+            }),
+            extraction_error: None,
+            summary: Some("accepted after restart".to_owned()),
+            diagnostics: Vec::new(),
+            final_review_event_id: None,
+            created_at: timestamp + 3,
+            updated_at: timestamp + 3,
+            resolved_at: None,
+        };
+        restarted
+            .upsert_task_result_candidate(extraction_failed)
+            .await
+            .expect("recoverable extraction failure should persist after restart");
+        assert_eq!(
+            restarted
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("effect should remain readable after extraction failure")
+                .expect("effect should remain present after extraction failure")
+                .status,
+            "waiting_acceptance",
+            "a recoverable extraction failure must not discard acceptance-gated work"
+        );
+        restarted
+            .database_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER reject_candidate_gate_release \
+                 BEFORE UPDATE ON native_terminal_effect_outbox \
+                 WHEN OLD.effect_id = 'turn_effect_late_accept:terminal-effect:post-turn' \
+                      AND NEW.status = 'ready' \
+                 BEGIN SELECT RAISE(ABORT, 'injected gate release failure'); END",
+            )
+            .await
+            .expect("candidate gate fault trigger should install");
+        assert!(
+            restarted
+                .update_task_result_candidate_resolution(
+                    candidate_id,
+                    TaskResultCandidateStatus::Accepted,
+                    Some("review_effect_late_accept"),
+                    Some(timestamp + 4),
+                    timestamp + 4,
+                )
+                .await
+                .is_err(),
+            "an outbox write fault must roll back candidate acceptance"
+        );
+        assert_eq!(
+            restarted
+                .get_task_result_candidate(candidate_id)
+                .await
+                .expect("candidate should remain readable")
+                .expect("candidate should remain present")
+                .status,
+            TaskResultCandidateStatus::ExtractionFailed
+        );
+        assert_eq!(
+            restarted
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("effect should remain readable after rollback")
+                .expect("effect should remain present")
+                .status,
+            "waiting_acceptance"
+        );
+        restarted
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER reject_candidate_gate_release")
+            .await
+            .expect("candidate gate fault trigger should uninstall");
+        restarted
+            .update_task_result_candidate_resolution(
+                candidate_id,
+                TaskResultCandidateStatus::Accepted,
+                Some("review_effect_late_accept"),
+                Some(timestamp + 5),
+                timestamp + 5,
+            )
+            .await
+            .expect("late durable acceptance should release the gate")
+            .expect("accepted candidate should remain present");
+        restarted
+            .update_task_result_candidate_resolution(
+                candidate_id,
+                TaskResultCandidateStatus::Accepted,
+                Some("review_effect_late_accept"),
+                Some(timestamp + 5),
+                timestamp + 5,
+            )
+            .await
+            .expect("duplicate durable acceptance should be idempotent");
+        let status = restarted
+            .native_terminal_effect_status(effect_id.as_str())
+            .await
+            .expect("released effect status should load")
+            .expect("released effect should exist");
+        assert_eq!(status.status, "ready");
+        assert_eq!(status.accepted_candidate_id.as_deref(), Some(candidate_id));
+        assert_eq!(status.attempt_count, 0);
+        assert!(
+            restarted
+                .update_task_result_candidate_resolution(
+                    candidate_id,
+                    TaskResultCandidateStatus::Rejected,
+                    Some("review_conflicting_rejection"),
+                    Some(timestamp + 6),
+                    timestamp + 6,
+                )
+                .await
+                .is_err(),
+            "accepted candidate state and its released side effect must be irreversible"
+        );
+        let accepted = restarted
+            .get_task_result_candidate(candidate_id)
+            .await
+            .expect("accepted candidate should remain readable")
+            .expect("accepted candidate should remain present");
+        assert_eq!(accepted.status, TaskResultCandidateStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn native_terminal_effect_outbox_exhausts_retry_budget_into_explicit_unresolved_state() {
+        let timestamp = 1_700_030_000;
+        let workspace_id = "ws_terminal_effect_exhausted";
+        let thread_id = "thr_terminal_effect_exhausted";
+        let turn_id = "turn_terminal_effect_exhausted";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let mut preparation =
+            cleanup_effect_preparation(workspace_id, thread_id, turn_id, "retry-budget");
+        preparation.effects[0].max_attempts = 2;
+        let effect_id = preparation.effects[0].effect_id.clone();
+        store
+            .prepare_native_terminal_effects(preparation, timestamp)
+            .await
+            .expect("retry-bounded effect should prepare");
+        terminal_turn.status = TurnStatus::Failed;
+        store
+            .materialize_turn_failed(
+                TurnFailedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal failure should activate cleanup obligation");
+
+        let first = store
+            .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+            .await
+            .expect("first attempt should claim")
+            .pop()
+            .expect("first attempt must exist");
+        assert_eq!(first.attempt_count, 1);
+        assert!(
+            store
+                .fail_native_terminal_effect(
+                    effect_id.as_str(),
+                    first.claim_token.as_str(),
+                    "cleanup_unavailable",
+                    "injected retryable cleanup failure",
+                    true,
+                    timestamp + 2,
+                    timestamp + 1,
+                )
+                .await
+                .expect("first failure should schedule a retry")
+        );
+
+        let second = store
+            .claim_due_native_terminal_effects(timestamp + 2, 10, 1)
+            .await
+            .expect("second attempt should claim")
+            .pop()
+            .expect("second attempt must exist");
+        assert_eq!(second.attempt_count, 2);
+        assert!(
+            store
+                .fail_native_terminal_effect(
+                    effect_id.as_str(),
+                    second.claim_token.as_str(),
+                    "cleanup_unavailable",
+                    "injected final cleanup failure",
+                    true,
+                    timestamp + 3,
+                    timestamp + 2,
+                )
+                .await
+                .expect("exhausted failure should terminalize explicitly")
+        );
+        let status = store
+            .native_terminal_effect_status(effect_id.as_str())
+            .await
+            .expect("exhausted status should load")
+            .expect("effect should remain inspectable");
+        assert_eq!(status.status, "unresolved");
+        assert_eq!(status.attempt_count, 2);
+        assert_eq!(
+            status.last_error_code.as_deref(),
+            Some("cleanup_unavailable")
+        );
+        assert!(
+            store
+                .claim_due_native_terminal_effects(timestamp + 100, 10, 1)
+                .await
+                .expect("terminal status lookup should succeed")
+                .is_empty(),
+            "an unresolved obligation must not retry forever"
+        );
+        assert!(
+            !store
+                .complete_native_terminal_effect(
+                    effect_id.as_str(),
+                    second.claim_token.as_str(),
+                    timestamp + 100,
+                )
+                .await
+                .expect("stale completion should be fenced")
+        );
+        assert_eq!(
+            store
+                .native_terminal_effect_stats()
+                .await
+                .expect("outbox stats should load")
+                .unresolved,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn native_terminal_effect_retention_is_bounded_and_preserves_recovery_authority() {
+        let workspace_id = "ws_terminal_effect_retention";
+        let thread_id = "thr_terminal_effect_retention";
+        let turn_ids = [
+            "turn_effect_old_succeeded",
+            "turn_effect_old_discarded",
+            "turn_effect_old_unresolved",
+            "turn_effect_old_pending",
+            "turn_effect_recent_succeeded",
+        ];
+        let (store, thread, template_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_ids[0]).await;
+        for turn_id in turn_ids.iter().skip(1) {
+            let mut turn = template_turn.clone();
+            turn.id = (*turn_id).to_owned();
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("retention fixture Turn should persist");
+        }
+        for turn_id in turn_ids {
+            store
+                .prepare_native_terminal_effects(
+                    cleanup_effect_preparation(workspace_id, thread_id, turn_id, "retention"),
+                    1_700_000_000,
+                )
+                .await
+                .expect("retention fixture effect should prepare");
+        }
+
+        let old_completed = unix_to_datetime(1_700_000_100);
+        let recent_completed = unix_to_datetime(1_700_100_000);
+        for (turn_id, status, completed_at) in [
+            (turn_ids[0], "succeeded", Some(old_completed)),
+            (turn_ids[1], "discarded", Some(old_completed)),
+            (turn_ids[2], "unresolved", Some(old_completed)),
+            (turn_ids[3], "prepared", None),
+            (turn_ids[4], "succeeded", Some(recent_completed)),
+        ] {
+            pioneer_entity::native_terminal_effect_outbox::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::native_terminal_effect_outbox::Column::Status,
+                    Expr::value(status.to_owned()),
+                )
+                .col_expr(
+                    pioneer_entity::native_terminal_effect_outbox::Column::CompletedAt,
+                    Expr::value(completed_at),
+                )
+                .col_expr(
+                    pioneer_entity::native_terminal_effect_outbox::Column::TerminalCommittedAt,
+                    Expr::value(completed_at),
+                )
+                .filter(
+                    pioneer_entity::native_terminal_effect_outbox::Column::TurnId
+                        .eq(turn_id.to_owned()),
+                )
+                .exec(&store.connection)
+                .await
+                .expect("retention fixture status should persist");
+        }
+
+        assert_eq!(
+            store
+                .purge_resolved_native_terminal_effects_before(1_700_050_000, 1)
+                .await
+                .expect("first bounded purge should succeed"),
+            1,
+            "one invocation must honor its row limit"
+        );
+        assert_eq!(
+            store
+                .purge_resolved_native_terminal_effects_before(1_700_050_000, 10)
+                .await
+                .expect("second bounded purge should succeed"),
+            1,
+            "the remaining old resolved row should be purged"
+        );
+
+        for turn_id in [turn_ids[2], turn_ids[3], turn_ids[4]] {
+            let effect_id = format!("{turn_id}:terminal-effect:attached-task-cleanup");
+            assert!(
+                pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id)
+                    .one(&store.connection)
+                    .await
+                    .expect("retained effect lookup should succeed")
+                    .is_some(),
+                "pending, unresolved, and recent recovery authority must be retained"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn late_native_finalization_cannot_attach_to_an_unrelated_completed_turn() {
         let (store, _, mut turn) = test_store_with_started_turn(
@@ -27390,12 +29623,30 @@ mod tests {
             .expect("terminalization should survive restart");
         assert_eq!(claimed.len(), 1);
         let applied = restarted
-            .apply_claimed_recovery_terminalization(&claimed[0], None, 1_700_000_004)
+            .apply_claimed_recovery_terminalization(
+                &claimed[0],
+                None,
+                RecoveryTerminalCleanupPlan {
+                    runtime_generation: 77,
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                },
+                1_700_000_004,
+            )
             .await
             .expect("item and Turn should commit atomically");
         assert!(!applied.already_terminal);
         assert_eq!(applied.turn.status, TurnStatus::Failed);
         assert!(applied.final_item.is_some());
+        let cleanup = restarted
+            .claim_due_native_terminal_effects(1_700_000_004, 90, 10)
+            .await
+            .expect("recovery terminal cleanup should activate atomically");
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].runtime_generation, 77);
+        assert!(matches!(
+            cleanup[0].payload,
+            pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup { .. }
+        ));
         let (_, terminal) = restarted
             .get_turn("thr_recovery_terminal_outbox", "turn_recovery_outbox")
             .await
@@ -27481,7 +29732,15 @@ mod tests {
             can_resume_same_turn: true,
         };
         store
-            .apply_claimed_recovery_terminalization(&claimed[0], Some(resume), 1_700_000_003)
+            .apply_claimed_recovery_terminalization(
+                &claimed[0],
+                Some(resume),
+                RecoveryTerminalCleanupPlan {
+                    runtime_generation: 1,
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                },
+                1_700_000_003,
+            )
             .await
             .expect("outbox-only blocked terminalization should commit");
 
@@ -27574,7 +29833,15 @@ mod tests {
             .expect("fault trigger should install");
         assert!(
             store
-                .apply_claimed_recovery_terminalization(&first_claim[0], None, 1_700_000_004)
+                .apply_claimed_recovery_terminalization(
+                    &first_claim[0],
+                    None,
+                    RecoveryTerminalCleanupPlan {
+                        runtime_generation: 1,
+                        runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                    },
+                    1_700_000_004,
+                )
                 .await
                 .is_err()
         );
@@ -27613,7 +29880,15 @@ mod tests {
         assert_eq!(reclaimed.len(), 1);
         assert_ne!(reclaimed[0].claim_token, first_claim[0].claim_token);
         restarted
-            .apply_claimed_recovery_terminalization(&reclaimed[0], None, 1_700_000_010)
+            .apply_claimed_recovery_terminalization(
+                &reclaimed[0],
+                None,
+                RecoveryTerminalCleanupPlan {
+                    runtime_generation: 1,
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                },
+                1_700_000_010,
+            )
             .await
             .expect("reclaimed terminalization should converge");
     }

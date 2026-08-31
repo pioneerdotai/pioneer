@@ -61,6 +61,7 @@ pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub mod native_agent_config;
+pub mod native_terminal_effect_outbox;
 pub mod patch_commit_intent;
 pub mod patch_commit_terminal;
 pub mod patch_snapshot;

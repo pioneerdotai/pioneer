@@ -365,14 +365,14 @@ impl MessageProcessor {
 
     pub(crate) async fn bind_artifact_tool_bridge(self: &Arc<Self>) {
         self.agent_manager
-            .set_turn_tool_provider(Some(Arc::new(GatewayArtifactToolProvider::new(
-                Arc::downgrade(self),
-            ))))
-            .await;
-        self.agent_manager
-            .set_turn_finalization_provider(Some(Arc::new(
-                GatewayArtifactFinalizationProvider::new(Arc::downgrade(self)),
-            )))
+            .set_turn_execution_providers(
+                Some(Arc::new(GatewayArtifactToolProvider::new(Arc::downgrade(
+                    self,
+                )))),
+                Some(Arc::new(GatewayArtifactFinalizationProvider::new(
+                    Arc::downgrade(self),
+                ))),
+            )
             .await;
     }
 

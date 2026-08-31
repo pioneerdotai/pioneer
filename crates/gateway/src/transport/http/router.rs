@@ -5,11 +5,14 @@ use axum::routing::get;
 use super::GatewayHttpState;
 use super::avatars::{agent_avatar_route, member_avatar_route};
 use super::content::{artifact_content_route, artifact_projection_route};
-use super::health::{health, ready};
+use super::health::{health, native_diagnostics, ready};
 use super::views::view_grant_route;
 
 pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
-    operational_router::<GatewayHttpState>(state.readiness())
+    operational_router::<GatewayHttpState>(
+        state.readiness(),
+        Some(state.message_processor.clone()),
+    )
         .route("/", get(crate::transport::ws::root_websocket))
         .route(
             "/storage/workspaces/{workspace_id}/artifacts/{artifact_id}/versions/{version_id}/content",
@@ -35,13 +38,27 @@ pub(crate) fn gateway_router(state: GatewayHttpState) -> Router {
         .with_state(state)
 }
 
-fn operational_router<S>(readiness: super::state::ReadinessState) -> Router<S>
+fn operational_router<S>(
+    readiness: super::state::ReadinessState,
+    processor: Option<std::sync::Arc<crate::message::MessageProcessor>>,
+) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
         .route("/health", get(health))
-        .route("/ready", get(move || ready(readiness.clone())))
+        .route(
+            "/ready",
+            get({
+                let readiness = readiness.clone();
+                let processor = processor.clone();
+                move || ready(readiness.clone(), processor.clone())
+            }),
+        )
+        .route(
+            "/health/native",
+            get(move || native_diagnostics(readiness.clone(), processor.clone())),
+        )
 }
 
 #[cfg(test)]
@@ -55,7 +72,7 @@ mod tests {
     #[tokio::test]
     async fn health_and_readiness_are_minimal_and_unknown_paths_stay_unregistered() {
         let readiness = super::super::state::ReadinessState::default();
-        let app = operational_router::<()>(readiness.clone());
+        let app = operational_router::<()>(readiness.clone(), None);
 
         let health = app
             .clone()
@@ -78,6 +95,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ready.status(), StatusCode::OK);
+
+        let diagnostics = app
+            .clone()
+            .oneshot(Request::get("/health/native").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(diagnostics.status(), StatusCode::OK);
 
         for path in [
             "/ws",

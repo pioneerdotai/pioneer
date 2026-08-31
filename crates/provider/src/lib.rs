@@ -34,7 +34,11 @@ pub use file_tools::{
     select_native_file_tool_capability,
 };
 pub use http::validate_proxy_url;
-pub use registry::{ProviderAuthorityFingerprint, ProviderRegistry};
+pub use registry::{
+    ProviderAuthorityFingerprint, ProviderAuthorityRevoked, ProviderRegistry,
+    ProviderRegistryCapacityExceeded, ProviderRegistryDefinitionCapacityExceeded,
+    ProviderRegistryLimits, ProviderRegistryStats,
+};
 pub use traits::{Provider, ProviderWarmupOutcome};
 pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,

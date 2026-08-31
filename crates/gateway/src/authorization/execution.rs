@@ -1556,7 +1556,7 @@ impl ExecutionAuthorizationContext {
         let current = registry.authority_fingerprint_for_workspace(
             self.workspace_id.as_str(),
             provider.provider.as_str(),
-        );
+        )?;
         if current.as_str() != provider.authority_fingerprint {
             bail!("provider authority changed; execution requires a fresh admission");
         }
@@ -3637,7 +3637,7 @@ impl ExecutionAuthorizationAdmission {
             let current = provider_registry.authority_fingerprint_for_workspace(
                 self.workspace_id.as_str(),
                 provider.provider.as_str(),
-            );
+            )?;
             if current.as_str() != provider.authority_fingerprint {
                 bail!("provider authority changed before durable execution start");
             }

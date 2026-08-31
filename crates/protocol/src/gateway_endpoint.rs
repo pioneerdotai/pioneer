@@ -53,6 +53,50 @@ pub struct GatewayReadinessSnapshot {
     pub status: GatewayReadinessStatus,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayReadinessComponent {
+    Database,
+    NativeAgentManager,
+    DurableListeners,
+    RecoveryCoordinator,
+    Terminalization,
+    ProviderRegistry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayReadinessComponentState {
+    Starting,
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayReadinessComponentSnapshot {
+    pub component: GatewayReadinessComponent,
+    pub state: GatewayReadinessComponentState,
+    pub generation: u64,
+    pub active: u64,
+    pub pending: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_age_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayNativeLifecycleReadinessReport {
+    pub status: GatewayReadinessStatus,
+    pub accepting_new_turns: bool,
+    pub generation: u64,
+    pub checked_at_unix: i64,
+    pub components: Vec<GatewayReadinessComponentSnapshot>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayBaseUrlError {
     Empty,

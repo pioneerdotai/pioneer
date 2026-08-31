@@ -447,28 +447,39 @@ async fn run_gateway_until_shutdown_inner(
         config.gateway.provider.max_stream_duration_secs,
     );
 
-    let provider_registry = Arc::new(ProviderRegistry::new_scoped_with_timeout_policy_and_proxy(
-        {
-            let gateway_secrets = gateway_secrets.clone();
-            move |workspace_id, provider_name| {
-                workspace_id
-                    .map(|workspace_id| {
-                        gateway_secrets
-                            .resolve_workspace_provider_api_key(workspace_id, provider_name)
-                    })
-                    .unwrap_or_else(|| gateway_secrets.resolve_provider_api_key(provider_name))
-            }
-        },
-        {
-            let gateway_secrets = gateway_secrets.clone();
-            move |workspace_id, provider_name| {
-                workspace_id.and_then(|workspace_id| {
-                    gateway_secrets.resolve_workspace_provider_proxy(workspace_id, provider_name)
-                })
-            }
-        },
-        provider_timeout_policy,
-    ));
+    let provider_registry = Arc::new(
+        ProviderRegistry::new_scoped_fallible_with_timeout_policy_and_proxy(
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    if crate::secrets::is_local_provider(provider_name) {
+                        return Ok(String::new());
+                    }
+                    match workspace_id {
+                        Some(workspace_id) => Ok(gateway_secrets
+                            .get_workspace_provider_api_key(workspace_id, provider_name)?
+                            .unwrap_or_default()),
+                        None => Ok(gateway_secrets
+                            .get_provider_api_key(provider_name)?
+                            .unwrap_or_default()),
+                    }
+                }
+            },
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    workspace_id
+                        .map(|workspace_id| {
+                            gateway_secrets
+                                .get_workspace_provider_proxy(workspace_id, provider_name)
+                        })
+                        .transpose()
+                        .map(Option::flatten)
+                }
+            },
+            provider_timeout_policy,
+        ),
+    );
 
     let summary_config = SummaryConfig {
         summary_model: config.gateway.thread.summary_model.clone(),

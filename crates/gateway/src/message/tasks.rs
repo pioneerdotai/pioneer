@@ -3,8 +3,7 @@ use anyhow::{Result, bail};
 use pioneer_crud::TaskRunOccurrenceTerminalizationOutcome;
 use pioneer_protocol::{
     ItemUpdatedNotification, TaskAttachmentMode, TaskDeliveryStatus, TaskEventPayload,
-    TaskExecutorKind, TaskGetResponse, TaskRescheduleReason, TaskResultCandidateStatus,
-    TaskTriggerKind,
+    TaskGetResponse, TaskRescheduleReason, TaskTriggerKind,
 };
 use serde_json::json;
 
@@ -160,8 +159,6 @@ impl MessageProcessor {
             event_id: event.id,
             sequence: event.sequence,
         };
-        self.resolve_deferred_task_result_post_turn(&task_response, &event.payload)
-            .await;
         let workspace_id = context.workspace_id.clone();
         let notification_task_id = context.task_id.clone();
         let is_progress_event = matches!(event.payload, TaskEventPayload::Progress { .. });
@@ -675,13 +672,27 @@ impl MessageProcessor {
             | TaskEventPayload::TaskRunTurnBlocked { .. }
             | TaskEventPayload::TaskResultCandidateCreated { .. }
             | TaskEventPayload::TaskResultReviewEventRecorded { .. }
-            | TaskEventPayload::TaskResultCandidateAccepted { .. }
-            | TaskEventPayload::TaskResultCandidateRejected { .. }
-            | TaskEventPayload::TaskResultCandidateCancelled { .. }
             | TaskEventPayload::TaskRevisionRequested { .. }
             | TaskEventPayload::TaskRunEnteredReview { .. }
             | TaskEventPayload::DepthLimitExceeded { .. }
             | TaskEventPayload::WriteLockExtended { .. } => {
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
+                    workspace_id.as_str(),
+                    events::TASK_TREE_CHANGED,
+                    &pioneer_protocol::TaskTreeChangedNotification { context },
+                )
+                .await;
+            }
+            TaskEventPayload::TaskResultCandidateAccepted { .. }
+            | TaskEventPayload::TaskResultCandidateRejected { .. }
+            | TaskEventPayload::TaskResultCandidateCancelled { .. } => {
+                // Candidate projection resolves the acceptance gate in the
+                // durable terminal-effect outbox. Wake execution after the
+                // committed task event is visible; otherwise an effect whose
+                // Turn committed first can remain asleep until the periodic
+                // resilience sweep.
+                self.kick_native_terminal_effects();
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
@@ -700,76 +711,6 @@ impl MessageProcessor {
             .await;
         }
         Ok(())
-    }
-
-    async fn resolve_deferred_task_result_post_turn(
-        &self,
-        response: &TaskGetResponse,
-        payload: &TaskEventPayload,
-    ) {
-        let attachment = response
-            .task
-            .lifecycle_policy
-            .as_ref()
-            .map(|policy| policy.attachment)
-            .unwrap_or(TaskAttachmentMode::Detached);
-        if response.task.executor_kind != TaskExecutorKind::Agent
-            || attachment != TaskAttachmentMode::Detached
-        {
-            return;
-        }
-
-        match payload {
-            TaskEventPayload::TaskResultCandidateAccepted { candidate, .. } => {
-                self.agent_manager
-                    .accept_deferred_task_result_post_turn(
-                        candidate.thread_id.as_str(),
-                        candidate.turn_id.as_str(),
-                    )
-                    .await;
-            }
-            TaskEventPayload::TaskResultCandidateCreated { candidate } => match candidate.status {
-                TaskResultCandidateStatus::Accepted => {
-                    self.agent_manager
-                        .accept_deferred_task_result_post_turn(
-                            candidate.thread_id.as_str(),
-                            candidate.turn_id.as_str(),
-                        )
-                        .await;
-                }
-                TaskResultCandidateStatus::PendingReview => {}
-                TaskResultCandidateStatus::Rejected
-                | TaskResultCandidateStatus::Superseded
-                | TaskResultCandidateStatus::Cancelled
-                | TaskResultCandidateStatus::ExtractionFailed => {
-                    self.agent_manager
-                        .discard_deferred_task_result_post_turn(
-                            candidate.thread_id.as_str(),
-                            candidate.turn_id.as_str(),
-                        )
-                        .await;
-                }
-            },
-            TaskEventPayload::TaskResultCandidateRejected { candidate, .. }
-            | TaskEventPayload::TaskResultCandidateCancelled { candidate, .. } => {
-                self.agent_manager
-                    .discard_deferred_task_result_post_turn(
-                        candidate.thread_id.as_str(),
-                        candidate.turn_id.as_str(),
-                    )
-                    .await;
-            }
-            TaskEventPayload::TaskRunTurnFailed { task_run_turn, .. }
-            | TaskEventPayload::TaskRunTurnBlocked { task_run_turn, .. } => {
-                self.agent_manager
-                    .discard_deferred_task_result_post_turn(
-                        task_run_turn.thread_id.as_str(),
-                        task_run_turn.turn_id.as_str(),
-                    )
-                    .await;
-            }
-            _ => {}
-        }
     }
 
     async fn refresh_parent_task_anchor(&self, response: &TaskGetResponse) -> Result<bool> {

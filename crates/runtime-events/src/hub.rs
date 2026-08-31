@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use pioneer_protocol::{AgentDurableEvent, AgentProgressEvent, TurnItemType};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
@@ -41,6 +42,7 @@ impl Error for ExecutionEventHubError {}
 struct DurableEventEnvelope {
     event: Box<AgentDurableEvent>,
     committed_tx: Option<oneshot::Sender<Result<(), String>>>,
+    enqueued_at: Instant,
 }
 
 /// Receiver for the durable lane. Events published with a commit waiter must
@@ -49,6 +51,7 @@ struct DurableEventEnvelope {
 pub struct DurableEventReceiver {
     lane: Arc<DurableLane>,
     pending_commit: Option<oneshot::Sender<Result<(), String>>>,
+    pending_enqueue_age: Option<Duration>,
 }
 
 impl DurableEventReceiver {
@@ -59,10 +62,18 @@ impl DurableEventReceiver {
         ));
         let envelope = self.lane.receiver.lock().await.recv().await?;
         self.pending_commit = envelope.committed_tx;
+        self.pending_enqueue_age = Some(envelope.enqueued_at.elapsed());
         Some(*envelope.event)
     }
 
+    /// Queue residence measured when the current durable envelope was
+    /// received. It contains no identifiers and is cleared with the ACK.
+    pub fn pending_enqueue_age(&self) -> Option<Duration> {
+        self.pending_enqueue_age
+    }
+
     pub fn acknowledge_last(&mut self, result: Result<(), String>) {
+        self.pending_enqueue_age = None;
         if let Some(committed_tx) = self.pending_commit.take() {
             let _ = committed_tx.send(result);
         }
@@ -166,10 +177,15 @@ impl ExecutionEventHub {
     ) -> Result<(), ExecutionEventHubError> {
         self.flush_progress_for_durable(&event).await;
         self.flush_snapshots_for_durable(&event);
+        // Start queue residence only after prerequisite coalescer flushes.
+        // The duration still includes bounded-channel backpressure, but not
+        // unrelated pre-enqueue projection work.
+        let enqueued_at = Instant::now();
         self.durable_tx
             .send(DurableEventEnvelope {
                 event,
                 committed_tx,
+                enqueued_at,
             })
             .await
             .map_err(|_| ExecutionEventHubError::DurableLaneClosed)
@@ -275,6 +291,7 @@ impl ExecutionEventHub {
         Some(DurableEventReceiver {
             lane: self.durable_lane.clone(),
             pending_commit: None,
+            pending_enqueue_age: None,
         })
     }
 

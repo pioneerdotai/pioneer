@@ -1,16 +1,20 @@
 use super::{
-    AgentEvent, AgentManager, AgentMcpAvailability, AgentMcpMaterialization,
-    AgentMcpMaterializationError, AgentMcpMaterializationRequest, AgentMcpPersistedProjection,
-    AgentMcpProjectionBinding, AgentMcpProjectionPersistenceError,
-    AgentMcpProjectionPersistenceRequest, AgentMcpToolProvider, AgentMemoryProvider,
-    AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy, AgentStartError,
-    AgentThreadControlPlane, AgentTurnHookRuntimeContext, DurableEventReceiver,
-    ExecutionCheckpointContext, ExecutionTurnStatus, MemoryExtractionPolicy, MemoryRecallItem,
-    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
-    MemoryTurnPolicy, MemoryTurnPolicyContext, MemoryTurnPolicyRequest, PendingAttachedTask,
-    RecoveryAttemptRequest, ResolvedArtifactInput, ReviewRequiredTaskObservation,
-    TaskFinalizationSnapshot, TaskToolMaterialization, TaskToolProvider, TaskTurnContext,
-    ToolLoopConfig, TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
+    AgentCommand, AgentControlError, AgentControlOperation, AgentControlOperationId,
+    AgentControlOperationStatus, AgentControlPlaneConfig, AgentEvent, AgentEventHub, AgentManager,
+    AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
+    AgentMcpMaterializationRequest, AgentMcpPersistedProjection, AgentMcpProjectionBinding,
+    AgentMcpProjectionPersistenceError, AgentMcpProjectionPersistenceRequest, AgentMcpToolProvider,
+    AgentMemoryProvider, AgentMemoryTurnPolicyProvider, AgentPostTurnHookDispatchPolicy,
+    AgentStartError, AgentTerminalEffectExecutionError, AgentThreadControlPlane, AgentThreadHandle,
+    AgentTurnHookRuntimeContext, COMMAND_CHANNEL_CAPACITY, ControlOperationAdmission,
+    ControlOperationRegistry, DurableEventReceiver, ExecutionCheckpointContext,
+    ExecutionTurnStatus, MemoryExtractionPolicy, MemoryRecallItem, MemoryRecallRequest,
+    MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext, MemoryTurnPolicy,
+    MemoryTurnPolicyContext, MemoryTurnPolicyRequest, NATIVE_TERMINAL_RUNTIME_HISTORY_LIMIT,
+    PendingAttachedTask, RecoveryAttemptRequest, ResolvedArtifactInput,
+    ReviewRequiredTaskObservation, StoredControlOutcome, TaskFinalizationSnapshot,
+    TaskToolMaterialization, TaskToolProvider, TaskTurnContext, ToolLoopConfig,
+    TurnExecutionControl, TurnFinalizationContext, TurnFinalizationDecision,
     TurnFinalizationProvider, TurnToolContext, TurnToolMaterialization, TurnToolProvider,
     WorkspaceSkillPolicy,
 };
@@ -21,10 +25,13 @@ use pioneer_hooks::{
     HookDiagnosticSeverity, HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy,
     HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInputKind, HookInputPayload,
     HookKind, HookPhase, HookPolicyKey, HookPolicySet, HookPromptContent, HookPromptContextSet,
-    HookPromptSectionTitle, HookRegistry, HookRuntime, HookRuntimeBuilder, HookSectionId,
-    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, HookValue, PolicyContribution,
-    PromptContextContribution, PromptManifestDiagnosticContribution, PromptSectionContribution,
-    TurnPostTurnStatus, TurnPostTurnToolStatus,
+    HookPromptSectionTitle, HookRecoverableRunRecord, HookRecoveryScan, HookRegistry,
+    HookRetrySchedule, HookRunAttemptId, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord,
+    HookRunId, HookRunStore, HookRunStoreCompletion, HookRunStoreRecord, HookRunStoreResult,
+    HookRuntime, HookRuntimeBuilder, HookSectionId, HookSubscription, HookSubscriptionId,
+    HookSubscriptionRegistry, HookValue, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
+    PolicyContribution, PromptContextContribution, PromptManifestDiagnosticContribution,
+    PromptSectionContribution, TurnPostTurnStatus, TurnPostTurnToolStatus,
 };
 use pioneer_memory::hooks::{
     MEMORY_ACCEPTED_TASK_RESULT_POST_TURN_FEATURE_FLAG, memory_turn_policy_from_hook_policy_set,
@@ -289,6 +296,7 @@ impl AgentManager {
         capabilities: Vec<TurnCapability>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
+        let runtime_snapshot = self.runtime_dependencies.snapshot().await;
         self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
@@ -296,7 +304,7 @@ impl AgentManager {
             model,
             provider_name,
             workspace_skill_policies,
-            test_skill_catalog(&self.tool_loop_config.skills),
+            test_skill_catalog(&runtime_snapshot.tool_loop_config.skills),
             input,
             capabilities,
             Vec::new(),
@@ -325,6 +333,7 @@ impl AgentManager {
         history: Vec<ChatMessage>,
         reasoning_effort: Option<&str>,
     ) -> Result<(), AgentStartError> {
+        let runtime_snapshot = self.runtime_dependencies.snapshot().await;
         self.start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
@@ -332,7 +341,7 @@ impl AgentManager {
             model,
             provider_name,
             workspace_skill_policies,
-            test_skill_catalog(&self.tool_loop_config.skills),
+            test_skill_catalog(&runtime_snapshot.tool_loop_config.skills),
             input,
             capabilities,
             resolved_artifacts,
@@ -361,6 +370,7 @@ impl AgentManager {
         runtime_environment: HashMap<String, String>,
         history: Vec<ChatMessage>,
     ) -> Result<(), AgentStartError> {
+        let runtime_snapshot = self.runtime_dependencies.snapshot().await;
         self.start_turn_with_hook_context_permission_profile_and_security_snapshot(
             thread_id,
             turn_id,
@@ -369,7 +379,7 @@ impl AgentManager {
             model,
             provider_name,
             workspace_skill_policies,
-            test_skill_catalog(&self.tool_loop_config.skills),
+            test_skill_catalog(&runtime_snapshot.tool_loop_config.skills),
             input,
             capabilities,
             resolved_artifacts,
@@ -511,6 +521,27 @@ struct CaptureAgentProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     response_text: String,
     preflight_response_text: String,
+}
+
+struct FirstCallBlockingProvider {
+    inner: CaptureAgentProvider,
+    first_call_started: Arc<tokio::sync::Notify>,
+    first_call_release: Arc<tokio::sync::Semaphore>,
+    call_index: AtomicUsize,
+}
+
+impl FirstCallBlockingProvider {
+    fn new(
+        first_call_started: Arc<tokio::sync::Notify>,
+        first_call_release: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self {
+            inner: CaptureAgentProvider::default(),
+            first_call_started,
+            first_call_release,
+            call_index: AtomicUsize::new(0),
+        }
+    }
 }
 
 struct EmptyNoToolRoundProvider {
@@ -1018,6 +1049,7 @@ fn test_hook_capabilities() -> HookCapabilities {
         HookCapability::new("contribute_prompt_manifest_diagnostic").expect("valid capability"),
         HookCapability::new("emit_audit").expect("valid capability"),
         HookCapability::new("schedule_background_job").expect("valid capability"),
+        HookCapability::new("idempotent_side_effect").expect("valid capability"),
     ])
 }
 
@@ -1029,21 +1061,29 @@ fn empty_hook_runtime() -> Arc<HookRuntime> {
 }
 
 async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
-    let memory_provider = manager
-        .memory_provider
-        .read()
-        .await
-        .clone()
-        .expect("memory provider must be configured before installing test memory hooks");
-    let memory_write_provider = manager.memory_write_provider.read().await.clone();
-    let post_turn_extractor_provider = manager
-        .memory_post_turn_extractor_provider
-        .read()
-        .await
-        .clone();
-    let policy_provider = manager.memory_turn_policy_provider.read().await.clone();
-    let episodic_recall_provider = manager.memory_episodic_recall_provider.read().await.clone();
-    let current_runtime = manager.hook_runtime.read().await.clone();
+    let (
+        memory_provider,
+        memory_write_provider,
+        post_turn_extractor_provider,
+        policy_provider,
+        episodic_recall_provider,
+        current_runtime,
+        memory_config,
+    ) = {
+        let state = manager.runtime_dependencies.state.read().await;
+        (
+            state
+                .memory_provider
+                .clone()
+                .expect("memory provider must be configured before installing test memory hooks"),
+            state.memory_write_provider.clone(),
+            state.memory_post_turn_extractor_provider.clone(),
+            state.memory_turn_policy_provider.clone(),
+            state.memory_episodic_recall_provider.clone(),
+            state.hook_runtime.clone(),
+            state.tool_loop_config.memory.clone(),
+        )
+    };
     let builder = current_runtime
         .as_ref()
         .map(|runtime| HookRuntimeBuilder::from_runtime(runtime.as_ref()))
@@ -1056,7 +1096,7 @@ async fn install_configured_memory_hooks_for_test(manager: &AgentManager) {
             policy_provider,
             episodic_recall_provider,
             manager.memory_tool_bundle_artifact_store(),
-            manager.tool_loop_config.memory.clone(),
+            memory_config,
         ))
         .expect("test memory hook package installs")
         .build();
@@ -1143,7 +1183,11 @@ fn recording_hook_runtime_with_phase_failures_and_fallback(
             .expect("recording hook subscription registers");
     }
 
-    Arc::new(HookRuntime::new(handlers, subscriptions))
+    Arc::new(HookRuntime::with_run_store(
+        handlers,
+        subscriptions,
+        Arc::new(TestHookRunStore::default()),
+    ))
 }
 
 fn recording_hook_runtime_for_phase(
@@ -1193,7 +1237,210 @@ fn recording_hook_runtime_for_phase_with_failures(
         )
         .expect("recording hook subscription registers");
 
-    Arc::new(HookRuntime::new(handlers, subscriptions))
+    Arc::new(HookRuntime::with_run_store(
+        handlers,
+        subscriptions,
+        Arc::new(TestHookRunStore::default()),
+    ))
+}
+
+#[derive(Default)]
+struct TestHookRunStore {
+    state: std::sync::Mutex<TestHookRunStoreState>,
+    next_id: AtomicU64,
+}
+
+#[derive(Default)]
+struct TestHookRunStoreState {
+    run_ids_by_key: HashMap<String, String>,
+    runs: HashMap<String, HookRunStoreRecord>,
+    attempts: HashMap<String, HookRunAttemptStoreRecord>,
+}
+
+impl TestHookRunStore {
+    fn next_id(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}.{}",
+            self.next_id.fetch_add(1, Ordering::SeqCst) + 1
+        )
+    }
+
+    fn update_run(
+        &self,
+        run_id: &HookRunId,
+        update: impl FnOnce(&mut HookRunStoreRecord),
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        let mut state = self.state.lock().expect("test hook run store lock");
+        let run = state
+            .runs
+            .get_mut(run_id.as_str())
+            .ok_or_else(|| pioneer_hooks::HookRunStoreError::invalid_record("run missing"))?;
+        update(run);
+        Ok(run.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl HookRunStore for TestHookRunStore {
+    async fn create_or_load_run(
+        &self,
+        run: NewHookRunStoreRecord,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        let mut state = self.state.lock().expect("test hook run store lock");
+        if let Some(run_id) = state
+            .run_ids_by_key
+            .get(run.idempotency_key.as_str())
+            .cloned()
+        {
+            return state.runs.get(run_id.as_str()).cloned().ok_or_else(|| {
+                pioneer_hooks::HookRunStoreError::invalid_record("run index is inconsistent")
+            });
+        }
+        let id = HookRunId::new(self.next_id("test.hook.run"))
+            .expect("generated test hook run id is valid");
+        let record = HookRunStoreRecord {
+            id: id.clone(),
+            idempotency_key: run.idempotency_key.clone(),
+            subscription_id: run.subscription_id,
+            hook_id: run.hook_id,
+            phase: run.phase,
+            status: run.status,
+            scope: run.scope,
+            context: run.context,
+            attempt_count: 0,
+            contribution_count: run.contribution_hashes.len(),
+            diagnostic_count: run.diagnostic_previews.len(),
+            contribution_hashes: run.contribution_hashes,
+            diagnostic_previews: run.diagnostic_previews,
+            error: run.error,
+            queued_at_unix_ms: run.queued_at_unix_ms,
+            started_at_unix_ms: run.started_at_unix_ms,
+            completed_at_unix_ms: run.completed_at_unix_ms,
+            deadline_at_unix_ms: run.deadline_at_unix_ms,
+            resume_state: run.resume_state,
+        };
+        state.run_ids_by_key.insert(
+            record.idempotency_key.as_str().to_owned(),
+            id.as_str().to_owned(),
+        );
+        state.runs.insert(id.as_str().to_owned(), record.clone());
+        Ok(record)
+    }
+
+    async fn mark_run_running(
+        &self,
+        run_id: &HookRunId,
+        started_at_unix_ms: i64,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        self.update_run(run_id, |run| {
+            run.status = pioneer_hooks::HookRunStatus::Running;
+            run.started_at_unix_ms = Some(started_at_unix_ms);
+        })
+    }
+
+    async fn complete_run(
+        &self,
+        run_id: &HookRunId,
+        completion: HookRunStoreCompletion,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        self.update_run(run_id, |run| {
+            run.status = completion.status;
+            run.contribution_count = completion.contribution_hashes.len();
+            run.diagnostic_count = completion.diagnostic_previews.len();
+            run.contribution_hashes = completion.contribution_hashes;
+            run.diagnostic_previews = completion.diagnostic_previews;
+            run.error = completion.error;
+            run.completed_at_unix_ms = Some(completion.completed_at_unix_ms);
+        })
+    }
+
+    async fn append_attempt(
+        &self,
+        attempt: NewHookRunAttemptStoreRecord,
+    ) -> HookRunStoreResult<HookRunAttemptStoreRecord> {
+        let id = HookRunAttemptId::new(self.next_id("test.hook.attempt"))
+            .expect("generated test hook attempt id is valid");
+        let record = HookRunAttemptStoreRecord {
+            id: id.clone(),
+            hook_run_id: attempt.hook_run_id.clone(),
+            attempt_number: attempt.attempt_number,
+            status: attempt.status,
+            contribution_count: attempt.contribution_hashes.len(),
+            diagnostic_count: attempt.diagnostic_previews.len(),
+            contribution_hashes: attempt.contribution_hashes,
+            diagnostic_previews: attempt.diagnostic_previews,
+            error: attempt.error,
+            started_at_unix_ms: attempt.started_at_unix_ms,
+            completed_at_unix_ms: attempt.completed_at_unix_ms,
+            duration_ms: attempt.duration_ms,
+        };
+        let mut state = self.state.lock().expect("test hook run store lock");
+        state
+            .attempts
+            .insert(id.as_str().to_owned(), record.clone());
+        if let Some(run) = state.runs.get_mut(attempt.hook_run_id.as_str()) {
+            run.attempt_count = run.attempt_count.max(attempt.attempt_number);
+        }
+        Ok(record)
+    }
+
+    async fn complete_attempt(
+        &self,
+        attempt_id: &HookRunAttemptId,
+        completion: HookRunAttemptStoreCompletion,
+    ) -> HookRunStoreResult<HookRunAttemptStoreRecord> {
+        let mut state = self.state.lock().expect("test hook run store lock");
+        let attempt = state
+            .attempts
+            .get_mut(attempt_id.as_str())
+            .ok_or_else(|| pioneer_hooks::HookRunStoreError::invalid_record("attempt missing"))?;
+        attempt.status = completion.status;
+        attempt.contribution_count = completion.contribution_hashes.len();
+        attempt.diagnostic_count = completion.diagnostic_previews.len();
+        attempt.contribution_hashes = completion.contribution_hashes;
+        attempt.diagnostic_previews = completion.diagnostic_previews;
+        attempt.error = completion.error;
+        attempt.completed_at_unix_ms = Some(completion.completed_at_unix_ms);
+        attempt.duration_ms = completion.duration_ms;
+        Ok(attempt.clone())
+    }
+
+    async fn list_recoverable_runs(
+        &self,
+        _scan: HookRecoveryScan,
+    ) -> HookRunStoreResult<Vec<HookRecoverableRunRecord>> {
+        Ok(Vec::new())
+    }
+
+    async fn schedule_run_retry(
+        &self,
+        run_id: &HookRunId,
+        schedule: HookRetrySchedule,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        self.update_run(run_id, |run| {
+            run.status = pioneer_hooks::HookRunStatus::Queued;
+            run.queued_at_unix_ms = Some(schedule.queued_at_unix_ms);
+            run.deadline_at_unix_ms = schedule.deadline_at_unix_ms;
+            run.diagnostic_count = schedule.diagnostic_previews.len();
+            run.diagnostic_previews = schedule.diagnostic_previews;
+        })
+    }
+
+    async fn mark_stale_run_timed_out(
+        &self,
+        run_id: &HookRunId,
+        completion: HookRunStoreCompletion,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        self.complete_run(run_id, completion).await
+    }
+
+    async fn mark_run_unrecoverable(
+        &self,
+        run_id: &HookRunId,
+        completion: HookRunStoreCompletion,
+    ) -> HookRunStoreResult<HookRunStoreRecord> {
+        self.complete_run(run_id, completion).await
+    }
 }
 
 fn policy_contribution(
@@ -1602,6 +1849,7 @@ struct FailingTaskFinalizationSnapshotProvider;
 #[derive(Clone)]
 struct StaticTaskToolProvider {
     bundle: ToolExtensionBundle,
+    runtime_contract: &'static str,
 }
 
 #[derive(Clone)]
@@ -1833,6 +2081,10 @@ impl ToolHandler for ReviewGuardTaskHandler {
 
 #[async_trait::async_trait]
 impl TaskToolProvider for FailingTaskMutationToolProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "pioneer.test.attached-task-cleanup.v1"
+    }
+
     async fn materialize_task_tools(
         &self,
         _context: TaskTurnContext,
@@ -1904,10 +2156,23 @@ impl TaskToolProvider for FailingTaskMutationToolProvider {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        _effect_id: &str,
+        context: TaskTurnContext,
+        reason: String,
+    ) -> Result<(), String> {
+        self.cleanup_attached_tasks(context, reason).await
+    }
 }
 
 #[async_trait::async_trait]
 impl TaskToolProvider for FailingTaskFinalizationSnapshotProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "pioneer.test.attached-task-cleanup.v1"
+    }
+
     async fn materialize_task_tools(
         &self,
         _context: TaskTurnContext,
@@ -1950,10 +2215,23 @@ impl TaskToolProvider for FailingTaskFinalizationSnapshotProvider {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        _effect_id: &str,
+        context: TaskTurnContext,
+        reason: String,
+    ) -> Result<(), String> {
+        self.cleanup_attached_tasks(context, reason).await
+    }
 }
 
 #[async_trait::async_trait]
 impl TaskToolProvider for ReviewGuardTaskToolProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "pioneer.test.attached-task-cleanup.v1"
+    }
+
     async fn materialize_task_tools(
         &self,
         _context: TaskTurnContext,
@@ -2011,10 +2289,23 @@ impl TaskToolProvider for ReviewGuardTaskToolProvider {
         state.pending.clear();
         Ok(())
     }
+
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        _effect_id: &str,
+        context: TaskTurnContext,
+        reason: String,
+    ) -> Result<(), String> {
+        self.cleanup_attached_tasks(context, reason).await
+    }
 }
 
 #[async_trait::async_trait]
 impl TaskToolProvider for StaticTaskToolProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        self.runtime_contract
+    }
+
     async fn materialize_task_tools(
         &self,
         _context: TaskTurnContext,
@@ -2052,6 +2343,15 @@ impl TaskToolProvider for StaticTaskToolProvider {
         _reason: String,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        _effect_id: &str,
+        context: TaskTurnContext,
+        reason: String,
+    ) -> Result<(), String> {
+        self.cleanup_attached_tasks(context, reason).await
     }
 }
 
@@ -3129,6 +3429,41 @@ impl Provider for CaptureAgentProvider {
 }
 
 #[async_trait::async_trait]
+impl Provider for FirstCallBlockingProvider {
+    fn name(&self) -> &str {
+        "generation-blocking"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if self.call_index.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_call_started.notify_one();
+            self.first_call_release
+                .acquire()
+                .await
+                .expect("test release semaphore should stay open")
+                .forget();
+        }
+        self.inner.chat(request).await
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta(response.text)),
+            Ok(StreamChunk::final_chunk_with(response.termination)),
+        ])
+        .boxed())
+    }
+}
+
+#[async_trait::async_trait]
 impl Provider for ReviewGuardProvider {
     fn name(&self) -> &str {
         "review-guard"
@@ -3563,7 +3898,8 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         | AgentDurableEvent::TurnExecutionWindowContinued { .. }
         | AgentDurableEvent::TurnExecutionWindowBlocked { .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { .. }
-        | AgentDurableEvent::TurnPermissionAudit { .. } => None,
+        | AgentDurableEvent::TurnPermissionAudit { .. }
+        | AgentDurableEvent::NativeTerminalEffectsPrepared { .. } => None,
         AgentDurableEvent::ProviderFailureDetected {
             thread_id,
             turn_id,
@@ -3752,6 +4088,33 @@ async fn recv_durable_events_until_turn_blocked(
     panic!("turn blocked event not received")
 }
 
+async fn recv_terminal_effect_preparation_until_completed(
+    events: &mut DurableEventReceiver,
+    expected_turn_id: &str,
+) -> pioneer_protocol::NativeTerminalEffectPreparation {
+    let mut preparation = None;
+    for _ in 0..160 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("timed out waiting for terminal durable event")
+            .expect("agent durable event channel should stay open");
+        match event {
+            AgentDurableEvent::NativeTerminalEffectsPrepared {
+                preparation: prepared,
+            } if prepared.turn_id == expected_turn_id => preparation = Some(prepared),
+            AgentDurableEvent::TurnCompleted { turn_id, .. } if turn_id == expected_turn_id => {
+                events.acknowledge_last(Ok(()));
+                return preparation.expect(
+                    "terminal-effect preparation must be acknowledged before TurnCompleted",
+                );
+            }
+            _ => {}
+        }
+        events.acknowledge_last(Ok(()));
+    }
+    panic!("turn completion was not received for {expected_turn_id}")
+}
+
 fn assert_turn_completed(observed: &[AgentEvent]) {
     assert!(
         matches!(observed.last(), Some(AgentEvent::TurnCompleted { .. })),
@@ -3835,6 +4198,106 @@ async fn start_simple_turn(
     recv_events_until_terminal(&mut events).await
 }
 
+async fn recv_and_execute_terminal_effects(
+    manager: &AgentManager,
+    durable_events: &mut DurableEventReceiver,
+    expected_turn_id: &str,
+) -> Vec<AgentEvent> {
+    let mut preparation = None;
+    let mut observed = Vec::new();
+    for _ in 0..160 {
+        let event = timeout(Duration::from_secs(2), durable_events.recv())
+            .await
+            .expect("timed out waiting for terminal durable event")
+            .expect("agent durable event channel should stay open");
+        if let AgentDurableEvent::NativeTerminalEffectsPrepared {
+            preparation: prepared,
+        } = &event
+            && prepared.turn_id == expected_turn_id
+        {
+            preparation = Some(prepared.clone());
+        }
+        let terminal = matches!(
+            &event,
+            AgentDurableEvent::TurnCompleted { turn_id, .. }
+                | AgentDurableEvent::TurnFailed { turn_id, .. }
+                | AgentDurableEvent::TurnBlocked { turn_id, .. }
+                | AgentDurableEvent::TurnInterrupted { turn_id, .. }
+                if turn_id == expected_turn_id
+        );
+        let agent_event = test_agent_event_from_durable(event);
+        durable_events.acknowledge_last(Ok(()));
+        if let Some(event) = agent_event {
+            observed.push(event);
+        }
+        if terminal {
+            let preparation =
+                preparation.expect("terminal effects must be prepared before the terminal commit");
+            for effect in preparation.effects {
+                if effect.gate != pioneer_protocol::NativeTerminalEffectGate::TerminalCommit {
+                    continue;
+                }
+                // This helper models the Gateway outbox worker. A hook failure
+                // is intentionally returned to that worker after the Turn is
+                // already terminal, so tests which exercise a failing hook
+                // must still observe the handler call without changing the
+                // completed Turn.
+                let _ = manager
+                    .execute_terminal_effect(
+                        effect.effect_id.as_str(),
+                        "manager-test-terminal-effect-claim",
+                        preparation.runtime_generation,
+                        preparation.workspace_id.as_str(),
+                        preparation.thread_id.as_str(),
+                        preparation.turn_id.as_str(),
+                        effect.payload,
+                    )
+                    .await;
+            }
+            return observed;
+        }
+    }
+    panic!("terminal durable event was not received for {expected_turn_id}")
+}
+
+async fn start_simple_turn_with_terminal_effects(
+    manager: &AgentManager,
+    thread_id: &str,
+    workspace_id: &str,
+    turn_id: &str,
+    mode: ThreadMode,
+    provider_name: &str,
+    text: &str,
+) -> Vec<AgentEvent> {
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("test Gateway should own the durable event receiver");
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread_id,
+            turn_id,
+            mode,
+            "test-model",
+            provider_name,
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: text.to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    recv_and_execute_terminal_effects(manager, &mut durable_events, turn_id).await
+}
+
 #[tokio::test]
 async fn preflight_agent_loop_runs_before_first_main_prompt_compile() {
     let provider = Arc::new(CaptureAgentProvider::default());
@@ -3895,6 +4358,7 @@ async fn start_agent_skill_delivery_turn(
     turn_id: &str,
     provider_name: &str,
 ) -> Vec<AgentEvent> {
+    let runtime_snapshot = manager.runtime_dependencies.snapshot().await;
     manager
         .ensure_thread(thread_id, "ws_agent_skill_delivery")
         .await
@@ -3908,7 +4372,7 @@ async fn start_agent_skill_delivery_turn(
             "test-model",
             provider_name,
             HashMap::new(),
-            test_skill_catalog(&manager.tool_loop_config.skills),
+            test_skill_catalog(&runtime_snapshot.tool_loop_config.skills),
             vec![agent_skill_delivery_fixture()],
             vec![UserInput::Text {
                 text: "Use learned procedures when relevant.".to_owned(),
@@ -4402,6 +4866,103 @@ async fn third_consecutive_empty_no_tool_round_surfaces_provider_failure() {
 }
 
 #[tokio::test]
+async fn provider_failure_prepares_cleanup_for_later_recovery_terminalization() {
+    let provider = Arc::new(EmptyNoToolRoundProvider::new(usize::MAX));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "empty-no-tool-round",
+        provider,
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
+            bundle: ToolExtensionBundle {
+                specs: Vec::new(),
+                handlers: Vec::new(),
+            },
+            runtime_contract: "pioneer.test.attached-task-cleanup.v1",
+        })))
+        .await;
+    let thread_id = "provider_failure_cleanup_thread";
+    let turn_id = "provider_failure_cleanup_turn";
+    manager
+        .ensure_thread(thread_id, "provider_failure_cleanup_workspace")
+        .await
+        .expect("thread should be created");
+    let mut events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "empty-no-tool-round",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "trigger a recoverable provider failure".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("turn should start");
+
+    let mut preparation = None;
+    let mut provider_failed_observed = false;
+    for _ in 0..80 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("provider failure lifecycle event should arrive")
+            .expect("durable receiver should stay open");
+        let provider_failed = matches!(
+            &event,
+            AgentDurableEvent::ProviderFailureDetected {
+                turn_id: failed_turn_id,
+                ..
+            } if failed_turn_id == turn_id
+        );
+        if let AgentDurableEvent::NativeTerminalEffectsPrepared {
+            preparation: prepared,
+        } = event
+            && prepared.turn_id == turn_id
+        {
+            preparation = Some(prepared);
+        }
+        events.acknowledge_last(Ok(()));
+        if provider_failed {
+            provider_failed_observed = true;
+            break;
+        }
+    }
+
+    assert!(
+        provider_failed_observed,
+        "the test must reach provider-failure recovery scheduling"
+    );
+    let preparation = preparation
+        .expect("cleanup must be durable before the recovery job can later terminalize the Turn");
+    let cleanup = preparation
+        .effects
+        .iter()
+        .find(|effect| {
+            effect.effect_kind == pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
+        })
+        .expect("provider failure must prepare attached-task cleanup");
+    assert_eq!(
+        cleanup.gate,
+        pioneer_protocol::NativeTerminalEffectGate::TerminalCommit
+    );
+    assert!(matches!(
+        &cleanup.payload,
+        pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup { reason, .. }
+            if reason.contains("recovery terminalized after provider failure")
+    ));
+}
+
+#[tokio::test]
 async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_window() {
     let provider = Arc::new(EmptyNoToolRoundProvider::new(usize::MAX));
     let registry = Arc::new(ProviderRegistry::with_provider(
@@ -4881,7 +5442,7 @@ async fn phase_07_agent_mode_calls_each_hook_phase_once() {
         )))
         .await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase07_agent_hooks",
         "ws_phase07_agent_hooks",
@@ -4983,7 +5544,7 @@ async fn phase_07_agent_mode_without_tool_calling_calls_each_hook_phase_once() {
         )))
         .await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase07_agent_no_tools",
         "ws_phase07_agent_no_tools",
@@ -5306,7 +5867,7 @@ async fn phase_12_post_turn_hook_runs_after_success_with_summary_input() {
         )))
         .await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase12_success",
         "ws_phase12_success",
@@ -5360,7 +5921,10 @@ async fn task_runtime_turn_hook_context_marks_post_turn_as_task_owned() {
         .ensure_thread("thr_task_runtime_hook", "ws_task_runtime_hook")
         .await
         .expect("thread should be created");
-    let mut events = subscribe_agent_events(&manager, "thr_task_runtime_hook").await;
+    let mut durable_events = manager
+        .take_durable_receiver("thr_task_runtime_hook")
+        .await
+        .expect("test Gateway should own the durable event receiver");
 
     manager
         .start_test_turn_with_default_profile_hook_context(
@@ -5383,7 +5947,9 @@ async fn task_runtime_turn_hook_context_marks_post_turn_as_task_owned() {
         .await
         .expect("task runtime turn should start");
 
-    let observed = recv_events_until_terminal(&mut events).await;
+    let observed =
+        recv_and_execute_terminal_effects(&manager, &mut durable_events, "turn_task_runtime_hook")
+            .await;
     assert_turn_completed(&observed);
 
     let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
@@ -5398,7 +5964,992 @@ async fn task_runtime_turn_hook_context_marks_post_turn_as_task_owned() {
 }
 
 #[tokio::test]
-async fn accepted_detached_task_result_dispatches_post_turn_once_with_parent_scope() {
+async fn related_turn_execution_providers_publish_in_one_runtime_generation() {
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "echo",
+        Arc::new(EchoProvider),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let before = manager.runtime_dependencies.snapshot().await;
+
+    manager
+        .set_turn_execution_providers(
+            Some(Arc::new(StaticTurnToolProvider {
+                bundle: ToolExtensionBundle::default(),
+            })),
+            Some(Arc::new(FailFinalizationProvider)),
+        )
+        .await;
+
+    let after = manager.runtime_dependencies.snapshot().await;
+    assert_eq!(after.generation, before.generation + 1);
+    assert!(after.turn_tool_provider.is_some());
+    assert!(after.turn_finalization_provider.is_some());
+}
+
+#[tokio::test]
+async fn memory_hook_builder_inputs_do_not_consume_runtime_generations() {
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "echo",
+        Arc::new(EchoProvider),
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let before = manager.runtime_dependencies.snapshot().await;
+
+    manager.set_memory_provider(None).await;
+    manager.set_memory_write_provider(None).await;
+    manager.set_memory_post_turn_extractor_provider(None).await;
+    manager.set_memory_turn_policy_provider(None).await;
+    manager.set_memory_episodic_recall_provider(None).await;
+
+    let after_builder_inputs = manager.runtime_dependencies.snapshot().await;
+    assert_eq!(after_builder_inputs.generation, before.generation);
+    assert!(
+        manager
+            .runtime_dependencies
+            .state
+            .read()
+            .await
+            .terminal_runtime_history
+            .is_empty(),
+        "non-executable hook builder inputs must not evict terminal adapters"
+    );
+
+    manager.set_hook_runtime(Some(empty_hook_runtime())).await;
+    let after_publication = manager.runtime_dependencies.snapshot().await;
+    assert_eq!(after_publication.generation, before.generation + 1);
+    assert_eq!(
+        manager
+            .runtime_dependencies
+            .state
+            .read()
+            .await
+            .terminal_runtime_history
+            .len(),
+        1,
+        "the assembled hook runtime is the single executable publication boundary"
+    );
+}
+
+#[tokio::test]
+async fn turn_runtime_snapshot_is_immutable_and_next_turn_uses_new_generation_on_same_thread() {
+    let first_call_started = Arc::new(tokio::sync::Notify::new());
+    let first_call_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider = Arc::new(FirstCallBlockingProvider::new(
+        first_call_started.clone(),
+        first_call_release.clone(),
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "generation-blocking",
+        provider,
+    ));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    let initial_generation = manager.runtime_dependencies.snapshot().await.generation;
+    let thread_id = "thr_runtime_generation";
+    manager
+        .ensure_thread(thread_id, "ws_runtime_generation")
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+
+    manager
+        .start_test_turn_with_default_profile(
+            thread_id,
+            "turn_runtime_generation_a",
+            ThreadMode::Agent,
+            "test-model",
+            "generation-blocking",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "Turn A".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("Turn A should start");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                _ = first_call_started.notified() => break,
+                event = durable_events.recv() => {
+                    event.expect("durable event channel should stay open before provider call");
+                    durable_events.acknowledge_last(Ok(()));
+                }
+            }
+        }
+    })
+    .await
+    .expect("Turn A provider call should start");
+
+    manager.set_hook_runtime(Some(empty_hook_runtime())).await;
+    let updated_generation = manager.runtime_dependencies.snapshot().await.generation;
+    assert!(updated_generation > initial_generation);
+    first_call_release.add_permits(1);
+    let turn_a = recv_terminal_effect_preparation_until_completed(
+        &mut durable_events,
+        "turn_runtime_generation_a",
+    )
+    .await;
+    assert_eq!(
+        turn_a.runtime_generation, initial_generation,
+        "a mid-Turn runtime update must not alter Turn A's immutable snapshot"
+    );
+    assert!(
+        turn_a.effects.is_empty(),
+        "a Turn whose immutable snapshot has no hook runtime must not persist an unexecutable hook obligation"
+    );
+
+    manager
+        .start_test_turn_with_default_profile(
+            thread_id,
+            "turn_runtime_generation_b",
+            ThreadMode::Agent,
+            "test-model",
+            "generation-blocking",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "Turn B".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("Turn B should start on the same actor");
+    let turn_b = recv_terminal_effect_preparation_until_completed(
+        &mut durable_events,
+        "turn_runtime_generation_b",
+    )
+    .await;
+    assert_eq!(turn_b.runtime_generation, updated_generation);
+    assert!(turn_b.runtime_generation > turn_a.runtime_generation);
+    assert_eq!(
+        turn_b.effects.len(),
+        1,
+        "the next Turn must prepare its post-turn obligation from the updated runtime generation"
+    );
+    assert_eq!(
+        turn_b.effects[0].effect_kind,
+        pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
+    );
+    assert!(matches!(
+        &turn_b.effects[0].payload,
+        pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+            runtime_snapshot: _,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn terminal_effect_execution_uses_the_origin_runtime_generation() {
+    let origin_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let replacement_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            origin_calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+    let thread_id = "thr_terminal_runtime_generation";
+    let workspace_id = "ws_terminal_runtime_generation";
+    let turn_id = "turn_terminal_runtime_generation";
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("thread should be created");
+    let mut durable_events = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("thread should expose one durable receiver");
+
+    manager
+        .start_test_turn_with_default_profile(
+            thread_id,
+            turn_id,
+            ThreadMode::Agent,
+            "test-model",
+            "capture",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "Complete with the origin hook runtime.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("Turn should start");
+    let preparation =
+        recv_terminal_effect_preparation_until_completed(&mut durable_events, turn_id).await;
+    assert!(
+        snapshot_hook_calls(&origin_calls).is_empty(),
+        "the actor must only prepare the post-turn side effect"
+    );
+    let runtime_generation = preparation.runtime_generation;
+    let effect = preparation
+        .effects
+        .into_iter()
+        .next()
+        .expect("post-turn effect should be prepared");
+
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            replacement_calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+    manager
+        .execute_terminal_effect(
+            effect.effect_id.as_str(),
+            "test-terminal-effect-claim",
+            runtime_generation,
+            workspace_id,
+            thread_id,
+            turn_id,
+            effect.payload,
+        )
+        .await
+        .expect("the origin runtime generation should remain executable");
+
+    assert_eq!(snapshot_hook_calls(&origin_calls).len(), 1);
+    assert!(
+        snapshot_hook_calls(&replacement_calls).is_empty(),
+        "a later runtime generation must not take ownership of an older Turn's side effect"
+    );
+}
+
+#[tokio::test]
+async fn attached_task_cleanup_rebind_fails_closed_after_origin_runtime_eviction() {
+    let manager = test_manager();
+    let origin = Arc::new(StaticTaskToolProvider {
+        bundle: ToolExtensionBundle::default(),
+        runtime_contract: "pioneer.test.attached-task-cleanup.v1",
+    });
+    manager.set_task_tool_provider(Some(origin)).await;
+    let (origin_generation, origin_contract) = manager
+        .terminal_cleanup_runtime_binding()
+        .await
+        .expect("origin cleanup binding should exist");
+
+    let replacement = Arc::new(StaticTaskToolProvider {
+        bundle: ToolExtensionBundle::default(),
+        runtime_contract: "pioneer.test.attached-task-cleanup.v2",
+    });
+    for _ in 0..=NATIVE_TERMINAL_RUNTIME_HISTORY_LIMIT {
+        manager
+            .set_task_tool_provider(Some(replacement.clone()))
+            .await;
+    }
+
+    let error = manager
+        .execute_terminal_effect(
+            "turn_cleanup_contract:terminal-effect:attached-task-cleanup",
+            "claim-cleanup-contract",
+            origin_generation,
+            "ws_cleanup_contract",
+            "thr_cleanup_contract",
+            "turn_cleanup_contract",
+            pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                reason: "parent turn terminalized".to_owned(),
+                runtime_contract: origin_contract,
+            },
+        )
+        .await
+        .expect_err("an incompatible rebound cleanup adapter must fail closed");
+    assert!(matches!(
+        error,
+        AgentTerminalEffectExecutionError::InvalidPayload(message)
+            if message.contains("runtime contract mismatch")
+    ));
+}
+
+#[tokio::test]
+async fn agent_manager_health_detects_dead_actor_and_listener_gap_until_generation_repair() {
+    let manager = test_manager();
+    let thread_id = "thr_health_generation_repair";
+    timeout(
+        Duration::from_secs(5),
+        manager.ensure_thread(thread_id, "ws_health_generation_repair"),
+    )
+    .await
+    .expect("initial actor creation should remain bounded")
+    .expect("thread actor should start");
+
+    let initial = manager.health_snapshot().await;
+    assert_eq!(initial.registered_actors, 1);
+    assert_eq!(initial.dead_actors, 0);
+    assert_eq!(initial.durable_listener_gaps, 1);
+    let first_generation = initial.highest_actor_generation;
+
+    let listener = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("durable listener should claim the first actor lane");
+    assert_eq!(manager.health_snapshot().await.durable_listener_gaps, 0);
+
+    {
+        let state = manager.state.read().await;
+        state
+            .threads
+            .get(thread_id)
+            .expect("thread handle should remain registered")
+            .loop_handle
+            .abort();
+    }
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if manager.health_snapshot().await.dead_actors == 1 {
+                break;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("aborted actor should become unhealthy");
+
+    drop(listener);
+    let failed = manager.health_snapshot().await;
+    assert_eq!(failed.dead_actors, 1);
+    assert_eq!(failed.durable_listener_gaps, 1);
+
+    timeout(
+        Duration::from_secs(5),
+        manager.ensure_thread(thread_id, "ws_health_generation_repair"),
+    )
+    .await
+    .expect("actor replacement should remain bounded")
+    .expect("finished actor should be replaced");
+    let replacement_listener = manager
+        .take_durable_receiver(thread_id)
+        .await
+        .expect("replacement generation should expose a fresh durable lane");
+    let repaired = manager.health_snapshot().await;
+    assert_eq!(repaired.registered_actors, 1);
+    assert_eq!(repaired.dead_actors, 0);
+    assert_eq!(repaired.durable_listener_gaps, 0);
+    assert!(repaired.highest_actor_generation > first_generation);
+
+    drop(replacement_listener);
+    timeout(Duration::from_secs(5), manager.remove_thread(thread_id))
+        .await
+        .expect("replacement actor shutdown should remain bounded");
+}
+
+#[tokio::test]
+async fn thread_removal_fences_a_full_mailbox_without_unbounded_wait() {
+    let manager = AgentManager::new_with_mcp_memory_and_control_config(
+        Arc::new(ProviderRegistry::new(|_| String::new())),
+        test_tool_loop_config(),
+        None,
+        None,
+        AgentControlPlaneConfig {
+            enqueue_timeout: Duration::from_millis(5),
+            acknowledgement_timeout: Duration::from_millis(5),
+            outcome_capacity_per_thread: 4,
+        },
+    );
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+    for _ in 0..COMMAND_CHANNEL_CAPACITY {
+        command_tx
+            .try_send(AgentCommand::Shutdown)
+            .expect("test actor mailbox should fill exactly to capacity");
+    }
+    let loop_handle = tokio::spawn(async { std::future::pending::<()>().await });
+    manager.state.write().await.threads.insert(
+        "thread_full_shutdown".to_owned(),
+        AgentThreadHandle {
+            workspace_id: "ws_full_shutdown".to_owned(),
+            generation: 1,
+            command_tx,
+            control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
+            control_plane: AgentThreadControlPlane::default(),
+            event_hub: Arc::new(AgentEventHub::new()),
+            loop_handle,
+        },
+    );
+
+    timeout(
+        Duration::from_millis(250),
+        manager.remove_thread("thread_full_shutdown"),
+    )
+    .await
+    .expect("thread removal must fence a mailbox which cannot accept shutdown");
+    assert!(!manager.has_thread("thread_full_shutdown").await);
+    drop(command_rx);
+}
+
+#[tokio::test]
+async fn thread_removal_does_not_expose_replacement_until_old_actor_has_stopped() {
+    let manager = Arc::new(test_manager());
+    let thread_id = "thread_serialized_removal";
+    let workspace_id = "ws_serialized_removal";
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
+    let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
+    let (allow_shutdown_tx, allow_shutdown_rx) = tokio::sync::oneshot::channel();
+    let loop_handle = tokio::spawn(async move {
+        if matches!(command_rx.recv().await, Some(AgentCommand::Shutdown)) {
+            let _ = shutdown_observed_tx.send(());
+            let _ = allow_shutdown_rx.await;
+        }
+    });
+    manager.state.write().await.threads.insert(
+        thread_id.to_owned(),
+        AgentThreadHandle {
+            workspace_id: workspace_id.to_owned(),
+            generation: 83,
+            command_tx,
+            control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
+            control_plane: AgentThreadControlPlane::default(),
+            event_hub: Arc::new(AgentEventHub::new()),
+            loop_handle,
+        },
+    );
+
+    let removal = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.remove_thread(thread_id).await }
+    });
+    timeout(Duration::from_secs(1), shutdown_observed_rx)
+        .await
+        .expect("old actor should receive cooperative shutdown")
+        .expect("old actor should report cooperative shutdown");
+
+    let replacement = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.ensure_thread(thread_id, workspace_id).await }
+    });
+    yield_now().await;
+    assert!(
+        !replacement.is_finished(),
+        "replacement admission must remain fenced while the old actor can still run"
+    );
+
+    allow_shutdown_tx
+        .send(())
+        .expect("old actor shutdown waiter should remain alive");
+    timeout(Duration::from_secs(1), removal)
+        .await
+        .expect("old actor removal should finish")
+        .expect("old actor removal task should not panic");
+    timeout(Duration::from_secs(1), replacement)
+        .await
+        .expect("replacement should start after old actor exits")
+        .expect("replacement task should not panic")
+        .expect("replacement actor should start");
+    assert_ne!(manager.thread_generation(thread_id).await, Some(83));
+
+    manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test]
+async fn control_timeout_fences_only_the_unresponsive_actor_generation() {
+    let manager = AgentManager::new_with_mcp_memory_and_control_config(
+        Arc::new(ProviderRegistry::new(|_| String::new())),
+        test_tool_loop_config(),
+        None,
+        None,
+        AgentControlPlaneConfig {
+            enqueue_timeout: Duration::from_millis(5),
+            acknowledgement_timeout: Duration::from_millis(5),
+            outcome_capacity_per_thread: 4,
+        },
+    );
+    let thread_id = "thread_unresponsive_generation";
+    let workspace_id = "ws_unresponsive_generation";
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+    for _ in 0..COMMAND_CHANNEL_CAPACITY {
+        command_tx
+            .try_send(AgentCommand::Shutdown)
+            .expect("test actor mailbox should fill exactly to capacity");
+    }
+    let loop_handle = tokio::spawn(async { std::future::pending::<()>().await });
+    manager.state.write().await.threads.insert(
+        thread_id.to_owned(),
+        AgentThreadHandle {
+            workspace_id: workspace_id.to_owned(),
+            generation: 41,
+            command_tx,
+            control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
+            control_plane: AgentThreadControlPlane::default(),
+            event_hub: Arc::new(AgentEventHub::new()),
+            loop_handle,
+        },
+    );
+
+    let result = timeout(
+        Duration::from_millis(250),
+        manager.cancel_turn(thread_id, "turn_unresponsive", "cancel"),
+    )
+    .await
+    .expect("bounded control protocol must return");
+    assert_eq!(
+        result,
+        Err(AgentControlError::MailboxEnqueueTimeout {
+            operation: AgentControlOperation::CancelTurn,
+            actor_generation: 41,
+        })
+    );
+    assert!(
+        !manager.has_thread(thread_id).await,
+        "the exact unresponsive generation must be removed before recovery retries"
+    );
+
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("durable recovery must be able to create a replacement actor");
+    let replacement_generation = manager
+        .thread_generation(thread_id)
+        .await
+        .expect("replacement generation should be registered");
+    assert_ne!(replacement_generation, 41);
+    assert!(
+        !manager
+            .fence_unresponsive_thread_generation(thread_id, 41)
+            .await,
+        "a delayed old timeout must not fence the replacement generation"
+    );
+    assert_eq!(
+        manager.thread_generation(thread_id).await,
+        Some(replacement_generation)
+    );
+
+    manager.remove_thread(thread_id).await;
+    drop(command_rx);
+}
+
+#[tokio::test]
+async fn abandoned_enqueued_control_is_generation_fenced_on_reconciliation() {
+    let config = AgentControlPlaneConfig {
+        enqueue_timeout: Duration::from_millis(5),
+        acknowledgement_timeout: Duration::from_millis(5),
+        outcome_capacity_per_thread: 4,
+    };
+    let manager = AgentManager::new_with_mcp_memory_and_control_config(
+        Arc::new(ProviderRegistry::new(|_| String::new())),
+        test_tool_loop_config(),
+        None,
+        None,
+        config,
+    );
+    let thread_id = "thread_abandoned_enqueued_control";
+    let workspace_id = "ws_abandoned_enqueued_control";
+    let operation_id = AgentControlOperationId::CancelTurn {
+        turn_id: "turn_abandoned_enqueued_control".to_owned(),
+    };
+    let outcomes = Arc::new(ControlOperationRegistry::with_config(config));
+    let admitted_at = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("one-second synthetic age should be representable");
+    assert!(matches!(
+        outcomes.begin_at(operation_id.clone(), 73, admitted_at),
+        ControlOperationAdmission::Fresh
+    ));
+    outcomes.mark_enqueued_at(&operation_id, 73, admitted_at);
+
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+    let loop_handle = tokio::spawn(async { std::future::pending::<()>().await });
+    manager.state.write().await.threads.insert(
+        thread_id.to_owned(),
+        AgentThreadHandle {
+            workspace_id: workspace_id.to_owned(),
+            generation: 73,
+            command_tx,
+            control_outcomes: outcomes,
+            control_plane: AgentThreadControlPlane::default(),
+            event_hub: Arc::new(AgentEventHub::new()),
+            loop_handle,
+        },
+    );
+
+    assert_eq!(
+        manager
+            .cancel_turn(
+                thread_id,
+                "turn_abandoned_enqueued_control",
+                "reconcile abandoned caller",
+            )
+            .await,
+        Err(AgentControlError::AcknowledgementTimeout {
+            operation: AgentControlOperation::CancelTurn,
+            actor_generation: 73,
+        })
+    );
+    assert!(
+        !manager.has_thread(thread_id).await,
+        "an accepted command left pending by a canceled caller must not poison the actor registry forever"
+    );
+    assert_eq!(
+        manager
+            .control_operation_status(thread_id, &operation_id)
+            .await
+            .expect("a fenced generation must retain a bounded reconciliation tombstone"),
+        Some(AgentControlOperationStatus::ReconciliationRequired {
+            actor_generation: 73,
+        })
+    );
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("durable recovery should install a replacement actor");
+    assert_eq!(
+        manager
+            .control_operation_status(thread_id, &operation_id)
+            .await
+            .expect("replacement installation must not erase the prior uncertain outcome"),
+        Some(AgentControlOperationStatus::ReconciliationRequired {
+            actor_generation: 73,
+        })
+    );
+    manager.remove_thread(thread_id).await;
+    drop(command_rx);
+}
+
+#[tokio::test]
+async fn terminal_retirement_fences_generation_before_registry_release() {
+    let manager = test_manager();
+    let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+    let loop_handle = tokio::spawn(async { std::future::pending::<()>().await });
+    manager.state.write().await.threads.insert(
+        "thread_terminal_retirement".to_owned(),
+        AgentThreadHandle {
+            workspace_id: "ws_terminal_retirement".to_owned(),
+            generation: 17,
+            command_tx,
+            control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
+            control_plane: AgentThreadControlPlane::default(),
+            event_hub: Arc::new(AgentEventHub::new()),
+            loop_handle,
+        },
+    );
+
+    manager
+        .retire_thread_after_terminal_commit(
+            "thread_terminal_retirement",
+            "turn_terminal_retirement",
+            17,
+        )
+        .await;
+    assert!(
+        !manager.has_thread("thread_terminal_retirement").await,
+        "the committed terminal generation must be aborted before its registry slot is released"
+    );
+
+    manager
+        .ensure_thread("thread_terminal_retirement", "ws_terminal_retirement")
+        .await
+        .expect("the finished fenced generation should be replaced");
+    assert_ne!(
+        manager
+            .thread_generation("thread_terminal_retirement")
+            .await,
+        Some(17)
+    );
+    manager.remove_thread("thread_terminal_retirement").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_retirement_does_not_publish_replacement_before_old_actor_stops() {
+    let manager = Arc::new(test_manager());
+    let thread_id = "thread_terminal_retirement_join";
+    let workspace_id = "ws_terminal_retirement_join";
+    let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+    let (actor_entered_tx, actor_entered_rx) = tokio::sync::oneshot::channel();
+    let (actor_release_tx, actor_release_rx) = std::sync::mpsc::channel();
+    let loop_handle = tokio::spawn(async move {
+        let _ = actor_entered_tx.send(());
+        tokio::task::block_in_place(|| {
+            actor_release_rx
+                .recv()
+                .expect("test should release the old actor")
+        });
+    });
+    actor_entered_rx
+        .await
+        .expect("old actor should enter its non-cancellable section");
+    manager.state.write().await.threads.insert(
+        thread_id.to_owned(),
+        AgentThreadHandle {
+            workspace_id: workspace_id.to_owned(),
+            generation: 29,
+            command_tx,
+            control_outcomes: Arc::new(ControlOperationRegistry::new(4)),
+            control_plane: AgentThreadControlPlane::default(),
+            event_hub: Arc::new(AgentEventHub::new()),
+            loop_handle,
+        },
+    );
+
+    let retiring_manager = manager.clone();
+    let retirement = tokio::spawn(async move {
+        retiring_manager
+            .retire_thread_after_terminal_commit(thread_id, "turn_terminal_retirement_join", 29)
+            .await;
+    });
+    timeout(Duration::from_secs(1), async {
+        while manager.has_thread(thread_id).await {
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement should fence the old registry generation");
+
+    let replacement_manager = manager.clone();
+    let mut replacement = tokio::spawn(async move {
+        replacement_manager
+            .ensure_thread(thread_id, workspace_id)
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut replacement)
+            .await
+            .is_err(),
+        "replacement publication must wait until the old actor has stopped"
+    );
+
+    actor_release_tx
+        .send(())
+        .expect("old actor should still be awaiting the release signal");
+    retirement.await.expect("terminal retirement task");
+    replacement
+        .await
+        .expect("replacement task")
+        .expect("replacement actor should start after old actor exit");
+    assert_ne!(manager.thread_generation(thread_id).await, Some(29));
+    manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test]
+async fn stale_terminal_retirement_preserves_replacement_generation_ownership() {
+    let manager = test_manager();
+    let thread_id = "thread_stale_terminal_retirement";
+    let workspace_id = "ws_stale_terminal_retirement";
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("replacement actor should start");
+    let replacement_generation = manager
+        .thread_generation(thread_id)
+        .await
+        .expect("replacement generation should be registered");
+    let (control_plane, control_outcomes) = {
+        let state = manager.state.read().await;
+        let thread = state.threads.get(thread_id).expect("replacement handle");
+        (
+            thread.control_plane.clone(),
+            thread.control_outcomes.clone(),
+        )
+    };
+    manager
+        .retire_thread_after_terminal_commit(
+            thread_id,
+            "turn_stale_terminal",
+            replacement_generation.saturating_sub(1),
+        )
+        .await;
+    assert_eq!(
+        manager.thread_generation(thread_id).await,
+        Some(replacement_generation),
+        "a stale generation must not abort an idle replacement actor"
+    );
+
+    let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+    control_plane.activate(
+        "turn_replacement".to_owned(),
+        1,
+        TurnExecutionControl::new(command_tx, 1),
+    );
+    manager
+        .retire_thread_after_terminal_commit(
+            thread_id,
+            "turn_stale_terminal",
+            replacement_generation,
+        )
+        .await;
+    assert_eq!(
+        manager.thread_generation(thread_id).await,
+        Some(replacement_generation),
+        "the current generation still cannot be retired for a different active Turn"
+    );
+
+    control_plane.clear("turn_replacement", 1);
+    let pending_start = AgentControlOperationId::StartTurn {
+        turn_id: "turn_pending_replacement".to_owned(),
+    };
+    assert!(matches!(
+        control_outcomes.begin(pending_start.clone(), replacement_generation),
+        ControlOperationAdmission::Fresh
+    ));
+    control_outcomes.mark_enqueued(&pending_start, replacement_generation);
+    let retirement = manager.retire_thread_after_terminal_commit(
+        thread_id,
+        "turn_stale_terminal",
+        replacement_generation,
+    );
+    tokio::pin!(retirement);
+    assert!(
+        timeout(Duration::from_millis(50), &mut retirement)
+            .await
+            .is_err(),
+        "an accepted next-Turn start must fence the pre-activation mailbox window"
+    );
+
+    let (next_command_tx, _next_command_rx) = tokio::sync::mpsc::channel(1);
+    control_plane.activate(
+        "turn_pending_replacement".to_owned(),
+        1,
+        TurnExecutionControl::new(next_command_tx, 1),
+    );
+    control_outcomes.complete(
+        &pending_start,
+        replacement_generation,
+        StoredControlOutcome::Start(Ok(())),
+    );
+    retirement.await;
+    assert_eq!(
+        manager.thread_generation(thread_id).await,
+        Some(replacement_generation),
+        "the next active Turn must retain ownership of the actor generation"
+    );
+
+    manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test]
+async fn terminal_retirement_prunes_an_expired_unaccepted_dispatch() {
+    let manager = test_manager();
+    let thread_id = "thread_terminal_abandoned_dispatch";
+    manager
+        .ensure_thread(thread_id, "ws_terminal_abandoned_dispatch")
+        .await
+        .expect("actor should start");
+    let generation = manager
+        .thread_generation(thread_id)
+        .await
+        .expect("actor generation");
+    let (control_plane, control_outcomes) = {
+        let state = manager.state.read().await;
+        let thread = state.threads.get(thread_id).expect("actor handle");
+        (
+            thread.control_plane.clone(),
+            thread.control_outcomes.clone(),
+        )
+    };
+    let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+    control_plane.activate(
+        "turn_terminal_abandoned_dispatch".to_owned(),
+        1,
+        TurnExecutionControl::new(command_tx, 1),
+    );
+    let operation_id = AgentControlOperationId::CancelTurn {
+        turn_id: "turn_never_enqueued".to_owned(),
+    };
+    let admitted_at = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(3))
+        .expect("synthetic dispatch age");
+    assert!(matches!(
+        control_outcomes.begin_at(operation_id.clone(), generation, admitted_at),
+        ControlOperationAdmission::Fresh
+    ));
+
+    manager
+        .retire_thread_after_terminal_commit(
+            thread_id,
+            "turn_terminal_abandoned_dispatch",
+            generation,
+        )
+        .await;
+
+    assert!(!manager.has_thread(thread_id).await);
+    assert!(
+        matches!(
+            manager
+                .control_operation_status(thread_id, &operation_id)
+                .await,
+            Err(AgentControlError::ThreadNotFound)
+        ),
+        "a command never accepted by the mailbox must leave neither reconciliation authority nor an empty retired-thread tombstone"
+    );
+}
+
+#[tokio::test]
+async fn terminal_retirement_preserves_generation_with_accepted_next_turn() {
+    let manager = test_manager();
+    let thread_id = "thread_terminal_pending_next";
+    let workspace_id = "ws_terminal_pending_next";
+    manager
+        .ensure_thread(thread_id, workspace_id)
+        .await
+        .expect("actor should start");
+    let generation = manager
+        .thread_generation(thread_id)
+        .await
+        .expect("actor generation should be registered");
+    let (control_plane, control_outcomes) = {
+        let state = manager.state.read().await;
+        let thread = state.threads.get(thread_id).expect("actor handle");
+        (
+            thread.control_plane.clone(),
+            thread.control_outcomes.clone(),
+        )
+    };
+    let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+    control_plane.activate(
+        "turn_terminal_pending_next".to_owned(),
+        1,
+        TurnExecutionControl::new(command_tx, 1),
+    );
+    let operation_id = AgentControlOperationId::StartTurn {
+        turn_id: "turn_accepted_next".to_owned(),
+    };
+    assert!(matches!(
+        control_outcomes.begin(operation_id.clone(), generation),
+        ControlOperationAdmission::Fresh
+    ));
+    control_outcomes.mark_enqueued(&operation_id, generation);
+    let takeover_control_plane = control_plane.clone();
+    let takeover_outcomes = control_outcomes.clone();
+    let takeover = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        takeover_control_plane.clear("turn_terminal_pending_next", 1);
+        let (next_tx, _next_rx) = tokio::sync::mpsc::channel(1);
+        takeover_control_plane.activate(
+            "turn_accepted_next".to_owned(),
+            1,
+            TurnExecutionControl::new(next_tx, 1),
+        );
+        takeover_outcomes.complete(
+            &operation_id,
+            generation,
+            StoredControlOutcome::Start(Ok(())),
+        );
+    });
+
+    manager
+        .retire_thread_after_terminal_commit(thread_id, "turn_terminal_pending_next", generation)
+        .await;
+    takeover.await.expect("next Turn takeover task");
+
+    assert_eq!(
+        manager.thread_generation(thread_id).await,
+        Some(generation),
+        "a queued next-Turn start must not be dropped by the previous Turn's terminal listener"
+    );
+    manager.remove_thread(thread_id).await;
+}
+
+#[tokio::test]
+async fn accepted_detached_task_result_prepares_durable_post_turn_gate_with_parent_scope() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -5415,7 +6966,10 @@ async fn accepted_detached_task_result_dispatches_post_turn_once_with_parent_sco
         .ensure_thread("thr_detached_result_hook", "ws_detached_result_hook")
         .await
         .expect("thread should be created");
-    let mut events = subscribe_agent_events(&manager, "thr_detached_result_hook").await;
+    let mut durable_events = manager
+        .take_durable_receiver("thr_detached_result_hook")
+        .await
+        .expect("thread should expose one durable receiver");
 
     manager
         .start_test_turn_with_default_profile_hook_context(
@@ -5441,44 +6995,58 @@ async fn accepted_detached_task_result_dispatches_post_turn_once_with_parent_sco
         .await
         .expect("detached task result turn should start");
 
-    let observed = recv_events_until_terminal(&mut events).await;
-    assert_turn_completed(&observed);
+    let mut preparation = None;
+    let mut completed = false;
+    for _ in 0..160 {
+        let event = timeout(Duration::from_secs(2), durable_events.recv())
+            .await
+            .expect("timed out waiting for detached result terminal event")
+            .expect("durable event channel should stay open");
+        match event {
+            AgentDurableEvent::NativeTerminalEffectsPrepared {
+                preparation: prepared,
+            } => preparation = Some(prepared),
+            AgentDurableEvent::TurnCompleted { .. } => completed = true,
+            _ => {}
+        }
+        durable_events.acknowledge_last(Ok(()));
+        if completed {
+            break;
+        }
+    }
+    assert!(completed, "detached result turn should complete");
     sleep(Duration::from_millis(25)).await;
     assert!(
         snapshot_hook_calls(&calls).is_empty(),
-        "post-turn must wait until the Task result candidate is accepted"
+        "the agent process must not execute acceptance-gated post-turn work"
     );
 
-    manager
-        .accept_deferred_task_result_post_turn(
-            "thr_detached_result_hook",
-            "turn_detached_result_hook",
-        )
-        .await;
-    let call = wait_for_hook_phase(&calls, HookPhase::TurnPostTurn).await;
+    let preparation = preparation.expect("terminal effects must be prepared before completion");
+    assert_eq!(preparation.workspace_id, "ws_detached_result_hook");
+    assert_eq!(preparation.thread_id, "thr_detached_result_hook");
+    assert_eq!(preparation.turn_id, "turn_detached_result_hook");
+    assert_eq!(preparation.effects.len(), 1);
+    let effect = &preparation.effects[0];
     assert_eq!(
-        call.conversation_thread_id.as_deref(),
-        Some("thread-visible-parent")
+        effect.effect_kind,
+        pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
     );
-    assert!(call.accepted_task_result_post_turn);
-    assert_eq!(call.thread_id.as_deref(), Some("thr_detached_result_hook"));
-    assert_eq!(call.turn_id.as_deref(), Some("turn_detached_result_hook"));
-    assert_eq!(call.task_id.as_deref(), Some("task-detached-result"));
-
-    manager
-        .accept_deferred_task_result_post_turn(
-            "thr_detached_result_hook",
-            "turn_detached_result_hook",
-        )
-        .await;
-    sleep(Duration::from_millis(25)).await;
     assert_eq!(
-        snapshot_hook_calls(&calls)
-            .iter()
-            .filter(|call| call.phase == HookPhase::TurnPostTurn)
-            .count(),
-        1,
-        "replayed acceptance must not dispatch the extractor twice"
+        effect.gate,
+        pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult
+    );
+    let pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { request, .. } =
+        &effect.payload
+    else {
+        panic!("accepted result must prepare a post-turn hook payload");
+    };
+    assert_eq!(
+        request.pointer("/context/conversation_thread_id"),
+        Some(&json!("thread-visible-parent"))
+    );
+    assert_eq!(
+        request.pointer("/context/task_id"),
+        Some(&json!("task-detached-result"))
     );
     assert_eq!(provider.snapshot_requests().len(), 1);
 }
@@ -5508,7 +7076,7 @@ async fn phase_12_post_turn_hook_receives_tool_event_summaries() {
         )))
         .await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase12_tool_summary",
         "ws_phase12_tool_summary",
@@ -5616,7 +7184,7 @@ async fn phase_12_post_turn_hook_receives_bounded_summary_input() {
         )))
         .await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase12_bounded",
         "ws_phase12_bounded",
@@ -5664,7 +7232,7 @@ async fn phase_12_post_turn_hook_failure_does_not_change_completed_turn() {
         )))
         .await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase12_hook_failure",
         "ws_phase12_hook_failure",
@@ -5702,7 +7270,7 @@ async fn phase_12_post_turn_hook_runs_after_failure_when_configured() {
         )))
         .await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase12_failure",
         "ws_phase12_failure",
@@ -5747,7 +7315,7 @@ async fn phase_12_background_post_turn_hook_does_not_delay_completion_notificati
     let manager = AgentManager::new(registry, test_tool_loop_config());
     manager.set_hook_runtime(Some(runtime.clone())).await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase12_background",
         "ws_phase12_background",
@@ -5787,7 +7355,7 @@ async fn phase_12_post_turn_hook_does_not_create_task_anchor() {
         )))
         .await;
 
-    let observed = start_simple_turn(
+    let observed = start_simple_turn_with_terminal_effects(
         &manager,
         "thr_phase12_no_anchor",
         "ws_phase12_no_anchor",
@@ -6830,6 +8398,7 @@ async fn phase_10_preflight_selected_optional_domain_tool_schemas_are_serialized
     manager
         .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
             bundle: fake_memory_tool_bundle_for_names(&registered_optional_tools, handler),
+            runtime_contract: "pioneer.test.attached-task-cleanup.v1",
         })))
         .await;
 
@@ -9793,7 +11362,9 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     let recall_provider = Arc::new(CaptureAgentProvider::with_preflight_response(
         memory_read_preflight_response(),
     ));
-    registry.insert("capture-recall", recall_provider.clone());
+    registry
+        .insert("capture-recall", recall_provider.clone())
+        .expect("test provider should fit registry bounds");
     let observed = start_simple_turn(
         &manager,
         "thr_stateful_memory_recall_new",
@@ -9827,7 +11398,9 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
         "forgotten",
         memory_forget_preflight_response(),
     ));
-    registry.insert("sequenced-forget", forget_provider);
+    registry
+        .insert("sequenced-forget", forget_provider)
+        .expect("test provider should fit registry bounds");
     let observed = start_simple_turn(
         &manager,
         "thr_stateful_memory_forget",
@@ -9843,7 +11416,9 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     let after_forget_provider = Arc::new(CaptureAgentProvider::with_preflight_response(
         memory_read_preflight_response(),
     ));
-    registry.insert("capture-after-forget", after_forget_provider.clone());
+    registry
+        .insert("capture-after-forget", after_forget_provider.clone())
+        .expect("test provider should fit registry bounds");
     let observed = start_simple_turn(
         &manager,
         "thr_stateful_memory_after_forget",
@@ -10594,10 +12169,24 @@ async fn max_windows_cap_blocks_continuation_without_turn_failed() {
         .expect("turn should start");
 
     let observed_events = recv_durable_events_until_turn_blocked(&mut durable_events).await;
-    let observation = manager
-        .observe_turn(thread_id, turn_id)
-        .await
-        .expect("blocked turn should remain observable after task exit");
+    // The durable receiver ACK releases the actor; its in-memory observation
+    // is updated immediately afterwards. Wait for that bounded hand-off
+    // instead of racing the actor on the same scheduler tick.
+    let observation = timeout(Duration::from_secs(2), async {
+        loop {
+            let observation = manager
+                .observe_turn(thread_id, turn_id)
+                .await
+                .expect("turn observation query should succeed")
+                .expect("blocked turn should remain observable after task exit");
+            if observation.status == ExecutionTurnStatus::Blocked {
+                break observation;
+            }
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("blocked observation should catch up with the durable commit");
     assert_eq!(observation.status, ExecutionTurnStatus::Blocked);
     assert!(
         observation
@@ -11695,7 +13284,7 @@ async fn cancel_turn_returns_without_waiting_for_actor_terminal_event() {
     .expect("turn cancellation should succeed");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn non_tool_recovery_request_restarts_turn_without_failing() {
     let registry = Arc::new(ProviderRegistry::with_provider(
         "pending",
@@ -12443,7 +14032,7 @@ async fn thread_control_plane_cancels_turn_without_actor_mailbox_progress() {
     let execution = plane
         .execution_for("turn_control_plane")
         .expect("active turn should be observable outside the actor");
-    execution.cancel_all_attempts().await;
+    execution.cancel_all_attempts();
 
     assert!(attempt.is_cancelled());
     assert_eq!(

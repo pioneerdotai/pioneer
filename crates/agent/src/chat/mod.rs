@@ -111,6 +111,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -5993,6 +5994,7 @@ async fn execute_agent_provider_response(
                             }
                         });
 
+                        let tool_attempt_started = Instant::now();
                         let dispatch_result = runtime
                             .execute_tool_call_with_cancellation(tool_call, attempt_token.clone())
                             .await;
@@ -6057,6 +6059,19 @@ async fn execute_agent_provider_response(
                                     (output, false, outcome, None, None, None, message)
                                 }
                             };
+
+                        pioneer_observability::record_native_lifecycle_event(
+                            pioneer_observability::NativeLifecycleEventMetric {
+                                stage: pioneer_observability::NativeLifecycleStage::ToolAttempt,
+                                outcome: if success {
+                                    pioneer_observability::NativeLifecycleOutcome::Succeeded
+                                } else {
+                                    pioneer_observability::NativeLifecycleOutcome::Failed
+                                },
+                                provider_class: pioneer_observability::NativeProviderClass::Api,
+                                elapsed: Some(tool_attempt_started.elapsed()),
+                            },
+                        );
 
                         Ok(ExecutedToolResult {
                             item_id: item_id.clone(),

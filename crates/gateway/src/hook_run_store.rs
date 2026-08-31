@@ -198,6 +198,7 @@ impl HookRunStore for CrudHookRunStore {
         let records = events
             .into_iter()
             .map(|event| CrudNewHookAuditEventRecord {
+                id: event.id,
                 hook_run_id: event.hook_run_id,
                 hook_run_attempt_id: event.hook_run_attempt_id,
                 subscription_id: event.subscription_id,
@@ -1124,6 +1125,62 @@ mod tests {
         assert_eq!(
             records[0].details,
             HookValue::Text("gateway audit detail".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn crud_hook_run_store_deduplicates_stable_audit_identity_and_rejects_conflict() {
+        let (connection, _crud_store, hook_store) = migrated_store().await;
+        let run = hook_store
+            .create_or_load_run(new_store_run("gateway:hook:audit:idempotent"))
+            .await
+            .expect("audit fixture run should create");
+        let event = NewHookAuditEventStoreRecord {
+            id: Some("auditStableIdentity01".to_owned()),
+            hook_run_id: run.id,
+            hook_run_attempt_id: None,
+            subscription_id: HookSubscriptionId::new("sub.gateway.audit.idempotent")
+                .expect("valid subscription id"),
+            hook_id: HookId::new("hook.gateway.audit.idempotent").expect("valid hook id"),
+            phase: HookPhase::TurnPrePromptCompile,
+            context: HookContext::default(),
+            event_kind: HookAuditEventKind::new("test.gateway_hook_audit.idempotent")
+                .expect("valid audit kind"),
+            contribution_hash: Some(
+                pioneer_hooks::HookContributionHash::new(format!("sha256:{}", "a".repeat(64)))
+                    .expect("valid contribution hash"),
+            ),
+            details: HookValue::Text("stable audit".to_owned()),
+            safe_for_user: false,
+            created_at_unix_ms: Some(1_700_000_000_000),
+        };
+
+        let first = hook_store
+            .append_audit_events(vec![event.clone()])
+            .await
+            .expect("first audit append should persist");
+        let replay = hook_store
+            .append_audit_events(vec![event.clone()])
+            .await
+            .expect("exact audit replay should be idempotent");
+        assert_eq!(first[0].id, replay[0].id);
+        assert_eq!(
+            hook_audit_event::Entity::find()
+                .all(&connection)
+                .await
+                .expect("audit rows should query")
+                .len(),
+            1
+        );
+
+        let mut conflicting = event;
+        conflicting.details = HookValue::Text("different audit".to_owned());
+        assert!(
+            hook_store
+                .append_audit_events(vec![conflicting])
+                .await
+                .is_err(),
+            "a stable identity must fail closed when replayed with different semantics"
         );
     }
 }

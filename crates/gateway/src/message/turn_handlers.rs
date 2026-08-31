@@ -901,6 +901,11 @@ impl MessageProcessor {
             _ => Some(
                 self.provider_registry
                     .authority_fingerprint_for_workspace(workspace_id, provider)
+                    .map_err(|error| {
+                        TurnStartFailure::unavailable(format!(
+                            "provider authority could not be resolved: {error:#}"
+                        ))
+                    })?
                     .as_str()
                     .to_owned(),
             ),

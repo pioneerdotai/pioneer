@@ -128,6 +128,20 @@ async fn commit_waiter_completes_only_after_consumer_finishes_event() {
 }
 
 #[tokio::test]
+async fn durable_queue_residence_is_exposed_without_ids_and_cleared_on_ack() {
+    let hub = ExecutionEventHub::with_capacity(8, 8);
+    let mut receiver = hub.take_durable_receiver().await.expect("receiver");
+    hub.publish_durable(completed("turn_latency"))
+        .await
+        .expect("durable event should enqueue");
+
+    assert!(receiver.recv().await.is_some());
+    assert!(receiver.pending_enqueue_age().is_some());
+    receiver.acknowledge_last(Ok(()));
+    assert_eq!(receiver.pending_enqueue_age(), None);
+}
+
+#[tokio::test]
 async fn requesting_next_event_without_ack_rejects_commit_waiter() {
     let hub = Arc::new(ExecutionEventHub::with_capacity(8, 8));
     let mut receiver = hub.take_durable_receiver().await.expect("receiver");

@@ -231,6 +231,10 @@ pub struct HookRunAttemptStoreCompletion {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewHookAuditEventStoreRecord {
+    /// Stable storage identity for replayable audit contributions. Durable
+    /// hook execution supplies this value; legacy/non-durable callers may let
+    /// the store allocate an opaque ID.
+    pub id: Option<String>,
     pub hook_run_id: HookRunId,
     pub hook_run_attempt_id: Option<HookRunAttemptId>,
     pub subscription_id: HookSubscriptionId,

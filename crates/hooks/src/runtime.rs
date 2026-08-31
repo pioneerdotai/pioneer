@@ -69,6 +69,37 @@ pub enum HookRuntimeError {
         phase: HookPhase,
         subscription_ids: Vec<HookSubscriptionId>,
     },
+    DurablePersistenceUnavailable {
+        phase: HookPhase,
+        operation: &'static str,
+    },
+    DurableExecutionIncomplete {
+        phase: HookPhase,
+        failed_runs: usize,
+        timed_out_runs: usize,
+        incomplete_runs: usize,
+        retryable: bool,
+    },
+}
+
+impl HookRuntimeError {
+    /// Whether repeating the same immutable hook invocation can make forward
+    /// progress without a configuration or payload change.
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::HookFailed { error, .. } | Self::HookFailedClosed { error, .. } => {
+                error.retryable
+            }
+            Self::HookTimedOut { .. } | Self::DurablePersistenceUnavailable { .. } => true,
+            Self::DurableExecutionIncomplete { retryable, .. } => *retryable,
+            Self::Registry(_)
+            | Self::MissingHandler { .. }
+            | Self::MissingFallbackContribution { .. }
+            | Self::InvalidExecutionPolicy { .. }
+            | Self::MissingDependency { .. }
+            | Self::DependencyCycle { .. } => false,
+        }
+    }
 }
 
 impl fmt::Display for HookRuntimeError {
@@ -155,6 +186,20 @@ impl fmt::Display for HookRuntimeError {
                 }
                 Ok(())
             }
+            Self::DurablePersistenceUnavailable { phase, operation } => write!(
+                formatter,
+                "durable hook persistence failed during `{operation}` for phase `{phase}`"
+            ),
+            Self::DurableExecutionIncomplete {
+                phase,
+                failed_runs,
+                timed_out_runs,
+                incomplete_runs,
+                ..
+            } => write!(
+                formatter,
+                "durable hook phase `{phase}` did not reach a successful outcome (failed: {failed_runs}, timed out: {timed_out_runs}, incomplete: {incomplete_runs})"
+            ),
         }
     }
 }
@@ -169,7 +214,9 @@ impl std::error::Error for HookRuntimeError {
             | Self::MissingFallbackContribution { .. }
             | Self::InvalidExecutionPolicy { .. }
             | Self::MissingDependency { .. }
-            | Self::DependencyCycle { .. } => None,
+            | Self::DependencyCycle { .. }
+            | Self::DurablePersistenceUnavailable { .. }
+            | Self::DurableExecutionIncomplete { .. } => None,
         }
     }
 }
@@ -303,6 +350,10 @@ pub struct HookBackgroundRunSummary {
     pub status: HookRunStatus,
     pub contribution_count: usize,
     pub diagnostic_count: usize,
+    /// Whether the final failed/timed-out outcome can make progress on a
+    /// later durable attempt with the same immutable input.
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -312,6 +363,8 @@ pub struct HookBackgroundDrainSummary {
     pub failed_count: usize,
     pub timed_out_count: usize,
     pub skipped_count: usize,
+    pub incomplete_count: usize,
+    pub retryable_failed_count: usize,
 }
 
 impl HookBackgroundDrainSummary {
@@ -319,10 +372,15 @@ impl HookBackgroundDrainSummary {
         self.executed_count += 1;
         match run.status {
             HookRunStatus::Succeeded => self.succeeded_count += 1,
-            HookRunStatus::Failed => self.failed_count += 1,
+            HookRunStatus::Failed => {
+                self.failed_count += 1;
+                if run.retryable {
+                    self.retryable_failed_count += 1;
+                }
+            }
             HookRunStatus::TimedOut => self.timed_out_count += 1,
             HookRunStatus::Skipped => self.skipped_count += 1,
-            HookRunStatus::Queued | HookRunStatus::Running => {}
+            HookRunStatus::Queued | HookRunStatus::Running => self.incomplete_count += 1,
         }
     }
 }
@@ -608,6 +666,142 @@ impl HookRuntime {
         request: HookPhaseRequest,
     ) -> HookRuntimeResult<HookPhaseResponse> {
         let subscriptions = self.subscriptions.subscriptions_for_phase(request.phase)?;
+        self.run_phase_with_snapshot(request, subscriptions).await
+    }
+
+    /// Runs a phase from an immutable subscription snapshot.
+    ///
+    /// Durable lifecycle workers use this entry point so a later runtime
+    /// rebuild cannot add newly installed subscriptions to an already
+    /// committed side effect. Handler identities are still resolved at the
+    /// execution boundary, which lets a restarted process rebind the same
+    /// durable plan while failing closed if a required handler disappeared.
+    pub async fn run_phase_with_snapshot(
+        &self,
+        request: HookPhaseRequest,
+        subscriptions: Vec<HookSubscription>,
+    ) -> HookRuntimeResult<HookPhaseResponse> {
+        self.run_phase_with_snapshot_and_queue(
+            request,
+            subscriptions,
+            self.queued_background.clone(),
+        )
+        .await
+    }
+
+    /// Runs one durable phase with invocation-owned background work.
+    ///
+    /// Unlike the process-shared fire-and-record queue, this method does not
+    /// return until every background run enqueued by this invocation has
+    /// reached an outcome. Concurrent durable effects therefore cannot drain,
+    /// acknowledge, or cancel each other's side effects.
+    pub async fn run_phase_to_completion(
+        &self,
+        request: HookPhaseRequest,
+    ) -> HookRuntimeResult<HookPhaseResponse> {
+        let subscriptions = self.subscriptions.subscriptions_for_phase(request.phase)?;
+        self.run_phase_with_snapshot_to_completion(request, subscriptions)
+            .await
+    }
+
+    /// Snapshot-preserving counterpart of [`Self::run_phase_to_completion`].
+    pub async fn run_phase_with_snapshot_to_completion(
+        &self,
+        request: HookPhaseRequest,
+        subscriptions: Vec<HookSubscription>,
+    ) -> HookRuntimeResult<HookPhaseResponse> {
+        let phase = request.phase;
+        let invocation_queue = HookBackgroundQueue::new();
+        let phase_result = self
+            .run_phase_with_snapshot_and_queue(request, subscriptions, invocation_queue.clone())
+            .await;
+        // Drain even when a later required hook failed: earlier queued work is
+        // already part of this durable attempt and must not be silently lost.
+        let drain_result = self.drain_background_queue(&invocation_queue).await;
+        match (phase_result, drain_result) {
+            (Err(_phase_error), Ok(drain)) if drain.failed_count > drain.retryable_failed_count => {
+                // A retryable foreground failure must not hide a permanent
+                // failure from work already admitted to this invocation. If
+                // any owned background obligation is terminal, replaying the
+                // immutable effect cannot make the whole phase succeed.
+                Err(HookRuntimeError::DurableExecutionIncomplete {
+                    phase,
+                    failed_runs: drain.failed_count,
+                    timed_out_runs: drain.timed_out_count,
+                    incomplete_runs: drain.incomplete_count,
+                    retryable: false,
+                })
+            }
+            (Err(phase_error), Err(drain_error))
+                if phase_error.retryable() && !drain_error.retryable() =>
+            {
+                Err(drain_error)
+            }
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(response), Ok(drain)) => {
+                let failed_runs = response
+                    .runs
+                    .iter()
+                    .filter(|run| run.status == HookRunStatus::Failed)
+                    .count()
+                    .saturating_add(drain.failed_count);
+                let retryable_failed_runs = response
+                    .runs
+                    .iter()
+                    .filter(|run| run.status == HookRunStatus::Failed)
+                    .filter(|run| run.error.as_ref().is_some_and(|error| error.retryable))
+                    .count()
+                    .saturating_add(drain.retryable_failed_count);
+                let timed_out_runs = response
+                    .runs
+                    .iter()
+                    .filter(|run| run.status == HookRunStatus::TimedOut)
+                    .count()
+                    .saturating_add(drain.timed_out_count);
+                let queued_runs = response
+                    .runs
+                    .iter()
+                    .filter(|run| run.status == HookRunStatus::Queued)
+                    .count();
+                let incomplete_runs = drain
+                    .incomplete_count
+                    .saturating_add(queued_runs.saturating_sub(drain.executed_count));
+                if failed_runs > 0 || timed_out_runs > 0 || incomplete_runs > 0 {
+                    return Err(HookRuntimeError::DurableExecutionIncomplete {
+                        phase,
+                        failed_runs,
+                        timed_out_runs,
+                        incomplete_runs,
+                        // Timeouts and incomplete owned work are transient.
+                        // A single terminal handler failure, however, makes
+                        // the whole immutable invocation terminal because a
+                        // retry cannot make every obligation succeed.
+                        retryable: retryable_failed_runs == failed_runs,
+                    });
+                }
+                Ok(response)
+            }
+        }
+    }
+
+    async fn run_phase_with_snapshot_and_queue(
+        &self,
+        request: HookPhaseRequest,
+        subscriptions: Vec<HookSubscription>,
+        queued_background: HookBackgroundQueue,
+    ) -> HookRuntimeResult<HookPhaseResponse> {
+        for subscription in &subscriptions {
+            if subscription.phase != request.phase || !subscription.enabled {
+                return Err(HookRuntimeError::InvalidExecutionPolicy {
+                    subscription_id: subscription.subscription_id.clone(),
+                    hook_id: subscription.hook_id.clone(),
+                    phase: request.phase,
+                    reason: "durable subscription snapshot does not match the requested phase"
+                        .to_owned(),
+                });
+            }
+        }
         let plan = build_execution_plan(request.phase, subscriptions, self.handlers.as_ref())?;
         let mut response = HookPhaseResponse::default();
 
@@ -618,7 +812,7 @@ impl HookRuntime {
                     execute_node(
                         node,
                         request.clone(),
-                        self.queued_background.clone(),
+                        queued_background.clone(),
                         self.options.clone(),
                         self.run_store.clone(),
                     )
@@ -650,11 +844,18 @@ impl HookRuntime {
     }
 
     pub async fn drain_queued_background(&self) -> HookRuntimeResult<HookBackgroundDrainSummary> {
-        let Some(_guard) = self.queued_background.try_acquire_drain()? else {
+        self.drain_background_queue(&self.queued_background).await
+    }
+
+    async fn drain_background_queue(
+        &self,
+        queue: &HookBackgroundQueue,
+    ) -> HookRuntimeResult<HookBackgroundDrainSummary> {
+        let Some(_guard) = queue.try_acquire_drain()? else {
             return Ok(HookBackgroundDrainSummary::default());
         };
         let mut summary = HookBackgroundDrainSummary::default();
-        while let Some(run) = self.queued_background.pop_front()? {
+        while let Some(run) = queue.pop_front()? {
             let run_summary = execute_queued_background_run(run, &self.options).await?;
             summary.record(&run_summary);
         }
@@ -1166,7 +1367,38 @@ async fn execute_node_with_persistence(
     options: &HookRuntimeOptions,
     run_store: Option<Arc<dyn HookRunStore>>,
 ) -> HookRuntimeResult<HookNodeOutcome> {
+    if durable_terminal_effect_id(&request.context).is_some()
+        && !handler_declares_idempotent_side_effect(node)
+    {
+        return Err(HookRuntimeError::InvalidExecutionPolicy {
+            subscription_id: node.subscription.subscription_id.clone(),
+            hook_id: node.subscription.hook_id.clone(),
+            phase: request.phase,
+            reason: "durable terminal effects require the handler to declare the `idempotent_side_effect` capability"
+                .to_owned(),
+        });
+    }
+
     let mut persistence = HookRunPersistence::start(run_store, node, &request).await;
+    persistence.ensure_healthy()?;
+
+    // Durable terminal effects are retried at-least-once by their outbox. A
+    // successful persisted hook run is the handler-level idempotency fence;
+    // replaying the same stable effect must not invoke its side effect again.
+    if durable_terminal_effect_id(&request.context).is_some()
+        && let Some(run) = persistence.run.as_ref()
+    {
+        match run.status {
+            HookRunStatus::Succeeded => {
+                return Ok(HookNodeOutcome::Succeeded(HookHandlerResponse::default()));
+            }
+            HookRunStatus::Skipped => return Ok(HookNodeOutcome::Skipped),
+            HookRunStatus::Queued
+            | HookRunStatus::Running
+            | HookRunStatus::Failed
+            | HookRunStatus::TimedOut => {}
+        }
+    }
 
     if node.subscription.failure_policy == HookFailurePolicy::Skip {
         persistence
@@ -1178,6 +1410,7 @@ async fn execute_node_with_persistence(
                 current_unix_ms(),
             )
             .await;
+        persistence.ensure_healthy()?;
         return Ok(HookNodeOutcome::Skipped);
     }
 
@@ -1193,11 +1426,13 @@ async fn execute_node_with_persistence(
     }
 
     persistence.start_attempt().await;
+    persistence.ensure_healthy()?;
     let outcome = execute_node_with_policy(node, request.clone(), options).await;
     if let Ok(outcome) = &outcome {
         persistence
             .complete_for_outcome(&node.subscription, request.phase, outcome, options)
             .await;
+        persistence.ensure_healthy()?;
     }
     outcome
 }
@@ -1207,6 +1442,7 @@ async fn execute_queued_background_run(
     options: &HookRuntimeOptions,
 ) -> HookRuntimeResult<HookBackgroundRunSummary> {
     run.persistence.start_attempt().await;
+    run.persistence.ensure_healthy()?;
     let mut outcome = execute_node_with_policy(&run.node, run.request.clone(), options).await?;
     if let HookNodeOutcome::Succeeded(response) = outcome {
         outcome = match validate_background_response(response) {
@@ -1218,6 +1454,7 @@ async fn execute_queued_background_run(
         .persistence
         .complete_background_for_outcome(&run.node, run.request.phase, &outcome, options)
         .await;
+    run.persistence.ensure_healthy()?;
     Ok(background_run_summary(&run, &outcome, status))
 }
 
@@ -1544,6 +1781,8 @@ struct HookRunPersistence {
     run: Option<HookRunStoreRecord>,
     attempt: Option<HookRunAttemptStoreRecord>,
     attempt_started_instant: Option<Instant>,
+    durable_phase: Option<HookPhase>,
+    failure_operation: Option<&'static str>,
 }
 
 impl HookRunPersistence {
@@ -1552,8 +1791,14 @@ impl HookRunPersistence {
         node: &HookExecutionNode,
         request: &HookPhaseRequest,
     ) -> Self {
+        let durable_phase = durable_terminal_effect_id(&request.context).map(|_| request.phase);
         let Some(store) = store else {
-            return Self::disabled();
+            let mut persistence = Self::disabled();
+            persistence.durable_phase = durable_phase;
+            if durable_phase.is_some() {
+                persistence.failure_operation = Some("run_store_missing");
+            }
+            return persistence;
         };
         let queued_at_unix_ms = current_unix_ms();
         let run = store
@@ -1569,7 +1814,7 @@ impl HookRunPersistence {
                 phase: request.phase,
                 status: HookRunStatus::Queued,
                 scope: hook_run_scope_from_context(&request.context),
-                context: request.context.clone(),
+                context: persisted_hook_run_context(&request.context),
                 contribution_hashes: Vec::new(),
                 diagnostic_previews: Vec::new(),
                 error: None,
@@ -1583,14 +1828,27 @@ impl HookRunPersistence {
                 ),
                 resume_state: background_resume_state(node, request),
             })
-            .await
-            .ok();
+            .await;
+
+        let (run, failure_operation) = match run {
+            Ok(run) => (Some(run), None),
+            Err(error) => {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    phase = request.phase.as_str(),
+                    "failed to create or load hook run"
+                );
+                (None, durable_phase.map(|_| "create_or_load_run"))
+            }
+        };
 
         Self {
             store: Some(store),
             run,
             attempt: None,
             attempt_started_instant: None,
+            durable_phase,
+            failure_operation,
         }
     }
 
@@ -1600,28 +1858,67 @@ impl HookRunPersistence {
             run: None,
             attempt: None,
             attempt_started_instant: None,
+            durable_phase: None,
+            failure_operation: None,
         }
     }
 
     fn from_existing(store: Arc<dyn HookRunStore>, run: HookRunStoreRecord) -> Self {
+        let durable_phase = durable_terminal_effect_id(&run.context).map(|_| run.phase);
         Self {
             store: Some(store),
             run: Some(run),
             attempt: None,
             attempt_started_instant: None,
+            durable_phase,
+            failure_operation: None,
+        }
+    }
+
+    fn record_failure(&mut self, operation: &'static str, error: &impl fmt::Display) {
+        tracing::error!(
+            error = %error,
+            operation,
+            phase = self
+                .durable_phase
+                .map(|phase| phase.as_str())
+                .unwrap_or("unknown"),
+            "failed to persist hook run lifecycle"
+        );
+        if self.durable_phase.is_some() && self.failure_operation.is_none() {
+            self.failure_operation = Some(operation);
+        }
+    }
+
+    fn ensure_healthy(&self) -> HookRuntimeResult<()> {
+        match (self.durable_phase, self.failure_operation) {
+            (Some(phase), Some(operation)) => {
+                Err(HookRuntimeError::DurablePersistenceUnavailable { phase, operation })
+            }
+            _ => Ok(()),
         }
     }
 
     async fn start_attempt(&mut self) {
-        let (Some(store), Some(run)) = (self.store.as_ref(), self.run.as_ref()) else {
+        let (Some(store), Some(run)) = (self.store.clone(), self.run.clone()) else {
+            if self.durable_phase.is_some() {
+                self.failure_operation.get_or_insert("run_state_missing");
+            }
             return;
         };
         let started_at_unix_ms = current_unix_ms();
-        if let Ok(updated) = store.mark_run_running(&run.id, started_at_unix_ms).await {
-            self.run = Some(updated);
+        match store.mark_run_running(&run.id, started_at_unix_ms).await {
+            Ok(updated) => self.run = Some(updated),
+            Err(error) => {
+                self.record_failure("mark_run_running", &error);
+                return;
+            }
         }
 
-        let Some(run) = self.run.as_ref() else {
+        let Some(run) = self.run.clone() else {
+            if self.durable_phase.is_some() {
+                self.failure_operation.get_or_insert("run_state_missing");
+            }
             return;
         };
         let run_id = run.id.clone();
@@ -1638,31 +1935,35 @@ impl HookRunPersistence {
             completed_at_unix_ms: None,
             duration_ms: None,
         };
-        match store.append_attempt(new_attempt(run, attempt_number)).await {
+        match store
+            .append_attempt(new_attempt(&run, attempt_number))
+            .await
+        {
             Ok(attempt) => {
                 self.attempt = Some(attempt);
             }
             Err(crate::HookRunStoreError::Conflict { .. }) => {
-                if let Ok(updated) = store.mark_run_running(&run_id, started_at_unix_ms).await {
-                    self.run = Some(updated);
-                }
-                let Some(run) = self.run.as_ref() else {
-                    return;
+                let updated = match store.mark_run_running(&run_id, started_at_unix_ms).await {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        self.record_failure("refresh_run_after_attempt_conflict", &error);
+                        return;
+                    }
                 };
-                let retry_attempt_number = run
+                self.run = Some(updated.clone());
+                let retry_attempt_number = updated
                     .attempt_count
                     .saturating_add(1)
                     .max(attempt_number.saturating_add(1));
-                if retry_attempt_number != attempt_number {
-                    if let Ok(attempt) = store
-                        .append_attempt(new_attempt(run, retry_attempt_number))
-                        .await
-                    {
-                        self.attempt = Some(attempt);
-                    }
+                match store
+                    .append_attempt(new_attempt(&updated, retry_attempt_number))
+                    .await
+                {
+                    Ok(attempt) => self.attempt = Some(attempt),
+                    Err(error) => self.record_failure("append_attempt_after_conflict", &error),
                 }
             }
-            Err(_) => {}
+            Err(error) => self.record_failure("append_attempt", &error),
         }
     }
 
@@ -1678,18 +1979,23 @@ impl HookRunPersistence {
                 let policy = options.diagnostic_redaction_policy();
                 let contribution_hashes = hash_contributions(&response.contributions);
                 let diagnostic_previews = diagnostic_previews(&response.diagnostics, &policy);
+                let audit_persisted = self
+                    .persist_audit_contributions(
+                        subscription,
+                        phase,
+                        response.contributions.as_slice(),
+                        current_unix_ms(),
+                    )
+                    .await;
+                if self.durable_phase.is_some() && !audit_persisted {
+                    self.complete_durable_persistence_failure(options).await;
+                    return;
+                }
                 self.complete_attempt_and_run(
                     HookRunStatus::Succeeded,
                     contribution_hashes,
                     diagnostic_previews,
                     None,
-                    current_unix_ms(),
-                )
-                .await;
-                self.persist_audit_contributions(
-                    subscription,
-                    phase,
-                    response.contributions.as_slice(),
                     current_unix_ms(),
                 )
                 .await;
@@ -1740,18 +2046,23 @@ impl HookRunPersistence {
                 let policy = options.diagnostic_redaction_policy();
                 let contribution_hashes = hash_contributions(&response.contributions);
                 let diagnostic_previews = diagnostic_previews(&response.diagnostics, &policy);
+                let audit_persisted = self
+                    .persist_audit_contributions(
+                        &node.subscription,
+                        phase,
+                        response.contributions.as_slice(),
+                        current_unix_ms(),
+                    )
+                    .await;
+                if self.durable_phase.is_some() && !audit_persisted {
+                    self.complete_durable_persistence_failure(options).await;
+                    return HookRunStatus::Failed;
+                }
                 self.complete_attempt_and_run(
                     HookRunStatus::Succeeded,
                     contribution_hashes,
                     diagnostic_previews,
                     None,
-                    current_unix_ms(),
-                )
-                .await;
-                self.persist_audit_contributions(
-                    &node.subscription,
-                    phase,
-                    response.contributions.as_slice(),
                     current_unix_ms(),
                 )
                 .await;
@@ -1805,16 +2116,32 @@ impl HookRunPersistence {
         let diagnostic_preview = diagnostic.preview(&policy);
         let error_summary = HookRunErrorSummary::from_error(&error, &policy);
         let completed_at_unix_ms = current_unix_ms();
-        self.complete_attempt(
-            status,
-            Vec::new(),
-            vec![diagnostic_preview.clone()],
-            Some(error_summary.clone()),
-            completed_at_unix_ms,
-        )
-        .await;
+        let attempt_completed = self
+            .complete_attempt(
+                status,
+                Vec::new(),
+                vec![diagnostic_preview.clone()],
+                Some(error_summary.clone()),
+                completed_at_unix_ms,
+            )
+            .await;
+        if self.durable_phase.is_some() && !attempt_completed {
+            return status;
+        }
 
-        if should_retry_background_outcome(node, self.current_attempt_number(), status, &error) {
+        // A durable terminal-effect outbox is the sole retry owner for this
+        // invocation. Scheduling a second hook-level retry would let the
+        // outbox report success while an untracked side effect is still
+        // queued, and that retry could later bind to different runtime
+        // configuration. Persist the failed attempt and return it to the
+        // outbox instead.
+        // `durable_phase` is captured from the immutable invocation context
+        // before any store round-trip. Retry ownership must not depend on a
+        // mutable/reconstructed store record preserving incidental metadata.
+        let durable_terminal_effect = self.durable_phase.is_some();
+        if !durable_terminal_effect
+            && should_retry_background_outcome(node, self.current_attempt_number(), status, &error)
+        {
             let queued_at_unix_ms = completed_at_unix_ms.saturating_add(retry_delay_ms(
                 &node.subscription.retry_policy,
                 self.current_attempt_number(),
@@ -1826,8 +2153,8 @@ impl HookRunPersistence {
                     .map(|timeout_ms| {
                         queued_at_unix_ms.saturating_add(u64_to_i64_saturating(timeout_ms))
                     });
-            if let (Some(store), Some(run)) = (self.store.as_ref(), self.run.as_ref()) {
-                if let Ok(updated) = store
+            if let (Some(store), Some(run)) = (self.store.clone(), self.run.clone()) {
+                match store
                     .schedule_run_retry(
                         &run.id,
                         HookRetrySchedule {
@@ -1838,8 +2165,11 @@ impl HookRunPersistence {
                     )
                     .await
                 {
-                    self.run = Some(updated);
-                    return HookRunStatus::Queued;
+                    Ok(updated) => {
+                        self.run = Some(updated);
+                        return HookRunStatus::Queued;
+                    }
+                    Err(error) => self.record_failure("schedule_run_retry", &error),
                 }
             }
         }
@@ -1890,14 +2220,18 @@ impl HookRunPersistence {
         } else {
             Vec::new()
         };
-        self.complete_attempt(
-            status,
-            Vec::new(),
-            vec![diagnostic_preview.clone()],
-            Some(error_summary.clone()),
-            current_unix_ms(),
-        )
-        .await;
+        let attempt_completed = self
+            .complete_attempt(
+                status,
+                Vec::new(),
+                vec![diagnostic_preview.clone()],
+                Some(error_summary.clone()),
+                current_unix_ms(),
+            )
+            .await;
+        if self.durable_phase.is_some() && !attempt_completed {
+            return;
+        }
         self.complete_run(
             status,
             run_contribution_hashes,
@@ -1925,20 +2259,43 @@ impl HookRunPersistence {
         error: Option<HookRunErrorSummary>,
         completed_at_unix_ms: i64,
     ) {
-        self.complete_attempt(
-            status,
-            contribution_hashes.clone(),
-            diagnostic_previews.clone(),
-            error.clone(),
-            completed_at_unix_ms,
-        )
-        .await;
+        let attempt_completed = self
+            .complete_attempt(
+                status,
+                contribution_hashes.clone(),
+                diagnostic_previews.clone(),
+                error.clone(),
+                completed_at_unix_ms,
+            )
+            .await;
+        if self.durable_phase.is_some() && !attempt_completed {
+            return;
+        }
         self.complete_run(
             status,
             contribution_hashes,
             diagnostic_previews,
             error,
             completed_at_unix_ms,
+        )
+        .await;
+    }
+
+    async fn complete_durable_persistence_failure(&mut self, options: &HookRuntimeOptions) {
+        let operation = self
+            .failure_operation
+            .unwrap_or("persist_audit_contributions");
+        let error = hook_persistence_error(operation);
+        let policy = options.diagnostic_redaction_policy();
+        let diagnostic_preview =
+            diagnostic_from_error(&error, HookRunStatus::Failed).preview(&policy);
+        let error_summary = HookRunErrorSummary::from_error(&error, &policy);
+        self.complete_attempt_and_run(
+            HookRunStatus::Failed,
+            Vec::new(),
+            vec![diagnostic_preview],
+            Some(error_summary),
+            current_unix_ms(),
         )
         .await;
     }
@@ -1950,14 +2307,18 @@ impl HookRunPersistence {
         diagnostic_previews: Vec<HookDiagnosticPreview>,
         error: Option<HookRunErrorSummary>,
         completed_at_unix_ms: i64,
-    ) {
-        let (Some(store), Some(attempt)) = (self.store.as_ref(), self.attempt.as_ref()) else {
-            return;
+    ) -> bool {
+        let (Some(store), Some(attempt)) = (self.store.clone(), self.attempt.clone()) else {
+            if self.durable_phase.is_some() {
+                self.failure_operation
+                    .get_or_insert("attempt_state_missing_on_completion");
+            }
+            return false;
         };
         let duration_ms = self
             .attempt_started_instant
             .map(|instant| u128_to_i64_saturating(instant.elapsed().as_millis()));
-        if let Ok(updated) = store
+        match store
             .complete_attempt(
                 &attempt.id,
                 HookRunAttemptStoreCompletion {
@@ -1971,7 +2332,14 @@ impl HookRunPersistence {
             )
             .await
         {
-            self.attempt = Some(updated);
+            Ok(updated) => {
+                self.attempt = Some(updated);
+                true
+            }
+            Err(error) => {
+                self.record_failure("complete_attempt", &error);
+                false
+            }
         }
     }
 
@@ -1983,10 +2351,14 @@ impl HookRunPersistence {
         error: Option<HookRunErrorSummary>,
         completed_at_unix_ms: i64,
     ) {
-        let (Some(store), Some(run)) = (self.store.as_ref(), self.run.as_ref()) else {
+        let (Some(store), Some(run)) = (self.store.clone(), self.run.clone()) else {
+            if self.durable_phase.is_some() {
+                self.failure_operation
+                    .get_or_insert("run_state_missing_on_completion");
+            }
             return;
         };
-        if let Ok(updated) = store
+        match store
             .complete_run(
                 &run.id,
                 HookRunStoreCompletion {
@@ -1999,28 +2371,45 @@ impl HookRunPersistence {
             )
             .await
         {
-            self.run = Some(updated);
+            Ok(updated) => self.run = Some(updated),
+            Err(error) => self.record_failure("complete_run", &error),
         }
     }
 
     async fn persist_audit_contributions(
-        &self,
+        &mut self,
         subscription: &HookSubscription,
         phase: HookPhase,
         contributions: &[HookContribution],
         created_at_unix_ms: i64,
-    ) {
-        let (Some(store), Some(run)) = (self.store.as_ref(), self.run.as_ref()) else {
-            return;
+    ) -> bool {
+        let audit_contributions = contributions
+            .iter()
+            .enumerate()
+            .filter_map(|(contribution_index, contribution)| {
+                matches!(contribution, HookContribution::Audit(_))
+                    .then_some((contribution_index, contribution))
+            })
+            .collect::<Vec<_>>();
+        if audit_contributions.is_empty() {
+            return true;
+        }
+        let (Some(store), Some(run)) = (self.store.clone(), self.run.clone()) else {
+            if self.durable_phase.is_some() {
+                self.failure_operation
+                    .get_or_insert("audit_run_state_missing");
+            }
+            return false;
         };
         let attempt_id = self.attempt.as_ref().map(|attempt| attempt.id.clone());
-        let events = contributions
-            .iter()
-            .filter_map(|contribution| {
+        let events = audit_contributions
+            .into_iter()
+            .filter_map(|(contribution_index, contribution)| {
                 let HookContribution::Audit(audit) = contribution else {
                     return None;
                 };
                 Some(NewHookAuditEventStoreRecord {
+                    id: Some(hook_audit_event_id(&run.id, contribution_index)),
                     hook_run_id: run.id.clone(),
                     hook_run_attempt_id: attempt_id.clone(),
                     subscription_id: subscription.subscription_id.clone(),
@@ -2035,19 +2424,31 @@ impl HookRunPersistence {
                 })
             })
             .collect::<Vec<_>>();
-        if !events.is_empty()
-            && let Err(error) = store.append_audit_events(events).await
-        {
-            tracing::error!(
-                error = %format!("{error:#}"),
-                hook_run_id = run.id.as_str(),
-                subscription_id = subscription.subscription_id.as_str(),
-                hook_id = subscription.hook_id.as_str(),
-                phase = phase.as_str(),
-                "failed to persist hook audit events"
-            );
+        match store.append_audit_events(events).await {
+            Ok(_) => true,
+            Err(error) => {
+                self.record_failure("append_audit_events", &error);
+                false
+            }
         }
     }
+}
+
+fn durable_terminal_effect_id(context: &HookContext) -> Option<&str> {
+    let key = HookMetadataKey::new("native_terminal_effect_id")
+        .expect("static terminal-effect metadata key is valid");
+    match context.metadata.get(&key) {
+        Some(HookValue::Text(effect_id)) if !effect_id.is_empty() => Some(effect_id.as_str()),
+        _ => None,
+    }
+}
+
+fn persisted_hook_run_context(context: &HookContext) -> HookContext {
+    let mut persisted = context.clone();
+    let claim_key = HookMetadataKey::new("native_terminal_effect_claim_token")
+        .expect("static terminal-effect claim metadata key is valid");
+    persisted.metadata.remove(&claim_key);
+    persisted
 }
 
 fn hook_run_idempotency_key(
@@ -2092,6 +2493,9 @@ fn hook_run_idempotency_key(
             hash_segment(&mut hasher, "actor_id", actor_id.as_str());
         }
     }
+    if let Some(effect_id) = durable_terminal_effect_id(context) {
+        hash_segment(&mut hasher, "native_terminal_effect_id", effect_id);
+    }
     if let HookInputPayload::TurnPreCompaction(payload) = &input.payload {
         hash_segment(&mut hasher, "compaction_id", payload.compaction_id.as_str());
     }
@@ -2103,6 +2507,12 @@ fn background_resume_state(
     node: &HookExecutionNode,
     request: &HookPhaseRequest,
 ) -> Option<HookRunResumeState> {
+    // Durable terminal effects are leased and retried exclusively by their
+    // outbox. Publishing a second generic hook-recovery owner would permit a
+    // restart race in which both workers execute the same handler.
+    if durable_terminal_effect_id(&request.context).is_some() {
+        return None;
+    }
     if !is_background_like(node.subscription.execution_policy.await_policy) {
         return None;
     }
@@ -2116,6 +2526,41 @@ fn background_resume_state(
         node.handler.output_contract_version(),
         snapshot,
     ))
+}
+
+fn hook_audit_event_id(run_id: &crate::HookRunId, contribution_index: usize) -> String {
+    let mut hasher = Sha256::new();
+    hash_segment(&mut hasher, "identity", "hook_audit_event_v1");
+    hash_segment(&mut hasher, "hook_run_id", run_id.as_str());
+    hash_segment(
+        &mut hasher,
+        "contribution_index",
+        contribution_index.to_string().as_str(),
+    );
+    let digest = hasher.finalize();
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(21);
+    let mut bits = 0_u16;
+    let mut bit_count = 0_u8;
+    for byte in digest {
+        bits = (bits << 8) | u16::from(byte);
+        bit_count += 8;
+        while bit_count >= 6 && encoded.len() < 21 {
+            bit_count -= 6;
+            let index = ((bits >> bit_count) & 0x3f) as usize;
+            encoded.push(ALPHABET[index] as char);
+        }
+        bits &= if bit_count == 0 {
+            0
+        } else {
+            (1_u16 << bit_count) - 1
+        };
+        if encoded.len() == 21 {
+            break;
+        }
+    }
+    debug_assert_eq!(encoded.len(), 21);
+    encoded
 }
 
 fn recoverable_background_input_snapshot(
@@ -2300,17 +2745,13 @@ fn should_retry_background_outcome(
 }
 
 fn retry_idempotency_satisfied(node: &HookExecutionNode) -> bool {
+    handler_declares_idempotent_side_effect(node)
+}
+
+fn handler_declares_idempotent_side_effect(node: &HookExecutionNode) -> bool {
     let capability =
         HookCapability::new("idempotent_side_effect").expect("static hook capability is valid");
-    if node.handler.capabilities().contains(&capability) {
-        return true;
-    }
-    let key =
-        HookMetadataKey::new("idempotent_side_effect").expect("static hook metadata key is valid");
-    matches!(
-        node.subscription.metadata.get(&key),
-        Some(HookValue::Bool(true))
-    )
+    node.handler.capabilities().contains(&capability)
 }
 
 fn retry_delay_ms(policy: &crate::HookRetryPolicy, attempt_number: u16) -> i64 {
@@ -2345,6 +2786,13 @@ fn background_run_summary(
         status,
         contribution_count,
         diagnostic_count,
+        retryable: match outcome {
+            HookNodeOutcome::Failed(error) => error.retryable,
+            HookNodeOutcome::TimedOut { .. } => true,
+            HookNodeOutcome::Succeeded(_) | HookNodeOutcome::Skipped | HookNodeOutcome::Queued => {
+                false
+            }
+        },
     }
 }
 
@@ -2568,6 +3016,18 @@ fn timeout_error(timeout_ms: u64) -> HookError {
     )
 }
 
+fn hook_persistence_error(operation: &'static str) -> HookError {
+    HookError::new(
+        HookDiagnosticCode::new("hook.persistence_unavailable")
+            .expect("static diagnostic code is valid"),
+        HookDiagnosticMessage::new(format!(
+            "durable hook persistence failed during {operation}"
+        ))
+        .expect("persistence diagnostic message is valid"),
+    )
+    .with_retryable(true)
+}
+
 fn diagnostic_from_error(error: &HookError, status: HookRunStatus) -> HookDiagnostic {
     HookDiagnostic {
         code: error.code.clone(),
@@ -2628,7 +3088,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     use std::time::Duration;
     use tokio::sync::Barrier;
@@ -2708,6 +3168,74 @@ mod tests {
         active_count: Arc<AtomicUsize>,
         max_active_count: Arc<AtomicUsize>,
         delay: Duration,
+    }
+
+    struct SideEffectCountingHookHandler {
+        id: HookId,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct SequencedIdempotentHookHandler {
+        id: HookId,
+        calls: Arc<AtomicUsize>,
+        responses: Mutex<VecDeque<HookResult<HookHandlerResponse>>>,
+    }
+
+    #[async_trait]
+    impl HookHandler for SideEffectCountingHookHandler {
+        fn id(&self) -> HookId {
+            self.id.clone()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").expect("valid hook kind")
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPrePromptCompile]
+        }
+
+        fn capabilities(&self) -> HookCapabilities {
+            HookCapabilities::new([
+                HookCapability::new("idempotent_side_effect").expect("valid capability")
+            ])
+        }
+
+        async fn execute(&self, _request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(HookHandlerResponse::default())
+        }
+    }
+
+    #[async_trait]
+    impl HookHandler for SequencedIdempotentHookHandler {
+        fn id(&self) -> HookId {
+            self.id.clone()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").expect("valid hook kind")
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPrePromptCompile]
+        }
+
+        fn capabilities(&self) -> HookCapabilities {
+            HookCapabilities::new([
+                HookCapability::new("idempotent_side_effect").expect("valid capability"),
+                HookCapability::new("emit_audit").expect("valid capability"),
+            ])
+        }
+
+        async fn execute(&self, _request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .expect("test response exists")
+        }
     }
 
     #[async_trait]
@@ -4858,6 +5386,693 @@ mod tests {
         assert_eq!(max_active_count.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_phase_background_drain_is_owned_by_its_effect() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let max_active_count = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(ConcurrencyTrackingHookHandler {
+                id: hook_id("test.durable.effect.owned"),
+                active_count: active_count.clone(),
+                max_active_count: max_active_count.clone(),
+                delay: Duration::from_millis(25),
+            }))
+            .expect("handler registers");
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.durable.effect.owned",
+            "test.durable.effect.owned",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let snapshot = subscriptions
+            .subscriptions_for_phase(HookPhase::TurnPrePromptCompile)
+            .expect("durable subscription snapshot");
+        let runtime = Arc::new(runtime(handlers, subscriptions));
+        let start = Arc::new(Barrier::new(3));
+
+        let first = tokio::spawn({
+            let runtime = runtime.clone();
+            let snapshot = snapshot.clone();
+            let start = start.clone();
+            async move {
+                start.wait().await;
+                runtime
+                    .run_phase_with_snapshot_to_completion(phase_request(), snapshot)
+                    .await
+            }
+        });
+        let second = tokio::spawn({
+            let runtime = runtime.clone();
+            let start = start.clone();
+            async move {
+                start.wait().await;
+                runtime
+                    .run_phase_with_snapshot_to_completion(phase_request(), snapshot)
+                    .await
+            }
+        });
+        start.wait().await;
+
+        first
+            .await
+            .expect("first effect task joins")
+            .expect("first durable phase succeeds");
+        second
+            .await
+            .expect("second effect task joins")
+            .expect("second durable phase succeeds");
+        assert_eq!(active_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            max_active_count.load(Ordering::SeqCst),
+            2,
+            "each effect must drain its own background handler instead of one shared drainer stealing both jobs"
+        );
+        assert_eq!(runtime.queued_background_len().expect("shared queue"), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_phase_does_not_hide_permanent_background_failure_behind_retryable_foreground_failure()
+     {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        register_handler(
+            &handlers,
+            "test.durable.permanent.background",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Err(hook_error(
+                "hook.permanent_background",
+                "permanent background failure",
+            ))],
+        );
+        register_handler(
+            &handlers,
+            "test.durable.retryable.foreground",
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Err(hook_error(
+                "hook.retryable_foreground",
+                "retryable foreground failure",
+            )
+            .with_retryable(true))],
+        );
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.durable.permanent.background",
+            "test.durable.permanent.background",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.durable.retryable.foreground",
+            "test.durable.retryable.foreground",
+            1,
+            HookFailurePolicy::Required,
+        );
+        let snapshot = subscriptions
+            .subscriptions_for_phase(HookPhase::TurnPrePromptCompile)
+            .expect("durable subscription snapshot");
+        let runtime = runtime(handlers, subscriptions);
+
+        let error = runtime
+            .run_phase_with_snapshot_to_completion(phase_request(), snapshot)
+            .await
+            .expect_err("the permanent owned failure must make the invocation terminal");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::DurableExecutionIncomplete {
+                failed_runs: 1,
+                timed_out_runs: 0,
+                incomplete_runs: 0,
+                retryable: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_subscription_snapshot_excludes_later_runtime_additions() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        register_handler(
+            &handlers,
+            "test.snapshot.origin",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.snapshot.origin",
+            "test.snapshot.origin",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let durable_snapshot = vec![
+            subscriptions
+                .get_subscription(&subscription_id("sub.snapshot.origin"))
+                .expect("subscription lookup should succeed")
+                .expect("origin subscription should exist"),
+        ];
+
+        register_handler(
+            &handlers,
+            "test.snapshot.later",
+            calls.clone(),
+            vec![Ok(HookHandlerResponse::default())],
+        );
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.snapshot.later",
+            "test.snapshot.later",
+            1,
+            HookFailurePolicy::BestEffort,
+        );
+        let runtime = runtime(handlers, subscriptions);
+
+        runtime
+            .run_phase_with_snapshot(phase_request(), durable_snapshot)
+            .await
+            .expect("the durable subscription snapshot should remain executable");
+
+        assert_eq!(
+            *calls.lock().expect("calls lock"),
+            vec![hook_id("test.snapshot.origin")],
+            "a runtime subscription installed after preparation must not inherit the old side effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_effect_replay_does_not_repeat_succeeded_hook_side_effect() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(SideEffectCountingHookHandler {
+                id: hook_id("test.terminal.effect.dedup"),
+                calls: calls.clone(),
+            }))
+            .expect("handler registers");
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.terminal.effect.dedup",
+            "test.terminal.effect.dedup",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+        let mut request = phase_request();
+        request.context.metadata.insert(
+            HookMetadataKey::new("native_terminal_effect_id").expect("valid stable metadata key"),
+            HookValue::Text("effect-stable-1".to_owned()),
+        );
+        request.context.metadata.insert(
+            HookMetadataKey::new("native_terminal_effect_claim_token")
+                .expect("valid ephemeral claim metadata key"),
+            HookValue::Text("claim-must-not-persist".to_owned()),
+        );
+
+        let first = runtime
+            .run_phase(request.clone())
+            .await
+            .expect("first effect execution should succeed");
+        let replay = runtime
+            .run_phase(request)
+            .await
+            .expect("durable replay should reconcile as success");
+
+        assert_eq!(first.runs[0].status, HookRunStatus::Succeeded);
+        assert_eq!(replay.runs[0].status, HookRunStatus::Succeeded);
+        let persisted = store
+            .completed_run
+            .lock()
+            .expect("completed run lock")
+            .clone()
+            .expect("completed durable run should persist");
+        assert!(
+            !persisted.context.metadata.contains_key(
+                &HookMetadataKey::new("native_terminal_effect_claim_token")
+                    .expect("valid ephemeral claim metadata key")
+            ),
+            "a delivery lease token must never be retained in hook history"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a persisted successful hook run must fence duplicate side effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_effect_persists_audit_before_success_and_retries_idempotently() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let audit = audit_contribution("test.terminal.effect.audit");
+        handlers
+            .register_handler(Arc::new(SequencedIdempotentHookHandler {
+                id: hook_id("test.terminal.effect.audit"),
+                calls: calls.clone(),
+                responses: Mutex::new(VecDeque::from([
+                    Ok(HookHandlerResponse {
+                        contributions: vec![audit.clone()],
+                        ..HookHandlerResponse::default()
+                    }),
+                    Ok(HookHandlerResponse {
+                        contributions: vec![audit],
+                        ..HookHandlerResponse::default()
+                    }),
+                ])),
+            }))
+            .expect("handler registers");
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.terminal.effect.audit",
+            "test.terminal.effect.audit",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore::with_append_audit_failures(1));
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+        let mut request = phase_request();
+        request.context.metadata.insert(
+            HookMetadataKey::new("native_terminal_effect_id").expect("valid stable metadata key"),
+            HookValue::Text("effect-stable-audit".to_owned()),
+        );
+
+        let first = runtime.run_phase(request.clone()).await;
+        assert!(
+            matches!(
+                &first,
+                Err(HookRuntimeError::DurablePersistenceUnavailable {
+                    operation: "append_audit_events",
+                    ..
+                })
+            ),
+            "unexpected first durable audit result: {first:?}"
+        );
+        assert!(
+            matches!(
+                store
+                    .completed_run
+                    .lock()
+                    .expect("completed run lock")
+                    .as_ref()
+                    .map(|run| run.status),
+                Some(HookRunStatus::Failed)
+            ),
+            "an audit persistence failure must terminate the durable run as Failed instead of leaving a false Succeeded or immortal Running row"
+        );
+        assert!(store.events().iter().any(|event| matches!(
+            event,
+            StoreEvent::CompleteAttempt {
+                status: HookRunStatus::Failed,
+                ..
+            }
+        )));
+
+        runtime
+            .run_phase(request.clone())
+            .await
+            .expect("outbox retry should persist audit and complete");
+        runtime
+            .run_phase(request)
+            .await
+            .expect("successful replay should hit the persisted run fence");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store
+                .events()
+                .iter()
+                .filter(|event| matches!(event, StoreEvent::AppendAudit { .. }))
+                .count(),
+            1,
+            "only the successful stable audit append should be recorded"
+        );
+        assert_eq!(
+            store
+                .completed_run
+                .lock()
+                .expect("completed run lock")
+                .as_ref()
+                .map(|run| run.status),
+            Some(HookRunStatus::Succeeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_effect_is_excluded_from_generic_hook_recovery_ownership() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(SideEffectCountingHookHandler {
+                id: hook_id("test.terminal.effect.single.retry.owner"),
+                calls: calls.clone(),
+            }))
+            .expect("handler registers");
+        register_subscription_with_policy(
+            &handlers,
+            &subscriptions,
+            "sub.terminal.effect.single.retry.owner",
+            "test.terminal.effect.single.retry.owner",
+            0,
+            HookAwaitPolicy::FireAndRecord,
+            Some(1_000),
+            HookFailurePolicy::BestEffort,
+            Vec::new(),
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+        let mut request = phase_request();
+        request.context.metadata.insert(
+            HookMetadataKey::new("native_terminal_effect_id").expect("valid stable metadata key"),
+            HookValue::Text("effect-single-retry-owner".to_owned()),
+        );
+
+        let response = runtime
+            .run_phase(request)
+            .await
+            .expect("durable background invocation should queue");
+        assert_eq!(response.runs[0].status, HookRunStatus::Queued);
+        assert!(
+            !store.last_resume_state_present.load(Ordering::SeqCst),
+            "generic hook recovery must not receive a second retry capsule for an outbox-owned effect"
+        );
+        let drain = runtime
+            .drain_queued_background()
+            .await
+            .expect("outbox-owned background work should drain in its invocation");
+        assert_eq!(drain.succeeded_count, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_effect_rejects_handler_without_idempotency_contract() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        handlers
+            .register_handler(Arc::new(RecordingHookHandler {
+                id: hook_id("test.terminal.effect.non_idempotent"),
+                phases: vec![HookPhase::TurnPrePromptCompile],
+                calls: calls.clone(),
+                responses: Mutex::new(VecDeque::from([Ok(HookHandlerResponse::default())])),
+                capabilities: HookCapabilities::default(),
+            }))
+            .expect("handler registers");
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.terminal.effect.non_idempotent",
+            "test.terminal.effect.non_idempotent",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore::default());
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store);
+        let mut request = phase_request();
+        request.context.metadata.insert(
+            HookMetadataKey::new("native_terminal_effect_id").expect("valid stable metadata key"),
+            HookValue::Text("effect-non-idempotent".to_owned()),
+        );
+
+        let error = runtime
+            .run_phase(request)
+            .await
+            .expect_err("durable execution must reject a non-idempotent handler");
+
+        assert!(matches!(
+            error,
+            HookRuntimeError::InvalidExecutionPolicy { .. }
+        ));
+        assert!(
+            calls.lock().expect("calls lock").is_empty(),
+            "the handler must not run before proving its replay contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_effect_fails_closed_before_handler_when_run_store_is_unavailable() {
+        for run_store in [
+            None,
+            Some(Arc::new(RecordingHookRunStore {
+                fail_all: true,
+                ..RecordingHookRunStore::default()
+            })),
+        ] {
+            let handlers = Arc::new(HookRegistry::new());
+            let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            handlers
+                .register_handler(Arc::new(SideEffectCountingHookHandler {
+                    id: hook_id("test.terminal.effect.persistence.fence"),
+                    calls: calls.clone(),
+                }))
+                .expect("handler registers");
+            register_subscription(
+                &handlers,
+                &subscriptions,
+                "sub.terminal.effect.persistence.fence",
+                "test.terminal.effect.persistence.fence",
+                0,
+                HookFailurePolicy::BestEffort,
+            );
+            let runtime = HookRuntime::with_options_and_optional_run_store(
+                handlers,
+                subscriptions,
+                HookRuntimeOptions::default(),
+                run_store.map(|store| -> Arc<dyn HookRunStore> { store }),
+            );
+            let mut request = phase_request();
+            request.context.metadata.insert(
+                HookMetadataKey::new("native_terminal_effect_id")
+                    .expect("valid stable metadata key"),
+                HookValue::Text("effect-persistence-fence".to_owned()),
+            );
+
+            let error = runtime
+                .run_phase(request)
+                .await
+                .expect_err("durable execution must require its idempotency store");
+            assert!(matches!(
+                error,
+                HookRuntimeError::DurablePersistenceUnavailable { .. }
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the external handler must not run without a durable idempotency fence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_effect_does_not_ack_when_success_fence_cannot_persist() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(SideEffectCountingHookHandler {
+                id: hook_id("test.terminal.effect.completion.fence"),
+                calls: calls.clone(),
+            }))
+            .expect("handler registers");
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.terminal.effect.completion.fence",
+            "test.terminal.effect.completion.fence",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore {
+            fail_complete_run: true,
+            ..RecordingHookRunStore::default()
+        });
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store);
+        let mut request = phase_request();
+        request.context.metadata.insert(
+            HookMetadataKey::new("native_terminal_effect_id").expect("valid stable metadata key"),
+            HookValue::Text("effect-completion-fence".to_owned()),
+        );
+
+        let error = runtime
+            .run_phase(request)
+            .await
+            .expect_err("outbox acknowledgement requires the persisted success fence");
+        assert!(matches!(
+            error,
+            HookRuntimeError::DurablePersistenceUnavailable {
+                operation: "complete_run",
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_effect_does_not_publish_success_after_attempt_completion_failure() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(SideEffectCountingHookHandler {
+                id: hook_id("test.terminal.effect.attempt.completion.fence"),
+                calls: calls.clone(),
+            }))
+            .expect("handler registers");
+        register_subscription(
+            &handlers,
+            &subscriptions,
+            "sub.terminal.effect.attempt.completion.fence",
+            "test.terminal.effect.attempt.completion.fence",
+            0,
+            HookFailurePolicy::BestEffort,
+        );
+        let store = Arc::new(RecordingHookRunStore {
+            fail_complete_attempt: true,
+            ..RecordingHookRunStore::default()
+        });
+        let runtime = runtime_with_recording_store(handlers, subscriptions, store.clone());
+        let mut request = phase_request();
+        request.context.metadata.insert(
+            HookMetadataKey::new("native_terminal_effect_id").expect("valid stable metadata key"),
+            HookValue::Text("effect-attempt-completion-fence".to_owned()),
+        );
+
+        let error = runtime
+            .run_phase(request)
+            .await
+            .expect_err("run success must not outrun its durable attempt completion");
+        assert!(matches!(
+            error,
+            HookRuntimeError::DurablePersistenceUnavailable {
+                operation: "complete_attempt",
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !store.events().iter().any(|event| matches!(
+                event,
+                StoreEvent::CompleteRun {
+                    status: HookRunStatus::Succeeded,
+                    ..
+                }
+            )),
+            "a failed attempt completion must fence the run-level success marker"
+        );
+        assert!(
+            store
+                .completed_run
+                .lock()
+                .expect("completed run lock")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_effect_keeps_outbox_as_the_only_retry_owner() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        handlers
+            .register_handler(Arc::new(SequencedIdempotentHookHandler {
+                id: hook_id("test.terminal.effect.retry.owner"),
+                calls: calls.clone(),
+                responses: Mutex::new(VecDeque::from([
+                    Err(HookError::new(
+                        HookDiagnosticCode::new("test.retryable").expect("valid diagnostic code"),
+                        HookDiagnosticMessage::new("retryable test failure")
+                            .expect("valid diagnostic message"),
+                    )
+                    .with_retryable(true)),
+                    Ok(HookHandlerResponse::default()),
+                ])),
+            }))
+            .expect("handler registers");
+        let subscription = HookSubscription::new(
+            subscription_id("sub.terminal.effect.retry.owner"),
+            hook_id("test.terminal.effect.retry.owner"),
+            HookPhase::TurnPrePromptCompile,
+        )
+        .with_execution_policy(HookExecutionPolicy {
+            await_policy: HookAwaitPolicy::FireAndRecord,
+            timeout_ms: Some(1_000),
+            max_parallelism: None,
+        })
+        .with_failure_policy(HookFailurePolicy::BestEffort)
+        .with_retry_policy(crate::HookRetryPolicy {
+            max_attempts: 2,
+            backoff: HookRetryBackoff::Fixed,
+            initial_delay_ms: Some(1),
+            idempotency_required: true,
+        });
+        subscriptions
+            .register_subscription(handlers.as_ref(), subscription.clone())
+            .expect("subscription registers");
+        let runtime = runtime_with_recording_store(
+            handlers,
+            subscriptions,
+            Arc::new(RecordingHookRunStore::default()),
+        );
+        let mut request = phase_request();
+        request.context.metadata.insert(
+            HookMetadataKey::new("native_terminal_effect_id").expect("valid stable metadata key"),
+            HookValue::Text("effect-retry-owner".to_owned()),
+        );
+
+        let first = runtime
+            .run_phase_with_snapshot_to_completion(request.clone(), vec![subscription.clone()])
+            .await
+            .expect_err("a failed handler must leave the outbox attempt retryable");
+        assert!(
+            matches!(
+                &first,
+                HookRuntimeError::DurableExecutionIncomplete {
+                    failed_runs: 1,
+                    timed_out_runs: 0,
+                    incomplete_runs: 0,
+                    ..
+                }
+            ),
+            "unexpected durable hook failure: {first:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        runtime
+            .run_phase_with_snapshot_to_completion(request.clone(), vec![subscription.clone()])
+            .await
+            .expect("the next outbox attempt should execute the handler retry");
+        runtime
+            .run_phase_with_snapshot_to_completion(request, vec![subscription])
+            .await
+            .expect("persisted success should reconcile duplicate outbox delivery");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "hook-level recovery must not compete with the outbox and persisted success must deduplicate replay"
+        );
+    }
+
     #[tokio::test]
     async fn phase_20_fire_and_record_persists_success_lifecycle() {
         let handlers = Arc::new(HookRegistry::new());
@@ -5402,10 +6617,8 @@ mod tests {
             Vec::new(),
         );
         let store = Arc::new(RecordingHookRunStore {
-            events: Mutex::new(Vec::new()),
-            recoverable_runs: Mutex::new(Vec::new()),
             fail_all: true,
-            append_attempt_conflicts_remaining: AtomicUsize::new(0),
+            ..RecordingHookRunStore::default()
         });
         let runtime = runtime_with_recording_store(handlers, subscriptions, store);
 
@@ -5835,7 +7048,13 @@ mod tests {
     struct RecordingHookRunStore {
         events: Mutex<Vec<StoreEvent>>,
         recoverable_runs: Mutex<Vec<crate::HookRecoverableRunRecord>>,
+        last_idempotency_key: Mutex<Option<HookRunIdempotencyKey>>,
+        completed_run: Mutex<Option<HookRunStoreRecord>>,
         fail_all: bool,
+        fail_complete_attempt: bool,
+        fail_complete_run: bool,
+        fail_append_audit_remaining: AtomicUsize,
+        last_resume_state_present: AtomicBool,
         append_attempt_conflicts_remaining: AtomicUsize,
     }
 
@@ -5848,8 +7067,21 @@ mod tests {
             Self {
                 events: Mutex::new(Vec::new()),
                 recoverable_runs: Mutex::new(Vec::new()),
+                last_idempotency_key: Mutex::new(None),
+                completed_run: Mutex::new(None),
                 fail_all: false,
+                fail_complete_attempt: false,
+                fail_complete_run: false,
+                fail_append_audit_remaining: AtomicUsize::new(0),
+                last_resume_state_present: AtomicBool::new(false),
                 append_attempt_conflicts_remaining: AtomicUsize::new(count),
+            }
+        }
+
+        fn with_append_audit_failures(count: usize) -> Self {
+            Self {
+                fail_append_audit_remaining: AtomicUsize::new(count),
+                ..Self::default()
             }
         }
 
@@ -5857,7 +7089,13 @@ mod tests {
             Self {
                 events: Mutex::new(Vec::new()),
                 recoverable_runs: Mutex::new(records),
+                last_idempotency_key: Mutex::new(None),
+                completed_run: Mutex::new(None),
                 fail_all: false,
+                fail_complete_attempt: false,
+                fail_complete_run: false,
+                fail_append_audit_remaining: AtomicUsize::new(0),
+                last_resume_state_present: AtomicBool::new(false),
                 append_attempt_conflicts_remaining: AtomicUsize::new(0),
             }
         }
@@ -5872,6 +7110,21 @@ mod tests {
             if self.fail_all {
                 return Err(crate::HookRunStoreError::internal("store unavailable"));
             }
+            if let Some(completed) = self
+                .completed_run
+                .lock()
+                .expect("completed run lock")
+                .clone()
+                && completed.idempotency_key == run.idempotency_key
+            {
+                return Ok(completed);
+            }
+            *self
+                .last_idempotency_key
+                .lock()
+                .expect("idempotency key lock") = Some(run.idempotency_key.clone());
+            self.last_resume_state_present
+                .store(run.resume_state.is_some(), Ordering::SeqCst);
             self.events
                 .lock()
                 .expect("events lock")
@@ -5942,7 +7195,7 @@ mod tests {
             run_id: &HookRunId,
             completion: HookRunStoreCompletion,
         ) -> HookRunStoreResult<HookRunStoreRecord> {
-            if self.fail_all {
+            if self.fail_all || self.fail_complete_run {
                 return Err(crate::HookRunStoreError::internal("store unavailable"));
             }
             self.events
@@ -5952,10 +7205,16 @@ mod tests {
                     status: completion.status,
                     contribution_hashes: completion.contribution_hashes.clone(),
                 });
-            Ok(HookRunStoreRecord {
+            let completed = HookRunStoreRecord {
                 id: run_id.clone(),
-                idempotency_key: HookRunIdempotencyKey::new("phase15.completed")
-                    .expect("valid key"),
+                idempotency_key: self
+                    .last_idempotency_key
+                    .lock()
+                    .expect("idempotency key lock")
+                    .clone()
+                    .unwrap_or_else(|| {
+                        HookRunIdempotencyKey::new("phase15.completed").expect("valid key")
+                    }),
                 subscription_id: subscription_id("sub.persistence"),
                 hook_id: hook_id("test.persistence"),
                 phase: HookPhase::TurnPrePromptCompile,
@@ -5973,7 +7232,9 @@ mod tests {
                 completed_at_unix_ms: Some(completion.completed_at_unix_ms),
                 deadline_at_unix_ms: None,
                 resume_state: None,
-            })
+            };
+            *self.completed_run.lock().expect("completed run lock") = Some(completed.clone());
+            Ok(completed)
         }
 
         async fn append_attempt(
@@ -6023,7 +7284,7 @@ mod tests {
             attempt_id: &HookRunAttemptId,
             completion: HookRunAttemptStoreCompletion,
         ) -> HookRunStoreResult<HookRunAttemptStoreRecord> {
-            if self.fail_all {
+            if self.fail_all || self.fail_complete_attempt {
                 return Err(crate::HookRunStoreError::internal("store unavailable"));
             }
             self.events
@@ -6056,6 +7317,17 @@ mod tests {
             if self.fail_all {
                 return Err(crate::HookRunStoreError::internal("store unavailable"));
             }
+            if self
+                .fail_append_audit_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(crate::HookRunStoreError::internal(
+                    "injected audit persistence failure",
+                ));
+            }
             self.events
                 .lock()
                 .expect("events lock")
@@ -6073,7 +7345,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(index, event)| HookAuditEventStoreRecord {
-                    id: format!("audit.{index}"),
+                    id: event.id.unwrap_or_else(|| format!("audit.{index}")),
                     hook_run_id: event.hook_run_id,
                     hook_run_attempt_id: event.hook_run_attempt_id,
                     subscription_id: event.subscription_id,
@@ -6985,10 +8257,8 @@ mod tests {
             HookFailurePolicy::BestEffort,
         );
         let store = Arc::new(RecordingHookRunStore {
-            events: Mutex::new(Vec::new()),
-            recoverable_runs: Mutex::new(Vec::new()),
             fail_all: true,
-            append_attempt_conflicts_remaining: AtomicUsize::new(0),
+            ..RecordingHookRunStore::default()
         });
         let runtime = runtime_with_recording_store(handlers, subscriptions, store);
 

@@ -1,9 +1,18 @@
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context as TracingContext, Layer};
+
+static NATIVE_LIFECYCLE_DEPTH_VALUES: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatabaseRole {
@@ -97,6 +106,9 @@ pub(crate) struct GatewayMetrics {
     pub(crate) provider_warmup_stage_duration: Histogram<f64>,
     pub(crate) provider_warmup_failures: Counter<u64>,
     pub(crate) provider_readiness_checks: Counter<u64>,
+    pub(crate) native_lifecycle_events: Counter<u64>,
+    pub(crate) native_lifecycle_readiness_checks: Counter<u64>,
+    pub(crate) native_lifecycle_duration: Histogram<f64>,
     pub(crate) gateway_operation_duration: Histogram<f64>,
     pub(crate) gateway_operation_stage_duration: Histogram<f64>,
     pub(crate) gateway_operation_items: Histogram<u64>,
@@ -193,6 +205,29 @@ impl GatewayMetrics {
             )
             .with_unit("{check}")
             .build();
+        let native_lifecycle_events = meter
+            .u64_counter("pioneer.gateway.native.lifecycle.events")
+            .with_description(
+                "Native-agent lifecycle events by bounded stage and outcome without resource IDs",
+            )
+            .with_unit("{event}")
+            .build();
+        let native_lifecycle_readiness_checks = meter
+            .u64_counter("pioneer.gateway.native.readiness.checks")
+            .with_description(
+                "Native lifecycle readiness component checks by bounded component and state",
+            )
+            .with_unit("{check}")
+            .build();
+        let native_lifecycle_duration = meter
+            .f64_histogram("pioneer.gateway.native.lifecycle.duration")
+            .with_description(
+                "Native lifecycle latency for bounded provider, tool, durable and terminal stages",
+            )
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        register_native_lifecycle_depth_observable(&meter);
         let gateway_operation_duration = meter
             .f64_histogram("pioneer.gateway.operation.duration")
             .with_description("End-to-end duration of a bounded Gateway operation")
@@ -265,6 +300,9 @@ impl GatewayMetrics {
             provider_warmup_stage_duration,
             provider_warmup_failures,
             provider_readiness_checks,
+            native_lifecycle_events,
+            native_lifecycle_readiness_checks,
+            native_lifecycle_duration,
             gateway_operation_duration,
             gateway_operation_stage_duration,
             gateway_operation_items,
@@ -344,6 +382,246 @@ fn operation_item_boundaries() -> Vec<f64> {
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 500.0, 1_000.0, 2_500.0, 5_000.0,
         10_000.0, 25_000.0, 100_000.0,
     ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeLifecycleStage {
+    Turn,
+    FirstEvent,
+    DurableCommit,
+    ProviderRound,
+    ToolAttempt,
+    ToolRetry,
+    Recovery,
+    TerminalCommit,
+    Terminalization,
+    Readiness,
+}
+
+impl NativeLifecycleStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::FirstEvent => "first_event",
+            Self::DurableCommit => "durable_commit",
+            Self::ProviderRound => "provider_round",
+            Self::ToolAttempt => "tool_attempt",
+            Self::ToolRetry => "tool_retry",
+            Self::Recovery => "recovery",
+            Self::TerminalCommit => "terminal_commit",
+            Self::Terminalization => "terminalization",
+            Self::Readiness => "readiness",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeLifecycleOutcome {
+    Started,
+    Succeeded,
+    Failed,
+    Blocked,
+    Interrupted,
+    TimedOut,
+    Rejected,
+    Exhausted,
+    Saturated,
+    Closed,
+    Recovered,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeProviderClass {
+    Api,
+    Cli,
+    Unknown,
+}
+
+impl NativeProviderClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Cli => "cli",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl NativeLifecycleOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Interrupted => "interrupted",
+            Self::TimedOut => "timed_out",
+            Self::Rejected => "rejected",
+            Self::Exhausted => "exhausted",
+            Self::Saturated => "saturated",
+            Self::Closed => "closed",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeLifecycleEventMetric {
+    pub stage: NativeLifecycleStage,
+    pub outcome: NativeLifecycleOutcome,
+    pub provider_class: NativeProviderClass,
+    pub elapsed: Option<Duration>,
+}
+
+pub fn record_native_lifecycle_event(metric: NativeLifecycleEventMetric) {
+    if !super::telemetry_enabled() {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return;
+    };
+    let attributes = [
+        KeyValue::new("native.stage", metric.stage.as_str()),
+        KeyValue::new("outcome", metric.outcome.as_str()),
+        KeyValue::new("provider.class", metric.provider_class.as_str()),
+    ];
+    metrics.native_lifecycle_events.add(1, &attributes);
+    if let Some(elapsed) = metric.elapsed {
+        metrics
+            .native_lifecycle_duration
+            .record(elapsed.as_secs_f64() * 1_000.0, &attributes);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeReadinessComponent {
+    Database,
+    NativeAgentManager,
+    DurableListeners,
+    RecoveryCoordinator,
+    Terminalization,
+    ProviderRegistry,
+}
+
+impl NativeReadinessComponent {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Database => "database",
+            Self::NativeAgentManager => "native_agent_manager",
+            Self::DurableListeners => "durable_listeners",
+            Self::RecoveryCoordinator => "recovery_coordinator",
+            Self::Terminalization => "terminalization",
+            Self::ProviderRegistry => "provider_registry",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeReadinessState {
+    Starting,
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+impl NativeReadinessState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+pub fn record_native_readiness_component(
+    component: NativeReadinessComponent,
+    state_value: NativeReadinessState,
+) {
+    if !super::telemetry_enabled() {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return;
+    };
+    metrics.native_lifecycle_readiness_checks.add(
+        1,
+        &[
+            KeyValue::new("native.component", component.as_str()),
+            KeyValue::new("native.state", state_value.as_str()),
+        ],
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeLifecycleDepthKind {
+    ActiveTurns,
+    StaleRunningTurns,
+    RecoveryBacklog,
+    TerminalBacklog,
+    UnresolvedTerminalEffects,
+}
+
+impl NativeLifecycleDepthKind {
+    const ALL: [Self; 5] = [
+        Self::ActiveTurns,
+        Self::StaleRunningTurns,
+        Self::RecoveryBacklog,
+        Self::TerminalBacklog,
+        Self::UnresolvedTerminalEffects,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ActiveTurns => 0,
+            Self::StaleRunningTurns => 1,
+            Self::RecoveryBacklog => 2,
+            Self::TerminalBacklog => 3,
+            Self::UnresolvedTerminalEffects => 4,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ActiveTurns => "active_turns",
+            Self::StaleRunningTurns => "stale_running_turns",
+            Self::RecoveryBacklog => "recovery_backlog",
+            Self::TerminalBacklog => "terminal_backlog",
+            Self::UnresolvedTerminalEffects => "unresolved_terminal_effects",
+        }
+    }
+}
+
+pub fn record_native_lifecycle_depth(kind: NativeLifecycleDepthKind, value: u64) {
+    NATIVE_LIFECYCLE_DEPTH_VALUES[kind.index()].store(value, Ordering::Release);
+}
+
+fn register_native_lifecycle_depth_observable(meter: &Meter) {
+    meter
+        .u64_observable_gauge("pioneer.gateway.native.lifecycle.depth")
+        .with_description(
+            "Current bounded native lifecycle active, stale, recovery and terminal backlog depth",
+        )
+        .with_unit("{item}")
+        .with_callback(|observer| {
+            if !super::telemetry_enabled() {
+                return;
+            }
+            for kind in NativeLifecycleDepthKind::ALL {
+                observer.observe(
+                    NATIVE_LIFECYCLE_DEPTH_VALUES[kind.index()].load(Ordering::Acquire),
+                    &[KeyValue::new("native.depth.kind", kind.as_str())],
+                );
+            }
+        })
+        .build();
 }
 
 /// One bounded, source-free Apply Patch observation. All string values are
@@ -834,4 +1112,31 @@ where
         })
         .build();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_lifecycle_depth_is_a_bounded_latest_value_snapshot() {
+        for (index, kind) in NativeLifecycleDepthKind::ALL.into_iter().enumerate() {
+            record_native_lifecycle_depth(kind, u64::try_from(index + 1).unwrap());
+        }
+        record_native_lifecycle_depth(NativeLifecycleDepthKind::ActiveTurns, 99);
+
+        let values = NativeLifecycleDepthKind::ALL
+            .map(|kind| NATIVE_LIFECYCLE_DEPTH_VALUES[kind.index()].load(Ordering::Acquire));
+        assert_eq!(values, [99, 2, 3, 4, 5]);
+        assert_eq!(
+            NativeLifecycleDepthKind::ALL.map(NativeLifecycleDepthKind::as_str),
+            [
+                "active_turns",
+                "stale_running_turns",
+                "recovery_backlog",
+                "terminal_backlog",
+                "unresolved_terminal_effects",
+            ]
+        );
+    }
 }

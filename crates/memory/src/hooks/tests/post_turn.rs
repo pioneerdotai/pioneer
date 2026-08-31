@@ -25,6 +25,41 @@ fn assert_post_turn_eligibility_skip(
 }
 
 #[test]
+fn durable_terminal_effect_claim_requires_a_complete_text_fence() {
+    let effect_key = HookMetadataKey::new("native_terminal_effect_id")
+        .expect("valid terminal-effect metadata key");
+    let claim_key = HookMetadataKey::new("native_terminal_effect_claim_token")
+        .expect("valid terminal-effect claim metadata key");
+    let mut context = HookContext::default();
+    context.metadata.insert(
+        effect_key.clone(),
+        HookValue::Text("effect-durable-1".to_owned()),
+    );
+    assert!(
+        memory_durable_terminal_effect_claim(&context).is_err(),
+        "an effect id without its claim token must fail closed"
+    );
+
+    context.metadata.insert(
+        claim_key.clone(),
+        HookValue::Text("claim-durable-1".to_owned()),
+    );
+    assert_eq!(
+        memory_durable_terminal_effect_claim(&context).expect("complete claim should decode"),
+        Some(MemoryDurableTerminalEffectClaim {
+            effect_id: "effect-durable-1".to_owned(),
+            claim_token: "claim-durable-1".to_owned(),
+        })
+    );
+
+    context.metadata.insert(claim_key, HookValue::I64(1));
+    assert!(
+        memory_durable_terminal_effect_claim(&context).is_err(),
+        "a non-text claim token must fail closed"
+    );
+}
+
+#[test]
 fn strict_json_parser_accepts_typed_semantic_fact() {
     let parsed = parse_memory_post_turn_extractor_json(
         valid_post_turn_extractor_json().as_str(),

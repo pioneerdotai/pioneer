@@ -59,6 +59,7 @@ pub use super::mcp_audit_event::Entity as McpAuditEvent;
 pub use super::mcp_server_catalog_snapshot::Entity as McpServerCatalogSnapshot;
 pub use super::mcp_server_installation::Entity as McpServerInstallation;
 pub use super::native_agent_config::Entity as NativeAgentConfig;
+pub use super::native_terminal_effect_outbox::Entity as NativeTerminalEffectOutbox;
 pub use super::patch_commit_intent::Entity as PatchCommitIntent;
 pub use super::patch_commit_terminal::Entity as PatchCommitTerminal;
 pub use super::patch_snapshot::Entity as PatchSnapshot;

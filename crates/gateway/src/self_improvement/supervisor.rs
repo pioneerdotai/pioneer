@@ -3045,7 +3045,9 @@ mod tests {
         let version_id = overlay[0].version_id.clone();
 
         let native_provider = Arc::new(NativeReadSkillProvider::new(skill_id.clone()));
-        registry.insert("native", native_provider.clone());
+        registry
+            .insert("native", native_provider.clone())
+            .expect("native provider should fit the bounded test registry");
         let manager = AgentManager::new(registry, agent_tool_loop_config());
         manager
             .ensure_thread("thread_native", WORKSPACE)
@@ -5446,7 +5448,9 @@ mod tests {
             "learning-old",
             old_provider.clone(),
         ));
-        registry.insert("learning-new", new_provider.clone());
+        registry
+            .insert("learning-new", new_provider.clone())
+            .expect("replacement provider should fit the bounded test registry");
         let old_config = GatewaySelfImprovementConfig {
             enabled: true,
             default_model: Some(GatewaySelfImprovementModelSelectionConfig {

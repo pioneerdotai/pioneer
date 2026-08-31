@@ -11,6 +11,7 @@ use pioneer_keystore::{
     DbKeyStore, DbKeyStoreConfig, SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta,
     SecretStore, ensure_private_file,
 };
+#[cfg(test)]
 use tracing::warn;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -412,6 +413,7 @@ impl GatewaySecrets {
         Ok(proxies)
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_provider_api_key(&self, provider_name: &str) -> String {
         if is_local_provider(provider_name) {
             return String::new();
@@ -431,30 +433,7 @@ impl GatewaySecrets {
         }
     }
 
-    pub(crate) fn resolve_workspace_provider_api_key(
-        &self,
-        workspace_id: &str,
-        provider_name: &str,
-    ) -> String {
-        if is_local_provider(provider_name) {
-            return String::new();
-        }
-
-        match self.get_workspace_provider_api_key(workspace_id, provider_name) {
-            Ok(Some(value)) => value,
-            Ok(None) => String::new(),
-            Err(error) => {
-                warn!(
-                    workspace_id,
-                    provider = provider_name,
-                    error = %format!("{error:#}"),
-                    "failed to resolve workspace provider api key from keystore"
-                );
-                String::new()
-            }
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn resolve_workspace_provider_proxy(
         &self,
         workspace_id: &str,

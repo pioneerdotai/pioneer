@@ -12,9 +12,44 @@ use pioneer_provider::{
     StreamChunk, TokenUsage,
 };
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::time::timeout;
 
 const HARD_MAX_PROVIDER_OUTPUT_TOKENS: u32 = 8_192;
+
+struct NativeProviderRoundMetric {
+    started: Instant,
+    finished: bool,
+}
+
+impl NativeProviderRoundMetric {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: pioneer_observability::NativeLifecycleOutcome) {
+        self.finished = true;
+        pioneer_observability::record_native_lifecycle_event(
+            pioneer_observability::NativeLifecycleEventMetric {
+                stage: pioneer_observability::NativeLifecycleStage::ProviderRound,
+                outcome,
+                provider_class: pioneer_observability::NativeProviderClass::Api,
+                elapsed: Some(self.started.elapsed()),
+            },
+        );
+    }
+}
+
+impl Drop for NativeProviderRoundMetric {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(pioneer_observability::NativeLifecycleOutcome::Failed);
+        }
+    }
+}
 
 pub(super) fn bounded_provider_request(mut request: ChatRequest) -> ChatRequest {
     request.max_tokens = Some(
@@ -63,6 +98,7 @@ pub(super) async fn request_agent_round(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
+    let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let request = bounded_provider_request(request);
     if provider.capabilities().streaming && !force_non_stream {
         let provider_name = provider.name().to_owned();
@@ -189,6 +225,7 @@ pub(super) async fn request_agent_round(
             model_name.as_str(),
             ProviderTransportKind::Stream,
         )?;
+        lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
         return Ok(AgentRoundResponse {
             text: full_text,
             reasoning: full_reasoning,
@@ -255,6 +292,7 @@ pub(super) async fn request_agent_round(
         model_name.as_str(),
         ProviderTransportKind::NonStream,
     )?;
+    lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
     Ok(AgentRoundResponse {
         text: response.text,
         reasoning,
@@ -276,6 +314,7 @@ pub(super) async fn stream_provider_response(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<String, ChatTurnError> {
+    let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let request = bounded_provider_request(request);
     let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
@@ -583,6 +622,7 @@ pub(super) async fn stream_provider_response(
     )
     .await?;
 
+    lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
     Ok(assistant_text)
 }
 
@@ -596,6 +636,7 @@ pub(super) async fn non_stream_provider_response(
     message_item_id: &str,
     event_tx: &AgentEventHub,
 ) -> Result<String, ChatTurnError> {
+    let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let request = bounded_provider_request(request);
     let model_name = request.model.clone();
 
@@ -714,6 +755,7 @@ pub(super) async fn non_stream_provider_response(
     )
     .await?;
 
+    lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
     Ok(assistant_text)
 }
 

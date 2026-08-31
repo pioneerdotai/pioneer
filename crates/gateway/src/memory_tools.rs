@@ -33,6 +33,66 @@ const MEMORY_SEARCH_TOOL: &str = "memory_search";
 const MEMORY_LIST_TOOL: &str = "memory_list";
 const MEMORY_GET_TOOL: &str = "memory_get";
 const MEMORY_REMEMBER_TOOL: &str = "memory_remember";
+const MAX_POST_TURN_EXTRACTOR_RAW_BYTES: usize = 64 * 1024;
+const MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableMemoryPostTurnExtractorCheckpoint {
+    schema_version: u8,
+    raw_json: String,
+    model: String,
+    model_provider: String,
+}
+
+fn decode_memory_post_turn_extractor_checkpoint(
+    checkpoint_json: &str,
+    model: &str,
+    model_provider: &str,
+) -> Result<String, String> {
+    if checkpoint_json.len() > MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES {
+        return Err(
+            "memory post-turn extraction checkpoint exceeds its durable byte limit".to_owned(),
+        );
+    }
+    let checkpoint: DurableMemoryPostTurnExtractorCheckpoint =
+        serde_json::from_str(checkpoint_json)
+            .map_err(|_| "memory post-turn extraction checkpoint is invalid".to_owned())?;
+    if checkpoint.schema_version != 1
+        || checkpoint.raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES
+        || checkpoint.model.trim().is_empty()
+        || checkpoint.model_provider.trim().is_empty()
+    {
+        return Err("memory post-turn extraction checkpoint is unsupported".to_owned());
+    }
+    if checkpoint.model != model || checkpoint.model_provider != model_provider {
+        return Err("memory post-turn extraction checkpoint provider identity mismatch".to_owned());
+    }
+    Ok(checkpoint.raw_json)
+}
+
+fn encode_memory_post_turn_extractor_checkpoint(
+    raw_json: &str,
+    model: &str,
+    model_provider: &str,
+) -> Result<String, String> {
+    if raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES {
+        return Err("memory post-turn extractor response exceeds its byte limit".to_owned());
+    }
+    let checkpoint_json = serde_json::to_string(&DurableMemoryPostTurnExtractorCheckpoint {
+        schema_version: 1,
+        raw_json: raw_json.to_owned(),
+        model: model.to_owned(),
+        model_provider: model_provider.to_owned(),
+    })
+    .map_err(|_| "failed to encode memory post-turn extraction checkpoint".to_owned())?;
+    if checkpoint_json.len() > MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES {
+        return Err(
+            "memory post-turn extraction checkpoint exceeds its durable byte limit".to_owned(),
+        );
+    }
+    Ok(checkpoint_json)
+}
 const MEMORY_FORGET_TOOL: &str = "memory_forget";
 const DEFAULT_SEARCH_LIMIT: u32 = 8;
 const MAX_SEARCH_LIMIT: u32 = 20;
@@ -509,6 +569,24 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         let model = model
             .as_deref()
             .ok_or_else(|| "missing model for memory post-turn extractor".to_owned())?;
+        if let Some(claim) = context.durable_terminal_effect.as_ref()
+            && let Some(checkpoint_json) = processor
+                .crud_store
+                .native_terminal_effect_handler_checkpoint(
+                    claim.effect_id.as_str(),
+                    claim.claim_token.as_str(),
+                )
+                .await
+                .map_err(|error| {
+                    format!("failed to load memory post-turn extraction checkpoint: {error:#}")
+                })?
+        {
+            return decode_memory_post_turn_extractor_checkpoint(
+                checkpoint_json.as_str(),
+                model,
+                provider_name,
+            );
+        }
         let provider_authorization = processor
             .revalidate_post_turn_execution_authorization(
                 context.workspace_id.as_str(),
@@ -538,7 +616,32 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             .map_err(|error| {
                 format!("failed to create memory post-turn extractor provider: {error}")
             })?;
-        request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt()).await
+        let raw_json =
+            request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
+                .await?;
+        if raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES {
+            return Err("memory post-turn extractor response exceeds its byte limit".to_owned());
+        }
+        if let Some(claim) = context.durable_terminal_effect.as_ref() {
+            let checkpoint_json = encode_memory_post_turn_extractor_checkpoint(
+                raw_json.as_str(),
+                model,
+                provider_name,
+            )?;
+            processor
+                .crud_store
+                .store_native_terminal_effect_handler_checkpoint(
+                    claim.effect_id.as_str(),
+                    claim.claim_token.as_str(),
+                    checkpoint_json.as_str(),
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+                .map_err(|error| {
+                    format!("failed to persist memory post-turn extraction checkpoint: {error:#}")
+                })?;
+        }
+        Ok(raw_json)
     }
 }
 
@@ -1752,6 +1855,44 @@ mod tests {
     use futures_util::stream::{self, BoxStream};
     use pioneer_provider::{ChatResponse, ProviderCapabilities, StreamChunk};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn durable_memory_post_turn_checkpoint_is_bounded_and_authority_fenced() {
+        let raw_json = r#"{"facts":[]}"#;
+        let encoded = encode_memory_post_turn_extractor_checkpoint(
+            raw_json,
+            "memory-model",
+            "memory-provider",
+        )
+        .expect("bounded checkpoint should encode");
+        assert_eq!(
+            decode_memory_post_turn_extractor_checkpoint(
+                encoded.as_str(),
+                "memory-model",
+                "memory-provider",
+            )
+            .expect("matching provider identity should replay"),
+            raw_json
+        );
+        assert!(
+            decode_memory_post_turn_extractor_checkpoint(
+                encoded.as_str(),
+                "replacement-model",
+                "memory-provider",
+            )
+            .is_err(),
+            "a checkpoint must not cross provider/model authority"
+        );
+        assert!(
+            encode_memory_post_turn_extractor_checkpoint(
+                "x".repeat(MAX_POST_TURN_EXTRACTOR_RAW_BYTES + 1).as_str(),
+                "memory-model",
+                "memory-provider",
+            )
+            .is_err(),
+            "raw provider output must remain bounded before persistence"
+        );
+    }
 
     struct CompatibilityFallbackProvider {
         requests: Arc<Mutex<Vec<ChatRequest>>>,

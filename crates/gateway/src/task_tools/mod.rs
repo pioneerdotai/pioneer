@@ -131,6 +131,10 @@ impl GatewayTaskToolProvider {
 
 #[async_trait]
 impl TaskToolProvider for GatewayTaskToolProvider {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "pioneer.gateway.attached-task-cleanup.v1"
+    }
+
     async fn materialize_task_tools(
         &self,
         context: TaskTurnContext,
@@ -594,6 +598,19 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         }
         Ok(())
     }
+
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        _effect_id: &str,
+        context: TaskTurnContext,
+        reason: String,
+    ) -> Result<(), String> {
+        // Cancellation is reconciled from authoritative task state on every
+        // attempt. Terminal children are skipped and cancel_task itself owns
+        // the task revision fence, so replay after an unknown outbox ACK is a
+        // logical no-op rather than a second cancellation transition.
+        self.cleanup_attached_tasks(context, reason).await
+    }
 }
 
 fn agent_bound_task_tool_visible(name: &str, capabilities: &BTreeSet<AgentToolCapability>) -> bool {
@@ -769,6 +786,7 @@ impl TaskToolAuthorizationScope {
                         workspace_id.as_str(),
                         request.provider.as_str(),
                     )
+                    .map_err(|_| task_tool_authorization_error())?
                     .as_str()
                     .to_owned(),
             );

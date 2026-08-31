@@ -1,6 +1,7 @@
 use super::{
-    AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor, message_future,
-    now_timestamp_secs, record_resilience_worker_poll_error,
+    AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor,
+    ResilienceWorkerFailureImpact, message_future, now_timestamp_secs,
+    record_resilience_worker_error, record_resilience_worker_poll_error,
 };
 use crate::bootstrap::bootstrap;
 use crate::cli_runtime::continuation::{
@@ -309,6 +310,7 @@ async fn persist_test_execution_authorization_context_for_principal_with_profile
         processor
             .provider_registry
             .authority_fingerprint_for_workspace(workspace_id, "openai")
+            .expect("test provider authority should resolve")
             .as_str(),
     );
     let encoded = context
@@ -2862,6 +2864,25 @@ fn resilience_worker_pool_timeout_is_transient_storage_backpressure() {
 }
 
 #[test]
+fn resilience_maintenance_failure_does_not_backoff_critical_polling() {
+    let error = anyhow::anyhow!(
+        "failed to purge retained rows: Failed to acquire connection from pool: \
+         Connection pool timed out: Connection pool timed out"
+    );
+
+    assert!(record_resilience_worker_error(
+        "critical recovery poll",
+        &error,
+        ResilienceWorkerFailureImpact::CriticalPoll,
+    ));
+    assert!(!record_resilience_worker_error(
+        "terminal-effect retention",
+        &error,
+        ResilienceWorkerFailureImpact::Maintenance,
+    ));
+}
+
+#[test]
 fn terminal_failure_paths_stay_behind_recovery_gate() {
     let leaf_sources = [
         ("turn_handlers.rs", include_str!("turn_handlers.rs")),
@@ -4097,7 +4118,9 @@ impl HookHandler for TaskPostTurnRecordingHookHandler {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        HookCapabilities::new([])
+        HookCapabilities::new([
+            HookCapability::new("idempotent_side_effect").expect("valid capability")
+        ])
     }
 
     async fn execute(
@@ -5854,12 +5877,24 @@ async fn setup_provider_api_key_processor(
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let secret_store = Arc::new(MemorySecretStore::new());
     let gateway_secrets = Arc::new(GatewaySecrets::new(secret_store.clone()));
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::new_scoped({
+        let gateway_secrets = gateway_secrets.clone();
+        move |workspace_id, provider_name| {
+            workspace_id
+                .and_then(|workspace_id| {
+                    gateway_secrets
+                        .get_workspace_provider_api_key(workspace_id, provider_name)
+                        .expect("test provider key lookup")
+                })
+                .unwrap_or_default()
+        }
+    }));
     let base_dir = unique_temp_dir(case_id);
     std::fs::create_dir_all(&base_dir).expect("create settings dir");
     let settings_path = base_dir.join("gateway-settings.toml");
     let processor = MessageProcessor::new(
         thread_manager,
-        test_provider(),
+        provider_registry,
         session_manager.clone(),
         workspace_manager.clone(),
         crud_store,
@@ -6036,12 +6071,9 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
         .map(|provider| provider.name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(provider_names, vec!["local", "openai", "openrouter"]);
-    assert!(
-        list_payload
-            .providers
-            .iter()
-            .all(|provider| provider.capabilities.embeddings)
-    );
+    // Capability projection must reflect the actual adapter. The injected
+    // OpenAI EchoProvider used by this handler test intentionally has no
+    // embedding implementation; API-key presence must not fabricate one.
     let local_provider = list_payload
         .providers
         .iter()
@@ -6301,7 +6333,8 @@ async fn provider_list_transcription_models_covers_success_and_validation_errors
 
     processor
         .provider_registry
-        .insert("echo", Arc::new(EchoProvider::new()));
+        .insert("echo", Arc::new(EchoProvider::new()))
+        .expect("echo provider should fit the bounded test registry");
     let unsupported_id =
         pioneer_protocol::RequestId::new(generate_test_request_id("tx", "unsupported"))
             .expect("valid unsupported request id");
@@ -6783,7 +6816,7 @@ async fn create_task_for_test(
                     .authority_fingerprint_for_workspace(
                         params.workspace_id.as_str(),
                         request.provider.as_str(),
-                    )
+                    )?
                     .as_str()
                     .to_owned(),
             );
@@ -19282,7 +19315,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         test_tool_loop_config(),
     ));
     let post_turn_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    install_test_hook_runtime(
+    install_recoverable_test_hook_runtime(
         &processor,
         task_post_turn_recording_hook_runtime(post_turn_calls.clone()),
     )
@@ -19423,10 +19456,14 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         }
         sleep(Duration::from_millis(10)).await;
     }
+    let terminal_effects = pioneer_entity::native_terminal_effect_outbox::Entity::find()
+        .all(&crud_store.database_connection())
+        .await
+        .expect("terminal effects should remain inspectable");
     assert_eq!(
         accepted_post_turn_calls.len(),
         1,
-        "the accepted final detached Task result must dispatch post-turn exactly once"
+        "the accepted final detached Task result must dispatch post-turn exactly once; terminal effects: {terminal_effects:#?}"
     );
     let accepted_post_turn = &accepted_post_turn_calls[0];
     assert_eq!(accepted_post_turn.phase, HookPhase::TurnPostTurn);
@@ -23516,8 +23553,12 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     .await;
     assert_eq!(responded.result["resolution"], json!("allow_once"));
 
+    const EXPECTED_COPY: &str = "approved direct Agent child\n";
     for _ in 0..200 {
-        if destination.is_file() {
+        if matches!(
+            std::fs::read_to_string(destination.as_path()),
+            Ok(contents) if contents == EXPECTED_COPY
+        ) {
             break;
         }
         sleep(Duration::from_millis(25)).await;
@@ -23525,7 +23566,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
     assert_eq!(
         std::fs::read_to_string(destination.as_path())
             .expect("approved direct Agent child side effect should exist"),
-        "approved direct Agent child\n"
+        EXPECTED_COPY
     );
 
     let child_security = crud_store
@@ -23976,7 +24017,9 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "parent",
         provider.clone(),
     ));
-    provider_registry.insert("echo", Arc::new(EchoProvider::new()));
+    provider_registry
+        .insert("echo", Arc::new(EchoProvider::new()))
+        .expect("echo provider should fit the bounded test registry");
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -25128,13 +25171,15 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             "parent",
             provider.clone(),
         ));
-        provider_registry.insert(
-            "delayed",
-            Arc::new(DelayedProvider {
-                delay: Duration::from_secs(10),
-                text: "slow child".to_owned(),
-            }),
-        );
+        provider_registry
+            .insert(
+                "delayed",
+                Arc::new(DelayedProvider {
+                    delay: Duration::from_secs(10),
+                    text: "slow child".to_owned(),
+                }),
+            )
+            .expect("delayed provider should fit the bounded test registry");
         let processor = Arc::new(MessageProcessor::new(
             thread_manager,
             provider_registry,
@@ -25344,13 +25389,15 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         "parent",
         provider.clone(),
     ));
-    provider_registry.insert(
-        "delayed",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(10),
-            text: "slow child".to_owned(),
-        }),
-    );
+    provider_registry
+        .insert(
+            "delayed",
+            Arc::new(DelayedProvider {
+                delay: Duration::from_secs(10),
+                text: "slow child".to_owned(),
+            }),
+        )
+        .expect("delayed provider should fit the bounded test registry");
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -31697,7 +31744,8 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
     let learning_provider = Arc::new(VerticalSelfImprovementProvider::new());
     harness
         .provider_registry
-        .insert("learning", learning_provider.clone());
+        .insert("learning", learning_provider.clone())
+        .expect("learning provider should fit the bounded test registry");
 
     let enable_id = generate_test_request_id("vertical", "enable");
     let connection_context = harness
@@ -31748,7 +31796,8 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
     ]));
     harness
         .provider_registry
-        .insert("source", source_provider.clone());
+        .insert("source", source_provider.clone())
+        .expect("source provider should fit the bounded test registry");
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
     let source_parent_thread_id = "thread_agent_skill_source";
@@ -31765,7 +31814,8 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
     let sibling_provider = Arc::new(VerticalUnfinishedSiblingProvider::new());
     harness
         .provider_registry
-        .insert("vertical-sibling", sibling_provider.clone());
+        .insert("vertical-sibling", sibling_provider.clone())
+        .expect("sibling provider should fit the bounded test registry");
     let sibling_turn_id = "turn_agent_skill_unfinished_sibling";
     let sibling_request_id = generate_test_request_id("vertical", "unfinished-sibling");
     Arc::clone(&harness.processor)
@@ -32045,7 +32095,8 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
     let native_provider = Arc::new(VerticalReadSkillProvider::new(skill_id.clone()));
     harness
         .provider_registry
-        .insert("native", native_provider.clone());
+        .insert("native", native_provider.clone())
+        .expect("native provider should fit the bounded test registry");
     seed_vertical_self_improvement_thread(
         &mut harness,
         "thread_native_agent_skill",
@@ -59519,7 +59570,9 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
         MemoryAgentE2eScript::ChatCapture,
     ));
     let provider_registry = memory_e2e_provider_registry();
-    provider_registry.insert("memory-chat", chat_provider.clone());
+    provider_registry
+        .insert("memory-chat", chat_provider.clone())
+        .expect("memory chat provider should fit the bounded test registry");
     let mut harness = setup_memory_agent_e2e_harness("chat_no_memory", provider_registry).await;
 
     let chat_thread_id = generate_test_request_id("thr", "memchatnomutate");
@@ -60717,7 +60770,10 @@ async fn wait_for_result_candidate_status(
     run_id: &str,
     expected_status: TaskResultCandidateStatus,
 ) -> TaskResultCandidate {
-    for _ in 0..100 {
+    // The full workspace harness runs many database-backed Gateway tests in
+    // parallel. Preserve a bounded deadline, but do not turn scheduler/SQLite
+    // contention into a 2.5-second false failure.
+    for _ in 0..1_200 {
         let candidates = crud_store
             .list_task_result_candidates(run_id)
             .await

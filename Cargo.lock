@@ -8517,6 +8517,7 @@ dependencies = [
  "pioneer-config",
  "pioneer-hooks",
  "pioneer-memory",
+ "pioneer-observability",
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",

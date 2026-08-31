@@ -20,6 +20,7 @@ mod member_handlers;
 mod memory_handlers;
 mod message_mutations;
 mod message_turn;
+mod native_health;
 mod notifications;
 mod patch_history_handlers;
 mod permission_handlers;
@@ -329,6 +330,10 @@ const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
 const AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS: i64 = 60 * 60;
 const AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE: u64 = 256;
+const NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+const NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
+const NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS: i64 = 60 * 60;
+const NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE: u64 = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MessageProcessorResilienceConfig {
@@ -363,24 +368,45 @@ where
     .await
 }
 
-fn record_resilience_worker_poll_error(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResilienceWorkerFailureImpact {
+    CriticalPoll,
+    Maintenance,
+}
+
+fn record_resilience_worker_error(
     operation: &'static str,
     error: &anyhow::Error,
-    transient_storage_poll_failed: &mut bool,
-) {
+    impact: ResilienceWorkerFailureImpact,
+) -> bool {
     if is_anyhow_sqlite_transient_access(error) {
-        *transient_storage_poll_failed = true;
         warn!(
             operation,
             error = %format!("{error:#}"),
             "resilience worker poll deferred by transient storage access failure"
         );
+        impact == ResilienceWorkerFailureImpact::CriticalPoll
     } else {
         error!(
             operation,
             error = %format!("{error:#}"),
             "resilience worker poll failed"
         );
+        false
+    }
+}
+
+fn record_resilience_worker_poll_error(
+    operation: &'static str,
+    error: &anyhow::Error,
+    transient_storage_poll_failed: &mut bool,
+) {
+    if record_resilience_worker_error(
+        operation,
+        error,
+        ResilienceWorkerFailureImpact::CriticalPoll,
+    ) {
+        *transient_storage_poll_failed = true;
     }
 }
 
@@ -450,7 +476,8 @@ pub struct MessageProcessor {
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
     summary_config: Arc<summary::SummaryConfig>,
     context_budget: ContextBudget,
-    agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
+    agent_listener_generation: Arc<AtomicU64>,
     agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
     agent_action_bindings:
         Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
@@ -490,6 +517,9 @@ pub struct MessageProcessor {
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
     native_turn_event_delivery_kick_running: Arc<AtomicBool>,
+    native_terminal_effect_kick_running: Arc<AtomicBool>,
+    native_terminal_effect_kick_pending: Arc<AtomicBool>,
+    native_lifecycle_readiness: Arc<native_health::NativeLifecycleReadinessState>,
     resilience_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     hook_recovery_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     task_event_listener_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -529,6 +559,12 @@ pub struct MessageProcessor {
     gateway_settings_update_lock: Arc<Mutex<()>>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
+}
+
+struct AgentListenerTask {
+    actor_generation: u64,
+    listener_generation: u64,
+    handle: JoinHandle<()>,
 }
 
 #[derive(Default)]
@@ -849,6 +885,7 @@ impl MessageProcessor {
             summary_config: Arc::new(summary_config),
             context_budget,
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
+            agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -876,6 +913,11 @@ impl MessageProcessor {
             timeout_supervisor,
             recovery_coordinator,
             native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
+            native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
+            native_lifecycle_readiness: Arc::new(
+                native_health::NativeLifecycleReadinessState::default(),
+            ),
             resilience_worker: Arc::new(Mutex::new(None)),
             hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),
@@ -2096,6 +2138,7 @@ impl MessageProcessor {
             ]);
             let mut next_skill_upload_cleanup = 0;
             let mut next_agent_action_ledger_compaction = 0;
+            let mut next_native_terminal_effect_purge = 0;
             loop {
                 let Some(this) = processor.upgrade() else {
                     break;
@@ -2225,6 +2268,44 @@ impl MessageProcessor {
                     continue;
                 }
 
+                if now >= next_native_terminal_effect_purge {
+                    next_native_terminal_effect_purge =
+                        now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
+                    match retry_transient_storage_access(|| {
+                        this.crud_store
+                            .purge_resolved_native_terminal_effects_before(
+                                now.saturating_sub(NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS),
+                                NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE,
+                            )
+                    })
+                    .await
+                    {
+                        Ok(purged) => {
+                            if purged > 0 {
+                                info!(purged, "purged retained native terminal effects");
+                            }
+                            if purged >= NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE {
+                                next_native_terminal_effect_purge = now;
+                            }
+                        }
+                        Err(error) => {
+                            next_native_terminal_effect_purge =
+                                now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS);
+                            // Retention is maintenance, not recovery authority.
+                            // Its failure must not defer terminalization,
+                            // timeout supervision, or either durable outbox.
+                            record_resilience_worker_error(
+                                "native terminal-effect retention",
+                                &error,
+                                ResilienceWorkerFailureImpact::Maintenance,
+                            );
+                        }
+                    }
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
                 if let Err(error) = retry_transient_storage_access(|| {
                     agent_action_tools::process_due_agent_action_outbox(&this, 64)
                 })
@@ -2239,6 +2320,11 @@ impl MessageProcessor {
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                     continue;
                 }
+
+                // Hook/cleanup handlers have their own bounded deadlines and
+                // must never block lease heartbeats, timeout recovery, or the
+                // rest of this global resilience control loop.
+                this.kick_native_terminal_effects();
 
                 match retry_transient_storage_access(|| {
                     this.poll_timeouts_respecting_human_wait(now, 64)
@@ -3845,6 +3931,7 @@ impl MessageProcessor {
                 response_reserve_tokens: 16_000,
             },
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
+            agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -3876,6 +3963,11 @@ impl MessageProcessor {
             timeout_supervisor,
             recovery_coordinator,
             native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
+            native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
+            native_lifecycle_readiness: Arc::new(
+                native_health::NativeLifecycleReadinessState::default(),
+            ),
             resilience_worker: Arc::new(Mutex::new(None)),
             hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),

@@ -201,6 +201,7 @@ pub struct HookRunAttemptCompletionRecord {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewHookAuditEventRecord {
+    pub id: Option<String>,
     pub hook_run_id: HookRunId,
     pub hook_run_attempt_id: Option<HookRunAttemptId>,
     pub subscription_id: HookSubscriptionId,
@@ -784,7 +785,24 @@ pub async fn append_hook_audit_events<C: ConnectionTrait>(
 ) -> Result<Vec<HookAuditEventRecord>> {
     let mut created = Vec::with_capacity(records.len());
     for record in records {
-        let id = generate_id(DB_ID_LEN);
+        let id = record.id.clone().unwrap_or_else(|| generate_id(DB_ID_LEN));
+        ensure!(
+            id.chars().count() == DB_ID_LEN,
+            "hook audit event id must contain exactly {DB_ID_LEN} characters"
+        );
+        if let Some(existing) = hook_audit_event::Entity::find_by_id(id.clone())
+            .one(db)
+            .await
+            .context("failed to inspect hook_audit_event idempotency identity")?
+        {
+            ensure!(
+                hook_audit_event_matches(&existing, &record)?,
+                "hook audit event identity `{id}` conflicts with an existing payload"
+            );
+            created.push(hook_audit_event_record_from_model(existing)?);
+            continue;
+        }
+
         let created_at = record.created_at.unwrap_or(now);
         let actor_kind = record
             .context
@@ -798,32 +816,83 @@ pub async fn append_hook_audit_events<C: ConnectionTrait>(
             .and_then(|actor| actor.id.as_ref())
             .map(|id| id.as_str().to_owned());
 
-        hook_audit_event::Entity::insert(hook_audit_event::ActiveModel {
+        let insert = hook_audit_event::Entity::insert(hook_audit_event::ActiveModel {
             id: Set(id.clone()),
-            hook_run_id: Set(record.hook_run_id.into_inner()),
-            hook_run_attempt_id: Set(record.hook_run_attempt_id.map(HookRunAttemptId::into_inner)),
-            subscription_id: Set(record.subscription_id.into_inner()),
-            hook_id: Set(record.hook_id.into_inner()),
+            hook_run_id: Set(record.hook_run_id.as_str().to_owned()),
+            hook_run_attempt_id: Set(record
+                .hook_run_attempt_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())),
+            subscription_id: Set(record.subscription_id.as_str().to_owned()),
+            hook_id: Set(record.hook_id.as_str().to_owned()),
             phase: Set(record.phase.as_str().to_owned()),
-            event_kind: Set(record.event_kind.into_inner()),
+            event_kind: Set(record.event_kind.as_str().to_owned()),
             contribution_hash: Set(record
                 .contribution_hash
-                .map(HookContributionHash::into_inner)),
-            workspace_id: Set(record.context.workspace_id.map(HookWorkspaceId::into_inner)),
-            thread_id: Set(record.context.thread_id.map(HookThreadId::into_inner)),
-            turn_id: Set(record.context.turn_id.map(HookTurnId::into_inner)),
-            task_id: Set(record.context.task_id.map(HookTaskId::into_inner)),
-            agent_id: Set(record.context.agent_id.map(HookAgentId::into_inner)),
+                .as_ref()
+                .map(|hash| hash.as_str().to_owned())),
+            workspace_id: Set(record
+                .context
+                .workspace_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())),
+            thread_id: Set(record
+                .context
+                .thread_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())),
+            turn_id: Set(record
+                .context
+                .turn_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())),
+            task_id: Set(record
+                .context
+                .task_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())),
+            agent_id: Set(record
+                .context
+                .agent_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())),
             actor_kind: Set(actor_kind),
             actor_id: Set(actor_id),
-            context_mode: Set(record.context.mode.map(|mode| mode.as_str().to_owned())),
+            context_mode: Set(record
+                .context
+                .mode
+                .as_ref()
+                .map(|mode| mode.as_str().to_owned())),
             safe_for_user: Set(record.safe_for_user),
             details_json: Set(serialize_hook_value(&record.details)?),
             created_at: Set(created_at),
         })
         .exec(db)
-        .await
-        .context("failed to insert hook_audit_event row")?;
+        .await;
+
+        if let Err(insert_error) = insert {
+            // Multiple Gateway processes may replay the same durable hook at
+            // once. A primary-key race is an idempotent success only when the
+            // winner persisted the exact same semantic contribution.
+            let raced = hook_audit_event::Entity::find_by_id(id.clone())
+                .one(db)
+                .await
+                .context("failed to reconcile hook_audit_event insert race")?;
+            match raced {
+                Some(existing) if hook_audit_event_matches(&existing, &record)? => {
+                    created.push(hook_audit_event_record_from_model(existing)?);
+                    continue;
+                }
+                Some(_) => {
+                    bail!(
+                        "hook audit event identity `{id}` collided with a different payload after insert race"
+                    );
+                }
+                None => {
+                    return Err(insert_error).context("failed to insert hook_audit_event row");
+                }
+            }
+        }
 
         let row = hook_audit_event::Entity::find_by_id(id)
             .one(db)
@@ -833,6 +902,48 @@ pub async fn append_hook_audit_events<C: ConnectionTrait>(
         created.push(hook_audit_event_record_from_model(row)?);
     }
     Ok(created)
+}
+
+fn hook_audit_event_matches(
+    row: &hook_audit_event::Model,
+    record: &NewHookAuditEventRecord,
+) -> Result<bool> {
+    let actor_kind = record
+        .context
+        .actor
+        .as_ref()
+        .map(|actor| actor.kind.as_str());
+    let actor_id = record
+        .context
+        .actor
+        .as_ref()
+        .and_then(|actor| actor.id.as_ref())
+        .map(|id| id.as_str());
+    Ok(row.hook_run_id == record.hook_run_id.as_str()
+        && row.subscription_id == record.subscription_id.as_str()
+        && row.hook_id == record.hook_id.as_str()
+        && row.phase == record.phase.as_str()
+        && row.event_kind == record.event_kind.as_str()
+        && row.contribution_hash.as_deref()
+            == record
+                .contribution_hash
+                .as_ref()
+                .map(HookContributionHash::as_str)
+        && row.workspace_id.as_deref()
+            == record
+                .context
+                .workspace_id
+                .as_ref()
+                .map(HookWorkspaceId::as_str)
+        && row.thread_id.as_deref() == record.context.thread_id.as_ref().map(HookThreadId::as_str)
+        && row.turn_id.as_deref() == record.context.turn_id.as_ref().map(HookTurnId::as_str)
+        && row.task_id.as_deref() == record.context.task_id.as_ref().map(HookTaskId::as_str)
+        && row.agent_id.as_deref() == record.context.agent_id.as_ref().map(HookAgentId::as_str)
+        && row.actor_kind.as_deref() == actor_kind
+        && row.actor_id.as_deref() == actor_id
+        && row.context_mode.as_deref() == record.context.mode.as_ref().map(|mode| mode.as_str())
+        && row.safe_for_user == record.safe_for_user
+        && row.details_json == serialize_hook_value(&record.details)?)
 }
 
 pub async fn list_hook_audit_events_for_run<C: ConnectionTrait>(

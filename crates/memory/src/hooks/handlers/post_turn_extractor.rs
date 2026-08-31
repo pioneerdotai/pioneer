@@ -21,12 +21,17 @@ impl HookHandler for MemoryPostTurnExtractorHook {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        memory_post_turn_extractor_capabilities(self.extractor_provider.is_some())
+        memory_post_turn_extractor_capabilities(
+            &self.config,
+            self.write_provider.is_some(),
+            self.extractor_provider.is_some(),
+        )
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
         let input = turn_post_turn_input(&request)?;
         let config = self.config.normalized();
+        let durable_terminal_effect = memory_durable_terminal_effect_claim(&request.context)?;
         let mut response = HookHandlerResponse::default();
 
         let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
@@ -71,6 +76,12 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         }
 
         let Some(write_provider) = self.write_provider.as_ref() else {
+            if durable_terminal_effect.is_some() {
+                return Err(memory_retryable_safe_hook_error(
+                    "memory.post_turn_extractor.write_provider_unavailable",
+                    "memory post-turn extractor write provider is unavailable",
+                ));
+            }
             response
                 .diagnostics
                 .push(memory_post_turn_provider_skip_diagnostic(
@@ -80,6 +91,12 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             return Ok(response);
         };
         let Some(extractor_provider) = self.extractor_provider.as_ref() else {
+            if durable_terminal_effect.is_some() {
+                return Err(memory_retryable_safe_hook_error(
+                    "memory.post_turn_extractor.provider_unavailable",
+                    "memory post-turn extractor provider is unavailable",
+                ));
+            }
             response
                 .diagnostics
                 .push(memory_post_turn_provider_skip_diagnostic(
@@ -103,6 +120,12 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         {
             Ok(manifest) => manifest,
             Err(_) => {
+                if durable_terminal_effect.is_some() {
+                    return Err(memory_retryable_safe_hook_error(
+                        "memory.post_turn_extractor.manifest_failed",
+                        "memory post-turn extractor manifest loading failed",
+                    ));
+                }
                 response
                     .diagnostics
                     .push(memory_post_turn_provider_skip_diagnostic(
@@ -120,6 +143,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 .provider_name
                 .clone()
                 .or_else(|| input.model_provider.clone()),
+            durable_terminal_effect.clone(),
         );
         let extractor_request =
             memory_post_turn_extractor_request_from_input(input, manifest, &config);
@@ -141,6 +165,12 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 ));
             }
             Err(MemoryPostTurnExtractorFailure::InvalidJson(error)) => {
+                if durable_terminal_effect.is_some() {
+                    return Err(memory_hook_error(
+                        "memory.post_turn_extractor.invalid_json",
+                        format!("memory post-turn extractor returned invalid JSON: {error}"),
+                    ));
+                }
                 response.diagnostics.push(memory_safe_warning_diagnostic(
                     "memory.post_turn_extractor.invalid_json",
                     format!("memory post-turn extractor returned invalid JSON: {error}"),
@@ -199,6 +229,13 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                     ));
                 }
             }
+        }
+
+        if durable_terminal_effect.is_some() && stats.write_failure_count > 0 {
+            return Err(memory_retryable_safe_hook_error(
+                "memory.post_turn_extractor.write_failed",
+                "memory post-turn extractor failed to persist one or more semantic writes",
+            ));
         }
 
         response
