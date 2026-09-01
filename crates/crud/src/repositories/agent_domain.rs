@@ -2244,15 +2244,12 @@ pub async fn insert_agent_execution_grant<C: ConnectionTrait>(
     let (identity, profile, child_launch_grant) =
         parse_agent_execution_launch_grant(input.grant_json.as_str())?;
     if input.grant_fingerprint != agent_execution_grant_fingerprint(input.grant_json.as_str())?
-        || identity.id.as_str() != input.child_identity_id
-        || !child_launch_grant
-            .identities
-            .iter()
-            .any(|candidate| candidate == &identity)
-        || !child_launch_grant
-            .profiles
-            .iter()
-            .any(|candidate| candidate == &profile)
+        || !agent_execution_launch_grant_matches_child_identity(
+            &identity,
+            &profile,
+            &child_launch_grant,
+            input.child_identity_id.as_str(),
+        )
     {
         bail!("agent execution grant identity/profile is outside its child launch ceiling");
     }
@@ -2278,6 +2275,8 @@ pub async fn insert_agent_execution_grant<C: ConnectionTrait>(
         .await
         .context("failed to reload agent execution grant")?
         .context("agent execution grant disappeared after idempotent insert")?;
+    let grant = upgrade_agent_execution_grant_model_to_current(grant)
+        .context("failed to upcast reloaded agent execution grant")?;
     if grant.execution_id != input.execution_id
         || grant.parent_execution_id != input.parent_execution_id
         || grant.child_identity_id != input.child_identity_id
@@ -2298,6 +2297,62 @@ pub fn agent_execution_grant_fingerprint(grant_json: &str) -> Result<String> {
     digest.update(b"pioneer:agent-runtime:execution-grant:v1\0");
     digest.update(canonical);
     Ok(hex::encode(digest.finalize()))
+}
+
+/// Verifies an immutable AgentExecution grant in its stored representation,
+/// then upcasts only its embedded child-launch ceiling for current readers.
+/// The returned model is an in-memory projection; background maintenance owns
+/// durable rewrites so ordinary reads never acquire a write dependency.
+pub fn upgrade_agent_execution_grant_model_to_current(
+    mut grant: agent_execution_grant::Model,
+) -> Result<agent_execution_grant::Model> {
+    let stored_fingerprint = agent_execution_grant_fingerprint(grant.grant_json.as_str())?;
+    if grant.grant_fingerprint != stored_fingerprint {
+        bail!("agent execution grant fingerprint does not match its stored JSON");
+    }
+
+    let migrated = pioneer_protocol::migrate_embedded_child_launch_grant_json_to_current(
+        grant.grant_json.as_str(),
+    )
+    .context("failed to upcast agent execution child launch ceiling")?;
+    let (identity, profile, child_launch_grant) =
+        parse_agent_execution_launch_grant(migrated.as_str())?;
+    if !agent_execution_launch_grant_matches_child_identity(
+        &identity,
+        &profile,
+        &child_launch_grant,
+        grant.child_identity_id.as_str(),
+    ) {
+        bail!("agent execution grant identity/profile is outside its child launch ceiling");
+    }
+
+    if migrated != grant.grant_json {
+        grant.grant_fingerprint = agent_execution_grant_fingerprint(migrated.as_str())?;
+        grant.grant_json = migrated;
+    }
+    Ok(grant)
+}
+
+fn agent_execution_launch_grant_matches_child_identity(
+    identity: &pioneer_protocol::AgentIdentityProjection,
+    profile: &pioneer_protocol::AgentExecutionProfileProjection,
+    child_launch_grant: &pioneer_protocol::ChildAgentLaunchGrantSet,
+    child_identity_id: &str,
+) -> bool {
+    identity.id.as_str() == child_identity_id
+        && child_launch_grant
+            .identities
+            .iter()
+            .any(|candidate| candidate == identity)
+        && child_launch_grant
+            .profiles
+            .iter()
+            .any(|candidate| candidate == profile)
+        && (identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral
+            || profile
+                .compatible_agent_identity_ids
+                .iter()
+                .any(|candidate| candidate == &identity.id))
 }
 
 fn parse_agent_execution_launch_grant(
@@ -2344,7 +2399,10 @@ pub async fn load_agent_execution_grant<C: ConnectionTrait>(
         .filter(agent_execution_grant::Column::ExecutionId.eq(execution_id.to_owned()))
         .one(db)
         .await
-        .context("failed to load agent execution grant")
+        .context("failed to load agent execution grant")?
+        .map(upgrade_agent_execution_grant_model_to_current)
+        .transpose()
+        .context("failed to upcast loaded agent execution grant")
 }
 
 pub async fn insert_agent_turn_response<C: ConnectionTrait>(
@@ -4095,6 +4153,11 @@ async fn revalidate_agent_receipt_authority(
         .all(db)
         .await
         .context("failed to revalidate Agent action execution grant")?;
+    let grants = grants
+        .into_iter()
+        .map(upgrade_agent_execution_grant_model_to_current)
+        .collect::<Result<Vec<_>>>()
+        .context("failed to upcast Agent action execution grant")?;
     if grants.len() != 1 {
         bail!("Agent action execution must own one exact immutable grant");
     }
@@ -6831,6 +6894,101 @@ mod tests {
     use super::*;
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, DatabaseBackend, TransactionTrait};
+
+    fn version_one_child_launch_grant() -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "identities": [{
+                "id": "A00000000000000000001",
+                "source_kind": "native_agent",
+                "display_name": "Pioneer",
+                "nickname": "pioneer",
+                "source_revision": 3,
+                "source_fingerprint": "generation-a"
+            }],
+            "allowInheritParentIdentity": false,
+            "allowServerDerivedEphemeral": false,
+            "profiles": [{
+                "id": "P00000000000000000003",
+                "compatibleAgentIdentityIds": ["A00000000000000000001"],
+                "backend": "api_provider",
+                "providerId": "provider-opaque",
+                "modelId": "model-opaque",
+                "providerDisplayName": "Provider",
+                "modelDisplayName": "Model",
+                "allowedReasoning": [{ "effort": "medium" }],
+                "allowedPermissionProfiles": ["full_access"],
+                "catalogGeneration": 4,
+                "policyGeneration": 5,
+                "fingerprint": "profile-fingerprint"
+            }],
+            "allowInheritParentProfile": false,
+            "skillIds": [],
+            "mcpServerIds": [],
+            "maxPermissionProfile": {
+                "mode": "supervised",
+                "effective_policy": {
+                    "default_behavior": "ask",
+                    "file_read": "allow",
+                    "file_write": "ask",
+                    "shell_command": "ask",
+                    "network": "ask",
+                    "mcp_read": "allow",
+                    "mcp_write_or_unknown": "ask",
+                    "dynamic_skill_tool": "ask",
+                    "computer_use": "ask",
+                    "task_subagent": "ask"
+                }
+            },
+            "maxReasoning": { "allowed": [{ "effort": "medium" }] },
+            "fingerprint": "fc747ed91c91bd27b7ed9378961fedb2c57de5eba831ae5bfd5e3745e29e0af3"
+        })
+    }
+
+    #[test]
+    fn execution_grant_read_projection_verifies_v1_before_upcasting_and_rehashing_outer_json() {
+        let child = version_one_child_launch_grant();
+        let grant_json = serde_json::json!({
+            "kind": "test",
+            "identity": child["identities"][0].clone(),
+            "profile": child["profiles"][0].clone(),
+            "child_launch_grant": child
+        })
+        .to_string();
+        let stored_fingerprint =
+            agent_execution_grant_fingerprint(grant_json.as_str()).expect("stored fingerprint");
+        let model = agent_execution_grant::Model {
+            id: "G00000000000000000001".to_owned(),
+            execution_id: "E00000000000000000001".to_owned(),
+            parent_execution_id: None,
+            child_identity_id: "A00000000000000000001".to_owned(),
+            grant_fingerprint: stored_fingerprint.clone(),
+            grant_json,
+            created_at: utc_now(),
+        };
+
+        let upgraded = upgrade_agent_execution_grant_model_to_current(model.clone())
+            .expect("valid version 1 grant should upcast");
+        let upgraded_json: serde_json::Value =
+            serde_json::from_str(upgraded.grant_json.as_str()).expect("upgraded grant JSON");
+        assert_eq!(
+            upgraded_json["child_launch_grant"]["version"],
+            serde_json::json!(2)
+        );
+        assert_ne!(upgraded.grant_json, model.grant_json);
+        assert_ne!(upgraded.grant_fingerprint, stored_fingerprint);
+        assert_eq!(
+            upgraded.grant_fingerprint,
+            agent_execution_grant_fingerprint(upgraded.grant_json.as_str())
+                .expect("upgraded outer fingerprint")
+        );
+
+        let mut tampered = model;
+        tampered.grant_json = tampered
+            .grant_json
+            .replace("model-opaque", "tampered-model");
+        assert!(upgrade_agent_execution_grant_model_to_current(tampered).is_err());
+    }
 
     #[test]
     fn nickname_rules_are_explicit_and_lowercase() {

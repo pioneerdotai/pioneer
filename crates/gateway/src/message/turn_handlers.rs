@@ -2154,7 +2154,7 @@ impl MessageProcessor {
                             return None;
                         }
                     };
-                let (canonical_launch, resolved_launch) =
+                let (mut canonical_launch, resolved_launch) =
                     match super::agent_action_tools::resolve_workspace_task_launch(
                         self,
                         thread.workspace_id.as_str(),
@@ -2177,6 +2177,18 @@ impl MessageProcessor {
                             return None;
                         }
                     };
+                if let Err(error) = super::agent_action_tools::pin_launch_selection_capabilities(
+                    &mut canonical_launch,
+                    outcome.materialization.capabilities.as_slice(),
+                ) {
+                    self.mark_turn_blocked(
+                        thread.id.clone(),
+                        launch.turn_id.clone(),
+                        format!("failed to freeze Composer Task capabilities: {error:#}"),
+                    )
+                    .await;
+                    return None;
+                }
                 task_params.launch = Some(canonical_launch.clone());
                 let agent_authorization_grant = match resolved_launch.as_ref() {
                     Some((identity, profile)) => {

@@ -8684,7 +8684,7 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
                     pack_member_key: Some("first".to_owned()),
                 },
                 SkillInstallationRecord {
-                    skill_id: second_skill_id,
+                    skill_id: second_skill_id.clone(),
                     owner: Some("tests".to_owned()),
                     slug: "pack-second".to_owned(),
                     version: None,
@@ -8817,6 +8817,21 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
             ..
         }] if actual_pack_id == &pack_id
     ));
+    let actor_contract = processor
+        .crud_store
+        .get_task_actor_contract(task.id.as_str())
+        .await
+        .expect("Composer Task actor contract should load")
+        .expect("Composer Task actor contract should be durable");
+    let actor_launch = actor_contract
+        .launch
+        .expect("Composer Task actor launch should be durable");
+    assert_eq!(
+        actor_launch.execution.skill_ids,
+        vec![first_skill_id, second_skill_id],
+        "the durable Native Task launch must pin every Skill expanded from the Composer pack"
+    );
+    assert!(actor_launch.execution.mcp_server_ids.is_empty());
 
     let parent = thread_manager
         .thread_get(parent_thread_id)
@@ -20287,22 +20302,9 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             format!("{runtime_id}-attachment.txt").as_str(),
         )
         .await;
-        let mut exact_cli_launch = exact_cli_task_launch_for_test(
-            processor.as_ref(),
-            workspace_id.as_str(),
-            format!("cli_runtime:{runtime_id}").as_str(),
-            model,
-            runtime_id,
-        )
-        .await
-        .expect("dynamic CLI Composer should resolve an exact server-owned launch");
-        exact_cli_launch.execution.permission_profile =
-            Some(pioneer_protocol::TurnPermissionProfileSelection::full_access());
-        exact_cli_launch.execution.mcp_server_ids =
-            vec![pioneer_protocol::mcp_server_capability_key(
-                McpScopeKind::Workspace,
-                "resend",
-            )];
+        sync_test_cli_runtime_identities(processor.as_ref())
+            .await
+            .expect("dynamic CLI Composer identities should be durable");
         let launch = pioneer_protocol::TurnStartParams {
             agent_delegation_routes: Vec::new(),
             thread_id: parent_thread_id.clone(),
@@ -20334,7 +20336,9 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 SandboxMode::FullAccess,
             )),
             mode: Some(ThreadMode::Agent),
-            agent_launch: Some(exact_cli_launch),
+            // Exercise the ordinary Composer shape: the backend identifies the
+            // CLI runtime while the Gateway freezes the canonical actor launch.
+            agent_launch: None,
             reply_to_turn_id: None,
             mentioned_principal_ids: Vec::new(),
             execution_backend: Some(AgentExecutionBackend::CLIAgentRuntime {
@@ -20446,6 +20450,23 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 .and_then(|work| work.launch.model_provider.as_deref()),
             None,
             "the exact shell launch snapshot should retain its absent provider claim"
+        );
+        let actor_contract = crud_store
+            .get_task_actor_contract(task_response.task.id.as_str())
+            .await
+            .expect("dynamic CLI Composer actor contract should load")
+            .expect("dynamic CLI Composer actor contract should be durable");
+        let actor_launch = actor_contract
+            .launch
+            .expect("dynamic CLI Composer actor launch should be durable");
+        assert!(actor_launch.execution.skill_ids.is_empty());
+        assert_eq!(
+            actor_launch.execution.mcp_server_ids,
+            vec![pioneer_protocol::mcp_server_capability_key(
+                McpScopeKind::Workspace,
+                "resend",
+            )],
+            "the durable {runtime_id} Task launch must pin the Composer MCP server"
         );
         let run = task_response
             .runs

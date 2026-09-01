@@ -11,6 +11,9 @@ use crate::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+const TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES: usize = 131_072;
 
 fn validate_task_route_receipt(
     receipt_json: &str,
@@ -68,8 +71,71 @@ pub enum TaskDerivedChildLaunchGrant {
     },
 }
 
+/// Migrates the nested child-launch contract through every registered adjacent
+/// version and returns a JSON document that current runtime code can consume.
+pub fn migrate_task_derived_child_launch_grant_json_to_current(
+    json: &str,
+) -> Result<String, TaskDerivedChildLaunchGrantMigrationError> {
+    if json.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
+        return Err(
+            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!(
+                "task launch contract exceeds {} bytes",
+                TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES
+            )),
+        );
+    }
+    let migrated = crate::migrate_embedded_child_launch_grant_json_to_current(json)
+        .map_err(TaskDerivedChildLaunchGrantMigrationError::ChildGrant)?;
+    let current =
+        serde_json::from_str::<TaskDerivedChildLaunchGrant>(&migrated).map_err(|error| {
+            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
+        })?;
+    current.validate_embedded().map_err(|error| {
+        TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!("{error:?}"))
+    })?;
+    // Task actor contracts compare their immutable JSON on idempotent insert.
+    // Re-encode through the current typed outer contract so an upcast V1 row
+    // has exactly the same representation as a newly produced V2 row. The
+    // generic embedded migrator cannot do this because AgentExecution grants
+    // intentionally have a different, open outer document.
+    let encoded = serde_json::to_string(&current).map_err(|error| {
+        TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
+    })?;
+    if encoded.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
+        return Err(
+            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!(
+                "migrated task launch contract exceeds {} bytes",
+                TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES
+            )),
+        );
+    }
+    Ok(encoded)
+}
+
+#[derive(Debug)]
+pub enum TaskDerivedChildLaunchGrantMigrationError {
+    ChildGrant(crate::ChildAgentLaunchGrantMigrationError),
+    InvalidCurrentContract(String),
+}
+
+impl fmt::Display for TaskDerivedChildLaunchGrantMigrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChildGrant(error) => write!(formatter, "{error}"),
+            Self::InvalidCurrentContract(message) => {
+                write!(
+                    formatter,
+                    "invalid migrated task launch contract: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaskDerivedChildLaunchGrantMigrationError {}
+
 impl TaskDerivedChildLaunchGrant {
-    fn validate_for(&self, contract: &TaskActorContract) -> Result<(), TaskActorContractError> {
+    fn validate_embedded(&self) -> Result<(), TaskActorContractError> {
         let Self::ResolvedTaskLaunch {
             identity,
             profile,
@@ -79,18 +145,6 @@ impl TaskDerivedChildLaunchGrant {
             agent_authorization_fingerprint,
             child_launch_grant,
         } = self;
-        if contract.resolved_identity_id.as_deref() != Some(identity.id.as_str())
-            || contract.resolved_profile_id.as_deref() != Some(profile.id.as_str())
-            || contract.source_config_fingerprint.as_deref()
-                != Some(identity.source_fingerprint.as_str())
-            || (identity.source_kind != crate::AgentIdentitySourceKind::Ephemeral
-                && !profile
-                    .compatible_agent_identity_ids
-                    .iter()
-                    .any(|candidate| candidate == &identity.id))
-        {
-            return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
-        }
         if role_key.trim().is_empty()
             || *agent_policy_generation == 0
             || allowed_actions.is_empty()
@@ -112,9 +166,42 @@ impl TaskDerivedChildLaunchGrant {
                 .profiles
                 .iter()
                 .any(|candidate| candidate == profile)
+            || (identity.source_kind != crate::AgentIdentitySourceKind::Ephemeral
+                && !profile
+                    .compatible_agent_identity_ids
+                    .iter()
+                    .any(|candidate| candidate == &identity.id))
         {
             return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
         }
+        let mut unique_actions = allowed_actions.clone();
+        unique_actions.sort();
+        unique_actions.dedup();
+        if unique_actions != *allowed_actions
+            || allowed_actions
+                .iter()
+                .any(|action| action.trim().is_empty())
+        {
+            return Err(TaskActorContractError::InvalidResolvedLaunchGrant);
+        }
+        Ok(())
+    }
+
+    fn validate_for(&self, contract: &TaskActorContract) -> Result<(), TaskActorContractError> {
+        let Self::ResolvedTaskLaunch {
+            identity,
+            profile,
+            child_launch_grant,
+            ..
+        } = self;
+        if contract.resolved_identity_id.as_deref() != Some(identity.id.as_str())
+            || contract.resolved_profile_id.as_deref() != Some(profile.id.as_str())
+            || contract.source_config_fingerprint.as_deref()
+                != Some(identity.source_fingerprint.as_str())
+        {
+            return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
+        }
+        self.validate_embedded()?;
         let launch = contract
             .launch
             .as_ref()
@@ -177,16 +264,6 @@ impl TaskDerivedChildLaunchGrant {
                 .any(|id| !child_launch_grant.mcp_server_ids.contains(id))
         {
             return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
-        }
-        let mut unique_actions = allowed_actions.clone();
-        unique_actions.sort();
-        unique_actions.dedup();
-        if unique_actions != *allowed_actions
-            || allowed_actions
-                .iter()
-                .any(|action| action.trim().is_empty())
-        {
-            return Err(TaskActorContractError::InvalidResolvedLaunchGrant);
         }
         Ok(())
     }
@@ -450,7 +527,7 @@ impl TaskActorContract {
             return Err(TaskActorContractError::IncompleteResolvedLaunch);
         }
         if let Some(grant_json) = self.derived_child_launch_grant_json.as_deref() {
-            if grant_json.len() > 131_072 {
+            if grant_json.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
                 return Err(TaskActorContractError::OversizedField(
                     "derived_child_launch_grant_json",
                 ));

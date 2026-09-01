@@ -154,6 +154,138 @@ impl TaskScheduler {
         Ok(created)
     }
 
+    pub(crate) async fn process_queued_run_once(&self, run: TaskRun) -> TaskRuntimeResult<bool> {
+        // This boundary is used only for the freshly committed immediate run.
+        // Do not queue the caller behind an unrelated global due sweep. A
+        // concurrent scheduler wake is safe: claim_task_run_for_dispatch is
+        // the per-run CAS and exactly one contender can own the dispatch.
+        self.process_queued_run(run).await
+    }
+
+    async fn load_due_task_actor_contract(
+        &self,
+        trigger: &TaskTrigger,
+        now: i64,
+    ) -> TaskRuntimeResult<Option<pioneer_protocol::TaskActorContract>> {
+        match self
+            .store
+            .get_task_actor_contract(trigger.task_id.as_str())
+            .await
+        {
+            Ok(Some(contract)) => Ok(Some(contract)),
+            Ok(None) => {
+                let error =
+                    anyhow::anyhow!("Task `{}` has no durable actor contract", trigger.task_id);
+                self.block_task_for_trigger_failure(trigger, now, &error)
+                    .await?;
+                Ok(None)
+            }
+            Err(error) if is_transient_scheduler_storage_error(&error) => Err(error),
+            Err(error) => {
+                // Contract decoding, fingerprint verification and version
+                // migration all happen before a Run is materialized. A bad
+                // immutable row therefore belongs to this Task and can be
+                // isolated without changing the retry semantics of later
+                // storage or dispatch failures.
+                self.block_task_for_trigger_failure(trigger, now, &error)
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn block_task_for_trigger_failure(
+        &self,
+        trigger: &TaskTrigger,
+        now: i64,
+        error: &anyhow::Error,
+    ) -> TaskRuntimeResult<()> {
+        let message = format!("{error:#}");
+        let Some(expected_next_fire_at) = trigger.next_fire_at else {
+            return Ok(());
+        };
+        let appended = match self
+            .store
+            .append_due_trigger_task_events(
+                trigger.id.as_str(),
+                expected_next_fire_at,
+                now,
+                vec![TaskEventPayload::TaskBlocked {
+                    task_id: trigger.task_id.clone(),
+                    error: Some(task_error(
+                        "task_actor_contract_invalid",
+                        message.clone(),
+                        TaskErrorClass::Validation,
+                        None,
+                    )),
+                    blocked_at: now,
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+        {
+            Ok(appended) => appended,
+            Err(append_error) if is_transient_scheduler_storage_error(&append_error) => {
+                return Err(append_error);
+            }
+            Err(append_error) => {
+                // A terminal transition can win after process_trigger read the
+                // Task but before this isolation transaction starts. The
+                // terminal event deliberately owns the same idempotency slot,
+                // so reconcile that newer state instead of turning a harmless
+                // race into a scheduler-wide failure.
+                if let Some(reconciliation) = self
+                    .store
+                    .reconcile_due_trigger_for_nonexecuting_task(
+                        trigger.id.as_str(),
+                        expected_next_fire_at,
+                        now,
+                    )
+                    .await?
+                {
+                    self.event_bus
+                        .publish_many(reconciliation.appended_events)
+                        .await;
+                    debug!(
+                        task_id = %trigger.task_id,
+                        trigger_id = %trigger.id,
+                        error = %message,
+                        task_status = ?reconciliation.task_status,
+                        trigger_status = ?reconciliation.trigger_status,
+                        failure_class = "task_scheduler_trigger_failure_terminal_race",
+                        "a concurrent terminal Task transition superseded trigger isolation"
+                    );
+                    return Ok(());
+                }
+                return Err(append_error);
+            }
+        };
+        if appended.is_empty() {
+            // The same transaction that appends TaskBlocked also verifies the
+            // original due timestamp. If another actor already advanced or
+            // replaced the trigger, that newer state wins and must not be
+            // overwritten by this stale failure.
+            debug!(
+                task_id = %trigger.task_id,
+                trigger_id = %trigger.id,
+                error = %message,
+                failure_class = "task_scheduler_trigger_failure_superseded",
+                "did not block a Task because its due trigger changed concurrently"
+            );
+            return Ok(());
+        }
+        self.event_bus.publish_many(appended).await;
+        warn!(
+            task_id = %trigger.task_id,
+            trigger_id = %trigger.id,
+            error = %message,
+            failure_class = "task_scheduler_trigger_isolated",
+            "blocked a Task whose durable trigger could not be processed"
+        );
+        Ok(())
+    }
+
     async fn rebuild_due_queue(&self) -> TaskRuntimeResult<()> {
         let mut items = self
             .store
@@ -250,6 +382,16 @@ impl TaskScheduler {
         }) {
             return Ok(0);
         }
+        // Authenticate and upcast the immutable Task-owned contract before
+        // calculating or materializing any new occurrence. The completed
+        // one-shot guard above deliberately runs first: a stale trigger that
+        // cannot create another occurrence must not reclassify its Task only
+        // because an otherwise-unused historical contract is unreadable.
+        // Everything after this boundary keeps the scheduler's existing
+        // storage/dispatch retry semantics.
+        let Some(actor_contract) = self.load_due_task_actor_contract(&trigger, now).await? else {
+            return Ok(0);
+        };
         let active_run_count = task_response
             .runs
             .iter()
@@ -268,7 +410,7 @@ impl TaskScheduler {
             // recurring fire from disappearing merely because a sibling is
             // still running.
             return self
-                .enqueue_saturated_occurrence(task_response, trigger, now)
+                .enqueue_saturated_occurrence(task_response, trigger, &actor_contract, now)
                 .await;
         }
 
@@ -371,16 +513,6 @@ impl TaskScheduler {
             .iter()
             .map(|run| (run.id.clone(), run.executor_kind))
             .collect::<Vec<_>>();
-        let actor_contract = self
-            .store
-            .get_task_actor_contract(task_response.task.id.as_str())
-            .await?
-            .with_context(|| {
-                format!(
-                    "Task `{}` has no durable actor contract",
-                    task_response.task.id
-                )
-            })?;
         let mut occurrence_contracts = Vec::with_capacity(runs.len());
         for run in &runs {
             occurrence_contracts.push(build_occurrence_contract(
@@ -424,6 +556,7 @@ impl TaskScheduler {
         &self,
         task_response: pioneer_protocol::TaskGetResponse,
         trigger: TaskTrigger,
+        actor_contract: &pioneer_protocol::TaskActorContract,
         now: i64,
     ) -> TaskRuntimeResult<usize> {
         let expected_next_fire_at = trigger.next_fire_at.unwrap_or(now);
@@ -534,19 +667,9 @@ impl TaskScheduler {
             .store
             .next_task_occurrence_execution_generation(task_response.task.id.as_str())
             .await?;
-        let actor_contract = self
-            .store
-            .get_task_actor_contract(task_response.task.id.as_str())
-            .await?
-            .with_context(|| {
-                format!(
-                    "Task `{}` has no durable actor contract",
-                    task_response.task.id
-                )
-            })?;
         let occurrence = build_occurrence_contract(
             &task_response.task,
-            &actor_contract,
+            actor_contract,
             run.id.as_str(),
             Some(trigger.id.as_str()),
             format!("{}:{}", trigger.id, run.run_number),

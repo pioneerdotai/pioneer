@@ -862,6 +862,58 @@ pub(crate) async fn resolve_workspace_task_launch(
     Ok((canonical, Some((identity, profile))))
 }
 
+/// Freeze the already normalized Turn capability set into the durable Task
+/// launch selection. Composer keeps its presentation payload separately, but
+/// the actor contract must carry the exact execution IDs used by both API and
+/// CLI Agent backends.
+pub(crate) fn pin_launch_selection_capabilities(
+    launch: &mut pioneer_protocol::AgentLaunchSelection,
+    capabilities: &[pioneer_protocol::TurnCapability],
+) -> anyhow::Result<()> {
+    use pioneer_protocol::TurnCapabilityKind;
+
+    let mut skill_ids = Vec::new();
+    let mut mcp_server_ids = Vec::new();
+    for capability in capabilities {
+        match &capability.kind {
+            TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                if pack_id.is_some() {
+                    anyhow::bail!(
+                        "normalized Task launch capability retains Skill pack membership"
+                    );
+                }
+                if skill_ids.iter().any(|selected| selected == skill_id) {
+                    anyhow::bail!("normalized Task launch contains duplicate Skill `{skill_id}`");
+                }
+                skill_ids.push(skill_id.clone());
+            }
+            TurnCapabilityKind::SkillPack { .. } => {
+                anyhow::bail!("normalized Task launch contains an unexpanded Skill pack");
+            }
+            TurnCapabilityKind::McpServer { name, scope_kind } => {
+                let capability_id = pioneer_protocol::mcp_server_capability_key(*scope_kind, name);
+                if !mcp_server_ids.contains(&capability_id) {
+                    mcp_server_ids.push(capability_id);
+                }
+            }
+            TurnCapabilityKind::McpTool {
+                server_name,
+                scope_kind,
+                ..
+            } => {
+                let capability_id =
+                    pioneer_protocol::mcp_server_capability_key(*scope_kind, server_name);
+                if !mcp_server_ids.contains(&capability_id) {
+                    mcp_server_ids.push(capability_id);
+                }
+            }
+        }
+    }
+    launch.execution.skill_ids = skill_ids;
+    launch.execution.mcp_server_ids = mcp_server_ids;
+    Ok(())
+}
+
 /// Compile the capability portion of the common agent domain launch contract
 /// into the canonical Turn representation. The selection carries stable
 /// Skill IDs and canonical MCP server capability IDs; labels and runtime
