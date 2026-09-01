@@ -383,7 +383,7 @@ struct CachedOpenRouterEmbeddingModel {
 impl StoreThreadEpisodicIndexPayloadProvider {
     pub(crate) fn new(crud_store: Arc<CrudStore>, storage_uri_root: impl Into<String>) -> Self {
         Self {
-            crud_store,
+            crud_store: Arc::new(crud_store.with_maintenance_access()),
             storage_uri_root: storage_uri_root.into(),
         }
     }
@@ -411,7 +411,7 @@ impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
         Self {
             inner,
             embedding_provider_resolver,
-            crud_store,
+            crud_store: Arc::new(crud_store.with_maintenance_access()),
             artifact_locks: StdMutex::new(BTreeMap::new()),
         }
     }
@@ -3108,7 +3108,9 @@ impl ThreadEpisodicIndexExecutor {
         payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
     ) -> Self {
         Self {
-            crud_store,
+            // Index discovery and projection are always background work,
+            // regardless of which runtime event wakes this executor.
+            crud_store: Arc::new(crud_store.with_maintenance_access()),
             backend,
             payload_provider,
             config: StdRwLock::new(ThreadEpisodicIndexExecutorConfig::default()),

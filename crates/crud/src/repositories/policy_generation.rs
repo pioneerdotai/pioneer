@@ -3,7 +3,7 @@ use pioneer_protocol::{
     AuthorizationChangeKind, AuthorizationChangeScope, AuthorizationProjectionChangedNotification,
     PolicyGeneration,
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionSession, TransactionTrait};
 
 const STATE_ROW: &str = "SELECT generation, code_policy_fingerprint FROM authorization_policy_state WHERE singleton_id = 1";
 
@@ -28,7 +28,7 @@ pub async fn ensure_code_policy_generation<D>(
     fingerprint: &str,
 ) -> Result<AuthorizationProjectionChangedNotification>
 where
-    D: TransactionTrait<Transaction = DatabaseTransaction>,
+    D: TransactionTrait,
 {
     if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("authorization policy fingerprint must be a SHA-256 hex digest");
@@ -78,7 +78,7 @@ pub async fn append_authorization_change<D>(
     affected: AuthorizationChangeScope,
 ) -> Result<AuthorizationProjectionChangedNotification>
 where
-    D: TransactionTrait<Transaction = DatabaseTransaction>,
+    D: TransactionTrait,
 {
     let transaction = db
         .begin()

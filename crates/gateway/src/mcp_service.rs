@@ -429,9 +429,21 @@ impl McpService {
     }
 
     pub(crate) async fn reload_workspace(&self, workspace_id: &str) -> Result<()> {
-        let rows = self
-            .inner
-            .crud_store
+        self.reload_workspace_with_store(self.inner.crud_store.as_ref(), workspace_id)
+            .await
+    }
+
+    pub(crate) async fn reload_workspace_for_maintenance(&self, workspace_id: &str) -> Result<()> {
+        let store = self.inner.crud_store.with_maintenance_access();
+        self.reload_workspace_with_store(&store, workspace_id).await
+    }
+
+    async fn reload_workspace_with_store(
+        &self,
+        store: &CrudStore,
+        workspace_id: &str,
+    ) -> Result<()> {
+        let rows = store
             .list_mcp_server_installations("workspace", workspace_id)
             .await
             .context("failed to load MCP workspace installations for reload")?;

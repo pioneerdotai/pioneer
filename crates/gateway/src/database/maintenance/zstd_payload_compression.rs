@@ -29,7 +29,9 @@ pub(super) async fn run(
         {
             Ok(outcome) if outcome.cancelled => return,
             Ok(outcome) if outcome.deferred => {
-                debug!("sqlite-zstd periodic payload maintenance deferred for foreground writes");
+                debug!(
+                    "sqlite-zstd periodic payload maintenance deferred for higher-priority writes"
+                );
                 continue;
             }
             Ok(outcome) => outcome,

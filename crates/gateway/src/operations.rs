@@ -221,7 +221,7 @@ async fn open_artifact_service_for_operations(
         );
     };
     Ok(ArtifactService::new_with_policies(
-        Arc::new(CrudStore::new(database)),
+        Arc::new(CrudStore::new(database.maintenance())),
         Arc::new(LocalArtifactBlobStore::new(runtime_home.to_path_buf())),
         ArtifactQuotaPolicy {
             max_file_bytes: config.gateway.artifacts.max_file_bytes,

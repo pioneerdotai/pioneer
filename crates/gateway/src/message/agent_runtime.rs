@@ -734,6 +734,7 @@ impl MessageProcessor {
                         let (committed, listener_failed) = match AssertUnwindSafe(async {
                             if let Some(weak) = &this {
                                 let Some(this) = weak.upgrade() else { return false; };
+                                let this = this.with_database_class(SqliteWriteClass::Critical);
                                 this.handle_durable_agent_event(event).await
                             } else {
                                 #[cfg(test)]
@@ -798,6 +799,7 @@ impl MessageProcessor {
                                 if AssertUnwindSafe(async {
                                     if let Some(weak) = &this {
                                         let Some(this) = weak.upgrade() else { return; };
+                                        let this = this.with_database_class(SqliteWriteClass::Critical);
                                         this.handle_progress_agent_event(event).await;
                                     } else {
                                         #[cfg(test)]
@@ -2031,7 +2033,7 @@ impl MessageProcessor {
         {
             return;
         }
-        let this = self.clone();
+        let this = self.scoped_with_database_class(SqliteWriteClass::Critical);
         tokio::spawn(async move {
             struct KickGuard(Arc<AtomicBool>);
 
@@ -2077,7 +2079,7 @@ impl MessageProcessor {
         {
             return;
         }
-        let this = self.clone();
+        let this = self.scoped_with_database_class(SqliteWriteClass::Critical);
         tokio::spawn(async move {
             loop {
                 this.native_terminal_effect_kick_pending
@@ -6644,6 +6646,7 @@ impl MessageProcessor {
                     .reconcile_child_turn_completed(
                         reconciliation_thread_id.as_str(),
                         reconciliation_turn_id.as_str(),
+                        TaskChildReconciliationOrigin::Live,
                     )
                     .await
             })
@@ -7334,6 +7337,7 @@ impl MessageProcessor {
                 thread_id.as_str(),
                 turn_id.as_str(),
                 turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
+                TaskChildReconciliationOrigin::Live,
             )
             .await
         {
@@ -7516,6 +7520,7 @@ impl MessageProcessor {
                 thread_id.as_str(),
                 turn_id.as_str(),
                 turn_blocked.turn.error.as_deref().unwrap_or("turn blocked"),
+                TaskChildReconciliationOrigin::Live,
             )
             .await
         {
@@ -7729,6 +7734,7 @@ impl MessageProcessor {
                             thread_id.as_str(),
                             turn_id.as_str(),
                             reason.as_str(),
+                            TaskChildReconciliationOrigin::Live,
                         )
                         .await
                 {
@@ -7861,6 +7867,7 @@ impl MessageProcessor {
                         .error
                         .as_deref()
                         .unwrap_or("turn cancelled by user"),
+                    TaskChildReconciliationOrigin::Live,
                 )
                 .await
         } else {
@@ -7873,6 +7880,7 @@ impl MessageProcessor {
                         .error
                         .as_deref()
                         .unwrap_or("turn interrupted"),
+                    TaskChildReconciliationOrigin::Live,
                 )
                 .await
         } {
@@ -8113,6 +8121,7 @@ impl MessageProcessor {
                 thread_id.as_str(),
                 turn_id.as_str(),
                 turn_failed.turn.error.as_deref().unwrap_or("turn failed"),
+                TaskChildReconciliationOrigin::Live,
             )
             .await
         {

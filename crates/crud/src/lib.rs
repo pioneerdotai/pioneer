@@ -188,8 +188,8 @@ use pioneer_protocol::{
     TurnPermissionProfileSnapshot, TurnPermissionProfileSource, TurnStatus, UserInput, generate_id,
 };
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteAdmissionClass,
-    SqliteDatabase, SqliteWriteCoordinator, is_anyhow_sqlite_lock, retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase, SqliteReadClass,
+    SqliteWriteClass, is_anyhow_sqlite_lock, retry_with_backoff,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -2095,8 +2095,6 @@ pub struct CrudStore {
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
-    write_coordinator: SqliteWriteCoordinator,
-    write_admission_class: SqliteAdmissionClass,
 }
 
 /// Complete durable write-set for one Task creation.  Task events, frozen
@@ -3513,30 +3511,42 @@ impl CrudStore {
     }
 
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
-        Self::new_with_write_coordinator(connection, SqliteWriteCoordinator::default())
-    }
-
-    pub fn new_with_write_coordinator(
-        connection: impl Into<SqliteDatabase>,
-        write_coordinator: SqliteWriteCoordinator,
-    ) -> Self {
         Self {
             connection: connection.into(),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
-            write_coordinator,
-            write_admission_class: SqliteAdmissionClass::Foreground,
         }
     }
 
-    pub fn with_background_write_admission(&self) -> Self {
-        let mut background = self.clone();
-        background.write_admission_class = SqliteAdmissionClass::Background;
-        background
+    /// Returns a store whose reads and writes are both classified as
+    /// maintenance. Keeping both contours on one scoped handle prevents a
+    /// background worker from limiting its writes while bypassing the read
+    /// limiter.
+    pub fn with_maintenance_access(&self) -> Self {
+        let mut maintenance = self.clone();
+        maintenance.connection = maintenance.connection.maintenance();
+        maintenance
     }
 
-    pub fn write_coordinator(&self) -> SqliteWriteCoordinator {
-        self.write_coordinator.clone()
+    /// Returns a background control-plane store: discovery reads remain
+    /// bounded by the maintenance limiter while authority-preserving writes
+    /// retain critical writer priority.
+    pub fn with_maintenance_reads_and_critical_writes(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.connection = scoped.connection.maintenance().with_critical_writes();
+        scoped
+    }
+
+    pub fn with_critical_writes(&self) -> Self {
+        let mut critical = self.clone();
+        critical.connection = critical.connection.with_critical_writes();
+        critical
+    }
+
+    pub fn with_interactive_writes(&self) -> Self {
+        let mut interactive = self.clone();
+        interactive.connection = interactive.connection.with_interactive_writes();
+        interactive
     }
 
     async fn project_semantic_timeline_live_turn_event(
@@ -3678,40 +3688,29 @@ impl CrudStore {
         .await
     }
 
-    pub async fn try_run_low_priority_write<T, F, Fut>(&self, operation: F) -> Result<Option<T>>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        match self
-            .write_coordinator
-            .try_run_background_serialized_with_retry(operation, is_anyhow_sqlite_lock)
-            .await
-        {
-            Some(result) => result.map(Some),
-            None => Ok(None),
-        }
-    }
-
-    pub async fn run_background_write<T, F, Fut>(&self, operation: F) -> Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        self.run_background_database_quantum(operation).await
-    }
-
-    /// Runs one bounded background database quantum through the shared fair
-    /// admission controller. CPU-heavy work must happen after this future
-    /// returns so the sole SQLite connection is not retained during analysis.
+    /// Runs one bounded maintenance database quantum. Each mutation performed
+    /// by the operation obtains its own writer-executor reservation (or keeps
+    /// one for the lifetime of its transaction); a pure read must never
+    /// reserve the writer. This wrapper only preserves the whole-quantum lock
+    /// retry policy.
     pub async fn run_background_database_quantum<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        self.write_coordinator
-            .run_background_serialized_with_retry(operation, is_anyhow_sqlite_lock)
-            .await
+        if self.connection.read_class() != SqliteReadClass::Maintenance
+            || self.connection.write_class() != SqliteWriteClass::Maintenance
+        {
+            bail!("background database quantum requires maintenance-scoped reads and writes");
+        }
+        let mut operation = operation;
+        retry_with_backoff(
+            || operation(),
+            is_anyhow_sqlite_lock,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 
     pub async fn insert_turn_llm_context(
@@ -17907,21 +17906,19 @@ WHERE id IN (SELECT event_id FROM candidates)
     ) -> std::result::Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
     {
         let replacement = replacement.clone();
-        self.write_coordinator
-            .run_serialized_with_retry(
-                || {
-                    let replacement = replacement.clone();
-                    async move {
-                        turn_mcp_projection::replace_turn_mcp_projection(
-                            &self.connection,
-                            &replacement,
-                        )
+        retry_with_backoff(
+            || {
+                let replacement = replacement.clone();
+                self.connection.run_write_operation(async move {
+                    turn_mcp_projection::replace_turn_mcp_projection(&self.connection, &replacement)
                         .await
-                    }
-                },
-                TurnMcpProjectionPersistenceError::is_sqlite_lock,
-            )
-            .await
+                })
+            },
+            TurnMcpProjectionPersistenceError::is_sqlite_lock,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 
     pub async fn replace_turn_mcp_projection_with_authorization_context(
@@ -17932,23 +17929,24 @@ WHERE id IN (SELECT event_id FROM candidates)
     {
         let replacement = replacement.clone();
         let authorization_context_json = authorization_context_json.to_owned();
-        self.write_coordinator
-            .run_serialized_with_retry(
-                || {
-                    let replacement = replacement.clone();
-                    let authorization_context_json = authorization_context_json.clone();
-                    async move {
-                        turn_mcp_projection::replace_turn_mcp_projection_with_authorization_context(
-                            &self.connection,
-                            &replacement,
-                            authorization_context_json.as_str(),
-                        )
-                        .await
-                    }
-                },
-                TurnMcpProjectionPersistenceError::is_sqlite_lock,
-            )
-            .await
+        retry_with_backoff(
+            || {
+                let replacement = replacement.clone();
+                let authorization_context_json = authorization_context_json.clone();
+                self.connection.run_write_operation(async move {
+                    turn_mcp_projection::replace_turn_mcp_projection_with_authorization_context(
+                        &self.connection,
+                        &replacement,
+                        authorization_context_json.as_str(),
+                    )
+                    .await
+                })
+            },
+            TurnMcpProjectionPersistenceError::is_sqlite_lock,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 
     pub async fn list_turn_mcp_bindings(&self, turn_id: &str) -> Result<Vec<TurnMcpBindingRecord>> {
@@ -18832,9 +18830,9 @@ WHERE id IN (SELECT event_id FROM candidates)
         folder_id: Option<&str>,
         actor_id: Option<&str>,
     ) -> thread_agents_doc::ThreadAgentsDocResult<ThreadAgentsDocRecord> {
-        self.write_coordinator
-            .run_serialized_with_retry(
-                || async {
+        retry_with_backoff(
+            || {
+                self.connection.run_write_operation(async {
                     thread_agents_doc::ThreadAgentsDocRepository::new()
                         .create_draft(
                             &self.connection,
@@ -18844,10 +18842,13 @@ WHERE id IN (SELECT event_id FROM candidates)
                             actor_id,
                         )
                         .await
-                },
-                |_| false,
-            )
-            .await
+                })
+            },
+            |_| false,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 
     pub async fn save_thread_agents_doc(
@@ -18859,9 +18860,9 @@ WHERE id IN (SELECT event_id FROM candidates)
         actor_id: Option<&str>,
         save_reason: ThreadAgentsDocSaveReason,
     ) -> thread_agents_doc::ThreadAgentsDocResult<ThreadAgentsDocRecord> {
-        self.write_coordinator
-            .run_serialized_with_retry(
-                || async {
+        retry_with_backoff(
+            || {
+                self.connection.run_write_operation(async {
                     thread_agents_doc::ThreadAgentsDocRepository::new()
                         .save_content(
                             &self.connection,
@@ -18874,10 +18875,13 @@ WHERE id IN (SELECT event_id FROM candidates)
                             save_reason,
                         )
                         .await
-                },
-                |_| false,
-            )
-            .await
+                })
+            },
+            |_| false,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 
     pub async fn archive_thread_agents_doc(
@@ -18887,9 +18891,9 @@ WHERE id IN (SELECT event_id FROM candidates)
         expected_version: Option<i64>,
         actor_id: Option<&str>,
     ) -> thread_agents_doc::ThreadAgentsDocResult<Option<ThreadAgentsDocRecord>> {
-        self.write_coordinator
-            .run_serialized_with_retry(
-                || async {
+        retry_with_backoff(
+            || {
+                self.connection.run_write_operation(async {
                     thread_agents_doc::ThreadAgentsDocRepository::new()
                         .archive(
                             &self.connection,
@@ -18900,10 +18904,13 @@ WHERE id IN (SELECT event_id FROM candidates)
                             actor_id,
                         )
                         .await
-                },
-                |_| false,
-            )
-            .await
+                })
+            },
+            |_| false,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 
     pub async fn list_thread_agents_doc_revisions(
@@ -20045,11 +20052,20 @@ WHERE id IN (SELECT event_id FROM candidates)
     }
 
     pub async fn repair_deterministic_read_model_violations(&self) -> Result<RepairSummary> {
+        let maintenance = self.with_maintenance_access();
         let mut summary = RepairSummary::default();
-        summary.merge(self.repair_terminal_turn_item_payloads().await?);
-        summary.merge(self.repair_terminal_turn_running_attempts().await?);
-        summary.merge(self.repair_terminal_tasks_missing_completed_at().await?);
-        summary.merge(self.repair_terminal_runs_missing_completed_at().await?);
+        summary.merge(maintenance.repair_terminal_turn_item_payloads().await?);
+        summary.merge(maintenance.repair_terminal_turn_running_attempts().await?);
+        summary.merge(
+            maintenance
+                .repair_terminal_tasks_missing_completed_at()
+                .await?,
+        );
+        summary.merge(
+            maintenance
+                .repair_terminal_runs_missing_completed_at()
+                .await?,
+        );
         Ok(summary)
     }
 
@@ -23306,11 +23322,14 @@ WHERE id IN (SELECT event_id FROM candidates)
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        self.write_coordinator
-            .run_serialized_with_retry(operation, |error| {
-                !turn_event_was_appended_before_error(error) && is_anyhow_sqlite_lock(error)
-            })
-            .await
+        let mut operation = operation;
+        retry_with_backoff(
+            || self.connection.run_write_operation(operation()),
+            |error| !turn_event_was_appended_before_error(error) && is_anyhow_sqlite_lock(error),
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 
     async fn materialize_turn_events_atomically(
@@ -25297,18 +25316,14 @@ WHERE id IN (SELECT event_id FROM candidates)
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        match self.write_admission_class {
-            SqliteAdmissionClass::Foreground => {
-                self.write_coordinator
-                    .run_serialized_with_retry(operation, is_anyhow_sqlite_lock)
-                    .await
-            }
-            SqliteAdmissionClass::Background => {
-                self.write_coordinator
-                    .run_background_serialized_with_retry(operation, is_anyhow_sqlite_lock)
-                    .await
-            }
-        }
+        let mut operation = operation;
+        retry_with_backoff(
+            || self.connection.run_write_operation(operation()),
+            is_anyhow_sqlite_lock,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 }
 
@@ -26909,6 +26924,78 @@ mod tests {
         .expect("workspace insert should succeed");
 
         CrudStore::new(connection)
+    }
+
+    #[tokio::test]
+    async fn store_preserves_typed_database_scope_across_construction_and_write_reclassification() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection)
+            .maintenance()
+            .with_critical_writes();
+
+        let store = CrudStore::new(database);
+        let scoped = store.database_connection();
+
+        assert_eq!(
+            scoped.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            scoped.write_class(),
+            pioneer_sqlite::SqliteWriteClass::Critical
+        );
+
+        let background_control_plane = store.with_maintenance_reads_and_critical_writes();
+        let scoped = background_control_plane.database_connection();
+        assert_eq!(
+            scoped.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            scoped.write_class(),
+            pioneer_sqlite::SqliteWriteClass::Critical
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_maintenance_read_does_not_reserve_the_writer() {
+        let reader = Database::connect("sqlite::memory:")
+            .await
+            .expect("open test reader");
+        let writer = Database::connect("sqlite::memory:")
+            .await
+            .expect("open test writer");
+        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
+        let store = CrudStore::new(database.clone());
+        let transaction = database
+            .with_critical_writes()
+            .begin()
+            .await
+            .expect("occupy the writer");
+        let read_database = store.database_connection();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.run_background_database_quantum(|| {
+                let read_database = read_database.clone();
+                async move {
+                    read_database
+                        .query_one_raw(Statement::from_string(
+                            DatabaseBackend::Sqlite,
+                            "SELECT 1 AS value".to_owned(),
+                        ))
+                        .await?;
+                    Ok(())
+                }
+            }),
+        )
+        .await
+        .expect("pure maintenance read must not wait for the occupied writer")
+        .expect("pure maintenance read must succeed");
+
+        transaction.rollback().await.expect("release writer");
     }
 
     async fn ensure_test_agent_identity(store: &CrudStore, workspace_id: &str, timestamp: i64) {

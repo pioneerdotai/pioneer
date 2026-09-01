@@ -12,7 +12,10 @@ use pioneer_protocol::{
     RoleKey, WorkspaceId, WorkspaceMemberAddParams, WorkspaceMemberListParams,
     WorkspaceMemberListResponse, WorkspaceMemberMutationResponse, WorkspaceMemberRemoveParams,
 };
-use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
+use sea_orm::{
+    DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionSession,
+    TransactionTrait,
+};
 use sha2::Digest as _;
 
 use crate::administrative_audit::AdministrativeAuditWriter;
@@ -146,7 +149,6 @@ impl MemberService {
             return Err(scope_mismatch());
         }
         let database = self.store.database_connection();
-        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -270,7 +272,6 @@ impl MemberService {
             return Err(scope_mismatch());
         }
         let database = self.store.database_connection();
-        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -386,7 +387,6 @@ impl MemberService {
             return Err(scope_mismatch());
         }
         let database = self.store.database_connection();
-        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -791,7 +791,6 @@ impl MemberService {
             return Err(MemberServiceError::RateLimited);
         }
         let database = self.store.database_connection();
-        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -894,7 +893,6 @@ impl MemberService {
             return Err(scope_mismatch());
         }
         let database = self.store.database_connection();
-        let _write_admission = self.store.write_coordinator().acquire_foreground().await;
         let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -1002,10 +1000,13 @@ async fn ensure_current_actor(
     }
 }
 
-async fn finish_read_transaction<T>(
-    transaction: DatabaseTransaction,
+async fn finish_read_transaction<T, S>(
+    transaction: S,
     result: Result<T, MemberServiceError>,
-) -> Result<T, MemberServiceError> {
+) -> Result<T, MemberServiceError>
+where
+    S: TransactionSession,
+{
     match result {
         Ok(value) => {
             transaction

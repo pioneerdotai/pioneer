@@ -31,6 +31,7 @@ impl MessageProcessor {
         cancellation: &tokio_util::sync::CancellationToken,
         on_degraded: impl Fn(bool),
     ) -> Result<()> {
+        let maintenance = self.for_background_reconciliation();
         let mut initialized = std::collections::HashSet::new();
         let mut retry_delay = std::time::Duration::from_millis(250);
         loop {
@@ -42,7 +43,7 @@ impl MessageProcessor {
             );
             let workspaces_stage =
                 trace.stage(pioneer_observability::GatewayOperationStage::McpWorkspacesLoad);
-            let workspaces = match self.workspace_manager.list_workspaces().await {
+            let workspaces = match maintenance.workspace_manager.list_workspaces().await {
                 Ok(workspaces) => {
                     workspaces_stage.succeed();
                     workspaces
@@ -86,9 +87,9 @@ impl MessageProcessor {
                 }
                 let reload_stage =
                     trace.stage(pioneer_observability::GatewayOperationStage::McpWorkspaceReload);
-                if let Err(error) = self
+                if let Err(error) = maintenance
                     .mcp_service
-                    .reload_workspace(workspace.id.as_str())
+                    .reload_workspace_for_maintenance(workspace.id.as_str())
                     .await
                 {
                     drop(reload_stage);

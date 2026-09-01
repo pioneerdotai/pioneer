@@ -57,6 +57,16 @@ pub(crate) trait ArtifactStreamInvalidation: Send + Sync {
     fn cancel_authorization_signal(&self, signal: &AccessChangeSignal) -> usize;
 }
 
+/// Identifies whether Task child reconciliation is part of the live Turn
+/// lifecycle or a durable background repair pass. The distinction controls
+/// read admission independently from the correctness-critical writes shared
+/// by both paths.
+#[derive(Clone, Copy)]
+enum TaskChildReconciliationOrigin {
+    Live,
+    DurableBackground,
+}
+
 use crate::hook_runtime::GatewayHookRuntimeBuilder;
 use crate::keep_awake::GatewayKeepAwake;
 use crate::prompt_hooks::agents_doc_prompt_hook_package;
@@ -175,8 +185,8 @@ use pioneer_protocol::{
 use pioneer_provider::{ChatMessage, ProviderRegistry};
 use pioneer_runtime_events::ExecutionEventHub;
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
-    is_anyhow_sqlite_transient_access, retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteReadClass,
+    SqliteWriteClass, is_anyhow_sqlite_transient_access, retry_with_backoff,
 };
 use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
 use serde::Serialize;
@@ -748,6 +758,7 @@ impl MessageProcessor {
             Ok(duration) => duration.as_secs(),
             Err(_) => 0,
         };
+        let maintenance_crud_store = Arc::new(crud_store.with_maintenance_access());
         let mcp_snapshot_version = Arc::new(AtomicU64::new(0));
         let authorization_invalidation_hub =
             Arc::new(AuthorizationInvalidationHub::durable(crud_store.clone()));
@@ -828,15 +839,15 @@ impl MessageProcessor {
             ),
         );
         let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
-            crud_store.clone(),
+            maintenance_crud_store.clone(),
             thread_episodic_backend.clone(),
             Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                 Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    crud_store.clone(),
+                    maintenance_crud_store.clone(),
                     thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
                 )),
                 thread_episodic_embedding_provider_resolver.clone(),
-                crud_store.clone(),
+                maintenance_crud_store,
             )),
         ));
         thread_episodic_index_executor.apply_config(thread_episodic_runtime_config.index_executor);
@@ -1547,6 +1558,7 @@ impl MessageProcessor {
                     }
                     break;
                 };
+                let processor = processor.with_database_class(SqliteWriteClass::Critical);
                 match event {
                     crate::permissions::GatewayPermissionApprovalEvent::Revalidate(request) => {
                         let result = processor
@@ -1803,11 +1815,68 @@ impl MessageProcessor {
         self.keepawake.set_enabled(enabled)
     }
 
+    /// Clone the processor with one explicit class for its core persistence
+    /// services while preserving all shared runtime state. Long-lived workers
+    /// use this at their task boundary instead of inheriting request priority.
+    fn scoped_with_database_class(&self, class: SqliteWriteClass) -> Self {
+        let crud_store = Arc::new(match class {
+            SqliteWriteClass::Critical => self.crud_store.with_critical_writes(),
+            SqliteWriteClass::Interactive => self.crud_store.with_interactive_writes(),
+            SqliteWriteClass::Maintenance => self.crud_store.with_maintenance_access(),
+        });
+        self.scoped_with_crud_store(crud_store)
+    }
+
+    /// Background reconciliation performs bounded discovery reads but owns
+    /// correctness-critical mutations. Keep those two resource classes
+    /// independent instead of allowing critical writer priority to bypass the
+    /// maintenance read limiter.
+    fn scoped_for_background_reconciliation(&self) -> Self {
+        self.scoped_with_crud_store(Arc::new(
+            self.crud_store.with_maintenance_reads_and_critical_writes(),
+        ))
+    }
+
+    fn scoped_with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
+        let mut scoped = self.clone();
+        scoped.crud_store = crud_store.clone();
+        scoped.workspace_manager = Arc::new(
+            self.workspace_manager
+                .with_database(crud_store.database_connection()),
+        );
+        scoped.timeout_supervisor =
+            Arc::new(self.timeout_supervisor.with_crud_store(crud_store.clone()));
+        scoped.recovery_coordinator = Arc::new(
+            self.recovery_coordinator
+                .with_crud_store(crud_store.clone()),
+        );
+        scoped
+    }
+
+    fn with_database_class(self: &Arc<Self>, class: SqliteWriteClass) -> Arc<Self> {
+        Arc::new(self.scoped_with_database_class(class))
+    }
+
+    fn for_background_reconciliation(self: &Arc<Self>) -> Arc<Self> {
+        Arc::new(self.scoped_for_background_reconciliation())
+    }
+
+    /// Selects the correctness-critical Task service without losing the read
+    /// class already carried by this scoped processor. This is the sole bridge
+    /// for nested TaskService calls made from MessageProcessor work.
+    fn critical_task_service(&self) -> Arc<pioneer_tasks::TaskService> {
+        match self.crud_store.database_connection().read_class() {
+            SqliteReadClass::Interactive => self.task_runtime.critical_service(),
+            SqliteReadClass::Maintenance => self.task_runtime.background_control_service(),
+        }
+    }
+
     async fn run_projection_delivery_resilience_worker(processor: Weak<Self>) {
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
             };
+            let this = this.for_background_reconciliation();
             let cycle = AssertUnwindSafe(async {
                 let now = now_timestamp_secs();
                 match retry_transient_storage_access(|| {
@@ -1876,6 +1945,7 @@ impl MessageProcessor {
             let Some(this) = processor.upgrade() else {
                 break;
             };
+            let this = this.for_background_reconciliation();
             let cycle = AssertUnwindSafe(async {
                 let now = now_timestamp_secs();
                 match retry_transient_storage_access(|| {
@@ -1927,12 +1997,13 @@ impl MessageProcessor {
     }
 
     async fn initialize_resilience_workers(self: &Arc<Self>) -> anyhow::Result<()> {
+        let background = self.for_background_reconciliation();
         let trace = pioneer_observability::GatewayOperationTrace::start(
             pioneer_observability::GatewayOperation::ResilienceInitialize,
         );
         let repair_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceReadModelRepair);
-        match self
+        match background
             .crud_store
             .repair_deterministic_read_model_violations()
             .await
@@ -1967,7 +2038,7 @@ impl MessageProcessor {
 
         let deadline_stage =
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceDeadlineBackfill);
-        match self
+        match background
             .timeout_supervisor
             .backfill_missing_deadlines(1024)
             .await
@@ -1994,7 +2065,11 @@ impl MessageProcessor {
 
         let admission_stage = trace
             .stage(pioneer_observability::GatewayOperationStage::ResilienceAdmissionLeaseReconcile);
-        match self.crud_store.reconcile_execution_admission_leases().await {
+        match background
+            .crud_store
+            .reconcile_execution_admission_leases()
+            .await
+        {
             Ok(reconciled) => {
                 admission_stage.succeed();
                 if reconciled > 0 {
@@ -2069,6 +2144,7 @@ impl MessageProcessor {
                     let processor = processor.upgrade().ok_or_else(|| {
                         "message processor stopped before recovery listener startup".to_owned()
                     })?;
+                    let processor = processor.with_database_class(SqliteWriteClass::Critical);
                     processor
                         .ensure_agent_listener_task(thread_id.as_str())
                         .await
@@ -2084,7 +2160,7 @@ impl MessageProcessor {
             }
             let initialization = async {
                 self.authorization_invalidation_hub
-                    .current_generation()
+                    .current_generation_for_maintenance()
                     .await
                     .context("Gateway startup requires durable authorization policy generation")?;
                 self.initialize_resilience_workers().await
@@ -2143,10 +2219,12 @@ impl MessageProcessor {
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
+                let this = this.for_background_reconciliation();
+                let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
                 let now = now_timestamp_secs();
                 let mut transient_storage_poll_failed = false;
                 if now >= next_skill_upload_cleanup {
-                    this.cleanup_stale_skill_uploads(now).await;
+                    maintenance.cleanup_stale_skill_uploads(now).await;
                     next_skill_upload_cleanup = now.saturating_add(60);
                 }
 
@@ -2229,7 +2307,7 @@ impl MessageProcessor {
                     next_agent_action_ledger_compaction =
                         now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
                     match retry_transient_storage_access(|| {
-                        let database = this.crud_store.database_connection();
+                        let database = maintenance.crud_store.database_connection();
                         async move {
                             pioneer_crud::compact_terminal_agent_action_ledger(
                                 &database,
@@ -2272,7 +2350,8 @@ impl MessageProcessor {
                     next_native_terminal_effect_purge =
                         now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
                     match retry_transient_storage_access(|| {
-                        this.crud_store
+                        maintenance
+                            .crud_store
                             .purge_resolved_native_terminal_effects_before(
                                 now.saturating_sub(NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS),
                                 NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE,
@@ -2795,6 +2874,7 @@ impl MessageProcessor {
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
+                let this = this.for_background_reconciliation();
                 let config = this.hook_recovery_config.read().await.clone();
                 if config.enabled && (!first_pass || config.startup_scan) {
                     this.run_hook_recovery_pass(config.clone()).await;
@@ -2814,6 +2894,9 @@ impl MessageProcessor {
         if !runtime.has_run_store() {
             return;
         }
+        let runtime = GatewayHookRuntimeBuilder::from_runtime(self.crud_store.clone(), &runtime)
+            .with_crud_run_store()
+            .build();
         let options = HookRecoveryOptions {
             now_unix_ms: now_timestamp_millis(),
             batch_size: config.batch_size,
@@ -2867,10 +2950,12 @@ impl MessageProcessor {
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
+                let runtime = this.with_database_class(SqliteWriteClass::Critical);
+                let reconciliation = this.for_background_reconciliation();
                 tokio::select! {
                     delivery = subscription.recv() => match delivery {
                         pioneer_tasks::TaskEventWakeDelivery::Wake(wake) => {
-                            if let Err(error) = this
+                            if let Err(error) = runtime
                                 .emit_committed_task_events_after_cursor(
                                     wake.task_id.as_str(),
                                     &mut cursors_by_task,
@@ -2891,7 +2976,7 @@ impl MessageProcessor {
                                 missed_wakes = count,
                                 "task wake bus lagged; durable fanout backlog will be rescanned"
                             );
-                            if let Err(error) = this
+                            if let Err(error) = reconciliation
                                 .replay_pending_task_event_fanout(
                                     &mut cursors_by_task,
                                     &mut durable_replay_after_task_id,
@@ -2908,7 +2993,7 @@ impl MessageProcessor {
                         pioneer_tasks::TaskEventWakeDelivery::Closed => break,
                     },
                     _ = durable_replay.tick() => {
-                        if let Err(error) = this
+                        if let Err(error) = reconciliation
                             .replay_pending_task_event_fanout(
                                 &mut cursors_by_task,
                                 &mut durable_replay_after_task_id,
@@ -2948,9 +3033,14 @@ impl MessageProcessor {
         } else {
             None
         };
+        let maintenance_service = self.task_runtime.maintenance_service();
         for task_id in task_ids {
             if let Err(error) = self
-                .emit_committed_task_events_after_cursor(task_id.as_str(), cursors_by_task)
+                .emit_committed_task_events_after_cursor_with_service(
+                    maintenance_service.as_ref(),
+                    task_id.as_str(),
+                    cursors_by_task,
+                )
                 .await
             {
                 warn!(
@@ -2968,6 +3058,21 @@ impl MessageProcessor {
         task_id: &str,
         cursors_by_task: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
+        let service = self.task_runtime.service();
+        self.emit_committed_task_events_after_cursor_with_service(
+            service.as_ref(),
+            task_id,
+            cursors_by_task,
+        )
+        .await
+    }
+
+    async fn emit_committed_task_events_after_cursor_with_service(
+        &self,
+        service: &pioneer_tasks::TaskService,
+        task_id: &str,
+        cursors_by_task: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
         let after_sequence = match cursors_by_task.get(task_id).copied() {
             Some(sequence) => sequence,
             None => {
@@ -2982,9 +3087,7 @@ impl MessageProcessor {
                 sequence
             }
         };
-        let events = self
-            .task_runtime
-            .service()
+        let events = service
             .list_task_events_after(task_id, after_sequence)
             .await?;
 
@@ -3716,6 +3819,7 @@ impl MessageProcessor {
         workspace_manager: Arc<WorkspaceManager>,
         crud_store: Arc<CrudStore>,
     ) -> Self {
+        let maintenance_crud_store = Arc::new(crud_store.with_maintenance_access());
         let timeout_supervisor = Arc::new(TimeoutSupervisor::new(
             crud_store.clone(),
             TimeoutPolicyRegistry::default(),
@@ -3872,15 +3976,15 @@ impl MessageProcessor {
             ),
         );
         let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
-            crud_store.clone(),
+            maintenance_crud_store.clone(),
             thread_episodic_backend.clone(),
             Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
                 Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    crud_store.clone(),
+                    maintenance_crud_store.clone(),
                     thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
                 )),
                 thread_episodic_embedding_provider_resolver.clone(),
-                crud_store.clone(),
+                maintenance_crud_store,
             )),
         ));
         let thread_episodic_recall_embedding_provider_resolver: Arc<

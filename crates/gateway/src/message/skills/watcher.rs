@@ -8,7 +8,7 @@ impl MessageProcessor {
             return;
         }
 
-        let this = self.clone();
+        let this = self.with_database_class(SqliteWriteClass::Maintenance);
 
         let handle: JoinHandle<()> = tokio::spawn(async move {
             let mut timer = interval(Duration::from_millis(SKILLS_WATCH_DEBOUNCE_MS));

@@ -728,6 +728,12 @@ impl RecoveryCoordinator {
         }
     }
 
+    pub(crate) fn with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
+        let mut scoped = self.clone();
+        scoped.crud_store = crud_store;
+        scoped
+    }
+
     pub(crate) async fn set_listener_starter(&self, starter: RecoveryListenerStarter) {
         *self.listener_starter.write().await = Some(starter);
     }

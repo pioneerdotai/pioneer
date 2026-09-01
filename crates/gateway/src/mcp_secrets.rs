@@ -20,6 +20,7 @@ pub(crate) async fn garbage_collection_orphan_mcp_secrets(
     gateway_secrets: &GatewaySecrets,
     dry_run: bool,
 ) -> Result<McpSecretGarbageCollectionReport> {
+    let crud_store = crud_store.with_maintenance_access();
     let rows = crud_store
         .list_all_mcp_server_installations()
         .await

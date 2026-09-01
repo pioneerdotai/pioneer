@@ -42,6 +42,7 @@ impl TaskStartupReconciler {
         executors: Arc<TaskExecutorRegistry>,
         scheduler: TaskSchedulerHandle,
     ) -> Self {
+        let store = Arc::new(store.with_maintenance_access());
         let projector = TaskProjector::new(store.clone());
         Self {
             store,

@@ -59,7 +59,7 @@ impl TaskScheduler {
         executors: Arc<TaskExecutorRegistry>,
     ) -> Self {
         Self {
-            store,
+            store: Arc::new(store.with_maintenance_access()),
             event_bus,
             executors,
             notify: Arc::new(Notify::new()),

@@ -107,6 +107,9 @@ struct TaskReviseValidationContext {
 
 pub struct TaskRuntime {
     service: Arc<TaskService>,
+    critical_service: Arc<TaskService>,
+    maintenance_service: Arc<TaskService>,
+    background_control_service: Arc<TaskService>,
     scheduler: Arc<TaskScheduler>,
     event_bus: Arc<TaskEventBus>,
     executors: Arc<TaskExecutorRegistry>,
@@ -198,26 +201,53 @@ impl TaskRuntime {
     pub fn new_with_config(store: Arc<CrudStore>, config: TaskRuntimeConfig) -> Self {
         let event_bus = Arc::new(TaskEventBus::new());
         let executors = Arc::new(TaskExecutorRegistry::new());
+        let critical_store = Arc::new(store.with_critical_writes());
+        let maintenance_store = Arc::new(store.with_maintenance_access());
+        let background_control_store = Arc::new(store.with_maintenance_reads_and_critical_writes());
         let service = Arc::new(TaskService::new_with_config(
             store.clone(),
             event_bus.clone(),
             executors.clone(),
             config.clone(),
         ));
+        let critical_service = Arc::new(TaskService::new_with_config(
+            critical_store,
+            event_bus.clone(),
+            executors.clone(),
+            config.clone(),
+        ));
+        let maintenance_service = Arc::new(TaskService::new_with_config(
+            maintenance_store.clone(),
+            event_bus.clone(),
+            executors.clone(),
+            config.clone(),
+        ));
+        let background_control_service = Arc::new(TaskService::new_with_config(
+            background_control_store,
+            event_bus.clone(),
+            executors.clone(),
+            config,
+        ));
         let scheduler = Arc::new(TaskScheduler::new(
-            store.clone(),
+            maintenance_store.clone(),
             event_bus.clone(),
             executors.clone(),
         ));
         service.set_scheduler(Arc::downgrade(&scheduler));
+        critical_service.set_scheduler(Arc::downgrade(&scheduler));
+        maintenance_service.set_scheduler(Arc::downgrade(&scheduler));
+        background_control_service.set_scheduler(Arc::downgrade(&scheduler));
         let reconciler = Arc::new(TaskStartupReconciler::new(
-            store,
+            maintenance_store,
             event_bus.clone(),
             executors.clone(),
             scheduler.handle(),
         ));
         Self {
             service,
+            critical_service,
+            maintenance_service,
+            background_control_service,
             scheduler,
             event_bus,
             executors,
@@ -232,6 +262,21 @@ impl TaskRuntime {
         self.service.clone()
     }
 
+    pub fn critical_service(&self) -> Arc<TaskService> {
+        self.critical_service.clone()
+    }
+
+    pub fn maintenance_service(&self) -> Arc<TaskService> {
+        self.maintenance_service.clone()
+    }
+
+    /// Returns the durable background control-plane service. Its discovery
+    /// reads are admitted as maintenance work while its authority-preserving
+    /// mutations retain critical writer priority.
+    pub fn background_control_service(&self) -> Arc<TaskService> {
+        self.background_control_service.clone()
+    }
+
     pub fn event_bus(&self) -> Arc<TaskEventBus> {
         self.event_bus.clone()
     }
@@ -243,11 +288,13 @@ impl TaskRuntime {
     pub async fn start(&self) -> TaskRuntimeResult<()> {
         let now = now_timestamp_secs();
         self.reconciler.reconcile(now).await?;
-        self.service.recover_retry_and_lock_state(now).await?;
-        self.service
+        self.maintenance_service
+            .recover_retry_and_lock_state(now)
+            .await?;
+        self.maintenance_service
             .recover_stuck_deliveries(now, DELIVERY_RECOVERY_BATCH_LIMIT)
             .await?;
-        self.service
+        self.maintenance_service
             .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
             .await?;
         self.scheduler.process_due_once(now).await?;
@@ -278,9 +325,12 @@ impl TaskRuntime {
         }
         let mut review_timeout_guard = self.review_timeout_task.lock().await;
         if review_timeout_guard.is_none()
-            && self.service.review_auto_accept_timeout_seconds().is_some()
+            && self
+                .maintenance_service
+                .review_auto_accept_timeout_seconds()
+                .is_some()
         {
-            let service = self.service.clone();
+            let service = self.maintenance_service.clone();
             *review_timeout_guard = Some(tokio::spawn(async move {
                 let mut interval = interval(REVIEW_AUTO_ACCEPT_SCAN_INTERVAL);
                 interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -5910,7 +5960,11 @@ pub(crate) fn task_error(
 
 #[cfg(test)]
 mod resource_policy_tests {
-    use super::ensure_paginated_response_budget;
+    use super::{TaskRuntime, ensure_paginated_response_budget};
+    use pioneer_crud::CrudStore;
+    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteWriteClass};
+    use sea_orm::Database;
+    use std::sync::Arc;
 
     #[test]
     fn page_size_target_never_hides_a_single_logical_record() {
@@ -5918,5 +5972,45 @@ mod resource_policy_tests {
         ensure_paginated_response_budget(&response, 1, 64, "test page")
             .expect("a single logical record must remain readable intact");
         assert!(ensure_paginated_response_budget(&response, 2, 64, "test page").is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_services_preserve_independent_read_and_write_classes() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("open test database");
+        let store = Arc::new(CrudStore::new(SqliteDatabase::from_single_connection(
+            connection,
+        )));
+        let runtime = TaskRuntime::new(store);
+
+        let cases = [
+            (
+                runtime.service(),
+                SqliteReadClass::Interactive,
+                SqliteWriteClass::Interactive,
+            ),
+            (
+                runtime.critical_service(),
+                SqliteReadClass::Interactive,
+                SqliteWriteClass::Critical,
+            ),
+            (
+                runtime.maintenance_service(),
+                SqliteReadClass::Maintenance,
+                SqliteWriteClass::Maintenance,
+            ),
+            (
+                runtime.background_control_service(),
+                SqliteReadClass::Maintenance,
+                SqliteWriteClass::Critical,
+            ),
+        ];
+
+        for (service, expected_read, expected_write) in cases {
+            let database = service.store().database_connection();
+            assert_eq!(database.read_class(), expected_read);
+            assert_eq!(database.write_class(), expected_write);
+        }
     }
 }

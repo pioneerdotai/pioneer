@@ -243,9 +243,11 @@ impl WakeBudget {
 /// resumable history processing and terminal finalization remain one
 /// production `wake_once` path.
 pub(crate) struct SelfImprovementSupervisor {
-    store: Arc<CrudStore>,
+    interactive_store: Arc<CrudStore>,
+    maintenance_store: Arc<CrudStore>,
     provider_registry: Arc<ProviderRegistry>,
     workspace_manager: Arc<WorkspaceManager>,
+    maintenance_workspace_manager: Arc<WorkspaceManager>,
     desired: StdRwLock<BTreeMap<String, GatewaySelfImprovementConfig>>,
     max_skill_markdown_bytes: usize,
     worker_id: String,
@@ -265,10 +267,15 @@ impl SelfImprovementSupervisor {
         workspace_configs: BTreeMap<String, GatewaySelfImprovementConfig>,
         max_skill_markdown_bytes: usize,
     ) -> Self {
+        let maintenance_store = Arc::new(store.with_maintenance_access());
+        let maintenance_workspace_manager =
+            Arc::new(workspace_manager.with_database(maintenance_store.database_connection()));
         Self {
-            store,
+            interactive_store: store,
+            maintenance_store,
             provider_registry,
             workspace_manager,
+            maintenance_workspace_manager,
             desired: StdRwLock::new(workspace_configs),
             max_skill_markdown_bytes: max_skill_markdown_bytes.max(1),
             worker_id: format!("gateway-self-improvement-{}", generate_id(SKILL_ID_LEN)),
@@ -331,7 +338,11 @@ impl SelfImprovementSupervisor {
 
         loop {
             let now = Utc::now();
-            let retry_at_unix = match self.store.get_next_self_improvement_retry_at().await {
+            let retry_at_unix = match self
+                .maintenance_store
+                .get_next_self_improvement_retry_at()
+                .await
+            {
                 Ok(retry_at) => retry_at,
                 Err(error) => {
                     let failure = classify_execution_failure(&error);
@@ -397,7 +408,13 @@ impl SelfImprovementSupervisor {
         }
 
         let reconciliation = self
-            .reconcile_workspace_with(workspace_id.as_str(), &desired, true, now_unix)
+            .reconcile_workspace_with(
+                self.interactive_store.as_ref(),
+                workspace_id.as_str(),
+                &desired,
+                true,
+                now_unix,
+            )
             .await;
         if invalidates_execution {
             self.replace_workspace_execution_cancellation(workspace_id.as_str());
@@ -428,7 +445,7 @@ impl SelfImprovementSupervisor {
             return Ok(Vec::new());
         }
 
-        self.store
+        self.interactive_store
             .activate_self_improvement_workspace(workspace_id, Utc::now().timestamp())
             .await
             .with_context(|| {
@@ -437,7 +454,11 @@ impl SelfImprovementSupervisor {
                      `{workspace_id}`"
                 )
             })?;
-        super::overlay::load_active_agent_skill_overlay(self.store.as_ref(), workspace_id).await
+        super::overlay::load_active_agent_skill_overlay(
+            self.interactive_store.as_ref(),
+            workspace_id,
+        )
+        .await
     }
 
     /// Executes the real production wake. Tests call this method only to
@@ -490,7 +511,7 @@ impl SelfImprovementSupervisor {
         now_unix: i64,
     ) -> Result<Vec<String>> {
         let workspaces = self
-            .workspace_manager
+            .maintenance_workspace_manager
             .list_workspaces()
             .await
             .map_err(|error| {
@@ -504,6 +525,7 @@ impl SelfImprovementSupervisor {
                 .unwrap_or_default();
             if self
                 .reconcile_workspace_with(
+                    self.maintenance_store.as_ref(),
                     workspace.id.as_str(),
                     &workspace_desired,
                     workspace.is_active,
@@ -519,6 +541,7 @@ impl SelfImprovementSupervisor {
 
     async fn reconcile_workspace_with(
         &self,
+        store: &CrudStore,
         workspace_id: &str,
         desired: &GatewaySelfImprovementConfig,
         workspace_is_active: bool,
@@ -526,8 +549,7 @@ impl SelfImprovementSupervisor {
     ) -> Result<bool> {
         let authoritative = self.authoritative_settings_from(desired, Some(workspace_id));
         if authoritative.effective_enabled && workspace_is_active {
-            let state = self
-                .store
+            let state = store
                 .activate_self_improvement_workspace(workspace_id, now_unix)
                 .await
                 .with_context(|| {
@@ -535,12 +557,18 @@ impl SelfImprovementSupervisor {
                         "failed to reconcile enabled self-improvement workspace `{workspace_id}`"
                     )
                 })?;
-            self.reconcile_unfinished_authority(workspace_id, &state, &authoritative, now_unix)
-                .await?;
+            self.reconcile_unfinished_authority(
+                store,
+                workspace_id,
+                &state,
+                &authoritative,
+                now_unix,
+            )
+            .await?;
             return Ok(true);
         }
 
-        self.store
+        store
             .deactivate_self_improvement_workspace(workspace_id, now_unix)
             .await
             .with_context(|| {
@@ -551,13 +579,13 @@ impl SelfImprovementSupervisor {
 
     async fn reconcile_unfinished_authority(
         &self,
+        store: &CrudStore,
         workspace_id: &str,
         state: &pioneer_crud::SelfImprovementWorkspaceStateRecord,
         authoritative: &AuthoritativeSelfImprovementSettings,
         now_unix: i64,
     ) -> Result<()> {
-        let Some(run) = self
-            .store
+        let Some(run) = store
             .get_oldest_unresolved_self_improvement_run(workspace_id, state.activation_epoch)
             .await?
         else {
@@ -595,15 +623,13 @@ impl SelfImprovementSupervisor {
             return Ok(());
         }
 
-        match self
-            .store
+        match store
             .reset_unfinished_self_improvement_run_authority(&run, &authority, now_unix)
             .await?
         {
             SelfImprovementRunMutationResult::Applied => Ok(()),
             SelfImprovementRunMutationResult::LostAuthority => {
-                let current = self
-                    .store
+                let current = store
                     .get_self_improvement_run(workspace_id, run.id.as_str())
                     .await?;
                 if current.as_ref().is_none_or(|current| {
@@ -703,7 +729,7 @@ impl SelfImprovementSupervisor {
 
     async fn process_workspace(&self, workspace_id: &str, now_unix: i64) -> Result<()> {
         let state = self
-            .store
+            .maintenance_store
             .get_self_improvement_workspace_state(workspace_id)
             .await?
             .with_context(|| {
@@ -715,7 +741,7 @@ impl SelfImprovementSupervisor {
         };
 
         if let Some(oldest) = self
-            .store
+            .maintenance_store
             .get_oldest_unresolved_self_improvement_run(workspace_id, state.activation_epoch)
             .await?
         {
@@ -732,7 +758,7 @@ impl SelfImprovementSupervisor {
         }
 
         let selected_sources = self
-            .store
+            .maintenance_store
             .list_self_improvement_source_turns_after(
                 workspace_id,
                 state.cursor_source_id,
@@ -758,7 +784,7 @@ impl SelfImprovementSupervisor {
             .format("%Y-%m-%d")
             .to_string();
         let run = self
-            .store
+            .maintenance_store
             .create_or_get_self_improvement_run(
                 NewSelfImprovementRun {
                     workspace_id: workspace_id.to_owned(),
@@ -793,13 +819,13 @@ impl SelfImprovementSupervisor {
                 return Ok(());
             }
             match self
-                .store
+                .maintenance_store
                 .requeue_failed_self_improvement_run(&run, now_unix)
                 .await?
             {
                 SelfImprovementRunMutationResult::Applied => {
                     run = self
-                        .store
+                        .maintenance_store
                         .get_self_improvement_run(run.workspace_id.as_str(), run.id.as_str())
                         .await?
                         .context("requeued self-improvement run disappeared")?;
@@ -835,7 +861,7 @@ impl SelfImprovementSupervisor {
         effective_enabled_at: i64,
     ) -> Result<SelfImprovementFrozenSourceRange> {
         let anchors = self
-            .store
+            .maintenance_store
             .list_frozen_self_improvement_source_range(
                 run.workspace_id.as_str(),
                 run.source_lower_exclusive,
@@ -858,7 +884,7 @@ impl SelfImprovementSupervisor {
         now_unix: i64,
     ) -> Result<()> {
         let Some(claimed) = self
-            .store
+            .maintenance_store
             .claim_available_self_improvement_run(
                 run.workspace_id.as_str(),
                 run.id.as_str(),
@@ -940,7 +966,7 @@ impl SelfImprovementSupervisor {
             && run.attempt_count < MAX_INFRASTRUCTURE_ATTEMPTS
         {
             let retry_at = now_unix.saturating_add(retry_backoff_seconds(run.attempt_count));
-            self.store
+            self.maintenance_store
                 .return_self_improvement_run_to_pending(
                     &fence,
                     now_unix,
@@ -949,7 +975,7 @@ impl SelfImprovementSupervisor {
                 )
                 .await?
         } else {
-            self.store
+            self.maintenance_store
                 .fail_claimed_self_improvement_run(&fence, now_unix, safe_error.as_str())
                 .await?
         };
@@ -971,7 +997,7 @@ impl SelfImprovementSupervisor {
             .with_context(|| format!("claimed run `{}` has no execution fence", run.id))?;
         let lease_clock = RunLeaseClock::new(now_unix);
         let canonical = self
-            .store
+            .maintenance_store
             .list_canonical_turn_events_for_self_improvement(&frozen_range)
             .await?;
         let snapshot = build_model_safe_full_thread_snapshot(&frozen_range, canonical.as_slice())?;
@@ -1047,7 +1073,7 @@ impl SelfImprovementSupervisor {
             }
             let (cursor, digest) = analysis.encode()?;
             match self
-                .store
+                .maintenance_store
                 .save_self_improvement_run_checkpoint(
                     &fence,
                     cursor.as_str(),
@@ -1082,7 +1108,7 @@ impl SelfImprovementSupervisor {
         }
 
         let active = self
-            .store
+            .maintenance_store
             .list_active_agent_skill_versions(run.workspace_id.as_str())
             .await?;
         let mut authorized_targets = Vec::with_capacity(active.len());
@@ -1090,7 +1116,7 @@ impl SelfImprovementSupervisor {
             let rollback_parent = match snapshot.version.parent_version_id.as_deref() {
                 Some(parent_version_id) => {
                     let parent = self
-                        .store
+                        .maintenance_store
                         .get_agent_skill_version(run.workspace_id.as_str(), parent_version_id)
                         .await?
                         .with_context(|| {
@@ -1116,7 +1142,7 @@ impl SelfImprovementSupervisor {
                 active: snapshot.clone(),
                 rollback_parent,
                 next_version_number: self
-                    .store
+                    .maintenance_store
                     .get_next_agent_skill_version_number(
                         run.workspace_id.as_str(),
                         &snapshot.skill_id,
@@ -1149,7 +1175,7 @@ impl SelfImprovementSupervisor {
             .map(super::overlay::agent_skill_runtime_entry)
             .collect::<Vec<_>>();
         let existing_fingerprints = self
-            .store
+            .maintenance_store
             .list_agent_skill_version_fingerprints(run.workspace_id.as_str())
             .await?
             .into_iter()
@@ -1324,7 +1350,7 @@ impl SelfImprovementSupervisor {
     ) -> Result<()> {
         let now_unix = lease_clock.now_unix();
         match self
-            .store
+            .maintenance_store
             .yield_self_improvement_run_after_budget(
                 fence,
                 now_unix,
@@ -1403,7 +1429,7 @@ impl SelfImprovementSupervisor {
 
     async fn refresh_lease(&self, fence: &SelfImprovementRunFence, now_unix: i64) -> Result<()> {
         match self
-            .store
+            .maintenance_store
             .heartbeat_self_improvement_run(
                 fence,
                 now_unix,
@@ -1464,7 +1490,7 @@ impl SelfImprovementSupervisor {
             pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
         };
         let result = self
-            .store
+            .maintenance_store
             .finalize_self_improvement_run(
                 FinalizeSelfImprovementRunInput {
                     fence,

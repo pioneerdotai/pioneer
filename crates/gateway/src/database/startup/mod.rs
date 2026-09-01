@@ -86,7 +86,8 @@ pub(crate) struct ThreadEpisodicWorkspaceRefillLease {
 pub(crate) async fn enforce_execution_authority_integrity(
     crud_store: &CrudStore,
 ) -> anyhow::Result<()> {
-    execution_authority_integrity::run(crud_store).await
+    let crud_store = crud_store.with_maintenance_access();
+    execution_authority_integrity::run(&crud_store).await
 }
 
 impl ThreadEpisodicWorkspaceRefillSupervisor {
@@ -318,7 +319,7 @@ async fn run_inner(
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
 ) -> anyhow::Result<()> {
-    let crud_store = Arc::new(crud_store.with_background_write_admission());
+    let crud_store = Arc::new(crud_store.with_maintenance_access());
     let interrupted_before_unix = chrono::Utc::now().timestamp();
     let trace = pioneer_observability::GatewayOperationTrace::start(
         pioneer_observability::GatewayOperation::DatabaseStartupMaintenance,

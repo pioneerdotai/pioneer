@@ -11,7 +11,7 @@ use tracing::info;
 use crate::workspace::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
 pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
-    let connection = connection.into();
+    let connection = connection.into().maintenance();
     let patch_intents =
         pioneer_tools::apply_patch::history::SqliteCommitIntentStore::new(connection.clone());
     let patch_records =

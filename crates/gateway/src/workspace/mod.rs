@@ -3,7 +3,7 @@ use pioneer_entity::workspace;
 use pioneer_protocol::Workspace;
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    SqliteWriteCoordinator, is_sqlite_lock_message, retry_with_backoff,
+    is_sqlite_lock_message, retry_with_backoff,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
@@ -48,23 +48,17 @@ impl std::error::Error for WorkspaceError {}
 #[derive(Clone)]
 pub struct WorkspaceManager {
     connection: SqliteDatabase,
-    write_coordinator: SqliteWriteCoordinator,
 }
 
 impl WorkspaceManager {
-    #[cfg(test)]
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
-        Self::new_with_write_coordinator(connection, SqliteWriteCoordinator::default())
-    }
-
-    pub fn new_with_write_coordinator(
-        connection: impl Into<SqliteDatabase>,
-        write_coordinator: SqliteWriteCoordinator,
-    ) -> Self {
         Self {
             connection: connection.into(),
-            write_coordinator,
         }
+    }
+
+    pub(crate) fn with_database(&self, connection: SqliteDatabase) -> Self {
+        Self { connection }
     }
 
     pub async fn validate_workspace_id(
@@ -440,9 +434,14 @@ impl WorkspaceManager {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, WorkspaceError>>,
     {
-        self.write_coordinator
-            .run_serialized_with_retry(operation, is_workspace_sqlite_lock_error)
-            .await
+        let mut operation = operation;
+        retry_with_backoff(
+            || self.connection.run_write_operation(operation()),
+            is_workspace_sqlite_lock_error,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
     }
 }
 
@@ -866,6 +865,27 @@ mod tests {
             .await
             .expect("workspace list should succeed");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manager_preserves_the_typed_database_scope() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection)
+            .maintenance()
+            .with_critical_writes();
+
+        let manager = WorkspaceManager::new(database);
+
+        assert_eq!(
+            manager.connection.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            manager.connection.write_class(),
+            pioneer_sqlite::SqliteWriteClass::Critical
+        );
     }
 
     async fn setup_workspace_manager() -> WorkspaceManager {

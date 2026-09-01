@@ -31,7 +31,7 @@ use sea_orm::sea_query::{OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
     ExprTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
-    TransactionTrait, TryGetable,
+    TransactionSession, TransactionTrait, TryGetable,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -4470,7 +4470,7 @@ pub async fn compact_terminal_agent_action_ledger<C>(
     limit: u64,
 ) -> Result<AgentActionLedgerCompactionSummary>
 where
-    C: ConnectionTrait + TransactionTrait<Transaction = DatabaseTransaction>,
+    C: ConnectionTrait + TransactionTrait,
 {
     if limit == 0 {
         return Ok(AgentActionLedgerCompactionSummary::default());

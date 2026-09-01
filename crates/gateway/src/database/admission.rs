@@ -1,21 +1,18 @@
 use std::sync::Arc;
 
 use pioneer_observability::{DatabaseAdmissionMetric, record_database_admission};
-use pioneer_sqlite::{
-    SqliteAdmissionEvent, SqliteAdmissionObserver, SqliteAdmissionQueueSnapshot,
-    SqliteWriteCoordinator,
-};
+use pioneer_sqlite::{SqliteWriteEvent, SqliteWriteObserver, SqliteWriteQueueSnapshot};
 
 #[derive(Default)]
-struct GatewaySqliteAdmissionObserver;
+struct GatewaySqliteWriteObserver;
 
-impl SqliteAdmissionObserver for GatewaySqliteAdmissionObserver {
-    fn observe(&self, event: SqliteAdmissionEvent) {
+impl SqliteWriteObserver for GatewaySqliteWriteObserver {
+    fn observe(&self, event: SqliteWriteEvent) {
         let metric = match event {
-            SqliteAdmissionEvent::Enqueued { class, queue } => {
+            SqliteWriteEvent::Enqueued { class, queue } => {
                 admission_metric("enqueued", class.as_str(), "none", queue, None, None)
             }
-            SqliteAdmissionEvent::Acquired {
+            SqliteWriteEvent::Acquired {
                 class,
                 reason,
                 waited,
@@ -28,10 +25,10 @@ impl SqliteAdmissionObserver for GatewaySqliteAdmissionObserver {
                 Some(waited),
                 None,
             ),
-            SqliteAdmissionEvent::Released { class, held, queue } => {
+            SqliteWriteEvent::Released { class, held, queue } => {
                 admission_metric("released", class.as_str(), "none", queue, None, Some(held))
             }
-            SqliteAdmissionEvent::Cancelled {
+            SqliteWriteEvent::Cancelled {
                 class,
                 waited,
                 queue,
@@ -52,7 +49,7 @@ fn admission_metric(
     event: &'static str,
     class: &'static str,
     reason: &'static str,
-    queue: SqliteAdmissionQueueSnapshot,
+    queue: SqliteWriteQueueSnapshot,
     waited: Option<std::time::Duration>,
     held: Option<std::time::Duration>,
 ) -> DatabaseAdmissionMetric {
@@ -60,13 +57,14 @@ fn admission_metric(
         event,
         class,
         reason,
-        foreground_queue: queue.foreground as u64,
-        background_queue: queue.background as u64,
+        critical_queue: u64::try_from(queue.critical).unwrap_or(u64::MAX),
+        interactive_queue: u64::try_from(queue.interactive).unwrap_or(u64::MAX),
+        maintenance_queue: u64::try_from(queue.maintenance).unwrap_or(u64::MAX),
         waited,
         held,
     }
 }
 
-pub(crate) fn new_write_coordinator() -> SqliteWriteCoordinator {
-    SqliteWriteCoordinator::with_observer(Arc::new(GatewaySqliteAdmissionObserver))
+pub(crate) fn write_observer() -> Arc<dyn SqliteWriteObserver> {
+    Arc::new(GatewaySqliteWriteObserver)
 }

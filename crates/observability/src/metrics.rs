@@ -79,16 +79,17 @@ pub struct DatabasePoolSnapshot {
     pub idle: u64,
 }
 
-/// One low-cardinality observation emitted by the Gateway's fair SQLite
-/// admission controller. Values are selected from finite runtime enums; no
+/// One low-cardinality observation emitted by the Gateway's SQLite writer
+/// executor. Values are selected from finite runtime enums; no
 /// SQL, IDs, paths, or error text are accepted here.
 #[derive(Clone, Copy, Debug)]
 pub struct DatabaseAdmissionMetric {
     pub event: &'static str,
     pub class: &'static str,
     pub reason: &'static str,
-    pub foreground_queue: u64,
-    pub background_queue: u64,
+    pub critical_queue: u64,
+    pub interactive_queue: u64,
+    pub maintenance_queue: u64,
     pub waited: Option<Duration>,
     pub held: Option<Duration>,
 }
@@ -1027,19 +1028,27 @@ pub fn record_database_admission(metric: DatabaseAdmissionMetric) {
     ];
     metrics.database_admission_events.add(1, &attributes);
     metrics.database_admission_queue_depth.record(
-        metric.foreground_queue,
+        metric.critical_queue,
         &[
             attributes[0].clone(),
             attributes[1].clone(),
-            KeyValue::new("db.admission.queue.class", "foreground"),
+            KeyValue::new("db.admission.queue.class", "critical"),
         ],
     );
     metrics.database_admission_queue_depth.record(
-        metric.background_queue,
+        metric.interactive_queue,
         &[
             attributes[0].clone(),
             attributes[1].clone(),
-            KeyValue::new("db.admission.queue.class", "background"),
+            KeyValue::new("db.admission.queue.class", "interactive"),
+        ],
+    );
+    metrics.database_admission_queue_depth.record(
+        metric.maintenance_queue,
+        &[
+            attributes[0].clone(),
+            attributes[1].clone(),
+            KeyValue::new("db.admission.queue.class", "maintenance"),
         ],
     );
     if let Some(waited) = metric.waited {

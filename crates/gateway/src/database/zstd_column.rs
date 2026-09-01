@@ -190,6 +190,8 @@ async fn run_periodic_maintenance(
     cancellation: Option<&tokio_util::sync::CancellationToken>,
     row_inspection: RowInspection,
 ) -> Result<ZstdPeriodicMaintenanceOutcome> {
+    let crud_store = crud_store.with_maintenance_access();
+    let crud_store = &crud_store;
     if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         return Ok(ZstdPeriodicMaintenanceOutcome {
             cancelled: true,
@@ -363,7 +365,7 @@ async fn ensure_compression_enabled(
             skipped_empty = true;
         } else {
             mark_compression_backfilling(db, config).await?;
-            if let Err(error) = enable_transparent_compression(db.writer(), config).await {
+            if let Err(error) = enable_transparent_compression(&db.maintenance(), config).await {
                 mark_compression_failed(db, config, &error).await?;
                 return Err(error);
             }
@@ -441,17 +443,17 @@ async fn compression_is_enabled(db: &SqliteDatabase, config: ZstdColumnConfig) -
     Ok(backing_table > 0 && compressed_view > 0)
 }
 
-async fn enable_transparent_compression<C>(db: &C, config: ZstdColumnConfig) -> Result<()>
-where
-    C: ConnectionTrait,
-{
+async fn enable_transparent_compression(
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+) -> Result<()> {
     let sqlite_zstd_config = json!({
         "table": config.table,
         "column": config.column,
         "compression_level": 19,
         "dict_chooser": config.dict_chooser
     });
-    db.query_one_raw(Statement::from_sql_and_values(
+    db.query_one_write_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "SELECT zstd_enable_transparent(?) AS value",
         [sqlite_zstd_config.to_string().into()],
@@ -477,8 +479,8 @@ async fn run_maintenance(
         }
         None => format!("SELECT zstd_incremental_maintenance(NULL, {target_db_load}) AS value"),
     };
-    let result = query_i64(
-        db.writer(),
+    let result = query_i64_on_writer(
+        &db.maintenance(),
         sql.as_str(),
         "failed to run sqlite-zstd maintenance",
     )
@@ -541,6 +543,23 @@ where
         .context("query unexpectedly returned no rows")?;
     row.try_get::<i64>("", "value")
         .with_context(|| format!("{error_context}: failed to decode value"))
+}
+
+async fn query_i64_on_writer(
+    db: &SqliteDatabase,
+    sql: &str,
+    error_context: &'static str,
+) -> Result<i64> {
+    let row = db
+        .query_one_write_raw(Statement::from_string(
+            db.get_database_backend(),
+            sql.to_owned(),
+        ))
+        .await
+        .with_context(|| error_context.to_owned())?
+        .context(error_context)?;
+    row.try_get::<i64>("", "value")
+        .with_context(|| error_context.to_owned())
 }
 
 async fn mark_compression_backfilling<C>(db: &C, config: ZstdColumnConfig) -> Result<()>
@@ -670,7 +689,9 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, find_projection_meta};
     use pioneer_protocol::{AgentMessagePhase, TurnItem};
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement, TransactionTrait,
+    };
     use std::sync::Arc;
     use tokio::sync::Notify;
 
@@ -1129,7 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_maintenance_queues_behind_foreground_and_then_progresses() {
+    async fn periodic_maintenance_queues_behind_interactive_write_and_then_progresses() {
         pioneer_sqlite::zstd::register_auto_extension_once()
             .expect("sqlite-zstd auto-extension should register");
         let connection = Database::connect("sqlite::memory:")
@@ -1141,20 +1162,23 @@ mod tests {
         insert_turn_events(&connection, 3).await;
 
         let store = CrudStore::new(connection);
-        let foreground_store = store.clone();
+        let interactive_store = store.clone();
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let foreground = tokio::spawn({
+        let interactive = tokio::spawn({
             let entered = entered.clone();
             let release = release.clone();
             async move {
-                let permit = foreground_store
-                    .write_coordinator()
-                    .acquire_foreground()
-                    .await;
+                let database = interactive_store
+                    .database_connection()
+                    .with_interactive_writes();
+                let transaction = database.begin().await.expect("begin interactive writer");
                 entered.notify_one();
                 release.notified().await;
-                drop(permit);
+                transaction
+                    .commit()
+                    .await
+                    .expect("commit interactive writer");
             }
         });
 
@@ -1173,7 +1197,7 @@ mod tests {
         assert!(!maintenance.is_finished());
 
         release.notify_one();
-        foreground.await.expect("foreground task should join");
+        interactive.await.expect("interactive task should join");
         let outcome = maintenance
             .await
             .expect("maintenance task should join")

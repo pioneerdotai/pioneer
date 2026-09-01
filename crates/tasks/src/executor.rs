@@ -63,6 +63,16 @@ impl TaskExecutionHandle {
         self.run_id.as_str()
     }
 
+    /// Reclassifies durable executor-lifecycle writes independently from the
+    /// scheduler or reconciler which created this handle. Those producers do
+    /// maintenance discovery, but once a run is handed to its executor its
+    /// lease, progress, and terminal transitions are control-plane state.
+    pub fn with_critical_writes(mut self) -> Self {
+        self.store = Arc::new(self.store.with_critical_writes());
+        self.projector = TaskProjector::new(self.store.clone());
+        self
+    }
+
     pub async fn link_child_thread_with_runtime(
         &self,
         lineage: TaskThreadLineage,

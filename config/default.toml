@@ -274,7 +274,7 @@ circuit_breaker_open_ms = 30000
 
 [gateway.database]
 file_name = "gateway.db"
-# Parallel read-only connections. Gateway writes use a separate single connection.
+# Parallel read-only connections (runtime minimum: 4). Gateway writes use a separate single connection.
 max_connections = 4
 connect_timeout_ms = 5000
 acquire_timeout_ms = 30000

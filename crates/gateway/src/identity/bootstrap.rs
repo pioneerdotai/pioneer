@@ -13,7 +13,10 @@ use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
     is_anyhow_sqlite_lock, retry_with_backoff,
 };
-use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
+use sea_orm::{
+    ConnectionTrait, SqliteTransactionMode, TransactionOptions, TransactionSession,
+    TransactionTrait,
+};
 use std::time::Duration;
 
 use super::invariants::validate_identity_invariants;
@@ -54,14 +57,17 @@ pub(crate) struct IdentityBootstrapOutcome {
     pub superuser_created: bool,
 }
 
-struct IdentityBootstrapTransaction {
-    transaction: DatabaseTransaction,
+struct IdentityBootstrapTransaction<T> {
+    transaction: T,
     snapshot: IdentityBootstrapSnapshot,
     gateway_created: bool,
     superuser_created: bool,
 }
 
-impl IdentityBootstrapTransaction {
+impl<T> IdentityBootstrapTransaction<T>
+where
+    T: ConnectionTrait + TransactionSession,
+{
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> &IdentityBootstrapSnapshot {
         &self.snapshot
@@ -108,7 +114,7 @@ impl IdentityBootstrapTransaction {
 pub(crate) async fn bootstrap_identity(
     connection: impl Into<SqliteDatabase>,
 ) -> Result<IdentityBootstrapOutcome> {
-    let connection = connection.into();
+    let connection = connection.into().maintenance();
     let mut bootstrap = begin_identity_bootstrap(&connection).await?;
     let (gateway_created, superuser_created) = bootstrap.created_flags();
     let work = async {
@@ -135,9 +141,11 @@ pub(crate) async fn bootstrap_identity(
     }
 }
 
-async fn begin_identity_bootstrap<D>(connection: &D) -> Result<IdentityBootstrapTransaction>
+async fn begin_identity_bootstrap<D>(
+    connection: &D,
+) -> Result<IdentityBootstrapTransaction<D::Transaction>>
 where
-    D: TransactionTrait<Transaction = DatabaseTransaction>,
+    D: TransactionTrait,
 {
     retry_with_backoff(
         || begin_identity_bootstrap_once(connection),
@@ -148,9 +156,11 @@ where
     .await
 }
 
-async fn begin_identity_bootstrap_once<D>(connection: &D) -> Result<IdentityBootstrapTransaction>
+async fn begin_identity_bootstrap_once<D>(
+    connection: &D,
+) -> Result<IdentityBootstrapTransaction<D::Transaction>>
 where
-    D: TransactionTrait<Transaction = DatabaseTransaction>,
+    D: TransactionTrait,
 {
     let transaction = connection
         .begin_with_options(TransactionOptions {
@@ -177,9 +187,12 @@ where
     }
 }
 
-async fn load_or_create_identity(
-    transaction: &DatabaseTransaction,
-) -> Result<(IdentityBootstrapSnapshot, bool, bool)> {
+async fn load_or_create_identity<C>(
+    transaction: &C,
+) -> Result<(IdentityBootstrapSnapshot, bool, bool)>
+where
+    C: ConnectionTrait,
+{
     let (gateway, gateway_created) = match load_gateway_singleton(transaction).await? {
         Some(existing) => (existing, false),
         None => {

@@ -3,7 +3,8 @@ use anyhow::anyhow;
 use pioneer_entity::{thread, turn, turn_mcp_projection};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    DatabaseTransaction, EntityTrait, Set, TransactionTrait, entity::prelude::DateTimeWithTimeZone,
+    ConnectionTrait, EntityTrait, Set, TransactionSession, TransactionTrait,
+    entity::prelude::DateTimeWithTimeZone,
 };
 use std::error::Error;
 use std::fmt;
@@ -125,7 +126,7 @@ pub async fn replace_turn_mcp_projection<D>(
     replacement: &TurnMcpProjectionReplacement,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
 where
-    D: TransactionTrait<Transaction = DatabaseTransaction>,
+    D: TransactionTrait,
 {
     replace_turn_mcp_projection_inner(db, replacement, None, AtomicProjectionReplaceFault::None)
         .await
@@ -137,7 +138,7 @@ pub async fn replace_turn_mcp_projection_with_authorization_context<D>(
     authorization_context_json: &str,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
 where
-    D: TransactionTrait<Transaction = DatabaseTransaction>,
+    D: TransactionTrait,
 {
     replace_turn_mcp_projection_inner(
         db,
@@ -158,7 +159,7 @@ pub(crate) enum AtomicProjectionReplaceFault {
 
 #[cfg(test)]
 pub(crate) async fn replace_turn_mcp_projection_with_fault(
-    db: &impl TransactionTrait<Transaction = DatabaseTransaction>,
+    db: &impl TransactionTrait,
     replacement: &TurnMcpProjectionReplacement,
     fault: AtomicProjectionReplaceFault,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
@@ -172,7 +173,7 @@ async fn replace_turn_mcp_projection_inner<D>(
     fault: AtomicProjectionReplaceFault,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
 where
-    D: TransactionTrait<Transaction = DatabaseTransaction>,
+    D: TransactionTrait,
 {
     validate_replacement_shape(replacement)?;
     let transaction = db
@@ -216,11 +217,14 @@ where
     }
 }
 
-async fn replace_in_transaction(
-    transaction: &sea_orm::DatabaseTransaction,
+async fn replace_in_transaction<C>(
+    transaction: &C,
     replacement: &TurnMcpProjectionReplacement,
     fault: AtomicProjectionReplaceFault,
-) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError> {
+) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
+where
+    C: ConnectionTrait,
+{
     validate_turn_workspace(transaction, &replacement.projection).await?;
     let created_at = unix_to_datetime(replacement.projection.created_at_unix)?;
 
@@ -323,10 +327,13 @@ fn validate_replacement_shape(
     Ok(())
 }
 
-async fn validate_turn_workspace(
-    transaction: &sea_orm::DatabaseTransaction,
+async fn validate_turn_workspace<C>(
+    transaction: &C,
     projection: &TurnMcpProjectionRecord,
-) -> Result<(), TurnMcpProjectionPersistenceError> {
+) -> Result<(), TurnMcpProjectionPersistenceError>
+where
+    C: ConnectionTrait,
+{
     let turn = turn::Entity::find_by_id(projection.turn_id.clone())
         .one(transaction)
         .await

@@ -1334,7 +1334,7 @@ impl ProviderProbeScheduler {
         force_if_running: bool,
         only: Option<&HashSet<String>>,
     ) -> Option<HashSet<String>> {
-        let message_processor = self.processor.upgrade()?;
+        let message_processor = self.processor.upgrade()?.for_background_reconciliation();
         let workspaces = match message_processor.workspace_manager.list_workspaces().await {
             Ok(workspaces) => workspaces,
             Err(error) => {
@@ -1394,7 +1394,10 @@ impl ProviderProbeScheduler {
                     .await
                     .map_err(|_| anyhow::anyhow!("provider warm-up concurrency limiter closed"))?;
                 queue_stage.succeed();
-                if let Some(processor) = processor.upgrade() {
+                if let Some(processor) = processor
+                    .upgrade()
+                    .map(|processor| processor.for_background_reconciliation())
+                {
                     processor
                         .perform_provider_warmup(
                             workspace_id.as_str(),

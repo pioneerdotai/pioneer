@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
-use migration::{Migrator, MigratorTrait};
+use migration::Migrator;
 use pioneer_config::AppConfig;
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-    SqliteDatabase, apply_sqlite_pragmas, is_anyhow_sqlite_lock,
+    SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor, is_anyhow_sqlite_lock,
     normalize_relative_database_file_name, retry_with_backoff, sqlite_connection_url,
     sqlite_read_only_connection_url,
 };
@@ -21,6 +21,8 @@ struct GatewayDatabaseRuntimeConfig {
     idle_timeout: Duration,
     sqlx_logging: bool,
 }
+
+const MIN_READER_CONNECTIONS: u32 = 4;
 
 impl GatewayDatabaseRuntimeConfig {
     fn from_app_config(config: &AppConfig) -> Result<Self> {
@@ -46,7 +48,7 @@ impl GatewayDatabaseRuntimeConfig {
 
         Ok(Self {
             file_name,
-            max_connections: database.max_connections,
+            max_connections: database.max_connections.max(MIN_READER_CONNECTIONS),
             connect_timeout: Duration::from_millis(database.connect_timeout_ms),
             acquire_timeout: Duration::from_millis(database.acquire_timeout_ms),
             idle_timeout: Duration::from_millis(database.idle_timeout_ms),
@@ -106,9 +108,9 @@ async fn initialize_inner(
         .ping()
         .await
         .context("failed to ping gateway writer")?;
-
+    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer());
     retry_with_backoff(
-        || apply_sqlite_pragmas(&writer),
+        || writer.apply_pragmas(SqliteWriteClass::Maintenance),
         is_anyhow_sqlite_lock,
         DEFAULT_LOCK_RETRY_ATTEMPTS,
         Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
@@ -122,7 +124,8 @@ async fn initialize_inner(
         .map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseMigrate));
     retry_with_backoff(
         || async {
-            Migrator::up(&writer, None)
+            writer
+                .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
                 .await
                 .context("failed to apply gateway database migrations")
         },
@@ -163,7 +166,7 @@ async fn initialize_inner(
         "gateway database is ready"
     );
 
-    Ok(SqliteDatabase::new(reader, writer))
+    Ok(SqliteDatabase::from_executor(reader, writer))
 }
 
 fn connect_options(
@@ -361,12 +364,11 @@ mod tests {
         let database = super::initialize(runtime.path(), &config)
             .await
             .expect("initialize split Gateway database");
-        assert_eq!(database.reader().max_connections(), 4);
-        assert_eq!(database.writer().max_connections(), 1);
+        assert_eq!(database.reader_max_connections(), 4);
+        assert_eq!(database.writer_max_connections(), 1);
         assert!(
             database
-                .reader()
-                .query_only_enabled()
+                .reader_query_only_enabled()
                 .await
                 .expect("read query_only state")
         );
@@ -388,7 +390,6 @@ mod tests {
         assert_eq!(inserted.try_get::<String>("", "value").unwrap(), "ok");
 
         let selected = database
-            .reader()
             .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT value FROM routing_probe".to_owned(),
@@ -441,7 +442,7 @@ mod tests {
             .expect("sqlite-zstd probe row");
         assert!(extension_probe.try_get::<i64>("", "value").unwrap() > 0);
 
-        let transaction = database.writer().begin().await.expect("begin writer probe");
+        let transaction = database.begin().await.expect("begin writer probe");
         transaction
             .execute_unprepared("UPDATE routing_probe SET value = 'uncommitted'")
             .await
@@ -475,34 +476,17 @@ mod tests {
         );
         transaction.rollback().await.expect("rollback writer probe");
 
-        let execute_error = database
-            .reader()
-            .execute_unprepared("DELETE FROM routing_probe")
-            .await
-            .expect_err("reader execution API must reject writes");
-        assert!(execute_error.to_string().contains("SQLite read pool"));
-        let returning_error = database
-            .reader()
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "DELETE FROM routing_probe RETURNING id".to_owned(),
-            ))
-            .await
-            .expect_err("reader query API must reject write-returning statements");
-        assert!(returning_error.to_string().contains("SQLite read pool"));
-        let streaming_error = match database
-            .reader()
-            .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "DELETE FROM routing_probe RETURNING id".to_owned(),
-            ))
-            .await
-        {
-            Ok(_) => panic!("reader streaming API must reject write-returning statements"),
-            Err(error) => error,
-        };
-        assert!(streaming_error.to_string().contains("SQLite read pool"));
-
         database.close().await.expect("close both Gateway pools");
+    }
+
+    #[test]
+    fn reserves_four_reader_connections_even_for_legacy_single_connection_config() {
+        let mut config = pioneer_config::AppConfig::load().expect("load test config");
+        config.gateway.database.max_connections = 1;
+
+        let runtime = super::GatewayDatabaseRuntimeConfig::from_app_config(&config)
+            .expect("normalize database config");
+
+        assert_eq!(runtime.max_connections, super::MIN_READER_CONNECTIONS);
     }
 }

@@ -361,6 +361,13 @@ impl TimeoutSupervisor {
         }
     }
 
+    pub(crate) fn with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
+        Self {
+            crud_store,
+            policy_registry: self.policy_registry.clone(),
+        }
+    }
+
     pub fn deadlines_for_item(
         &self,
         item: &TurnItem,

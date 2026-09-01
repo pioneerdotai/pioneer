@@ -4,7 +4,7 @@ use pioneer_crud::{
     mark_gateway_auth_ready, scan_auth_persistence_invariants,
 };
 use pioneer_protocol::{PrincipalKind, PrincipalStatus};
-use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
+use sea_orm::{SqliteTransactionMode, TransactionOptions, TransactionSession, TransactionTrait};
 
 use crate::identity::IdentityBootstrapSnapshot;
 
@@ -15,7 +15,7 @@ pub(crate) async fn ensure_auth_readiness<D>(
     identity: &IdentityBootstrapSnapshot,
 ) -> Result<()>
 where
-    D: TransactionTrait<Transaction = DatabaseTransaction>,
+    D: TransactionTrait,
 {
     let transaction = database
         .begin_with_options(TransactionOptions {

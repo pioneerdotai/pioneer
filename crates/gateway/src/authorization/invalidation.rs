@@ -52,12 +52,34 @@ impl AuthorizationInvalidationHub {
     pub(crate) fn durable(store: Arc<CrudStore>) -> Self {
         Self {
             generation: AtomicU64::new(0),
-            store: Some(store),
+            // Policy generations and committed ACL invalidations fence every
+            // later authorization decision. They are control-plane writes,
+            // independent of whether the mutation which triggered them came
+            // from an interactive request or a recovery worker.
+            store: Some(Arc::new(store.with_critical_writes())),
         }
     }
 
     pub(crate) async fn current_generation(&self) -> Result<PolicyGeneration> {
-        if let Some(store) = &self.store {
+        self.current_generation_with_store(self.store.as_deref())
+            .await
+    }
+
+    pub(crate) async fn current_generation_for_maintenance(&self) -> Result<PolicyGeneration> {
+        match self.store.as_deref() {
+            Some(store) => {
+                let store = store.with_maintenance_reads_and_critical_writes();
+                self.current_generation_with_store(Some(&store)).await
+            }
+            None => self.current_generation_with_store(None).await,
+        }
+    }
+
+    async fn current_generation_with_store(
+        &self,
+        store: Option<&CrudStore>,
+    ) -> Result<PolicyGeneration> {
+        if let Some(store) = store {
             let fingerprint = RoleDefinitionRegistry::new().policy_fingerprint();
             let initialized = pioneer_crud::ensure_code_policy_generation(
                 &store.database_connection(),

@@ -306,16 +306,14 @@ impl MessageProcessor {
     }
 
     pub(super) async fn process_due_task_deliveries(&self, now: i64, limit: u64) -> Result<()> {
-        self.task_runtime
-            .service()
+        let task_service = self.task_runtime.background_control_service();
+        task_service
             .recover_stuck_deliveries(now, limit)
             .await
             .map_err(|error| anyhow!("{error:#}"))?;
         let deliveries = self.crud_store.list_due_task_deliveries(now, limit).await?;
         for delivery in deliveries {
-            let Some((delivery, attempt)) = self
-                .task_runtime
-                .service()
+            let Some((delivery, attempt)) = task_service
                 .start_delivery(delivery.id.as_str(), now)
                 .await
                 .map_err(|error| anyhow!("{error:#}"))?
@@ -347,8 +345,7 @@ impl MessageProcessor {
             if let Err(error) = execution_result {
                 let failed_at = now_timestamp_secs();
                 let _ = error;
-                self.task_runtime
-                    .service()
+                task_service
                     .fail_delivery(
                         delivery,
                         attempt,
@@ -561,7 +558,7 @@ impl MessageProcessor {
         response_fingerprint: Option<String>,
     ) -> Result<()> {
         self.task_runtime
-            .service()
+            .background_control_service()
             .complete_delivery(
                 delivery,
                 attempt,
@@ -1306,7 +1303,7 @@ impl MessageProcessor {
                 .await
         } else {
             self.task_runtime
-                .service()
+                .background_control_service()
                 .fail_delivery(
                     delivery,
                     attempt,

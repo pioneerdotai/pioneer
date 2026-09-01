@@ -1293,6 +1293,24 @@ impl TaskAgentExecutor {
             .ok_or_else(|| anyhow!("task agent executor is not bound"))
     }
 
+    fn task_reconciliation_processor(
+        &self,
+        origin: TaskChildReconciliationOrigin,
+    ) -> Result<Option<Arc<MessageProcessor>>> {
+        match self.processor() {
+            Ok(processor) => Ok(Some(match origin {
+                TaskChildReconciliationOrigin::Live => {
+                    processor.with_database_class(SqliteWriteClass::Critical)
+                }
+                TaskChildReconciliationOrigin::DurableBackground => {
+                    processor.for_background_reconciliation()
+                }
+            })),
+            Err(error) if error.to_string() == "task agent executor is not bound" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn root_collaboration_still_has_task_authority(
         processor: &Arc<MessageProcessor>,
         task_response: &TaskGetResponse,
@@ -1339,7 +1357,10 @@ impl TaskAgentExecutor {
         run: TaskRun,
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
-        let processor = self.processor()?;
+        let processor = self
+            .processor()?
+            .with_database_class(SqliteWriteClass::Critical);
+        let handle = handle.with_critical_writes();
         let Some(task_response) = processor.crud_store.get_task(run.task_id.as_str()).await? else {
             bail!("task `{}` not found", run.task_id);
         };
@@ -4134,8 +4155,7 @@ impl TaskAgentExecutor {
         handle: TaskExecutionHandle,
     ) -> Result<TaskExecutorStartOutcome> {
         match processor
-            .task_runtime
-            .service()
+            .critical_task_service()
             .acquire_write_locks_for_run(run.id.as_str(), now_timestamp_secs())
             .await?
         {
@@ -4165,16 +4185,13 @@ impl TaskAgentExecutor {
         &self,
         thread_id: &str,
         turn_id: &str,
+        origin: TaskChildReconciliationOrigin,
     ) -> Result<bool> {
-        let processor = match self.processor() {
-            Ok(processor) => processor,
-            Err(error) if error.to_string() == "task agent executor is not bound" => {
-                // Processors used without the task runtime have no task
-                // aggregate to reconcile; ordinary native terminal cleanup
-                // remains safe to complete.
-                return Ok(true);
-            }
-            Err(error) => return Err(error),
+        let Some(processor) = self.task_reconciliation_processor(origin)? else {
+            // Processors used without the task runtime have no task aggregate
+            // to reconcile; ordinary native terminal cleanup remains safe to
+            // complete.
+            return Ok(true);
         };
         let Some(child_runtime) =
             load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
@@ -4415,13 +4432,10 @@ impl TaskAgentExecutor {
         thread_id: &str,
         turn_id: &str,
         error_message: &str,
+        origin: TaskChildReconciliationOrigin,
     ) -> Result<bool> {
-        let processor = match self.processor() {
-            Ok(processor) => processor,
-            Err(error) if error.to_string() == "task agent executor is not bound" => {
-                return Ok(true);
-            }
-            Err(error) => return Err(error),
+        let Some(processor) = self.task_reconciliation_processor(origin)? else {
+            return Ok(true);
         };
         let Some(child_runtime) =
             load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
@@ -4500,13 +4514,10 @@ impl TaskAgentExecutor {
         thread_id: &str,
         turn_id: &str,
         reason: &str,
+        origin: TaskChildReconciliationOrigin,
     ) -> Result<bool> {
-        let processor = match self.processor() {
-            Ok(processor) => processor,
-            Err(error) if error.to_string() == "task agent executor is not bound" => {
-                return Ok(true);
-            }
-            Err(error) => return Err(error),
+        let Some(processor) = self.task_reconciliation_processor(origin)? else {
+            return Ok(true);
         };
         let Some(child_runtime) =
             load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
@@ -4551,13 +4562,10 @@ impl TaskAgentExecutor {
         thread_id: &str,
         turn_id: &str,
         reason: &str,
+        origin: TaskChildReconciliationOrigin,
     ) -> Result<bool> {
-        let processor = match self.processor() {
-            Ok(processor) => processor,
-            Err(error) if error.to_string() == "task agent executor is not bound" => {
-                return Ok(true);
-            }
-            Err(error) => return Err(error),
+        let Some(processor) = self.task_reconciliation_processor(origin)? else {
+            return Ok(true);
         };
         let Some(child_runtime) =
             load_child_runtime_for_turn(&processor, thread_id, turn_id).await?
@@ -4802,8 +4810,7 @@ impl TaskAgentExecutor {
             let reviewer_turn_id =
                 stable_review_turn_id(candidate.id.as_str(), reviewer_key.as_str());
             let reviewer_context = processor
-                .task_runtime
-                .service()
+                .critical_task_service()
                 .create_task_result_reviewer_context(CreateTaskResultReviewerContextParams {
                     candidate_id: candidate.id.clone(),
                     reviewer_index: index,
@@ -5772,8 +5779,7 @@ impl TaskAgentExecutor {
         );
         drop(adapter);
         processor
-            .task_runtime
-            .service()
+            .critical_task_service()
             .record_task_result_review_event_with_agent_action(
                 RecordTaskResultReviewEventParams {
                     candidate_id: candidate.id,
@@ -5851,7 +5857,10 @@ impl TaskAgentExecutor {
         target_status: TaskRunTurnStatus,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
-        let processor = self.processor()?;
+        let processor = self
+            .processor()?
+            .with_database_class(SqliteWriteClass::Critical);
+        let handle = handle.with_critical_writes();
         let failed_at = now_timestamp_secs();
         let error = task_error(
             "child_turn_failed",
@@ -5883,7 +5892,10 @@ impl TaskAgentExecutor {
         reason: &str,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
-        let processor = self.processor()?;
+        let processor = self
+            .processor()?
+            .with_database_class(SqliteWriteClass::Critical);
+        let handle = handle.with_critical_writes();
         let cancelled_at = now_timestamp_secs();
         let error = task_error(
             "child_turn_cancelled",
@@ -5919,7 +5931,10 @@ impl TaskAgentExecutor {
         reason: &str,
         handle: TaskExecutionHandle,
     ) -> Result<()> {
-        let processor = self.processor()?;
+        let processor = self
+            .processor()?
+            .with_database_class(SqliteWriteClass::Critical);
+        let handle = handle.with_critical_writes();
         let blocked_at = now_timestamp_secs();
         let error = task_error(
             "child_turn_blocked",
@@ -6006,7 +6021,10 @@ impl TaskExecutor for TaskAgentExecutor {
         reason: &str,
         handle: TaskExecutionHandle,
     ) -> pioneer_tasks::TaskRuntimeResult<()> {
-        let processor = self.processor()?;
+        let processor = self
+            .processor()?
+            .with_database_class(SqliteWriteClass::Critical);
+        let handle = handle.with_critical_writes();
         let task_run_turns = processor.crud_store.list_task_run_turns(run_id).await?;
         let cancelled_at = now_timestamp_secs();
         // Task cancellation owns the run terminal state. Commit it before
@@ -7616,6 +7634,7 @@ fn spawn_execution_heartbeat(
         let Some(owner) = processor.upgrade() else {
             return;
         };
+        let owner = owner.with_database_class(SqliteWriteClass::Critical);
         let Ok(Some(resource_state)) = pioneer_crud::load_agent_execution_resource_state(
             &owner.crud_store.database_connection(),
             execution_id.as_str(),
@@ -7648,6 +7667,7 @@ fn spawn_execution_heartbeat(
             let Some(processor) = processor.upgrade() else {
                 break;
             };
+            let processor = processor.with_database_class(SqliteWriteClass::Critical);
             let Ok(Some(execution)) = processor.crud_store.load_execution_for_run(&run_id).await
             else {
                 break;

@@ -29,6 +29,7 @@ impl MessageProcessor {
                         .reconcile_child_turn_completed(
                             turn.thread_id.as_str(),
                             turn.turn_id.as_str(),
+                            TaskChildReconciliationOrigin::DurableBackground,
                         )
                         .await
                 }
@@ -39,6 +40,7 @@ impl MessageProcessor {
                             turn.thread_id.as_str(),
                             turn.turn_id.as_str(),
                             error,
+                            TaskChildReconciliationOrigin::DurableBackground,
                         )
                         .await
                 }
@@ -52,6 +54,7 @@ impl MessageProcessor {
                             turn.thread_id.as_str(),
                             turn.turn_id.as_str(),
                             reason,
+                            TaskChildReconciliationOrigin::DurableBackground,
                         )
                         .await
                 }
@@ -62,6 +65,7 @@ impl MessageProcessor {
                             turn.thread_id.as_str(),
                             turn.turn_id.as_str(),
                             reason,
+                            TaskChildReconciliationOrigin::DurableBackground,
                         )
                         .await
                 }

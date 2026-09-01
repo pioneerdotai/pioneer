@@ -293,6 +293,7 @@ pub(super) async fn run(
     owner: super::RefillOwner,
     supervisor_cancellation: CancellationToken,
 ) {
+    let crud_store = Arc::new(crud_store.with_maintenance_access());
     let workspace_ids = match tokio::select! {
         _ = supervisor_cancellation.cancelled() => return,
         workspace_ids = crud_store.list_thread_episodic_refill_workspace_ids() => workspace_ids,
@@ -378,6 +379,7 @@ pub(super) async fn run_workspace(
     interrupted_before_unix: Option<i64>,
     cancellation: CancellationToken,
 ) {
+    let crud_store = Arc::new(crud_store.with_maintenance_access());
     if cancellation.is_cancelled() {
         return;
     }

@@ -252,7 +252,6 @@ async fn run_gateway_until_shutdown_inner(
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
     secrets_open_stage.succeed();
     let database = initialize_database(&runtime_home, &config, startup).await?;
-    let write_coordinator = database::new_write_coordinator();
 
     let database_bootstrap_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::DatabaseBootstrap);
@@ -287,13 +286,12 @@ async fn run_gateway_until_shutdown_inner(
     let auth = AuthAdmissionService::new(&config, &access_jwt_material, identity_snapshot.as_ref())
         .context("failed to initialize Gateway auth admission")?;
     let auth_service = Arc::new(
-        GatewayAuthService::new_with_write_coordinator(
+        GatewayAuthService::new(
             database.clone(),
             config.gateway.auth.clone(),
             identity_snapshot.clone(),
             &access_jwt_material,
             &credential_hmac_material,
-            write_coordinator.clone(),
         )
         .context("failed to initialize Gateway auth service")?,
     );
@@ -316,7 +314,7 @@ async fn run_gateway_until_shutdown_inner(
             "stale auth sessions were expired before auth readiness"
         );
     }
-    ensure_auth_readiness(&database, identity_snapshot.as_ref())
+    ensure_auth_readiness(&database.maintenance(), identity_snapshot.as_ref())
         .await
         .context("Gateway auth readiness failed")?;
     match gateway_secrets.purge_retired_superuser_jwt_tokens() {
@@ -363,14 +361,8 @@ async fn run_gateway_until_shutdown_inner(
     )?);
     let session_manager = Arc::new(SessionManager::new());
     auth_service.set_disconnect_hook(session_manager.clone());
-    let workspace_manager = Arc::new(WorkspaceManager::new_with_write_coordinator(
-        database.clone(),
-        write_coordinator.clone(),
-    ));
-    let crud_store = Arc::new(CrudStore::new_with_write_coordinator(
-        database.clone(),
-        write_coordinator,
-    ));
+    let workspace_manager = Arc::new(WorkspaceManager::new(database.clone()));
+    let crud_store = Arc::new(CrudStore::new(database.clone()));
     let configured_agent_runtimes =
         crate::cli_runtime::config::load_effective_cli_runtime_instances(runtime_home.as_path())
             .context("failed to load CLI runtime catalog during Gateway startup")?;
@@ -384,7 +376,7 @@ async fn run_gateway_until_shutdown_inner(
         &agent_identity_settings,
     )?;
     pioneer_crud::sync_cli_runtime_identity_catalog(
-        &database,
+        &database.maintenance(),
         agent_identity_catalog.as_slice(),
         chrono::Utc::now().fixed_offset(),
     )
@@ -395,8 +387,9 @@ async fn run_gateway_until_shutdown_inner(
         .context("Gateway execution authority integrity gate failed")?;
     let thread_manager = Arc::new(ThreadManager::from_app_config(&config));
 
+    let maintenance_workspace_manager = workspace_manager.with_database(database.maintenance());
     migrate_legacy_provider_api_keys_to_current_workspace(
-        workspace_manager.as_ref(),
+        &maintenance_workspace_manager,
         gateway_secrets.as_ref(),
     )
     .await;

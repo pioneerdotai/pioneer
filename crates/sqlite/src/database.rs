@@ -1,26 +1,58 @@
 use async_trait::async_trait;
 use sea_orm::{
-    AccessMode, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
-    ExecResult, IsolationLevel, QueryResult, Statement, StreamTrait, TransactionError,
-    TransactionOptions, TransactionTrait,
+    AccessMode, ConnectionTrait, DatabaseConnection, DbBackend, DbErr, ExecResult, IsolationLevel,
+    QueryResult, Statement, StreamTrait, TransactionError, TransactionOptions, TransactionTrait,
 };
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// A pool dedicated to ordinary SQLite reads.
+use crate::writer::{
+    SqliteQueryStream, SqliteTransaction, SqliteWriteClass, SqliteWriteConnection,
+    SqliteWriteExecutor, SqliteWriteObserver,
+};
+
+pub const DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS: usize = 1;
+
+/// Scheduling class for SQLite reads. Interactive reads use the pool
+/// directly; maintenance reads share one process-local permit so background
+/// work cannot consume every physical reader connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SqliteReadClass {
+    #[default]
+    Interactive,
+    Maintenance,
+}
+
+impl SqliteReadClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+/// The private owner of the physical SQLite read pool.
 ///
 /// The Gateway opens the underlying connections with SQLite's read-only flag
 /// and `PRAGMA query_only = ON`. This wrapper adds an API-level guard:
 /// mutation entry points and non-read statements are rejected before they can
-/// reach the pool.
+/// reach the pool. It deliberately never crosses the crate boundary: every
+/// query must carry a typed read class through [`SqliteDatabase`].
 #[derive(Clone, Debug)]
-pub struct SqliteReadPool {
+struct SqliteReadPool {
     connection: DatabaseConnection,
+    maintenance: Arc<Semaphore>,
 }
 
 impl SqliteReadPool {
-    pub fn new(connection: DatabaseConnection) -> Self {
-        Self { connection }
+    fn new(connection: DatabaseConnection) -> Self {
+        Self {
+            connection,
+            maintenance: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS)),
+        }
     }
 
     fn reject_write() -> DbErr {
@@ -35,14 +67,14 @@ impl SqliteReadPool {
         }
     }
 
-    pub fn max_connections(&self) -> u32 {
+    fn max_connections(&self) -> u32 {
         self.connection
             .get_sqlite_connection_pool()
             .options()
             .get_max_connections()
     }
 
-    pub async fn query_only_enabled(&self) -> Result<bool, DbErr> {
+    async fn query_only_enabled(&self) -> Result<bool, DbErr> {
         let row = self
             .connection
             .query_one_raw(Statement::from_string(
@@ -53,179 +85,49 @@ impl SqliteReadPool {
             .ok_or_else(|| DbErr::Custom("PRAGMA query_only returned no row".to_owned()))?;
         Ok(row.try_get::<i64>("", "query_only")? != 0)
     }
-}
 
-#[async_trait]
-impl ConnectionTrait for SqliteReadPool {
-    fn get_database_backend(&self) -> DbBackend {
-        self.connection.get_database_backend()
+    async fn acquire(&self, class: SqliteReadClass) -> Result<Option<OwnedSemaphorePermit>, DbErr> {
+        match class {
+            SqliteReadClass::Interactive => Ok(None),
+            SqliteReadClass::Maintenance => self
+                .maintenance
+                .clone()
+                .acquire_owned()
+                .await
+                .map(Some)
+                .map_err(|_| DbErr::Custom("SQLite maintenance read limiter closed".to_owned())),
+        }
     }
 
-    async fn execute_raw(&self, _statement: Statement) -> Result<ExecResult, DbErr> {
-        Err(Self::reject_write())
-    }
-
-    async fn execute_unprepared(&self, _sql: &str) -> Result<ExecResult, DbErr> {
-        Err(Self::reject_write())
-    }
-
-    async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
+    async fn query_one_raw(
+        &self,
+        class: SqliteReadClass,
+        statement: Statement,
+    ) -> Result<Option<QueryResult>, DbErr> {
         Self::ensure_read_statement(&statement)?;
+        let _permit = self.acquire(class).await?;
         self.connection.query_one_raw(statement).await
     }
 
-    async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
+    async fn query_all_raw(
+        &self,
+        class: SqliteReadClass,
+        statement: Statement,
+    ) -> Result<Vec<QueryResult>, DbErr> {
         Self::ensure_read_statement(&statement)?;
+        let _permit = self.acquire(class).await?;
         self.connection.query_all_raw(statement).await
     }
 
-    fn support_returning(&self) -> bool {
-        self.connection.support_returning()
-    }
-
-    fn is_mock_connection(&self) -> bool {
-        self.connection.is_mock_connection()
-    }
-}
-
-impl StreamTrait for SqliteReadPool {
-    type Stream<'a> = <DatabaseConnection as StreamTrait>::Stream<'a>;
-
-    fn get_database_backend(&self) -> DbBackend {
-        self.connection.get_database_backend()
-    }
-
-    fn stream_raw<'a>(
-        &'a self,
+    async fn stream_raw(
+        &self,
+        class: SqliteReadClass,
         statement: Statement,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
-        Box::pin(async move {
-            Self::ensure_read_statement(&statement)?;
-            self.connection.stream_raw(statement).await
-        })
-    }
-}
-
-/// The single SQLite writer contour. Transactions always originate here, so
-/// every query made through a write transaction remains on the writer.
-#[derive(Clone, Debug)]
-pub struct SqliteWriter {
-    connection: DatabaseConnection,
-}
-
-impl SqliteWriter {
-    pub fn new(connection: DatabaseConnection) -> Self {
-        Self { connection }
-    }
-
-    pub fn max_connections(&self) -> u32 {
-        self.connection
-            .get_sqlite_connection_pool()
-            .options()
-            .get_max_connections()
-    }
-}
-
-#[async_trait]
-impl ConnectionTrait for SqliteWriter {
-    fn get_database_backend(&self) -> DbBackend {
-        self.connection.get_database_backend()
-    }
-
-    async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
-        self.connection.execute_raw(statement).await
-    }
-
-    async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
-        self.connection.execute_unprepared(sql).await
-    }
-
-    async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
-        self.connection.query_one_raw(statement).await
-    }
-
-    async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
-        self.connection.query_all_raw(statement).await
-    }
-
-    fn support_returning(&self) -> bool {
-        self.connection.support_returning()
-    }
-
-    fn is_mock_connection(&self) -> bool {
-        self.connection.is_mock_connection()
-    }
-}
-
-impl StreamTrait for SqliteWriter {
-    type Stream<'a> = <DatabaseConnection as StreamTrait>::Stream<'a>;
-
-    fn get_database_backend(&self) -> DbBackend {
-        self.connection.get_database_backend()
-    }
-
-    fn stream_raw<'a>(
-        &'a self,
-        statement: Statement,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
-        self.connection.stream_raw(statement)
-    }
-}
-
-#[async_trait]
-impl TransactionTrait for SqliteWriter {
-    type Transaction = DatabaseTransaction;
-
-    async fn begin(&self) -> Result<Self::Transaction, DbErr> {
-        self.connection.begin().await
-    }
-
-    async fn begin_with_config(
-        &self,
-        isolation_level: Option<IsolationLevel>,
-        access_mode: Option<AccessMode>,
-    ) -> Result<Self::Transaction, DbErr> {
-        self.connection
-            .begin_with_config(isolation_level, access_mode)
-            .await
-    }
-
-    async fn begin_with_options(
-        &self,
-        options: TransactionOptions,
-    ) -> Result<Self::Transaction, DbErr> {
-        self.connection.begin_with_options(options).await
-    }
-
-    async fn transaction<F, T, E>(&self, callback: F) -> Result<T, TransactionError<E>>
-    where
-        F: for<'c> FnOnce(
-                &'c Self::Transaction,
-            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
-            + Send,
-        T: Send,
-        E: std::fmt::Display + std::fmt::Debug + Send,
-    {
-        self.connection.transaction(callback).await
-    }
-
-    async fn transaction_with_config<F, T, E>(
-        &self,
-        callback: F,
-        isolation_level: Option<IsolationLevel>,
-        access_mode: Option<AccessMode>,
-    ) -> Result<T, TransactionError<E>>
-    where
-        F: for<'c> FnOnce(
-                &'c Self::Transaction,
-            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
-            + Send,
-        T: Send,
-        E: std::fmt::Display + std::fmt::Debug + Send,
-    {
-        self.connection
-            .transaction_with_config(callback, isolation_level, access_mode)
-            .await
+    ) -> Result<SqliteQueryStream, DbErr> {
+        Self::ensure_read_statement(&statement)?;
+        let permit = self.acquire(class).await?;
+        let stream = self.connection.stream_raw(statement).await?;
+        Ok(SqliteQueryStream::read(stream, permit))
     }
 }
 
@@ -237,14 +139,30 @@ impl TransactionTrait for SqliteWriter {
 #[derive(Clone, Debug)]
 pub struct SqliteDatabase {
     reader: SqliteReadPool,
-    writer: SqliteWriter,
+    writer: SqliteWriteExecutor,
+    read_class: SqliteReadClass,
+    write_class: SqliteWriteClass,
 }
 
 impl SqliteDatabase {
     pub fn new(reader: DatabaseConnection, writer: DatabaseConnection) -> Self {
+        Self::from_executor(reader, SqliteWriteExecutor::new(writer))
+    }
+
+    pub fn new_with_observer(
+        reader: DatabaseConnection,
+        writer: DatabaseConnection,
+        observer: Arc<dyn SqliteWriteObserver>,
+    ) -> Self {
+        Self::from_executor(reader, SqliteWriteExecutor::with_observer(writer, observer))
+    }
+
+    pub fn from_executor(reader: DatabaseConnection, writer: SqliteWriteExecutor) -> Self {
         Self {
             reader: SqliteReadPool::new(reader),
-            writer: SqliteWriter::new(writer),
+            writer,
+            read_class: SqliteReadClass::Interactive,
+            write_class: SqliteWriteClass::Interactive,
         }
     }
 
@@ -255,33 +173,88 @@ impl SqliteDatabase {
         Self::new(connection.clone(), connection)
     }
 
-    pub fn reader(&self) -> &SqliteReadPool {
-        &self.reader
+    pub fn with_critical_writes(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.write_class = SqliteWriteClass::Critical;
+        scoped
     }
 
-    pub fn writer(&self) -> &SqliteWriter {
-        &self.writer
+    pub fn with_interactive_writes(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.write_class = SqliteWriteClass::Interactive;
+        scoped
+    }
+
+    pub fn maintenance(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.read_class = SqliteReadClass::Maintenance;
+        scoped.write_class = SqliteWriteClass::Maintenance;
+        scoped
+    }
+
+    pub const fn read_class(&self) -> SqliteReadClass {
+        self.read_class
+    }
+
+    pub const fn write_class(&self) -> SqliteWriteClass {
+        self.write_class
+    }
+
+    /// Runs one logical mutation under a single reservation from the physical
+    /// writer executor. Nested writes and transactions on this database reuse
+    /// that reservation; retry delays must remain outside this scope.
+    pub async fn run_write_operation<T, Fut>(&self, operation: Fut) -> T
+    where
+        Fut: Future<Output = T>,
+    {
+        self.writer.run_scoped(self.write_class, operation).await
+    }
+
+    pub fn writer_max_connections(&self) -> u32 {
+        self.writer.max_connections()
+    }
+
+    pub fn reader_max_connections(&self) -> u32 {
+        self.reader.max_connections()
+    }
+
+    pub async fn reader_query_only_enabled(&self) -> Result<bool, DbErr> {
+        self.reader.query_only_enabled().await
+    }
+
+    /// Execute a row-returning statement on the serialized writer. This is
+    /// reserved for SQLite extension functions whose SQL surface is `SELECT`
+    /// but whose execution mutates database state.
+    pub async fn query_one_write_raw(
+        &self,
+        statement: Statement,
+    ) -> Result<Option<QueryResult>, DbErr> {
+        self.writer_connection().query_one_raw(statement).await
+    }
+
+    fn writer_connection(&self) -> SqliteWriteConnection {
+        self.writer.connection(self.write_class)
     }
 
     /// Close both physical pools. Both close attempts are made so a reader
     /// shutdown error cannot leave the writer pool running.
     pub async fn close(self) -> Result<(), DbErr> {
         let reader_result = self.reader.connection.close().await;
-        let writer_result = self.writer.connection.close().await;
+        let writer_result = self.writer.close().await;
         reader_result.and(writer_result)
     }
 
     async fn query_one_routed(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
         match statement_route(statement.sql.as_str()) {
-            StatementRoute::Read => self.reader.query_one_raw(statement).await,
-            StatementRoute::Write => self.writer.query_one_raw(statement).await,
+            StatementRoute::Read => self.reader.query_one_raw(self.read_class, statement).await,
+            StatementRoute::Write => self.writer_connection().query_one_raw(statement).await,
         }
     }
 
     async fn query_all_routed(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
         match statement_route(statement.sql.as_str()) {
-            StatementRoute::Read => self.reader.query_all_raw(statement).await,
-            StatementRoute::Write => self.writer.query_all_raw(statement).await,
+            StatementRoute::Read => self.reader.query_all_raw(self.read_class, statement).await,
+            StatementRoute::Write => self.writer_connection().query_all_raw(statement).await,
         }
     }
 }
@@ -307,15 +280,15 @@ impl From<&SqliteDatabase> for SqliteDatabase {
 #[async_trait]
 impl ConnectionTrait for SqliteDatabase {
     fn get_database_backend(&self) -> DbBackend {
-        ConnectionTrait::get_database_backend(&self.writer)
+        ConnectionTrait::get_database_backend(&self.writer_connection())
     }
 
     async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
-        self.writer.execute_raw(statement).await
+        self.writer_connection().execute_raw(statement).await
     }
 
     async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
-        self.writer.execute_unprepared(sql).await
+        self.writer_connection().execute_unprepared(sql).await
     }
 
     async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
@@ -327,19 +300,19 @@ impl ConnectionTrait for SqliteDatabase {
     }
 
     fn support_returning(&self) -> bool {
-        self.writer.support_returning()
+        self.writer_connection().support_returning()
     }
 
     fn is_mock_connection(&self) -> bool {
-        self.writer.is_mock_connection()
+        self.writer_connection().is_mock_connection()
     }
 }
 
 impl StreamTrait for SqliteDatabase {
-    type Stream<'a> = <DatabaseConnection as StreamTrait>::Stream<'a>;
+    type Stream<'a> = SqliteQueryStream;
 
     fn get_database_backend(&self) -> DbBackend {
-        StreamTrait::get_database_backend(&self.writer)
+        StreamTrait::get_database_backend(&self.writer_connection())
     }
 
     fn stream_raw<'a>(
@@ -348,8 +321,8 @@ impl StreamTrait for SqliteDatabase {
     ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
         Box::pin(async move {
             match statement_route(statement.sql.as_str()) {
-                StatementRoute::Read => self.reader.stream_raw(statement).await,
-                StatementRoute::Write => self.writer.stream_raw(statement).await,
+                StatementRoute::Read => self.reader.stream_raw(self.read_class, statement).await,
+                StatementRoute::Write => self.writer_connection().stream_raw(statement).await,
             }
         })
     }
@@ -357,10 +330,10 @@ impl StreamTrait for SqliteDatabase {
 
 #[async_trait]
 impl TransactionTrait for SqliteDatabase {
-    type Transaction = DatabaseTransaction;
+    type Transaction = SqliteTransaction;
 
     async fn begin(&self) -> Result<Self::Transaction, DbErr> {
-        self.writer.begin().await
+        self.writer_connection().begin().await
     }
 
     async fn begin_with_config(
@@ -368,7 +341,7 @@ impl TransactionTrait for SqliteDatabase {
         isolation_level: Option<IsolationLevel>,
         access_mode: Option<AccessMode>,
     ) -> Result<Self::Transaction, DbErr> {
-        self.writer
+        self.writer_connection()
             .begin_with_config(isolation_level, access_mode)
             .await
     }
@@ -377,7 +350,7 @@ impl TransactionTrait for SqliteDatabase {
         &self,
         options: TransactionOptions,
     ) -> Result<Self::Transaction, DbErr> {
-        self.writer.begin_with_options(options).await
+        self.writer_connection().begin_with_options(options).await
     }
 
     async fn transaction<F, T, E>(&self, callback: F) -> Result<T, TransactionError<E>>
@@ -389,7 +362,7 @@ impl TransactionTrait for SqliteDatabase {
         T: Send,
         E: std::fmt::Display + std::fmt::Debug + Send,
     {
-        self.writer.transaction(callback).await
+        self.writer_connection().transaction(callback).await
     }
 
     async fn transaction_with_config<F, T, E>(
@@ -406,7 +379,7 @@ impl TransactionTrait for SqliteDatabase {
         T: Send,
         E: std::fmt::Display + std::fmt::Debug + Send,
     {
-        self.writer
+        self.writer_connection()
             .transaction_with_config(callback, isolation_level, access_mode)
             .await
     }
@@ -549,7 +522,26 @@ impl<'a> SqlScanner<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatementRoute, statement_route};
+    use super::{SqliteDatabase, SqliteReadClass, SqliteReadPool, StatementRoute, statement_route};
+    use futures_util::StreamExt;
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, StreamTrait};
+    use std::time::Duration;
+
+    async fn test_database() -> SqliteDatabase {
+        let mut reader_options = ConnectOptions::new("sqlite::memory:");
+        reader_options.max_connections(4);
+        let reader = Database::connect(reader_options)
+            .await
+            .expect("open test reader pool");
+
+        let mut writer_options = ConnectOptions::new("sqlite::memory:");
+        writer_options.max_connections(1);
+        let writer = Database::connect(writer_options)
+            .await
+            .expect("open test writer");
+
+        SqliteDatabase::new(reader, writer)
+    }
 
     #[test]
     fn routes_plain_queries_to_reader() {
@@ -616,5 +608,200 @@ mod tests {
             ),
             StatementRoute::Read
         );
+    }
+
+    #[tokio::test]
+    async fn database_scopes_carry_consistent_read_and_write_classes() {
+        let database = test_database().await;
+
+        assert_eq!(database.read_class(), SqliteReadClass::Interactive);
+        assert_eq!(database.write_class(), crate::SqliteWriteClass::Interactive);
+        assert_eq!(
+            database.with_critical_writes().read_class(),
+            SqliteReadClass::Interactive
+        );
+        assert_eq!(
+            database.with_critical_writes().write_class(),
+            crate::SqliteWriteClass::Critical
+        );
+        assert_eq!(
+            database.maintenance().read_class(),
+            SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            database.maintenance().write_class(),
+            crate::SqliteWriteClass::Maintenance
+        );
+        let background_critical = database.maintenance().with_critical_writes();
+        assert_eq!(
+            background_critical.read_class(),
+            SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            background_critical.write_class(),
+            crate::SqliteWriteClass::Critical
+        );
+    }
+
+    #[tokio::test]
+    async fn private_reader_rejects_every_write_entry_point() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("open test reader");
+        let reader = SqliteReadPool::new(connection);
+
+        let query_error = reader
+            .query_one_raw(
+                SqliteReadClass::Interactive,
+                Statement::from_string(
+                    DbBackend::Sqlite,
+                    "DELETE FROM item RETURNING id".to_owned(),
+                ),
+            )
+            .await
+            .expect_err("row-returning write must be rejected");
+        assert!(query_error.to_string().contains("SQLite read pool"));
+
+        let stream_error = match reader
+            .stream_raw(
+                SqliteReadClass::Maintenance,
+                Statement::from_string(
+                    DbBackend::Sqlite,
+                    "INSERT INTO item DEFAULT VALUES RETURNING id".to_owned(),
+                ),
+            )
+            .await
+        {
+            Ok(_) => panic!("streaming write must be rejected"),
+            Err(error) => error,
+        };
+        assert!(stream_error.to_string().contains("SQLite read pool"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_stream_reserves_one_slot_without_blocking_interactive_reads() {
+        let database = test_database().await;
+        let maintenance = database.maintenance();
+        let mut held_stream = maintenance
+            .stream_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 AS value UNION ALL SELECT 2 AS value".to_owned(),
+            ))
+            .await
+            .expect("open maintenance stream");
+
+        let first = held_stream
+            .next()
+            .await
+            .expect("first stream row")
+            .expect("read first stream row");
+        assert_eq!(first.try_get::<i64>("", "value").unwrap(), 1);
+
+        let second_maintenance = tokio::spawn({
+            let maintenance = maintenance.with_critical_writes();
+            async move {
+                maintenance
+                    .query_one_raw(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "SELECT 3 AS value".to_owned(),
+                    ))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !second_maintenance.is_finished(),
+            "a second maintenance read must wait for the stream permit"
+        );
+
+        let interactive = tokio::time::timeout(
+            Duration::from_secs(1),
+            database.query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 4 AS value".to_owned(),
+            )),
+        )
+        .await
+        .expect("interactive read must not wait for maintenance limiter")
+        .expect("run interactive read")
+        .expect("interactive row");
+        assert_eq!(interactive.try_get::<i64>("", "value").unwrap(), 4);
+
+        drop(held_stream);
+        let resumed = tokio::time::timeout(Duration::from_secs(1), second_maintenance)
+            .await
+            .expect("maintenance read must resume after stream drop")
+            .expect("join maintenance read")
+            .expect("run maintenance read")
+            .expect("maintenance row");
+        assert_eq!(resumed.try_get::<i64>("", "value").unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn completed_maintenance_stream_releases_permit_before_drop() {
+        let database = test_database().await;
+        let maintenance = database.maintenance();
+        let mut completed_stream = maintenance
+            .stream_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 AS value".to_owned(),
+            ))
+            .await
+            .expect("open maintenance stream");
+        assert!(completed_stream.next().await.is_some());
+        assert!(completed_stream.next().await.is_none());
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            maintenance.query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 2 AS value".to_owned(),
+            )),
+        )
+        .await
+        .expect("EOF must release maintenance permit while wrapper remains alive")
+        .expect("run maintenance read after EOF");
+
+        drop(completed_stream);
+    }
+
+    #[tokio::test]
+    async fn cancelling_waiting_maintenance_read_does_not_leak_capacity() {
+        let database = test_database().await;
+        let maintenance = database.maintenance();
+        let held_stream = maintenance
+            .stream_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 AS value".to_owned(),
+            ))
+            .await
+            .expect("open maintenance stream");
+
+        let waiting = tokio::spawn({
+            let maintenance = maintenance.clone();
+            async move {
+                maintenance
+                    .query_one_raw(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "SELECT 2 AS value".to_owned(),
+                    ))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        waiting.abort();
+        let _ = waiting.await;
+        drop(held_stream);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            maintenance.query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 3 AS value".to_owned(),
+            )),
+        )
+        .await
+        .expect("cancelled waiter must not consume maintenance capacity")
+        .expect("run maintenance read after cancellation");
     }
 }

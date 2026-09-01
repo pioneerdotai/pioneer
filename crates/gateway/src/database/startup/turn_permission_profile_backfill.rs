@@ -93,6 +93,11 @@ pub(crate) async fn backfill_once(
     crud_store: &CrudStore,
     runtime_home: &Path,
 ) -> Result<TurnPermissionProfileBackfillSummary> {
+    // This routine owns a complete startup-maintenance operation, including
+    // its projection marker writes. Pin the class at this boundary instead of
+    // relying on every caller (including repair and test entry points) to
+    // remember to pre-scope the store.
+    let crud_store = crud_store.with_maintenance_access();
     let db = crud_store.database_connection();
     if backfill_is_current(&db).await? {
         return Ok(TurnPermissionProfileBackfillSummary {
@@ -121,7 +126,7 @@ pub(crate) async fn backfill_once(
     )
     .await?;
 
-    let result = backfill_all_batches(crud_store, runtime_home).await;
+    let result = backfill_all_batches(&crud_store, runtime_home).await;
     match result {
         Ok(summary) => {
             mark_backfill_complete(&db, &summary).await?;
