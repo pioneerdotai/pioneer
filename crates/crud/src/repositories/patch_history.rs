@@ -922,6 +922,7 @@ pub async fn update_patch_commit_intent_progress<C: ConnectionTrait>(
     invocation_id: &str,
     commit_ordinal: i64,
     expected_status: &str,
+    expected_progress_json: &str,
     progress_json: String,
     status: String,
 ) -> Result<u64> {
@@ -940,6 +941,7 @@ pub async fn update_patch_commit_intent_progress<C: ConnectionTrait>(
         .filter(patch_commit_intent::Column::InvocationId.eq(invocation_id.to_owned()))
         .filter(patch_commit_intent::Column::CommitOrdinal.eq(commit_ordinal))
         .filter(patch_commit_intent::Column::Status.eq(expected_status.to_owned()))
+        .filter(patch_commit_intent::Column::ProgressJson.eq(expected_progress_json.to_owned()))
         .exec(db)
         .await
         .context("failed to update patch commit intent progress")?

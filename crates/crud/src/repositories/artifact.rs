@@ -101,18 +101,33 @@ impl ArtifactRepository {
     ) -> ArtifactCrudResult<ArtifactBlobRecord> {
         let now = now();
         let id = generate_id(21);
+        let size_bytes = to_i64_size(record.size_bytes)?;
+        let metadata_json = metadata_to_db(&record.metadata)?;
+        self.create_blob_prepared(db, record, id, now, size_bytes, metadata_json)
+            .await
+    }
+
+    pub(crate) async fn create_blob_prepared<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        record: NewArtifactBlobRecord,
+        id: String,
+        now: DateTimeWithTimeZone,
+        size_bytes: i64,
+        metadata_json: String,
+    ) -> ArtifactCrudResult<ArtifactBlobRecord> {
         let model = artifact_blob::ActiveModel {
             id: Set(id),
             workspace_id: Set(record.workspace_id),
             sha256: Set(record.sha256),
-            size_bytes: Set(to_i64_size(record.size_bytes)?),
+            size_bytes: Set(size_bytes),
             mime_type: Set(record.mime_type),
             storage_backend: Set(record.storage_backend),
             storage_key: Set(record.storage_key),
             encryption_key_id: Set(None),
             created_at: Set(now),
             last_verified_at: Set(None),
-            metadata_json: Set(metadata_to_db(&record.metadata)?),
+            metadata_json: Set(metadata_json),
         }
         .insert(db)
         .await
@@ -159,14 +174,59 @@ impl ArtifactRepository {
         }
     }
 
-    pub async fn create_artifact<C: ConnectionTrait>(
+    pub(crate) async fn find_or_create_blob_prepared<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        record: NewArtifactBlobRecord,
+        id: String,
+        now: DateTimeWithTimeZone,
+        size_bytes: i64,
+        metadata_json: String,
+    ) -> ArtifactCrudResult<ArtifactBlobRecord> {
+        if let Some(existing) = self
+            .find_blob_by_workspace_sha(
+                db,
+                &record.workspace_id,
+                &record.sha256,
+                record.size_bytes,
+                &record.storage_backend,
+            )
+            .await?
+        {
+            return Ok(existing);
+        }
+
+        match self
+            .create_blob_prepared(db, record.clone(), id, now, size_bytes, metadata_json)
+            .await
+        {
+            Ok(model) => Ok(model),
+            Err(ArtifactCrudError::Database { .. }) => self
+                .find_blob_by_workspace_sha(
+                    db,
+                    &record.workspace_id,
+                    &record.sha256,
+                    record.size_bytes,
+                    &record.storage_backend,
+                )
+                .await?
+                .ok_or_else(|| ArtifactCrudError::NotFound {
+                    message: "artifact blob insert failed and no existing row was found".to_owned(),
+                }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn create_artifact_prepared<C: ConnectionTrait>(
         &self,
         db: &C,
         request: &IngestArtifactMetadataRecord,
+        id: String,
+        now: DateTimeWithTimeZone,
+        metadata_json: String,
     ) -> ArtifactCrudResult<ArtifactRecord> {
-        let now = now();
         artifact::ActiveModel {
-            id: Set(generate_id(21)),
+            id: Set(id),
             workspace_id: Set(request.workspace_id.clone()),
             primary_thread_id: Set(request.primary_thread_id.clone()),
             current_version_id: Set(None),
@@ -179,7 +239,7 @@ impl ArtifactRepository {
             created_at: Set(now),
             updated_at: Set(now),
             deleted_at: Set(None),
-            metadata_json: Set(metadata_to_db(&request.metadata)?),
+            metadata_json: Set(metadata_json),
         }
         .insert(db)
         .await
@@ -190,16 +250,19 @@ impl ArtifactRepository {
         .map(artifact_record_from_model)
     }
 
-    pub async fn create_version<C: ConnectionTrait>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_version_prepared<C: ConnectionTrait>(
         &self,
         db: &C,
         artifact: &ArtifactRecord,
         blob: &ArtifactBlobRecord,
         binding: Option<&ArtifactBindingTargetRecord>,
-        metadata: &BTreeMap<String, serde_json::Value>,
+        id: String,
+        created_at: DateTimeWithTimeZone,
+        metadata_json: String,
     ) -> ArtifactCrudResult<ArtifactVersionRecord> {
         let version = artifact_version::ActiveModel {
-            id: Set(generate_id(21)),
+            id: Set(id),
             workspace_id: Set(artifact.workspace_id.clone()),
             artifact_id: Set(artifact.id.clone()),
             version_number: Set(1),
@@ -212,8 +275,8 @@ impl ArtifactRepository {
             created_by_tool_call_id: Set(binding.and_then(|target| target.tool_call_id.clone())),
             created_by_task_id: Set(binding.and_then(|target| target.task_id.clone())),
             created_by_task_run_id: Set(binding.and_then(|target| target.task_run_id.clone())),
-            created_at: Set(now()),
-            metadata_json: Set(metadata_to_db(metadata)?),
+            created_at: Set(created_at),
+            metadata_json: Set(metadata_json),
         }
         .insert(db)
         .await
@@ -260,17 +323,20 @@ impl ArtifactRepository {
             .map(artifact_record_from_model)
     }
 
-    pub async fn create_binding<C: ConnectionTrait>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_binding_prepared<C: ConnectionTrait>(
         &self,
         db: &C,
         workspace_id: &str,
         artifact_id: &str,
         version_id: Option<&str>,
         target: &ArtifactBindingTargetRecord,
-        metadata: &BTreeMap<String, serde_json::Value>,
+        id: String,
+        created_at: DateTimeWithTimeZone,
+        metadata_json: String,
     ) -> ArtifactCrudResult<ArtifactBindingSummary> {
         let model = artifact_binding::ActiveModel {
-            id: Set(generate_id(21)),
+            id: Set(id),
             artifact_id: Set(artifact_id.to_owned()),
             artifact_version_id: Set(version_id.map(ToOwned::to_owned)),
             workspace_id: Set(workspace_id.to_owned()),
@@ -285,8 +351,8 @@ impl ArtifactRepository {
             direction: Set(binding_direction_to_db(target.direction)),
             item_index: Set(target.item_index),
             role: Set(target.role.map(role_to_db)),
-            created_at: Set(now()),
-            metadata_json: Set(metadata_to_db(metadata)?),
+            created_at: Set(created_at),
+            metadata_json: Set(metadata_json),
         }
         .insert(db)
         .await
@@ -973,6 +1039,49 @@ impl ArtifactRepository {
                 source,
             })
             .map(artifact_record_from_model)
+    }
+
+    pub(crate) async fn resolve_binding_version<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace_id: &str,
+        artifact_id: &str,
+        version_id: Option<&str>,
+    ) -> ArtifactCrudResult<String> {
+        let artifact = self
+            .find_artifact(db, workspace_id, artifact_id)
+            .await?
+            .ok_or_else(|| ArtifactCrudError::NotFound {
+                message: format!("workspace={workspace_id} artifact={artifact_id}"),
+            })?;
+        let resolved_version_id = version_id
+            .map(ToOwned::to_owned)
+            .or(artifact.current_version_id)
+            .ok_or_else(|| ArtifactCrudError::NotFound {
+                message: format!("artifact `{artifact_id}` has no current version"),
+            })?;
+        let exists = artifact_version::Entity::find()
+            .select_only()
+            .column(artifact_version::Column::Id)
+            .filter(artifact_version::Column::WorkspaceId.eq(workspace_id.to_owned()))
+            .filter(artifact_version::Column::ArtifactId.eq(artifact_id.to_owned()))
+            .filter(artifact_version::Column::Id.eq(resolved_version_id.clone()))
+            .into_tuple::<String>()
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to resolve artifact binding version".to_owned(),
+                source,
+            })?
+            .is_some();
+        if !exists {
+            return Err(ArtifactCrudError::NotFound {
+                message: format!(
+                    "workspace={workspace_id} artifact={artifact_id} version={resolved_version_id}"
+                ),
+            });
+        }
+        Ok(resolved_version_id)
     }
 
     async fn find_artifact<C: ConnectionTrait>(
@@ -2002,11 +2111,17 @@ fn gc_cutoff_ms(now_unix_ms: i64, grace_secs: u64) -> i64 {
     now_unix_ms.saturating_sub(i64::try_from(grace_ms).unwrap_or(i64::MAX))
 }
 
-fn metadata_to_db(value: &BTreeMap<String, serde_json::Value>) -> ArtifactCrudResult<String> {
+pub(crate) fn metadata_to_db(
+    value: &BTreeMap<String, serde_json::Value>,
+) -> ArtifactCrudResult<String> {
     serde_json::to_string(value).map_err(|source| ArtifactCrudError::Json {
         message: "failed to encode artifact metadata".to_owned(),
         source,
     })
+}
+
+pub(crate) fn checked_size_bytes(value: u64) -> ArtifactCrudResult<i64> {
+    to_i64_size(value)
 }
 
 fn metadata_from_db(value: &str) -> ArtifactCrudResult<BTreeMap<String, serde_json::Value>> {

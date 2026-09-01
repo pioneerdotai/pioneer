@@ -11,8 +11,24 @@ use crate::apply_patch::history::{
 };
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::patch_history as crud;
+use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteObserver};
 use sea_orm::{Database, DatabaseConnection};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Default)]
+struct WriterAcquisitionCounter {
+    acquired: AtomicUsize,
+}
+
+impl SqliteWriteObserver for WriterAcquisitionCounter {
+    fn observe(&self, event: SqliteWriteEvent) {
+        if matches!(event, SqliteWriteEvent::Acquired { .. }) {
+            self.acquired.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 async fn database() -> DatabaseConnection {
     let database = Database::connect("sqlite::memory:")
@@ -322,6 +338,36 @@ async fn sqlite_history_survives_reload_and_rebuilds_projection_from_snapshots()
     assert_eq!(
         projections.get("thread", "turn").await.unwrap(),
         Some(expected)
+    );
+}
+
+#[tokio::test]
+async fn thread_history_deletion_releases_writer_between_records() {
+    let connection = database().await;
+    let observer = Arc::new(WriterAcquisitionCounter::default());
+    let database =
+        SqliteDatabase::new_with_observer(connection.clone(), connection, observer.clone());
+    let records = SqliteAppliedPatchStore::new(database);
+    let domain = SnapshotDomain::new("thread:bounded-delete", "pioneer", "thread_history");
+
+    for (invocation_id, ordinal) in [("call-1", 0), ("call-2", 1)] {
+        records
+            .insert_with_snapshots(
+                record_for("bounded-delete", "turn", invocation_id, ordinal, &[]),
+                [ordinal as u8 + 1; 32],
+                &domain,
+                &[],
+            )
+            .await
+            .expect("seed patch record");
+    }
+
+    observer.acquired.store(0, Ordering::Relaxed);
+    assert_eq!(records.delete_thread("bounded-delete").await.unwrap(), 2);
+    assert_eq!(
+        observer.acquired.load(Ordering::Relaxed),
+        3,
+        "each record and final auxiliary cleanup must use its own writer quantum"
     );
 }
 

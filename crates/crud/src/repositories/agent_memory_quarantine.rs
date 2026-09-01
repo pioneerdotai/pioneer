@@ -8,44 +8,148 @@ use sea_orm::{
 
 use crate::convention::DB_ID_LEN;
 use crate::memory::{
-    NewAgentMemoryQuarantine, ResolveAgentMemoryQuarantine, lifecycle_actor_id_to_db,
-    lifecycle_actor_kind_to_db,
+    NewAgentMemoryEvent, NewAgentMemoryQuarantine, ResolveAgentMemoryQuarantine,
+    lifecycle_actor_id_to_db, lifecycle_actor_kind_to_db,
 };
 use crate::{convention::memory_lifecycle_reason_code_to_db, util::unix_to_datetime};
 
 const QUARANTINE_DETAILS_JSON_MAX_CHARS: usize = 4096;
 
-pub async fn create_active_quarantine<C: ConnectionTrait>(
-    db: &C,
-    quarantine: NewAgentMemoryQuarantine,
-) -> Result<agent_memory_quarantine::Model> {
-    if let Some(existing) =
-        find_active_quarantine_by_memory(db, quarantine.memory_id.as_str()).await?
-    {
-        return Ok(existing);
-    }
+#[derive(Clone, Debug)]
+pub struct PreparedAgentMemoryQuarantine {
+    memory_id: String,
+    id: String,
+    active_model: agent_memory_quarantine::ActiveModel,
+    event: NewAgentMemoryEvent,
+}
 
+#[derive(Clone, Debug)]
+pub struct PreparedResolveAgentMemoryQuarantine {
+    memory_id: String,
+    expected_quarantine_id: Option<String>,
+    resolved_at: DateTimeWithTimeZone,
+    reason_code: String,
+    actor_kind: String,
+    actor_id: Option<String>,
+}
+
+pub fn prepare_active_quarantine(
+    quarantine: NewAgentMemoryQuarantine,
+) -> PreparedAgentMemoryQuarantine {
     let id = quarantine
         .id
         .clone()
         .unwrap_or_else(|| pioneer_protocol::generate_id(DB_ID_LEN));
-    agent_memory_quarantine::Entity::insert(agent_memory_quarantine::ActiveModel {
+    let memory_id = quarantine.memory_id.clone();
+    let reason_code = memory_lifecycle_reason_code_to_db(quarantine.reason_code);
+    let actor_kind = lifecycle_actor_kind_to_db(&quarantine.actor);
+    let actor_id = lifecycle_actor_id_to_db(&quarantine.actor);
+    let event = NewAgentMemoryEvent {
+        memory_id: Some(memory_id.clone()),
+        candidate_id: None,
+        workspace_id: quarantine.workspace_id.clone(),
+        event_kind: crate::convention::MEMORY_EVENT_QUARANTINED.to_owned(),
+        actor: None,
+        thread_id: None,
+        turn_id: None,
+        item_id: None,
+        details_json: Some(
+            serde_json::json!({
+                "quarantine_id": id.clone(),
+                "reason_code": reason_code.clone(),
+                "actor": {
+                    "kind": actor_kind.clone(),
+                    "id": actor_id.clone(),
+                }
+            })
+            .to_string(),
+        ),
+        created_at_unix: quarantine.created_at_unix,
+    };
+    let active_model = agent_memory_quarantine::ActiveModel {
         id: Set(id.clone()),
-        memory_id: Set(quarantine.memory_id.clone()),
+        memory_id: Set(memory_id.clone()),
         workspace_id: Set(quarantine.workspace_id),
-        reason_code: Set(memory_lifecycle_reason_code_to_db(quarantine.reason_code)),
-        actor_kind: Set(lifecycle_actor_kind_to_db(&quarantine.actor)),
-        actor_id: Set(lifecycle_actor_id_to_db(&quarantine.actor)),
+        reason_code: Set(reason_code),
+        actor_kind: Set(actor_kind),
+        actor_id: Set(actor_id),
         created_at: Set(Some(unix_to_datetime(quarantine.created_at_unix))),
         resolved_at: Set(None),
         resolved_reason_code: Set(None),
         resolved_actor_kind: Set(None),
         resolved_actor_id: Set(None),
         details_json: Set(bounded_details_json(quarantine.details_json)),
-    })
-    .exec(db)
-    .await
-    .with_context(|| format!("failed to create quarantine marker `{id}`"))?;
+    };
+    PreparedAgentMemoryQuarantine {
+        memory_id,
+        id,
+        active_model,
+        event,
+    }
+}
+
+impl PreparedAgentMemoryQuarantine {
+    pub(crate) fn event(&self) -> NewAgentMemoryEvent {
+        self.event.clone()
+    }
+}
+
+pub(crate) async fn prepare_quarantine_resolution<C: ConnectionTrait>(
+    db: &C,
+    resolution: ResolveAgentMemoryQuarantine,
+) -> Result<(
+    PreparedResolveAgentMemoryQuarantine,
+    Option<NewAgentMemoryEvent>,
+)> {
+    let current = find_active_quarantine_by_memory(db, resolution.memory_id.as_str()).await?;
+    let prepared = PreparedResolveAgentMemoryQuarantine {
+        memory_id: resolution.memory_id,
+        expected_quarantine_id: current.as_ref().map(|row| row.id.clone()),
+        resolved_at: unix_to_datetime(resolution.resolved_at_unix),
+        reason_code: memory_lifecycle_reason_code_to_db(resolution.reason_code),
+        actor_kind: lifecycle_actor_kind_to_db(&resolution.actor),
+        actor_id: lifecycle_actor_id_to_db(&resolution.actor),
+    };
+    let event = current.map(|row| NewAgentMemoryEvent {
+        memory_id: Some(row.memory_id),
+        candidate_id: None,
+        workspace_id: row.workspace_id,
+        event_kind: crate::convention::MEMORY_EVENT_RESTORED.to_owned(),
+        actor: None,
+        thread_id: None,
+        turn_id: None,
+        item_id: None,
+        details_json: Some(
+            serde_json::json!({
+                "quarantine_id": row.id,
+                "reason_code": prepared.reason_code.clone(),
+                "actor": {
+                    "kind": prepared.actor_kind.clone(),
+                    "id": prepared.actor_id.clone(),
+                }
+            })
+            .to_string(),
+        ),
+        created_at_unix: resolution.resolved_at_unix,
+    });
+    Ok((prepared, event))
+}
+
+pub async fn create_active_quarantine<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedAgentMemoryQuarantine,
+) -> Result<agent_memory_quarantine::Model> {
+    if let Some(existing) =
+        find_active_quarantine_by_memory(db, prepared.memory_id.as_str()).await?
+    {
+        return Ok(existing);
+    }
+
+    let id = prepared.id;
+    agent_memory_quarantine::Entity::insert(prepared.active_model)
+        .exec(db)
+        .await
+        .with_context(|| format!("failed to create quarantine marker `{id}`"))?;
 
     agent_memory_quarantine::Entity::find_by_id(id)
         .one(db)
@@ -92,36 +196,37 @@ pub async fn list_active_quarantines_by_memory_ids<C: ConnectionTrait>(
 
 pub async fn resolve_active_quarantine<C: ConnectionTrait>(
     db: &C,
-    resolution: ResolveAgentMemoryQuarantine,
+    prepared: PreparedResolveAgentMemoryQuarantine,
 ) -> Result<Option<agent_memory_quarantine::Model>> {
-    let resolved_at: DateTimeWithTimeZone = unix_to_datetime(resolution.resolved_at_unix);
+    let Some(expected_quarantine_id) = prepared.expected_quarantine_id.clone() else {
+        return Ok(None);
+    };
     let affected = agent_memory_quarantine::Entity::update_many()
         .col_expr(
             agent_memory_quarantine::Column::ResolvedAt,
-            Expr::value(Some(resolved_at)),
+            Expr::value(Some(prepared.resolved_at)),
         )
         .col_expr(
             agent_memory_quarantine::Column::ResolvedReasonCode,
-            Expr::value(Some(memory_lifecycle_reason_code_to_db(
-                resolution.reason_code,
-            ))),
+            Expr::value(Some(prepared.reason_code)),
         )
         .col_expr(
             agent_memory_quarantine::Column::ResolvedActorKind,
-            Expr::value(Some(lifecycle_actor_kind_to_db(&resolution.actor))),
+            Expr::value(Some(prepared.actor_kind)),
         )
         .col_expr(
             agent_memory_quarantine::Column::ResolvedActorId,
-            Expr::value(lifecycle_actor_id_to_db(&resolution.actor)),
+            Expr::value(prepared.actor_id),
         )
-        .filter(agent_memory_quarantine::Column::MemoryId.eq(resolution.memory_id.clone()))
+        .filter(agent_memory_quarantine::Column::MemoryId.eq(prepared.memory_id.clone()))
+        .filter(agent_memory_quarantine::Column::Id.eq(expected_quarantine_id))
         .filter(agent_memory_quarantine::Column::ResolvedAt.is_null())
         .exec(db)
         .await
         .with_context(|| {
             format!(
                 "failed to resolve active quarantine for memory `{}`",
-                resolution.memory_id
+                prepared.memory_id
             )
         })?
         .rows_affected;
@@ -130,7 +235,7 @@ pub async fn resolve_active_quarantine<C: ConnectionTrait>(
         return Ok(None);
     }
 
-    list_quarantine_history_for_memory(db, resolution.memory_id.as_str(), 1)
+    list_quarantine_history_for_memory(db, prepared.memory_id.as_str(), 1)
         .await
         .map(|mut rows| rows.pop())
 }

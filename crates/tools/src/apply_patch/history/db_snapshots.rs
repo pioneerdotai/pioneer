@@ -10,7 +10,8 @@ use pioneer_crud::patch_history as crud;
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use sha2::Digest;
-const RECONCILIATION_PAGE_SIZE: u64 = 256;
+const RECONCILIATION_PAGE_SIZE: u64 = 32;
+const RECONCILIATION_REFERENCE_BATCH_SIZE: usize = 32;
 const MAX_RECORD_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RECORD_CHANGES: usize = 256;
 const MAX_RESERVATION_SNAPSHOTS: usize = MAX_RECORD_CHANGES * 3;
@@ -27,6 +28,15 @@ pub struct SnapshotReconciliationReport {
 pub struct SqliteSnapshotStore {
     db: SqliteDatabase,
     limits: SnapshotStoreLimits,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedSnapshot {
+    pub(crate) reference: ContentAddressedSnapshotRef,
+    byte_len_sql: i64,
+    encoding_json: String,
+    line_endings_json: String,
+    compressed_bytes: Vec<u8>,
 }
 
 impl SqliteSnapshotStore {
@@ -48,6 +58,66 @@ impl SqliteSnapshotStore {
         self.limits
     }
 
+    pub(crate) fn prepare_snapshots(
+        &self,
+        domain: &SnapshotDomain,
+        snapshots: &[CommittedTextSnapshot],
+    ) -> Result<Vec<PreparedSnapshot>> {
+        if snapshots.len() > MAX_RESERVATION_SNAPSHOTS {
+            bail!("snapshot set contains too many snapshots");
+        }
+        let domain_id = domain.id();
+        let mut total_bytes = 0u64;
+        snapshots
+            .iter()
+            .map(|snapshot| {
+                total_bytes = total_bytes
+                    .checked_add(snapshot.bytes.len() as u64)
+                    .ok_or_else(|| anyhow!("snapshot set logical-byte overflow"))?;
+                if total_bytes > self.limits.max_logical_bytes {
+                    bail!("snapshot set logical-byte limit exceeded");
+                }
+                self.prepare_snapshot(domain_id.as_str(), snapshot)
+            })
+            .collect()
+    }
+
+    fn prepare_snapshot(
+        &self,
+        domain_id: &str,
+        snapshot: &CommittedTextSnapshot,
+    ) -> Result<PreparedSnapshot> {
+        let byte_len = snapshot.bytes.len() as u64;
+        if snapshot.version.token.byte_len() != byte_len {
+            bail!("snapshot version byte length does not match snapshot bytes");
+        }
+        if byte_len > self.limits.max_single_bytes || byte_len > self.limits.max_decompressed_bytes
+        {
+            bail!("snapshot single-blob limit exceeded");
+        }
+        let content_hash: [u8; 32] = sha2::Sha256::digest(snapshot.bytes.as_slice()).into();
+        if content_hash != *snapshot.version.token.digest() {
+            bail!("snapshot content hash does not match snapshot bytes");
+        }
+        let compressed_bytes =
+            zstd::stream::encode_all(snapshot.bytes.as_slice(), 3).context("compress snapshot")?;
+        let compressed_len = u64::try_from(compressed_bytes.len())
+            .map_err(|_| anyhow!("compressed snapshot length exceeds u64"))?;
+        if compressed_len > self.limits.max_physical_bytes {
+            bail!("snapshot compressed-byte limit exceeded");
+        }
+        Ok(PreparedSnapshot {
+            reference: ContentAddressedSnapshotRef {
+                domain_id: domain_id.to_owned(),
+                snapshot: TextSnapshotRef::from_snapshot(snapshot),
+            },
+            byte_len_sql: sqlite_i64(byte_len, "snapshot byte length")?,
+            encoding_json: serde_json::to_string(&snapshot.encoding)?,
+            line_endings_json: serde_json::to_string(&snapshot.line_endings)?,
+            compressed_bytes,
+        })
+    }
+
     /// Reserve the storage needed by a tracked invocation before its first
     /// filesystem mutation.  The reservation is atomic with respect to other
     /// admissions and is conservative for content that is not interned yet:
@@ -59,13 +129,14 @@ impl SqliteSnapshotStore {
         domain: &SnapshotDomain,
         snapshots: &[CommittedTextSnapshot],
     ) -> Result<SnapshotReservation> {
+        let prepared = self.prepare_snapshots(domain, snapshots)?;
         let transaction = self
             .db
             .begin()
             .await
             .context("begin patch snapshot admission")?;
         let result = self
-            .reserve_for_intent_in_transaction(&transaction, identity, domain, snapshots)
+            .reserve_for_intent_in_transaction(&transaction, identity, &prepared)
             .await;
         match result {
             Ok(reservation) => {
@@ -86,8 +157,7 @@ impl SqliteSnapshotStore {
         &self,
         transaction: &DatabaseTransaction,
         identity: &InvocationIdentity,
-        domain: &SnapshotDomain,
-        snapshots: &[CommittedTextSnapshot],
+        snapshots: &[PreparedSnapshot],
     ) -> Result<SnapshotReservation> {
         if snapshots.len() > MAX_RESERVATION_SNAPSHOTS {
             bail!("snapshot reservation contains too many snapshots");
@@ -115,62 +185,35 @@ impl SqliteSnapshotStore {
             });
         }
 
-        let mut unique = Vec::<(
-            [u8; 32],
-            u64,
-            u64,
-            u64,
-            crate::apply_patch::history::TextEncoding,
-            crate::apply_patch::history::LineEndingMetadata,
-        )>::new();
-        let mut requested_logical_bytes = 0u64;
-        let mut requested_physical_bytes = 0u64;
+        let mut unique = Vec::<([u8; 32], u64, String, String)>::new();
+        let mut logical_bytes = 0u64;
+        let mut physical_bytes = 0u64;
         for snapshot in snapshots {
-            let byte_len = snapshot.bytes.len() as u64;
-            if snapshot.version.token.byte_len() != byte_len {
-                bail!("snapshot version byte length does not match snapshot bytes");
-            }
-            if byte_len > self.limits.max_single_bytes
-                || byte_len > self.limits.max_decompressed_bytes
-            {
-                bail!("snapshot single-blob limit exceeded");
-            }
-            requested_logical_bytes = requested_logical_bytes
-                .checked_add(byte_len)
-                .ok_or_else(|| anyhow!("snapshot reservation logical-byte overflow"))?;
-            if requested_logical_bytes > self.limits.max_logical_bytes {
-                bail!("snapshot reservation logical-byte limit exceeded");
-            }
-            let content_hash: [u8; 32] = sha2::Sha256::digest(snapshot.bytes.as_slice()).into();
-            if content_hash != *snapshot.version.token.digest() {
-                bail!("snapshot content hash does not match snapshot bytes");
-            }
-            let compressed = zstd::stream::encode_all(snapshot.bytes.as_slice(), 3)
-                .context("compress patch snapshot for admission")?;
-            let compressed_len = u64::try_from(compressed.len())
-                .map_err(|_| anyhow!("compressed snapshot length exceeds u64"))?;
-            if compressed_len > self.limits.max_physical_bytes {
-                bail!("snapshot compressed-byte limit exceeded");
-            }
-            let expected_encoding = serde_json::to_string(&snapshot.encoding)?;
-            let expected_line_endings = serde_json::to_string(&snapshot.line_endings)?;
-            if let Some((_, _existing_len, _, _, existing_encoding, existing_line_endings)) =
-                unique.iter().find(|(hash, existing_len, _, _, _, _)| {
+            let content_hash = snapshot.reference.snapshot.content_hash;
+            let byte_len = snapshot.reference.snapshot.byte_len;
+            if let Some((_, _, existing_encoding, existing_line_endings)) =
+                unique.iter().find(|(hash, existing_len, _, _)| {
                     *hash == content_hash && *existing_len == byte_len
                 })
             {
-                if *existing_encoding != snapshot.encoding
-                    || *existing_line_endings != snapshot.line_endings
+                if existing_encoding != &snapshot.encoding_json
+                    || existing_line_endings != &snapshot.line_endings_json
                 {
                     bail!("snapshot content hash collision or metadata mismatch during admission");
                 }
                 continue;
             }
+            unique.push((
+                content_hash,
+                byte_len,
+                snapshot.encoding_json.clone(),
+                snapshot.line_endings_json.clone(),
+            ));
             let existing = load_snapshot_bounded(
                 transaction,
-                &domain.id(),
+                &snapshot.reference.domain_id,
                 &content_hash,
-                sqlite_i64(byte_len, "snapshot byte length")?,
+                snapshot.byte_len_sql,
                 self.limits.max_physical_bytes,
             )
             .await
@@ -185,55 +228,33 @@ impl SqliteSnapshotStore {
                     let existing_raw_len = row.raw_byte_len;
                     if existing_raw_len < 0
                         || existing_raw_len as u64 != byte_len
-                        || row.encoding != expected_encoding
-                        || row.line_endings_json != expected_line_endings
+                        || row.encoding != snapshot.encoding_json
+                        || row.line_endings_json != snapshot.line_endings_json
                     {
                         bail!(
                             "snapshot content hash collision or metadata mismatch during admission"
                         );
                     }
-                    let decoded = decode_zstd_bounded(
-                        row.compressed_bytes.as_slice(),
-                        self.limits.max_decompressed_bytes,
-                    )
-                    .ok()
-                    .is_some_and(|bytes| {
-                        bytes.len() as u64 == byte_len
-                            && sha2::Sha256::digest(bytes.as_slice()).as_slice()
-                                == content_hash.as_slice()
-                    });
-                    !decoded
+                    row.compressed_bytes != snapshot.compressed_bytes
                 }
             };
             if needs_storage {
-                requested_physical_bytes = requested_physical_bytes
+                logical_bytes = logical_bytes
+                    .checked_add(byte_len)
+                    .ok_or_else(|| anyhow!("snapshot reservation logical-byte overflow"))?;
+                let compressed_len = u64::try_from(snapshot.compressed_bytes.len())
+                    .map_err(|_| anyhow!("compressed snapshot length exceeds u64"))?;
+                physical_bytes = physical_bytes
                     .checked_add(compressed_len)
                     .ok_or_else(|| anyhow!("snapshot reservation physical-byte overflow"))?;
-                if requested_physical_bytes > self.limits.max_physical_bytes {
+                if logical_bytes > self.limits.max_logical_bytes {
+                    bail!("snapshot reservation logical-byte limit exceeded");
+                }
+                if physical_bytes > self.limits.max_physical_bytes {
                     bail!("snapshot reservation physical-byte limit exceeded");
                 }
-                unique.push((
-                    content_hash,
-                    byte_len,
-                    byte_len,
-                    compressed_len,
-                    snapshot.encoding,
-                    snapshot.line_endings,
-                ));
             }
         }
-        let logical_bytes = unique
-            .iter()
-            .try_fold(0u64, |sum, (_, _, logical, _, _, _)| {
-                sum.checked_add(*logical)
-                    .ok_or_else(|| anyhow!("snapshot logical reservation overflow"))
-            })?;
-        let physical_bytes = unique
-            .iter()
-            .try_fold(0u64, |sum, (_, _, _, physical, _, _)| {
-                sum.checked_add(*physical)
-                    .ok_or_else(|| anyhow!("snapshot physical reservation overflow"))
-            })?;
         let totals = crud::patch_snapshot_totals(transaction)
             .await
             .context("read patch snapshot admission totals")?;
@@ -365,25 +386,20 @@ impl SqliteSnapshotStore {
     /// startup repair for blobs left by older writers or an interrupted
     /// pre-transaction promotion; it never invents bytes for a missing blob.
     ///
-    /// The record log can be large, so the scan is cursor-paginated and the
-    /// expected reference counts live in a SQLite TEMP table rather than in a
-    /// process-sized HashMap.  The repair and its scratch state are committed
-    /// as one transaction; a crash simply discards the TEMP table and retries
-    /// on the next startup.
+    /// Every scan and mutation is cursor-paginated. Expected counts live in a
+    /// connection-local TEMP table, while record decoding runs before a short
+    /// writer transaction. A crash can leave only a partially repaired count;
+    /// the next startup rebuilds the scratch table and deterministically
+    /// completes the remaining idempotent repairs.
     pub async fn reconcile_references(&self) -> Result<SnapshotReconciliationReport> {
-        let transaction = self
-            .db
-            .begin()
-            .await
-            .context("begin snapshot reference repair")?;
-        crud::prepare_expected_patch_snapshot_references(&transaction)
+        crud::prepare_expected_patch_snapshot_references(&self.db)
             .await
             .context("prepare snapshot reference repair scratch state")?;
 
         let mut reservation_cursor = None;
         loop {
             let reservations = crud::list_patch_snapshot_reservations(
-                &transaction,
+                &self.db,
                 reservation_cursor.as_ref(),
                 RECONCILIATION_PAGE_SIZE,
             )
@@ -392,6 +408,11 @@ impl SqliteSnapshotStore {
             if reservations.is_empty() {
                 break;
             }
+            let transaction = self
+                .db
+                .begin()
+                .await
+                .context("begin stale snapshot reservation batch")?;
             for reservation in &reservations {
                 if crud::find_patch_commit_intent(
                     &transaction,
@@ -411,6 +432,10 @@ impl SqliteSnapshotStore {
                     .await?;
                 }
             }
+            transaction
+                .commit()
+                .await
+                .context("commit stale snapshot reservation batch")?;
             let last = reservations.last().expect("non-empty reservation page");
             reservation_cursor = Some(crud::PatchSnapshotReservationCursor {
                 thread_id: last.thread_id.clone(),
@@ -425,7 +450,7 @@ impl SqliteSnapshotStore {
         let mut last_id = String::new();
         loop {
             let rows = crud::list_applied_patch_records_after_id(
-                &transaction,
+                &self.db,
                 &last_id,
                 RECONCILIATION_PAGE_SIZE,
             )
@@ -455,31 +480,63 @@ impl SqliteSnapshotStore {
                     "thread_history",
                 )
                 .id();
-                for snapshot in changes.iter().flat_map(|change| {
-                    [
-                        change.before.as_ref(),
-                        change.after.as_ref(),
-                        change.overwritten_destination.as_ref(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                }) {
-                    crud::increment_expected_patch_snapshot_reference(
-                        &transaction,
-                        &domain_id,
-                        &snapshot.content_hash,
-                        sqlite_i64(snapshot.byte_len, "snapshot byte length")?,
-                    )
-                    .await
-                    .context("accumulate snapshot reference count")?;
+                let references = changes
+                    .iter()
+                    .flat_map(|change| {
+                        [
+                            change.before.as_ref(),
+                            change.after.as_ref(),
+                            change.overwritten_destination.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                    })
+                    .map(|snapshot| {
+                        Ok((
+                            snapshot.content_hash,
+                            sqlite_i64(snapshot.byte_len, "snapshot byte length")?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if references.is_empty() {
+                    continue;
+                }
+                for reference_batch in references.chunks(RECONCILIATION_REFERENCE_BATCH_SIZE) {
+                    let transaction = self
+                        .db
+                        .begin()
+                        .await
+                        .context("begin expected snapshot reference batch")?;
+                    for (content_hash, byte_len) in reference_batch {
+                        crud::increment_expected_patch_snapshot_reference(
+                            &transaction,
+                            &domain_id,
+                            content_hash,
+                            *byte_len,
+                        )
+                        .await
+                        .context("accumulate snapshot reference count")?;
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("commit expected snapshot reference batch")?;
+                    tokio::task::yield_now().await;
                 }
             }
         }
 
+        // Validate the complete scratch projection before changing persistent
+        // ref counts. A missing blob therefore fails closed without exposing
+        // a partially applied repair.
         let mut missing_references = 0_u64;
-        let mut repaired_references = 0_u64;
         let mut expected_cursor = None;
         loop {
+            let transaction = self
+                .db
+                .begin()
+                .await
+                .context("begin expected snapshot validation batch")?;
             let expected = crud::list_expected_patch_snapshot_references(
                 &transaction,
                 expected_cursor.as_ref(),
@@ -488,20 +545,77 @@ impl SqliteSnapshotStore {
             .await
             .context("load expected snapshot reference page")?;
             if expected.is_empty() {
+                transaction
+                    .commit()
+                    .await
+                    .context("commit empty expected snapshot validation batch")?;
                 break;
             }
             for expected_row in &expected {
-                let Some(stored) = crud::find_patch_snapshot_sizes(
+                if crud::find_patch_snapshot_sizes(
                     &transaction,
                     &expected_row.domain_id,
                     &expected_row.content_hash,
                     expected_row.byte_len,
                 )
                 .await?
-                else {
+                .is_none()
+                {
                     missing_references = missing_references.saturating_add(1);
-                    continue;
-                };
+                }
+            }
+            let last = expected.last().expect("non-empty expected reference page");
+            expected_cursor = Some(crud::PatchSnapshotKeyCursor {
+                domain_id: last.domain_id.clone(),
+                content_hash: last.content_hash.clone(),
+                byte_len: last.byte_len,
+            });
+            transaction
+                .commit()
+                .await
+                .context("commit expected snapshot validation batch")?;
+            if expected.len() < RECONCILIATION_PAGE_SIZE as usize {
+                break;
+            }
+        }
+        if missing_references > 0 {
+            bail!(
+                "{} retained patch snapshot reference(s) have no stored blob",
+                missing_references
+            );
+        }
+
+        let mut repaired_references = 0_u64;
+        expected_cursor = None;
+        loop {
+            let transaction = self
+                .db
+                .begin()
+                .await
+                .context("begin snapshot reference repair batch")?;
+            let expected = crud::list_expected_patch_snapshot_references(
+                &transaction,
+                expected_cursor.as_ref(),
+                RECONCILIATION_PAGE_SIZE,
+            )
+            .await
+            .context("load snapshot reference repair page")?;
+            if expected.is_empty() {
+                transaction
+                    .commit()
+                    .await
+                    .context("commit empty snapshot reference repair batch")?;
+                break;
+            }
+            for expected_row in &expected {
+                let stored = crud::find_patch_snapshot_sizes(
+                    &transaction,
+                    &expected_row.domain_id,
+                    &expected_row.content_hash,
+                    expected_row.byte_len,
+                )
+                .await?
+                .context("validated patch snapshot disappeared during repair")?;
                 if stored.ref_count != expected_row.ref_count {
                     let updated = crud::set_patch_snapshot_reference_count(
                         &transaction,
@@ -518,21 +632,19 @@ impl SqliteSnapshotStore {
                     repaired_references = repaired_references.saturating_add(1);
                 }
             }
-            let last = expected.last().expect("non-empty expected reference page");
+            let last = expected.last().expect("non-empty reference repair page");
             expected_cursor = Some(crud::PatchSnapshotKeyCursor {
                 domain_id: last.domain_id.clone(),
                 content_hash: last.content_hash.clone(),
                 byte_len: last.byte_len,
             });
+            transaction
+                .commit()
+                .await
+                .context("commit snapshot reference repair batch")?;
             if expected.len() < RECONCILIATION_PAGE_SIZE as usize {
                 break;
             }
-        }
-        if missing_references > 0 {
-            bail!(
-                "{} retained patch snapshot reference(s) have no stored blob",
-                missing_references
-            );
         }
 
         let mut collected_blobs = 0_u64;
@@ -540,7 +652,7 @@ impl SqliteSnapshotStore {
         let mut snapshot_cursor = None;
         loop {
             let snapshots = crud::list_patch_snapshot_keys(
-                &transaction,
+                &self.db,
                 snapshot_cursor.as_ref(),
                 RECONCILIATION_PAGE_SIZE,
             )
@@ -549,6 +661,11 @@ impl SqliteSnapshotStore {
             if snapshots.is_empty() {
                 break;
             }
+            let transaction = self
+                .db
+                .begin()
+                .await
+                .context("begin orphan snapshot collection batch")?;
             for snapshot in &snapshots {
                 if !crud::expected_patch_snapshot_reference_exists(
                     &transaction,
@@ -583,17 +700,17 @@ impl SqliteSnapshotStore {
                 content_hash: last.content_hash.clone(),
                 byte_len: last.byte_len,
             });
+            transaction
+                .commit()
+                .await
+                .context("commit orphan snapshot collection batch")?;
             if snapshots.len() < RECONCILIATION_PAGE_SIZE as usize {
                 break;
             }
         }
-        crud::drop_expected_patch_snapshot_references(&transaction)
+        crud::drop_expected_patch_snapshot_references(&self.db)
             .await
             .context("drop snapshot reference repair scratch state")?;
-        transaction
-            .commit()
-            .await
-            .context("commit snapshot reference repair")?;
         Ok(SnapshotReconciliationReport {
             repaired_references,
             collected_blobs,
@@ -606,9 +723,10 @@ impl SqliteSnapshotStore {
         domain: &SnapshotDomain,
         snapshot: &CommittedTextSnapshot,
     ) -> Result<ContentAddressedSnapshotRef> {
+        let prepared = self.prepare_snapshot(domain.id().as_str(), snapshot)?;
         let transaction = self.db.begin().await.context("begin snapshot insert")?;
         let result = self
-            .put_in_transaction(&transaction, domain, snapshot, true)
+            .put_prepared_in_transaction(&transaction, prepared, true)
             .await;
         match result {
             Ok(reference) => {
@@ -630,42 +748,20 @@ impl SqliteSnapshotStore {
     /// record and false when repairing a pre-existing record's missing or
     /// corrupt blob. Keeping blob admission and record insertion in one
     /// transaction prevents an orphan ref-counted blob after a crash.
-    pub(crate) async fn put_in_transaction(
+    pub(crate) async fn put_prepared_in_transaction(
         &self,
         transaction: &DatabaseTransaction,
-        domain: &SnapshotDomain,
-        snapshot: &CommittedTextSnapshot,
+        snapshot: PreparedSnapshot,
         add_reference: bool,
     ) -> Result<ContentAddressedSnapshotRef> {
-        let domain_id = domain.id();
-        let content_hash = *snapshot.version.token.digest();
-        let byte_len = snapshot.bytes.len() as u64;
-        if snapshot.version.token.byte_len() != byte_len {
-            bail!("snapshot version byte length does not match snapshot bytes");
-        }
-        let actual_hash: [u8; 32] = sha2::Sha256::digest(snapshot.bytes.as_slice()).into();
-        if actual_hash != content_hash {
-            bail!("snapshot content hash does not match snapshot bytes");
-        }
-        if byte_len > self.limits.max_single_bytes {
-            bail!("snapshot single-blob limit exceeded");
-        }
-        if byte_len > self.limits.max_decompressed_bytes {
-            bail!("snapshot decompressed-byte limit exceeded");
-        }
-        let compressed =
-            zstd::stream::encode_all(snapshot.bytes.as_slice(), 3).context("compress snapshot")?;
-        let compressed_len = u64::try_from(compressed.len())
-            .map_err(|_| anyhow!("compressed snapshot length exceeds u64"))?;
-        if compressed_len > self.limits.max_physical_bytes {
-            bail!("snapshot compressed-byte limit exceeded");
-        }
-        let byte_len_sql = sqlite_i64(byte_len, "snapshot byte length")?;
+        let domain_id = snapshot.reference.domain_id.as_str();
+        let content_hash = snapshot.reference.snapshot.content_hash;
+        let byte_len = snapshot.reference.snapshot.byte_len;
         let existing = load_snapshot_bounded(
             transaction,
-            &domain_id,
+            domain_id,
             &content_hash,
-            byte_len_sql,
+            snapshot.byte_len_sql,
             self.limits.max_physical_bytes,
         )
         .await
@@ -677,8 +773,8 @@ impl SqliteSnapshotStore {
             }
             if existing.raw_byte_len < 0
                 || existing.raw_byte_len as u64 != byte_len
-                || existing.encoding != serde_json::to_string(&snapshot.encoding)?
-                || existing.line_endings_json != serde_json::to_string(&snapshot.line_endings)?
+                || existing.encoding != snapshot.encoding_json
+                || existing.line_endings_json != snapshot.line_endings_json
             {
                 bail!("snapshot content hash collision or metadata mismatch");
             }
@@ -689,15 +785,6 @@ impl SqliteSnapshotStore {
             if add_reference && existing_ref_count == i64::MAX {
                 bail!("snapshot reference count is exhausted");
             }
-            let decoded_existing = decode_zstd_bounded(
-                existing.compressed_bytes.as_slice(),
-                self.limits.max_decompressed_bytes,
-            )
-            .ok()
-            .filter(|bytes| {
-                let actual_hash: [u8; 32] = sha2::Sha256::digest(bytes.as_slice()).into();
-                bytes.len() as u64 == byte_len && actual_hash == content_hash
-            });
             let next_ref_count = if add_reference {
                 existing_ref_count
                     .checked_add(1)
@@ -705,17 +792,17 @@ impl SqliteSnapshotStore {
             } else {
                 existing_ref_count.max(1)
             };
-            if decoded_existing.is_none() {
+            if existing.compressed_bytes != snapshot.compressed_bytes {
                 let updated = crud::replace_patch_snapshot(
                     transaction,
                     crud::PatchSnapshotWrite {
-                        domain_id: domain_id.clone(),
+                        domain_id: domain_id.to_owned(),
                         content_hash: content_hash.to_vec(),
-                        byte_len: byte_len_sql,
-                        encoding: serde_json::to_string(&snapshot.encoding)?,
-                        line_endings_json: serde_json::to_string(&snapshot.line_endings)?,
-                        compressed_bytes: compressed.clone(),
-                        raw_byte_len: byte_len_sql,
+                        byte_len: snapshot.byte_len_sql,
+                        encoding: snapshot.encoding_json,
+                        line_endings_json: snapshot.line_endings_json,
+                        compressed_bytes: snapshot.compressed_bytes,
+                        raw_byte_len: snapshot.byte_len_sql,
                         ref_count: next_ref_count,
                     },
                     existing_ref_count,
@@ -729,9 +816,9 @@ impl SqliteSnapshotStore {
                 if next_ref_count != existing_ref_count {
                     let updated = crud::set_patch_snapshot_reference_count(
                         transaction,
-                        &domain_id,
+                        domain_id,
                         &content_hash,
-                        byte_len_sql,
+                        snapshot.byte_len_sql,
                         existing_ref_count,
                         next_ref_count,
                     )
@@ -769,7 +856,7 @@ impl SqliteSnapshotStore {
             {
                 bail!("snapshot logical-byte limit exceeded");
             }
-            let compressed_len = u64::try_from(compressed.len())
+            let compressed_len = u64::try_from(snapshot.compressed_bytes.len())
                 .map_err(|_| anyhow!("compressed snapshot length exceeds u64"))?;
             if physical_bytes
                 .checked_add(compressed_len)
@@ -780,23 +867,20 @@ impl SqliteSnapshotStore {
             crud::insert_patch_snapshot(
                 transaction,
                 crud::PatchSnapshotWrite {
-                    domain_id: domain_id.clone(),
+                    domain_id: domain_id.to_owned(),
                     content_hash: content_hash.to_vec(),
-                    byte_len: byte_len_sql,
-                    encoding: serde_json::to_string(&snapshot.encoding)?,
-                    line_endings_json: serde_json::to_string(&snapshot.line_endings)?,
-                    compressed_bytes: compressed,
-                    raw_byte_len: byte_len_sql,
+                    byte_len: snapshot.byte_len_sql,
+                    encoding: snapshot.encoding_json,
+                    line_endings_json: snapshot.line_endings_json,
+                    compressed_bytes: snapshot.compressed_bytes,
+                    raw_byte_len: snapshot.byte_len_sql,
                     ref_count: 1,
                 },
             )
             .await
             .context("insert content addressed snapshot")?;
         }
-        Ok(ContentAddressedSnapshotRef {
-            domain_id,
-            snapshot: TextSnapshotRef::from_snapshot(snapshot),
-        })
+        Ok(snapshot.reference.clone())
     }
 
     pub async fn get(
@@ -877,8 +961,10 @@ impl SqliteSnapshotStore {
         {
             bail!("snapshot reference exceeds the configured byte limit");
         }
-        let transaction = self.db.begin().await.context("begin snapshot release")?;
         let byte_len = sqlite_i64(reference.snapshot.byte_len, "snapshot byte length")?;
+        let encoding_json = serde_json::to_string(&reference.snapshot.encoding)?;
+        let line_endings_json = serde_json::to_string(&reference.snapshot.line_endings)?;
+        let transaction = self.db.begin().await.context("begin snapshot release")?;
         let existing = load_snapshot_bounded(
             &transaction,
             &reference.domain_id,
@@ -896,9 +982,8 @@ impl SqliteSnapshotStore {
         if existing.raw_byte_len < 0
             || existing.raw_byte_len as u64 != reference.snapshot.byte_len
             || ref_count <= 0
-            || existing.encoding != serde_json::to_string(&reference.snapshot.encoding)?
-            || existing.line_endings_json
-                != serde_json::to_string(&reference.snapshot.line_endings)?
+            || existing.encoding != encoding_json
+            || existing.line_endings_json != line_endings_json
         {
             transaction.rollback().await.ok();
             bail!("snapshot reference metadata or count is corrupt");

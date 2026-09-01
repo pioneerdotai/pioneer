@@ -30,4 +30,13 @@ pub struct AppendedTaskEvent {
     pub parent_task_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub append_status: TaskEventAppendStatus,
+    pub(crate) candidate_gate_resolution:
+        Option<crate::repositories::native_terminal_effect_outbox::PreparedCandidateGateResolution>,
+    pub(crate) candidate_projection:
+        Option<crate::repositories::task_result_candidate::PreparedTaskResultCandidate>,
+    pub(crate) review_projection:
+        Option<crate::repositories::task_result_review_event::PreparedTaskResultReviewEvent>,
+    pub(crate) delivery_authority:
+        Option<crate::repositories::task_actor_contract::PreparedTaskDeliveryAuthority>,
+    pub(crate) projection: crate::task_projector::PreparedTaskProjection,
 }

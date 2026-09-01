@@ -122,6 +122,68 @@ pub struct NewTurnExecutionCheckpointRecord {
     pub created_at: DateTimeWithTimeZone,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnExecutionWindowInsert {
+    model: turn_execution_window::ActiveModel,
+    id: String,
+    turn_id: String,
+    window_index: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnExecutionWindowStatsTransition {
+    expected_status: ExecutionWindowStatus,
+    expected_status_db: String,
+    target_status: ExecutionWindowStatus,
+    target_status_db: String,
+    reason_db: Option<String>,
+    stats: TurnExecutionWindowStatsRecord,
+    metadata_json: String,
+    provider_token_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnExecutionWindowStatusTransition {
+    expected_status: ExecutionWindowStatus,
+    expected_status_db: String,
+    target_status: ExecutionWindowStatus,
+    target_status_db: String,
+    updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnExecutionCheckpointInsert {
+    id: String,
+    window_id: String,
+    workspace_id: String,
+    thread_id: String,
+    turn_id: String,
+    checkpoint_kind_db: String,
+    payload_json_db: String,
+    created_at: DateTimeWithTimeZone,
+}
+
+impl PreparedTurnExecutionCheckpointInsert {
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.payload_json_db.len()
+    }
+
+    pub(crate) fn with_window_id(mut self, window_id: String) -> Self {
+        self.window_id = window_id;
+        self
+    }
+
+    pub(crate) fn matches_model(&self, model: &turn_execution_checkpoint::Model) -> bool {
+        model.id == self.id
+            && model.window_id == self.window_id
+            && model.workspace_id == self.workspace_id
+            && model.thread_id == self.thread_id
+            && model.turn_id == self.turn_id
+            && model.checkpoint_kind == self.checkpoint_kind_db
+            && model.payload_json == self.payload_json_db
+    }
+}
+
 pub fn window_record_from_model(
     model: turn_execution_window::Model,
 ) -> Result<TurnExecutionWindowRecord> {
@@ -225,20 +287,89 @@ pub fn new_window_active_model(
     })
 }
 
-pub fn checkpoint_active_model(
-    record: NewTurnExecutionCheckpointRecord,
-) -> Result<turn_execution_checkpoint::ActiveModel> {
-    let payload_json = serialize_checkpoint_payload(&record.payload_json)?;
-    Ok(turn_execution_checkpoint::ActiveModel {
-        id: Set(record.id.unwrap_or_else(|| generate_id(DB_ID_LEN))),
-        window_id: Set(record.window_id),
-        workspace_id: Set(record.workspace_id),
-        thread_id: Set(record.thread_id),
-        turn_id: Set(record.turn_id),
-        checkpoint_kind: Set(checkpoint_kind_to_db(record.checkpoint_kind)),
-        payload_json: Set(payload_json),
-        created_at: Set(record.created_at),
+pub(crate) fn prepare_turn_execution_window_insert(
+    record: NewTurnExecutionWindowRecord,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<PreparedTurnExecutionWindowInsert> {
+    let turn_id = record.turn_id.clone();
+    let window_index = record.window_index;
+    let model = new_window_active_model(record, created_at, updated_at)?;
+    let id = active_model_id(&model.id)?;
+    Ok(PreparedTurnExecutionWindowInsert {
+        model,
+        id,
+        turn_id,
+        window_index,
     })
+}
+
+pub(crate) fn prepare_turn_execution_window_stats_transition(
+    expected_status: ExecutionWindowStatus,
+    target_status: ExecutionWindowStatus,
+    reason: Option<ExecutionWindowExhaustionReason>,
+    stats: TurnExecutionWindowStatsRecord,
+) -> Result<PreparedTurnExecutionWindowStatsTransition> {
+    let metadata_json = serde_json::to_string(&stats.metadata_json)
+        .context("failed to serialize execution-window metadata_json")?;
+    let provider_token_count =
+        i64::try_from(stats.provider_token_count).context("provider_token_count exceeds i64")?;
+    Ok(PreparedTurnExecutionWindowStatsTransition {
+        expected_status,
+        expected_status_db: execution_window_status_to_db(expected_status),
+        target_status,
+        target_status_db: execution_window_status_to_db(target_status),
+        reason_db: reason.map(execution_window_exhaustion_reason_to_db),
+        stats,
+        metadata_json,
+        provider_token_count,
+    })
+}
+
+pub(crate) fn prepare_turn_execution_window_status_transition(
+    expected_status: ExecutionWindowStatus,
+    target_status: ExecutionWindowStatus,
+    updated_at: DateTimeWithTimeZone,
+) -> PreparedTurnExecutionWindowStatusTransition {
+    PreparedTurnExecutionWindowStatusTransition {
+        expected_status,
+        expected_status_db: execution_window_status_to_db(expected_status),
+        target_status,
+        target_status_db: execution_window_status_to_db(target_status),
+        updated_at,
+    }
+}
+
+pub(crate) fn prepare_turn_execution_checkpoint_insert(
+    record: NewTurnExecutionCheckpointRecord,
+) -> Result<PreparedTurnExecutionCheckpointInsert> {
+    let payload_json_db = serialize_checkpoint_payload(&record.payload_json)?;
+    let checkpoint_kind_db = checkpoint_kind_to_db(record.checkpoint_kind);
+    Ok(PreparedTurnExecutionCheckpointInsert {
+        id: record.id.unwrap_or_else(|| generate_id(DB_ID_LEN)),
+        window_id: record.window_id,
+        workspace_id: record.workspace_id,
+        thread_id: record.thread_id,
+        turn_id: record.turn_id,
+        checkpoint_kind_db,
+        payload_json_db,
+        created_at: record.created_at,
+    })
+}
+
+impl PreparedTurnExecutionCheckpointInsert {
+    fn active_model(&self) -> turn_execution_checkpoint::ActiveModel {
+        turn_execution_checkpoint::ActiveModel {
+            id: Set(self.id.clone()),
+            window_id: Set(self.window_id.clone()),
+            workspace_id: Set(self.workspace_id.clone()),
+            thread_id: Set(self.thread_id.clone()),
+            turn_id: Set(self.turn_id.clone()),
+            checkpoint_kind: Set(self.checkpoint_kind_db.clone()),
+            payload_json: Set(self.payload_json_db.clone()),
+            created_at: Set(self.created_at),
+        }
+    }
 }
 
 pub async fn create_turn_execution_window<C: ConnectionTrait>(
@@ -247,18 +378,25 @@ pub async fn create_turn_execution_window<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<TurnExecutionWindowRecord> {
-    enforce_next_window_index(db, record.turn_id.as_str(), record.window_index).await?;
-
-    let active_model = new_window_active_model(record, created_at, updated_at)?;
-    let id = active_model_id(&active_model.id)?;
-    turn_execution_window::Entity::insert(active_model)
-        .exec(db)
-        .await
-        .context("failed to insert turn_execution_window row")?;
+    let prepared = prepare_turn_execution_window_insert(record, created_at, updated_at)?;
+    let id = prepared.id.clone();
+    insert_prepared_turn_execution_window(db, prepared).await?;
 
     get_turn_execution_window(db, id.as_str())
         .await?
         .context("inserted turn_execution_window row is missing")
+}
+
+pub(crate) async fn insert_prepared_turn_execution_window<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnExecutionWindowInsert,
+) -> Result<()> {
+    enforce_next_window_index(db, prepared.turn_id.as_str(), prepared.window_index).await?;
+    turn_execution_window::Entity::insert(prepared.model)
+        .exec(db)
+        .await
+        .context("failed to insert turn_execution_window row")?;
+    Ok(())
 }
 
 pub async fn get_turn_execution_window<C: ConnectionTrait>(
@@ -271,6 +409,16 @@ pub async fn get_turn_execution_window<C: ConnectionTrait>(
         .context("failed to query turn_execution_window row")?
         .map(window_record_from_model)
         .transpose()
+}
+
+pub(crate) async fn get_turn_execution_window_model<C: ConnectionTrait>(
+    db: &C,
+    window_id: &str,
+) -> Result<Option<turn_execution_window::Model>> {
+    turn_execution_window::Entity::find_by_id(window_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query raw turn_execution_window row")
 }
 
 pub async fn list_turn_execution_windows<C: ConnectionTrait>(
@@ -300,6 +448,57 @@ pub async fn latest_turn_execution_window<C: ConnectionTrait>(
         .context("failed to query latest turn_execution_window row")?
         .map(window_record_from_model)
         .transpose()
+}
+
+pub(crate) async fn latest_turn_execution_window_model<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<turn_execution_window::Model>> {
+    turn_execution_window::Entity::find()
+        .filter(turn_execution_window::Column::TurnId.eq(turn_id.to_owned()))
+        .order_by_desc(turn_execution_window::Column::WindowIndex)
+        .one(db)
+        .await
+        .context("failed to query latest raw turn_execution_window row")
+}
+
+pub(crate) async fn window_metadata_string_matches<C: ConnectionTrait>(
+    db: &C,
+    window_id: &str,
+    key: &'static str,
+    expected: &str,
+) -> Result<bool> {
+    let json_path = format!("$.{key}");
+    Ok(
+        turn_execution_window::Entity::find_by_id(window_id.to_owned())
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                "json_extract(metadata_json, ?) = ?",
+                vec![json_path, expected.to_owned()],
+            ))
+            .one(db)
+            .await
+            .with_context(|| format!("failed to validate execution-window metadata key `{key}`"))?
+            .is_some(),
+    )
+}
+
+pub(crate) async fn window_metadata_string_is_present<C: ConnectionTrait>(
+    db: &C,
+    window_id: &str,
+    key: &'static str,
+) -> Result<bool> {
+    let json_path = format!("$.{key}");
+    Ok(
+        turn_execution_window::Entity::find_by_id(window_id.to_owned())
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                "json_type(metadata_json, ?) = 'text'",
+                vec![json_path],
+            ))
+            .one(db)
+            .await
+            .with_context(|| format!("failed to validate execution-window metadata key `{key}`"))?
+            .is_some(),
+    )
 }
 
 pub async fn aggregate_turn_execution_window_usage<C: ConnectionTrait>(
@@ -442,125 +641,106 @@ pub async fn mark_turn_execution_window_blocked<C: ConnectionTrait>(
     update_window_with_stats(db, window_id, ExecutionWindowStatus::Blocked, reason, stats).await
 }
 
-/// Apply a monotonic execution-window transition with a database compare-and-
-/// set. Exact replay of the already committed target is idempotent; every
-/// other stale, skipped, or regressive transition is rejected.
-pub async fn transition_window_with_stats<C: ConnectionTrait>(
+pub(crate) async fn transition_window_with_prepared_stats<C: ConnectionTrait>(
     db: &C,
     window_id: &str,
-    expected_status: ExecutionWindowStatus,
-    target_status: ExecutionWindowStatus,
-    reason: Option<ExecutionWindowExhaustionReason>,
-    stats: TurnExecutionWindowStatsRecord,
-) -> Result<TurnExecutionWindowRecord> {
-    let metadata_json = serde_json::to_string(&stats.metadata_json)
-        .context("failed to serialize execution-window metadata_json")?;
+    prepared: PreparedTurnExecutionWindowStatsTransition,
+) -> Result<turn_execution_window::Model> {
     let affected = turn_execution_window::Entity::update_many()
         .col_expr(
             turn_execution_window::Column::Status,
-            sea_orm::sea_query::Expr::value(execution_window_status_to_db(target_status)),
+            sea_orm::sea_query::Expr::value(prepared.target_status_db.clone()),
         )
         .col_expr(
             turn_execution_window::Column::ExhaustionReason,
-            sea_orm::sea_query::Expr::value(reason.map(execution_window_exhaustion_reason_to_db)),
+            sea_orm::sea_query::Expr::value(prepared.reason_db.clone()),
         )
         .col_expr(
             turn_execution_window::Column::AgentRoundCount,
-            sea_orm::sea_query::Expr::value(i64::from(stats.agent_round_count)),
+            sea_orm::sea_query::Expr::value(i64::from(prepared.stats.agent_round_count)),
         )
         .col_expr(
             turn_execution_window::Column::ToolCallCount,
-            sea_orm::sea_query::Expr::value(i64::from(stats.tool_call_count)),
+            sea_orm::sea_query::Expr::value(i64::from(prepared.stats.tool_call_count)),
         )
         .col_expr(
             turn_execution_window::Column::ProviderTokenCount,
-            sea_orm::sea_query::Expr::value(
-                i64::try_from(stats.provider_token_count)
-                    .context("provider_token_count exceeds i64")?,
-            ),
+            sea_orm::sea_query::Expr::value(prepared.provider_token_count),
         )
         .col_expr(
             turn_execution_window::Column::MetadataJson,
-            sea_orm::sea_query::Expr::value(metadata_json),
+            sea_orm::sea_query::Expr::value(prepared.metadata_json.clone()),
         )
         .col_expr(
             turn_execution_window::Column::CompletedAt,
-            sea_orm::sea_query::Expr::value(Some(stats.completed_at.clone())),
+            sea_orm::sea_query::Expr::value(Some(prepared.stats.completed_at.clone())),
         )
         .col_expr(
             turn_execution_window::Column::UpdatedAt,
-            sea_orm::sea_query::Expr::value(stats.updated_at.clone()),
+            sea_orm::sea_query::Expr::value(prepared.stats.updated_at.clone()),
         )
         .filter(turn_execution_window::Column::Id.eq(window_id.to_owned()))
-        .filter(
-            turn_execution_window::Column::Status
-                .eq(execution_window_status_to_db(expected_status)),
-        )
+        .filter(turn_execution_window::Column::Status.eq(prepared.expected_status_db.as_str()))
         .exec(db)
         .await
         .with_context(|| format!("failed to transition execution window `{window_id}`"))?
         .rows_affected;
 
-    let current = get_turn_execution_window(db, window_id)
+    let current = get_turn_execution_window_model(db, window_id)
         .await?
         .with_context(|| format!("execution window `{window_id}` is missing"))?;
     if affected == 1 {
         return Ok(current);
     }
-    if current.status == target_status
-        && current.exhaustion_reason == reason
-        && current.agent_round_count == stats.agent_round_count
-        && current.tool_call_count == stats.tool_call_count
-        && current.provider_token_count == stats.provider_token_count
-        && current.metadata_json == stats.metadata_json
-        && current.completed_at.as_ref() == Some(&stats.completed_at)
+    if current.status == prepared.target_status_db
+        && current.exhaustion_reason == prepared.reason_db
+        && current.agent_round_count == i64::from(prepared.stats.agent_round_count)
+        && current.tool_call_count == i64::from(prepared.stats.tool_call_count)
+        && current.provider_token_count == prepared.provider_token_count
+        && current.metadata_json == prepared.metadata_json
+        && current.completed_at.as_ref() == Some(&prepared.stats.completed_at)
     {
         return Ok(current);
     }
     anyhow::bail!(
         "execution window `{window_id}` cannot transition from {:?} to {:?}; expected {:?}",
         current.status,
-        target_status,
-        expected_status
+        prepared.target_status,
+        prepared.expected_status
     )
 }
 
-pub async fn transition_window_status_only<C: ConnectionTrait>(
+pub(crate) async fn transition_window_with_prepared_status<C: ConnectionTrait>(
     db: &C,
     window_id: &str,
-    expected_status: ExecutionWindowStatus,
-    target_status: ExecutionWindowStatus,
-    updated_at: DateTimeWithTimeZone,
-) -> Result<TurnExecutionWindowRecord> {
+    prepared: PreparedTurnExecutionWindowStatusTransition,
+) -> Result<turn_execution_window::Model> {
     let affected = turn_execution_window::Entity::update_many()
         .col_expr(
             turn_execution_window::Column::Status,
-            sea_orm::sea_query::Expr::value(execution_window_status_to_db(target_status)),
+            sea_orm::sea_query::Expr::value(prepared.target_status_db.as_str()),
         )
         .col_expr(
             turn_execution_window::Column::UpdatedAt,
-            sea_orm::sea_query::Expr::value(updated_at.clone()),
+            sea_orm::sea_query::Expr::value(prepared.updated_at.clone()),
         )
         .filter(turn_execution_window::Column::Id.eq(window_id.to_owned()))
-        .filter(
-            turn_execution_window::Column::Status
-                .eq(execution_window_status_to_db(expected_status)),
-        )
+        .filter(turn_execution_window::Column::Status.eq(prepared.expected_status_db.as_str()))
         .exec(db)
         .await
         .with_context(|| format!("failed to transition execution window `{window_id}` status"))?
         .rows_affected;
-    let current = get_turn_execution_window(db, window_id)
+    let current = get_turn_execution_window_model(db, window_id)
         .await?
         .with_context(|| format!("execution window `{window_id}` is missing"))?;
-    if affected == 1 || current.status == target_status {
+    if affected == 1 || current.status == prepared.target_status_db {
         return Ok(current);
     }
     anyhow::bail!(
         "execution window `{window_id}` cannot transition from {:?} to {:?}; expected {:?}",
         current.status,
-        target_status,
-        expected_status
+        prepared.target_status,
+        prepared.expected_status
     )
 }
 
@@ -744,16 +924,24 @@ pub async fn save_turn_execution_checkpoint<C: ConnectionTrait>(
     db: &C,
     record: NewTurnExecutionCheckpointRecord,
 ) -> Result<TurnExecutionCheckpointRecord> {
-    let active_model = checkpoint_active_model(record)?;
-    let id = active_model_id(&active_model.id)?;
-    turn_execution_checkpoint::Entity::insert(active_model)
-        .exec(db)
-        .await
-        .context("failed to insert turn_execution_checkpoint row")?;
+    let prepared = prepare_turn_execution_checkpoint_insert(record)?;
+    let id = prepared.id.clone();
+    insert_prepared_turn_execution_checkpoint(db, prepared).await?;
 
     get_turn_execution_checkpoint(db, id.as_str())
         .await?
         .context("inserted turn_execution_checkpoint row is missing")
+}
+
+pub(crate) async fn insert_prepared_turn_execution_checkpoint<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnExecutionCheckpointInsert,
+) -> Result<()> {
+    turn_execution_checkpoint::Entity::insert(prepared.active_model())
+        .exec(db)
+        .await
+        .context("failed to insert turn_execution_checkpoint row")?;
+    Ok(())
 }
 
 pub async fn get_turn_execution_checkpoint<C: ConnectionTrait>(
@@ -766,6 +954,16 @@ pub async fn get_turn_execution_checkpoint<C: ConnectionTrait>(
         .context("failed to query turn_execution_checkpoint row")?
         .map(checkpoint_record_from_model)
         .transpose()
+}
+
+pub(crate) async fn get_turn_execution_checkpoint_model<C: ConnectionTrait>(
+    db: &C,
+    checkpoint_id: &str,
+) -> Result<Option<turn_execution_checkpoint::Model>> {
+    turn_execution_checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to query raw turn_execution_checkpoint row")
 }
 
 pub async fn list_turn_execution_checkpoints_for_window<C: ConnectionTrait>(

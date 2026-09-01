@@ -9,10 +9,161 @@ use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
+use std::error::Error as StdError;
+use std::fmt;
 
 use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 
 const DB_ID_LEN: usize = 21;
+
+#[derive(Clone, Debug)]
+pub struct PreparedTaskEvent {
+    id: String,
+    task_id: String,
+    run_id: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    event_type: String,
+    idempotency_key: Option<String>,
+    payload_json: String,
+    payload: TaskEventPayload,
+    semantically_matching_existing: Option<SemanticallyMatchingExistingTaskEvent>,
+    candidate_gate_resolution:
+        Option<super::native_terminal_effect_outbox::PreparedCandidateGateResolution>,
+    candidate_projection: Option<super::task_result_candidate::PreparedTaskResultCandidate>,
+    review_projection: Option<super::task_result_review_event::PreparedTaskResultReviewEvent>,
+    delivery_authority: Option<super::task_actor_contract::PreparedTaskDeliveryAuthority>,
+    projection: crate::task_projector::PreparedTaskProjection,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticallyMatchingExistingTaskEvent {
+    id: String,
+    payload: TaskEventPayload,
+}
+
+#[derive(Debug)]
+struct TaskEventIdempotencyPreflightRace {
+    idempotency_key: String,
+}
+
+impl fmt::Display for TaskEventIdempotencyPreflightRace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "task event idempotency key `{}` changed after preflight",
+            self.idempotency_key
+        )
+    }
+}
+
+impl StdError for TaskEventIdempotencyPreflightRace {}
+
+pub(crate) fn is_idempotency_preflight_race(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<TaskEventIdempotencyPreflightRace>()
+            .is_some()
+    })
+}
+
+impl PreparedTaskEvent {
+    pub fn prepare(payload: TaskEventPayload) -> Result<Self> {
+        let projection = crate::task_projector::PreparedTaskProjection::prepare(&payload)?;
+        let candidate_projection = match &payload {
+            TaskEventPayload::TaskResultCandidateCreated { candidate }
+            | TaskEventPayload::TaskResultCandidateAccepted { candidate, .. }
+            | TaskEventPayload::TaskResultCandidateRejected { candidate, .. }
+            | TaskEventPayload::TaskResultCandidateCancelled { candidate, .. } => Some(
+                super::task_result_candidate::prepare_protocol_candidate(candidate)?,
+            ),
+            _ => None,
+        };
+        let review_projection = match &payload {
+            TaskEventPayload::TaskResultReviewEventRecorded { review_event } => {
+                Some(super::task_result_review_event::prepare_protocol_review_event(review_event)?)
+            }
+            _ => None,
+        };
+        let task_id = payload.task_id().to_owned();
+        let run_id = payload.run_id().map(str::to_owned);
+        let thread_id = payload.thread_id().map(str::to_owned);
+        let turn_id = payload.turn_id().map(str::to_owned);
+        let event_type = payload.event_type().to_owned();
+        let idempotency_key = payload.idempotency_key();
+        let payload_json =
+            serde_json::to_string(&payload).context("failed to serialize task event payload")?;
+        Ok(Self {
+            id: generate_id(DB_ID_LEN),
+            task_id,
+            run_id,
+            thread_id,
+            turn_id,
+            event_type,
+            idempotency_key,
+            payload_json,
+            payload,
+            semantically_matching_existing: None,
+            candidate_gate_resolution: None,
+            candidate_projection,
+            review_projection,
+            delivery_authority: None,
+            projection,
+        })
+    }
+
+    pub async fn preflight_idempotency<C: ConnectionTrait>(mut self, db: &C) -> Result<Self> {
+        let Some(idempotency_key) = self.idempotency_key.as_deref() else {
+            return Ok(self);
+        };
+        if let Some(existing) =
+            find_event_by_idempotency_key(db, &self.task_id, idempotency_key).await?
+        {
+            let existing = existing_event_outcome(existing, &self.payload, idempotency_key)?;
+            self.semantically_matching_existing = Some(SemanticallyMatchingExistingTaskEvent {
+                id: existing.id,
+                payload: existing.payload,
+            });
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn payload(&self) -> &TaskEventPayload {
+        &self.payload
+    }
+
+    pub(crate) fn with_candidate_gate_resolution(
+        mut self,
+        prepared: Option<super::native_terminal_effect_outbox::PreparedCandidateGateResolution>,
+    ) -> Self {
+        self.candidate_gate_resolution = prepared;
+        self
+    }
+
+    pub(crate) fn with_candidate_projection(
+        mut self,
+        prepared: Option<super::task_result_candidate::PreparedTaskResultCandidate>,
+    ) -> Self {
+        self.candidate_projection = prepared;
+        self
+    }
+
+    pub(crate) fn with_review_projection(
+        mut self,
+        prepared: Option<super::task_result_review_event::PreparedTaskResultReviewEvent>,
+    ) -> Self {
+        self.review_projection = prepared;
+        self
+    }
+
+    pub(crate) fn with_delivery_authority(
+        mut self,
+        prepared: Option<super::task_actor_contract::PreparedTaskDeliveryAuthority>,
+    ) -> Self {
+        self.delivery_authority = prepared;
+        self
+    }
+}
 
 pub async fn append_event<C: ConnectionTrait>(
     db: &C,
@@ -20,22 +171,48 @@ pub async fn append_event<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     idempotency_key: Option<&str>,
 ) -> Result<AppendedTaskEvent> {
-    let task_id = payload.task_id().to_owned();
-    if let Some(idempotency_key) = idempotency_key
+    let mut prepared = PreparedTaskEvent::prepare(payload.clone())?;
+    prepared.idempotency_key = idempotency_key.map(str::to_owned);
+    let prepared = prepared.preflight_idempotency(db).await?;
+    append_prepared_event(db, prepared, created_at).await
+}
+
+pub async fn append_prepared_event<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskEvent,
+    created_at: DateTimeWithTimeZone,
+) -> Result<AppendedTaskEvent> {
+    if let Some(idempotency_key) = prepared.idempotency_key.as_deref()
         && let Some(existing) =
-            find_event_by_idempotency_key(db, task_id.as_str(), idempotency_key).await?
+            find_event_by_idempotency_key(db, prepared.task_id.as_str(), idempotency_key).await?
     {
-        return existing_event_outcome(existing, payload, idempotency_key);
+        return existing_event_outcome_after_preflight(
+            existing,
+            &prepared.payload,
+            prepared.payload_json.as_str(),
+            prepared.semantically_matching_existing.as_ref(),
+            idempotency_key,
+        );
     }
 
-    let run_id = payload.run_id().map(str::to_owned);
-    let thread_id = payload.thread_id().map(str::to_owned);
-    let turn_id = payload.turn_id().map(str::to_owned);
-    let event_type = payload.event_type().to_owned();
-    let payload_json =
-        serde_json::to_string(payload).context("failed to serialize task event payload")?;
+    let PreparedTaskEvent {
+        id,
+        task_id,
+        run_id,
+        thread_id,
+        turn_id,
+        event_type,
+        idempotency_key,
+        payload_json,
+        payload,
+        semantically_matching_existing,
+        candidate_gate_resolution,
+        candidate_projection,
+        review_projection,
+        delivery_authority,
+        projection,
+    } = prepared;
     let sequence = next_sequence_for_task(db, task_id.as_str()).await?;
-    let id = generate_id(DB_ID_LEN);
 
     let mut insert = Query::insert();
     insert
@@ -60,17 +237,23 @@ pub async fn append_event<C: ConnectionTrait>(
             turn_id.clone().into(),
             sequence.into(),
             event_type.clone().into(),
-            idempotency_key.map(str::to_owned).into(),
-            payload_json.into(),
+            idempotency_key.clone().into(),
+            payload_json.clone().into(),
             created_at.into(),
         ]);
 
     if let Err(error) = db.execute(&insert).await {
-        if let Some(idempotency_key) = idempotency_key
+        if let Some(idempotency_key) = idempotency_key.as_deref()
             && let Some(existing) =
                 find_event_by_idempotency_key(db, task_id.as_str(), idempotency_key).await?
         {
-            return existing_event_outcome(existing, payload, idempotency_key);
+            return existing_event_outcome_after_preflight(
+                existing,
+                &payload,
+                payload_json.as_str(),
+                semantically_matching_existing.as_ref(),
+                idempotency_key,
+            );
         }
         return Err(error).context("failed to append task event");
     }
@@ -83,14 +266,74 @@ pub async fn append_event<C: ConnectionTrait>(
         turn_id,
         sequence,
         event_type,
-        idempotency_key: idempotency_key.map(str::to_owned),
-        payload: payload.clone(),
+        idempotency_key,
+        payload,
         workspace_id: None,
         root_task_id: None,
         parent_task_id: None,
         created_at,
         append_status: TaskEventAppendStatus::Inserted,
+        candidate_gate_resolution,
+        candidate_projection,
+        review_projection,
+        delivery_authority,
+        projection,
     })
+}
+
+fn existing_event_outcome_after_preflight(
+    model: task_event::Model,
+    attempted_payload: &TaskEventPayload,
+    attempted_payload_json: &str,
+    preflight: Option<&SemanticallyMatchingExistingTaskEvent>,
+    idempotency_key: &str,
+) -> Result<AppendedTaskEvent> {
+    let payload = if model.payload_json == attempted_payload_json {
+        attempted_payload.clone()
+    } else if let Some(preflight) = preflight.filter(|preflight| preflight.id == model.id) {
+        preflight.payload.clone()
+    } else {
+        // Deserializing and semantically comparing an unexpected row can be
+        // arbitrarily CPU-heavy. Release the writer and let the operation's
+        // next preflight resolve it through the reader pool instead.
+        return Err(TaskEventIdempotencyPreflightRace {
+            idempotency_key: idempotency_key.to_owned(),
+        }
+        .into());
+    };
+    Ok(appended_task_event_from_known_payload(
+        model,
+        payload,
+        TaskEventAppendStatus::AlreadyExists,
+    ))
+}
+
+fn appended_task_event_from_known_payload(
+    model: task_event::Model,
+    payload: TaskEventPayload,
+    append_status: TaskEventAppendStatus,
+) -> AppendedTaskEvent {
+    AppendedTaskEvent {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        sequence: model.sequence,
+        event_type: model.event_type,
+        idempotency_key: model.idempotency_key,
+        payload,
+        workspace_id: None,
+        root_task_id: None,
+        parent_task_id: None,
+        created_at: model.created_at,
+        append_status,
+        candidate_gate_resolution: None,
+        candidate_projection: None,
+        review_projection: None,
+        delivery_authority: None,
+        projection: Default::default(),
+    }
 }
 
 async fn find_event_by_idempotency_key<C: ConnectionTrait>(
@@ -386,6 +629,11 @@ pub(crate) fn appended_task_event_from_model(
         parent_task_id: None,
         created_at: model.created_at,
         append_status,
+        candidate_gate_resolution: None,
+        candidate_projection: None,
+        review_projection: None,
+        delivery_authority: None,
+        projection: Default::default(),
     })
 }
 

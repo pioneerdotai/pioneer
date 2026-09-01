@@ -119,7 +119,7 @@ impl WorkspaceManager {
         requested_name: Option<&str>,
     ) -> Result<Workspace, WorkspaceError> {
         let workspace = self
-            .run_serialized_write(|| async {
+            .run_with_retry(|| async {
                 let requested_workspace_id = normalize_workspace_id(requested_workspace_id)?;
                 let explicit_name = normalize_workspace_name(requested_name)?;
 
@@ -197,7 +197,7 @@ impl WorkspaceManager {
 
     pub async fn ensure_default_workspace(&self) -> Result<Workspace, WorkspaceError> {
         let workspace = self
-            .run_serialized_write(|| async {
+            .run_with_retry(|| async {
                 let existing_workspaces = self.list_workspaces().await?;
                 if let Some(workspace) = select_default_workspace(existing_workspaces.as_slice()) {
                     return Ok(workspace);
@@ -313,7 +313,7 @@ impl WorkspaceManager {
                 .await;
         }
 
-        self.run_serialized_write(|| async {
+        self.run_with_retry(|| async {
             let workspace_id = normalize_workspace_id(requested_workspace_id)?;
             let transaction = self.connection.begin().await.map_err(|error| {
                 WorkspaceError::Internal(format!(
@@ -387,7 +387,7 @@ impl WorkspaceManager {
         requested_workspace_id: &str,
         requested_name: Option<&str>,
     ) -> Result<Workspace, WorkspaceError> {
-        self.run_serialized_write(|| async {
+        self.run_with_retry(|| async {
             let workspace_id = normalize_workspace_id(requested_workspace_id)?;
             let name = normalize_workspace_name(requested_name)?;
 
@@ -422,21 +422,6 @@ impl WorkspaceManager {
     {
         retry_with_backoff(
             operation,
-            is_workspace_sqlite_lock_error,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-        .await
-    }
-
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T, WorkspaceError>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, WorkspaceError>>,
-    {
-        let mut operation = operation;
-        retry_with_backoff(
-            || self.connection.run_write_operation(operation()),
             is_workspace_sqlite_lock_error,
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),

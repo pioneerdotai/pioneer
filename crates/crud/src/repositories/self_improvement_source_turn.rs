@@ -41,12 +41,23 @@ pub(crate) struct VerifiedCollaborativeExchange {
     pub accepted_task_run_turn_id: Option<String>,
 }
 
-pub async fn project_completed_source_turn<C: ConnectionTrait>(
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedSelfImprovementSourceTurn {
+    row: self_improvement_source_turn::ActiveModel,
+    workspace_id: String,
+    thread_id: String,
+    turn_id: String,
+    task_delivery_id: Option<String>,
+    terminal_event_id: String,
+    parent_turn_created_at_unix: i64,
+}
+
+pub(crate) async fn prepare_completed_source_turn<C: ConnectionTrait>(
     db: &C,
     terminal_event_id: &str,
     terminal_at: DateTimeWithTimeZone,
     notification: &TurnCompletedNotification,
-) -> Result<Option<SelfImprovementSourceTurnRecord>> {
+) -> Result<Option<PreparedSelfImprovementSourceTurn>> {
     let thread = thread::Entity::find_by_id(notification.thread_id.clone())
         .one(db)
         .await
@@ -88,7 +99,7 @@ pub async fn project_completed_source_turn<C: ConnectionTrait>(
         return Ok(None);
     }
 
-    self_improvement_source_turn::Entity::insert(self_improvement_source_turn::ActiveModel {
+    let row = self_improvement_source_turn::ActiveModel {
         id: sea_orm::ActiveValue::NotSet,
         workspace_id: Set(thread.workspace_id.clone()),
         thread_id: Set(notification.thread_id.clone()),
@@ -97,28 +108,7 @@ pub async fn project_completed_source_turn<C: ConnectionTrait>(
         terminal_event_id: Set(terminal_event_id.to_owned()),
         terminal_at: Set(terminal_at),
         created_at: Set(terminal_at),
-    })
-    .on_conflict(OnConflict::new().do_nothing().to_owned())
-    .exec_without_returning(db)
-    .await
-    .context("failed to insert self-improvement source turn")?;
-
-    let by_turn = self_improvement_source_turn::Entity::find()
-        .filter(self_improvement_source_turn::Column::TurnId.eq(notification.turn.id.clone()))
-        .one(db)
-        .await
-        .context("failed to verify self-improvement source turn identity")?
-        .context("self-improvement source turn is missing after idempotent insert")?;
-
-    if by_turn.terminal_event_id != terminal_event_id
-        || by_turn.workspace_id != thread.workspace_id
-        || by_turn.thread_id != notification.thread_id
-    {
-        bail!(
-            "self-improvement source identity conflict for turn `{}`",
-            notification.turn.id
-        );
-    }
+    };
 
     let parent_turn_created_at_unix = turn::Entity::find_by_id(notification.turn.id.clone())
         .one(db)
@@ -128,18 +118,23 @@ pub async fn project_completed_source_turn<C: ConnectionTrait>(
         .created_at
         .timestamp();
 
-    Ok(Some(record_from_model(
-        by_turn,
+    Ok(Some(PreparedSelfImprovementSourceTurn {
+        row,
+        workspace_id: thread.workspace_id,
+        thread_id: notification.thread_id.clone(),
+        turn_id: notification.turn.id.clone(),
+        task_delivery_id: None,
+        terminal_event_id: terminal_event_id.to_owned(),
         parent_turn_created_at_unix,
-    )))
+    }))
 }
 
-pub async fn project_completed_collaborative_source_exchange<C: ConnectionTrait>(
+pub(crate) async fn prepare_completed_collaborative_source_exchange<C: ConnectionTrait>(
     db: &C,
     terminal_event_id: &str,
     terminal_at: DateTimeWithTimeZone,
     notification: &ItemCompletedNotification,
-) -> Result<Option<SelfImprovementSourceTurnRecord>> {
+) -> Result<Option<PreparedSelfImprovementSourceTurn>> {
     let TurnItem::AgentMessage { id: item_id, .. } = &notification.item else {
         return Ok(None);
     };
@@ -207,7 +202,7 @@ pub async fn project_completed_collaborative_source_exchange<C: ConnectionTrait>
         return Ok(None);
     }
 
-    self_improvement_source_turn::Entity::insert(self_improvement_source_turn::ActiveModel {
+    let row = self_improvement_source_turn::ActiveModel {
         id: sea_orm::ActiveValue::NotSet,
         workspace_id: Set(notification.workspace_id.clone()),
         thread_id: Set(notification.thread_id.clone()),
@@ -216,32 +211,49 @@ pub async fn project_completed_collaborative_source_exchange<C: ConnectionTrait>
         terminal_event_id: Set(terminal_event_id.to_owned()),
         terminal_at: Set(terminal_at),
         created_at: Set(terminal_at),
-    })
-    .on_conflict(OnConflict::new().do_nothing().to_owned())
-    .exec_without_returning(db)
-    .await
-    .context("failed to insert collaborative self-improvement source exchange")?;
+    };
+
+    Ok(Some(PreparedSelfImprovementSourceTurn {
+        row,
+        workspace_id: notification.workspace_id.clone(),
+        thread_id: notification.thread_id.clone(),
+        turn_id: parent_turn_id,
+        task_delivery_id: Some(task_delivery_id.to_owned()),
+        terminal_event_id: terminal_event_id.to_owned(),
+        parent_turn_created_at_unix: parent_turn.created_at.timestamp(),
+    }))
+}
+
+pub(crate) async fn apply_prepared_source_turn<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedSelfImprovementSourceTurn,
+) -> Result<SelfImprovementSourceTurnRecord> {
+    self_improvement_source_turn::Entity::insert(prepared.row)
+        .on_conflict(OnConflict::new().do_nothing().to_owned())
+        .exec_without_returning(db)
+        .await
+        .context("failed to insert prepared self-improvement source turn")?;
 
     let by_turn = self_improvement_source_turn::Entity::find()
-        .filter(self_improvement_source_turn::Column::TurnId.eq(parent_turn_id.clone()))
+        .filter(self_improvement_source_turn::Column::TurnId.eq(prepared.turn_id.clone()))
         .one(db)
         .await
-        .context("failed to verify collaborative source exchange identity")?
-        .context("collaborative source exchange is missing after idempotent insert")?;
-    if by_turn.workspace_id != notification.workspace_id
-        || by_turn.thread_id != notification.thread_id
-        || by_turn.task_delivery_id.as_deref() != Some(task_delivery_id)
+        .context("failed to verify prepared self-improvement source turn identity")?
+        .context("prepared self-improvement source turn is missing after idempotent insert")?;
+    if by_turn.terminal_event_id != prepared.terminal_event_id
+        || by_turn.workspace_id != prepared.workspace_id
+        || by_turn.thread_id != prepared.thread_id
+        || by_turn.task_delivery_id != prepared.task_delivery_id
     {
         bail!(
-            "collaborative self-improvement source identity conflict for turn `{}`",
-            parent_turn_id
+            "self-improvement source identity conflict for turn `{}`",
+            prepared.turn_id
         );
     }
-
-    Ok(Some(record_from_model(
+    Ok(record_from_model(
         by_turn,
-        parent_turn.created_at.timestamp(),
-    )))
+        prepared.parent_turn_created_at_unix,
+    ))
 }
 
 async fn collaborative_parent_turn_id_for_delivery<C: ConnectionTrait>(

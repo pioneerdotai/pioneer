@@ -5,27 +5,49 @@ use pioneer_protocol::SkillPackId;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSkillPackInstallation {
+    row: skill_pack_installation::ActiveModel,
+}
+
+pub(crate) fn prepare_skill_pack_installation(
+    record: &crate::SkillPackInstallationRecord,
+) -> PreparedSkillPackInstallation {
+    PreparedSkillPackInstallation {
+        row: skill_pack_installation::ActiveModel {
+            id: Set(record.pack_id.to_string()),
+            name: Set(record.name.clone()),
+            scope_key: Set(record.scope_key.clone()),
+            source_kind: Set(record.source_kind.clone()),
+            created_at: Set(unix_to_datetime(record.created_at_unix)),
+            updated_at: Set(unix_to_datetime(record.updated_at_unix)),
+        },
+    }
+}
+
+pub(crate) async fn insert_prepared_skill_pack_installation<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedSkillPackInstallation,
+) -> Result<()> {
+    skill_pack_installation::Entity::insert(prepared.row)
+        .exec(db)
+        .await
+        .context("failed to insert prepared skill pack installation")?;
+    Ok(())
+}
+
 pub async fn insert_skill_pack_installation<C: ConnectionTrait>(
     db: &C,
     record: &crate::SkillPackInstallationRecord,
 ) -> Result<()> {
-    skill_pack_installation::Entity::insert(skill_pack_installation::ActiveModel {
-        id: Set(record.pack_id.to_string()),
-        name: Set(record.name.clone()),
-        scope_key: Set(record.scope_key.clone()),
-        source_kind: Set(record.source_kind.clone()),
-        created_at: Set(unix_to_datetime(record.created_at_unix)),
-        updated_at: Set(unix_to_datetime(record.updated_at_unix)),
-    })
-    .exec(db)
-    .await
-    .with_context(|| {
-        format!(
-            "failed to insert skill pack installation `{}` ({})",
-            record.pack_id, record.scope_key
-        )
-    })?;
-    Ok(())
+    insert_prepared_skill_pack_installation(db, prepare_skill_pack_installation(record))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to insert skill pack installation `{}` ({})",
+                record.pack_id, record.scope_key
+            )
+        })
 }
 
 pub async fn find_skill_pack_installation<C: ConnectionTrait>(

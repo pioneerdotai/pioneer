@@ -5,6 +5,80 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
+const SKILL_WORKSPACE_POLICY_WRITE_BATCH_SIZE: usize = 64;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedWorkspaceSkillPolicy {
+    row: skill_workspace_policy::ActiveModel,
+}
+
+pub(crate) fn prepare_workspace_skill_policy(
+    record: &crate::WorkspaceSkillPolicyRecord,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> PreparedWorkspaceSkillPolicy {
+    PreparedWorkspaceSkillPolicy {
+        row: skill_workspace_policy::ActiveModel {
+            id: Set(record.id.clone()),
+            workspace_id: Set(record.workspace_id.clone()),
+            skill_id: Set(record.skill_id.to_string()),
+            enabled: Set(record.enabled),
+            allow_implicit_invocation: Set(record.allow_implicit_invocation),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
+        },
+    }
+}
+
+pub(crate) async fn upsert_prepared_workspace_skill_policies<C: ConnectionTrait>(
+    db: &C,
+    prepared: &[PreparedWorkspaceSkillPolicy],
+) -> Result<()> {
+    for batch in prepared.chunks(SKILL_WORKSPACE_POLICY_WRITE_BATCH_SIZE) {
+        skill_workspace_policy::Entity::insert_many(batch.iter().map(|item| item.row.clone()))
+            .on_conflict(
+                OnConflict::columns([
+                    skill_workspace_policy::Column::WorkspaceId,
+                    skill_workspace_policy::Column::SkillId,
+                ])
+                .update_columns([
+                    skill_workspace_policy::Column::Enabled,
+                    skill_workspace_policy::Column::AllowImplicitInvocation,
+                    skill_workspace_policy::Column::UpdatedAt,
+                ])
+                .to_owned(),
+            )
+            .exec(db)
+            .await
+            .context("failed to upsert prepared workspace skill policies")?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn delete_workspace_skill_policies<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    skill_ids: &[SkillId],
+) -> Result<u64> {
+    if skill_ids.is_empty() {
+        return Ok(0);
+    }
+    let result = skill_workspace_policy::Entity::delete_many()
+        .filter(skill_workspace_policy::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .filter(
+            skill_workspace_policy::Column::SkillId.is_in(
+                skill_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .exec(db)
+        .await
+        .context("failed to delete workspace skill policies")?;
+    Ok(result.rows_affected)
+}
+
 pub async fn list_workspace_skill_policies<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
@@ -40,35 +114,28 @@ pub async fn upsert_workspace_skill_policy<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    skill_workspace_policy::Entity::insert(skill_workspace_policy::ActiveModel {
-        id: Set(record.id.clone()),
-        workspace_id: Set(record.workspace_id.clone()),
-        skill_id: Set(record.skill_id.to_string()),
-        enabled: Set(record.enabled),
-        allow_implicit_invocation: Set(record.allow_implicit_invocation),
-        created_at: Set(created_at),
-        updated_at: Set(updated_at),
-    })
-    .on_conflict(
-        OnConflict::columns([
-            skill_workspace_policy::Column::WorkspaceId,
-            skill_workspace_policy::Column::SkillId,
-        ])
-        .update_columns([
-            skill_workspace_policy::Column::Enabled,
-            skill_workspace_policy::Column::AllowImplicitInvocation,
-            skill_workspace_policy::Column::UpdatedAt,
-        ])
-        .to_owned(),
-    )
-    .exec(db)
-    .await
-    .with_context(|| {
-        format!(
-            "failed to upsert workspace skill policy `{}` for workspace `{}`",
-            record.skill_id, record.workspace_id
+    let prepared = prepare_workspace_skill_policy(record, created_at, updated_at);
+    skill_workspace_policy::Entity::insert(prepared.row)
+        .on_conflict(
+            OnConflict::columns([
+                skill_workspace_policy::Column::WorkspaceId,
+                skill_workspace_policy::Column::SkillId,
+            ])
+            .update_columns([
+                skill_workspace_policy::Column::Enabled,
+                skill_workspace_policy::Column::AllowImplicitInvocation,
+                skill_workspace_policy::Column::UpdatedAt,
+            ])
+            .to_owned(),
         )
-    })?;
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to upsert workspace skill policy `{}` for workspace `{}`",
+                record.skill_id, record.workspace_id
+            )
+        })?;
 
     Ok(())
 }

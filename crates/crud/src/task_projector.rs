@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use pioneer_protocol::{
     PersistedActorRef, TaskAgentReviewPolicy, TaskDelivery, TaskDeliveryMode, TaskDeliveryStatus,
-    TaskError, TaskErrorClass, TaskResult, TaskResultCandidate, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
-    TaskResultReviewerRef, TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskStatus, TaskThreadLineage, TaskValue, ThreadLineage,
+    TaskError, TaskErrorClass, TaskResultCandidateStatus, TaskResultReviewerRef, TaskRunStatus,
+    TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
+    TaskValue, ThreadLineage,
 };
 use sea_orm::ConnectionTrait;
 use std::collections::BTreeMap;
@@ -14,9 +13,10 @@ use tracing::warn;
 
 use crate::convention::{is_terminal_task_status_db, task_run_status_from_db, task_status_from_db};
 use crate::repositories::{
-    ProjectionWriteOutcome, task, task_actor_contract, task_agent_spec, task_delivery,
-    task_dependency, task_result_candidate, task_result_review_event, task_run, task_run_execution,
-    task_run_thread_binding, task_run_turn, task_trigger, task_write_lock, thread_lineage,
+    ProjectionWriteOutcome, native_terminal_effect_outbox, task, task_actor_contract,
+    task_agent_spec, task_delivery, task_dependency, task_result_candidate,
+    task_result_review_event, task_run, task_run_execution, task_run_thread_binding, task_run_turn,
+    task_trigger, task_write_lock, thread_lineage,
 };
 use crate::task_events::{AppendedTaskEvent, TaskEventPayload};
 use crate::util::{optional_typed_json_from_db, unix_to_datetime};
@@ -47,6 +47,191 @@ fn target_lineage_from_legacy(lineage: &ThreadLineage) -> TaskThreadLineage {
 #[derive(Clone, Default)]
 pub struct TaskProjector;
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreparedTaskProjection {
+    task: Option<task::PreparedTaskProjection>,
+    triggers: Vec<task_trigger::PreparedTaskTriggerProjection>,
+    dependency: Option<task_dependency::PreparedTaskDependencyProjection>,
+    agent_specs: Vec<task_agent_spec::PreparedTaskAgentSpecProjection>,
+    run: Option<task_run::PreparedTaskRunProjection>,
+    run_result_json: Option<String>,
+    run_error_json: Option<String>,
+    run_error_status: Option<TaskRunStatus>,
+    task_result_json: Option<String>,
+    task_error_json: Option<String>,
+    task_error_status: Option<TaskStatus>,
+    delivery: Option<task_delivery::PreparedTaskDeliveryProjection>,
+    delivery_attempt: Option<task_delivery::PreparedTaskDeliveryAttemptProjection>,
+}
+
+impl PreparedTaskProjection {
+    pub(crate) fn prepare(payload: &TaskEventPayload) -> Result<Self> {
+        let mut prepared = Self::default();
+        match payload {
+            TaskEventPayload::TaskCreated { task: task_model }
+            | TaskEventPayload::TaskDetached {
+                task: task_model, ..
+            } => {
+                prepared.task = Some(task::prepare_task_projection(task_model)?);
+            }
+            TaskEventPayload::TriggerCreated { trigger }
+            | TaskEventPayload::TaskRescheduled { trigger, .. } => {
+                prepared
+                    .triggers
+                    .push(task_trigger::prepare_trigger_projection(trigger)?);
+            }
+            TaskEventPayload::DependencyCreated { dependency } => {
+                prepared.dependency =
+                    Some(task_dependency::prepare_dependency_projection(dependency)?);
+            }
+            TaskEventPayload::AgentSpecCreated { agent_spec } => {
+                prepared
+                    .agent_specs
+                    .push(task_agent_spec::prepare_agent_spec_projection(agent_spec)?);
+            }
+            TaskEventPayload::RunCreated { run, agent_spec } => {
+                prepared.run = Some(task_run::prepare_run_projection(run)?);
+                if let Some(agent_spec) = agent_spec {
+                    prepared
+                        .agent_specs
+                        .push(task_agent_spec::prepare_agent_spec_projection(agent_spec)?);
+                }
+            }
+            TaskEventPayload::RunRetryScheduled { retry_run, .. } => {
+                prepared.run = Some(task_run::prepare_run_projection(retry_run)?);
+            }
+            TaskEventPayload::RunCompleted { result, .. } => {
+                prepared.run_result_json = task_run::prepare_run_result_json(result.as_ref())?;
+            }
+            TaskEventPayload::RunFailed { error, .. }
+            | TaskEventPayload::RunBlocked { error, .. } => {
+                prepared.run_error_json = task_run::prepare_run_error_json(error.as_ref())?;
+                prepared.run_error_status =
+                    Some(if matches!(payload, TaskEventPayload::RunBlocked { .. }) {
+                        TaskRunStatus::Blocked
+                    } else if task_error_is_cancellation(error.as_ref()) {
+                        TaskRunStatus::Cancelled
+                    } else {
+                        TaskRunStatus::Failed
+                    });
+            }
+            TaskEventPayload::RunCancelled { run_id, reason, .. } => {
+                let error = reason.as_ref().map(|reason| TaskError {
+                    code: "task_run_cancelled".to_owned(),
+                    message: reason.clone(),
+                    class: TaskErrorClass::Cancelled,
+                    details: None,
+                    failed_run_id: Some(run_id.clone()),
+                });
+                prepared.run_error_json = task_run::prepare_run_error_json(error.as_ref())?;
+                prepared.run_error_status = Some(TaskRunStatus::Cancelled);
+            }
+            TaskEventPayload::TaskCompleted { result, .. } => {
+                prepared.task_result_json = task::prepare_task_result_json(result.as_ref())?;
+            }
+            TaskEventPayload::TaskFailed { error, .. }
+            | TaskEventPayload::TaskBlocked { error, .. } => {
+                prepared.task_error_json = task::prepare_task_error_json(error.as_ref())?;
+                prepared.task_error_status =
+                    Some(if matches!(payload, TaskEventPayload::TaskBlocked { .. }) {
+                        TaskStatus::Blocked
+                    } else if task_error_is_cancellation(error.as_ref()) {
+                        TaskStatus::Cancelled
+                    } else {
+                        TaskStatus::Failed
+                    });
+            }
+            TaskEventPayload::TaskCancelled { reason, .. } => {
+                let error = reason.as_ref().map(|reason| TaskError {
+                    code: "task_cancelled".to_owned(),
+                    message: reason.clone(),
+                    class: TaskErrorClass::Cancelled,
+                    details: None,
+                    failed_run_id: None,
+                });
+                prepared.task_error_json = task::prepare_task_error_json(error.as_ref())?;
+                prepared.task_error_status = Some(TaskStatus::Cancelled);
+            }
+            TaskEventPayload::TaskUpdated {
+                task: task_model,
+                trigger,
+                agent_spec,
+                ..
+            } => {
+                prepared.task = Some(task::prepare_task_projection(task_model)?);
+                if let Some(trigger) = trigger {
+                    prepared
+                        .triggers
+                        .push(task_trigger::prepare_trigger_projection(trigger)?);
+                }
+                if let Some(agent_spec) = agent_spec {
+                    prepared
+                        .agent_specs
+                        .push(task_agent_spec::prepare_agent_spec_projection(agent_spec)?);
+                }
+            }
+            TaskEventPayload::TaskPaused {
+                task: task_model,
+                triggers,
+                ..
+            }
+            | TaskEventPayload::TaskResumed {
+                task: task_model,
+                triggers,
+                ..
+            } => {
+                prepared.task = Some(task::prepare_task_projection(task_model)?);
+                prepared.triggers = triggers
+                    .iter()
+                    .map(task_trigger::prepare_trigger_projection)
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            TaskEventPayload::DepthLimitExceeded {
+                run_id,
+                depth,
+                max_depth,
+                ..
+            } => {
+                let error = TaskError {
+                    code: "task_depth_limit_exceeded".to_owned(),
+                    message: format!("task depth {depth} exceeds max depth {max_depth}"),
+                    class: TaskErrorClass::Policy,
+                    details: Some(TaskValue::Object(BTreeMap::from([
+                        ("depth".to_owned(), TaskValue::Integer(*depth)),
+                        ("maxDepth".to_owned(), TaskValue::Integer(*max_depth)),
+                    ]))),
+                    failed_run_id: run_id.clone(),
+                };
+                let error_json = task::prepare_task_error_json(Some(&error))?;
+                prepared.task_error_json = error_json.clone();
+                prepared.run_error_json = error_json;
+                prepared.task_error_status = Some(TaskStatus::Failed);
+                prepared.run_error_status = Some(TaskRunStatus::Failed);
+            }
+            TaskEventPayload::DeliveryQueued { delivery } => {
+                prepared.delivery = Some(task_delivery::prepare_delivery_projection(delivery)?);
+            }
+            TaskEventPayload::DeliveryCancelled {
+                delivery, attempt, ..
+            } => {
+                prepared.delivery = Some(task_delivery::prepare_delivery_projection(delivery)?);
+                prepared.delivery_attempt = attempt
+                    .as_ref()
+                    .map(task_delivery::prepare_attempt_projection);
+            }
+            TaskEventPayload::DeliveryStarted { delivery, attempt }
+            | TaskEventPayload::DeliveryDelivered { delivery, attempt }
+            | TaskEventPayload::DeliveryFailed { delivery, attempt } => {
+                prepared.delivery = Some(task_delivery::prepare_delivery_projection(delivery)?);
+                prepared.delivery_attempt =
+                    Some(task_delivery::prepare_attempt_projection(attempt));
+            }
+            _ => {}
+        }
+        Ok(prepared)
+    }
+}
+
 impl TaskProjector {
     pub fn new() -> Self {
         Self
@@ -58,19 +243,66 @@ impl TaskProjector {
         event: &AppendedTaskEvent,
     ) -> Result<()> {
         let created_at = event.created_at;
+        let candidate_gate_resolution = event.candidate_gate_resolution.clone();
+        let candidate_projection = event.candidate_projection.clone();
+        let review_projection = event.review_projection.clone();
+        let delivery_authority = event.delivery_authority.clone();
+        let task_projection = event.projection.task.clone();
+        let trigger_projections = event.projection.triggers.clone();
+        let dependency_projection = event.projection.dependency.clone();
+        let agent_spec_projections = event.projection.agent_specs.clone();
+        let run_projection = event.projection.run.clone();
+        let run_result_json = event.projection.run_result_json.clone();
+        let run_error_json = event.projection.run_error_json.clone();
+        let run_error_status = event.projection.run_error_status;
+        let task_result_json = event.projection.task_result_json.clone();
+        let task_error_json = event.projection.task_error_json.clone();
+        let task_error_status = event.projection.task_error_status;
+        let delivery_projection = event.projection.delivery.clone();
+        let delivery_attempt_projection = event.projection.delivery_attempt.clone();
         let future: ProjectFuture<'_> = match &event.payload {
-            TaskEventPayload::TaskCreated { task: task_model } => {
-                project_future(task::upsert_task(db, task_model))
-            }
-            TaskEventPayload::TriggerCreated { trigger } => {
-                project_future(task_trigger::upsert_trigger(db, trigger))
-            }
-            TaskEventPayload::DependencyCreated { dependency } => {
-                project_future(task_dependency::upsert_dependency(db, dependency))
-            }
-            TaskEventPayload::AgentSpecCreated { agent_spec } => {
-                project_future(task_agent_spec::upsert_agent_spec(db, agent_spec))
-            }
+            TaskEventPayload::TaskCreated { task: task_model } => project_future(async move {
+                task::upsert_prepared_task(
+                    db,
+                    task_projection.with_context(|| {
+                        format!("task `{}` projection was not prepared", task_model.id)
+                    })?,
+                )
+                .await
+            }),
+            TaskEventPayload::TriggerCreated { trigger } => project_future(async move {
+                task_trigger::upsert_prepared_trigger(
+                    db,
+                    trigger_projections.into_iter().next().with_context(|| {
+                        format!("task trigger `{}` projection was not prepared", trigger.id)
+                    })?,
+                )
+                .await
+            }),
+            TaskEventPayload::DependencyCreated { dependency } => project_future(async move {
+                task_dependency::upsert_prepared_dependency(
+                    db,
+                    dependency_projection.with_context(|| {
+                        format!(
+                            "task dependency `{}` projection was not prepared",
+                            dependency.id
+                        )
+                    })?,
+                )
+                .await
+            }),
+            TaskEventPayload::AgentSpecCreated { agent_spec } => project_future(async move {
+                task_agent_spec::upsert_prepared_agent_spec(
+                    db,
+                    agent_spec_projections.into_iter().next().with_context(|| {
+                        format!(
+                            "task agent spec `{}` projection was not prepared",
+                            agent_spec.id
+                        )
+                    })?,
+                )
+                .await
+            }),
             TaskEventPayload::TaskScheduled {
                 task_id,
                 trigger_id,
@@ -99,9 +331,22 @@ impl TaskProjector {
                 Ok(())
             }),
             TaskEventPayload::RunCreated { run, agent_spec } => project_future(async move {
-                task_run::upsert_run(db, run).await?;
-                if let Some(agent_spec) = agent_spec {
-                    task_agent_spec::upsert_agent_spec(db, agent_spec).await?;
+                task_run::upsert_prepared_run(
+                    db,
+                    run_projection.with_context(|| {
+                        format!("task run `{}` projection was not prepared", run.id)
+                    })?,
+                )
+                .await?;
+                if agent_spec.is_some() {
+                    task_agent_spec::upsert_prepared_agent_spec(
+                        db,
+                        agent_spec_projections
+                            .into_iter()
+                            .next()
+                            .context("task run agent spec projection was not prepared")?,
+                    )
+                    .await?;
                 }
                 Ok(())
             }),
@@ -130,63 +375,69 @@ impl TaskProjector {
             }),
             TaskEventPayload::Progress { .. } => project_future(async { Ok(()) }),
             TaskEventPayload::RunCompleted {
-                task_id,
+                task_id: _,
                 run_id,
                 result,
                 completed_at,
             } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
-                let outcome = task_run::update_run_result(
+                let outcome = task_run::update_run_result_json(
                     db,
                     run_id,
                     TaskRunStatus::Succeeded,
-                    result.as_ref(),
+                    run_result_json,
                     completed_at,
                 )
                 .await?;
                 handle_projection_outcome("run_completed", run_id, &outcome)?;
-                if let Some(result) = result {
-                    project_legacy_auto_accepted_candidate(
+                if result.is_some()
+                    && project_legacy_auto_accepted_candidate(
                         db,
-                        task_id,
                         run_id,
-                        result,
-                        completed_at.timestamp(),
+                        candidate_projection,
+                        review_projection,
                     )
-                    .await?;
+                    .await?
+                    && let Some(prepared) = candidate_gate_resolution
+                {
+                    native_terminal_effect_outbox::apply_prepared_gate_resolution(db, prepared)
+                        .await?;
                 }
                 Ok(())
             }),
             TaskEventPayload::RunFailed {
                 task_id: _,
                 run_id,
-                error,
+                error: _,
                 completed_at,
             } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
-                let status = if task_error_is_cancellation(error.as_ref()) {
-                    TaskRunStatus::Cancelled
-                } else {
-                    TaskRunStatus::Failed
-                };
-                let outcome =
-                    task_run::update_run_error(db, run_id, status, error.as_ref(), completed_at)
-                        .await?;
+                let status = run_error_status
+                    .context("task run failure status projection was not prepared")?;
+                let outcome = task_run::update_run_error_json(
+                    db,
+                    run_id,
+                    status,
+                    run_error_json,
+                    completed_at,
+                )
+                .await?;
                 handle_projection_outcome("run_failed", run_id, &outcome)?;
                 Ok(())
             }),
             TaskEventPayload::RunBlocked {
                 task_id: _,
                 run_id,
-                error,
+                error: _,
                 blocked_at,
             } => project_future(async move {
                 let blocked_at = unix_to_datetime(*blocked_at);
-                let outcome = task_run::update_run_error(
+                let outcome = task_run::update_run_error_json(
                     db,
                     run_id,
-                    TaskRunStatus::Blocked,
-                    error.as_ref(),
+                    run_error_status
+                        .context("blocked task run status projection was not prepared")?,
+                    run_error_json,
                     blocked_at,
                 )
                 .await?;
@@ -194,7 +445,16 @@ impl TaskProjector {
                 Ok(())
             }),
             TaskEventPayload::RunRetryScheduled { retry_run, .. } => project_future(async move {
-                task_run::upsert_run(db, retry_run).await?;
+                task_run::upsert_prepared_run(
+                    db,
+                    run_projection.with_context(|| {
+                        format!(
+                            "retry task run `{}` projection was not prepared",
+                            retry_run.id
+                        )
+                    })?,
+                )
+                .await?;
                 let outcome = task::update_task_status(
                     db,
                     retry_run.task_id.as_str(),
@@ -214,22 +474,16 @@ impl TaskProjector {
             TaskEventPayload::RunCancelled {
                 task_id: _,
                 run_id,
-                reason,
+                reason: _,
                 cancelled_at,
             } => project_future(async move {
                 let cancelled_at = unix_to_datetime(*cancelled_at);
-                let error = reason.as_ref().map(|reason| TaskError {
-                    code: "task_run_cancelled".to_owned(),
-                    message: reason.clone(),
-                    class: TaskErrorClass::Cancelled,
-                    details: None,
-                    failed_run_id: Some(run_id.clone()),
-                });
-                let outcome = task_run::update_run_error(
+                let outcome = task_run::update_run_error_json(
                     db,
                     run_id,
-                    TaskRunStatus::Cancelled,
-                    error.as_ref(),
+                    run_error_status
+                        .context("cancelled task run status projection was not prepared")?,
+                    run_error_json,
                     cancelled_at,
                 )
                 .await?;
@@ -238,15 +492,15 @@ impl TaskProjector {
             }),
             TaskEventPayload::TaskCompleted {
                 task_id,
-                result,
+                result: _,
                 completed_at,
             } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
-                let outcome = task::update_task_result(
+                let outcome = task::update_task_result_json(
                     db,
                     task_id,
                     TaskStatus::Completed,
-                    result.as_ref(),
+                    task_result_json,
                     completed_at,
                     Some(completed_at),
                 )
@@ -256,20 +510,17 @@ impl TaskProjector {
             }),
             TaskEventPayload::TaskFailed {
                 task_id,
-                error,
+                error: _,
                 completed_at,
             } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
-                let status = if task_error_is_cancellation(error.as_ref()) {
-                    TaskStatus::Cancelled
-                } else {
-                    TaskStatus::Failed
-                };
-                let outcome = task::update_task_error(
+                let status =
+                    task_error_status.context("task failure status projection was not prepared")?;
+                let outcome = task::update_task_error_json(
                     db,
                     task_id,
                     status,
-                    error.as_ref(),
+                    task_error_json,
                     completed_at,
                     Some(completed_at),
                 )
@@ -279,15 +530,15 @@ impl TaskProjector {
             }),
             TaskEventPayload::TaskBlocked {
                 task_id,
-                error,
+                error: _,
                 blocked_at,
             } => project_future(async move {
                 let blocked_at = unix_to_datetime(*blocked_at);
-                let outcome = task::update_task_error(
+                let outcome = task::update_task_error_json(
                     db,
                     task_id,
-                    TaskStatus::Blocked,
-                    error.as_ref(),
+                    task_error_status.context("blocked task status projection was not prepared")?,
+                    task_error_json,
                     blocked_at,
                     Some(blocked_at),
                 )
@@ -304,22 +555,16 @@ impl TaskProjector {
             }),
             TaskEventPayload::TaskCancelled {
                 task_id,
-                reason,
+                reason: _,
                 completed_at,
             } => project_future(async move {
                 let completed_at = unix_to_datetime(*completed_at);
-                let error = reason.as_ref().map(|reason| TaskError {
-                    code: "task_cancelled".to_owned(),
-                    message: reason.clone(),
-                    class: TaskErrorClass::Cancelled,
-                    details: None,
-                    failed_run_id: None,
-                });
-                let outcome = task::update_task_error(
+                let outcome = task::update_task_error_json(
                     db,
                     task_id,
-                    TaskStatus::Cancelled,
-                    error.as_ref(),
+                    task_error_status
+                        .context("cancelled task status projection was not prepared")?,
+                    task_error_json,
                     completed_at,
                     Some(completed_at),
                 )
@@ -333,7 +578,16 @@ impl TaskProjector {
                 if task_is_terminal_db(db, task_model.id.as_str()).await? {
                     return Ok(());
                 }
-                task::upsert_task(db, task_model).await
+                task::upsert_prepared_task(
+                    db,
+                    task_projection.with_context(|| {
+                        format!(
+                            "detached task `{}` projection was not prepared",
+                            task_model.id
+                        )
+                    })?,
+                )
+                .await
             }),
             TaskEventPayload::TaskUpdated {
                 task: task_model,
@@ -344,17 +598,49 @@ impl TaskProjector {
                 if task_is_terminal_db(db, task_model.id.as_str()).await? {
                     return Ok(());
                 }
-                task::upsert_task(db, task_model).await?;
-                if let Some(trigger) = trigger {
-                    task_trigger::upsert_trigger(db, trigger).await?;
+                task::upsert_prepared_task(
+                    db,
+                    task_projection.with_context(|| {
+                        format!(
+                            "updated task `{}` projection was not prepared",
+                            task_model.id
+                        )
+                    })?,
+                )
+                .await?;
+                let mut trigger_projections = trigger_projections.into_iter();
+                if trigger.is_some() {
+                    task_trigger::upsert_prepared_trigger(
+                        db,
+                        trigger_projections
+                            .next()
+                            .context("updated task trigger projection was not prepared")?,
+                    )
+                    .await?;
                 }
-                if let Some(agent_spec) = agent_spec {
-                    task_agent_spec::upsert_agent_spec(db, agent_spec).await?;
+                if agent_spec.is_some() {
+                    task_agent_spec::upsert_prepared_agent_spec(
+                        db,
+                        agent_spec_projections
+                            .into_iter()
+                            .next()
+                            .context("updated task agent spec projection was not prepared")?,
+                    )
+                    .await?;
                 }
                 Ok(())
             }),
             TaskEventPayload::TaskRescheduled { trigger, .. } => project_future(async move {
-                task_trigger::upsert_trigger(db, trigger).await?;
+                task_trigger::upsert_prepared_trigger(
+                    db,
+                    trigger_projections.into_iter().next().with_context(|| {
+                        format!(
+                            "rescheduled trigger `{}` projection was not prepared",
+                            trigger.id
+                        )
+                    })?,
+                )
+                .await?;
                 if task_has_nonterminal_run_db(db, trigger.task_id.as_str()).await? {
                     return Ok(());
                 }
@@ -382,9 +668,21 @@ impl TaskProjector {
                 if task_is_terminal_db(db, task_model.id.as_str()).await? {
                     return Ok(());
                 }
-                task::upsert_task(db, task_model).await?;
-                for trigger in triggers {
-                    task_trigger::upsert_trigger(db, trigger).await?;
+                task::upsert_prepared_task(
+                    db,
+                    task_projection.with_context(|| {
+                        format!(
+                            "paused task `{}` projection was not prepared",
+                            task_model.id
+                        )
+                    })?,
+                )
+                .await?;
+                if trigger_projections.len() != triggers.len() {
+                    anyhow::bail!("paused task trigger projections were not prepared completely");
+                }
+                for trigger in trigger_projections {
+                    task_trigger::upsert_prepared_trigger(db, trigger).await?;
                 }
                 Ok(())
             }),
@@ -399,9 +697,21 @@ impl TaskProjector {
                 {
                     return Ok(());
                 }
-                task::upsert_task(db, task_model).await?;
-                for trigger in triggers {
-                    task_trigger::upsert_trigger(db, trigger).await?;
+                task::upsert_prepared_task(
+                    db,
+                    task_projection.with_context(|| {
+                        format!(
+                            "resumed task `{}` projection was not prepared",
+                            task_model.id
+                        )
+                    })?,
+                )
+                .await?;
+                if trigger_projections.len() != triggers.len() {
+                    anyhow::bail!("resumed task trigger projections were not prepared completely");
+                }
+                for trigger in trigger_projections {
+                    task_trigger::upsert_prepared_trigger(db, trigger).await?;
                 }
                 Ok(())
             }),
@@ -503,35 +813,34 @@ impl TaskProjector {
                 })
             }
             TaskEventPayload::TaskResultCandidateCreated { candidate } => {
-                project_future(async move { upsert_task_result_candidate(db, candidate).await })
+                project_future(async move {
+                    task_result_candidate::upsert_candidate(
+                        db,
+                        candidate_projection.with_context(|| {
+                            format!(
+                                "task result candidate `{}` projection was not prepared before writer admission",
+                                candidate.id
+                            )
+                        })?,
+                    )
+                    .await?;
+                    if let Some(prepared) = candidate_gate_resolution {
+                        native_terminal_effect_outbox::apply_prepared_gate_resolution(db, prepared)
+                            .await?;
+                    }
+                    Ok(())
+                })
             }
             TaskEventPayload::TaskResultReviewEventRecorded { review_event } => {
                 project_future(async move {
                     task_result_review_event::upsert_review_event(
                         db,
-                        task_result_review_event::NewTaskResultReviewEvent {
-                            id: review_event.id.clone(),
-                            candidate_id: review_event.candidate_id.clone(),
-                            task_id: review_event.task_id.clone(),
-                            run_id: review_event.run_id.clone(),
-                            task_run_turn_id: review_event.task_run_turn_id.clone(),
-                            reviewer_kind: review_event.reviewer_kind,
-                            reviewer: review_event.reviewer.clone(),
-                            reviewer_thread_id: review_event.reviewer_thread_id.clone(),
-                            reviewer_turn_id: review_event.reviewer_turn_id.clone(),
-                            reviewer_user_id: review_event.reviewer_user_id.clone(),
-                            reviewer_agent_spec_id: review_event.reviewer_agent_spec_id.clone(),
-                            event_kind: review_event.event_kind,
-                            decision: review_event.decision,
-                            feedback_text: review_event.feedback_text.clone(),
-                            feedback: review_event.feedback.clone(),
-                            confidence: review_event.confidence,
-                            supersedes_review_event_id: review_event
-                                .supersedes_review_event_id
-                                .clone(),
-                            next_task_run_turn_id: review_event.next_task_run_turn_id.clone(),
-                            created_at: review_event.created_at,
-                        },
+                        review_projection.with_context(|| {
+                            format!(
+                                "task result review event `{}` projection was not prepared before writer admission",
+                                review_event.id
+                            )
+                        })?,
                     )
                     .await
                 })
@@ -540,7 +849,16 @@ impl TaskProjector {
                 candidate,
                 review_event_id,
             } => project_future(async move {
-                upsert_task_result_candidate(db, candidate).await?;
+                task_result_candidate::upsert_candidate(
+                    db,
+                    candidate_projection.with_context(|| {
+                        format!(
+                            "accepted task result candidate `{}` projection was not prepared before writer admission",
+                            candidate.id
+                        )
+                    })?,
+                )
+                .await?;
                 let resolved_at = candidate.resolved_at.unwrap_or(created_at.timestamp());
                 task_result_candidate::update_candidate_resolution(
                     db,
@@ -551,13 +869,26 @@ impl TaskProjector {
                     candidate.updated_at.max(resolved_at),
                 )
                 .await?;
+                if let Some(prepared) = candidate_gate_resolution {
+                    native_terminal_effect_outbox::apply_prepared_gate_resolution(db, prepared)
+                        .await?;
+                }
                 Ok(())
             }),
             TaskEventPayload::TaskResultCandidateRejected {
                 candidate,
                 review_event_id,
             } => project_future(async move {
-                upsert_task_result_candidate(db, candidate).await?;
+                task_result_candidate::upsert_candidate(
+                    db,
+                    candidate_projection.with_context(|| {
+                        format!(
+                            "rejected task result candidate `{}` projection was not prepared before writer admission",
+                            candidate.id
+                        )
+                    })?,
+                )
+                .await?;
                 let resolved_at = candidate.resolved_at.unwrap_or(created_at.timestamp());
                 task_result_candidate::update_candidate_resolution(
                     db,
@@ -568,13 +899,26 @@ impl TaskProjector {
                     candidate.updated_at.max(resolved_at),
                 )
                 .await?;
+                if let Some(prepared) = candidate_gate_resolution {
+                    native_terminal_effect_outbox::apply_prepared_gate_resolution(db, prepared)
+                        .await?;
+                }
                 Ok(())
             }),
             TaskEventPayload::TaskResultCandidateCancelled {
                 candidate,
                 review_event_id,
             } => project_future(async move {
-                upsert_task_result_candidate(db, candidate).await?;
+                task_result_candidate::upsert_candidate(
+                    db,
+                    candidate_projection.with_context(|| {
+                        format!(
+                            "cancelled task result candidate `{}` projection was not prepared before writer admission",
+                            candidate.id
+                        )
+                    })?,
+                )
+                .await?;
                 let resolved_at = candidate.resolved_at.unwrap_or(created_at.timestamp());
                 task_result_candidate::update_candidate_resolution(
                     db,
@@ -585,6 +929,10 @@ impl TaskProjector {
                     candidate.updated_at.max(resolved_at),
                 )
                 .await?;
+                if let Some(prepared) = candidate_gate_resolution {
+                    native_terminal_effect_outbox::apply_prepared_gate_resolution(db, prepared)
+                        .await?;
+                }
                 Ok(())
             }),
             TaskEventPayload::TaskRevisionRequested {
@@ -671,35 +1019,27 @@ impl TaskProjector {
             TaskEventPayload::DepthLimitExceeded {
                 task_id,
                 run_id,
-                depth,
-                max_depth,
+                depth: _,
+                max_depth: _,
             } => project_future(async move {
-                let error = TaskError {
-                    code: "task_depth_limit_exceeded".to_owned(),
-                    message: format!("task depth {depth} exceeds max depth {max_depth}"),
-                    class: TaskErrorClass::Policy,
-                    details: Some(TaskValue::Object(BTreeMap::from([
-                        ("depth".to_owned(), TaskValue::Integer(*depth)),
-                        ("maxDepth".to_owned(), TaskValue::Integer(*max_depth)),
-                    ]))),
-                    failed_run_id: run_id.clone(),
-                };
                 if let Some(run_id) = run_id {
-                    let outcome = task_run::update_run_error(
+                    let outcome = task_run::update_run_error_json(
                         db,
                         run_id,
-                        TaskRunStatus::Failed,
-                        Some(&error),
+                        run_error_status
+                            .context("depth-limit task run status projection was not prepared")?,
+                        run_error_json,
                         created_at,
                     )
                     .await?;
                     handle_projection_outcome("depth_limit_run_failed", run_id, &outcome)?;
                 }
-                let outcome = task::update_task_error(
+                let outcome = task::update_task_error_json(
                     db,
                     task_id,
-                    TaskStatus::Failed,
-                    Some(&error),
+                    task_error_status
+                        .context("depth-limit task status projection was not prepared")?,
+                    task_error_json,
                     created_at,
                     Some(created_at),
                 )
@@ -707,26 +1047,59 @@ impl TaskProjector {
                 handle_projection_outcome("depth_limit_task_failed", task_id, &outcome)?;
                 Ok(())
             }),
-            TaskEventPayload::DeliveryQueued { delivery } => {
-                project_future(project_task_delivery(db, delivery))
-            }
+            TaskEventPayload::DeliveryQueued { delivery } => project_future(project_task_delivery(
+                db,
+                delivery,
+                delivery_projection.context("queued delivery projection was not prepared")?,
+                delivery_authority.context("queued delivery authority was not prepared")?,
+            )),
             TaskEventPayload::DeliveryCancelled {
                 delivery, attempt, ..
             } => project_future(async move {
-                project_task_delivery(db, delivery).await?;
-                if let Some(attempt) = attempt {
-                    task_delivery::upsert_attempt(db, attempt).await?;
+                project_task_delivery(
+                    db,
+                    delivery,
+                    delivery_projection
+                        .context("cancelled delivery projection was not prepared")?,
+                    delivery_authority.context("cancelled delivery authority was not prepared")?,
+                )
+                .await?;
+                if attempt.is_some() {
+                    task_delivery::upsert_prepared_attempt(
+                        db,
+                        delivery_attempt_projection
+                            .context("cancelled delivery attempt projection was not prepared")?,
+                    )
+                    .await?;
                 }
                 Ok(())
             }),
-            TaskEventPayload::DeliveryStarted { delivery, attempt }
-            | TaskEventPayload::DeliveryDelivered { delivery, attempt }
-            | TaskEventPayload::DeliveryFailed { delivery, attempt } => {
-                project_future(async move {
-                    project_task_delivery(db, delivery).await?;
-                    task_delivery::upsert_attempt(db, attempt).await
-                })
+            TaskEventPayload::DeliveryStarted {
+                delivery,
+                attempt: _,
             }
+            | TaskEventPayload::DeliveryDelivered {
+                delivery,
+                attempt: _,
+            }
+            | TaskEventPayload::DeliveryFailed {
+                delivery,
+                attempt: _,
+            } => project_future(async move {
+                project_task_delivery(
+                    db,
+                    delivery,
+                    delivery_projection.context("delivery projection was not prepared")?,
+                    delivery_authority.context("delivery authority was not prepared")?,
+                )
+                .await?;
+                task_delivery::upsert_prepared_attempt(
+                    db,
+                    delivery_attempt_projection
+                        .context("delivery attempt projection was not prepared")?,
+                )
+                .await
+            }),
             TaskEventPayload::WriteLockAcquired { lock }
             | TaskEventPayload::WriteLockExtended { lock, .. }
             | TaskEventPayload::WriteLockReleased { lock, .. }
@@ -741,9 +1114,18 @@ impl TaskProjector {
 
 async fn project_task_delivery<C: ConnectionTrait + Sync>(
     db: &C,
-    delivery: &TaskDelivery,
+    _delivery: &TaskDelivery,
+    prepared_delivery: task_delivery::PreparedTaskDeliveryProjection,
+    prepared_authority: task_actor_contract::PreparedTaskDeliveryAuthority,
 ) -> Result<()> {
-    task_delivery::upsert_delivery(db, delivery).await?;
+    task_delivery::upsert_prepared_delivery(db, prepared_delivery).await?;
+    task_actor_contract::upsert_prepared_task_delivery_authority(db, prepared_authority).await
+}
+
+pub(crate) async fn prepare_task_delivery_authority<C: ConnectionTrait>(
+    db: &C,
+    delivery: &TaskDelivery,
+) -> Result<task_actor_contract::PreparedTaskDeliveryAuthority> {
     let contract = task_actor_contract::find_task_actor_contract(db, &delivery.task_id)
         .await?
         .context("Task delivery is missing its immutable actor contract")?;
@@ -827,8 +1209,7 @@ async fn project_task_delivery<C: ConnectionTrait + Sync>(
     };
     let author_json = serde_json::to_string(&author)?;
     let reviewer_json = reviewer.as_ref().map(serde_json::to_string).transpose()?;
-    task_actor_contract::upsert_task_delivery_authority(
-        db,
+    task_actor_contract::prepare_task_delivery_authority(
         &delivery.id,
         &delivery.task_id,
         &delivery.run_id,
@@ -841,7 +1222,6 @@ async fn project_task_delivery<C: ConnectionTrait + Sync>(
         status,
         delivery.updated_at,
     )
-    .await
 }
 
 async fn task_delivery_requires_final_review<C: ConnectionTrait>(
@@ -913,41 +1293,12 @@ fn task_error_is_cancellation(error: Option<&TaskError>) -> bool {
     ) || code.contains("cancel")
 }
 
-async fn upsert_task_result_candidate<C: ConnectionTrait>(
-    db: &C,
-    candidate: &TaskResultCandidate,
-) -> Result<()> {
-    task_result_candidate::upsert_candidate(
-        db,
-        task_result_candidate::NewTaskResultCandidate {
-            id: candidate.id.clone(),
-            task_id: candidate.task_id.clone(),
-            run_id: candidate.run_id.clone(),
-            task_run_turn_id: candidate.task_run_turn_id.clone(),
-            thread_id: candidate.thread_id.clone(),
-            turn_id: candidate.turn_id.clone(),
-            round: candidate.round,
-            status: candidate.status,
-            result: candidate.result.clone(),
-            extraction_error: candidate.extraction_error.clone(),
-            summary: candidate.summary.clone(),
-            diagnostics: candidate.diagnostics.clone(),
-            final_review_event_id: candidate.final_review_event_id.clone(),
-            created_at: candidate.created_at,
-            updated_at: candidate.updated_at,
-            resolved_at: candidate.resolved_at,
-        },
-    )
-    .await
-}
-
 async fn project_legacy_auto_accepted_candidate<C: ConnectionTrait>(
     db: &C,
-    task_id: &str,
     run_id: &str,
-    result: &TaskResult,
-    completed_at: i64,
-) -> Result<()> {
+    candidate: Option<task_result_candidate::PreparedTaskResultCandidate>,
+    review: Option<task_result_review_event::PreparedTaskResultReviewEvent>,
+) -> Result<bool> {
     if task_result_candidate::find_candidate_by_run_and_status(
         db,
         run_id,
@@ -956,69 +1307,40 @@ async fn project_legacy_auto_accepted_candidate<C: ConnectionTrait>(
     .await?
     .is_some()
     {
-        return Ok(());
+        return Ok(true);
     }
 
     let Some(task_run_turn) = task_run_turn::find_latest_turn_by_run(db, run_id).await? else {
-        return Ok(());
+        // Legacy runs without a linked TaskRunTurn never materialized a
+        // result candidate. Preserve that compatibility behavior without
+        // requiring a synthetic projection plan.
+        return Ok(false);
     };
+    let candidate = candidate.context(
+        "legacy task result candidate projection was not prepared before writer admission",
+    )?;
+    let expected = candidate.expected();
+    if task_run_turn.id != expected.task_run_turn_id
+        || task_run_turn.thread_id != expected.thread_id
+        || task_run_turn.turn_id != expected.turn_id
+        || task_run_turn.round != i64::from(expected.round)
+    {
+        anyhow::bail!("legacy task result candidate task run turn changed after preparation");
+    }
     if task_result_candidate::find_candidate_by_turn(db, task_run_turn.id.as_str())
         .await?
         .is_some()
     {
-        return Ok(());
+        return Ok(false);
     }
 
-    let candidate_id = format!("trc_{run_id}");
-    let review_event_id = format!("trre_auto_{run_id}");
-    task_result_candidate::upsert_candidate(
-        db,
-        task_result_candidate::NewTaskResultCandidate {
-            id: candidate_id.clone(),
-            task_id: task_id.to_owned(),
-            run_id: run_id.to_owned(),
-            task_run_turn_id: task_run_turn.id.clone(),
-            thread_id: task_run_turn.thread_id.clone(),
-            turn_id: task_run_turn.turn_id.clone(),
-            round: u32::try_from(task_run_turn.round)
-                .context("legacy task run turn round is out of range")?,
-            status: TaskResultCandidateStatus::Accepted,
-            result: Some(result.clone()),
-            extraction_error: None,
-            summary: result.summary.clone(),
-            diagnostics: Vec::new(),
-            final_review_event_id: Some(review_event_id.clone()),
-            created_at: completed_at,
-            updated_at: completed_at,
-            resolved_at: Some(completed_at),
-        },
-    )
-    .await?;
+    task_result_candidate::upsert_candidate(db, candidate).await?;
     task_result_review_event::upsert_review_event(
         db,
-        task_result_review_event::NewTaskResultReviewEvent {
-            id: review_event_id,
-            candidate_id,
-            task_id: task_id.to_owned(),
-            run_id: run_id.to_owned(),
-            task_run_turn_id: task_run_turn.id,
-            reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
-            reviewer: pioneer_protocol::TaskResultReviewerRef::RuntimePolicy,
-            reviewer_thread_id: None,
-            reviewer_turn_id: None,
-            reviewer_user_id: None,
-            reviewer_agent_spec_id: None,
-            event_kind: TaskResultReviewEventKind::SystemAuto,
-            decision: TaskResultReviewDecision::Accept,
-            feedback_text: None,
-            feedback: None,
-            confidence: None,
-            supersedes_review_event_id: None,
-            next_task_run_turn_id: None,
-            created_at: completed_at,
-        },
+        review.context("legacy task result review projection was not prepared")?,
     )
-    .await
+    .await?;
+    Ok(true)
 }
 
 fn handle_projection_outcome(

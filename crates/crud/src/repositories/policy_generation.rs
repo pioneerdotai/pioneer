@@ -33,6 +33,9 @@ where
     if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("authorization policy fingerprint must be a SHA-256 hex digest");
     }
+    let affected = AuthorizationChangeScope::Global;
+    let affected_scope_json = serde_json::to_string(&affected)
+        .context("failed to serialize authorization change scope")?;
     let transaction = db
         .begin()
         .await
@@ -62,9 +65,9 @@ where
     let notification = AuthorizationProjectionChangedNotification {
         policy_generation: generation,
         change: AuthorizationChangeKind::CodePolicy,
-        affected: AuthorizationChangeScope::Global,
+        affected,
     };
-    insert_change_if_absent(&transaction, &notification).await?;
+    insert_change_if_absent(&transaction, &notification, affected_scope_json.as_str()).await?;
     transaction
         .commit()
         .await
@@ -80,6 +83,8 @@ pub async fn append_authorization_change<D>(
 where
     D: TransactionTrait,
 {
+    let affected_scope_json = serde_json::to_string(&affected)
+        .context("failed to serialize authorization change scope")?;
     let transaction = db
         .begin()
         .await
@@ -102,7 +107,7 @@ where
         change,
         affected,
     };
-    insert_change_if_absent(&transaction, &notification).await?;
+    insert_change_if_absent(&transaction, &notification, affected_scope_json.as_str()).await?;
     transaction
         .commit()
         .await
@@ -153,16 +158,15 @@ pub async fn list_authorization_changes_after<C: ConnectionTrait>(
 async fn insert_change_if_absent<C: ConnectionTrait>(
     db: &C,
     notification: &AuthorizationProjectionChangedNotification,
+    scope_json: &str,
 ) -> Result<()> {
-    let scope_json = serde_json::to_string(&notification.affected)
-        .context("failed to serialize authorization change scope")?;
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT OR IGNORE INTO authorization_change_feed(generation, change_kind, affected_scope_json, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
         [
             generation_i64(notification.policy_generation).into(),
             change_kind_name(notification.change).into(),
-            scope_json.into(),
+            scope_json.to_owned().into(),
         ],
     ))
     .await

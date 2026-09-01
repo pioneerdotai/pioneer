@@ -22,6 +22,65 @@ pub struct TurnMcpProjectionReplaceOutcome {
     pub tool_count: i32,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedTurnMcpProjectionReplacement {
+    projection: TurnMcpProjectionRecord,
+    header: turn_mcp_projection::ActiveModel,
+    bindings: Vec<crate::repositories::turn_mcp_binding::PreparedTurnMcpBinding>,
+    outcome: TurnMcpProjectionReplaceOutcome,
+}
+
+impl PreparedTurnMcpProjectionReplacement {
+    fn prepare(
+        replacement: &TurnMcpProjectionReplacement,
+    ) -> Result<Self, TurnMcpProjectionPersistenceError> {
+        validate_replacement_shape(replacement)?;
+        let created_at = unix_to_datetime(replacement.projection.created_at_unix)?;
+        let mut bindings = replacement.bindings.iter().collect::<Vec<_>>();
+        bindings.sort_by(|left, right| {
+            left.canonical_callable_name
+                .cmp(&right.canonical_callable_name)
+                .then_with(|| {
+                    left.provider_callable_name
+                        .cmp(&right.provider_callable_name)
+                })
+                .then_with(|| {
+                    left.server_installation_id
+                        .cmp(&right.server_installation_id)
+                })
+                .then_with(|| left.raw_tool_name.cmp(&right.raw_tool_name))
+        });
+        let bindings = bindings
+            .into_iter()
+            .map(|binding| {
+                crate::repositories::turn_mcp_binding::prepare_turn_mcp_binding(
+                    replacement.projection.turn_id.as_str(),
+                    binding,
+                    created_at,
+                )
+            })
+            .collect();
+        Ok(Self {
+            projection: replacement.projection.clone(),
+            header: turn_mcp_projection::ActiveModel {
+                turn_id: Set(replacement.projection.turn_id.clone()),
+                workspace_id: Set(replacement.projection.workspace_id.clone()),
+                projection_version: Set(i64::from(replacement.projection.projection_version)),
+                manifest_hash: Set(replacement.projection.manifest_hash.clone()),
+                resolution_status: Set(replacement.projection.resolution_status.clone()),
+                tool_count: Set(i64::from(replacement.projection.tool_count)),
+                created_at: Set(created_at),
+            },
+            bindings,
+            outcome: TurnMcpProjectionReplaceOutcome {
+                turn_id: replacement.projection.turn_id.clone(),
+                manifest_hash: replacement.projection.manifest_hash.clone(),
+                tool_count: replacement.projection.tool_count,
+            },
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum TurnMcpProjectionPersistenceError {
     InvalidToolCount {
@@ -175,18 +234,18 @@ async fn replace_turn_mcp_projection_inner<D>(
 where
     D: TransactionTrait,
 {
-    validate_replacement_shape(replacement)?;
+    let prepared = PreparedTurnMcpProjectionReplacement::prepare(replacement)?;
     let transaction = db
         .begin()
         .await
         .map_err(|error| TurnMcpProjectionPersistenceError::storage("begin", error))?;
 
     let result = async {
-        let outcome = replace_in_transaction(&transaction, replacement, fault).await?;
+        let outcome = replace_in_transaction(&transaction, &prepared, fault).await?;
         if let Some(context_json) = authorization_context_json {
             let updated = crate::repositories::turn::set_turn_execution_authorization_context(
                 &transaction,
-                replacement.projection.turn_id.as_str(),
+                prepared.projection.turn_id.as_str(),
                 context_json,
             )
             .await
@@ -195,7 +254,7 @@ where
             })?;
             if !updated {
                 return Err(TurnMcpProjectionPersistenceError::TurnNotFound {
-                    turn_id: replacement.projection.turn_id.clone(),
+                    turn_id: prepared.projection.turn_id.clone(),
                 });
             }
         }
@@ -219,80 +278,62 @@ where
 
 async fn replace_in_transaction<C>(
     transaction: &C,
-    replacement: &TurnMcpProjectionReplacement,
+    prepared: &PreparedTurnMcpProjectionReplacement,
     fault: AtomicProjectionReplaceFault,
 ) -> Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
 where
     C: ConnectionTrait,
 {
-    validate_turn_workspace(transaction, &replacement.projection).await?;
-    let created_at = unix_to_datetime(replacement.projection.created_at_unix)?;
+    validate_turn_workspace(transaction, &prepared.projection).await?;
 
-    turn_mcp_projection::Entity::insert(turn_mcp_projection::ActiveModel {
-        turn_id: Set(replacement.projection.turn_id.clone()),
-        workspace_id: Set(replacement.projection.workspace_id.clone()),
-        projection_version: Set(i64::from(replacement.projection.projection_version)),
-        manifest_hash: Set(replacement.projection.manifest_hash.clone()),
-        resolution_status: Set(replacement.projection.resolution_status.clone()),
-        tool_count: Set(i64::from(replacement.projection.tool_count)),
-        created_at: Set(created_at),
-    })
-    .on_conflict(
-        OnConflict::column(turn_mcp_projection::Column::TurnId)
-            .update_columns([
-                turn_mcp_projection::Column::WorkspaceId,
-                turn_mcp_projection::Column::ProjectionVersion,
-                turn_mcp_projection::Column::ManifestHash,
-                turn_mcp_projection::Column::ResolutionStatus,
-                turn_mcp_projection::Column::ToolCount,
-                turn_mcp_projection::Column::CreatedAt,
-            ])
-            .to_owned(),
-    )
-    .exec(transaction)
-    .await
-    .map_err(|error| TurnMcpProjectionPersistenceError::storage("header_upsert", error))?;
+    turn_mcp_projection::Entity::insert(prepared.header.clone())
+        .on_conflict(
+            OnConflict::column(turn_mcp_projection::Column::TurnId)
+                .update_columns([
+                    turn_mcp_projection::Column::WorkspaceId,
+                    turn_mcp_projection::Column::ProjectionVersion,
+                    turn_mcp_projection::Column::ManifestHash,
+                    turn_mcp_projection::Column::ResolutionStatus,
+                    turn_mcp_projection::Column::ToolCount,
+                    turn_mcp_projection::Column::CreatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(transaction)
+        .await
+        .map_err(|error| TurnMcpProjectionPersistenceError::storage("header_upsert", error))?;
     inject_fault(fault, AtomicProjectionReplaceFault::AfterHeader)?;
 
     crate::repositories::turn_mcp_binding::delete_turn_mcp_bindings(
         transaction,
-        replacement.projection.turn_id.as_str(),
+        prepared.projection.turn_id.as_str(),
     )
     .await
     .map_err(|error| TurnMcpProjectionPersistenceError::storage("binding_delete", error))?;
     inject_fault(fault, AtomicProjectionReplaceFault::AfterDelete)?;
 
-    let mut bindings = replacement.bindings.iter().collect::<Vec<_>>();
-    bindings.sort_by(|left, right| {
-        left.canonical_callable_name
-            .cmp(&right.canonical_callable_name)
-            .then_with(|| {
-                left.provider_callable_name
-                    .cmp(&right.provider_callable_name)
-            })
-            .then_with(|| {
-                left.server_installation_id
-                    .cmp(&right.server_installation_id)
-            })
-            .then_with(|| left.raw_tool_name.cmp(&right.raw_tool_name))
-    });
-    for (index, binding) in bindings.into_iter().enumerate() {
-        crate::repositories::turn_mcp_binding::insert_turn_mcp_binding(
+    if matches!(fault, AtomicProjectionReplaceFault::AfterInsert(_)) {
+        for (index, binding) in prepared.bindings.iter().cloned().enumerate() {
+            crate::repositories::turn_mcp_binding::insert_prepared_turn_mcp_binding(
+                transaction,
+                binding,
+            )
+            .await
+            .map_err(|error| TurnMcpProjectionPersistenceError::storage("binding_insert", error))?;
+            inject_fault(fault, AtomicProjectionReplaceFault::AfterInsert(index + 1))?;
+        }
+    } else {
+        crate::repositories::turn_mcp_binding::insert_prepared_turn_mcp_bindings(
             transaction,
-            replacement.projection.turn_id.as_str(),
-            binding,
-            created_at,
+            prepared.bindings.as_slice(),
         )
         .await
-        .map_err(|error| TurnMcpProjectionPersistenceError::storage("binding_insert", error))?;
-        inject_fault(fault, AtomicProjectionReplaceFault::AfterInsert(index + 1))?;
+        .map_err(|error| {
+            TurnMcpProjectionPersistenceError::storage("binding_batch_insert", error)
+        })?;
     }
 
-    Ok(TurnMcpProjectionReplaceOutcome {
-        turn_id: replacement.projection.turn_id.clone(),
-        manifest_hash: replacement.projection.manifest_hash.clone(),
-        tool_count: replacement.projection.tool_count,
-    })
+    Ok(prepared.outcome.clone())
 }
 
 fn validate_replacement_shape(

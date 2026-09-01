@@ -2,7 +2,106 @@ use anyhow::{Context, Result, bail};
 use pioneer_entity::skill_installation;
 use pioneer_protocol::{SkillId, SkillPackId};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+
+const SKILL_INSTALLATION_WRITE_BATCH_SIZE: usize = 32;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSkillInstallation {
+    row: skill_installation::ActiveModel,
+}
+
+pub(crate) fn prepare_skill_installation(
+    record: &crate::SkillInstallationRecord,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> PreparedSkillInstallation {
+    PreparedSkillInstallation {
+        row: skill_installation::ActiveModel {
+            id: Set(record.skill_id.to_string()),
+            owner: Set(record.owner.clone()),
+            slug: Set(record.slug.clone()),
+            version: Set(record.version.clone()),
+            source_kind: Set(record.source_kind.clone()),
+            scope_key: Set(record.scope_key.clone()),
+            source_ref: Set(record.source_ref.clone()),
+            install_path: Set(record.install_path.clone()),
+            trust_level: Set(record.trust_level.clone()),
+            fingerprint: Set(record.fingerprint.clone()),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
+            pack_id: Set(record.pack_id.as_ref().map(ToString::to_string)),
+            pack_member_key: Set(record.pack_member_key.clone()),
+        },
+    }
+}
+
+pub(crate) async fn insert_prepared_skill_installations<C: ConnectionTrait>(
+    db: &C,
+    prepared: &[PreparedSkillInstallation],
+) -> Result<()> {
+    for batch in prepared.chunks(SKILL_INSTALLATION_WRITE_BATCH_SIZE) {
+        skill_installation::Entity::insert_many(batch.iter().map(|item| item.row.clone()))
+            .exec(db)
+            .await
+            .context("failed to insert prepared skill installations")?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn upsert_prepared_pack_skill_installations<C: ConnectionTrait>(
+    db: &C,
+    prepared: &[PreparedSkillInstallation],
+) -> Result<()> {
+    for batch in prepared.chunks(SKILL_INSTALLATION_WRITE_BATCH_SIZE) {
+        skill_installation::Entity::insert_many(batch.iter().map(|item| item.row.clone()))
+            .on_conflict(
+                OnConflict::column(skill_installation::Column::Id)
+                    .update_columns([
+                        skill_installation::Column::Owner,
+                        skill_installation::Column::Slug,
+                        skill_installation::Column::Version,
+                        skill_installation::Column::SourceKind,
+                        skill_installation::Column::ScopeKey,
+                        skill_installation::Column::SourceRef,
+                        skill_installation::Column::InstallPath,
+                        skill_installation::Column::TrustLevel,
+                        skill_installation::Column::Fingerprint,
+                        skill_installation::Column::UpdatedAt,
+                        skill_installation::Column::PackId,
+                        skill_installation::Column::PackMemberKey,
+                    ])
+                    .to_owned(),
+            )
+            .exec(db)
+            .await
+            .context("failed to upsert prepared pack skill installations")?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn delete_skill_installations<C: ConnectionTrait>(
+    db: &C,
+    skill_ids: &[SkillId],
+) -> Result<u64> {
+    if skill_ids.is_empty() {
+        return Ok(0);
+    }
+    let result = skill_installation::Entity::delete_many()
+        .filter(
+            skill_installation::Column::Id.is_in(
+                skill_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .exec(db)
+        .await
+        .context("failed to delete skill installations")?;
+    Ok(result.rows_affected)
+}
 
 pub async fn insert_skill_installation<C: ConnectionTrait>(
     db: &C,
@@ -10,30 +109,16 @@ pub async fn insert_skill_installation<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    skill_installation::Entity::insert(skill_installation::ActiveModel {
-        id: Set(record.skill_id.to_string()),
-        owner: Set(record.owner.clone()),
-        slug: Set(record.slug.clone()),
-        version: Set(record.version.clone()),
-        source_kind: Set(record.source_kind.clone()),
-        scope_key: Set(record.scope_key.clone()),
-        source_ref: Set(record.source_ref.clone()),
-        install_path: Set(record.install_path.clone()),
-        trust_level: Set(record.trust_level.clone()),
-        fingerprint: Set(record.fingerprint.clone()),
-        created_at: Set(created_at),
-        updated_at: Set(updated_at),
-        pack_id: Set(record.pack_id.as_ref().map(ToString::to_string)),
-        pack_member_key: Set(record.pack_member_key.clone()),
-    })
-    .exec(db)
-    .await
-    .with_context(|| {
-        format!(
-            "failed to insert skill installation `{}` ({}/{})",
-            record.skill_id, record.source_kind, record.scope_key
-        )
-    })?;
+    let prepared = prepare_skill_installation(record, created_at, updated_at);
+    skill_installation::Entity::insert(prepared.row)
+        .exec(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to insert skill installation `{}` ({}/{})",
+                record.skill_id, record.source_kind, record.scope_key
+            )
+        })?;
 
     Ok(())
 }
@@ -85,71 +170,6 @@ pub async fn update_skill_installation<C: ConnectionTrait>(
         .exec(db)
         .await
         .with_context(|| format!("failed to update skill installation `{skill_id}`"))?;
-    Ok(result.rows_affected == 1)
-}
-
-pub async fn update_pack_skill_installation<C: ConnectionTrait>(
-    db: &C,
-    record: &crate::SkillInstallationRecord,
-    updated_at: DateTimeWithTimeZone,
-) -> Result<bool> {
-    let pack_id = record
-        .pack_id
-        .as_ref()
-        .context("pack child update requires pack_id")?;
-    let member_key = record
-        .pack_member_key
-        .as_ref()
-        .context("pack child update requires pack_member_key")?;
-    let result = skill_installation::Entity::update_many()
-        .filter(skill_installation::Column::Id.eq(record.skill_id.to_string()))
-        .filter(skill_installation::Column::ScopeKey.eq(record.scope_key.clone()))
-        .filter(skill_installation::Column::PackId.eq(pack_id.to_string()))
-        .filter(skill_installation::Column::PackMemberKey.eq(member_key.clone()))
-        .col_expr(
-            skill_installation::Column::Owner,
-            sea_orm::sea_query::Expr::value(record.owner.clone()),
-        )
-        .col_expr(
-            skill_installation::Column::Slug,
-            sea_orm::sea_query::Expr::value(record.slug.clone()),
-        )
-        .col_expr(
-            skill_installation::Column::Version,
-            sea_orm::sea_query::Expr::value(record.version.clone()),
-        )
-        .col_expr(
-            skill_installation::Column::SourceKind,
-            sea_orm::sea_query::Expr::value(record.source_kind.clone()),
-        )
-        .col_expr(
-            skill_installation::Column::SourceRef,
-            sea_orm::sea_query::Expr::value(record.source_ref.clone()),
-        )
-        .col_expr(
-            skill_installation::Column::InstallPath,
-            sea_orm::sea_query::Expr::value(record.install_path.clone()),
-        )
-        .col_expr(
-            skill_installation::Column::TrustLevel,
-            sea_orm::sea_query::Expr::value(record.trust_level.clone()),
-        )
-        .col_expr(
-            skill_installation::Column::Fingerprint,
-            sea_orm::sea_query::Expr::value(record.fingerprint.clone()),
-        )
-        .col_expr(
-            skill_installation::Column::UpdatedAt,
-            sea_orm::sea_query::Expr::value(updated_at),
-        )
-        .exec(db)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to update pack skill installation `{}`",
-                record.skill_id
-            )
-        })?;
     Ok(result.rows_affected == 1)
 }
 

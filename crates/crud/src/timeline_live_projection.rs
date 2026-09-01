@@ -25,8 +25,7 @@ use crate::timeline_projection_model::{
 use crate::util::unix_to_datetime;
 use crate::{
     ProjectionPageAnchor, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
-    TurnWorkProjectionRecord, WORK_ITEM_STATUS_RUNNING, WORK_VISIBILITY_HIDDEN,
-    WORK_VISIBILITY_VISIBLE,
+    TurnWorkProjectionRecord, WORK_VISIBILITY_HIDDEN, WORK_VISIBILITY_VISIBLE,
 };
 
 pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait>(
@@ -498,30 +497,14 @@ async fn project_terminal_turn_event<C: ConnectionTrait>(
         return Ok(());
     }
 
-    let mut after_order_key: Option<String> = None;
-    loop {
-        let running_rows = timeline_repository::list_turn_work_items_by_status_page(
-            db,
-            turn_model.id.as_str(),
-            WORK_ITEM_STATUS_RUNNING,
-            after_order_key.as_deref(),
-            128,
-        )
-        .await?;
-        if running_rows.is_empty() {
-            break;
-        }
-
-        for row in &running_rows {
-            if let Some(item_model) =
-                turn::find_turn_item(db, turn_model.id.as_str(), row.item_id.as_str()).await?
-            {
-                project_turn_item_row(db, &thread_model, &turn_model, &item_model, event).await?;
-            }
-        }
-
-        after_order_key = running_rows.last().map(|row| row.order_key.clone());
-    }
+    timeline_repository::refresh_terminal_running_turn_work_item_projections(
+        db,
+        turn_model.id.as_str(),
+        event.id.as_str(),
+        event.sequence,
+        event.created_at,
+    )
+    .await?;
 
     refresh_turn_work_summary(
         db,

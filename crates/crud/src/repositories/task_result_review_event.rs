@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, ensure};
 use pioneer_entity::task_result_review_event;
 use pioneer_protocol::{
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
-    TaskResultReviewerRef, TaskValue,
+    TaskResultReviewDecision, TaskResultReviewEvent, TaskResultReviewEventKind,
+    TaskResultReviewerKind, TaskResultReviewerRef, TaskValue,
 };
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
@@ -13,7 +13,7 @@ use crate::convention::{
 };
 use crate::util::{optional_typed_json_to_db, unix_to_datetime};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NewTaskResultReviewEvent {
     pub id: String,
     pub candidate_id: String,
@@ -36,11 +36,89 @@ pub struct NewTaskResultReviewEvent {
     pub created_at: i64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedTaskResultReviewEvent {
+    expected: NewTaskResultReviewEvent,
+    active_model: task_result_review_event::ActiveModel,
+    reviewer_ref_json: String,
+    feedback_json: Option<String>,
+    created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+}
+
+pub(crate) fn prepare_review_event(
+    event: NewTaskResultReviewEvent,
+) -> Result<PreparedTaskResultReviewEvent> {
+    let reviewer_ref_json = serde_json::to_string(&event.reviewer)?;
+    let feedback_json = optional_typed_json_to_db(&event.feedback)?;
+    let created_at = unix_to_datetime(event.created_at);
+    let active_model = task_result_review_event::ActiveModel {
+        id: Set(event.id.clone()),
+        candidate_id: Set(event.candidate_id.clone()),
+        task_id: Set(event.task_id.clone()),
+        run_id: Set(event.run_id.clone()),
+        task_run_turn_id: Set(event.task_run_turn_id.clone()),
+        reviewer_kind: Set(task_result_reviewer_kind_to_db(event.reviewer_kind)),
+        reviewer_ref_json: Set(reviewer_ref_json.clone()),
+        reviewer_thread_id: Set(event.reviewer_thread_id.clone()),
+        reviewer_turn_id: Set(event.reviewer_turn_id.clone()),
+        reviewer_user_id: Set(event.reviewer_user_id.clone()),
+        reviewer_agent_spec_id: Set(event.reviewer_agent_spec_id.clone()),
+        event_kind: Set(task_result_review_event_kind_to_db(event.event_kind)),
+        decision: Set(task_result_review_decision_to_db(event.decision)),
+        feedback_text: Set(event.feedback_text.clone()),
+        feedback_json: Set(feedback_json.clone()),
+        confidence: Set(event.confidence),
+        supersedes_review_event_id: Set(event.supersedes_review_event_id.clone()),
+        next_task_run_turn_id: Set(event.next_task_run_turn_id.clone()),
+        created_at: Set(created_at),
+    };
+    Ok(PreparedTaskResultReviewEvent {
+        expected: event,
+        active_model,
+        reviewer_ref_json,
+        feedback_json,
+        created_at,
+    })
+}
+
+pub(crate) fn prepare_protocol_review_event(
+    event: &TaskResultReviewEvent,
+) -> Result<PreparedTaskResultReviewEvent> {
+    prepare_review_event(NewTaskResultReviewEvent {
+        id: event.id.clone(),
+        candidate_id: event.candidate_id.clone(),
+        task_id: event.task_id.clone(),
+        run_id: event.run_id.clone(),
+        task_run_turn_id: event.task_run_turn_id.clone(),
+        reviewer_kind: event.reviewer_kind,
+        reviewer: event.reviewer.clone(),
+        reviewer_thread_id: event.reviewer_thread_id.clone(),
+        reviewer_turn_id: event.reviewer_turn_id.clone(),
+        reviewer_user_id: event.reviewer_user_id.clone(),
+        reviewer_agent_spec_id: event.reviewer_agent_spec_id.clone(),
+        event_kind: event.event_kind,
+        decision: event.decision,
+        feedback_text: event.feedback_text.clone(),
+        feedback: event.feedback.clone(),
+        confidence: event.confidence,
+        supersedes_review_event_id: event.supersedes_review_event_id.clone(),
+        next_task_run_turn_id: event.next_task_run_turn_id.clone(),
+        created_at: event.created_at,
+    })
+}
+
 pub async fn upsert_review_event<C: ConnectionTrait>(
     db: &C,
-    event: NewTaskResultReviewEvent,
+    prepared: PreparedTaskResultReviewEvent,
 ) -> Result<()> {
-    task_result_review_event::Entity::insert(active_model_from_new_review_event(event.clone())?)
+    let PreparedTaskResultReviewEvent {
+        expected,
+        active_model,
+        reviewer_ref_json,
+        feedback_json,
+        created_at,
+    } = prepared;
+    task_result_review_event::Entity::insert(active_model)
         .on_conflict(
             OnConflict::column(task_result_review_event::Column::Id)
                 .do_nothing()
@@ -49,19 +127,26 @@ pub async fn upsert_review_event<C: ConnectionTrait>(
         .exec_without_returning(db)
         .await
         .context("failed to upsert task result review event")?;
-    let persisted = find_review_event_by_id(db, event.id.as_str())
+    let persisted = find_review_event_by_id(db, expected.id.as_str())
         .await?
         .context("task result review event missing after insert")?;
-    ensure_review_event_is_exact(&persisted, &event)?;
+    ensure_review_event_is_exact(
+        &persisted,
+        &expected,
+        reviewer_ref_json.as_str(),
+        feedback_json.as_deref(),
+        created_at,
+    )?;
     Ok(())
 }
 
 fn ensure_review_event_is_exact(
     persisted: &task_result_review_event::Model,
     expected: &NewTaskResultReviewEvent,
+    reviewer_ref_json: &str,
+    feedback_json: Option<&str>,
+    created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
 ) -> Result<()> {
-    let reviewer_ref_json = serde_json::to_string(&expected.reviewer)?;
-    let feedback_json = optional_typed_json_to_db(&expected.feedback)?;
     ensure!(
         persisted.candidate_id == expected.candidate_id
             && persisted.task_id == expected.task_id
@@ -76,11 +161,11 @@ fn ensure_review_event_is_exact(
             && persisted.event_kind == task_result_review_event_kind_to_db(expected.event_kind)
             && persisted.decision == task_result_review_decision_to_db(expected.decision)
             && persisted.feedback_text == expected.feedback_text
-            && persisted.feedback_json == feedback_json
+            && persisted.feedback_json.as_deref() == feedback_json
             && persisted.confidence == expected.confidence
             && persisted.supersedes_review_event_id == expected.supersedes_review_event_id
             && persisted.next_task_run_turn_id == expected.next_task_run_turn_id
-            && persisted.created_at.timestamp() == expected.created_at,
+            && persisted.created_at == created_at,
         "task result review event {} already exists with different immutable facts",
         expected.id
     );
@@ -121,30 +206,4 @@ pub async fn list_review_events_by_run<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list task result review events by run")
-}
-
-fn active_model_from_new_review_event(
-    event: NewTaskResultReviewEvent,
-) -> Result<task_result_review_event::ActiveModel> {
-    Ok(task_result_review_event::ActiveModel {
-        id: Set(event.id),
-        candidate_id: Set(event.candidate_id),
-        task_id: Set(event.task_id),
-        run_id: Set(event.run_id),
-        task_run_turn_id: Set(event.task_run_turn_id),
-        reviewer_kind: Set(task_result_reviewer_kind_to_db(event.reviewer_kind)),
-        reviewer_ref_json: Set(serde_json::to_string(&event.reviewer)?),
-        reviewer_thread_id: Set(event.reviewer_thread_id),
-        reviewer_turn_id: Set(event.reviewer_turn_id),
-        reviewer_user_id: Set(event.reviewer_user_id),
-        reviewer_agent_spec_id: Set(event.reviewer_agent_spec_id),
-        event_kind: Set(task_result_review_event_kind_to_db(event.event_kind)),
-        decision: Set(task_result_review_decision_to_db(event.decision)),
-        feedback_text: Set(event.feedback_text),
-        feedback_json: Set(optional_typed_json_to_db(&event.feedback)?),
-        confidence: Set(event.confidence),
-        supersedes_review_event_id: Set(event.supersedes_review_event_id),
-        next_task_run_turn_id: Set(event.next_task_run_turn_id),
-        created_at: Set(unix_to_datetime(event.created_at)),
-    })
 }

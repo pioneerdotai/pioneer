@@ -283,6 +283,7 @@ pub async fn resume_blocked_job<C: ConnectionTrait>(
         )
         .filter(recovery_job::Column::Id.eq(job.id.clone()))
         .filter(recovery_job::Column::Status.eq(blocked))
+        .filter(recovery_job::Column::UpdatedAt.eq(job.updated_at))
         .exec(db)
         .await
         .with_context(|| format!("failed to resume blocked recovery job `{}`", job.id))?

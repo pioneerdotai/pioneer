@@ -45,6 +45,23 @@ pub struct NewTurnMessageRevision<'a> {
     pub created_at: DateTimeWithTimeZone,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnMessageRevision {
+    row: turn_message_revision::ActiveModel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedMessageTurnMutationState {
+    thread_id: String,
+    turn_id: String,
+    revision: i64,
+    mentions_json: String,
+    deleted_at: Option<DateTimeWithTimeZone>,
+    deleted_by_actor_kind: Option<String>,
+    deleted_by_actor_id: Option<String>,
+    updated_at: DateTimeWithTimeZone,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnPromptManifestColumns {
     pub prompt_manifest_json: String,
@@ -67,6 +84,27 @@ pub struct TurnExecutionSecuritySnapshotRecord {
     pub turn_id: String,
     pub version: i64,
     pub snapshot: TurnExecutionSecuritySnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnUpsert {
+    expected_existing: Option<turn::Model>,
+    allow_existing_if_preflight_missing: bool,
+    row: turn::ActiveModel,
+    update_columns: Vec<turn::Column>,
+}
+
+impl PreparedTurnUpsert {
+    pub(crate) fn changes_status_history(&self, status: TurnStatus, error: Option<&str>) -> bool {
+        self.expected_existing.as_ref().is_none_or(|existing| {
+            existing.status != turn_status_to_db(status) || existing.error.as_deref() != error
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnStatusHistory {
+    row: turn_status_history::ActiveModel,
 }
 
 pub async fn find_turn_by_id<C: ConnectionTrait>(
@@ -124,6 +162,7 @@ pub async fn has_in_progress_conversation_turn<C: ConnectionTrait>(
     Ok(count > 0)
 }
 
+#[cfg(test)]
 pub async fn upsert_turn<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -150,6 +189,7 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     .await
 }
 
+#[cfg(test)]
 pub async fn upsert_turn_with_initiator<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -191,6 +231,42 @@ pub async fn upsert_turn_with_initiator<C: ConnectionTrait>(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_projected_turn_upsert<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    thread_id: &str,
+    turn_model: &Turn,
+    prompt_manifest: Option<&TurnPromptManifestColumns>,
+    reasoning_effort: Option<&str>,
+    initiator: Option<&PersistedActorRef>,
+    update_initiator: bool,
+    allow_existing_if_preflight_missing: bool,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<PreparedTurnUpsert> {
+    let (actor_kind, actor_id) = match initiator {
+        Some(initiator) => actor_ref_to_db(initiator),
+        None => (None, None),
+    };
+    let mut prepared = prepare_turn_upsert_with_actor_columns(
+        db,
+        turn_id,
+        thread_id,
+        turn_model,
+        prompt_manifest,
+        reasoning_effort,
+        actor_kind,
+        actor_id,
+        update_initiator,
+        created_at,
+        updated_at,
+    )
+    .await?;
+    prepared.allow_existing_if_preflight_missing = allow_existing_if_preflight_missing;
+    Ok(prepared)
+}
+
 pub async fn find_turn_initiator<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -206,6 +282,7 @@ pub async fn find_turn_initiator<C: ConnectionTrait>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -219,6 +296,37 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    let prepared = prepare_turn_upsert_with_actor_columns(
+        db,
+        turn_id,
+        thread_id,
+        turn_model,
+        prompt_manifest,
+        reasoning_effort,
+        initiated_by_actor_kind,
+        initiated_by_actor_id,
+        update_initiator,
+        created_at,
+        updated_at,
+    )
+    .await?;
+    apply_prepared_turn_upsert(db, prepared).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    thread_id: &str,
+    turn_model: &Turn,
+    prompt_manifest: Option<&TurnPromptManifestColumns>,
+    reasoning_effort: Option<&str>,
+    initiated_by_actor_kind: Option<String>,
+    initiated_by_actor_id: Option<String>,
+    update_initiator: bool,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<PreparedTurnUpsert> {
     let existing_collaboration = find_turn_by_id(db, turn_id).await?;
     let preserve_legacy_null_mode = existing_collaboration
         .as_ref()
@@ -251,6 +359,20 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         initiated_by_actor_kind.as_deref(),
         initiated_by_actor_id.as_deref(),
     )?;
+    if update_initiator
+        && let (Some(existing), Some(supplied)) =
+            (existing_collaboration.as_ref(), supplied_initiator.as_ref())
+    {
+        let existing_initiator = actor_ref_from_db(
+            existing.initiated_by_actor_kind.as_deref(),
+            existing.initiated_by_actor_id.as_deref(),
+        )
+        .with_context(|| format!("turn `{turn_id}` has an invalid persisted initiator pair"))?
+        .with_context(|| format!("turn `{turn_id}` is missing its persisted initiator"))?;
+        if &existing_initiator != supplied {
+            anyhow::bail!("turn `{turn_id}` already has a different persisted initiator");
+        }
+    }
     let effective_initiator = if supplied_initiator.is_some() {
         supplied_initiator
     } else if let Some(existing) = existing_collaboration.as_ref() {
@@ -344,7 +466,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         )
     };
 
-    turn::Entity::insert(turn::ActiveModel {
+    let row = turn::ActiveModel {
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
         initiated_by_actor_id: Set(initiated_by_actor_id),
@@ -389,15 +511,37 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         message_deleted_by_actor_kind: Set(None),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
+    };
+    Ok(PreparedTurnUpsert {
+        expected_existing: existing_collaboration,
+        allow_existing_if_preflight_missing: false,
+        row,
+        update_columns,
     })
-    .on_conflict(
-        OnConflict::column(turn::Column::Id)
-            .update_columns(update_columns)
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    .context("failed to upsert turn")?;
+}
+
+pub(crate) async fn apply_prepared_turn_upsert<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnUpsert,
+) -> Result<()> {
+    let turn_id = prepared.row.id.as_ref().to_owned();
+    let current = find_turn_by_id(db, turn_id.as_str()).await?;
+    if current != prepared.expected_existing
+        && !(prepared.allow_existing_if_preflight_missing
+            && prepared.expected_existing.is_none()
+            && current.is_some())
+    {
+        anyhow::bail!("turn `{turn_id}` changed during projection preparation");
+    }
+    turn::Entity::insert(prepared.row)
+        .on_conflict(
+            OnConflict::column(turn::Column::Id)
+                .update_columns(prepared.update_columns)
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("failed to upsert turn")?;
 
     Ok(())
 }
@@ -494,43 +638,13 @@ pub async fn insert_turn_message_revision<C: ConnectionTrait>(
     db: &C,
     revision: NewTurnMessageRevision<'_>,
 ) -> Result<()> {
-    let revision_number = i64::try_from(revision.revision)
-        .context("Turn message revision exceeds database integer range")?;
-    let input_json = serde_json::to_string(revision.input)
-        .context("failed to encode Turn message revision input")?;
-    if input_json.len() > TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES {
-        anyhow::bail!(
-            "Turn message revision input exceeds {TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES} bytes"
-        );
-    }
-    let mentions_json = canonical_turn_mentions_json(revision.mentions)?;
-    let (changed_by_actor_kind, changed_by_actor_id) = actor_ref_to_db(revision.changed_by);
-    let changed_by_actor_kind =
-        changed_by_actor_kind.context("Turn message revision actor kind must be persisted")?;
-    let change_kind = match revision.change_kind {
-        TurnMessageRevisionChangeKind::Edit => "edit",
-        TurnMessageRevisionChangeKind::Delete => "delete",
-    };
-    turn_message_revision::Entity::insert(turn_message_revision::ActiveModel {
-        turn_id: Set(revision.turn_id.to_owned()),
-        revision: Set(revision_number),
-        input_json: Set(input_json),
-        mentions_json: Set(mentions_json),
-        changed_by_actor_kind: Set(changed_by_actor_kind),
-        changed_by_actor_id: Set(changed_by_actor_id),
-        change_kind: Set(change_kind.to_owned()),
-        created_at: Set(revision.created_at),
-    })
-    .exec(db)
-    .await
-    .context("failed to insert Turn message revision")?;
-    Ok(())
+    let prepared = prepare_turn_message_revision(revision)?;
+    insert_prepared_turn_message_revision(db, prepared, false).await
 }
 
-pub async fn insert_turn_message_revision_if_absent<C: ConnectionTrait>(
-    db: &C,
+pub(crate) fn prepare_turn_message_revision(
     revision: NewTurnMessageRevision<'_>,
-) -> Result<()> {
+) -> Result<PreparedTurnMessageRevision> {
     let revision_number = i64::try_from(revision.revision)
         .context("Turn message revision exceeds database integer range")?;
     let input_json = serde_json::to_string(revision.input)
@@ -548,27 +662,41 @@ pub async fn insert_turn_message_revision_if_absent<C: ConnectionTrait>(
         TurnMessageRevisionChangeKind::Edit => "edit",
         TurnMessageRevisionChangeKind::Delete => "delete",
     };
-    turn_message_revision::Entity::insert(turn_message_revision::ActiveModel {
-        turn_id: Set(revision.turn_id.to_owned()),
-        revision: Set(revision_number),
-        input_json: Set(input_json),
-        mentions_json: Set(mentions_json),
-        changed_by_actor_kind: Set(changed_by_actor_kind),
-        changed_by_actor_id: Set(changed_by_actor_id),
-        change_kind: Set(change_kind.to_owned()),
-        created_at: Set(revision.created_at),
+    Ok(PreparedTurnMessageRevision {
+        row: turn_message_revision::ActiveModel {
+            turn_id: Set(revision.turn_id.to_owned()),
+            revision: Set(revision_number),
+            input_json: Set(input_json),
+            mentions_json: Set(mentions_json),
+            changed_by_actor_kind: Set(changed_by_actor_kind),
+            changed_by_actor_id: Set(changed_by_actor_id),
+            change_kind: Set(change_kind.to_owned()),
+            created_at: Set(revision.created_at),
+        },
     })
-    .on_conflict(
-        OnConflict::columns([
-            turn_message_revision::Column::TurnId,
-            turn_message_revision::Column::Revision,
-        ])
-        .do_nothing()
-        .to_owned(),
-    )
-    .exec(db)
-    .await
-    .context("failed to idempotently insert Turn message revision")?;
+}
+
+pub(crate) async fn insert_prepared_turn_message_revision<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnMessageRevision,
+    if_absent: bool,
+) -> Result<()> {
+    let mut insert = turn_message_revision::Entity::insert(prepared.row);
+    if if_absent {
+        insert = insert.on_conflict(
+            OnConflict::columns([
+                turn_message_revision::Column::TurnId,
+                turn_message_revision::Column::Revision,
+            ])
+            .do_nothing()
+            .to_owned(),
+        );
+    }
+    insert.exec(db).await.context(if if_absent {
+        "failed to idempotently insert Turn message revision"
+    } else {
+        "failed to insert Turn message revision"
+    })?;
     Ok(())
 }
 
@@ -832,97 +960,77 @@ pub async fn update_turn_status<C: ConnectionTrait>(
     Ok(update_result.rows_affected > 0)
 }
 
+#[cfg(test)]
 pub async fn replace_turn_input<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     input: &[UserInput],
     created_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    turn_input::Entity::delete_many()
-        .filter(turn_input::Column::TurnId.eq(turn_id.to_owned()))
-        .exec(db)
-        .await
-        .context("failed to clear turn input rows before projection")?;
+    let prepared = prepare_turn_input_projection(turn_id, input, created_at)?;
+    replace_prepared_turn_input(db, prepared).await
+}
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedTurnInputProjection {
+    turn_id: String,
+    rows: Vec<turn_input::ActiveModel>,
+}
+
+pub(crate) fn prepare_turn_input_projection(
+    turn_id: &str,
+    input: &[UserInput],
+    created_at: DateTimeWithTimeZone,
+) -> Result<PreparedTurnInputProjection> {
+    let mut rows = Vec::with_capacity(input.len());
     for (index, item) in input.iter().enumerate() {
         let (input_type, text) = input_type_and_text(item);
-        let payload_json =
-            serde_json::to_string(item).context("failed to serialize turn input payload")?;
-
-        turn_input::Entity::insert(turn_input::ActiveModel {
+        rows.push(turn_input::ActiveModel {
             id: Set(generate_id(DB_ID_LEN)),
             turn_id: Set(turn_id.to_owned()),
             input_index: Set(i64::try_from(index).unwrap_or(i64::MAX)),
             input_type: Set(input_type.to_owned()),
             text: Set(text),
-            payload: Set(payload_json),
+            payload: Set(
+                serde_json::to_string(item).context("failed to serialize turn input payload")?
+            ),
             created_at: Set(created_at),
-        })
+        });
+    }
+    Ok(PreparedTurnInputProjection {
+        turn_id: turn_id.to_owned(),
+        rows,
+    })
+}
+
+pub(crate) async fn replace_prepared_turn_input<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnInputProjection,
+) -> Result<()> {
+    turn_input::Entity::delete_many()
+        .filter(turn_input::Column::TurnId.eq(prepared.turn_id))
         .exec(db)
         .await
-        .context("failed to insert projected turn input row")?;
+        .context("failed to clear turn input rows before projection")?;
+
+    for rows in prepared.rows.chunks(32) {
+        turn_input::Entity::insert_many(rows.iter().cloned())
+            .exec_without_returning(db)
+            .await
+            .context("failed to insert projected turn input rows")?;
     }
 
     Ok(())
 }
 
-pub async fn compare_and_set_message_turn_mutation<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    turn_id: &str,
-    expected_revision: u64,
-    mentions: &[TurnMention],
-    deleted_by: Option<&PersistedActorRef>,
-    updated_at: DateTimeWithTimeZone,
-) -> Result<bool> {
-    let expected_revision = i64::try_from(expected_revision)
-        .context("expected Turn message revision exceeds database integer range")?;
-    let next_revision = expected_revision
-        .checked_add(1)
-        .context("Turn message revision exceeds database integer range")?;
-    let mentions_json = canonical_turn_mentions_json(mentions)?;
-    let (deleted_by_actor_kind, deleted_by_actor_id) = match deleted_by {
-        Some(actor) => actor_ref_to_db(actor),
-        None => (None, None),
-    };
-
-    let result = turn::Entity::update_many()
-        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(turn::Column::Id.eq(turn_id.to_owned()))
-        .filter(turn::Column::SendMode.eq("message"))
-        .filter(turn::Column::MessageRevision.eq(expected_revision))
-        .filter(turn::Column::MessageDeletedAt.is_null())
-        .col_expr(turn::Column::MentionsJson, Expr::value(mentions_json))
-        .col_expr(turn::Column::MessageRevision, Expr::value(next_revision))
-        .col_expr(
-            turn::Column::MessageDeletedAt,
-            Expr::value(deleted_by.map(|_| updated_at)),
-        )
-        .col_expr(
-            turn::Column::MessageDeletedByActorKind,
-            Expr::value(deleted_by_actor_kind),
-        )
-        .col_expr(
-            turn::Column::MessageDeletedByActorId,
-            Expr::value(deleted_by_actor_id),
-        )
-        .col_expr(turn::Column::UpdatedAt, Expr::value(updated_at))
-        .exec(db)
-        .await
-        .context("failed to compare-and-set Turn message mutation")?;
-
-    Ok(result.rows_affected == 1)
-}
-
-pub async fn project_message_turn_mutation_state<C: ConnectionTrait>(
-    db: &C,
+pub(crate) fn prepare_message_turn_mutation_state(
     thread_id: &str,
     turn_id: &str,
     revision: u64,
     mentions: &[TurnMention],
     deleted_by: Option<&PersistedActorRef>,
     updated_at: DateTimeWithTimeZone,
-) -> Result<bool> {
+) -> Result<PreparedMessageTurnMutationState> {
     let revision = i64::try_from(revision)
         .context("projected Turn message revision exceeds database integer range")?;
     let mentions_json = canonical_turn_mentions_json(mentions)?;
@@ -930,26 +1038,48 @@ pub async fn project_message_turn_mutation_state<C: ConnectionTrait>(
         Some(actor) => actor_ref_to_db(actor),
         None => (None, None),
     };
+    Ok(PreparedMessageTurnMutationState {
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        revision,
+        mentions_json,
+        deleted_at: deleted_by.map(|_| updated_at),
+        deleted_by_actor_kind,
+        deleted_by_actor_id,
+        updated_at,
+    })
+}
+
+pub(crate) async fn project_prepared_message_turn_mutation_state<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedMessageTurnMutationState,
+) -> Result<bool> {
     let result = turn::Entity::update_many()
-        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .filter(turn::Column::ThreadId.eq(prepared.thread_id))
+        .filter(turn::Column::Id.eq(prepared.turn_id))
         .filter(turn::Column::SendMode.eq("message"))
-        .filter(turn::Column::MessageRevision.lte(revision))
-        .col_expr(turn::Column::MentionsJson, Expr::value(mentions_json))
-        .col_expr(turn::Column::MessageRevision, Expr::value(revision))
+        .filter(turn::Column::MessageRevision.lte(prepared.revision))
+        .col_expr(
+            turn::Column::MentionsJson,
+            Expr::value(prepared.mentions_json),
+        )
+        .col_expr(
+            turn::Column::MessageRevision,
+            Expr::value(prepared.revision),
+        )
         .col_expr(
             turn::Column::MessageDeletedAt,
-            Expr::value(deleted_by.map(|_| updated_at)),
+            Expr::value(prepared.deleted_at),
         )
         .col_expr(
             turn::Column::MessageDeletedByActorKind,
-            Expr::value(deleted_by_actor_kind),
+            Expr::value(prepared.deleted_by_actor_kind),
         )
         .col_expr(
             turn::Column::MessageDeletedByActorId,
-            Expr::value(deleted_by_actor_id),
+            Expr::value(prepared.deleted_by_actor_id),
         )
-        .col_expr(turn::Column::UpdatedAt, Expr::value(updated_at))
+        .col_expr(turn::Column::UpdatedAt, Expr::value(prepared.updated_at))
         .exec(db)
         .await
         .context("failed to project Turn message mutation state")?;
@@ -963,60 +1093,99 @@ pub async fn append_turn_status_history<C: ConnectionTrait>(
     error: Option<String>,
     created_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    turn_status_history::Entity::insert(turn_status_history::ActiveModel {
-        id: Set(generate_id(DB_ID_LEN)),
-        turn_id: Set(turn_id.to_owned()),
-        status: Set(turn_status_to_db(status).to_owned()),
-        error: Set(error),
-        created_at: Set(created_at),
-    })
-    .exec(db)
-    .await
-    .context("failed to append turn status history")?;
+    let prepared = prepare_turn_status_history(turn_id, status, error, created_at);
+    append_prepared_turn_status_history(db, prepared).await
+}
 
+pub(crate) fn prepare_turn_status_history(
+    turn_id: &str,
+    status: TurnStatus,
+    error: Option<String>,
+    created_at: DateTimeWithTimeZone,
+) -> PreparedTurnStatusHistory {
+    PreparedTurnStatusHistory {
+        row: turn_status_history::ActiveModel {
+            id: Set(generate_id(DB_ID_LEN)),
+            turn_id: Set(turn_id.to_owned()),
+            status: Set(turn_status_to_db(status).to_owned()),
+            error: Set(error),
+            created_at: Set(created_at),
+        },
+    }
+}
+
+pub(crate) async fn append_prepared_turn_status_history<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnStatusHistory,
+) -> Result<()> {
+    turn_status_history::Entity::insert(prepared.row)
+        .exec(db)
+        .await
+        .context("failed to append turn status history")?;
     Ok(())
 }
 
-pub async fn upsert_turn_item<C: ConnectionTrait>(
-    db: &C,
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedTurnItemProjection {
+    row_id: String,
+    turn_id: String,
+    item_id: String,
+    item_type: String,
+    status: Option<String>,
+    payload_json: String,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+}
+
+impl PreparedTurnItemProjection {
+    pub(crate) fn payload_json(&self) -> &str {
+        self.payload_json.as_str()
+    }
+}
+
+pub(crate) fn prepare_turn_item_projection(
     turn_id: &str,
     item: &TurnItem,
     status: Option<&str>,
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
-) -> Result<()> {
+) -> Result<PreparedTurnItemProjection> {
     let (item_id, item_type) = turn_item_id_and_type_to_db(item);
-    let payload_json =
-        serde_json::to_string(item).context("failed to serialize turn item payload")?;
+    Ok(PreparedTurnItemProjection {
+        row_id: generate_id(DB_ID_LEN),
+        turn_id: turn_id.to_owned(),
+        item_id: item_id.to_owned(),
+        item_type: item_type.to_owned(),
+        status: status.map(str::to_owned),
+        payload_json: serde_json::to_string(item)
+            .context("failed to serialize turn item payload")?,
+        created_at,
+        updated_at,
+    })
+}
 
+pub(crate) async fn upsert_prepared_turn_item<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnItemProjection,
+) -> Result<()> {
     if db.get_database_backend() == DatabaseBackend::Sqlite {
-        return upsert_turn_item_sqlite_compatible(
-            db,
-            turn_id,
-            item_id,
-            item_type,
-            status,
-            payload_json.as_str(),
-            created_at,
-            updated_at,
-        )
-        .await;
+        return upsert_turn_item_sqlite_compatible(db, prepared).await;
     }
 
     turn_item::Entity::insert(turn_item::ActiveModel {
-        id: Set(generate_id(DB_ID_LEN)),
-        turn_id: Set(turn_id.to_owned()),
-        item_id: Set(item_id.to_owned()),
-        item_type: Set(item_type.to_owned()),
-        status: Set(status.map(str::to_owned)),
-        payload: Set(payload_json),
+        id: Set(prepared.row_id),
+        turn_id: Set(prepared.turn_id),
+        item_id: Set(prepared.item_id),
+        item_type: Set(prepared.item_type),
+        status: Set(prepared.status),
+        payload: Set(prepared.payload_json),
         active_attempt_number: Set(0),
         active_attempt_status: Set(None),
         active_attempt_id: Set(None),
         last_heartbeat_at: Set(None),
         lease_expires_at: Set(None),
-        created_at: Set(created_at),
-        updated_at: Set(updated_at),
+        created_at: Set(prepared.created_at),
+        updated_at: Set(prepared.updated_at),
     })
     .on_conflict(
         OnConflict::columns([turn_item::Column::TurnId, turn_item::Column::ItemId])
@@ -1037,15 +1206,9 @@ pub async fn upsert_turn_item<C: ConnectionTrait>(
 
 async fn upsert_turn_item_sqlite_compatible<C: ConnectionTrait>(
     db: &C,
-    turn_id: &str,
-    item_id: &str,
-    item_type: &str,
-    status: Option<&str>,
-    payload_json: &str,
-    created_at: DateTimeWithTimeZone,
-    updated_at: DateTimeWithTimeZone,
+    prepared: PreparedTurnItemProjection,
 ) -> Result<()> {
-    if sqlite_turn_item_exists(db, turn_id, item_id).await? {
+    if sqlite_turn_item_exists(db, prepared.turn_id.as_str(), prepared.item_id.as_str()).await? {
         db.execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             r#"
@@ -1058,12 +1221,12 @@ async fn upsert_turn_item_sqlite_compatible<C: ConnectionTrait>(
                 WHERE turn_id = ? AND item_id = ?
             "#,
             vec![
-                item_type.to_owned().into(),
-                status.map(str::to_owned).into(),
-                payload_json.to_owned().into(),
-                updated_at.into(),
-                turn_id.to_owned().into(),
-                item_id.to_owned().into(),
+                prepared.item_type.into(),
+                prepared.status.into(),
+                prepared.payload_json.into(),
+                prepared.updated_at.into(),
+                prepared.turn_id.into(),
+                prepared.item_id.into(),
             ],
         ))
         .await
@@ -1092,14 +1255,14 @@ async fn upsert_turn_item_sqlite_compatible<C: ConnectionTrait>(
             VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, ?)
         "#,
         vec![
-            generate_id(DB_ID_LEN).into(),
-            turn_id.to_owned().into(),
-            item_id.to_owned().into(),
-            item_type.to_owned().into(),
-            status.map(str::to_owned).into(),
-            payload_json.to_owned().into(),
-            created_at.into(),
-            updated_at.into(),
+            prepared.row_id.into(),
+            prepared.turn_id.into(),
+            prepared.item_id.into(),
+            prepared.item_type.into(),
+            prepared.status.into(),
+            prepared.payload_json.into(),
+            prepared.created_at.into(),
+            prepared.updated_at.into(),
         ],
     ))
     .await
@@ -1487,16 +1650,17 @@ mod tests {
 
         let created_at = fixed_test_datetime();
         let first = agent_message_item("item_zstd", "first payload");
-        upsert_turn_item(
-            &connection,
+        let first = prepare_turn_item_projection(
             "turn_item_zstd",
             &first,
             Some("running"),
             created_at,
             created_at,
         )
-        .await
-        .expect("turn_item insert should work through sqlite-zstd view");
+        .expect("turn_item insert should prepare");
+        upsert_prepared_turn_item(&connection, first)
+            .await
+            .expect("turn_item insert should work through sqlite-zstd view");
 
         let inserted = find_turn_item(&connection, "turn_item_zstd", "item_zstd")
             .await
@@ -1507,16 +1671,17 @@ mod tests {
 
         let updated_at = fixed_later_test_datetime();
         let updated = agent_message_item("item_zstd", "updated payload");
-        upsert_turn_item(
-            &connection,
+        let updated = prepare_turn_item_projection(
             "turn_item_zstd",
             &updated,
             Some("completed"),
             created_at,
             updated_at,
         )
-        .await
-        .expect("turn_item update should work through sqlite-zstd view");
+        .expect("turn_item update should prepare");
+        upsert_prepared_turn_item(&connection, updated)
+            .await
+            .expect("turn_item update should work through sqlite-zstd view");
 
         let stored = find_turn_item(&connection, "turn_item_zstd", "item_zstd")
             .await

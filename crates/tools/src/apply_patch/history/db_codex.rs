@@ -146,13 +146,13 @@ impl SqliteCodexAggregateStore {
         let existing = find_codex_aggregate_state(&self.db, &state.thread_id, &state.turn_id)
             .await
             .context("query Codex aggregate projection")?;
-        if let Some(existing) = existing {
+        if let Some(existing) = existing.as_ref() {
             let revision = existing.revision;
             let final_state = existing.final_state;
             if !matches!(final_state, 0 | 1) {
                 return Err(anyhow!("Codex aggregate final_state is not boolean"));
             }
-            let existing_json = existing.state_json;
+            let existing_json = existing.state_json.clone();
             let existing_state = decode_state_json(&existing_json)?;
             if existing_state.thread_id != state.thread_id
                 || existing_state.turn_id != state.turn_id
@@ -220,6 +220,15 @@ impl SqliteCodexAggregateStore {
             .begin()
             .await
             .context("begin Codex aggregate projection")?;
+        let current = find_codex_aggregate_state(&transaction, &state.thread_id, &state.turn_id)
+            .await
+            .context("revalidate Codex aggregate projection")?;
+        if current != existing {
+            transaction.rollback().await.ok();
+            return Err(anyhow!(
+                "Codex aggregate projection changed while its write was preparing"
+            ));
+        }
         upsert_codex_aggregate_state(
             &transaction,
             CodexAggregateStateWrite {

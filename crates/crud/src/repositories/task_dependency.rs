@@ -8,11 +8,27 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder
 
 use crate::util::{optional_typed_json_to_db, unix_to_datetime};
 
+#[derive(Clone, Debug)]
+pub struct PreparedTaskDependencyProjection(task_dependency::ActiveModel);
+
+pub fn prepare_dependency_projection(
+    dependency: &TaskDependency,
+) -> Result<PreparedTaskDependencyProjection> {
+    active_model_from_dependency(dependency).map(PreparedTaskDependencyProjection)
+}
+
 pub async fn upsert_dependency<C: ConnectionTrait>(
     db: &C,
     dependency: &TaskDependency,
 ) -> Result<()> {
-    task_dependency::Entity::insert(active_model_from_dependency(dependency)?)
+    upsert_prepared_dependency(db, prepare_dependency_projection(dependency)?).await
+}
+
+pub async fn upsert_prepared_dependency<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskDependencyProjection,
+) -> Result<()> {
+    task_dependency::Entity::insert(prepared.0)
         .on_conflict(
             OnConflict::columns([
                 task_dependency::Column::TaskId,

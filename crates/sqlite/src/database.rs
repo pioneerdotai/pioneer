@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use sea_orm::{
-    AccessMode, ConnectionTrait, DatabaseConnection, DbBackend, DbErr, ExecResult, IsolationLevel,
-    QueryResult, Statement, StreamTrait, TransactionError, TransactionOptions, TransactionTrait,
+    AccessMode, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
+    ExecResult, IsolationLevel, QueryResult, Statement, StreamTrait, TransactionError,
+    TransactionOptions, TransactionSession, TransactionStream, TransactionTrait,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -196,6 +197,166 @@ impl SqliteReadPool {
             }
         }
     }
+
+    async fn begin(&self, class: SqliteReadClass) -> Result<SqliteReadTransaction, DbErr> {
+        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let result = async {
+            let permit = self.acquire(class).await?;
+            let transaction = self
+                .connection
+                .begin_with_config(None, Some(AccessMode::ReadOnly))
+                .instrument(reader_pool_span(class))
+                .await?;
+            Ok((transaction, permit))
+        }
+        .await;
+        match result {
+            Ok((transaction, permit)) => {
+                Ok(SqliteReadTransaction::new(transaction, permit, operation))
+            }
+            Err(error) => {
+                operation.finish(SqliteReadOutcome::Error);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Read-only snapshot transaction acquired from the physical reader pool.
+///
+/// Unlike [`SqliteTransaction`], this type never owns writer admission. Its
+/// mutation APIs reject all calls, and maintenance admission is retained until
+/// commit, rollback, or drop.
+pub struct SqliteReadTransaction {
+    inner: Option<DatabaseTransaction>,
+    _maintenance_permit: Option<SqliteMaintenanceReadPermit>,
+    operation: Option<SqliteReadOperation>,
+}
+
+impl std::fmt::Debug for SqliteReadTransaction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SqliteReadTransaction")
+    }
+}
+
+impl SqliteReadTransaction {
+    fn new(
+        inner: DatabaseTransaction,
+        maintenance_permit: Option<SqliteMaintenanceReadPermit>,
+        operation: SqliteReadOperation,
+    ) -> Self {
+        Self {
+            inner: Some(inner),
+            _maintenance_permit: maintenance_permit,
+            operation: Some(operation),
+        }
+    }
+
+    fn inner(&self) -> &DatabaseTransaction {
+        self.inner
+            .as_ref()
+            .expect("SQLite read transaction was already completed")
+    }
+
+    pub async fn commit(mut self) -> Result<(), DbErr> {
+        let result = self
+            .inner
+            .take()
+            .expect("SQLite read transaction was already completed")
+            .commit()
+            .await;
+        self._maintenance_permit.take();
+        if let Some(operation) = self.operation.as_mut() {
+            operation.finish(if result.is_ok() {
+                SqliteReadOutcome::Ok
+            } else {
+                SqliteReadOutcome::Error
+            });
+        }
+        self.operation.take();
+        result
+    }
+
+    pub async fn rollback(mut self) -> Result<(), DbErr> {
+        let result = self
+            .inner
+            .take()
+            .expect("SQLite read transaction was already completed")
+            .rollback()
+            .await;
+        self._maintenance_permit.take();
+        if let Some(operation) = self.operation.as_mut() {
+            operation.finish(if result.is_ok() {
+                SqliteReadOutcome::Cancelled
+            } else {
+                SqliteReadOutcome::Error
+            });
+        }
+        self.operation.take();
+        result
+    }
+}
+
+#[async_trait]
+impl TransactionSession for SqliteReadTransaction {
+    async fn commit(self) -> Result<(), DbErr> {
+        SqliteReadTransaction::commit(self).await
+    }
+
+    async fn rollback(self) -> Result<(), DbErr> {
+        SqliteReadTransaction::rollback(self).await
+    }
+}
+
+#[async_trait]
+impl ConnectionTrait for SqliteReadTransaction {
+    fn get_database_backend(&self) -> DbBackend {
+        ConnectionTrait::get_database_backend(self.inner())
+    }
+
+    async fn execute_raw(&self, _statement: Statement) -> Result<ExecResult, DbErr> {
+        Err(SqliteReadPool::reject_write())
+    }
+
+    async fn execute_unprepared(&self, _sql: &str) -> Result<ExecResult, DbErr> {
+        Err(SqliteReadPool::reject_write())
+    }
+
+    async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
+        SqliteReadPool::ensure_read_statement(&statement)?;
+        self.inner().query_one_raw(statement).await
+    }
+
+    async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
+        SqliteReadPool::ensure_read_statement(&statement)?;
+        self.inner().query_all_raw(statement).await
+    }
+
+    fn support_returning(&self) -> bool {
+        false
+    }
+
+    fn is_mock_connection(&self) -> bool {
+        self.inner().is_mock_connection()
+    }
+}
+
+impl StreamTrait for SqliteReadTransaction {
+    type Stream<'a> = TransactionStream<'a>;
+
+    fn get_database_backend(&self) -> DbBackend {
+        StreamTrait::get_database_backend(self.inner())
+    }
+
+    fn stream_raw<'a>(
+        &'a self,
+        statement: Statement,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
+        Box::pin(async move {
+            SqliteReadPool::ensure_read_statement(&statement)?;
+            self.inner().stream_raw(statement).await
+        })
+    }
 }
 
 /// Typed SQLite runtime with independent read and write contours.
@@ -275,16 +436,6 @@ impl SqliteDatabase {
         self.write_class
     }
 
-    /// Runs one logical mutation under a single reservation from the physical
-    /// writer executor. Nested writes and transactions on this database reuse
-    /// that reservation; retry delays must remain outside this scope.
-    pub async fn run_write_operation<T, Fut>(&self, operation: Fut) -> T
-    where
-        Fut: Future<Output = T>,
-    {
-        self.writer.run_scoped(self.write_class, operation).await
-    }
-
     pub fn writer_max_connections(&self) -> u32 {
         self.writer.max_connections()
     }
@@ -305,6 +456,13 @@ impl SqliteDatabase {
             ));
         }
         Ok(())
+    }
+
+    /// Opens a consistent, read-only snapshot on the reader pool. Pure read
+    /// workflows which need transaction-level consistency must use this API;
+    /// [`TransactionTrait::begin`] intentionally remains the write boundary.
+    pub async fn begin_read(&self) -> Result<SqliteReadTransaction, DbErr> {
+        self.reader.begin(self.read_class).await
     }
 
     /// Execute a row-returning statement on the serialized writer. This is
@@ -611,6 +769,7 @@ mod tests {
     use crate::{SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome, SqliteWriteExecutor};
     use futures_util::StreamExt;
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, StreamTrait};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -673,6 +832,56 @@ mod tests {
             observer.clone(),
         );
         (database, observer)
+    }
+
+    async fn file_backed_test_database() -> (SqliteDatabase, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "pioneer-sqlite-read-transaction-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut writer_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        writer_options.max_connections(1);
+        let writer = Database::connect(writer_options)
+            .await
+            .expect("open file-backed test writer");
+        writer
+            .execute_unprepared("PRAGMA journal_mode = WAL")
+            .await
+            .expect("enable WAL for file-backed test database");
+        writer
+            .execute_unprepared(
+                "CREATE TABLE read_transaction_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+            )
+            .await
+            .expect("create file-backed read transaction probe");
+
+        let mut reader_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
+        reader_options.max_connections(4);
+        let reader = Database::connect(reader_options)
+            .await
+            .expect("open file-backed test reader");
+        (SqliteDatabase::new(reader, writer), path)
+    }
+
+    async fn close_file_backed_test_database(database: SqliteDatabase, path: PathBuf) {
+        database
+            .close()
+            .await
+            .expect("close file-backed test pools");
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            match std::fs::remove_file(&candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove test database {}: {error}", candidate.display()),
+            }
+        }
     }
 
     #[test]
@@ -808,6 +1017,147 @@ mod tests {
             Err(error) => error,
         };
         assert!(stream_error.to_string().contains("SQLite read pool"));
+    }
+
+    #[tokio::test]
+    async fn read_transaction_accepts_queries_and_rejects_all_mutations() {
+        let database = test_database().await;
+        let transaction = database.begin_read().await.expect("begin read transaction");
+
+        let row = transaction
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 7 AS value".to_owned(),
+            ))
+            .await
+            .expect("query through read transaction")
+            .expect("read transaction row");
+        assert_eq!(row.try_get::<i64>("", "value").unwrap(), 7);
+
+        let execute_error = transaction
+            .execute_unprepared("CREATE TABLE forbidden (id INTEGER)")
+            .await
+            .expect_err("read transaction execute must be rejected");
+        assert!(execute_error.to_string().contains("SQLite read pool"));
+
+        let returning_error = transaction
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "DELETE FROM forbidden RETURNING id".to_owned(),
+            ))
+            .await
+            .expect_err("row-returning mutation must be rejected");
+        assert!(returning_error.to_string().contains("SQLite read pool"));
+
+        transaction.commit().await.expect("commit read transaction");
+        database.close().await.expect("close test database");
+    }
+
+    #[tokio::test]
+    async fn held_read_snapshot_does_not_occupy_or_block_the_writer() {
+        let (database, path) = file_backed_test_database().await;
+        let transaction = database.begin_read().await.expect("begin read snapshot");
+        let initial = transaction
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM read_transaction_probe".to_owned(),
+            ))
+            .await
+            .expect("query initial snapshot")
+            .expect("initial count row");
+        assert_eq!(initial.try_get::<i64>("", "count").unwrap(), 0);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            database.execute_unprepared(
+                "INSERT INTO read_transaction_probe (id, value) VALUES (1, 'writer-progress')",
+            ),
+        )
+        .await
+        .expect("reader snapshot must not occupy writer admission")
+        .expect("writer must progress while read snapshot is held");
+
+        let snapshot = transaction
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM read_transaction_probe".to_owned(),
+            ))
+            .await
+            .expect("query held snapshot")
+            .expect("held snapshot count row");
+        assert_eq!(snapshot.try_get::<i64>("", "count").unwrap(), 0);
+        transaction.commit().await.expect("commit read snapshot");
+
+        let current = database
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM read_transaction_probe".to_owned(),
+            ))
+            .await
+            .expect("query current state")
+            .expect("current count row");
+        assert_eq!(current.try_get::<i64>("", "count").unwrap(), 1);
+        close_file_backed_test_database(database, path).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_read_transaction_holds_limiter_until_completion() {
+        let database = test_database().await;
+        let maintenance = database.maintenance();
+        let transaction = maintenance
+            .begin_read()
+            .await
+            .expect("begin maintenance read transaction");
+        transaction
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 AS value".to_owned(),
+            ))
+            .await
+            .expect("query maintenance read transaction");
+
+        let waiting = tokio::spawn({
+            let maintenance = maintenance.clone();
+            async move {
+                maintenance
+                    .query_one_raw(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "SELECT 2 AS value".to_owned(),
+                    ))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "second maintenance read must wait for transaction completion"
+        );
+
+        let interactive = tokio::time::timeout(
+            Duration::from_secs(1),
+            database.query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 3 AS value".to_owned(),
+            )),
+        )
+        .await
+        .expect("maintenance transaction must not block interactive reads")
+        .expect("run interactive read")
+        .expect("interactive read row");
+        assert_eq!(interactive.try_get::<i64>("", "value").unwrap(), 3);
+
+        transaction
+            .commit()
+            .await
+            .expect("commit maintenance read transaction");
+        let resumed = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("waiting maintenance read must resume")
+            .expect("join waiting maintenance read")
+            .expect("run waiting maintenance read")
+            .expect("waiting maintenance row");
+        assert_eq!(resumed.try_get::<i64>("", "value").unwrap(), 2);
+        database.close().await.expect("close test database");
     }
 
     #[tokio::test]

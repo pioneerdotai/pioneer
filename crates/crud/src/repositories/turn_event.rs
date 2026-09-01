@@ -10,40 +10,153 @@ use pioneer_protocol::generate_id;
 
 const DB_ID_LEN: usize = 21;
 
+/// CPU-only representation of an append. Serialization, idempotency-key
+/// derivation and ID generation happen before a caller begins a write
+/// transaction; the transaction then performs only SQLite work.
+#[derive(Clone, Debug)]
+pub struct PreparedTurnEvent {
+    id: String,
+    thread_id: String,
+    turn_id: String,
+    event_type: String,
+    payload_json: String,
+    idempotency_key: String,
+    payload: TurnEventPayload,
+    semantically_matching_existing_id: Option<String>,
+}
+
+impl PreparedTurnEvent {
+    pub fn prepare(payload: TurnEventPayload) -> Result<Self> {
+        let thread_id = payload.thread_id().to_owned();
+        let turn_id = payload.turn_id().to_owned();
+        let event_type = payload.event_type().to_owned();
+        let payload_json =
+            serde_json::to_string(&payload).context("failed to serialize turn event payload")?;
+        let idempotency_key = payload
+            .idempotency_key()
+            .context("failed to derive turn event idempotency key")?;
+        Ok(Self {
+            id: generate_id(DB_ID_LEN),
+            thread_id,
+            turn_id,
+            event_type,
+            payload_json,
+            idempotency_key,
+            payload,
+            semantically_matching_existing_id: None,
+        })
+    }
+
+    pub fn payload(&self) -> &TurnEventPayload {
+        &self.payload
+    }
+
+    pub fn id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    /// Performs the potentially expensive legacy-payload decode before a
+    /// caller acquires the writer. Newly written rows use canonical JSON, but
+    /// older rows may be semantically identical without being byte-identical.
+    /// The immutable row ID is carried into the write transaction as the
+    /// compare fence, preserving the old idempotent replay semantics without
+    /// parsing JSON while the writer is held.
+    pub async fn preflight_idempotency<C: ConnectionTrait>(mut self, db: &C) -> Result<Self> {
+        if let Some(existing) = turn_event::Entity::find()
+            .filter(turn_event::Column::TurnId.eq(self.turn_id.clone()))
+            .filter(turn_event::Column::IdempotencyKey.eq(self.idempotency_key.clone()))
+            .one(db)
+            .await
+            .context("failed to preflight idempotent turn event")?
+        {
+            let existing_id = existing.id.clone();
+            let existing = appended_event_from_model(existing)?;
+            if existing.payload != self.payload {
+                anyhow::bail!(
+                    "turn event idempotency key collision for turn `{}`",
+                    self.turn_id
+                );
+            }
+            self.semantically_matching_existing_id = Some(existing_id);
+        }
+        Ok(self)
+    }
+}
+
+fn validate_existing_prepared_event(
+    existing: &turn_event::Model,
+    prepared: &PreparedTurnEvent,
+) -> Result<()> {
+    let canonical_payload_matches = existing.payload == prepared.payload_json;
+    let preflight_fence_matches =
+        prepared.semantically_matching_existing_id.as_deref() == Some(existing.id.as_str());
+    if !canonical_payload_matches && !preflight_fence_matches {
+        anyhow::bail!(
+            "turn event idempotency key collision for turn `{}`",
+            prepared.turn_id
+        );
+    }
+    Ok(())
+}
+
+/// Checks the durable replay fence without decoding JSON. The semantic legacy
+/// check, when required, was completed by `preflight_idempotency` before the
+/// writer transaction began.
+pub async fn prepared_event_already_exists<C: ConnectionTrait>(
+    db: &C,
+    prepared: &PreparedTurnEvent,
+) -> Result<bool> {
+    let existing = turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq(prepared.turn_id.clone()))
+        .filter(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
+        .one(db)
+        .await
+        .context("failed to query idempotent turn event")?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    validate_existing_prepared_event(&existing, prepared)?;
+    Ok(true)
+}
+
+#[cfg(test)]
 pub async fn append_event<C: ConnectionTrait>(
     db: &C,
     payload: &TurnEventPayload,
     created_at: DateTimeWithTimeZone,
 ) -> Result<AppendedTurnEvent> {
-    let thread_id = payload.thread_id().to_owned();
-    let turn_id = payload.turn_id().to_owned();
+    let prepared = PreparedTurnEvent::prepare(payload.clone())?
+        .preflight_idempotency(db)
+        .await?;
+    append_prepared_event(db, prepared, created_at).await
+}
 
-    let event_type = payload.event_type().to_owned();
-
-    let payload_json =
-        serde_json::to_string(payload).context("failed to serialize turn event payload")?;
-
-    let idempotency_key = payload
-        .idempotency_key()
-        .context("failed to derive turn event idempotency key")?;
+pub async fn append_prepared_event<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnEvent,
+    created_at: DateTimeWithTimeZone,
+) -> Result<AppendedTurnEvent> {
     if let Some(existing) = turn_event::Entity::find()
-        .filter(turn_event::Column::TurnId.eq(turn_id.clone()))
-        .filter(turn_event::Column::IdempotencyKey.eq(idempotency_key.clone()))
+        .filter(turn_event::Column::TurnId.eq(prepared.turn_id.clone()))
+        .filter(turn_event::Column::IdempotencyKey.eq(prepared.idempotency_key.clone()))
         .one(db)
         .await
         .context("failed to query idempotent turn event")?
     {
-        let mut existing = appended_event_from_model(existing)?;
-        if existing.payload != *payload {
-            anyhow::bail!("turn event idempotency key collision for turn `{turn_id}`");
-        }
-        existing.was_inserted = false;
-        return Ok(existing);
+        validate_existing_prepared_event(&existing, &prepared)?;
+        return Ok(AppendedTurnEvent {
+            id: existing.id,
+            thread_id: existing.thread_id,
+            turn_id: existing.turn_id,
+            sequence: existing.sequence,
+            payload: prepared.payload,
+            idempotency_key: existing.idempotency_key,
+            was_inserted: false,
+            created_at: existing.created_at,
+        });
     }
 
-    let sequence = next_sequence_for_turn(db, turn_id.as_str()).await?;
-
-    let id = generate_id(DB_ID_LEN);
+    let sequence = next_sequence_for_turn(db, prepared.turn_id.as_str()).await?;
 
     let mut insert = Query::insert();
 
@@ -60,13 +173,13 @@ pub async fn append_event<C: ConnectionTrait>(
             Alias::new("created_at"),
         ])
         .values_panic([
-            id.clone().into(),
-            thread_id.clone().into(),
-            turn_id.clone().into(),
+            prepared.id.clone().into(),
+            prepared.thread_id.clone().into(),
+            prepared.turn_id.clone().into(),
             sequence.into(),
-            event_type.clone().into(),
-            payload_json.into(),
-            idempotency_key.clone().into(),
+            prepared.event_type.into(),
+            prepared.payload_json.into(),
+            prepared.idempotency_key.clone().into(),
             created_at.into(),
         ]);
 
@@ -75,12 +188,12 @@ pub async fn append_event<C: ConnectionTrait>(
         .context("failed to append turn event")?;
 
     Ok(AppendedTurnEvent {
-        id,
-        thread_id,
-        turn_id,
+        id: prepared.id,
+        thread_id: prepared.thread_id,
+        turn_id: prepared.turn_id,
         sequence,
-        payload: payload.clone(),
-        idempotency_key: Some(idempotency_key),
+        payload: prepared.payload,
+        idempotency_key: Some(prepared.idempotency_key),
         was_inserted: true,
         created_at,
     })
@@ -110,21 +223,6 @@ pub async fn find_event_by_id<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query turn_event by id")?
-        .map(appended_event_from_model)
-        .transpose()
-}
-
-pub async fn find_event_by_idempotency_key<C: ConnectionTrait>(
-    db: &C,
-    turn_id: &str,
-    idempotency_key: &str,
-) -> Result<Option<AppendedTurnEvent>> {
-    turn_event::Entity::find()
-        .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(turn_event::Column::IdempotencyKey.eq(idempotency_key.to_owned()))
-        .one(db)
-        .await
-        .context("failed to query turn_event by idempotency key")?
         .map(appended_event_from_model)
         .transpose()
 }

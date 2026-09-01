@@ -20,7 +20,9 @@ use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
 
 const THREAD_PREVIEW_AUTHOR_JSON_MAX_BYTES: usize = 4_096;
 
-fn preview_author_json(author: Option<&TurnAuthorSnapshot>) -> Result<Option<String>> {
+pub(crate) fn prepare_preview_author_json(
+    author: Option<&TurnAuthorSnapshot>,
+) -> Result<Option<String>> {
     let Some(author) = author else {
         return Ok(None);
     };
@@ -95,15 +97,14 @@ pub async fn replace_thread_preview_if_matches<C: ConnectionTrait>(
 /// concurrent Message restore stale execution or management state. The
 /// Message transition owns only the first derived preview and a monotonic
 /// activity timestamp on an already-persisted Thread.
-pub async fn touch_thread_for_completed_message<C: ConnectionTrait>(
+pub(crate) async fn touch_thread_for_completed_message_prepared<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
     derived_preview: &str,
-    preview_author: Option<&TurnAuthorSnapshot>,
+    preview_author_json: Option<String>,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
     if !derived_preview.is_empty() {
-        let preview_author_json = preview_author_json(preview_author)?;
         thread::Entity::update_many()
             .col_expr(
                 thread::Column::Preview,
@@ -178,6 +179,7 @@ pub async fn advance_thread_read_cursor<C: ConnectionTrait>(
     Ok(result.rows_affected() > 0)
 }
 
+#[cfg(test)]
 pub async fn upsert_thread<C: ConnectionTrait>(
     db: &C,
     thread_model: &Thread,
@@ -307,7 +309,7 @@ pub async fn insert_user_thread_with_creator<C: ConnectionTrait>(
     }
 
     let (created_by_actor_kind, created_by_actor_id) = actor_ref_to_db(creator);
-    let preview_author_json = preview_author_json(thread_model.preview_author.as_ref())?;
+    let preview_author_json = prepare_preview_author_json(thread_model.preview_author.as_ref())?;
     thread::Entity::insert(thread::ActiveModel {
         id: Set(thread_model.id.clone()),
         workspace_id: Set(thread_model.workspace_id.clone()),
@@ -350,7 +352,31 @@ async fn upsert_thread_with_actor_columns<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    let preview_author_json = preview_author_json(thread_model.preview_author.as_ref())?;
+    let preview_author_json = prepare_preview_author_json(thread_model.preview_author.as_ref())?;
+    upsert_thread_with_actor_columns_prepared(
+        db,
+        thread_model,
+        created_by_actor_kind,
+        created_by_actor_id,
+        access_class,
+        preview_author_json,
+        created_at,
+        updated_at,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_thread_with_actor_columns_prepared<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &Thread,
+    created_by_actor_kind: Option<String>,
+    created_by_actor_id: Option<String>,
+    access_class: Option<super::membership::PersistedThreadAccessClass>,
+    preview_author_json: Option<String>,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
     thread::Entity::insert(thread::ActiveModel {
         id: Set(thread_model.id.clone()),
         workspace_id: Set(thread_model.workspace_id.clone()),
@@ -415,6 +441,54 @@ async fn upsert_thread_with_actor_columns<C: ConnectionTrait>(
     .context("failed to upsert thread")?;
 
     Ok(())
+}
+
+pub(crate) async fn upsert_projected_thread<C: ConnectionTrait>(
+    db: &C,
+    thread_model: &Thread,
+    creator: Option<&PersistedActorRef>,
+    preview_author_json: Option<String>,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    if let Some(creator) = creator
+        && let Some(existing) = find_thread_by_id(db, thread_model.id.as_str()).await?
+    {
+        let existing_creator = actor_ref_from_db(
+            existing.created_by_actor_kind.as_deref(),
+            existing.created_by_actor_id.as_deref(),
+        )
+        .with_context(|| {
+            format!(
+                "thread `{}` has an invalid persisted creator pair",
+                thread_model.id
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "thread `{}` is missing its persisted creator",
+                thread_model.id
+            )
+        })?;
+        if &existing_creator != creator {
+            anyhow::bail!(
+                "thread `{}` has a different persisted creator",
+                thread_model.id
+            );
+        }
+    }
+    let (actor_kind, actor_id) = creator.map(actor_ref_to_db).unwrap_or((None, None));
+    upsert_thread_with_actor_columns_prepared(
+        db,
+        thread_model,
+        actor_kind,
+        actor_id,
+        None,
+        preview_author_json,
+        created_at,
+        updated_at,
+    )
+    .await
 }
 
 pub async fn find_thread_by_id<C: ConnectionTrait>(

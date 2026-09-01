@@ -13,7 +13,7 @@ use pioneer_protocol::{
     WorkspaceMemberListResponse, WorkspaceMemberMutationResponse, WorkspaceMemberRemoveParams,
 };
 use sea_orm::{
-    DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionSession,
+    ConnectionTrait, SqliteTransactionMode, TransactionOptions, TransactionSession,
     TransactionTrait,
 };
 use sha2::Digest as _;
@@ -547,7 +547,7 @@ impl MemberService {
             .map_err(|_| MemberServiceError::InvalidParams)?;
         let database = self.store.database_connection();
         let transaction = database
-            .begin()
+            .begin_read()
             .await
             .context("failed to begin Member directory read transaction")
             .map_err(MemberServiceError::Unavailable)?;
@@ -568,29 +568,30 @@ impl MemberService {
                 .map(|row| row.id.clone())
                 .collect::<Vec<_>>();
             let avatar_revisions =
-                pioneer_crud::list_principal_avatar_revisions(&transaction, &principal_ids)
-                    .await?
-                    .into_iter()
-                    .map(|avatar| (avatar.principal_id, hex::encode(avatar.content_hash)))
-                    .collect::<HashMap<_, _>>();
-            let members = page
-                .principals
-                .into_iter()
-                .map(|row| {
-                    let avatar_revision = avatar_revisions.get(row.id.as_str()).cloned();
-                    member_summary(row, avatar_revision)
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            Ok::<_, MemberServiceError>(MemberListResponse {
-                members,
-                next_cursor: page
-                    .next_cursor
-                    .as_ref()
-                    .map(|cursor| codec.encode(cursor, scope.as_str())),
-            })
+                pioneer_crud::list_principal_avatar_revisions(&transaction, &principal_ids).await?;
+            Ok::<_, MemberServiceError>((page, avatar_revisions))
         }
         .await;
-        finish_read_transaction(transaction, result).await
+        let (page, avatar_revisions) = finish_read_transaction(transaction, result).await?;
+        let avatar_revisions = avatar_revisions
+            .into_iter()
+            .map(|avatar| (avatar.principal_id, hex::encode(avatar.content_hash)))
+            .collect::<HashMap<_, _>>();
+        let members = page
+            .principals
+            .into_iter()
+            .map(|row| {
+                let avatar_revision = avatar_revisions.get(row.id.as_str()).cloned();
+                member_summary(row, avatar_revision)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(MemberListResponse {
+            members,
+            next_cursor: page
+                .next_cursor
+                .as_ref()
+                .map(|cursor| codec.encode(cursor, scope.as_str())),
+        })
     }
 
     pub(crate) async fn avatar_snapshot(
@@ -599,19 +600,25 @@ impl MemberService {
         target_principal_id: &PrincipalId,
         expected_revision: Option<&str>,
     ) -> Result<MemberAvatarSnapshot, MemberServiceError> {
+        let expected_content_hash = expected_revision
+            .map(|revision| {
+                hex::decode(revision)
+                    .map_err(|_| MemberServiceError::Authorization(missing_resource()))
+            })
+            .transpose()?;
+        let gate = AuthorizationService::new().authorize_action(
+            principal.kind,
+            principal.role_key.as_ref(),
+            ResourceAction::MemberAvatarRead,
+        );
         let database = self.store.database_connection();
         let transaction = database
-            .begin()
+            .begin_read()
             .await
             .context("failed to begin Member avatar snapshot transaction")
             .map_err(MemberServiceError::Unavailable)?;
         let result = async {
             ensure_current_actor(&transaction, principal).await?;
-            let gate = AuthorizationService::new().authorize_action(
-                principal.kind,
-                principal.role_key.as_ref(),
-                ResourceAction::MemberAvatarRead,
-            );
             match AuthorizationResolver::new(self.store.clone())
                 .authorize_member_avatar(&transaction, principal, &gate, target_principal_id)
                 .await
@@ -622,14 +629,12 @@ impl MemberService {
                     return Err(MemberServiceError::Authorization(decision));
                 }
             }
-            let avatar = match expected_revision {
-                Some(expected_revision) => {
-                    let content_hash = hex::decode(expected_revision)
-                        .map_err(|_| MemberServiceError::Authorization(missing_resource()))?;
+            let avatar = match expected_content_hash.as_deref() {
+                Some(content_hash) => {
                     pioneer_crud::load_principal_avatar_revision(
                         &transaction,
                         target_principal_id,
-                        content_hash.as_slice(),
+                        content_hash,
                     )
                     .await?
                 }
@@ -638,48 +643,49 @@ impl MemberService {
                 }
             }
             .ok_or_else(|| MemberServiceError::Authorization(missing_resource()))?;
-            if avatar.content.is_empty()
-                || avatar.content.len() > PROFILE_AVATAR_MAX_DECODED_BYTES
-                || avatar.width <= 0
-                || avatar.height <= 0
-                || avatar.width > i64::from(PROFILE_AVATAR_MAX_DIMENSION)
-                || avatar.height > i64::from(PROFILE_AVATAR_MAX_DIMENSION)
-                || avatar.content_hash.len() != 32
-            {
-                return Err(MemberServiceError::Unavailable(Error::msg(
-                    "persisted principal avatar violates bounded contract",
-                )));
-            }
-            let media_type = match avatar.media_type.as_str() {
-                "image/png" => ProfileAvatarMediaType::Png,
-                "image/jpeg" => ProfileAvatarMediaType::Jpeg,
-                "image/webp" => ProfileAvatarMediaType::Webp,
-                _ => {
-                    return Err(MemberServiceError::Unavailable(Error::msg(
-                        "persisted principal avatar media type is invalid",
-                    )));
-                }
-            };
-            let actual_content_hash: [u8; 32] = sha2::Sha256::digest(&avatar.content).into();
-            if avatar.content_hash.as_slice() != actual_content_hash {
-                return Err(MemberServiceError::Unavailable(Error::msg(
-                    "persisted principal avatar content hash is invalid",
-                )));
-            }
-            if detect_mime_from_bytes(avatar.content.as_slice(), None) != media_type.as_str() {
-                return Err(MemberServiceError::Unavailable(Error::msg(
-                    "persisted principal avatar media type does not match its content",
-                )));
-            }
-            let revision = hex::encode(avatar.content_hash);
-            Ok::<_, MemberServiceError>(MemberAvatarSnapshot::new(
-                media_type,
-                revision,
-                avatar.content,
-            ))
+            Ok::<_, MemberServiceError>(avatar)
         }
         .await;
-        finish_read_transaction(transaction, result).await
+        let avatar = finish_read_transaction(transaction, result).await?;
+        if avatar.content.is_empty()
+            || avatar.content.len() > PROFILE_AVATAR_MAX_DECODED_BYTES
+            || avatar.width <= 0
+            || avatar.height <= 0
+            || avatar.width > i64::from(PROFILE_AVATAR_MAX_DIMENSION)
+            || avatar.height > i64::from(PROFILE_AVATAR_MAX_DIMENSION)
+            || avatar.content_hash.len() != 32
+        {
+            return Err(MemberServiceError::Unavailable(Error::msg(
+                "persisted principal avatar violates bounded contract",
+            )));
+        }
+        let media_type = match avatar.media_type.as_str() {
+            "image/png" => ProfileAvatarMediaType::Png,
+            "image/jpeg" => ProfileAvatarMediaType::Jpeg,
+            "image/webp" => ProfileAvatarMediaType::Webp,
+            _ => {
+                return Err(MemberServiceError::Unavailable(Error::msg(
+                    "persisted principal avatar media type is invalid",
+                )));
+            }
+        };
+        let actual_content_hash: [u8; 32] = sha2::Sha256::digest(&avatar.content).into();
+        if avatar.content_hash.as_slice() != actual_content_hash {
+            return Err(MemberServiceError::Unavailable(Error::msg(
+                "persisted principal avatar content hash is invalid",
+            )));
+        }
+        if detect_mime_from_bytes(avatar.content.as_slice(), None) != media_type.as_str() {
+            return Err(MemberServiceError::Unavailable(Error::msg(
+                "persisted principal avatar media type does not match its content",
+            )));
+        }
+        let revision = hex::encode(avatar.content_hash);
+        Ok(MemberAvatarSnapshot::new(
+            media_type,
+            revision,
+            avatar.content,
+        ))
     }
 
     pub(crate) async fn workspace_list(
@@ -714,7 +720,7 @@ impl MemberService {
             .map_err(|_| MemberServiceError::InvalidParams)?;
         let database = self.store.database_connection();
         let transaction = database
-            .begin()
+            .begin_read()
             .await
             .context("failed to begin workspace member list transaction")
             .map_err(MemberServiceError::Unavailable)?;
@@ -740,30 +746,31 @@ impl MemberService {
                 .map(|row| row.id.clone())
                 .collect::<Vec<_>>();
             let avatar_revisions =
-                pioneer_crud::list_principal_avatar_revisions(&transaction, &principal_ids)
-                    .await?
-                    .into_iter()
-                    .map(|avatar| (avatar.principal_id, hex::encode(avatar.content_hash)))
-                    .collect::<HashMap<_, _>>();
-            let members = page
-                .principals
-                .into_iter()
-                .map(|row| {
-                    let avatar_revision = avatar_revisions.get(row.id.as_str()).cloned();
-                    member_summary(row, avatar_revision)
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            Ok::<_, MemberServiceError>(WorkspaceMemberListResponse {
-                workspace_id: params.workspace_id,
-                members,
-                next_cursor: page
-                    .next_cursor
-                    .as_ref()
-                    .map(|cursor| codec.encode(cursor, scope.as_str())),
-            })
+                pioneer_crud::list_principal_avatar_revisions(&transaction, &principal_ids).await?;
+            Ok::<_, MemberServiceError>((page, avatar_revisions))
         }
         .await;
-        finish_read_transaction(transaction, result).await
+        let (page, avatar_revisions) = finish_read_transaction(transaction, result).await?;
+        let avatar_revisions = avatar_revisions
+            .into_iter()
+            .map(|avatar| (avatar.principal_id, hex::encode(avatar.content_hash)))
+            .collect::<HashMap<_, _>>();
+        let members = page
+            .principals
+            .into_iter()
+            .map(|row| {
+                let avatar_revision = avatar_revisions.get(row.id.as_str()).cloned();
+                member_summary(row, avatar_revision)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(WorkspaceMemberListResponse {
+            workspace_id: params.workspace_id,
+            members,
+            next_cursor: page
+                .next_cursor
+                .as_ref()
+                .map(|cursor| codec.encode(cursor, scope.as_str())),
+        })
     }
 
     pub(crate) async fn workspace_add(
@@ -984,8 +991,8 @@ impl From<Error> for MemberServiceError {
     }
 }
 
-async fn ensure_current_actor(
-    transaction: &DatabaseTransaction,
+async fn ensure_current_actor<C: ConnectionTrait>(
+    transaction: &C,
     principal: &AuthenticatedSessionPrincipal,
 ) -> Result<(), MemberServiceError> {
     if persisted_actor_is_current(transaction, principal).await? {
@@ -1042,8 +1049,8 @@ async fn load_lifecycle_target(
     Ok(target)
 }
 
-async fn principal_has_active_workspace(
-    transaction: &DatabaseTransaction,
+async fn principal_has_active_workspace<C: ConnectionTrait>(
+    transaction: &C,
     principal: &AuthenticatedSessionPrincipal,
     workspace_id: &WorkspaceId,
 ) -> Result<bool, Error> {

@@ -36,7 +36,6 @@ use pioneer_protocol::{
     VoiceSessionFinalizeParams, VoiceSessionStartParams, VoiceStatusParams,
     WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberRemoveParams,
 };
-use sea_orm::TransactionTrait as _;
 use tracing::Instrument as _;
 
 use crate::authorization::{
@@ -7399,27 +7398,25 @@ impl MessageProcessor {
         });
         let changes =
             settings.apply_protocol_update_for_workspace(update, workspace_id.as_deref())?;
-        let cli_identity_transaction = if changes.cli_runtimes {
+        let cli_identity_instances = if changes.cli_runtimes {
             let effective_gateway = settings.apply_to_gateway_config(config.gateway.clone());
             let identity_settings = settings.effective_cli_runtime_settings(&config.gateway);
-            let instances = crate::identity::catalog::from_effective_settings(
+            Some(crate::identity::catalog::from_effective_settings(
                 effective_gateway.effective_cli_agent_runtime_instances(),
                 &identity_settings,
-            )?;
-            let transaction = self
-                .crud_store
-                .database_connection()
-                .begin()
-                .await
-                .context("failed to begin atomic CLI identity settings projection")?;
-            pioneer_crud::sync_cli_runtime_identity_catalog(
-                &transaction,
-                instances.as_slice(),
-                chrono::Utc::now().fixed_offset(),
-            )
-            .await
-            .context("failed to project CLI runtime identity settings")?;
-            Some(transaction)
+            )?)
+        } else {
+            None
+        };
+        let previous_cli_identity_instances = if changes.cli_runtimes {
+            let effective_gateway =
+                previous_settings.apply_to_gateway_config(config.gateway.clone());
+            let identity_settings =
+                previous_settings.effective_cli_runtime_settings(&config.gateway);
+            Some(crate::identity::catalog::from_effective_settings(
+                effective_gateway.effective_cli_agent_runtime_instances(),
+                &identity_settings,
+            )?)
         } else {
             None
         };
@@ -7469,12 +7466,43 @@ impl MessageProcessor {
             }
             return Err(error);
         }
-        if let Some(transaction) = cli_identity_transaction
-            && let Err(commit_error) = transaction.commit().await
-        {
+        let cli_identity_projection: anyhow::Result<()> = async {
+            let Some(instances) = cli_identity_instances else {
+                return Ok(());
+            };
+            // The catalog is a reconstructible projection of the settings
+            // file. Let every SQL statement obtain its own writer quantum;
+            // wrapping all workspaces in one transaction would make settings
+            // updates monopolize the writer for an unbounded duration.
+            pioneer_crud::sync_cli_runtime_identity_catalog(
+                &self.crud_store.database_connection(),
+                instances.as_slice(),
+                chrono::Utc::now().fixed_offset(),
+            )
+            .await
+            .context("failed to project CLI runtime identity settings")?;
+            Ok(())
+        }
+        .await;
+        if let Err(commit_error) = cli_identity_projection {
             let restore_error =
                 crate::settings::save_gateway_settings(settings_path.as_path(), &previous_settings)
                     .err();
+            let projection_restore_error = if restore_error.is_none() {
+                match previous_cli_identity_instances {
+                    Some(instances) => pioneer_crud::sync_cli_runtime_identity_catalog(
+                        &self.crud_store.database_connection(),
+                        instances.as_slice(),
+                        chrono::Utc::now().fixed_offset(),
+                    )
+                    .await
+                    .context("failed to restore previous CLI identity projection")
+                    .err(),
+                    None => None,
+                }
+            } else {
+                None
+            };
             if changes.general.keepawake.is_some()
                 && let Err(rollback_error) =
                     self.apply_keepawake_setting(previous_general_settings.keepawake)
@@ -7484,12 +7512,15 @@ impl MessageProcessor {
                     "failed to roll back keepawake setting after CLI identity commit failure"
                 );
             }
-            return match restore_error {
-                Some(restore_error) => Err(anyhow::anyhow!(
-                    "failed to commit CLI identity settings projection: {commit_error}; failed to restore settings file: {restore_error}"
+            return match (restore_error, projection_restore_error) {
+                (Some(restore_error), _) => Err(anyhow::anyhow!(
+                    "failed to apply CLI identity settings projection: {commit_error}; failed to restore settings file: {restore_error}"
                 )),
-                None => Err(commit_error).context(
-                    "failed to commit CLI identity settings projection; settings file restored",
+                (None, Some(projection_restore_error)) => Err(anyhow::anyhow!(
+                    "failed to apply CLI identity settings projection: {commit_error}; settings file was restored, but the previous identity projection could not be restored: {projection_restore_error}"
+                )),
+                (None, None) => Err(commit_error).context(
+                    "failed to apply CLI identity settings projection; settings file restored",
                 ),
             };
         }

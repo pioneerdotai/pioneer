@@ -8,34 +8,49 @@ use crate::convention::DB_ID_LEN;
 use crate::memory::{NewAgentMemoryEvent, actor_id_to_db, actor_kind_to_db};
 use crate::util::unix_to_datetime;
 
-pub async fn append_memory_event<C: ConnectionTrait>(
-    db: &C,
-    event: NewAgentMemoryEvent,
-) -> Result<agent_memory_event::Model> {
-    let id = pioneer_protocol::generate_id(DB_ID_LEN);
-    agent_memory_event::Entity::insert(agent_memory_event::ActiveModel {
-        id: Set(id.clone()),
-        memory_id: Set(event.memory_id),
-        candidate_id: Set(event.candidate_id),
-        workspace_id: Set(event.workspace_id),
-        event_kind: Set(event.event_kind.clone()),
-        actor_kind: Set(actor_kind_to_db(&event.actor)),
-        actor_id: Set(actor_id_to_db(&event.actor)),
-        thread_id: Set(event.thread_id),
-        turn_id: Set(event.turn_id),
-        item_id: Set(event.item_id),
-        details_json: Set(event.details_json),
-        created_at: Set(unix_to_datetime(event.created_at_unix)),
-    })
-    .exec(db)
-    .await
-    .with_context(|| format!("failed to append memory event `{}`", event.event_kind))?;
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedAgentMemoryEvent {
+    event_kind: String,
+    row: agent_memory_event::ActiveModel,
+}
 
-    agent_memory_event::Entity::find_by_id(id)
-        .one(db)
+pub(crate) fn prepare_memory_event(event: NewAgentMemoryEvent) -> PreparedAgentMemoryEvent {
+    prepare_memory_event_with_id(pioneer_protocol::generate_id(DB_ID_LEN), event)
+}
+
+pub(crate) fn prepare_memory_event_with_id(
+    id: String,
+    event: NewAgentMemoryEvent,
+) -> PreparedAgentMemoryEvent {
+    let event_kind = event.event_kind.clone();
+    PreparedAgentMemoryEvent {
+        event_kind,
+        row: agent_memory_event::ActiveModel {
+            id: Set(id),
+            memory_id: Set(event.memory_id),
+            candidate_id: Set(event.candidate_id),
+            workspace_id: Set(event.workspace_id),
+            event_kind: Set(event.event_kind),
+            actor_kind: Set(actor_kind_to_db(&event.actor)),
+            actor_id: Set(actor_id_to_db(&event.actor)),
+            thread_id: Set(event.thread_id),
+            turn_id: Set(event.turn_id),
+            item_id: Set(event.item_id),
+            details_json: Set(event.details_json),
+            created_at: Set(unix_to_datetime(event.created_at_unix)),
+        },
+    }
+}
+
+pub(crate) async fn append_prepared_memory_event<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedAgentMemoryEvent,
+) -> Result<()> {
+    agent_memory_event::Entity::insert(prepared.row)
+        .exec(db)
         .await
-        .context("failed to reload appended memory event")?
-        .context("appended memory event row missing")
+        .with_context(|| format!("failed to append memory event `{}`", prepared.event_kind))?;
+    Ok(())
 }
 
 pub async fn list_memory_events<C: ConnectionTrait>(

@@ -39,9 +39,61 @@ pub(super) struct NewAgentSkillVersion {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct PreparedAgentSkillVersion {
+    pub id: String,
+    pub skill_id: SkillId,
+    pub version_number: i64,
+    pub source_run_id: Option<String>,
+    pub parent_version_id: Option<String>,
+    pub candidate_key: String,
+    pub display_name: String,
+    pub skill_markdown: String,
+    pub instruction_body: String,
+    pub when_to_use: String,
+    pub when_not_to_use: String,
+    pub fingerprint: String,
+    source_turn_ids_json: String,
+}
+
+impl PreparedAgentSkillVersion {
+    pub(super) fn source_turn_ids_json(&self) -> &str {
+        self.source_turn_ids_json.as_str()
+    }
+}
+
+pub(super) fn prepare_agent_skill_version(
+    input: NewAgentSkillVersion,
+) -> Result<PreparedAgentSkillVersion> {
+    validate_version(&input)?;
+    let source_turn_ids_json = serde_json::to_string(&input.source_turn_ids)
+        .context("failed to encode Agent skill source turn IDs")?;
+    if source_turn_ids_json.len() > SOURCE_TURN_IDS_JSON_MAX_BYTES {
+        bail!(
+            "Agent skill source_turn_ids_json exceeds its {}-byte persistence limit",
+            SOURCE_TURN_IDS_JSON_MAX_BYTES
+        );
+    }
+    Ok(PreparedAgentSkillVersion {
+        id: input.id,
+        skill_id: input.skill_id,
+        version_number: input.version_number,
+        source_run_id: input.source_run_id,
+        parent_version_id: input.parent_version_id,
+        candidate_key: input.candidate_key,
+        display_name: input.display_name,
+        skill_markdown: input.skill_markdown,
+        instruction_body: input.instruction_body,
+        when_to_use: input.when_to_use,
+        when_not_to_use: input.when_not_to_use,
+        fingerprint: input.fingerprint,
+        source_turn_ids_json,
+    })
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct CreateAgentSkillMutation {
     pub skill: NewAgentSkill,
-    pub version: NewAgentSkillVersion,
+    pub version: PreparedAgentSkillVersion,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +102,7 @@ pub(super) struct UpdateAgentSkillMutation {
     pub skill_id: SkillId,
     pub expected_active_version_id: String,
     pub expected_slug: String,
-    pub version: NewAgentSkillVersion,
+    pub version: PreparedAgentSkillVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,19 +523,9 @@ async fn insert_logical_skill<C: ConnectionTrait>(
 
 async fn insert_immutable_version<C: ConnectionTrait>(
     db: &C,
-    input: NewAgentSkillVersion,
+    input: PreparedAgentSkillVersion,
     now: DateTimeWithTimeZone,
 ) -> Result<()> {
-    validate_version(&input)?;
-    let source_turn_ids_json = serde_json::to_string(&input.source_turn_ids)
-        .context("failed to encode Agent skill source turn IDs")?;
-    if source_turn_ids_json.len() > SOURCE_TURN_IDS_JSON_MAX_BYTES {
-        bail!(
-            "Agent skill source_turn_ids_json exceeds its {}-byte persistence limit",
-            SOURCE_TURN_IDS_JSON_MAX_BYTES
-        );
-    }
-
     agent_skill_version::ActiveModel {
         id: Set(input.id.clone()),
         skill_id: Set(input.skill_id.as_str().to_owned()),
@@ -497,7 +539,7 @@ async fn insert_immutable_version<C: ConnectionTrait>(
         when_to_use: Set(input.when_to_use),
         when_not_to_use: Set(input.when_not_to_use),
         fingerprint: Set(input.fingerprint),
-        source_turn_ids_json: Set(source_turn_ids_json),
+        source_turn_ids_json: Set(input.source_turn_ids_json),
         created_at: Set(now),
     }
     .insert(db)
@@ -726,8 +768,8 @@ mod tests {
         source_run_id: Option<&str>,
         candidate_key: &str,
         fingerprint: &str,
-    ) -> NewAgentSkillVersion {
-        NewAgentSkillVersion {
+    ) -> PreparedAgentSkillVersion {
+        prepare_agent_skill_version(NewAgentSkillVersion {
             id: id.to_owned(),
             skill_id: skill(skill_id),
             version_number,
@@ -743,7 +785,8 @@ mod tests {
             when_not_to_use: "Do not use outside the tested procedure.".to_owned(),
             fingerprint: fingerprint.to_owned(),
             source_turn_ids: vec!["turn-source-one".to_owned(), "turn-source-two".to_owned()],
-        }
+        })
+        .expect("fixture Agent skill version must prepare")
     }
 
     #[tokio::test]

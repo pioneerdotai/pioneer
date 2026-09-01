@@ -49,6 +49,98 @@ pub struct NativeTerminalEffectStats {
     pub unresolved: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedNativeTerminalEffectPreparation {
+    preparation: NativeTerminalEffectPreparation,
+    runtime_generation: i64,
+    effects: Vec<PreparedNativeTerminalEffect>,
+    compacted_payload_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedNativeTerminalEffect {
+    payload_json: String,
+    payload_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedNativeTerminalEffectActivation {
+    turn_id: String,
+    rows: Vec<PreparedNativeTerminalEffectActivationRow>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedNativeTerminalEffectActivationRow {
+    effect_id: String,
+    thread_id: String,
+    effect_kind: String,
+    gate_kind: String,
+    payload_sha256: String,
+    payload_identity_sha256: String,
+    updated_at: DateTimeWithTimeZone,
+    candidate_state: Option<CandidateGateState>,
+    status: &'static str,
+    candidate_id: Option<String>,
+    run_on_commit: bool,
+    complete_on_commit: bool,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    compact_payload: bool,
+    compacted_payload_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedCandidateGateResolution {
+    candidate_id: String,
+    thread_id: String,
+    turn_id: String,
+    resolved_at: DateTimeWithTimeZone,
+    requires_fence: bool,
+    rows: Vec<PreparedCandidateGateResolutionRow>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedCandidateGateResolutionRow {
+    effect_id: String,
+    status_before: String,
+    updated_at_before: DateTimeWithTimeZone,
+    payload_sha256_before: String,
+    payload_identity_sha256_before: String,
+    terminal_committed_at_before: Option<DateTimeWithTimeZone>,
+    status_after: &'static str,
+    accepted_candidate_id: Option<String>,
+    next_run_at: Option<DateTimeWithTimeZone>,
+    completed_at: Option<DateTimeWithTimeZone>,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
+    compact_payload: bool,
+    compacted_payload_sha256: Option<String>,
+}
+
+pub fn prepare_input(
+    preparation: NativeTerminalEffectPreparation,
+) -> Result<PreparedNativeTerminalEffectPreparation> {
+    validate_preparation(&preparation)?;
+    let runtime_generation = i64::try_from(preparation.runtime_generation)
+        .context("terminal-effect runtime generation exceeds database range")?;
+    let mut effects = Vec::with_capacity(preparation.effects.len());
+    for effect in &preparation.effects {
+        let payload_json = serde_json::to_string(&effect.payload)
+            .context("failed to serialize native terminal-effect payload")?;
+        let payload_sha256 = payload_sha256_hex(payload_json.as_str());
+        effects.push(PreparedNativeTerminalEffect {
+            payload_json,
+            payload_sha256,
+        });
+    }
+    Ok(PreparedNativeTerminalEffectPreparation {
+        preparation,
+        runtime_generation,
+        effects,
+        compacted_payload_sha256: payload_sha256_hex(COMPACTED_PAYLOAD_JSON),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CandidateGateState {
     Waiting,
@@ -58,10 +150,10 @@ enum CandidateGateState {
 
 pub async fn prepare<C: ConnectionTrait>(
     db: &C,
-    preparation: &NativeTerminalEffectPreparation,
+    prepared: PreparedNativeTerminalEffectPreparation,
     now: DateTimeWithTimeZone,
 ) -> Result<()> {
-    prepare_with_policy(db, preparation, now, true).await
+    prepare_with_policy(db, prepared, now, true).await
 }
 
 /// Merge a recovery-owned obligation without superseding a hook/cleanup plan
@@ -69,10 +161,15 @@ pub async fn prepare<C: ConnectionTrait>(
 /// recovery terminalization transaction.
 pub async fn prepare_supplemental<C: ConnectionTrait>(
     db: &C,
-    preparation: &NativeTerminalEffectPreparation,
+    prepared: PreparedNativeTerminalEffectPreparation,
     now: DateTimeWithTimeZone,
 ) -> Result<()> {
-    validate_preparation(preparation)?;
+    let PreparedNativeTerminalEffectPreparation {
+        preparation,
+        runtime_generation,
+        effects,
+        compacted_payload_sha256,
+    } = prepared;
     if preparation.effects.iter().any(|effect| {
         effect.gate != NativeTerminalEffectGate::TerminalCommit
             || effect.effect_kind != NativeTerminalEffectKind::AttachedTaskCleanup
@@ -91,7 +188,18 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
             )
         })?;
     if turn_row.status == "in_progress" {
-        return prepare_with_policy(db, preparation, now, false).await;
+        return prepare_with_policy(
+            db,
+            PreparedNativeTerminalEffectPreparation {
+                preparation,
+                runtime_generation,
+                effects,
+                compacted_payload_sha256,
+            },
+            now,
+            false,
+        )
+        .await;
     }
     if turn_row.thread_id != preparation.thread_id {
         bail!("supplemental terminal-effect preparation has a mismatched thread scope");
@@ -116,17 +224,16 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
     // transaction acts as the terminal fence and inserts (or repairs) the
     // missing obligation directly in `ready`. A previously committed row is
     // immutable authority and is never rewritten.
-    for effect in &preparation.effects {
-        let payload_json = serde_json::to_string(&effect.payload)
-            .context("failed to serialize supplemental terminal-effect payload")?;
-        let payload_sha256 = payload_sha256_hex(payload_json.as_str());
+    for (effect, prepared_effect) in preparation.effects.iter().zip(effects) {
+        let payload_json = prepared_effect.payload_json;
+        let payload_sha256 = prepared_effect.payload_sha256;
         if let Some(existing) =
             native_terminal_effect_outbox::Entity::find_by_id(effect.effect_id.clone())
                 .one(db)
                 .await
                 .context("failed to query supplemental native terminal effect")?
         {
-            validate_existing_identity(&existing, preparation, effect)?;
+            validate_existing_identity(&existing, &preparation, effect)?;
             if existing.terminal_committed_at.is_some() {
                 if existing.gate_kind != gate_to_db(NativeTerminalEffectGate::TerminalCommit) {
                     bail!(
@@ -154,8 +261,7 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
             }
             let mut active = existing.into_active_model();
             active.batch_id = Set(preparation.batch_id.clone());
-            active.runtime_generation = Set(i64::try_from(preparation.runtime_generation)
-                .context("supplemental runtime generation exceeds database range")?);
+            active.runtime_generation = Set(runtime_generation);
             active.gate_kind = Set(gate_to_db(effect.gate).to_owned());
             active.payload_json = Set(payload_json);
             active.payload_sha256 = Set(payload_sha256.clone());
@@ -186,8 +292,7 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
                 workspace_id: Set(preparation.workspace_id.clone()),
                 thread_id: Set(preparation.thread_id.clone()),
                 turn_id: Set(preparation.turn_id.clone()),
-                runtime_generation: Set(i64::try_from(preparation.runtime_generation)
-                    .context("supplemental runtime generation exceeds database range")?),
+                runtime_generation: Set(runtime_generation),
                 effect_kind: Set(kind_to_db(effect.effect_kind).to_owned()),
                 gate_kind: Set(gate_to_db(effect.gate).to_owned()),
                 payload_json: Set(payload_json),
@@ -220,11 +325,16 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
 
 async fn prepare_with_policy<C: ConnectionTrait>(
     db: &C,
-    preparation: &NativeTerminalEffectPreparation,
+    prepared: PreparedNativeTerminalEffectPreparation,
     now: DateTimeWithTimeZone,
     supersede_omitted_effects: bool,
 ) -> Result<()> {
-    validate_preparation(preparation)?;
+    let PreparedNativeTerminalEffectPreparation {
+        preparation,
+        runtime_generation,
+        effects,
+        compacted_payload_sha256,
+    } = prepared;
 
     let turn_row = turn::Entity::find_by_id(preparation.turn_id.clone())
         .one(db)
@@ -255,7 +365,6 @@ async fn prepare_with_policy<C: ConnectionTrait>(
 
     let terminal = turn_row.status != "in_progress";
     if !terminal && supersede_omitted_effects {
-        let compacted_payload_sha256 = payload_sha256_hex(COMPACTED_PAYLOAD_JSON);
         native_terminal_effect_outbox::Entity::update_many()
             .col_expr(
                 native_terminal_effect_outbox::Column::Status,
@@ -293,10 +402,9 @@ async fn prepare_with_policy<C: ConnectionTrait>(
             .context("failed to supersede prior terminal-effect preparation")?;
     }
 
-    for effect in &preparation.effects {
-        let payload_json = serde_json::to_string(&effect.payload)
-            .context("failed to serialize native terminal-effect payload")?;
-        let payload_sha256 = payload_sha256_hex(payload_json.as_str());
+    for (effect, prepared_effect) in preparation.effects.iter().zip(effects) {
+        let payload_json = prepared_effect.payload_json;
+        let payload_sha256 = prepared_effect.payload_sha256;
 
         if let Some(existing) =
             native_terminal_effect_outbox::Entity::find_by_id(effect.effect_id.clone())
@@ -304,7 +412,7 @@ async fn prepare_with_policy<C: ConnectionTrait>(
                 .await
                 .context("failed to query existing native terminal effect")?
         {
-            validate_existing_identity(&existing, preparation, effect)?;
+            validate_existing_identity(&existing, &preparation, effect)?;
             if terminal {
                 if existing.terminal_committed_at.is_none() {
                     bail!(
@@ -346,8 +454,7 @@ async fn prepare_with_policy<C: ConnectionTrait>(
                 };
             let mut active = existing.into_active_model();
             active.batch_id = Set(preparation.batch_id.clone());
-            active.runtime_generation = Set(i64::try_from(preparation.runtime_generation)
-                .context("terminal-effect runtime generation exceeds database range")?);
+            active.runtime_generation = Set(runtime_generation);
             active.gate_kind = Set(gate_to_db(effect.gate).to_owned());
             active.payload_json = Set(payload_json);
             active.payload_sha256 = Set(payload_sha256.clone());
@@ -399,8 +506,7 @@ async fn prepare_with_policy<C: ConnectionTrait>(
                 workspace_id: Set(preparation.workspace_id.clone()),
                 thread_id: Set(preparation.thread_id.clone()),
                 turn_id: Set(preparation.turn_id.clone()),
-                runtime_generation: Set(i64::try_from(preparation.runtime_generation)
-                    .context("terminal-effect runtime generation exceeds database range")?),
+                runtime_generation: Set(runtime_generation),
                 effect_kind: Set(kind_to_db(effect.effect_kind).to_owned()),
                 gate_kind: Set(gate_to_db(effect.gate).to_owned()),
                 payload_json: Set(payload_json),
@@ -431,21 +537,28 @@ async fn prepare_with_policy<C: ConnectionTrait>(
     Ok(())
 }
 
-/// Called inside the canonical terminal projection transaction. Side effects
-/// therefore cannot become runnable unless the terminal Turn commit succeeds.
-pub async fn activate_for_terminal<C: ConnectionTrait>(
+/// Prepares payload validation, hashing, decoding, and error formatting before
+/// the canonical terminal projection obtains writer admission.
+pub(crate) async fn prepare_activation_for_terminal<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
-    committed_at: DateTimeWithTimeZone,
-) -> Result<u64> {
+) -> Result<PreparedNativeTerminalEffectActivation> {
     let rows = native_terminal_effect_outbox::Entity::find()
         .filter(native_terminal_effect_outbox::Column::TurnId.eq(turn_id.to_owned()))
         .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_PREPARED))
         .filter(native_terminal_effect_outbox::Column::TerminalCommittedAt.is_null())
+        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
+        .limit((MAX_EFFECTS_PER_TURN + 1) as u64)
         .all(db)
         .await
         .context("failed to load prepared native terminal effects")?;
-    let mut activated = 0_u64;
+    if rows.len() > MAX_EFFECTS_PER_TURN {
+        bail!(
+            "Turn `{turn_id}` has more than {MAX_EFFECTS_PER_TURN} prepared native terminal effects"
+        );
+    }
+
+    let mut prepared_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let decoded = if row.payload_json.len() <= MAX_EFFECT_PAYLOAD_BYTES
             && payload_integrity_matches(
@@ -457,13 +570,20 @@ pub async fn activate_for_terminal<C: ConnectionTrait>(
         } else {
             None
         };
-        let (status, candidate_id, next_run_at, completed_at, error_code, error_message) =
+        let gate = gate_from_db(row.gate_kind.as_str());
+        let candidate_state = match gate.as_ref() {
+            Ok(NativeTerminalEffectGate::AcceptedTaskResult) => {
+                Some(candidate_gate_state(db, row.thread_id.as_str(), turn_id).await?)
+            }
+            _ => None,
+        };
+        let (status, candidate_id, run_on_commit, complete_on_commit, error_code, error_message) =
             match decoded {
                 Some(payload) if !payload_matches_db_kind(row.effect_kind.as_str(), &payload) => (
                     STATUS_UNRESOLVED,
                     None,
-                    None,
-                    Some(committed_at),
+                    false,
+                    true,
                     Some("invalid_persisted_kind".to_owned()),
                     Some(
                         "persisted native terminal-effect kind does not match its payload"
@@ -471,62 +591,61 @@ pub async fn activate_for_terminal<C: ConnectionTrait>(
                     ),
                 ),
                 Some(NativeTerminalEffectPayload::PostTurnHookPreparationFailed { failure }) => {
-                    match gate_from_db(row.gate_kind.as_str()) {
+                    match gate.as_ref() {
                         Ok(NativeTerminalEffectGate::TerminalCommit) => (
                             STATUS_UNRESOLVED,
                             None,
-                            None,
-                            Some(committed_at),
+                            false,
+                            true,
                             Some("terminal_effect_preparation_failed".to_owned()),
                             Some(format!("post-turn hook preparation failed: {failure:?}")),
                         ),
                         Ok(NativeTerminalEffectGate::AcceptedTaskResult) => {
-                            match candidate_gate_state(db, row.thread_id.as_str(), turn_id).await? {
+                            match candidate_state
+                                .as_ref()
+                                .expect("accepted-result gate has a prepared candidate state")
+                            {
                                 CandidateGateState::Accepted(candidate_id) => (
                                     STATUS_UNRESOLVED,
-                                    Some(candidate_id),
-                                    None,
-                                    Some(committed_at),
+                                    Some(candidate_id.clone()),
+                                    false,
+                                    true,
                                     Some("terminal_effect_preparation_failed".to_owned()),
                                     Some(format!("post-turn hook preparation failed: {failure:?}")),
                                 ),
                                 CandidateGateState::Rejected => {
-                                    (STATUS_DISCARDED, None, None, Some(committed_at), None, None)
+                                    (STATUS_DISCARDED, None, false, true, None, None)
                                 }
                                 CandidateGateState::Waiting => {
-                                    (STATUS_WAITING_ACCEPTANCE, None, None, None, None, None)
+                                    (STATUS_WAITING_ACCEPTANCE, None, false, false, None, None)
                                 }
                             }
                         }
                         Err(_) => (
                             STATUS_UNRESOLVED,
                             None,
-                            None,
-                            Some(committed_at),
+                            false,
+                            true,
                             Some("invalid_persisted_gate".to_owned()),
                             Some("persisted native terminal-effect gate is invalid".to_owned()),
                         ),
                     }
                 }
-                Some(_) => match gate_from_db(row.gate_kind.as_str()) {
+                Some(_) => match gate.as_ref() {
                     Ok(gate) => {
-                        // Terminal-commit gated work has no dependency on the
-                        // task-result candidate projection. Do not let an
-                        // unrelated candidate read failure abort the canonical
-                        // terminal transaction for cleanup-only effects.
                         let candidate = match gate {
                             NativeTerminalEffectGate::TerminalCommit => CandidateGateState::Waiting,
-                            NativeTerminalEffectGate::AcceptedTaskResult => {
-                                candidate_gate_state(db, row.thread_id.as_str(), turn_id).await?
-                            }
+                            NativeTerminalEffectGate::AcceptedTaskResult => candidate_state
+                                .clone()
+                                .expect("accepted-result gate has a prepared candidate state"),
                         };
-                        let (status, candidate_id, next_run_at) =
-                            activated_state(gate, candidate, committed_at);
+                        let (status, candidate_id, run_on_commit) =
+                            prepared_activated_state(*gate, candidate);
                         (
                             status,
                             candidate_id,
-                            next_run_at,
-                            (status == STATUS_DISCARDED).then_some(committed_at),
+                            run_on_commit,
+                            status == STATUS_DISCARDED,
                             None,
                             None,
                         )
@@ -534,8 +653,8 @@ pub async fn activate_for_terminal<C: ConnectionTrait>(
                     Err(_) => (
                         STATUS_UNRESOLVED,
                         None,
-                        None,
-                        Some(committed_at),
+                        false,
+                        true,
                         Some("invalid_persisted_gate".to_owned()),
                         Some("persisted native terminal-effect gate is invalid".to_owned()),
                     ),
@@ -543,8 +662,8 @@ pub async fn activate_for_terminal<C: ConnectionTrait>(
                 None => (
                     STATUS_UNRESOLVED,
                     None,
-                    None,
-                    Some(committed_at),
+                    false,
+                    true,
                     Some("invalid_persisted_payload".to_owned()),
                     Some(
                         "persisted native terminal-effect payload failed integrity validation"
@@ -552,22 +671,87 @@ pub async fn activate_for_terminal<C: ConnectionTrait>(
                     ),
                 ),
             };
-        let (payload_json, payload_sha256) = if status == STATUS_DISCARDED {
-            (
-                COMPACTED_PAYLOAD_JSON.to_owned(),
-                payload_sha256_hex(COMPACTED_PAYLOAD_JSON),
-            )
-        } else {
-            (row.payload_json.clone(), row.payload_sha256.clone())
-        };
-        let updated = native_terminal_effect_outbox::Entity::update_many()
+        let compact_payload = status == STATUS_DISCARDED;
+        prepared_rows.push(PreparedNativeTerminalEffectActivationRow {
+            effect_id: row.effect_id,
+            thread_id: row.thread_id,
+            effect_kind: row.effect_kind,
+            gate_kind: row.gate_kind,
+            payload_sha256: row.payload_sha256,
+            payload_identity_sha256: row.payload_identity_sha256,
+            updated_at: row.updated_at,
+            candidate_state,
+            status,
+            candidate_id,
+            run_on_commit,
+            complete_on_commit,
+            error_code,
+            error_message,
+            compact_payload,
+            compacted_payload_sha256: compact_payload
+                .then(|| payload_sha256_hex(COMPACTED_PAYLOAD_JSON)),
+        });
+    }
+    Ok(PreparedNativeTerminalEffectActivation {
+        turn_id: turn_id.to_owned(),
+        rows: prepared_rows,
+    })
+}
+
+/// Applies a prevalidated plan inside the canonical terminal projection. This
+/// path performs only bounded SQLite work: a small identity fence, an optional
+/// candidate fence, and at most two updates.
+pub(crate) async fn activate_prepared_for_terminal<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedNativeTerminalEffectActivation,
+    committed_at: DateTimeWithTimeZone,
+) -> Result<u64> {
+    let current_effect_ids = native_terminal_effect_outbox::Entity::find()
+        .select_only()
+        .column(native_terminal_effect_outbox::Column::EffectId)
+        .filter(native_terminal_effect_outbox::Column::TurnId.eq(prepared.turn_id.clone()))
+        .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_PREPARED))
+        .filter(native_terminal_effect_outbox::Column::TerminalCommittedAt.is_null())
+        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
+        .limit((MAX_EFFECTS_PER_TURN + 1) as u64)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to fence prepared native terminal effects")?;
+    let prepared_effect_ids = prepared
+        .rows
+        .iter()
+        .map(|row| row.effect_id.clone())
+        .collect::<Vec<_>>();
+    if current_effect_ids.len() > MAX_EFFECTS_PER_TURN || current_effect_ids != prepared_effect_ids
+    {
+        bail!(
+            "prepared native terminal effects changed before terminal projection for Turn `{}`",
+            prepared.turn_id
+        );
+    }
+
+    let mut activated = 0_u64;
+    for row in prepared.rows {
+        if let Some(expected_candidate_state) = row.candidate_state.as_ref() {
+            let current_candidate_state =
+                candidate_gate_state(db, row.thread_id.as_str(), prepared.turn_id.as_str()).await?;
+            if &current_candidate_state != expected_candidate_state {
+                bail!(
+                    "terminal-effect candidate gate changed before terminal projection for Turn `{}`",
+                    prepared.turn_id
+                );
+            }
+        }
+
+        let mut update = native_terminal_effect_outbox::Entity::update_many()
             .col_expr(
                 native_terminal_effect_outbox::Column::Status,
-                Expr::value(status.to_owned()),
+                Expr::value(row.status.to_owned()),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::AcceptedCandidateId,
-                Expr::value(candidate_id),
+                Expr::value(row.candidate_id),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::TerminalCommittedAt,
@@ -575,60 +759,101 @@ pub async fn activate_for_terminal<C: ConnectionTrait>(
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::NextRunAt,
-                Expr::value(next_run_at),
+                Expr::value(row.run_on_commit.then_some(committed_at)),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::CompletedAt,
-                Expr::value(completed_at),
+                Expr::value(row.complete_on_commit.then_some(committed_at)),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::LastErrorCode,
-                Expr::value(error_code),
+                Expr::value(row.error_code),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::LastErrorMessage,
-                Expr::value(error_message),
-            )
-            .col_expr(
-                native_terminal_effect_outbox::Column::PayloadJson,
-                Expr::value(payload_json),
-            )
-            .col_expr(
-                native_terminal_effect_outbox::Column::PayloadSha256,
-                Expr::value(payload_sha256),
+                Expr::value(row.error_message),
             )
             .col_expr(
                 native_terminal_effect_outbox::Column::UpdatedAt,
                 Expr::value(committed_at),
-            )
+            );
+        if row.compact_payload {
+            update = update
+                .col_expr(
+                    native_terminal_effect_outbox::Column::PayloadJson,
+                    Expr::value(COMPACTED_PAYLOAD_JSON.to_owned()),
+                )
+                .col_expr(
+                    native_terminal_effect_outbox::Column::PayloadSha256,
+                    Expr::value(row.compacted_payload_sha256),
+                );
+        }
+        let updated = update
             .filter(native_terminal_effect_outbox::Column::EffectId.eq(row.effect_id))
+            .filter(native_terminal_effect_outbox::Column::TurnId.eq(prepared.turn_id.clone()))
+            .filter(native_terminal_effect_outbox::Column::ThreadId.eq(row.thread_id))
+            .filter(native_terminal_effect_outbox::Column::EffectKind.eq(row.effect_kind))
+            .filter(native_terminal_effect_outbox::Column::GateKind.eq(row.gate_kind))
+            .filter(native_terminal_effect_outbox::Column::PayloadSha256.eq(row.payload_sha256))
+            .filter(
+                native_terminal_effect_outbox::Column::PayloadIdentitySha256
+                    .eq(row.payload_identity_sha256),
+            )
+            .filter(native_terminal_effect_outbox::Column::UpdatedAt.eq(row.updated_at))
             .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_PREPARED))
             .filter(native_terminal_effect_outbox::Column::TerminalCommittedAt.is_null())
             .exec(db)
             .await
-            .context("failed to activate native terminal effect")?
+            .context("failed to activate prepared native terminal effect")?
             .rows_affected;
+        if updated != 1 {
+            bail!(
+                "prepared native terminal effect changed before terminal projection for Turn `{}`",
+                prepared.turn_id
+            );
+        }
         activated = activated.saturating_add(updated);
     }
     Ok(activated)
 }
 
-/// Resolves the acceptance rendezvous in the same transaction which persists
-/// the authoritative task-result candidate state.
-pub async fn resolve_gate_for_candidate<C: ConnectionTrait>(
+fn prepared_activated_state(
+    gate: NativeTerminalEffectGate,
+    candidate: CandidateGateState,
+) -> (&'static str, Option<String>, bool) {
+    match gate {
+        NativeTerminalEffectGate::TerminalCommit => (STATUS_READY, None, true),
+        NativeTerminalEffectGate::AcceptedTaskResult => match candidate {
+            CandidateGateState::Accepted(id) => (STATUS_READY, Some(id), true),
+            CandidateGateState::Rejected => (STATUS_DISCARDED, None, false),
+            CandidateGateState::Waiting => (STATUS_WAITING_ACCEPTANCE, None, false),
+        },
+    }
+}
+
+/// Loads and validates the bounded acceptance-gate write set before an
+/// authoritative candidate transaction obtains writer admission.
+pub(crate) async fn prepare_gate_resolution_for_candidate<C: ConnectionTrait>(
     db: &C,
     candidate_id: &str,
     thread_id: &str,
     turn_id: &str,
     candidate_status: &str,
     now: DateTimeWithTimeZone,
-) -> Result<u64> {
+) -> Result<PreparedCandidateGateResolution> {
     let terminal_status = matches!(
         candidate_status,
         "accepted" | "rejected" | "superseded" | "cancelled"
     );
     if !terminal_status {
-        return Ok(0);
+        return Ok(PreparedCandidateGateResolution {
+            candidate_id: candidate_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            resolved_at: now,
+            requires_fence: false,
+            rows: Vec::new(),
+        });
     }
     let rows = native_terminal_effect_outbox::Entity::find()
         .filter(native_terminal_effect_outbox::Column::ThreadId.eq(thread_id.to_owned()))
@@ -641,10 +866,19 @@ pub async fn resolve_gate_for_candidate<C: ConnectionTrait>(
             native_terminal_effect_outbox::Column::Status
                 .is_in([STATUS_PREPARED, STATUS_WAITING_ACCEPTANCE]),
         )
+        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
+        .limit((MAX_EFFECTS_PER_TURN + 1) as u64)
         .all(db)
         .await
         .context("failed to load candidate-gated terminal effects")?;
-    let mut resolved = 0_u64;
+    if rows.len() > MAX_EFFECTS_PER_TURN {
+        bail!(
+            "Turn `{turn_id}` has more than {MAX_EFFECTS_PER_TURN} candidate-gated native terminal effects"
+        );
+    }
+
+    let compacted_payload_sha256 = payload_sha256_hex(COMPACTED_PAYLOAD_JSON);
+    let mut prepared_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let committed = row.terminal_committed_at.is_some();
         let preparation_failure = committed
@@ -658,7 +892,7 @@ pub async fn resolve_gate_for_candidate<C: ConnectionTrait>(
                 serde_json::from_str::<NativeTerminalEffectPayload>(row.payload_json.as_str()),
                 Ok(NativeTerminalEffectPayload::PostTurnHookPreparationFailed { .. })
             );
-        let status = if committed {
+        let status_after = if committed {
             if preparation_failure {
                 STATUS_UNRESOLVED
             } else if candidate_status == "accepted" {
@@ -675,66 +909,182 @@ pub async fn resolve_gate_for_candidate<C: ConnectionTrait>(
             (committed && candidate_status == "accepted" && !preparation_failure).then_some(now);
         let completed_at =
             (committed && (candidate_status != "accepted" || preparation_failure)).then_some(now);
-        let (payload_json, payload_sha256) = if committed && candidate_status != "accepted" {
-            (
-                COMPACTED_PAYLOAD_JSON.to_owned(),
-                payload_sha256_hex(COMPACTED_PAYLOAD_JSON),
+        let compact_payload = committed && candidate_status != "accepted";
+        prepared_rows.push(PreparedCandidateGateResolutionRow {
+            effect_id: row.effect_id,
+            status_before: row.status,
+            updated_at_before: row.updated_at,
+            payload_sha256_before: row.payload_sha256,
+            payload_identity_sha256_before: row.payload_identity_sha256,
+            terminal_committed_at_before: row.terminal_committed_at,
+            status_after,
+            accepted_candidate_id,
+            next_run_at,
+            completed_at,
+            last_error_code: preparation_failure
+                .then_some("terminal_effect_preparation_failed".to_owned()),
+            last_error_message: preparation_failure
+                .then_some("post-turn hook preparation failed before durable execution".to_owned()),
+            compact_payload,
+            compacted_payload_sha256: compact_payload.then(|| compacted_payload_sha256.clone()),
+        });
+    }
+    Ok(PreparedCandidateGateResolution {
+        candidate_id: candidate_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        resolved_at: now,
+        requires_fence: true,
+        rows: prepared_rows,
+    })
+}
+
+/// Applies a prevalidated acceptance-gate plan in the same transaction which
+/// persists the authoritative task-result candidate state. Only bounded
+/// SQLite reads and updates execute while the writer is held.
+pub(crate) async fn apply_prepared_gate_resolution<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedCandidateGateResolution,
+) -> Result<u64> {
+    // Non-terminal candidate updates do not resolve the acceptance gate and
+    // therefore must not fence or mutate the current waiting effect set.
+    if !prepared.requires_fence {
+        return Ok(0);
+    }
+    let current_effect_ids = native_terminal_effect_outbox::Entity::find()
+        .select_only()
+        .column(native_terminal_effect_outbox::Column::EffectId)
+        .filter(native_terminal_effect_outbox::Column::ThreadId.eq(prepared.thread_id.clone()))
+        .filter(native_terminal_effect_outbox::Column::TurnId.eq(prepared.turn_id.clone()))
+        .filter(
+            native_terminal_effect_outbox::Column::GateKind
+                .eq(gate_to_db(NativeTerminalEffectGate::AcceptedTaskResult)),
+        )
+        .filter(
+            native_terminal_effect_outbox::Column::Status
+                .is_in([STATUS_PREPARED, STATUS_WAITING_ACCEPTANCE]),
+        )
+        .order_by_asc(native_terminal_effect_outbox::Column::EffectId)
+        .limit((MAX_EFFECTS_PER_TURN + 1) as u64)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to fence candidate-gated terminal effects")?;
+    let prepared_effect_ids = prepared
+        .rows
+        .iter()
+        .map(|row| row.effect_id.clone())
+        .collect::<Vec<_>>();
+    if current_effect_ids.len() > MAX_EFFECTS_PER_TURN || current_effect_ids != prepared_effect_ids
+    {
+        bail!(
+            "candidate-gated native terminal effects changed before resolving candidate `{}`",
+            prepared.candidate_id
+        );
+    }
+
+    let mut resolved = 0_u64;
+    for row in prepared.rows {
+        let mut update = native_terminal_effect_outbox::Entity::update_many()
+            .col_expr(
+                native_terminal_effect_outbox::Column::Status,
+                Expr::value(row.status_after.to_owned()),
             )
-        } else {
-            (row.payload_json.clone(), row.payload_sha256.clone())
+            .col_expr(
+                native_terminal_effect_outbox::Column::AcceptedCandidateId,
+                Expr::value(row.accepted_candidate_id),
+            )
+            .col_expr(
+                native_terminal_effect_outbox::Column::NextRunAt,
+                Expr::value(row.next_run_at),
+            )
+            .col_expr(
+                native_terminal_effect_outbox::Column::CompletedAt,
+                Expr::value(row.completed_at),
+            )
+            .col_expr(
+                native_terminal_effect_outbox::Column::LastErrorCode,
+                Expr::value(row.last_error_code),
+            )
+            .col_expr(
+                native_terminal_effect_outbox::Column::LastErrorMessage,
+                Expr::value(row.last_error_message),
+            )
+            .col_expr(
+                native_terminal_effect_outbox::Column::UpdatedAt,
+                Expr::value(prepared.resolved_at),
+            )
+            .filter(native_terminal_effect_outbox::Column::EffectId.eq(row.effect_id))
+            .filter(native_terminal_effect_outbox::Column::ThreadId.eq(prepared.thread_id.clone()))
+            .filter(native_terminal_effect_outbox::Column::TurnId.eq(prepared.turn_id.clone()))
+            .filter(
+                native_terminal_effect_outbox::Column::GateKind
+                    .eq(gate_to_db(NativeTerminalEffectGate::AcceptedTaskResult)),
+            )
+            .filter(native_terminal_effect_outbox::Column::Status.eq(row.status_before))
+            .filter(native_terminal_effect_outbox::Column::UpdatedAt.eq(row.updated_at_before))
+            .filter(
+                native_terminal_effect_outbox::Column::PayloadSha256.eq(row.payload_sha256_before),
+            )
+            .filter(
+                native_terminal_effect_outbox::Column::PayloadIdentitySha256
+                    .eq(row.payload_identity_sha256_before),
+            );
+        update = match row.terminal_committed_at_before {
+            Some(committed_at) => update.filter(
+                native_terminal_effect_outbox::Column::TerminalCommittedAt.eq(committed_at),
+            ),
+            None => {
+                update.filter(native_terminal_effect_outbox::Column::TerminalCommittedAt.is_null())
+            }
         };
-        resolved = resolved.saturating_add(
-            native_terminal_effect_outbox::Entity::update_many()
-                .col_expr(
-                    native_terminal_effect_outbox::Column::Status,
-                    Expr::value(status.to_owned()),
-                )
-                .col_expr(
-                    native_terminal_effect_outbox::Column::AcceptedCandidateId,
-                    Expr::value(accepted_candidate_id),
-                )
-                .col_expr(
-                    native_terminal_effect_outbox::Column::NextRunAt,
-                    Expr::value(next_run_at),
-                )
-                .col_expr(
-                    native_terminal_effect_outbox::Column::CompletedAt,
-                    Expr::value(completed_at),
-                )
-                .col_expr(
-                    native_terminal_effect_outbox::Column::LastErrorCode,
-                    Expr::value(
-                        preparation_failure
-                            .then_some("terminal_effect_preparation_failed".to_owned()),
-                    ),
-                )
-                .col_expr(
-                    native_terminal_effect_outbox::Column::LastErrorMessage,
-                    Expr::value(preparation_failure.then_some(
-                        "post-turn hook preparation failed before durable execution".to_owned(),
-                    )),
-                )
+        if row.compact_payload {
+            update = update
                 .col_expr(
                     native_terminal_effect_outbox::Column::PayloadJson,
-                    Expr::value(payload_json),
+                    Expr::value(COMPACTED_PAYLOAD_JSON.to_owned()),
                 )
                 .col_expr(
                     native_terminal_effect_outbox::Column::PayloadSha256,
-                    Expr::value(payload_sha256),
-                )
-                .col_expr(
-                    native_terminal_effect_outbox::Column::UpdatedAt,
-                    Expr::value(now),
-                )
-                .filter(native_terminal_effect_outbox::Column::EffectId.eq(row.effect_id))
-                .filter(native_terminal_effect_outbox::Column::Status.eq(row.status))
-                .exec(db)
-                .await
-                .context("failed to resolve candidate-gated terminal effect")?
-                .rows_affected,
-        );
+                    Expr::value(row.compacted_payload_sha256),
+                );
+        }
+        let updated = update
+            .exec(db)
+            .await
+            .context("failed to resolve candidate-gated terminal effect")?
+            .rows_affected;
+        if updated != 1 {
+            bail!(
+                "candidate-gated native terminal effect changed before resolving candidate `{}`",
+                prepared.candidate_id
+            );
+        }
+        resolved = resolved.saturating_add(updated);
     }
     Ok(resolved)
+}
+
+/// Standalone reconciliation wrapper. Transactional candidate paths prepare
+/// on the reader and call `apply_prepared_gate_resolution` directly.
+pub async fn resolve_gate_for_candidate<C: ConnectionTrait>(
+    db: &C,
+    candidate_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    candidate_status: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    let prepared = prepare_gate_resolution_for_candidate(
+        db,
+        candidate_id,
+        thread_id,
+        turn_id,
+        candidate_status,
+        now,
+    )
+    .await?;
+    apply_prepared_gate_resolution(db, prepared).await
 }
 
 pub async fn reconcile_waiting_gates<C: ConnectionTrait>(
@@ -1314,21 +1664,6 @@ async fn candidate_gate_state<C: ConnectionTrait>(
 
 fn terminal_candidate_statuses() -> [&'static str; 4] {
     ["accepted", "rejected", "superseded", "cancelled"]
-}
-
-fn activated_state(
-    gate: NativeTerminalEffectGate,
-    candidate: CandidateGateState,
-    now: DateTimeWithTimeZone,
-) -> (&'static str, Option<String>, Option<DateTimeWithTimeZone>) {
-    match gate {
-        NativeTerminalEffectGate::TerminalCommit => (STATUS_READY, None, Some(now)),
-        NativeTerminalEffectGate::AcceptedTaskResult => match candidate {
-            CandidateGateState::Accepted(id) => (STATUS_READY, Some(id), Some(now)),
-            CandidateGateState::Rejected => (STATUS_DISCARDED, None, None),
-            CandidateGateState::Waiting => (STATUS_WAITING_ACCEPTANCE, None, None),
-        },
-    }
 }
 
 fn kind_to_db(kind: NativeTerminalEffectKind) -> &'static str {

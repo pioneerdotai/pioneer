@@ -23,8 +23,52 @@ const MAX_DELIVERY_LIST_LIMIT: u64 = 1_000;
 const MAX_DELIVERY_BATCH_IDS: usize = 512;
 const MAX_DELIVERY_ATTEMPTS: u32 = 16;
 
-pub async fn upsert_delivery<C: ConnectionTrait>(db: &C, delivery: &TaskDelivery) -> Result<()> {
-    task_delivery::Entity::insert(active_model_from_delivery(delivery)?)
+#[derive(Clone, Debug)]
+pub struct PreparedTaskDeliveryProjection {
+    delivery: TaskDelivery,
+    active_model: task_delivery::ActiveModel,
+    result_snapshot_json: Option<String>,
+    error_snapshot_json: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedTaskDeliveryAttemptProjection {
+    attempt: TaskDeliveryAttempt,
+    active_model: task_delivery_attempt::ActiveModel,
+}
+
+pub fn prepare_delivery_projection(
+    delivery: &TaskDelivery,
+) -> Result<PreparedTaskDeliveryProjection> {
+    let result_snapshot_json = optional_typed_json_to_db(&delivery.result_snapshot)?;
+    let error_snapshot_json = optional_typed_json_to_db(&delivery.error_snapshot)?;
+    Ok(PreparedTaskDeliveryProjection {
+        delivery: delivery.clone(),
+        active_model: active_model_from_delivery_json(
+            delivery,
+            result_snapshot_json.clone(),
+            error_snapshot_json.clone(),
+        ),
+        result_snapshot_json,
+        error_snapshot_json,
+    })
+}
+
+pub fn prepare_attempt_projection(
+    attempt: &TaskDeliveryAttempt,
+) -> PreparedTaskDeliveryAttemptProjection {
+    PreparedTaskDeliveryAttemptProjection {
+        attempt: attempt.clone(),
+        active_model: active_model_from_attempt(attempt),
+    }
+}
+
+pub async fn upsert_prepared_delivery<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskDeliveryProjection,
+) -> Result<()> {
+    let delivery = &prepared.delivery;
+    task_delivery::Entity::insert(prepared.active_model)
         .on_conflict(
             OnConflict::column(task_delivery::Column::Id)
                 .do_nothing()
@@ -36,7 +80,12 @@ pub async fn upsert_delivery<C: ConnectionTrait>(db: &C, delivery: &TaskDelivery
     let persisted = find_delivery_by_id(db, &delivery.id)
         .await?
         .context("task delivery disappeared after insert")?;
-    validate_delivery_update(&persisted, delivery)?;
+    validate_delivery_update(
+        &persisted,
+        delivery,
+        prepared.result_snapshot_json.as_deref(),
+        prepared.error_snapshot_json.as_deref(),
+    )?;
     let desired_status = task_delivery_status_to_db(delivery.status);
     let desired_attempt_count = i64::from(delivery.attempt_count);
     if persisted.status != desired_status
@@ -102,11 +151,12 @@ pub async fn upsert_delivery<C: ConnectionTrait>(db: &C, delivery: &TaskDelivery
     Ok(())
 }
 
-pub async fn upsert_attempt<C: ConnectionTrait>(
+pub async fn upsert_prepared_attempt<C: ConnectionTrait>(
     db: &C,
-    attempt: &TaskDeliveryAttempt,
+    prepared: PreparedTaskDeliveryAttemptProjection,
 ) -> Result<()> {
-    task_delivery_attempt::Entity::insert(active_model_from_attempt(attempt))
+    let attempt = &prepared.attempt;
+    task_delivery_attempt::Entity::insert(prepared.active_model)
         .on_conflict(
             OnConflict::column(task_delivery_attempt::Column::Id)
                 .do_nothing()
@@ -168,6 +218,8 @@ pub async fn upsert_attempt<C: ConnectionTrait>(
 fn validate_delivery_update(
     persisted: &task_delivery::Model,
     delivery: &TaskDelivery,
+    result_snapshot_json: Option<&str>,
+    error_snapshot_json: Option<&str>,
 ) -> Result<()> {
     let immutable_matches = persisted.workspace_id == delivery.workspace_id
         && persisted.task_id == delivery.task_id
@@ -183,8 +235,8 @@ fn validate_delivery_update(
         && persisted.webhook_url == delivery.webhook_url
         && persisted.webhook_url_fingerprint == delivery.webhook_url_fingerprint
         && persisted.max_attempts == i64::from(delivery.max_attempts)
-        && persisted.result_snapshot_json == optional_typed_json_to_db(&delivery.result_snapshot)?
-        && persisted.error_snapshot_json == optional_typed_json_to_db(&delivery.error_snapshot)?
+        && persisted.result_snapshot_json.as_deref() == result_snapshot_json
+        && persisted.error_snapshot_json.as_deref() == error_snapshot_json
         && persisted.created_at.timestamp() == delivery.created_at;
     if !immutable_matches {
         bail!("task delivery attempts to rewrite immutable destination/result facts");
@@ -557,8 +609,12 @@ pub async fn list_attempts_for_deliveries<C: ConnectionTrait>(
     Ok(rows)
 }
 
-fn active_model_from_delivery(delivery: &TaskDelivery) -> Result<task_delivery::ActiveModel> {
-    Ok(task_delivery::ActiveModel {
+fn active_model_from_delivery_json(
+    delivery: &TaskDelivery,
+    result_snapshot_json: Option<String>,
+    error_snapshot_json: Option<String>,
+) -> task_delivery::ActiveModel {
+    task_delivery::ActiveModel {
         id: Set(delivery.id.clone()),
         workspace_id: Set(delivery.workspace_id.clone()),
         task_id: Set(delivery.task_id.clone()),
@@ -577,15 +633,15 @@ fn active_model_from_delivery(delivery: &TaskDelivery) -> Result<task_delivery::
         next_attempt_at: Set(delivery.next_attempt_at.map(unix_to_datetime)),
         attempt_count: Set(i64::from(delivery.attempt_count)),
         max_attempts: Set(i64::from(delivery.max_attempts)),
-        result_snapshot_json: Set(optional_typed_json_to_db(&delivery.result_snapshot)?),
-        error_snapshot_json: Set(optional_typed_json_to_db(&delivery.error_snapshot)?),
+        result_snapshot_json: Set(result_snapshot_json),
+        error_snapshot_json: Set(error_snapshot_json),
         delivered_turn_id: Set(delivery.delivered_turn_id.clone()),
         delivered_notification_id: Set(delivery.delivered_notification_id.clone()),
         delivered_at: Set(delivery.delivered_at.map(unix_to_datetime)),
         last_error: Set(delivery.last_error.clone()),
         created_at: Set(unix_to_datetime(delivery.created_at)),
         updated_at: Set(unix_to_datetime(delivery.updated_at)),
-    })
+    }
 }
 
 fn active_model_from_attempt(attempt: &TaskDeliveryAttempt) -> task_delivery_attempt::ActiveModel {

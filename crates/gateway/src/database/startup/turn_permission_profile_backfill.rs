@@ -11,7 +11,7 @@ use pioneer_protocol::{
     TurnSecurityRuleProvenance, TurnSecuritySnapshotSource,
 };
 use sea_orm::{
-    ConnectionTrait, DatabaseTransaction, FromQueryResult, Statement, TransactionTrait,
+    ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait,
     entity::prelude::DateTimeWithTimeZone,
 };
 use serde_json::Value as JsonValue;
@@ -260,27 +260,27 @@ enum PermissionBackfillBatch {
 }
 
 impl PermissionBackfillBatch {
-    async fn run(&self, transaction: &DatabaseTransaction) -> Result<u64> {
+    async fn run(&self, database: &pioneer_sqlite::SqliteDatabase) -> Result<u64> {
         match self {
-            Self::TurnEvents => backfill_turn_event_batch(transaction).await,
-            Self::Turns => backfill_turn_batch(transaction).await,
-            Self::TaskAgentCaps => backfill_task_agent_cap_batch(transaction).await,
+            Self::TurnEvents => backfill_turn_event_batch(database).await,
+            Self::Turns => backfill_turn_batch(database).await,
+            Self::TaskAgentCaps => backfill_task_agent_cap_batch(database).await,
             Self::RepairSyntheticTaskCaps { runtime_home, cwd } => {
-                repair_synthetic_workspace_task_security_cap_batch(transaction, runtime_home, cwd)
+                repair_synthetic_workspace_task_security_cap_batch(database, runtime_home, cwd)
                     .await
             }
             Self::FullAccessSecuritySnapshots { cwd } => {
-                backfill_full_access_turn_security_snapshot_batch(transaction, cwd).await
+                backfill_full_access_turn_security_snapshot_batch(database, cwd).await
             }
             Self::RepairSyntheticSecuritySnapshots { runtime_home, cwd } => {
-                repair_synthetic_workspace_security_snapshot_batch(transaction, runtime_home, cwd)
+                repair_synthetic_workspace_security_snapshot_batch(database, runtime_home, cwd)
                     .await
             }
             Self::RepairRegressedSecuritySnapshots => {
-                repair_regressed_turn_security_snapshot_batch(transaction).await
+                repair_regressed_turn_security_snapshot_batch(database).await
             }
             Self::RemoveSyntheticCliBindings { runtime_home } => {
-                remove_synthetic_workspace_cli_thread_binding_batch(transaction, runtime_home).await
+                remove_synthetic_workspace_cli_thread_binding_batch(database, runtime_home).await
             }
         }
     }
@@ -296,24 +296,9 @@ async fn run_low_priority_batch(
             let database = database.clone();
             let operation = operation.clone();
             async move {
-                let transaction = database
-                    .begin()
-                    .await
-                    .context("failed to begin permission backfill batch transaction")?;
-                let result = operation.run(&transaction).await;
-                match result {
-                    Ok(updated) => {
-                        transaction
-                            .commit()
-                            .await
-                            .context("failed to commit permission backfill batch")?;
-                        Ok(updated)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
+                // Candidate reads and all JSON/path preparation happen before
+                // the batch function begins its short writer transaction.
+                operation.run(&database).await
             }
         })
         .await?;
@@ -323,7 +308,37 @@ async fn run_low_priority_batch(
     Ok(result)
 }
 
-async fn repair_regressed_turn_security_snapshot_batch(db: &DatabaseTransaction) -> Result<u64> {
+async fn execute_prepared_backfill_statement(
+    database: &pioneer_sqlite::SqliteDatabase,
+    statement: Option<Statement>,
+    label: &'static str,
+) -> Result<u64> {
+    let Some(statement) = statement else {
+        return Ok(0);
+    };
+    let transaction = database
+        .begin()
+        .await
+        .with_context(|| format!("failed to begin {label} transaction"))?;
+    match transaction.execute_raw(statement).await {
+        Ok(result) => {
+            let rows_affected = result.rows_affected();
+            transaction
+                .commit()
+                .await
+                .with_context(|| format!("failed to commit {label} transaction"))?;
+            Ok(rows_affected)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error).with_context(|| format!("failed to execute {label} statement"))
+        }
+    }
+}
+
+async fn repair_regressed_turn_security_snapshot_batch(
+    db: &pioneer_sqlite::SqliteDatabase,
+) -> Result<u64> {
     let candidates = SyntheticWorkspaceTurnSecuritySnapshot::find_by_statement(
         Statement::from_string(
             db.get_database_backend(),
@@ -386,9 +401,8 @@ async fn repair_regressed_turn_security_snapshot_batch(db: &DatabaseTransaction)
         })?;
         updates.push((candidate.id, snapshot_version, snapshot_json));
     }
-    update_turn_security_snapshots(db, updates)
-        .await
-        .context("failed to update turn snapshots with repaired security policies")
+    let statement = turn_security_snapshot_update_statement(updates)?;
+    execute_prepared_backfill_statement(db, statement, "regressed security snapshot repair").await
 }
 
 fn repair_regressed_turn_security_snapshot(snapshot: &mut TurnExecutionSecuritySnapshot) -> bool {
@@ -438,7 +452,7 @@ fn repair_regressed_turn_security_snapshot(snapshot: &mut TurnExecutionSecurityS
     changed
 }
 
-async fn backfill_task_agent_cap_batch(db: &DatabaseTransaction) -> Result<u64> {
+async fn backfill_task_agent_cap_batch(db: &pioneer_sqlite::SqliteDatabase) -> Result<u64> {
     let permission_cap =
         pioneer_protocol::task_permission_cap_for_mode(TurnPermissionMode::FullAccess);
     let security_cap = TaskAgentSecurityCap {
@@ -453,11 +467,10 @@ async fn backfill_task_agent_cap_batch(db: &DatabaseTransaction) -> Result<u64> 
         .context("failed to serialize legacy full access task permission cap")?;
     let security_cap_json = serde_json::to_string(&security_cap)
         .context("failed to serialize legacy full access task security cap")?;
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            format!(
-                "UPDATE task_agent_spec \
+    let statement = Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!(
+            "UPDATE task_agent_spec \
                  SET permission_cap_json = COALESCE(permission_cap_json, ?), \
                      security_cap_json = COALESCE(security_cap_json, ?) \
                  WHERE id IN (\
@@ -470,16 +483,14 @@ async fn backfill_task_agent_cap_batch(db: &DatabaseTransaction) -> Result<u64> 
                         LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}\
                     )\
                  )",
-            ),
-            vec![permission_cap_json.into(), security_cap_json.into()],
-        ))
-        .await
-        .context("failed to update legacy task agent caps")?;
-    Ok(result.rows_affected())
+        ),
+        vec![permission_cap_json.into(), security_cap_json.into()],
+    );
+    execute_prepared_backfill_statement(db, Some(statement), "legacy task agent cap backfill").await
 }
 
 async fn repair_synthetic_workspace_security_snapshot_batch(
-    db: &DatabaseTransaction,
+    db: &pioneer_sqlite::SqliteDatabase,
     runtime_home: &Path,
     cwd: &str,
 ) -> Result<u64> {
@@ -555,13 +566,13 @@ async fn repair_synthetic_workspace_security_snapshot_batch(
 
         updates.push((candidate.id, snapshot_version, snapshot_json));
     }
-    update_turn_security_snapshots(db, updates)
+    let statement = turn_security_snapshot_update_statement(updates)?;
+    execute_prepared_backfill_statement(db, statement, "synthetic turn security snapshot repair")
         .await
-        .context("failed to update turn snapshots with repaired cwd")
 }
 
 async fn repair_synthetic_workspace_task_security_cap_batch(
-    db: &DatabaseTransaction,
+    db: &pioneer_sqlite::SqliteDatabase,
     runtime_home: &Path,
     cwd: &str,
 ) -> Result<u64> {
@@ -637,13 +648,17 @@ async fn repair_synthetic_workspace_task_security_cap_batch(
         })?;
         updates.push((candidate.id, security_cap_json));
     }
-    update_json_column_batch(db, "task_agent_spec", "security_cap_json", updates)
-        .await
-        .context("failed to update task security caps with repaired cwd")
+    let statement = json_column_update_statement(
+        db.get_database_backend(),
+        "task_agent_spec",
+        "security_cap_json",
+        updates,
+    )?;
+    execute_prepared_backfill_statement(db, statement, "synthetic task security cap repair").await
 }
 
 async fn remove_synthetic_workspace_cli_thread_binding_batch(
-    db: &DatabaseTransaction,
+    db: &pioneer_sqlite::SqliteDatabase,
     runtime_home: &Path,
 ) -> Result<u64> {
     let legacy_workspace_segment = format!(
@@ -657,11 +672,10 @@ async fn remove_synthetic_workspace_cli_thread_binding_batch(
         std::path::MAIN_SEPARATOR
     );
     let agent_segment = format!("{}agent", std::path::MAIN_SEPARATOR);
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            format!(
-                "DELETE FROM thread_cli_runtime_binding \
+    let statement = Statement::from_sql_and_values(
+        db.get_database_backend(),
+        format!(
+            "DELETE FROM thread_cli_runtime_binding \
                  WHERE thread_id IN (\
                     SELECT thread_id FROM (\
                         SELECT thread_id \
@@ -672,18 +686,16 @@ async fn remove_synthetic_workspace_cli_thread_binding_batch(
                         LIMIT {TURN_PERMISSION_PROFILE_BACKFILL_BATCH_SIZE}\
                     )\
                  )",
-            ),
-            vec![
-                runtime_home.to_string_lossy().into_owned().into(),
-                legacy_workspace_segment.into(),
-                runtime_home.to_string_lossy().into_owned().into(),
-                regressed_workspace_segment.into(),
-                agent_segment.into(),
-            ],
-        ))
-        .await
-        .context("failed to delete CLI thread bindings with synthetic workspace paths")?;
-    Ok(result.rows_affected())
+        ),
+        vec![
+            runtime_home.to_string_lossy().into_owned().into(),
+            legacy_workspace_segment.into(),
+            runtime_home.to_string_lossy().into_owned().into(),
+            regressed_workspace_segment.into(),
+            agent_segment.into(),
+        ],
+    );
+    execute_prepared_backfill_statement(db, Some(statement), "synthetic CLI binding removal").await
 }
 
 fn repair_synthetic_workspace_entry(
@@ -702,7 +714,7 @@ fn repair_synthetic_workspace_entry(
 }
 
 async fn backfill_full_access_turn_security_snapshot_batch(
-    db: &DatabaseTransaction,
+    db: &pioneer_sqlite::SqliteDatabase,
     cwd: &str,
 ) -> Result<u64> {
     let candidates =
@@ -748,12 +760,11 @@ async fn backfill_full_access_turn_security_snapshot_batch(
 
         updates.push((candidate.id, snapshot_version, snapshot_json));
     }
-    update_turn_security_snapshots(db, updates)
-        .await
-        .context("failed to update legacy full access turn security snapshots")
+    let statement = turn_security_snapshot_update_statement(updates)?;
+    execute_prepared_backfill_statement(db, statement, "legacy full-access snapshot backfill").await
 }
 
-async fn backfill_turn_event_batch(db: &DatabaseTransaction) -> Result<u64> {
+async fn backfill_turn_event_batch(db: &pioneer_sqlite::SqliteDatabase) -> Result<u64> {
     let candidates = LegacyTurnEventPayload::find_by_statement(Statement::from_string(
         db.get_database_backend(),
         format!(
@@ -802,17 +813,16 @@ async fn backfill_turn_event_batch(db: &DatabaseTransaction) -> Result<u64> {
                 .context("failed to serialize patched turn_event payload")?,
         ));
     }
-    update_json_column_batch(db, "turn_event", "payload", updates)
-        .await
-        .context("failed to update legacy turn_event permission profile payloads")
+    let statement =
+        json_column_update_statement(db.get_database_backend(), "turn_event", "payload", updates)?;
+    execute_prepared_backfill_statement(db, statement, "legacy turn-event payload backfill").await
 }
 
-async fn update_turn_security_snapshots(
-    db: &DatabaseTransaction,
+fn turn_security_snapshot_update_statement(
     updates: Vec<(String, i64, String)>,
-) -> Result<u64> {
+) -> Result<Option<Statement>> {
     if updates.is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
     let mut version_case = String::from("CASE id ");
     let mut json_case = String::from("CASE id ");
@@ -833,32 +843,31 @@ async fn update_turn_security_snapshots(
         .collect::<Vec<_>>()
         .join(",");
     values.extend(updates.into_iter().map(|(id, _, _)| id.into()));
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            format!(
-                "UPDATE turn SET execution_security_snapshot_version = {version_case}, \
+    Ok(Some(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!(
+            "UPDATE turn SET execution_security_snapshot_version = {version_case}, \
                  execution_security_snapshot_json = {json_case} WHERE id IN ({placeholders})"
-            ),
-            values,
-        ))
-        .await?;
-    Ok(result.rows_affected())
+        ),
+        values,
+    )))
 }
 
-async fn update_json_column_batch(
-    db: &DatabaseTransaction,
+fn json_column_update_statement(
+    backend: DbBackend,
     table: &'static str,
     column: &'static str,
     updates: Vec<(String, String)>,
-) -> Result<u64> {
+) -> Result<Option<Statement>> {
     if updates.is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
-    debug_assert!(matches!(
+    if !matches!(
         (table, column),
         ("task_agent_spec", "security_cap_json") | ("turn_event", "payload")
-    ));
+    ) {
+        anyhow::bail!("unsupported startup JSON backfill target {table}.{column}");
+    }
     let mut update_case = String::from("CASE id ");
     let mut values: Vec<sea_orm::Value> = Vec::with_capacity(updates.len() * 3);
     for (id, value) in &updates {
@@ -871,17 +880,14 @@ async fn update_json_column_batch(
         .collect::<Vec<_>>()
         .join(",");
     values.extend(updates.into_iter().map(|(id, _)| id.into()));
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            format!("UPDATE {table} SET {column} = {update_case} WHERE id IN ({placeholders})"),
-            values,
-        ))
-        .await?;
-    Ok(result.rows_affected())
+    Ok(Some(Statement::from_sql_and_values(
+        backend,
+        format!("UPDATE {table} SET {column} = {update_case} WHERE id IN ({placeholders})"),
+        values,
+    )))
 }
 
-async fn backfill_turn_batch(db: &DatabaseTransaction) -> Result<u64> {
+async fn backfill_turn_batch(db: &pioneer_sqlite::SqliteDatabase) -> Result<u64> {
     let sql = format!(
         "UPDATE turn \
          SET permission_profile_mode = COALESCE(\
@@ -908,11 +914,12 @@ async fn backfill_turn_batch(db: &DatabaseTransaction) -> Result<u64> {
             )\
          )",
     );
-    let result = db
-        .execute_unprepared(sql.as_str())
-        .await
-        .context("failed to update legacy turn permission profile columns")?;
-    Ok(result.rows_affected())
+    execute_prepared_backfill_statement(
+        db,
+        Some(Statement::from_string(db.get_database_backend(), sql)),
+        "legacy turn permission profile backfill",
+    )
+    .await
 }
 
 async fn backfill_is_current<C: ConnectionTrait>(db: &C) -> Result<bool> {

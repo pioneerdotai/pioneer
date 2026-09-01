@@ -19,12 +19,6 @@ use tracing::{Instrument, Span};
 
 use crate::reader::{SqliteMaintenanceReadPermit, SqliteReadOperation, SqliteReadOutcome};
 
-static NEXT_EXECUTOR_ID: AtomicU64 = AtomicU64::new(1);
-
-tokio::task_local! {
-    static ACTIVE_WRITE_SCOPES: Vec<ActiveWriteScope>;
-}
-
 pub const DEFAULT_MAX_CRITICAL_BURST: usize = 8;
 pub const DEFAULT_MAX_NON_MAINTENANCE_BURST: usize = 16;
 pub const DEFAULT_MAX_MAINTENANCE_WAIT_MS: u64 = 2_000;
@@ -279,12 +273,6 @@ struct SqliteWritePermit {
     _reservation: Arc<Reservation>,
 }
 
-#[derive(Clone)]
-struct ActiveWriteScope {
-    executor_id: u64,
-    permit: SqliteWritePermit,
-}
-
 impl SqliteWritePermit {
     fn new(mut reservation: Reservation) -> Self {
         reservation.start();
@@ -503,7 +491,6 @@ impl AdmissionInner {
 /// queue. A write cannot reach the connection without a classed reservation.
 #[derive(Clone)]
 pub struct SqliteWriteExecutor {
-    id: u64,
     connection: DatabaseConnection,
     admission: Arc<AdmissionInner>,
 }
@@ -536,7 +523,6 @@ impl SqliteWriteExecutor {
         observer: Arc<dyn SqliteWriteObserver>,
     ) -> Self {
         Self {
-            id: NEXT_EXECUTOR_ID.fetch_add(1, Ordering::Relaxed),
             connection,
             admission: Arc::new(AdmissionInner {
                 state: Mutex::new(AdmissionState::default()),
@@ -568,7 +554,7 @@ impl SqliteWriteExecutor {
     /// Validates the physical writer connection under the same typed
     /// reservation and pool-attribution contract as every other operation.
     pub async fn ping(&self, class: SqliteWriteClass) -> Result<(), DbErr> {
-        let permit = self.acquire_or_reuse(class).await;
+        let permit = self.acquire(class).await;
         self.connection
             .ping()
             .instrument(writer_pool_span(permit.class()))
@@ -579,7 +565,7 @@ impl SqliteWriteExecutor {
     /// exclusively reserved. The raw connection never crosses this crate's
     /// API boundary.
     pub async fn apply_pragmas(&self, class: SqliteWriteClass) -> anyhow::Result<()> {
-        let permit = self.acquire_or_reuse(class).await;
+        let permit = self.acquire(class).await;
         crate::apply_sqlite_pragmas(&self.connection)
             .instrument(writer_pool_span(permit.class()))
             .await
@@ -596,54 +582,10 @@ impl SqliteWriteExecutor {
     where
         M: MigratorTrait,
     {
-        let permit = self.acquire_or_reuse(class).await;
+        let permit = self.acquire(class).await;
         M::up(&self.connection, steps)
             .instrument(writer_pool_span(permit.class()))
             .await
-    }
-
-    /// Runs one logical write operation under this executor's classed
-    /// reservation. Nested statements and transactions reuse the same
-    /// reservation, preserving operation-level serialization without a
-    /// second admission controller. The scope is task-local and deliberately
-    /// is not inherited by spawned tasks.
-    pub(crate) async fn run_scoped<T, Fut>(&self, class: SqliteWriteClass, operation: Fut) -> T
-    where
-        Fut: Future<Output = T>,
-    {
-        if self.active_permit().is_some() {
-            return operation.await;
-        }
-
-        let permit = self.acquire(class).await;
-        let mut scopes = ACTIVE_WRITE_SCOPES
-            .try_with(Clone::clone)
-            .unwrap_or_default();
-        scopes.push(ActiveWriteScope {
-            executor_id: self.id,
-            permit,
-        });
-        ACTIVE_WRITE_SCOPES.scope(scopes, operation).await
-    }
-
-    fn active_permit(&self) -> Option<SqliteWritePermit> {
-        ACTIVE_WRITE_SCOPES
-            .try_with(|scopes| {
-                scopes
-                    .iter()
-                    .rev()
-                    .find(|scope| scope.executor_id == self.id)
-                    .map(|scope| scope.permit.clone())
-            })
-            .ok()
-            .flatten()
-    }
-
-    async fn acquire_or_reuse(&self, class: SqliteWriteClass) -> SqliteWritePermit {
-        match self.active_permit() {
-            Some(permit) => permit,
-            None => self.acquire(class).await,
-        }
     }
 
     async fn acquire(&self, class: SqliteWriteClass) -> SqliteWritePermit {
@@ -671,7 +613,7 @@ impl ConnectionTrait for SqliteWriteConnection {
     }
 
     async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
-        let permit = self.executor.acquire_or_reuse(self.class).await;
+        let permit = self.executor.acquire(self.class).await;
         self.executor
             .connection
             .execute_raw(statement)
@@ -680,7 +622,7 @@ impl ConnectionTrait for SqliteWriteConnection {
     }
 
     async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
-        let permit = self.executor.acquire_or_reuse(self.class).await;
+        let permit = self.executor.acquire(self.class).await;
         self.executor
             .connection
             .execute_unprepared(sql)
@@ -689,7 +631,7 @@ impl ConnectionTrait for SqliteWriteConnection {
     }
 
     async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
-        let permit = self.executor.acquire_or_reuse(self.class).await;
+        let permit = self.executor.acquire(self.class).await;
         self.executor
             .connection
             .query_one_raw(statement)
@@ -698,7 +640,7 @@ impl ConnectionTrait for SqliteWriteConnection {
     }
 
     async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
-        let permit = self.executor.acquire_or_reuse(self.class).await;
+        let permit = self.executor.acquire(self.class).await;
         self.executor
             .connection
             .query_all_raw(statement)
@@ -787,7 +729,7 @@ impl StreamTrait for SqliteWriteConnection {
         statement: Statement,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
         Box::pin(async move {
-            let permit = self.executor.acquire_or_reuse(self.class).await;
+            let permit = self.executor.acquire(self.class).await;
             let effective_class = permit.class();
             let stream = self
                 .executor
@@ -946,7 +888,7 @@ impl TransactionTrait for SqliteWriteConnection {
     type Transaction = SqliteTransaction;
 
     async fn begin(&self) -> Result<Self::Transaction, DbErr> {
-        let permit = self.executor.acquire_or_reuse(self.class).await;
+        let permit = self.executor.acquire(self.class).await;
         let effective_class = permit.class();
         let transaction = self
             .executor
@@ -962,7 +904,7 @@ impl TransactionTrait for SqliteWriteConnection {
         isolation_level: Option<IsolationLevel>,
         access_mode: Option<AccessMode>,
     ) -> Result<Self::Transaction, DbErr> {
-        let permit = self.executor.acquire_or_reuse(self.class).await;
+        let permit = self.executor.acquire(self.class).await;
         let effective_class = permit.class();
         let transaction = self
             .executor
@@ -977,7 +919,7 @@ impl TransactionTrait for SqliteWriteConnection {
         &self,
         options: TransactionOptions,
     ) -> Result<Self::Transaction, DbErr> {
-        let permit = self.executor.acquire_or_reuse(self.class).await;
+        let permit = self.executor.acquire(self.class).await;
         let effective_class = permit.class();
         let transaction = self
             .executor
@@ -1523,7 +1465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logical_write_scope_reuses_one_classed_reservation() {
+    async fn each_statement_obtains_its_own_classed_reservation() {
         let mut options = ConnectOptions::new("sqlite::memory:");
         options.max_connections(1);
         let connection = Database::connect(options).await.expect("connect");
@@ -1532,121 +1474,34 @@ mod tests {
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
         let critical = executor.connection(SqliteWriteClass::Critical);
 
-        executor
-            .run_scoped(SqliteWriteClass::Maintenance, async {
-                maintenance
-                    .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
-                    .await
-                    .expect("create table in scope");
-                maintenance
-                    .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
-                    .await
-                    .expect("insert in scope");
-                executor
-                    .run_scoped(SqliteWriteClass::Critical, async {
-                        assert_eq!(
-                            executor
-                                .acquire_or_reuse(SqliteWriteClass::Critical)
-                                .await
-                                .class(),
-                            SqliteWriteClass::Maintenance,
-                            "nested handles must attribute work to the effective reservation"
-                        );
-                        critical
-                            .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
-                            .await
-                            .expect("nested scope insert");
-                    })
-                    .await;
-            })
-            .await;
+        maintenance
+            .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .await
+            .expect("create table");
+        maintenance
+            .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+            .await
+            .expect("maintenance insert");
+        critical
+            .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
+            .await
+            .expect("critical insert");
 
         assert_eq!(
             *observer
                 .acquired
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![SqliteWriteClass::Maintenance]
+            vec![
+                SqliteWriteClass::Maintenance,
+                SqliteWriteClass::Maintenance,
+                SqliteWriteClass::Critical,
+            ]
         );
     }
 
     #[tokio::test]
-    async fn spawned_tasks_do_not_inherit_a_logical_write_scope() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
-        let executor = SqliteWriteExecutor::new(connection);
-        let maintenance = executor.connection(SqliteWriteClass::Maintenance);
-        let interactive = executor.connection(SqliteWriteClass::Interactive);
-
-        let child = executor
-            .run_scoped(SqliteWriteClass::Maintenance, async {
-                maintenance
-                    .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
-                    .await
-                    .expect("create table in scope");
-                let child = tokio::spawn(async move {
-                    interactive
-                        .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
-                        .await
-                });
-                wait_for_queue(
-                    &executor.admission,
-                    SqliteWriteQueueSnapshot {
-                        critical: 0,
-                        interactive: 1,
-                        maintenance: 0,
-                    },
-                )
-                .await;
-                assert!(!child.is_finished());
-                Some(child)
-            })
-            .await
-            .expect("scope should return the child handle");
-
-        tokio::time::timeout(Duration::from_secs(1), child)
-            .await
-            .expect("child must run after the parent scope releases the writer")
-            .expect("child should join")
-            .expect("child write should succeed");
-    }
-
-    #[tokio::test]
-    async fn cancelling_an_active_logical_scope_releases_writer_capacity() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
-        let executor = SqliteWriteExecutor::new(connection);
-        let entered = Arc::new(Notify::new());
-        let never_release = Arc::new(Notify::new());
-        let active = tokio::spawn({
-            let executor = executor.clone();
-            let entered = entered.clone();
-            let never_release = never_release.clone();
-            async move {
-                executor
-                    .run_scoped(SqliteWriteClass::Maintenance, async move {
-                        entered.notify_one();
-                        never_release.notified().await;
-                    })
-                    .await;
-            }
-        });
-
-        entered.notified().await;
-        active.abort();
-        let _ = active.await;
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            acquire(&executor.admission, SqliteWriteClass::Critical),
-        )
-        .await
-        .expect("cancelled logical scope must release writer capacity");
-    }
-
-    #[tokio::test]
-    async fn transaction_escaping_a_logical_scope_retains_its_reservation() {
+    async fn unrelated_await_between_statements_does_not_hold_writer_capacity() {
         let mut options = ConnectOptions::new("sqlite::memory:");
         options.max_connections(1);
         let connection = Database::connect(options).await.expect("connect");
@@ -1658,24 +1513,40 @@ mod tests {
             .await
             .expect("create table");
 
-        let transaction = executor
-            .run_scoped(SqliteWriteClass::Maintenance, maintenance.begin())
-            .await
-            .expect("begin transaction in scope");
+        let between_statements = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let maintenance_task = tokio::spawn({
+            let between_statements = between_statements.clone();
+            let resume = resume.clone();
+            async move {
+                maintenance
+                    .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+                    .await?;
+                between_statements.notify_one();
+                resume.notified().await;
+                maintenance
+                    .execute_unprepared("INSERT INTO probe (id) VALUES (3)")
+                    .await
+            }
+        });
+        between_statements.notified().await;
+
         let interactive_task = tokio::spawn(async move {
             interactive
-                .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+                .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(!interactive_task.is_finished());
-
-        transaction.rollback().await.expect("rollback transaction");
         tokio::time::timeout(Duration::from_secs(1), interactive_task)
             .await
-            .expect("transaction completion must release writer capacity")
+            .expect("interactive write must not wait for unrelated maintenance work")
             .expect("interactive task should join")
             .expect("interactive write should succeed");
+        assert!(!maintenance_task.is_finished());
+        resume.notify_one();
+        maintenance_task
+            .await
+            .expect("maintenance task should join")
+            .expect("second maintenance write should succeed");
     }
 
     #[tokio::test]

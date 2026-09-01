@@ -1972,13 +1972,29 @@ pub async fn revoke_agent_delegation_route(
     Ok(true)
 }
 
-pub async fn expire_agent_delegation_routes(
-    db: &DatabaseTransaction,
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedAgentDelegationRouteExpiryBatch {
+    routes: Vec<PreparedAgentDelegationRouteExpiry>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedAgentDelegationRouteExpiry {
+    expected: agent_delegation_route::Model,
+    event_id: String,
+    next_generation: i64,
+    authority_actor_json: String,
+    authority_fingerprint: String,
+    occurred_at: DateTimeWithTimeZone,
+}
+
+pub(crate) async fn prepare_agent_delegation_route_expiry_batch<C: ConnectionTrait>(
+    db: &C,
     now: DateTimeWithTimeZone,
-) -> Result<u64> {
+) -> Result<PreparedAgentDelegationRouteExpiryBatch> {
     let candidates = agent_delegation_route::Entity::find()
         .filter(agent_delegation_route::Column::Status.is_in(["prepared", "active"]))
         .filter(agent_delegation_route::Column::ExpiresAt.lte(now))
+        .filter(agent_delegation_route::Column::RouteGeneration.lt(i64::MAX))
         .order_by_asc(agent_delegation_route::Column::ExpiresAt)
         .order_by_asc(agent_delegation_route::Column::Id)
         .limit(AGENT_ROUTE_EXPIRY_BATCH_SIZE)
@@ -1987,58 +2003,148 @@ pub async fn expire_agent_delegation_routes(
         .context("failed to load expiring agent delegation routes")?;
     let authority_actor_json = serde_json::to_string(&PersistedActorRef::System)
         .context("failed to serialize System actor for route expiry")?;
-    let authority_fingerprint = "agent-route-expiry";
-    let mut expired = 0u64;
-    for route in candidates {
-        let result = agent_delegation_route::Entity::update_many()
-            .col_expr(
-                agent_delegation_route::Column::Status,
-                sea_orm::sea_query::Expr::value("expired"),
-            )
-            .col_expr(
-                agent_delegation_route::Column::RouteGeneration,
-                sea_orm::sea_query::Expr::cust("route_generation + 1"),
-            )
-            .col_expr(
-                agent_delegation_route::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now.clone()),
-            )
-            .col_expr(
-                agent_delegation_route::Column::AuthorityActorJson,
-                sea_orm::sea_query::Expr::value(Some(authority_actor_json.clone())),
-            )
-            .col_expr(
-                agent_delegation_route::Column::AuthorityFingerprint,
-                sea_orm::sea_query::Expr::value(Some(authority_fingerprint.to_owned())),
-            )
-            .filter(agent_delegation_route::Column::Id.eq(route.id.clone()))
-            .filter(agent_delegation_route::Column::RouteGeneration.eq(route.route_generation))
-            .filter(agent_delegation_route::Column::RouteGeneration.lt(i64::MAX))
-            .filter(agent_delegation_route::Column::Status.is_in(["prepared", "active"]))
-            .filter(agent_delegation_route::Column::ExpiresAt.lte(now.clone()))
-            .exec(db)
-            .await
-            .context("failed to expire agent delegation route")?;
-        if result.rows_affected == 0 {
-            continue;
-        }
-        let next_generation = route
-            .route_generation
-            .checked_add(1)
-            .context("route generation overflow")?;
-        append_agent_route_event(
-            db,
-            route.id.as_str(),
-            "expired",
-            next_generation,
-            authority_actor_json.as_str(),
-            authority_fingerprint,
-            now.clone(),
-        )
-        .await?;
-        expired = expired.saturating_add(1);
+    let authority_fingerprint = "agent-route-expiry".to_owned();
+    let routes = candidates
+        .into_iter()
+        .map(|expected| {
+            let next_generation = expected
+                .route_generation
+                .checked_add(1)
+                .context("route generation overflow")?;
+            Ok(PreparedAgentDelegationRouteExpiry {
+                event_id: canonical_agent_id(
+                    'V',
+                    &format!("route-event\0{}\0{next_generation}", expected.id),
+                ),
+                expected,
+                next_generation,
+                authority_actor_json: authority_actor_json.clone(),
+                authority_fingerprint: authority_fingerprint.clone(),
+                occurred_at: now,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PreparedAgentDelegationRouteExpiryBatch { routes })
+}
+
+pub(crate) async fn apply_prepared_agent_delegation_route_expiry_batch(
+    db: &DatabaseTransaction,
+    prepared: &PreparedAgentDelegationRouteExpiryBatch,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    if prepared.routes.is_empty() {
+        return Ok(0);
     }
-    Ok(expired)
+
+    let route_ids = prepared
+        .routes
+        .iter()
+        .map(|route| route.expected.id.clone())
+        .collect::<Vec<_>>();
+    let current = agent_delegation_route::Entity::find()
+        .filter(agent_delegation_route::Column::Id.is_in(route_ids))
+        .all(db)
+        .await
+        .context("failed to revalidate expiring agent delegation routes")?
+        .into_iter()
+        .map(|route| (route.id.clone(), route))
+        .collect::<BTreeMap<_, _>>();
+    let eligible = prepared
+        .routes
+        .iter()
+        .filter(|route| current.get(route.expected.id.as_str()) == Some(&route.expected))
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+
+    let eligible_ids = eligible
+        .iter()
+        .map(|route| route.expected.id.clone())
+        .collect::<Vec<_>>();
+    let updated = agent_delegation_route::Entity::update_many()
+        .col_expr(
+            agent_delegation_route::Column::Status,
+            sea_orm::sea_query::Expr::value("expired"),
+        )
+        .col_expr(
+            agent_delegation_route::Column::RouteGeneration,
+            sea_orm::sea_query::Expr::cust("route_generation + 1"),
+        )
+        .col_expr(
+            agent_delegation_route::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            agent_delegation_route::Column::AuthorityActorJson,
+            sea_orm::sea_query::Expr::value(Some(eligible[0].authority_actor_json.clone())),
+        )
+        .col_expr(
+            agent_delegation_route::Column::AuthorityFingerprint,
+            sea_orm::sea_query::Expr::value(Some(eligible[0].authority_fingerprint.clone())),
+        )
+        .filter(agent_delegation_route::Column::Id.is_in(eligible_ids))
+        .filter(agent_delegation_route::Column::Status.is_in(["prepared", "active"]))
+        .filter(agent_delegation_route::Column::ExpiresAt.lte(now))
+        .filter(agent_delegation_route::Column::RouteGeneration.lt(i64::MAX))
+        .exec(db)
+        .await
+        .context("failed to bulk-expire agent delegation routes")?;
+    let expected_updated = u64::try_from(eligible.len()).unwrap_or(u64::MAX);
+    if updated.rows_affected != expected_updated {
+        bail!("agent delegation routes changed while the expiry batch was committing");
+    }
+
+    let event_models = eligible
+        .iter()
+        .map(|route| agent_delegation_route_event::ActiveModel {
+            id: Set(route.event_id.clone()),
+            route_id: Set(route.expected.id.clone()),
+            event_kind: Set("expired".to_owned()),
+            route_generation: Set(route.next_generation),
+            authority_actor_json: Set(route.authority_actor_json.clone()),
+            authority_fingerprint: Set(route.authority_fingerprint.clone()),
+            occurred_at: Set(route.occurred_at),
+        })
+        .collect::<Vec<_>>();
+    agent_delegation_route_event::Entity::insert_many(event_models)
+        .on_conflict(
+            OnConflict::column(agent_delegation_route_event::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .context("failed to append bulk Agent route expiry events")?;
+
+    let event_ids = eligible
+        .iter()
+        .map(|route| route.event_id.clone())
+        .collect::<Vec<_>>();
+    let persisted_events = agent_delegation_route_event::Entity::find()
+        .filter(agent_delegation_route_event::Column::Id.is_in(event_ids))
+        .all(db)
+        .await
+        .context("failed to verify bulk Agent route expiry events")?
+        .into_iter()
+        .map(|event| (event.id.clone(), event))
+        .collect::<BTreeMap<_, _>>();
+    for route in &eligible {
+        let event = persisted_events
+            .get(route.event_id.as_str())
+            .context("Agent route expiry event disappeared after append")?;
+        if event.route_id != route.expected.id
+            || event.event_kind != "expired"
+            || event.route_generation != route.next_generation
+            || event.authority_actor_json != route.authority_actor_json
+            || event.authority_fingerprint != route.authority_fingerprint
+            || event.occurred_at != route.occurred_at
+        {
+            bail!("Agent route expiry event id was reused with different facts");
+        }
+    }
+
+    Ok(expected_updated)
 }
 
 /// Atomically materialize a server-resolved thread and its execution-scoped
@@ -4506,18 +4612,14 @@ where
         ..Default::default()
     };
     for candidate in candidates {
-        let transaction = db
-            .begin()
-            .await
-            .context("failed to begin agent domain action ledger compaction")?;
         let action = agent_action::Entity::find_by_id(candidate.action_id.clone())
-            .one(&transaction)
+            .one(db)
             .await
             .context("failed to load compactable agent domain action")?
             .context("compactable agent domain outbox has no action")?;
         let receipt = agent_action_receipt::Entity::find()
             .filter(agent_action_receipt::Column::ActionId.eq(candidate.action_id.clone()))
-            .one(&transaction)
+            .one(db)
             .await
             .context("failed to load compactable agent domain action receipt")?
             .context("compactable agent domain outbox has no receipt")?;
@@ -4536,54 +4638,76 @@ where
 
         let compacted_outbox = compacted_agent_action_outbox_payload(&candidate, &action)?;
         let mut released = compacted_bytes(candidate.payload_json.as_str(), &compacted_outbox);
+        let compacted_action_response = action
+            .response_json
+            .as_deref()
+            .filter(|original| {
+                !is_agent_action_compaction_marker(original, AGENT_ACTION_COMPACTION_FORMAT)
+            })
+            .map(|original| {
+                let compacted = agent_action_compaction_marker(
+                    AGENT_ACTION_COMPACTION_FORMAT,
+                    original,
+                    serde_json::Map::new(),
+                );
+                released = released.saturating_add(compacted_bytes(original, &compacted));
+                (original.to_owned(), compacted)
+            });
+        let compacted_receipt_response = receipt
+            .response_json
+            .as_deref()
+            .filter(|original| {
+                !is_agent_action_compaction_marker(original, AGENT_ACTION_RECEIPT_COMPACTION_FORMAT)
+            })
+            .map(|original| {
+                let compacted = agent_action_compaction_marker(
+                    AGENT_ACTION_RECEIPT_COMPACTION_FORMAT,
+                    original,
+                    serde_json::Map::new(),
+                );
+                released = released.saturating_add(compacted_bytes(original, &compacted));
+                (original.to_owned(), compacted)
+            });
 
-        if let Some(original) = action.response_json.as_deref()
-            && !is_agent_action_compaction_marker(original, AGENT_ACTION_COMPACTION_FORMAT)
-        {
-            let compacted = agent_action_compaction_marker(
-                AGENT_ACTION_COMPACTION_FORMAT,
-                original,
-                serde_json::Map::new(),
-            );
+        let transaction = db
+            .begin()
+            .await
+            .context("failed to begin agent domain action ledger compaction")?;
+        if let Some((original, compacted)) = compacted_action_response {
             let updated = agent_action::Entity::update_many()
                 .col_expr(
                     agent_action::Column::ResponseJson,
-                    sea_orm::sea_query::Expr::value(Some(compacted.clone())),
+                    sea_orm::sea_query::Expr::value(Some(compacted)),
                 )
                 .filter(agent_action::Column::Id.eq(action.id.clone()))
                 .filter(agent_action::Column::Status.eq("committed"))
-                .filter(agent_action::Column::ResponseJson.eq(Some(original.to_owned())))
+                .filter(agent_action::Column::ExecutionId.eq(action.execution_id.clone()))
+                .filter(agent_action::Column::ResponseJson.eq(Some(original)))
                 .exec(&transaction)
                 .await
                 .context("failed to compact agent domain action response")?;
             if updated.rows_affected != 1 {
                 bail!("agent domain action response changed during compaction");
             }
-            released = released.saturating_add(compacted_bytes(original, &compacted));
         }
-        if let Some(original) = receipt.response_json.as_deref()
-            && !is_agent_action_compaction_marker(original, AGENT_ACTION_RECEIPT_COMPACTION_FORMAT)
-        {
-            let compacted = agent_action_compaction_marker(
-                AGENT_ACTION_RECEIPT_COMPACTION_FORMAT,
-                original,
-                serde_json::Map::new(),
-            );
+        if let Some((original, compacted)) = compacted_receipt_response {
             let updated = agent_action_receipt::Entity::update_many()
                 .col_expr(
                     agent_action_receipt::Column::ResponseJson,
-                    sea_orm::sea_query::Expr::value(Some(compacted.clone())),
+                    sea_orm::sea_query::Expr::value(Some(compacted)),
                 )
                 .filter(agent_action_receipt::Column::Id.eq(receipt.id.clone()))
+                .filter(agent_action_receipt::Column::ActionId.eq(action.id.clone()))
                 .filter(agent_action_receipt::Column::Decision.eq("allowed"))
-                .filter(agent_action_receipt::Column::ResponseJson.eq(Some(original.to_owned())))
+                .filter(agent_action_receipt::Column::ActorKind.eq("agent_execution"))
+                .filter(agent_action_receipt::Column::ActorId.eq(Some(action.execution_id.clone())))
+                .filter(agent_action_receipt::Column::ResponseJson.eq(Some(original)))
                 .exec(&transaction)
                 .await
                 .context("failed to compact agent domain receipt response")?;
             if updated.rows_affected != 1 {
                 bail!("agent domain receipt response changed during compaction");
             }
-            released = released.saturating_add(compacted_bytes(original, &compacted));
         }
         let updated = agent_action_outbox::Entity::update_many()
             .col_expr(
@@ -4594,6 +4718,7 @@ where
             .filter(agent_action_outbox::Column::PayloadJson.eq(candidate.payload_json.clone()))
             .filter(agent_action_outbox::Column::Status.eq(candidate.status.clone()))
             .filter(agent_action_outbox::Column::Attempts.eq(candidate.attempts))
+            .filter(agent_action_outbox::Column::OwnerExecutionId.eq(action.execution_id.clone()))
             .exec(&transaction)
             .await
             .context("failed to compact agent domain action outbox payload")?;

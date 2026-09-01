@@ -16,6 +16,25 @@ use crate::util::{optional_typed_json_to_db, unix_to_datetime};
 
 const DB_ID_LEN: usize = 21;
 
+#[derive(Clone, Debug)]
+pub struct PreparedTaskProjection(task::ActiveModel);
+
+pub fn prepare_task_projection(task_model: &Task) -> Result<PreparedTaskProjection> {
+    active_model_from_task(task_model).map(PreparedTaskProjection)
+}
+
+pub fn prepare_task_result_json(result: Option<&TaskResult>) -> Result<Option<String>> {
+    result
+        .map(|value| serde_json::to_string(value).context("failed to serialize task result"))
+        .transpose()
+}
+
+pub fn prepare_task_error_json(error: Option<&TaskError>) -> Result<Option<String>> {
+    error
+        .map(|value| serde_json::to_string(value).context("failed to serialize task error"))
+        .transpose()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskRootAccessFilter {
     pub allowed_root_thread_ids: Vec<String>,
@@ -68,8 +87,11 @@ fn apply_root_access_filter(
     }
 }
 
-pub async fn upsert_task<C: ConnectionTrait>(db: &C, task_model: &Task) -> Result<()> {
-    task::Entity::insert(active_model_from_task(task_model)?)
+pub async fn upsert_prepared_task<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskProjection,
+) -> Result<()> {
+    task::Entity::insert(prepared.0)
         .on_conflict(
             OnConflict::column(task::Column::Id)
                 .update_columns([
@@ -308,11 +330,11 @@ pub async fn update_task_status<C: ConnectionTrait>(
     Ok(ProjectionWriteOutcome::Applied)
 }
 
-pub async fn update_task_result<C: ConnectionTrait>(
+pub async fn update_task_result_json<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
     status: TaskStatus,
-    result: Option<&TaskResult>,
+    result_json: Option<String>,
     updated_at: DateTimeWithTimeZone,
     completed_at: Option<DateTimeWithTimeZone>,
 ) -> Result<ProjectionWriteOutcome> {
@@ -324,10 +346,6 @@ pub async fn update_task_result<C: ConnectionTrait>(
     if let Some(outcome) = terminal_task_transition_guard(task_id, model.status.as_str(), status) {
         return Ok(outcome);
     }
-
-    let result_json = result
-        .map(|value| serde_json::to_string(value).context("failed to serialize task result"))
-        .transpose()?;
 
     let result = task::Entity::update_many()
         .filter(task::Column::Id.eq(task_id.to_owned()))
@@ -348,11 +366,11 @@ pub async fn update_task_result<C: ConnectionTrait>(
     Ok(ProjectionWriteOutcome::Applied)
 }
 
-pub async fn update_task_error<C: ConnectionTrait>(
+pub async fn update_task_error_json<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
     status: TaskStatus,
-    error: Option<&TaskError>,
+    error_json: Option<String>,
     updated_at: DateTimeWithTimeZone,
     completed_at: Option<DateTimeWithTimeZone>,
 ) -> Result<ProjectionWriteOutcome> {
@@ -364,10 +382,6 @@ pub async fn update_task_error<C: ConnectionTrait>(
     if let Some(outcome) = terminal_task_transition_guard(task_id, model.status.as_str(), status) {
         return Ok(outcome);
     }
-
-    let error_json = error
-        .map(|value| serde_json::to_string(value).context("failed to serialize task error"))
-        .transpose()?;
 
     let result = task::Entity::update_many()
         .filter(task::Column::Id.eq(task_id.to_owned()))

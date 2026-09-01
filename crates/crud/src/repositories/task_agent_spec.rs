@@ -8,8 +8,24 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder
 
 use crate::util::{optional_typed_json_to_db, typed_json_to_db, unix_to_datetime};
 
+#[derive(Clone, Debug)]
+pub struct PreparedTaskAgentSpecProjection(task_agent_spec::ActiveModel);
+
+pub fn prepare_agent_spec_projection(
+    spec: &TaskAgentSpec,
+) -> Result<PreparedTaskAgentSpecProjection> {
+    active_model_from_spec(spec).map(PreparedTaskAgentSpecProjection)
+}
+
 pub async fn upsert_agent_spec<C: ConnectionTrait>(db: &C, spec: &TaskAgentSpec) -> Result<()> {
-    task_agent_spec::Entity::insert(active_model_from_spec(spec)?)
+    upsert_prepared_agent_spec(db, prepare_agent_spec_projection(spec)?).await
+}
+
+pub async fn upsert_prepared_agent_spec<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskAgentSpecProjection,
+) -> Result<()> {
+    task_agent_spec::Entity::insert(prepared.0)
         .on_conflict(
             OnConflict::column(task_agent_spec::Column::Id)
                 .update_columns([

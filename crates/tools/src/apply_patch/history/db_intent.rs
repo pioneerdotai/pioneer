@@ -146,6 +146,11 @@ impl SqliteCommitIntentStore {
         if let Some(plan) = recovery_plan.as_ref() {
             validate_recovery_plan(plan)?;
         }
+        let operations_json = encode_bounded_json(
+            &planned_operation_fingerprints,
+            "patch intent operation fingerprints",
+        )?;
+        let recovery_json = encode_bounded_json(&recovery_plan, "patch intent recovery plan")?;
         let ordinal_lock = turn_admission_lock(&identity)?;
         let _ordinal_guard = timeout(INTENT_ADMISSION_TIMEOUT, ordinal_lock.lock())
             .await
@@ -163,18 +168,17 @@ impl SqliteCommitIntentStore {
         .await
         .context("query existing next patch intent")?;
         if let Some(row) = existing {
+            transaction
+                .rollback()
+                .await
+                .context("release existing next patch intent transaction")?;
             let current = decode_row(&identity, &row)?;
             if current.plan_fingerprint != plan_fingerprint
                 || current.planned_operation_fingerprints != planned_operation_fingerprints
                 || current.recovery_plan != recovery_plan
             {
-                transaction.rollback().await.ok();
                 bail!("patch intent identity is bound to a different immutable plan");
             }
-            transaction
-                .commit()
-                .await
-                .context("commit existing next patch intent")?;
             return Ok((current, false));
         }
         if let Some(row) = crud::find_patch_commit_terminal(
@@ -186,17 +190,16 @@ impl SqliteCommitIntentStore {
         .await
         .context("query compacted next patch intent")?
         {
+            transaction
+                .rollback()
+                .await
+                .context("release compacted next patch intent transaction")?;
             let current = decode_terminal_row(&identity, &row)?;
             if current.plan_fingerprint != plan_fingerprint
                 || current.planned_operation_fingerprints != planned_operation_fingerprints
             {
-                transaction.rollback().await.ok();
                 bail!("patch intent identity is bound to a different immutable plan");
             }
-            transaction
-                .commit()
-                .await
-                .context("commit existing compacted next patch intent")?;
             return Ok((current, false));
         }
         let next_ordinal =
@@ -213,12 +216,6 @@ impl SqliteCommitIntentStore {
             committed_changes: Vec::new(),
             status: IntentStatus::Pending,
         };
-        let operations_json = encode_bounded_json(
-            &intent.planned_operation_fingerprints,
-            "patch intent operation fingerprints",
-        )?;
-        let recovery_json =
-            encode_bounded_json(&intent.recovery_plan, "patch intent recovery plan")?;
         crud::insert_patch_commit_intent(
             &transaction,
             crud::PatchCommitIntentWrite {
@@ -247,13 +244,9 @@ impl SqliteCommitIntentStore {
         if intent.plan_fingerprint.iter().all(|byte| *byte == 0) {
             bail!("patch intent plan fingerprint must not be all zeroes");
         }
-        let transaction = timeout(INTENT_ADMISSION_TIMEOUT, self.db.begin())
-            .await
-            .context("patch intent progress database admission timed out")?
-            .context("begin patch intent progress")?;
         let expected_ordinal = sqlite_ordinal(intent.commit_ordinal)?;
         let current = crud::find_patch_commit_intent(
-            &transaction,
+            &self.db,
             &intent.identity.thread_id,
             &intent.identity.turn_id,
             &intent.identity.invocation_id,
@@ -261,7 +254,6 @@ impl SqliteCommitIntentStore {
         .await
         .context("load patch intent before progress update")?;
         let Some(current) = current.filter(|row| row.commit_ordinal == expected_ordinal) else {
-            transaction.rollback().await.ok();
             bail!("patch intent disappeared before progress update");
         };
         let stored_fingerprint: [u8; 32] = current
@@ -282,7 +274,6 @@ impl SqliteCommitIntentStore {
             || stored_operations != intent.planned_operation_fingerprints
             || stored_recovery != intent.recovery_plan
         {
-            transaction.rollback().await.ok();
             bail!("patch intent immutable plan does not match the durable record");
         }
         let current_progress: Vec<crate::apply_patch::history::CommittedPatchChange> =
@@ -292,7 +283,6 @@ impl SqliteCommitIntentStore {
         if intent.committed_changes.len() < current_progress.len()
             || intent.committed_changes[..current_progress.len()] != current_progress[..]
         {
-            transaction.rollback().await.ok();
             bail!("patch intent progress must extend the already durable committed prefix");
         }
         let progress_json =
@@ -301,13 +291,16 @@ impl SqliteCommitIntentStore {
         if current_status != IntentStatus::Pending
             && (current_status != intent.status || current_progress != intent.committed_changes)
         {
-            transaction.rollback().await.ok();
             bail!(
                 "patch intent status transition {:?} -> {:?} or progress replacement is not allowed",
                 current_status,
                 intent.status
             );
         }
+        let transaction = timeout(INTENT_ADMISSION_TIMEOUT, self.db.begin())
+            .await
+            .context("patch intent progress database admission timed out")?
+            .context("begin patch intent progress")?;
         let updated = crud::update_patch_commit_intent_progress(
             &transaction,
             &intent.identity.thread_id,
@@ -315,12 +308,13 @@ impl SqliteCommitIntentStore {
             &intent.identity.invocation_id,
             expected_ordinal,
             status_name(current_status),
+            &current.progress_json,
             progress_json,
             status_name(intent.status).to_owned(),
         )
         .await
         .context("update patch intent progress")?;
-        if updated == 0 {
+        if updated != 1 {
             transaction.rollback().await.ok();
             bail!("patch intent progress update lost a concurrent transition");
         }
@@ -525,23 +519,19 @@ impl SqliteCommitIntentStore {
     /// startup recovery.
     pub async fn compact_terminal(&self, identity: &InvocationIdentity) -> Result<bool> {
         validate_identity(identity)?;
-        let transaction = timeout(INTENT_ADMISSION_TIMEOUT, self.db.begin())
-            .await
-            .context("patch intent compaction database admission timed out")?
-            .context("begin patch intent compaction")?;
         let Some(row) = crud::find_patch_commit_intent(
-            &transaction,
+            &self.db,
             &identity.thread_id,
             &identity.turn_id,
             &identity.invocation_id,
         )
         .await
-        .context("load terminal patch intent for compaction")?
+        .context("preflight terminal patch intent for compaction")?
         else {
-            transaction.rollback().await.ok();
             return Ok(false);
         };
         let ordinal = row.commit_ordinal;
+        let expected_updated_at = row.updated_at;
         let fingerprint = row.plan_fingerprint;
         let operations_json = row.operations_json;
         let recovery_json = row.recovery_json;
@@ -568,8 +558,41 @@ impl SqliteCommitIntentStore {
             status.as_str(),
             "promoted" | "applied_no_change" | "failed_no_change" | "rejected" | "gap"
         ) {
-            transaction.rollback().await.ok();
             bail!("only terminal patch intents may be compacted");
+        }
+        let terminal_write = crud::PatchCommitTerminalWrite {
+            thread_id: identity.thread_id.clone(),
+            turn_id: identity.turn_id.clone(),
+            invocation_id: identity.invocation_id.clone(),
+            commit_ordinal: ordinal,
+            plan_fingerprint: fingerprint,
+            operations_json,
+            authority: authority_name(authority).to_owned(),
+            status: status.clone(),
+            record_id: None,
+        };
+        let transaction = timeout(INTENT_ADMISSION_TIMEOUT, self.db.begin())
+            .await
+            .context("patch intent compaction database admission timed out")?
+            .context("begin patch intent compaction")?;
+        let Some(current) = crud::find_patch_commit_intent(
+            &transaction,
+            &identity.thread_id,
+            &identity.turn_id,
+            &identity.invocation_id,
+        )
+        .await
+        .context("revalidate terminal patch intent for compaction")?
+        else {
+            transaction.rollback().await.ok();
+            return Ok(false);
+        };
+        if current.commit_ordinal != ordinal
+            || current.updated_at != expected_updated_at
+            || current.status != status
+        {
+            transaction.rollback().await.ok();
+            bail!("patch intent changed while terminal compaction was being prepared");
         }
         let record_id = crud::find_applied_patch_record_by_invocation(
             &transaction,
@@ -583,15 +606,8 @@ impl SqliteCommitIntentStore {
         crud::upsert_patch_commit_terminal(
             &transaction,
             crud::PatchCommitTerminalWrite {
-                thread_id: identity.thread_id.clone(),
-                turn_id: identity.turn_id.clone(),
-                invocation_id: identity.invocation_id.clone(),
-                commit_ordinal: ordinal,
-                plan_fingerprint: fingerprint,
-                operations_json,
-                authority: authority_name(authority).to_owned(),
-                status,
                 record_id,
+                ..terminal_write
             },
         )
         .await

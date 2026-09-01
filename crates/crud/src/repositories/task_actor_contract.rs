@@ -154,6 +154,102 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedTaskOccurrenceRetry {
+    occurrence_id: String,
+    task_id: String,
+    run_id: String,
+    action_idempotency_key: String,
+    expected_status: String,
+    expected_retry_attempt: i64,
+    status: String,
+    retry_attempt: i64,
+    queue_position: Option<i64>,
+    terminal_reason: Option<String>,
+    updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+}
+
+pub fn prepare_task_occurrence_retry(
+    current: &TaskOccurrenceContract,
+    next: &TaskOccurrenceContract,
+    now: i64,
+) -> Result<PreparedTaskOccurrenceRetry> {
+    current
+        .validate()
+        .map_err(|error| anyhow!("invalid current task occurrence contract: {error:?}"))?;
+    next.validate()
+        .map_err(|error| anyhow!("invalid resumed task occurrence contract: {error:?}"))?;
+    validate_occurrence_update(current, next)?;
+    if current.run_id != next.run_id {
+        bail!("a resumed task occurrence cannot change its run");
+    }
+
+    Ok(PreparedTaskOccurrenceRetry {
+        occurrence_id: next.occurrence_id.clone(),
+        task_id: next.task_id.clone(),
+        run_id: next.run_id.clone(),
+        action_idempotency_key: next.action_idempotency_key.clone(),
+        expected_status: serde_json::to_string(&current.status)?
+            .trim_matches('"')
+            .to_owned(),
+        expected_retry_attempt: i64::from(current.retry_attempt),
+        status: serde_json::to_string(&next.status)?
+            .trim_matches('"')
+            .to_owned(),
+        retry_attempt: i64::from(next.retry_attempt),
+        queue_position: next
+            .queue_position
+            .map(i64::try_from)
+            .transpose()
+            .context("task occurrence queue position overflow")?,
+        terminal_reason: next.terminal_reason.clone(),
+        updated_at: unix_to_datetime(now),
+    })
+}
+
+/// Applies a prevalidated occurrence retry using an optimistic fence. All
+/// protocol validation and enum serialization happen before the writer is
+/// acquired.
+pub async fn apply_prepared_task_occurrence_retry<C: ConnectionTrait>(
+    db: &C,
+    prepared: &PreparedTaskOccurrenceRetry,
+) -> Result<bool> {
+    let result = task_occurrence_contract::Entity::update_many()
+        .filter(task_occurrence_contract::Column::OccurrenceId.eq(prepared.occurrence_id.clone()))
+        .filter(task_occurrence_contract::Column::TaskId.eq(prepared.task_id.clone()))
+        .filter(task_occurrence_contract::Column::RunId.eq(prepared.run_id.clone()))
+        .filter(
+            task_occurrence_contract::Column::ActionIdempotencyKey
+                .eq(prepared.action_idempotency_key.clone()),
+        )
+        .filter(task_occurrence_contract::Column::Status.eq(prepared.expected_status.clone()))
+        .filter(task_occurrence_contract::Column::RetryAttempt.eq(prepared.expected_retry_attempt))
+        .col_expr(
+            task_occurrence_contract::Column::Status,
+            sea_orm::sea_query::Expr::value(prepared.status.clone()),
+        )
+        .col_expr(
+            task_occurrence_contract::Column::RetryAttempt,
+            sea_orm::sea_query::Expr::value(prepared.retry_attempt),
+        )
+        .col_expr(
+            task_occurrence_contract::Column::QueuePosition,
+            sea_orm::sea_query::Expr::value(prepared.queue_position),
+        )
+        .col_expr(
+            task_occurrence_contract::Column::TerminalReason,
+            sea_orm::sea_query::Expr::value(prepared.terminal_reason.clone()),
+        )
+        .col_expr(
+            task_occurrence_contract::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(prepared.updated_at),
+        )
+        .exec(db)
+        .await
+        .context("failed to apply prepared task occurrence retry")?;
+    Ok(result.rows_affected == 1)
+}
+
 fn validate_occurrence_update(
     persisted: &TaskOccurrenceContract,
     candidate: &TaskOccurrenceContract,
@@ -315,6 +411,51 @@ pub(crate) async fn upsert_task_delivery_authority<C: ConnectionTrait>(
     status: &str,
     now: i64,
 ) -> Result<()> {
+    let prepared = prepare_task_delivery_authority(
+        delivery_id,
+        task_id,
+        run_id,
+        author_json,
+        reviewer_json,
+        destination_route_id,
+        route_receipt_json,
+        disclosure_generation,
+        idempotency_key,
+        status,
+        now,
+    )?;
+    upsert_prepared_task_delivery_authority(db, prepared).await
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedTaskDeliveryAuthority {
+    delivery_id: String,
+    task_id: String,
+    run_id: String,
+    author_json: String,
+    reviewer_json: Option<String>,
+    destination_route_id: Option<String>,
+    route_receipt_json: Option<String>,
+    disclosure_generation: i64,
+    idempotency_key: String,
+    status: String,
+    now: sea_orm::entity::prelude::DateTimeWithTimeZone,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_task_delivery_authority(
+    delivery_id: &str,
+    task_id: &str,
+    run_id: &str,
+    author_json: &str,
+    reviewer_json: Option<&str>,
+    destination_route_id: Option<&str>,
+    route_receipt_json: Option<&str>,
+    disclosure_generation: u64,
+    idempotency_key: &str,
+    status: &str,
+    now: i64,
+) -> Result<PreparedTaskDeliveryAuthority> {
     if delivery_id.trim().is_empty() || task_id.trim().is_empty() || run_id.trim().is_empty() {
         bail!("task delivery authority ids must not be empty");
     }
@@ -337,20 +478,39 @@ pub(crate) async fn upsert_task_delivery_authority<C: ConnectionTrait>(
     if destination_route_id.is_some() != route_receipt_json.is_some() {
         bail!("task delivery authority has incomplete exact route facts");
     }
+    Ok(PreparedTaskDeliveryAuthority {
+        delivery_id: delivery_id.to_owned(),
+        task_id: task_id.to_owned(),
+        run_id: run_id.to_owned(),
+        author_json: author_json.to_owned(),
+        reviewer_json: reviewer_json.map(str::to_owned),
+        destination_route_id: destination_route_id.map(str::to_owned),
+        route_receipt_json: route_receipt_json.map(str::to_owned),
+        disclosure_generation: i64::try_from(disclosure_generation)
+            .context("delivery disclosure generation overflow")?,
+        idempotency_key: idempotency_key.to_owned(),
+        status: status.to_owned(),
+        now: unix_to_datetime(now),
+    })
+}
+
+pub(crate) async fn upsert_prepared_task_delivery_authority<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskDeliveryAuthority,
+) -> Result<()> {
     task_delivery_authority::Entity::insert(task_delivery_authority::ActiveModel {
-        delivery_id: Set(delivery_id.to_owned()),
-        task_id: Set(task_id.to_owned()),
-        run_id: Set(run_id.to_owned()),
-        author_json: Set(author_json.to_owned()),
-        reviewer_json: Set(reviewer_json.map(str::to_owned)),
-        destination_route_id: Set(destination_route_id.map(str::to_owned)),
-        route_receipt_json: Set(route_receipt_json.map(str::to_owned)),
-        disclosure_generation: Set(i64::try_from(disclosure_generation)
-            .context("delivery disclosure generation overflow")?),
-        idempotency_key: Set(idempotency_key.to_owned()),
-        status: Set(status.to_owned()),
-        created_at: Set(unix_to_datetime(now)),
-        updated_at: Set(unix_to_datetime(now)),
+        delivery_id: Set(prepared.delivery_id.clone()),
+        task_id: Set(prepared.task_id.clone()),
+        run_id: Set(prepared.run_id.clone()),
+        author_json: Set(prepared.author_json.clone()),
+        reviewer_json: Set(prepared.reviewer_json.clone()),
+        destination_route_id: Set(prepared.destination_route_id.clone()),
+        route_receipt_json: Set(prepared.route_receipt_json.clone()),
+        disclosure_generation: Set(prepared.disclosure_generation),
+        idempotency_key: Set(prepared.idempotency_key.clone()),
+        status: Set(prepared.status.clone()),
+        created_at: Set(prepared.now),
+        updated_at: Set(prepared.now),
     })
     .on_conflict(
         OnConflict::column(task_delivery_authority::Column::DeliveryId)
@@ -360,24 +520,23 @@ pub(crate) async fn upsert_task_delivery_authority<C: ConnectionTrait>(
     .exec_without_returning(db)
     .await
     .context("failed to insert task delivery authority")?;
-    let persisted = task_delivery_authority::Entity::find_by_id(delivery_id.to_owned())
+    let persisted = task_delivery_authority::Entity::find_by_id(prepared.delivery_id.clone())
         .one(db)
         .await
         .context("failed to reload task delivery authority")?
         .context("task delivery authority disappeared after insert")?;
-    if persisted.task_id != task_id
-        || persisted.run_id != run_id
-        || persisted.author_json != author_json
-        || persisted.reviewer_json.as_deref() != reviewer_json
-        || persisted.destination_route_id.as_deref() != destination_route_id
-        || persisted.route_receipt_json.as_deref() != route_receipt_json
-        || persisted.disclosure_generation
-            != i64::try_from(disclosure_generation)
-                .context("delivery disclosure generation overflow")?
-        || persisted.idempotency_key != idempotency_key
+    if persisted.task_id != prepared.task_id
+        || persisted.run_id != prepared.run_id
+        || persisted.author_json != prepared.author_json
+        || persisted.reviewer_json != prepared.reviewer_json
+        || persisted.destination_route_id != prepared.destination_route_id
+        || persisted.route_receipt_json != prepared.route_receipt_json
+        || persisted.disclosure_generation != prepared.disclosure_generation
+        || persisted.idempotency_key != prepared.idempotency_key
     {
         bail!("task delivery authority attempts to rewrite immutable actor/route facts");
     }
+    let status = prepared.status.as_str();
     let transition_allowed = match persisted.status.as_str() {
         "pending" => matches!(status, "pending" | "delivering" | "cancelled"),
         "delivering" => matches!(
@@ -399,19 +558,19 @@ pub(crate) async fn upsert_task_delivery_authority<C: ConnectionTrait>(
         let update = task_delivery_authority::Entity::update_many()
             .col_expr(
                 task_delivery_authority::Column::Status,
-                sea_orm::sea_query::Expr::value(status.to_owned()),
+                sea_orm::sea_query::Expr::value(prepared.status.clone()),
             )
             .col_expr(
                 task_delivery_authority::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(unix_to_datetime(now)),
+                sea_orm::sea_query::Expr::value(prepared.now),
             )
-            .filter(task_delivery_authority::Column::DeliveryId.eq(delivery_id.to_owned()))
+            .filter(task_delivery_authority::Column::DeliveryId.eq(prepared.delivery_id.clone()))
             .filter(task_delivery_authority::Column::Status.eq(persisted.status.clone()))
             .exec(db)
             .await
             .context("failed to advance task delivery authority status")?;
         if update.rows_affected != 1 {
-            let current = task_delivery_authority::Entity::find_by_id(delivery_id.to_owned())
+            let current = task_delivery_authority::Entity::find_by_id(prepared.delivery_id.clone())
                 .one(db)
                 .await
                 .context("failed to recheck concurrent task delivery authority transition")?;

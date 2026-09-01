@@ -25,53 +25,52 @@ impl SqliteTurnDiffStore {
 
     pub async fn upsert(&self, state: &TurnDiffState) -> Result<bool> {
         let payload = encode_state(state)?;
-        let transaction = self
-            .db
-            .begin()
-            .await
-            .context("begin turn diff projection")?;
-        let existing = find_turn_diff_state(&transaction, &state.thread_id, &state.turn_id)
+        let existing = find_turn_diff_state(&self.db, &state.thread_id, &state.turn_id)
             .await
             .context("query turn diff projection")?;
-        if let Some(existing) = existing {
+        if let Some(existing) = existing.as_ref() {
             let existing_json = existing.state_json.clone();
             let existing_state = decode_state(&existing_json, &state.thread_id, &state.turn_id)?;
-            let (revision, final_state) = validate_projection_row(&existing, &existing_state)?;
+            let (revision, final_state) = validate_projection_row(existing, &existing_state)?;
             if final_state != 0 {
                 if existing_json == payload {
-                    transaction
-                        .commit()
-                        .await
-                        .context("commit idempotent final projection")?;
                     return Ok(false);
                 }
-                transaction.rollback().await.ok();
                 return Err(anyhow!("final turn diff state is immutable"));
             }
             let revision = u64::try_from(revision)
                 .map_err(|_| anyhow!("stored turn diff revision is negative"))?;
             if state.revision < revision {
-                transaction.rollback().await.ok();
                 return Err(anyhow!("turn diff projection revision is stale"));
             }
             if state.revision == revision {
                 if existing_json == payload {
-                    transaction
-                        .commit()
-                        .await
-                        .context("commit idempotent projection")?;
                     return Ok(false);
                 }
                 let finalization_only = state.final_state
                     && final_state == 0
                     && same_projection_ignoring_terminal(&existing_state, state);
                 if !finalization_only {
-                    transaction.rollback().await.ok();
                     return Err(anyhow!("turn diff projection revision conflicts"));
                 }
             }
         }
-        upsert_turn_diff_state(&transaction, projection_write(state, payload)?)
+        let write = projection_write(state, payload)?;
+        let transaction = self
+            .db
+            .begin()
+            .await
+            .context("begin turn diff projection")?;
+        let current = find_turn_diff_state(&transaction, &state.thread_id, &state.turn_id)
+            .await
+            .context("revalidate turn diff projection")?;
+        if current != existing {
+            transaction.rollback().await.ok();
+            return Err(anyhow!(
+                "turn diff projection changed while its write was preparing"
+            ));
+        }
+        upsert_turn_diff_state(&transaction, write)
             .await
             .context("upsert turn diff projection")?;
         transaction
@@ -89,36 +88,25 @@ impl SqliteTurnDiffStore {
     /// published concurrently by the live path.
     pub async fn repair_live(&self, state: &TurnDiffState) -> Result<bool> {
         let payload = encode_state(state)?;
-        let transaction = self
-            .db
-            .begin()
+        let existing = find_turn_diff_state(&self.db, &state.thread_id, &state.turn_id)
             .await
-            .context("begin turn diff projection repair")?;
-        if let Some(existing) = find_turn_diff_state(&transaction, &state.thread_id, &state.turn_id)
-            .await
-            .context("query projection before repair")?
-        {
+            .context("query projection before repair")?;
+        if let Some(existing) = existing.as_ref() {
             let existing_json = existing.state_json.clone();
             let existing_state = decode_state(&existing_json, &state.thread_id, &state.turn_id)?;
             let (existing_revision, final_state) =
-                validate_projection_row(&existing, &existing_state)?;
+                validate_projection_row(existing, &existing_state)?;
             let existing_revision = u64::try_from(existing_revision)
                 .map_err(|_| anyhow!("stored turn diff revision is negative"))?;
             if final_state != 0 {
                 if existing_json == payload {
-                    transaction
-                        .commit()
-                        .await
-                        .context("commit idempotent projection repair")?;
                     return Ok(false);
                 }
-                transaction.rollback().await.ok();
                 return Err(anyhow::anyhow!(
                     "final turn diff state is immutable during repair"
                 ));
             }
             if state.revision < existing_revision {
-                transaction.rollback().await.ok();
                 return Ok(false);
             }
             // Finalization intentionally changes only the final_state bit at
@@ -129,14 +117,26 @@ impl SqliteTurnDiffStore {
                     && final_state == 0
                     && same_projection_ignoring_terminal(&existing_state, state);
                 if !finalization_only {
-                    transaction.rollback().await.ok();
                     return Err(anyhow!(
                         "turn diff repair conflicts at an existing projection revision"
                     ));
                 }
             }
         }
-        upsert_turn_diff_state(&transaction, projection_write(state, payload)?)
+        let write = projection_write(state, payload)?;
+        let transaction = self
+            .db
+            .begin()
+            .await
+            .context("begin turn diff projection repair")?;
+        let current = find_turn_diff_state(&transaction, &state.thread_id, &state.turn_id)
+            .await
+            .context("revalidate projection before repair")?;
+        if current != existing {
+            transaction.rollback().await.ok();
+            return Ok(false);
+        }
+        upsert_turn_diff_state(&transaction, write)
             .await
             .context("repair turn diff projection")?;
         transaction

@@ -52,6 +52,115 @@ struct DecodedRecordDelta {
     side_effects: crate::apply_patch::history::PatchSideEffects,
 }
 
+struct PreparedAppliedPatchRecord {
+    id: String,
+    schema_version: i64,
+    thread_id: String,
+    turn_id: String,
+    invocation_id: String,
+    environment_id: String,
+    commit_ordinal: i64,
+    authority: String,
+    provenance: String,
+    exactness: String,
+    committed_at_unix_ms: i64,
+    plan_fingerprint: Vec<u8>,
+    outcome_json: String,
+    changes_json: String,
+    change_index_rows: Vec<crud::AppliedPatchChangeIndexWrite>,
+}
+
+impl PreparedAppliedPatchRecord {
+    fn prepare(record: &AppliedPatchRecord, plan_fingerprint: [u8; 32]) -> Result<Self> {
+        validate_record(record).map_err(|error| anyhow!(error))?;
+        validate_fingerprint(plan_fingerprint)?;
+        let id = record_id(&record.identity, record.commit_ordinal.0);
+        let commit_ordinal = sqlite_ordinal(record.commit_ordinal)?;
+        let change_index_rows = record
+            .changes
+            .iter()
+            .map(|change| {
+                Ok(crud::AppliedPatchChangeIndexWrite {
+                    record_id: id.clone(),
+                    thread_id: record.identity.thread_id.clone(),
+                    turn_id: record.identity.turn_id.clone(),
+                    invocation_id: record.identity.invocation_id.clone(),
+                    environment_id: record.environment_id.clone(),
+                    commit_ordinal,
+                    sequence: i64::from(change.sequence),
+                    source_path: change.source_path.clone(),
+                    destination_path: change.destination_path.clone(),
+                    change_json: serde_json::to_string(change)
+                        .context("encode patch change index")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            id,
+            schema_version: i64::from(record.schema_version),
+            thread_id: record.identity.thread_id.clone(),
+            turn_id: record.identity.turn_id.clone(),
+            invocation_id: record.identity.invocation_id.clone(),
+            environment_id: record.environment_id.clone(),
+            commit_ordinal,
+            authority: authority_name(record.authority).to_owned(),
+            provenance: provenance_name(record.provenance).to_owned(),
+            exactness: exactness_name(record.exactness).to_owned(),
+            committed_at_unix_ms: record.committed_at_unix_ms,
+            plan_fingerprint: plan_fingerprint.to_vec(),
+            outcome_json: serde_json::to_string(&record.outcome).context("encode patch outcome")?,
+            changes_json: serde_json::to_string(&PersistedRecordDelta {
+                changes: &record.changes,
+                side_effects: &record.side_effects,
+            })
+            .context("encode patch delta")?,
+            change_index_rows,
+        })
+    }
+
+    fn matches(&self, row: &crud::AppliedPatchRecordRow) -> bool {
+        row.id == self.id
+            && row.schema_version == self.schema_version
+            && row.thread_id == self.thread_id
+            && row.turn_id == self.turn_id
+            && row.invocation_id == self.invocation_id
+            && row.environment_id == self.environment_id
+            && row.commit_ordinal == self.commit_ordinal
+            && row.authority == self.authority
+            && row.provenance == self.provenance
+            && row.exactness == self.exactness
+            && row.committed_at_unix_ms == self.committed_at_unix_ms
+            && row.plan_fingerprint == self.plan_fingerprint
+            && row.outcome_json == self.outcome_json
+            && row.changes_json == self.changes_json
+    }
+
+    fn into_writes(
+        self,
+    ) -> (
+        crud::AppliedPatchRecordWrite,
+        Vec<crud::AppliedPatchChangeIndexWrite>,
+    ) {
+        let record = crud::AppliedPatchRecordWrite {
+            id: self.id,
+            schema_version: self.schema_version,
+            thread_id: self.thread_id,
+            turn_id: self.turn_id,
+            invocation_id: self.invocation_id,
+            environment_id: self.environment_id,
+            commit_ordinal: self.commit_ordinal,
+            authority: self.authority,
+            provenance: self.provenance,
+            exactness: self.exactness,
+            committed_at_unix_ms: self.committed_at_unix_ms,
+            plan_fingerprint: self.plan_fingerprint,
+            outcome_json: self.outcome_json,
+            changes_json: self.changes_json,
+        };
+        (record, self.change_index_rows)
+    }
+}
+
 pub(crate) fn decode_persisted_record_delta(
     changes_json: &str,
 ) -> Result<(
@@ -102,6 +211,31 @@ impl SqliteAppliedPatchStore {
         validate_record(&record).map_err(|error| anyhow!(error))?;
         validate_fingerprint(plan_fingerprint)?;
         validate_snapshot_inputs(&record, snapshots)?;
+        // Decode a pre-existing immutable record before reserving the writer.
+        // The transaction rechecks its stable ID, so an at-least-once replay
+        // preserves semantic JSON compatibility without parsing large JSON
+        // while the physical writer is held.
+        let preflight_existing = crud::find_applied_patch_record_by_invocation(
+            &self.db,
+            &record.identity.thread_id,
+            &record.identity.turn_id,
+            &record.identity.invocation_id,
+        )
+        .await
+        .context("preflight patch record idempotency key")?;
+        let preflight_idempotent_id = preflight_existing
+            .as_ref()
+            .map(|row| {
+                decode_row(row).map(|stored| {
+                    (stored.plan_fingerprint == plan_fingerprint && stored.record == record)
+                        .then(|| row.id.clone())
+                })
+            })
+            .transpose()?
+            .flatten();
+        let snapshot_store = crate::apply_patch::history::SqliteSnapshotStore::new(self.db.clone());
+        let prepared_snapshots = snapshot_store.prepare_snapshots(domain, snapshots)?;
+        let prepared_record = PreparedAppliedPatchRecord::prepare(&record, plan_fingerprint)?;
         let transaction = self
             .db
             .begin()
@@ -113,28 +247,32 @@ impl SqliteAppliedPatchStore {
         // reservation and keeps the tracked invocation fail-closed.
         SqliteSnapshotStore::release_reservation_in_transaction(&transaction, &record.identity)
             .await?;
-        let existing = self
-            .lookup_in_transaction(&transaction, &record.identity)
-            .await?;
+        let existing = crud::find_applied_patch_record_by_invocation(
+            &transaction,
+            &record.identity.thread_id,
+            &record.identity.turn_id,
+            &record.identity.invocation_id,
+        )
+        .await
+        .context("look up patch record in transaction")?;
         if let Some(existing) = existing {
-            if existing.plan_fingerprint != plan_fingerprint || existing.record != record {
+            let semantically_identical_preflight = preflight_idempotent_id
+                .as_deref()
+                .is_some_and(|id| id == existing.id);
+            if !prepared_record.matches(&existing) && !semantically_identical_preflight {
                 let _ = transaction.rollback().await;
                 return Err(anyhow!(RecordStoreError::ConflictingDuplicate {
                     identity: record.identity,
                 }));
             }
-            let snapshot_store =
-                crate::apply_patch::history::SqliteSnapshotStore::new(self.db.clone());
             let mut required_references = HashMap::<([u8; 32], u64), i64>::new();
-            for snapshot in snapshots {
+            for snapshot in prepared_snapshots {
+                let reference = snapshot.reference.clone();
                 snapshot_store
-                    .put_in_transaction(&transaction, domain, snapshot, false)
+                    .put_prepared_in_transaction(&transaction, snapshot, false)
                     .await?;
                 *required_references
-                    .entry((
-                        *snapshot.version.token.digest(),
-                        snapshot.bytes.len() as u64,
-                    ))
+                    .entry((reference.snapshot.content_hash, reference.snapshot.byte_len))
                     .or_default() += 1;
             }
             for ((content_hash, byte_len), required) in required_references {
@@ -148,22 +286,29 @@ impl SqliteAppliedPatchStore {
                 .await
                 .context("repair existing patch snapshot references")?;
             }
-            ensure_change_index(&transaction, &existing.record).await?;
+            ensure_prepared_change_index(
+                &transaction,
+                &prepared_record.id,
+                prepared_record.change_index_rows,
+            )
+            .await?;
             transaction
                 .commit()
                 .await
                 .context("commit idempotent patch record and snapshot repair")?;
-            return Ok(InsertedPatchRecord::Existing(existing));
+            return Ok(InsertedPatchRecord::Existing(StoredPatchRecord {
+                record,
+                plan_fingerprint,
+            }));
         }
 
-        let snapshot_store = crate::apply_patch::history::SqliteSnapshotStore::new(self.db.clone());
-        for snapshot in snapshots {
+        for snapshot in prepared_snapshots {
             snapshot_store
-                .put_in_transaction(&transaction, domain, snapshot, true)
+                .put_prepared_in_transaction(&transaction, snapshot, true)
                 .await?;
         }
         let result = self
-            .insert_in_transaction(&transaction, record, plan_fingerprint)
+            .insert_in_transaction(&transaction, record, plan_fingerprint, prepared_record)
             .await;
         match result {
             Ok(inserted) => {
@@ -185,9 +330,8 @@ impl SqliteAppliedPatchStore {
         transaction: &DatabaseTransaction,
         record: AppliedPatchRecord,
         plan_fingerprint: [u8; 32],
+        prepared: PreparedAppliedPatchRecord,
     ) -> Result<InsertedPatchRecord> {
-        validate_record(&record).map_err(|error| anyhow!(error))?;
-        validate_fingerprint(plan_fingerprint)?;
         let existing = crud::find_applied_patch_record_by_invocation(
             transaction,
             &record.identity.thread_id,
@@ -197,10 +341,13 @@ impl SqliteAppliedPatchStore {
         .await
         .context("look up patch record idempotency key")?;
         if let Some(row) = existing {
-            let stored = decode_row(&row)?;
-            if stored.plan_fingerprint == plan_fingerprint && stored.record == record {
-                ensure_change_index(transaction, &stored.record).await?;
-                return Ok(InsertedPatchRecord::Existing(stored));
+            if prepared.matches(&row) {
+                ensure_prepared_change_index(transaction, &prepared.id, prepared.change_index_rows)
+                    .await?;
+                return Ok(InsertedPatchRecord::Existing(StoredPatchRecord {
+                    record,
+                    plan_fingerprint,
+                }));
             }
             return Err(anyhow!(RecordStoreError::ConflictingDuplicate {
                 identity: record.identity,
@@ -222,61 +369,20 @@ impl SqliteAppliedPatchStore {
             );
         }
 
-        let id = record_id(&record.identity, record.commit_ordinal.0);
-        let outcome_json =
-            serde_json::to_string(&record.outcome).context("encode patch outcome")?;
-        let changes_json = serde_json::to_string(&PersistedRecordDelta {
-            changes: &record.changes,
-            side_effects: &record.side_effects,
-        })
-        .context("encode patch delta")?;
         #[cfg(test)]
         if self.fail_next_record_insert.swap(false, Ordering::SeqCst) {
             bail!("injected patch record failure");
         }
-        crud::insert_applied_patch_record(
-            transaction,
-            crud::AppliedPatchRecordWrite {
-                id,
-                schema_version: i64::from(record.schema_version),
-                thread_id: record.identity.thread_id.clone(),
-                turn_id: record.identity.turn_id.clone(),
-                invocation_id: record.identity.invocation_id.clone(),
-                environment_id: record.environment_id.clone(),
-                commit_ordinal: sqlite_ordinal(record.commit_ordinal)?,
-                authority: authority_name(record.authority).to_owned(),
-                provenance: provenance_name(record.provenance).to_owned(),
-                exactness: exactness_name(record.exactness).to_owned(),
-                committed_at_unix_ms: record.committed_at_unix_ms,
-                plan_fingerprint: plan_fingerprint.to_vec(),
-                outcome_json,
-                changes_json,
-            },
-        )
-        .await
-        .context("insert applied patch record")?;
-        ensure_change_index(transaction, &record).await?;
+        let (record_write, change_index_rows) = prepared.into_writes();
+        let record_id = record_write.id.clone();
+        crud::insert_applied_patch_record(transaction, record_write)
+            .await
+            .context("insert applied patch record")?;
+        ensure_prepared_change_index(transaction, &record_id, change_index_rows).await?;
         Ok(InsertedPatchRecord::Inserted(StoredPatchRecord {
             record,
             plan_fingerprint,
         }))
-    }
-
-    async fn lookup_in_transaction(
-        &self,
-        transaction: &DatabaseTransaction,
-        identity: &InvocationIdentity,
-    ) -> Result<Option<StoredPatchRecord>> {
-        crud::find_applied_patch_record_by_invocation(
-            transaction,
-            &identity.thread_id,
-            &identity.turn_id,
-            &identity.invocation_id,
-        )
-        .await
-        .context("look up patch record in transaction")?
-        .map(|row| decode_row(&row))
-        .transpose()
     }
 
     pub async fn get(&self, identity: &InvocationIdentity) -> Result<Option<StoredPatchRecord>> {
@@ -807,52 +913,94 @@ impl SqliteAppliedPatchStore {
 
     /// Delete one owning thread without materializing its complete history.
     ///
-    /// Records and their snapshot references are processed one at a time in a
-    /// single transaction.  This keeps explicit thread deletion bounded even
-    /// when a long-lived thread owns a large history.  Shared blobs remain
-    /// alive because each decrement is guarded by the durable reference count.
+    /// Records and their snapshot references are processed one at a time in
+    /// separate transactions. Each record remains atomic with all of its
+    /// reference decrements, while a long-lived thread cannot retain the
+    /// physical writer for its complete history. Shared blobs remain alive
+    /// because each decrement is guarded by the durable reference count.
     pub async fn delete_thread(&self, thread_id: &str) -> Result<u64> {
-        let transaction = self
-            .db
-            .begin()
-            .await
-            .context("begin patch thread deletion")?;
         let domain =
             SnapshotDomain::new(format!("thread:{thread_id}"), "pioneer", "thread_history");
         let domain_id = domain.id();
-        let mut last_turn_id: Option<String> = None;
-        let mut last_ordinal: Option<crate::apply_patch::history::CommitOrdinal> = None;
         let mut records_deleted = 0_u64;
         loop {
-            let after = match last_turn_id.as_deref().zip(last_ordinal) {
-                Some((turn_id, ordinal)) => Some((turn_id, sqlite_ordinal(ordinal)?)),
-                None => None,
-            };
-            let rows =
-                crud::list_applied_patch_records_for_thread(&transaction, thread_id, after, 1)
+            let expected =
+                crud::list_applied_patch_records_for_thread(&self.db, thread_id, None, 1)
                     .await
-                    .context("load one patch record for thread deletion")?;
-            let Some(row) = rows.into_iter().next() else {
-                break;
+                    .context("load one patch record before thread deletion quantum")?
+                    .into_iter()
+                    .next();
+            let Some(expected) = expected else {
+                let transaction = self
+                    .db
+                    .begin()
+                    .await
+                    .context("begin patch thread auxiliary-row deletion")?;
+                if !crud::list_applied_patch_records_for_thread(&transaction, thread_id, None, 1)
+                    .await
+                    .context("revalidate empty patch thread before auxiliary-row deletion")?
+                    .is_empty()
+                {
+                    transaction.rollback().await.ok();
+                    continue;
+                }
+                crud::delete_patch_history_auxiliary_rows_for_thread(&transaction, thread_id)
+                    .await
+                    .context("delete auxiliary patch history rows for thread")?;
+                transaction
+                    .commit()
+                    .await
+                    .context("commit patch thread auxiliary-row deletion")?;
+                return Ok(records_deleted);
             };
-            let stored = decode_row(&row)?;
+            // Parsing and validating the bounded immutable record may be CPU
+            // intensive, so finish it before reserving the writer. The raw
+            // row is compared again inside the transaction before mutation.
+            let stored = decode_row(&expected)?;
             let current_turn_id = stored.record.identity.turn_id.clone();
             let current_ordinal = stored.record.commit_ordinal;
+            let snapshot_references = stored
+                .record
+                .changes
+                .iter()
+                .flat_map(|change| {
+                    [
+                        change.before.as_ref(),
+                        change.after.as_ref(),
+                        change.overwritten_destination.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                })
+                .map(|snapshot| {
+                    Ok((
+                        snapshot.content_hash,
+                        sqlite_u64(snapshot.byte_len, "snapshot byte length")?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-            for snapshot in stored.record.changes.iter().flat_map(|change| {
-                [
-                    change.before.as_ref(),
-                    change.after.as_ref(),
-                    change.overwritten_destination.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-            }) {
-                let byte_len = sqlite_u64(snapshot.byte_len, "snapshot byte length")?;
+            let transaction = self
+                .db
+                .begin()
+                .await
+                .context("begin one patch record deletion quantum")?;
+            let current =
+                crud::list_applied_patch_records_for_thread(&transaction, thread_id, None, 1)
+                    .await
+                    .context("revalidate patch record deletion quantum")?
+                    .into_iter()
+                    .next();
+            if current.as_ref() != Some(&expected) {
+                transaction.rollback().await.ok();
+                continue;
+            }
+
+            for (content_hash, byte_len) in snapshot_references {
                 let updated = crud::decrement_patch_snapshot_reference(
                     &transaction,
                     &domain_id,
-                    &snapshot.content_hash,
+                    &content_hash,
                     byte_len,
                 )
                 .await
@@ -865,7 +1013,7 @@ impl SqliteAppliedPatchStore {
                 crud::delete_unreferenced_patch_snapshot(
                     &transaction,
                     &domain_id,
-                    &snapshot.content_hash,
+                    &content_hash,
                     byte_len,
                 )
                 .await
@@ -894,18 +1042,12 @@ impl SqliteAppliedPatchStore {
             records_deleted = records_deleted
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("patch deletion record count overflow"))?;
-            last_turn_id = Some(current_turn_id);
-            last_ordinal = Some(current_ordinal);
+            transaction
+                .commit()
+                .await
+                .context("commit one patch record deletion quantum")?;
+            tokio::task::yield_now().await;
         }
-
-        crud::delete_patch_history_auxiliary_rows_for_thread(&transaction, thread_id)
-            .await
-            .context("delete auxiliary patch history rows for thread")?;
-        transaction
-            .commit()
-            .await
-            .context("commit patch thread deletion")?;
-        Ok(records_deleted)
     }
 
     /// Durable adapters expose the same bounded query contract as the pure
@@ -1949,28 +2091,12 @@ fn parse_exactness(value: &str) -> Result<crate::apply_patch::history::PatchReco
     }
 }
 
-async fn ensure_change_index(
+async fn ensure_prepared_change_index(
     transaction: &DatabaseTransaction,
-    record: &AppliedPatchRecord,
+    record_id: &str,
+    rows: Vec<crud::AppliedPatchChangeIndexWrite>,
 ) -> Result<()> {
-    let record_id = record_id(&record.identity, record.commit_ordinal.0);
-    let mut rows = Vec::with_capacity(record.changes.len());
-    for change in &record.changes {
-        let change_json = serde_json::to_string(change).context("encode patch change index")?;
-        rows.push(crud::AppliedPatchChangeIndexWrite {
-            record_id: record_id.clone(),
-            thread_id: record.identity.thread_id.clone(),
-            turn_id: record.identity.turn_id.clone(),
-            invocation_id: record.identity.invocation_id.clone(),
-            environment_id: record.environment_id.clone(),
-            commit_ordinal: sqlite_ordinal(record.commit_ordinal)?,
-            sequence: i64::from(change.sequence),
-            source_path: change.source_path.clone(),
-            destination_path: change.destination_path.clone(),
-            change_json,
-        });
-    }
-    crud::replace_applied_patch_change_index(transaction, &record_id, rows)
+    crud::replace_applied_patch_change_index(transaction, record_id, rows)
         .await
         .context("replace applied patch change index rows")?;
     Ok(())

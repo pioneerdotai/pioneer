@@ -9,7 +9,7 @@ mod database;
 mod reader;
 mod writer;
 
-pub use database::SqliteDatabase;
+pub use database::{SqliteDatabase, SqliteReadTransaction};
 pub use reader::{
     DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS, SqliteReadClass, SqliteReadEvent, SqliteReadObserver,
     SqliteReadOutcome,

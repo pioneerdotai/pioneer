@@ -8,14 +8,13 @@ use sea_orm::ConnectionTrait;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_item_type_to_db, turn_status_to_db};
+use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_item_type_to_db};
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
 use crate::repositories::{
     identity, policy, self_improvement_source_turn, thread, turn, turn_item_attempt, turn_liveness,
 };
 use crate::turn_item_terminal::{
-    TurnItemTerminalState, attempt_status_from_payload, terminal_turn_item_status_from_payload,
-    terminalize_turn_item_payload,
+    attempt_status_from_payload, terminal_turn_item_status_from_payload,
 };
 use crate::util::unix_to_datetime;
 
@@ -46,48 +45,354 @@ enum TurnMessageMutationProjection<'a> {
     Delete(&'a TurnMessageDeletedEvent),
 }
 
+#[derive(Clone, Debug)]
+enum PreparedTurnMessageMutationProjection {
+    Superseded {
+        expected_turn: pioneer_entity::turn::Model,
+    },
+    Apply {
+        expected_turn: pioneer_entity::turn::Model,
+        expected_input_rows: Vec<pioneer_entity::turn_input::Model>,
+        expected_previous_revision: Option<pioneer_entity::turn_message_revision::Model>,
+        previous_preview: String,
+        replacement_preview: String,
+        preview_updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        already_projected: bool,
+        revision: Option<turn::PreparedTurnMessageRevision>,
+        mutation_state: turn::PreparedMessageTurnMutationState,
+    },
+}
+
 #[derive(Clone, Default)]
 pub struct TurnProjector;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreparedTurnProjection {
+    liveness: Option<turn_liveness::TurnLivenessObservation>,
+    item: Option<turn::PreparedTurnItemProjection>,
+    item_attempt_payload_json: Option<String>,
+    item_attempt_id: Option<String>,
+    item_attempt_failure_reason: Option<String>,
+    input: Option<turn::PreparedTurnInputProjection>,
+    terminal_running_attempts: Vec<turn_item_attempt::PreparedTerminalRunningAttempt>,
+    message_mutation: Option<PreparedTurnMessageMutationProjection>,
+    turn_upsert: Option<turn::PreparedTurnUpsert>,
+    thread_preview_author_json: Option<Option<String>>,
+    message_preview_author_json: Option<Option<String>>,
+    message_thread_preview: Option<String>,
+    task_run_parent_thread: Option<pioneer_protocol::Thread>,
+    self_improvement_source:
+        Option<self_improvement_source_turn::PreparedSelfImprovementSourceTurn>,
+    legacy_superuser_id: Option<Option<pioneer_protocol::PrincipalId>>,
+    status_history: Option<turn::PreparedTurnStatusHistory>,
+    append_status_history: bool,
+}
 
 impl TurnProjector {
     pub fn new() -> Self {
         Self
     }
 
-    pub async fn project<C: ConnectionTrait + Sync>(
+    pub(crate) async fn prepare<C: ConnectionTrait>(
         &self,
         db: &C,
-        event: &AppendedTurnEvent,
-    ) -> Result<()> {
-        let created_at = event.created_at;
-        if let Some(observation) = liveness_observation_from_event(event) {
-            turn_liveness::observe_activity(db, observation).await?;
-        }
-        let future: ProjectFuture<'_> = match &event.payload {
+        event_id: &str,
+        payload: &TurnEventPayload,
+        created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<PreparedTurnProjection> {
+        let mut prepared = PreparedTurnProjection {
+            liveness: liveness_observation_from_payload(payload, created_at),
+            ..Default::default()
+        };
+        match payload {
             TurnEventPayload::TurnStarted(payload) => {
-                project_future(self.project_turn_started(db, payload, event.sequence))
-            }
-            TurnEventPayload::ItemStarted(payload) => project_future(async move {
-                turn::upsert_turn_item(
+                let updated_at = unix_to_datetime(payload.thread.updated_at);
+                prepared.thread_preview_author_json = Some(thread::prepare_preview_author_json(
+                    payload.thread.preview_author.as_ref(),
+                )?);
+                prepared.message_preview_author_json = Some(thread::prepare_preview_author_json(
+                    payload.turn.author.as_ref(),
+                )?);
+                prepared.message_thread_preview =
+                    Some(message_thread_preview(payload.input.as_slice()));
+                if payload.turn.turn_kind == TurnKind::TaskRun {
+                    let mut parent = payload.thread.clone();
+                    parent.status = ThreadStatus::Idle;
+                    prepared.task_run_parent_thread = Some(parent);
+                }
+                if payload.actor.is_none() {
+                    prepared.legacy_superuser_id = Some(legacy_backfill_superuser_id(db).await?);
+                }
+                prepared.status_history = Some(turn::prepare_turn_status_history(
+                    payload.turn.id.as_str(),
+                    payload.turn.status,
+                    payload.turn.error.clone(),
+                    updated_at,
+                ));
+                prepared.input = Some(turn::prepare_turn_input_projection(
+                    payload.turn.id.as_str(),
+                    payload.input.as_slice(),
+                    created_at,
+                )?);
+                let turn_upsert = turn::prepare_projected_turn_upsert(
                     db,
+                    payload.turn.id.as_str(),
+                    payload.thread.id.as_str(),
+                    &payload.turn,
+                    None,
+                    payload.reasoning_effort.as_deref(),
+                    payload.actor.as_ref(),
+                    payload.actor.is_some(),
+                    false,
+                    updated_at,
+                    updated_at,
+                )
+                .await?;
+                prepared.append_status_history = turn_upsert
+                    .changes_status_history(payload.turn.status, payload.turn.error.as_deref());
+                prepared.turn_upsert = Some(turn_upsert);
+            }
+            TurnEventPayload::ItemStarted(payload) => {
+                let item = turn::prepare_turn_item_projection(
                     payload.turn_id.as_str(),
                     &payload.item,
                     Some(TURN_ITEM_STATUS_IN_PROGRESS),
                     created_at,
                     created_at,
+                )?;
+                prepared.item_attempt_payload_json = Some(item.payload_json().to_owned());
+                prepared.item_attempt_id = Some(pioneer_protocol::generate_id(21));
+                prepared.item = Some(item);
+            }
+            TurnEventPayload::ItemCompleted(payload) => {
+                let status = terminal_turn_item_status_from_payload(&payload.item);
+                if attempt_status_from_payload(&payload.item) == TurnItemAttemptStatus::Failed {
+                    prepared.item_attempt_failure_reason = Some(format!(
+                        "item `{}` completed with failed status",
+                        payload.item.item_id()
+                    ));
+                }
+                prepared.item = Some(turn::prepare_turn_item_projection(
+                    payload.turn_id.as_str(),
+                    &payload.item,
+                    Some(status),
+                    created_at,
+                    created_at,
+                )?);
+                prepared.self_improvement_source =
+                    self_improvement_source_turn::prepare_completed_collaborative_source_exchange(
+                        db, event_id, created_at, payload,
+                    )
+                    .await?;
+            }
+            TurnEventPayload::ItemUpdated(payload) => {
+                let status = terminal_turn_item_status_from_payload(&payload.item);
+                prepared.item = Some(turn::prepare_turn_item_projection(
+                    payload.turn_id.as_str(),
+                    &payload.item,
+                    Some(status),
+                    created_at,
+                    created_at,
+                )?);
+            }
+            TurnEventPayload::TurnMessageEdited(payload) => {
+                prepared.input = Some(turn::prepare_turn_input_projection(
+                    payload.turn.id.as_str(),
+                    payload.input.as_slice(),
+                    created_at,
+                )?);
+                prepared.message_mutation = Some(
+                    self.prepare_turn_message_mutation(
+                        db,
+                        TurnMessageMutationProjection::Edit(payload),
+                        created_at,
+                    )
+                    .await?,
+                );
+            }
+            TurnEventPayload::TurnMessageDeleted(payload) => {
+                prepared.input = Some(turn::prepare_turn_input_projection(
+                    payload.turn.id.as_str(),
+                    &[],
+                    created_at,
+                )?);
+                prepared.message_mutation = Some(
+                    self.prepare_turn_message_mutation(
+                        db,
+                        TurnMessageMutationProjection::Delete(payload),
+                        created_at,
+                    )
+                    .await?,
+                );
+            }
+            TurnEventPayload::TurnCompleted(payload) => {
+                prepared.status_history = Some(turn::prepare_turn_status_history(
+                    payload.turn.id.as_str(),
+                    payload.turn.status,
+                    payload.turn.error.clone(),
+                    created_at,
+                ));
+                prepared.self_improvement_source =
+                    self_improvement_source_turn::prepare_completed_source_turn(
+                        db, event_id, created_at, payload,
+                    )
+                    .await?;
+                let turn_upsert = turn::prepare_projected_turn_upsert(
+                    db,
+                    payload.turn.id.as_str(),
+                    payload.thread_id.as_str(),
+                    &payload.turn,
+                    None,
+                    None,
+                    None,
+                    false,
+                    true,
+                    created_at,
+                    created_at,
+                )
+                .await?;
+                prepared.append_status_history = turn_upsert
+                    .changes_status_history(payload.turn.status, payload.turn.error.as_deref());
+                prepared.turn_upsert = Some(turn_upsert);
+                prepared.terminal_running_attempts =
+                    turn_item_attempt::prepare_terminal_running_attempts(
+                        db,
+                        payload.turn.id.as_str(),
+                        created_at,
+                    )
+                    .await?;
+            }
+            TurnEventPayload::TurnFailed(payload) => {
+                prepared.status_history = Some(turn::prepare_turn_status_history(
+                    payload.turn.id.as_str(),
+                    payload.turn.status,
+                    payload.turn.error.clone(),
+                    created_at,
+                ));
+                let turn_upsert = turn::prepare_projected_turn_upsert(
+                    db,
+                    payload.turn.id.as_str(),
+                    payload.thread_id.as_str(),
+                    &payload.turn,
+                    None,
+                    None,
+                    None,
+                    false,
+                    true,
+                    created_at,
+                    created_at,
+                )
+                .await?;
+                prepared.append_status_history = turn_upsert
+                    .changes_status_history(payload.turn.status, payload.turn.error.as_deref());
+                prepared.turn_upsert = Some(turn_upsert);
+                prepared.terminal_running_attempts =
+                    turn_item_attempt::prepare_terminal_running_attempts(
+                        db,
+                        payload.turn.id.as_str(),
+                        created_at,
+                    )
+                    .await?;
+            }
+            TurnEventPayload::TurnBlocked(payload) => {
+                prepared.status_history = Some(turn::prepare_turn_status_history(
+                    payload.turn.id.as_str(),
+                    payload.turn.status,
+                    payload.turn.error.clone(),
+                    created_at,
+                ));
+                let turn_upsert = turn::prepare_projected_turn_upsert(
+                    db,
+                    payload.turn.id.as_str(),
+                    payload.thread_id.as_str(),
+                    &payload.turn,
+                    None,
+                    None,
+                    None,
+                    false,
+                    true,
+                    created_at,
+                    created_at,
+                )
+                .await?;
+                prepared.append_status_history = turn_upsert
+                    .changes_status_history(payload.turn.status, payload.turn.error.as_deref());
+                prepared.turn_upsert = Some(turn_upsert);
+                prepared.terminal_running_attempts =
+                    turn_item_attempt::prepare_terminal_running_attempts(
+                        db,
+                        payload.turn.id.as_str(),
+                        created_at,
+                    )
+                    .await?;
+            }
+            _ => {}
+        }
+        Ok(prepared)
+    }
+
+    pub async fn project_prepared<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        event: &AppendedTurnEvent,
+        prepared: PreparedTurnProjection,
+    ) -> Result<()> {
+        let created_at = event.created_at;
+        if let Some(mut observation) = prepared.liveness {
+            observation.activity_sequence = event.sequence;
+            turn_liveness::observe_activity(db, observation).await?;
+        }
+        let item_projection = prepared.item;
+        let item_attempt_payload_json = prepared.item_attempt_payload_json;
+        let item_attempt_id = prepared.item_attempt_id;
+        let item_attempt_failure_reason = prepared.item_attempt_failure_reason;
+        let input_projection = prepared.input;
+        let terminal_running_attempts = prepared.terminal_running_attempts;
+        let message_mutation = prepared.message_mutation;
+        let turn_upsert = prepared.turn_upsert;
+        let thread_preview_author_json = prepared.thread_preview_author_json;
+        let message_preview_author_json = prepared.message_preview_author_json;
+        let message_thread_preview = prepared.message_thread_preview;
+        let task_run_parent_thread = prepared.task_run_parent_thread;
+        let self_improvement_source = prepared.self_improvement_source;
+        let legacy_superuser_id = prepared.legacy_superuser_id;
+        let status_history = prepared.status_history;
+        let append_status_history = prepared.append_status_history;
+        let future: ProjectFuture<'_> = match &event.payload {
+            TurnEventPayload::TurnStarted(payload) => project_future(
+                self.project_turn_started(
+                    db,
+                    payload,
+                    event.sequence,
+                    input_projection.context("turn/start input projection was not prepared")?,
+                    turn_upsert.context("turn/start Turn projection was not prepared")?,
+                    thread_preview_author_json
+                        .context("turn/start Thread projection was not prepared")?,
+                    message_preview_author_json
+                        .context("turn/start Message preview was not prepared")?,
+                    message_thread_preview
+                        .context("turn/start derived preview was not prepared")?,
+                    task_run_parent_thread,
+                    legacy_superuser_id,
+                    status_history.context("turn/start status history was not prepared")?,
+                ),
+            ),
+            TurnEventPayload::ItemStarted(payload) => project_future(async move {
+                turn::upsert_prepared_turn_item(
+                    db,
+                    item_projection.context("item/start projection was not prepared")?,
                 )
                 .await?;
 
-                let payload_json = serde_json::to_string(&payload.item)
-                    .context("failed to serialize item payload for attempt seed")?;
-
                 turn_item_attempt::create_running_attempt(
                     db,
+                    item_attempt_id.context("item/start attempt id was not prepared")?,
                     payload.turn_id.as_str(),
                     payload.item.item_id(),
                     payload.item.item_type(),
                     payload.item.execution_class(),
-                    payload_json,
+                    item_attempt_payload_json
+                        .context("item/start attempt payload was not prepared")?,
                     turn_item_attempt::AttemptDeadlines {
                         lease_expires_at: None,
                         idle_deadline_at: None,
@@ -101,57 +406,34 @@ impl TurnProjector {
                 Ok(())
             }),
             TurnEventPayload::ItemCompleted(payload) => project_future(async move {
-                let turn_item_status = terminal_turn_item_status_from_payload(&payload.item);
-
-                turn::upsert_turn_item(
+                turn::upsert_prepared_turn_item(
                     db,
-                    payload.turn_id.as_str(),
-                    &payload.item,
-                    Some(turn_item_status),
-                    created_at,
-                    created_at,
+                    item_projection.context("item/completed projection was not prepared")?,
                 )
                 .await?;
 
                 let attempt_status = attempt_status_from_payload(&payload.item);
-
-                let failure_reason = (attempt_status == TurnItemAttemptStatus::Failed).then(|| {
-                    format!(
-                        "item `{}` completed with failed status",
-                        payload.item.item_id()
-                    )
-                });
 
                 let _ = turn_item_attempt::finish_running_attempt(
                     db,
                     payload.turn_id.as_str(),
                     payload.item.item_id(),
                     attempt_status,
-                    failure_reason,
+                    item_attempt_failure_reason,
                     created_at,
                 )
                 .await?;
 
-                self_improvement_source_turn::project_completed_collaborative_source_exchange(
-                    db,
-                    event.id.as_str(),
-                    created_at,
-                    payload,
-                )
-                .await?;
+                if let Some(source) = self_improvement_source {
+                    self_improvement_source_turn::apply_prepared_source_turn(db, source).await?;
+                }
 
                 Ok(())
             }),
-            TurnEventPayload::ItemUpdated(payload) => project_future(async move {
-                let turn_item_status = terminal_turn_item_status_from_payload(&payload.item);
-
-                turn::upsert_turn_item(
+            TurnEventPayload::ItemUpdated(_payload) => project_future(async move {
+                turn::upsert_prepared_turn_item(
                     db,
-                    payload.turn_id.as_str(),
-                    &payload.item,
-                    Some(turn_item_status),
-                    created_at,
-                    created_at,
+                    item_projection.context("item/updated projection was not prepared")?,
                 )
                 .await
             }),
@@ -175,67 +457,75 @@ impl TurnProjector {
             TurnEventPayload::TurnMessageEdited(payload) => {
                 project_future(self.project_turn_message_mutation(
                     db,
-                    TurnMessageMutationProjection::Edit(payload),
-                    created_at,
+                    payload.thread_id.as_str(),
+                    payload.turn.id.as_str(),
+                    payload.turn.message_revision,
+                    message_mutation.context("message edit projection was not prepared")?,
+                    input_projection.context("message edit input projection was not prepared")?,
                 ))
             }
             TurnEventPayload::TurnMessageDeleted(payload) => {
                 project_future(self.project_turn_message_mutation(
                     db,
-                    TurnMessageMutationProjection::Delete(payload),
-                    created_at,
+                    payload.thread_id.as_str(),
+                    payload.turn.id.as_str(),
+                    payload.turn.message_revision,
+                    message_mutation.context("message delete projection was not prepared")?,
+                    input_projection.context("message delete input projection was not prepared")?,
                 ))
             }
             TurnEventPayload::TurnCompleted(payload) => project_future(async move {
-                self.close_running_attempts_for_terminal_turn(
+                turn_item_attempt::close_prepared_terminal_running_attempts(
                     db,
                     payload.turn.id.as_str(),
-                    created_at,
+                    terminal_running_attempts,
                 )
                 .await?;
                 self.project_turn_finished(
                     db,
                     payload.thread_id.as_str(),
-                    &payload.turn,
                     created_at,
+                    turn_upsert.context("turn/completed Turn projection was not prepared")?,
+                    status_history.context("turn/completed status history was not prepared")?,
+                    append_status_history,
                 )
                 .await?;
-                self_improvement_source_turn::project_completed_source_turn(
-                    db,
-                    event.id.as_str(),
-                    created_at,
-                    payload,
-                )
-                .await?;
+                if let Some(source) = self_improvement_source {
+                    self_improvement_source_turn::apply_prepared_source_turn(db, source).await?;
+                }
                 Ok(())
             }),
             TurnEventPayload::TurnFailed(payload) => project_future(async move {
-                self.close_running_attempts_for_terminal_turn(
+                turn_item_attempt::close_prepared_terminal_running_attempts(
                     db,
                     payload.turn.id.as_str(),
-                    created_at,
+                    terminal_running_attempts,
                 )
                 .await?;
                 self.project_turn_finished(
                     db,
                     payload.thread_id.as_str(),
-                    &payload.turn,
                     created_at,
+                    turn_upsert.context("turn/failed Turn projection was not prepared")?,
+                    status_history.context("turn/failed status history was not prepared")?,
+                    append_status_history,
                 )
                 .await
             }),
             TurnEventPayload::TurnBlocked(payload) => project_future(async move {
-                self.close_running_attempts_for_terminal_turn(
+                turn_item_attempt::close_prepared_terminal_running_attempts(
                     db,
                     payload.turn.id.as_str(),
-                    created_at,
+                    terminal_running_attempts,
                 )
                 .await?;
                 self.project_turn_finished(
                     db,
                     payload.thread_id.as_str(),
-                    &payload.turn,
                     created_at,
+                    turn_upsert.context("turn/blocked Turn projection was not prepared")?,
+                    status_history.context("turn/blocked status history was not prepared")?,
+                    append_status_history,
                 )
                 .await
             }),
@@ -243,12 +533,24 @@ impl TurnProjector {
         future.await
     }
 
-    async fn project_turn_message_mutation<C: ConnectionTrait + Sync>(
+    #[cfg(test)]
+    pub async fn project<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        event: &AppendedTurnEvent,
+    ) -> Result<()> {
+        let prepared = self
+            .prepare(db, event.id.as_str(), &event.payload, event.created_at)
+            .await?;
+        self.project_prepared(db, event, prepared).await
+    }
+
+    async fn prepare_turn_message_mutation<C: ConnectionTrait>(
         &self,
         db: &C,
         mutation: TurnMessageMutationProjection<'_>,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
-    ) -> Result<()> {
+    ) -> Result<PreparedTurnMessageMutationProjection> {
         let (thread_id, event_turn, projected_input, changed_by, change_kind, deleted_by) =
             match mutation {
                 TurnMessageMutationProjection::Edit(payload) => (
@@ -295,7 +597,9 @@ impl TurnProjector {
 
         let current_revision = collaboration.message_revision;
         if current_revision > event_turn.message_revision {
-            return Ok(());
+            return Ok(PreparedTurnMessageMutationProjection::Superseded {
+                expected_turn: turn_model,
+            });
         }
         if current_revision < event_turn.message_revision
             && current_revision.checked_add(1) != Some(event_turn.message_revision)
@@ -303,61 +607,51 @@ impl TurnProjector {
             anyhow::bail!("Turn message mutation replay has a revision gap");
         }
 
-        let current_input = turn::find_turn_inputs(db, event_turn.id.as_str())
-            .await?
-            .into_iter()
+        let current_input_rows = turn::find_turn_inputs(db, event_turn.id.as_str()).await?;
+        let current_input = current_input_rows
+            .iter()
             .map(|row| {
                 serde_json::from_str::<UserInput>(row.payload.as_str())
                     .context("failed to decode current Turn input during mutation replay")
             })
             .collect::<Result<Vec<_>>>()?;
-        let previous_input = if current_revision < event_turn.message_revision {
-            current_input.clone()
-        } else {
-            let previous_revision = turn::list_turn_message_revisions(
-                db,
-                event_turn.id.as_str(),
-                Some(event_turn.message_revision),
-                1,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .map(turn::turn_message_revision_from_model)
-            .transpose()?
-            .filter(|revision| {
-                revision.revision.checked_add(1) == Some(event_turn.message_revision)
-            })
-            .context("message mutation replay is missing its previous revision")?;
-            previous_revision
-                .input
-                .context("message mutation replay previous revision has no input")?
-        };
+        let (expected_previous_revision, previous_input) =
+            if current_revision < event_turn.message_revision {
+                (None, current_input.clone())
+            } else {
+                let previous_revision_model = turn::list_turn_message_revisions(
+                    db,
+                    event_turn.id.as_str(),
+                    Some(event_turn.message_revision),
+                    1,
+                )
+                .await?
+                .into_iter()
+                .next()
+                .context("message mutation replay is missing its previous revision")?;
+                let previous_revision =
+                    turn::turn_message_revision_from_model(previous_revision_model.clone())?;
+                if previous_revision.revision.checked_add(1) != Some(event_turn.message_revision) {
+                    anyhow::bail!("message mutation replay is missing its previous revision");
+                }
+                let previous_input = previous_revision
+                    .input
+                    .context("message mutation replay previous revision has no input")?;
+                (Some(previous_revision_model), previous_input)
+            };
         let previous_preview = message_thread_preview(previous_input.as_slice());
         let replacement_preview = if is_delete {
             String::new()
         } else {
             message_thread_preview(projected_input)
         };
-        thread::replace_thread_preview_if_matches(
-            db,
-            thread_id,
-            previous_preview.as_str(),
-            replacement_preview.as_str(),
-            updated_at,
-        )
-        .await?;
-        if current_revision == event_turn.message_revision
+        let already_projected = current_revision == event_turn.message_revision
             && collaboration.mentions == event_turn.mentions
             && collaboration.message_deleted == event_turn.message_deleted
-            && current_input == projected_input
-        {
-            return Ok(());
-        }
+            && current_input == projected_input;
 
-        if current_revision < event_turn.message_revision {
-            turn::insert_turn_message_revision_if_absent(
-                db,
+        let revision = if current_revision < event_turn.message_revision {
+            Some(turn::prepare_turn_message_revision(
                 turn::NewTurnMessageRevision {
                     turn_id: event_turn.id.as_str(),
                     revision: current_revision,
@@ -367,23 +661,106 @@ impl TurnProjector {
                     change_kind,
                     created_at: updated_at,
                 },
-            )
-            .await?;
-        }
-        if !turn::project_message_turn_mutation_state(
-            db,
+            )?)
+        } else {
+            None
+        };
+        let mutation_state = turn::prepare_message_turn_mutation_state(
             turn_model.thread_id.as_str(),
             event_turn.id.as_str(),
             event_turn.message_revision,
             event_turn.mentions.as_slice(),
             deleted_by,
             updated_at,
-        )
-        .await?
-        {
-            anyhow::bail!("Turn message mutation replay lost its target");
+        )?;
+
+        Ok(PreparedTurnMessageMutationProjection::Apply {
+            expected_turn: turn_model,
+            expected_input_rows: current_input_rows,
+            expected_previous_revision,
+            previous_preview,
+            replacement_preview,
+            preview_updated_at: updated_at,
+            already_projected,
+            revision,
+            mutation_state,
+        })
+    }
+
+    async fn project_turn_message_mutation<C: ConnectionTrait + Sync>(
+        &self,
+        db: &C,
+        thread_id: &str,
+        turn_id: &str,
+        event_revision: u64,
+        prepared: PreparedTurnMessageMutationProjection,
+        input_projection: turn::PreparedTurnInputProjection,
+    ) -> Result<()> {
+        let expected_revision = i64::try_from(event_revision)
+            .context("Turn message revision exceeds database integer range")?;
+        match prepared {
+            PreparedTurnMessageMutationProjection::Superseded { expected_turn } => {
+                let current = turn::find_turn_by_thread_and_id(db, thread_id, turn_id)
+                    .await?
+                    .context("message mutation event targets a missing Turn")?;
+                if current != expected_turn && current.message_revision <= expected_revision {
+                    anyhow::bail!("Turn message mutation changed during projection preparation");
+                }
+                Ok(())
+            }
+            PreparedTurnMessageMutationProjection::Apply {
+                expected_turn,
+                expected_input_rows,
+                expected_previous_revision,
+                previous_preview,
+                replacement_preview,
+                preview_updated_at,
+                already_projected,
+                revision,
+                mutation_state,
+            } => {
+                let current_turn = turn::find_turn_by_thread_and_id(db, thread_id, turn_id)
+                    .await?
+                    .context("message mutation event targets a missing Turn")?;
+                if current_turn != expected_turn {
+                    anyhow::bail!("Turn message mutation changed during projection preparation");
+                }
+                let current_input_rows = turn::find_turn_inputs(db, turn_id).await?;
+                if current_input_rows != expected_input_rows {
+                    anyhow::bail!("Turn message input changed during projection preparation");
+                }
+                if let Some(expected_previous_revision) = expected_previous_revision {
+                    let current_previous_revision =
+                        turn::list_turn_message_revisions(db, turn_id, Some(event_revision), 1)
+                            .await?
+                            .into_iter()
+                            .next();
+                    if current_previous_revision.as_ref() != Some(&expected_previous_revision) {
+                        anyhow::bail!(
+                            "Turn message revision changed during projection preparation"
+                        );
+                    }
+                }
+                thread::replace_thread_preview_if_matches(
+                    db,
+                    thread_id,
+                    previous_preview.as_str(),
+                    replacement_preview.as_str(),
+                    preview_updated_at,
+                )
+                .await?;
+                if already_projected {
+                    return Ok(());
+                }
+                if let Some(revision) = revision {
+                    turn::insert_prepared_turn_message_revision(db, revision, true).await?;
+                }
+                if !turn::project_prepared_message_turn_mutation_state(db, mutation_state).await? {
+                    anyhow::bail!("Turn message mutation replay lost its target");
+                }
+                turn::replace_prepared_turn_input(db, input_projection).await
+            }
         }
-        turn::replace_turn_input(db, event_turn.id.as_str(), projected_input, updated_at).await
     }
 
     async fn project_turn_started<C: ConnectionTrait + Sync>(
@@ -391,17 +768,55 @@ impl TurnProjector {
         db: &C,
         payload: &TurnStartedEventPayload,
         event_sequence: i64,
+        input_projection: turn::PreparedTurnInputProjection,
+        turn_upsert: turn::PreparedTurnUpsert,
+        thread_preview_author_json: Option<String>,
+        message_preview_author_json: Option<String>,
+        message_thread_preview: String,
+        task_run_parent_thread: Option<pioneer_protocol::Thread>,
+        legacy_superuser_id: Option<Option<pioneer_protocol::PrincipalId>>,
+        status_history: turn::PreparedTurnStatusHistory,
     ) -> Result<()> {
         match payload.actor.as_ref() {
             Some(actor) => {
-                self.project_attributed_turn_started(db, payload, actor, event_sequence)
-                    .await
+                self.project_attributed_turn_started(
+                    db,
+                    payload,
+                    actor,
+                    event_sequence,
+                    turn_upsert,
+                    thread_preview_author_json,
+                    message_preview_author_json,
+                    message_thread_preview,
+                    task_run_parent_thread,
+                )
+                .await?;
             }
             None => {
-                self.project_legacy_turn_started(db, payload, event_sequence)
-                    .await
+                self.project_legacy_turn_started(
+                    db,
+                    payload,
+                    event_sequence,
+                    turn_upsert,
+                    thread_preview_author_json,
+                    message_preview_author_json,
+                    message_thread_preview,
+                    task_run_parent_thread,
+                    legacy_superuser_id
+                        .context("legacy turn/start Superuser projection was not prepared")?,
+                )
+                .await?;
             }
         }
+        self.project_turn_started_input_and_status(
+            db,
+            payload,
+            input_projection,
+            unix_to_datetime(payload.thread.updated_at),
+            payload.turn.turn_kind == TurnKind::TaskRun,
+            status_history,
+        )
+        .await
     }
 
     async fn project_attributed_turn_started<C: ConnectionTrait + Sync>(
@@ -410,9 +825,24 @@ impl TurnProjector {
         payload: &TurnStartedEventPayload,
         actor: &PersistedActorRef,
         event_sequence: i64,
+        turn_upsert: turn::PreparedTurnUpsert,
+        thread_preview_author_json: Option<String>,
+        message_preview_author_json: Option<String>,
+        message_thread_preview: String,
+        task_run_parent_thread: Option<pioneer_protocol::Thread>,
     ) -> Result<()> {
-        self.project_turn_started_inner(db, payload, Some(actor), event_sequence)
-            .await
+        self.project_turn_started_inner(
+            db,
+            payload,
+            Some(actor),
+            event_sequence,
+            turn_upsert,
+            thread_preview_author_json,
+            message_preview_author_json,
+            message_thread_preview,
+            task_run_parent_thread,
+        )
+        .await
     }
 
     /// Compatibility seam for append-only turn/start events written before actor attribution.
@@ -422,11 +852,33 @@ impl TurnProjector {
         db: &C,
         payload: &TurnStartedEventPayload,
         event_sequence: i64,
+        turn_upsert: turn::PreparedTurnUpsert,
+        thread_preview_author_json: Option<String>,
+        message_preview_author_json: Option<String>,
+        message_thread_preview: String,
+        task_run_parent_thread: Option<pioneer_protocol::Thread>,
+        legacy_superuser_id: Option<pioneer_protocol::PrincipalId>,
     ) -> Result<()> {
-        self.project_turn_started_inner(db, payload, None, event_sequence)
+        self.project_turn_started_inner(
+            db,
+            payload,
+            None,
+            event_sequence,
+            turn_upsert,
+            thread_preview_author_json,
+            message_preview_author_json,
+            message_thread_preview,
+            task_run_parent_thread,
+        )
+        .await?;
+        if let Some(superuser_id) = legacy_superuser_id {
+            identity::backfill_legacy_actor_references_for_turn(
+                db,
+                payload.thread.id.as_str(),
+                payload.turn.id.as_str(),
+                &superuser_id,
+            )
             .await?;
-        if let Some(superuser_id) = legacy_backfill_superuser_id(db).await? {
-            identity::backfill_legacy_actor_references(db, &superuser_id).await?;
         }
         Ok(())
     }
@@ -437,6 +889,11 @@ impl TurnProjector {
         payload: &TurnStartedEventPayload,
         actor: Option<&PersistedActorRef>,
         event_sequence: i64,
+        turn_upsert: turn::PreparedTurnUpsert,
+        thread_preview_author_json: Option<String>,
+        message_preview_author_json: Option<String>,
+        message_thread_preview: String,
+        task_run_parent_thread: Option<pioneer_protocol::Thread>,
     ) -> Result<()> {
         self.project_turn_started_identity(db, payload, event_sequence)
             .await?;
@@ -452,17 +909,14 @@ impl TurnProjector {
             thread_created_at,
             thread_updated_at,
             is_task_run_occurrence,
+            thread_preview_author_json,
+            message_preview_author_json,
+            message_thread_preview,
+            task_run_parent_thread,
         )
         .await?;
-        self.project_turn_started_turn(db, payload, actor, thread_updated_at)
-            .await?;
-        self.project_turn_started_input_and_status(
-            db,
-            payload,
-            thread_updated_at,
-            is_task_run_occurrence,
-        )
-        .await
+        turn::apply_prepared_turn_upsert(db, turn_upsert).await?;
+        Ok(())
     }
 
     fn project_turn_started_identity<'a, C: ConnectionTrait + Sync>(
@@ -501,6 +955,10 @@ impl TurnProjector {
         thread_created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
         thread_updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
         is_task_run_occurrence: bool,
+        thread_preview_author_json: Option<String>,
+        message_preview_author_json: Option<String>,
+        message_thread_preview: String,
+        task_run_parent_thread: Option<pioneer_protocol::Thread>,
     ) -> ProjectFuture<'a> {
         project_future(async move {
             if is_task_run_occurrence {
@@ -512,29 +970,17 @@ impl TurnProjector {
                     .await?
                     .is_none()
                 {
-                    let mut parent = payload.thread.clone();
-                    parent.status = ThreadStatus::Idle;
-                    match actor {
-                        Some(actor) => {
-                            thread::upsert_thread_with_creator(
-                                db,
-                                &parent,
-                                actor,
-                                thread_created_at,
-                                thread_updated_at,
-                            )
-                            .await?;
-                        }
-                        None => {
-                            thread::upsert_thread(
-                                db,
-                                &parent,
-                                thread_created_at,
-                                thread_updated_at,
-                            )
-                            .await?;
-                        }
-                    }
+                    let parent = task_run_parent_thread
+                        .context("task-run parent Thread projection was not prepared")?;
+                    thread::upsert_projected_thread(
+                        db,
+                        &parent,
+                        actor,
+                        thread_preview_author_json,
+                        thread_created_at,
+                        thread_updated_at,
+                    )
+                    .await?;
                     policy::upsert_thread_sandbox_policy(
                         db,
                         parent.id.as_str(),
@@ -553,12 +999,11 @@ impl TurnProjector {
                 // not replay the envelope's full Thread snapshot over concurrent
                 // execution or management changes. New threads still take the
                 // normal insertion path below.
-                let derived_preview = message_thread_preview(payload.input.as_slice());
-                thread::touch_thread_for_completed_message(
+                thread::touch_thread_for_completed_message_prepared(
                     db,
                     payload.thread.id.as_str(),
-                    derived_preview.as_str(),
-                    payload.turn.author.as_ref(),
+                    message_thread_preview.as_str(),
+                    message_preview_author_json,
                     thread_updated_at,
                 )
                 .await?;
@@ -582,27 +1027,16 @@ impl TurnProjector {
                 let existing_thread = thread::find_thread_by_id(db, payload.thread.id.as_str())
                     .await?
                     .is_some();
-                match (existing_thread, actor) {
-                    (false, Some(actor)) => {
-                        thread::upsert_thread_with_creator(
-                            db,
-                            &payload.thread,
-                            actor,
-                            thread_created_at,
-                            thread_updated_at,
-                        )
-                        .await?;
-                    }
-                    (true, _) | (false, None) => {
-                        thread::upsert_thread(
-                            db,
-                            &payload.thread,
-                            thread_created_at,
-                            thread_updated_at,
-                        )
-                        .await?;
-                    }
-                }
+                let creator = (!existing_thread).then_some(actor).flatten();
+                thread::upsert_projected_thread(
+                    db,
+                    &payload.thread,
+                    creator,
+                    thread_preview_author_json,
+                    thread_created_at,
+                    thread_updated_at,
+                )
+                .await?;
                 policy::upsert_thread_sandbox_policy(
                     db,
                     payload.thread.id.as_str(),
@@ -617,73 +1051,19 @@ impl TurnProjector {
         })
     }
 
-    fn project_turn_started_turn<'a, C: ConnectionTrait + Sync>(
-        &'a self,
-        db: &'a C,
-        payload: &'a TurnStartedEventPayload,
-        actor: Option<&'a PersistedActorRef>,
-        thread_updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
-    ) -> ProjectFuture<'a> {
-        project_future(async move {
-            match actor {
-                Some(actor) => {
-                    turn::upsert_turn_with_initiator(
-                        db,
-                        payload.turn.id.as_str(),
-                        payload.thread.id.as_str(),
-                        &payload.turn,
-                        None,
-                        payload.reasoning_effort.as_deref(),
-                        actor,
-                        thread_updated_at,
-                        thread_updated_at,
-                    )
-                    .await?;
-                }
-                None => {
-                    turn::upsert_turn(
-                        db,
-                        payload.turn.id.as_str(),
-                        payload.thread.id.as_str(),
-                        &payload.turn,
-                        None,
-                        payload.reasoning_effort.as_deref(),
-                        thread_updated_at,
-                        thread_updated_at,
-                    )
-                    .await?;
-                }
-            }
-
-            Ok(())
-        })
-    }
-
     fn project_turn_started_input_and_status<'a, C: ConnectionTrait + Sync>(
         &'a self,
         db: &'a C,
         payload: &'a TurnStartedEventPayload,
+        input_projection: turn::PreparedTurnInputProjection,
         thread_updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
         is_task_run_occurrence: bool,
+        status_history: turn::PreparedTurnStatusHistory,
     ) -> ProjectFuture<'a> {
         project_future(async move {
-            turn::replace_turn_input(
-                db,
-                payload.turn.id.as_str(),
-                payload.input.as_slice(),
-                thread_updated_at,
-            )
-            .await?;
+            turn::replace_prepared_turn_input(db, input_projection).await?;
 
-            let turn_error = payload.turn.error.clone();
-            turn::append_turn_status_history(
-                db,
-                payload.turn.id.as_str(),
-                payload.turn.status,
-                turn_error,
-                thread_updated_at,
-            )
-            .await?;
+            turn::append_prepared_turn_status_history(db, status_history).await?;
 
             if is_task_run_occurrence {
                 self.project_thread_foreground_status(
@@ -702,42 +1082,15 @@ impl TurnProjector {
         &self,
         db: &C,
         thread_id: &str,
-        turn_model: &pioneer_protocol::Turn,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+        turn_upsert: turn::PreparedTurnUpsert,
+        status_history: turn::PreparedTurnStatusHistory,
+        append_status_history: bool,
     ) -> Result<()> {
-        let Some(existing_turn) = turn::find_turn_by_id(db, turn_model.id.as_str()).await? else {
-            anyhow::bail!(
-                "terminal turn event for `{}` has no preceding turn/start projection",
-                turn_model.id
-            );
-        };
-        let turn_status = turn_status_to_db(turn_model.status).to_owned();
-        let turn_error = turn_model.error.clone();
+        turn::apply_prepared_turn_upsert(db, turn_upsert).await?;
 
-        turn::upsert_turn(
-            db,
-            turn_model.id.as_str(),
-            thread_id,
-            turn_model,
-            None,
-            None,
-            updated_at,
-            updated_at,
-        )
-        .await?;
-
-        let should_append_status = (existing_turn.status, existing_turn.error)
-            != (turn_status.clone(), turn_error.clone());
-
-        if should_append_status {
-            turn::append_turn_status_history(
-                db,
-                turn_model.id.as_str(),
-                turn_model.status,
-                turn_error,
-                updated_at,
-            )
-            .await?;
+        if append_status_history {
+            turn::append_prepared_turn_status_history(db, status_history).await?;
         }
 
         self.project_thread_foreground_status(db, thread_id, updated_at)
@@ -758,55 +1111,6 @@ impl TurnProjector {
             ThreadStatus::Idle
         };
         thread::update_thread_status(db, thread_id, status, updated_at).await
-    }
-
-    async fn close_running_attempts_for_terminal_turn<C: ConnectionTrait + Sync>(
-        &self,
-        db: &C,
-        turn_id: &str,
-        updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
-    ) -> Result<()> {
-        let running_attempts =
-            turn_item_attempt::list_running_attempts_for_turn(db, turn_id).await?;
-        for attempt in running_attempts {
-            let _ = turn_item_attempt::finish_running_attempt(
-                db,
-                turn_id,
-                attempt.item_id.as_str(),
-                TurnItemAttemptStatus::Interrupted,
-                Some("turn_terminal_before_item_completed".to_owned()),
-                updated_at,
-            )
-            .await?;
-
-            let Some(item_row) =
-                turn::find_turn_item(db, turn_id, attempt.item_id.as_str()).await?
-            else {
-                continue;
-            };
-            let mut item = serde_json::from_str::<pioneer_protocol::TurnItem>(item_row.payload.as_str())
-                .with_context(|| {
-                    format!(
-                        "failed to decode running turn_item payload for terminal turn `{turn_id}` item `{}`",
-                        attempt.item_id
-                    )
-                })?;
-            let state = TurnItemTerminalState::Failed {
-                reason: Some("turn_terminal_before_item_completed".to_owned()),
-            };
-            terminalize_turn_item_payload(&mut item, state.clone());
-
-            turn::upsert_turn_item(
-                db,
-                turn_id,
-                &item,
-                Some(state.to_turn_item_status()),
-                item_row.created_at,
-                updated_at,
-            )
-            .await?;
-        }
-        Ok(())
     }
 }
 
@@ -849,12 +1153,13 @@ async fn legacy_backfill_superuser_id<C: ConnectionTrait>(
     ))
 }
 
-fn liveness_observation_from_event(
-    event: &AppendedTurnEvent,
+fn liveness_observation_from_payload(
+    payload: &TurnEventPayload,
+    created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
 ) -> Option<turn_liveness::TurnLivenessObservation> {
     let mut item_id = None;
     let mut item_type = None;
-    let meaningful = match &event.payload {
+    let meaningful = match payload {
         TurnEventPayload::TurnStarted(payload) => payload.turn.mode != ThreadMode::Message,
         TurnEventPayload::ItemStarted(payload) => {
             item_id = Some(payload.item.item_id().to_owned());
@@ -896,13 +1201,13 @@ fn liveness_observation_from_event(
     };
 
     meaningful.then(|| turn_liveness::TurnLivenessObservation {
-        turn_id: event.turn_id.clone(),
-        thread_id: event.thread_id.clone(),
-        activity_sequence: event.sequence,
-        activity_kind: event.payload.event_type().to_owned(),
+        turn_id: payload.turn_id().to_owned(),
+        thread_id: payload.thread_id().to_owned(),
+        activity_sequence: 0,
+        activity_kind: payload.event_type().to_owned(),
         item_id,
         item_type,
-        observed_at: event.created_at,
+        observed_at: created_at,
     })
 }
 
@@ -969,8 +1274,8 @@ mod epic6_tests {
             },
         ));
 
-        assert!(liveness_observation_from_event(&edit).is_none());
-        assert!(liveness_observation_from_event(&delete).is_none());
+        assert!(liveness_observation_from_payload(&edit.payload, edit.created_at).is_none());
+        assert!(liveness_observation_from_payload(&delete.payload, delete.created_at).is_none());
     }
 
     #[test]
@@ -1009,6 +1314,6 @@ mod epic6_tests {
             reasoning_effort: None,
         }));
 
-        assert!(liveness_observation_from_event(&started).is_none());
+        assert!(liveness_observation_from_payload(&started.payload, started.created_at).is_none());
     }
 }

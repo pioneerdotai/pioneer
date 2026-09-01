@@ -6,7 +6,7 @@ use pioneer_protocol::{TaskError, TaskResult, TaskRun, TaskRunStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict, Query};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 use crate::convention::{
@@ -16,8 +16,34 @@ use crate::convention::{
 use crate::repositories::ProjectionWriteOutcome;
 use crate::util::{optional_typed_json_to_db, unix_to_datetime};
 
+#[derive(Clone, Debug)]
+pub struct PreparedTaskRunProjection(task_run::ActiveModel);
+
+pub fn prepare_run_projection(run: &TaskRun) -> Result<PreparedTaskRunProjection> {
+    active_model_from_run(run).map(PreparedTaskRunProjection)
+}
+
+pub fn prepare_run_result_json(result: Option<&TaskResult>) -> Result<Option<String>> {
+    result
+        .map(|value| serde_json::to_string(value).context("failed to serialize task run result"))
+        .transpose()
+}
+
+pub fn prepare_run_error_json(error: Option<&TaskError>) -> Result<Option<String>> {
+    error
+        .map(|value| serde_json::to_string(value).context("failed to serialize task run error"))
+        .transpose()
+}
+
 pub async fn upsert_run<C: ConnectionTrait>(db: &C, run: &TaskRun) -> Result<()> {
-    task_run::Entity::insert(active_model_from_run(run)?)
+    upsert_prepared_run(db, prepare_run_projection(run)?).await
+}
+
+pub async fn upsert_prepared_run<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskRunProjection,
+) -> Result<()> {
+    task_run::Entity::insert(prepared.0)
         .on_conflict(
             OnConflict::column(task_run::Column::Id)
                 .update_columns([
@@ -68,6 +94,42 @@ pub async fn list_runs_by_task<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list task runs")
+}
+
+/// Finds the first run that prevents reopening an older blocked run.
+///
+/// This is deliberately a bounded SQL query. Resume fencing must be checked
+/// again while the writer transaction is open, but it must not materialize and
+/// inspect the task's complete run history while holding the physical writer.
+pub async fn find_conflicting_successor_run<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    current_run_id: &str,
+    current_run_number: i64,
+) -> Result<Option<task_run::Model>> {
+    let terminal_statuses = [
+        TaskRunStatus::Succeeded,
+        TaskRunStatus::Failed,
+        TaskRunStatus::Blocked,
+        TaskRunStatus::Cancelled,
+        TaskRunStatus::TimedOut,
+    ]
+    .map(task_run_status_to_db);
+
+    task_run::Entity::find()
+        .filter(task_run::Column::TaskId.eq(task_id.to_owned()))
+        .filter(task_run::Column::Id.ne(current_run_id.to_owned()))
+        .filter(
+            Condition::any()
+                .add(task_run::Column::RunNumber.gt(current_run_number))
+                .add(task_run::Column::Status.is_not_in(terminal_statuses)),
+        )
+        .order_by_asc(task_run::Column::RunNumber)
+        .order_by_asc(task_run::Column::CreatedAt)
+        .limit(1)
+        .one(db)
+        .await
+        .context("failed to find conflicting successor task run")
 }
 
 pub async fn list_runs_by_tasks<C: ConnectionTrait>(
@@ -263,6 +325,17 @@ pub async fn update_run_result<C: ConnectionTrait>(
     result: Option<&TaskResult>,
     completed_at: DateTimeWithTimeZone,
 ) -> Result<ProjectionWriteOutcome> {
+    let result_json = prepare_run_result_json(result)?;
+    update_run_result_json(db, run_id, status, result_json, completed_at).await
+}
+
+pub async fn update_run_result_json<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    status: TaskRunStatus,
+    result_json: Option<String>,
+    completed_at: DateTimeWithTimeZone,
+) -> Result<ProjectionWriteOutcome> {
     let Some(model) = find_run_by_id(db, run_id).await? else {
         return Ok(ProjectionWriteOutcome::InvariantViolation {
             reason: format!("task run `{run_id}` missing for result update"),
@@ -271,10 +344,6 @@ pub async fn update_run_result<C: ConnectionTrait>(
     if let Some(outcome) = terminal_run_transition_guard(run_id, model.status.as_str(), status) {
         return Ok(outcome);
     }
-
-    let result_json = result
-        .map(|value| serde_json::to_string(value).context("failed to serialize task run result"))
-        .transpose()?;
 
     let result = task_run::Entity::update_many()
         .filter(task_run::Column::Id.eq(run_id.to_owned()))
@@ -303,6 +372,17 @@ pub async fn update_run_error<C: ConnectionTrait>(
     error: Option<&TaskError>,
     completed_at: DateTimeWithTimeZone,
 ) -> Result<ProjectionWriteOutcome> {
+    let error_json = prepare_run_error_json(error)?;
+    update_run_error_json(db, run_id, status, error_json, completed_at).await
+}
+
+pub async fn update_run_error_json<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+    status: TaskRunStatus,
+    error_json: Option<String>,
+    completed_at: DateTimeWithTimeZone,
+) -> Result<ProjectionWriteOutcome> {
     let Some(model) = find_run_by_id(db, run_id).await? else {
         return Ok(ProjectionWriteOutcome::InvariantViolation {
             reason: format!("task run `{run_id}` missing for error update"),
@@ -311,10 +391,6 @@ pub async fn update_run_error<C: ConnectionTrait>(
     if let Some(outcome) = terminal_run_transition_guard(run_id, model.status.as_str(), status) {
         return Ok(outcome);
     }
-
-    let error_json = error
-        .map(|value| serde_json::to_string(value).context("failed to serialize task run error"))
-        .transpose()?;
 
     let result = task_run::Entity::update_many()
         .filter(task_run::Column::Id.eq(run_id.to_owned()))
