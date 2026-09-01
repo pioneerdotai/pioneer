@@ -51,7 +51,8 @@ pub use repositories::agent_domain::{
     load_native_agent_config_by_system_key, mark_agent_action_outbox_delivered,
     mark_agent_action_outbox_failed, promote_queued_agent_executions,
     record_agent_execution_progress, reopen_agent_execution_for_retry,
-    revoke_agent_delegation_route, utc_now, wake_agent_action_outbox_for_execution,
+    revoke_agent_delegation_route, upgrade_agent_execution_grant_model_to_current, utc_now,
+    wake_agent_action_outbox_for_execution,
 };
 pub use repositories::agent_identity_catalog::{
     AgentIdentityCatalogSyncReport, CliRuntimeIdentitySeed, cli_runtime_identity_fingerprint,
@@ -149,7 +150,8 @@ pub use repositories::principal_avatar::{
 pub use repositories::task::TaskRootAccessFilter;
 pub use repositories::task_actor_contract::{
     find_task_actor_contract, find_task_occurrence_by_run_id, find_task_occurrence_contract,
-    list_task_occurrences, upsert_task_actor_contract, upsert_task_occurrence_contract,
+    list_task_occurrences, upgrade_task_actor_contract_model_to_current,
+    upsert_task_actor_contract, upsert_task_occurrence_contract,
 };
 pub use repositories::thread::{
     advance_thread_read_cursor, find_thread_read_cursor, thread_read_cursor_from_model,

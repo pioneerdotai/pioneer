@@ -40,6 +40,7 @@ mod thread_file;
 mod timeline;
 mod turn;
 mod turn_permissions;
+mod versioned_contract;
 mod voice;
 pub mod voice_contract;
 mod workspace;
@@ -71,8 +72,9 @@ pub use agent_launch::{
     AgentAuthoredInput, AgentAuthoredInputError, AgentExecutionProfileBackend,
     AgentExecutionProfileProjection, AgentExecutionProfileSelection, AgentExecutionSelection,
     AgentIdentitySelection, AgentLaunchSelection, AgentLaunchSelectionError,
-    AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantSet,
-    ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
+    AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantMigrationError,
+    ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
+    migrate_embedded_child_launch_grant_json_to_current,
 };
 pub use agent_route::{
     AgentDelegationRouteCreateParams, AgentDelegationRouteListParams,
@@ -387,7 +389,9 @@ pub use task::{
 };
 pub use task_actor::{
     TaskActorContract, TaskActorContractError, TaskDeliveryActorContract,
-    TaskDerivedChildLaunchGrant, TaskOccurrenceContract, TaskOccurrenceStatus, TaskReviewerIntent,
+    TaskDerivedChildLaunchGrant, TaskDerivedChildLaunchGrantMigrationError, TaskOccurrenceContract,
+    TaskOccurrenceStatus, TaskReviewerIntent,
+    migrate_task_derived_child_launch_grant_json_to_current,
 };
 pub use thread::{
     SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadComposerExecutionMode,

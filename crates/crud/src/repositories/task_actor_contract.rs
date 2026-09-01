@@ -426,6 +426,42 @@ pub(crate) async fn upsert_task_delivery_authority<C: ConnectionTrait>(
 pub(super) fn task_actor_contract_from_model(
     row: task_actor_contract::Model,
 ) -> Result<TaskActorContract> {
+    let (_, contract) = upgrade_task_actor_contract_model_and_parse(row)?;
+    Ok(contract)
+}
+
+/// Upcasts a stored Task actor contract in memory and validates the complete
+/// row against the current domain contract. Background maintenance may persist
+/// the returned model; ordinary CRUD reads use the same path without writing.
+pub fn upgrade_task_actor_contract_model_to_current(
+    row: task_actor_contract::Model,
+) -> Result<task_actor_contract::Model> {
+    let (row, _) = upgrade_task_actor_contract_model_and_parse(row)?;
+    Ok(row)
+}
+
+fn upgrade_task_actor_contract_model_and_parse(
+    mut row: task_actor_contract::Model,
+) -> Result<(task_actor_contract::Model, TaskActorContract)> {
+    let derived_child_launch_grant_json = row
+        .derived_child_launch_grant_json
+        .as_deref()
+        .map(pioneer_protocol::migrate_task_derived_child_launch_grant_json_to_current)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "failed to upcast child launch grant for Task `{}`",
+                row.task_id
+            )
+        })?;
+    row.derived_child_launch_grant_json = derived_child_launch_grant_json;
+    let contract = task_actor_contract_from_current_model(row.clone())?;
+    Ok((row, contract))
+}
+
+fn task_actor_contract_from_current_model(
+    row: task_actor_contract::Model,
+) -> Result<TaskActorContract> {
     let contract = TaskActorContract {
         task_id: row.task_id,
         workspace_id: row.workspace_id,

@@ -2173,8 +2173,8 @@ impl TaskService {
             })
             .await?;
         self.publish_and_wake(appended).await;
-        if trigger_kind == TaskTriggerKind::Immediate {
-            self.process_due_once(now).await?;
+        if let Some(run) = immediate_run {
+            self.process_queued_run_once(run).await?;
         }
 
         let response = self
@@ -4002,6 +4002,15 @@ impl TaskService {
             scheduler.process_due_once(now).await
         } else {
             Ok(0)
+        }
+    }
+
+    async fn process_queued_run_once(&self, run: TaskRun) -> TaskRuntimeResult<bool> {
+        let scheduler = self.scheduler.read().await.as_ref().and_then(Weak::upgrade);
+        if let Some(scheduler) = scheduler {
+            scheduler.process_queued_run_once(run).await
+        } else {
+            Ok(false)
         }
     }
 

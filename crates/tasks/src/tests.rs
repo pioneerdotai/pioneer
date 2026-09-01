@@ -32,7 +32,9 @@ use pioneer_protocol::{
     TurnFilesystemSandboxEntry, TurnNetworkPolicySnapshot, TurnPermissionMode,
     TurnProcessPolicySnapshot, TurnSandboxMode,
 };
-use sea_orm::{ActiveValue::Set, Database, EntityTrait};
+use sea_orm::{
+    ActiveValue::Set, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement,
+};
 use std::collections::BTreeMap;
 use std::sync::{
     Arc,
@@ -556,6 +558,58 @@ fn test_agent_launch_facts() -> (
         child_launch_grant,
     };
     (launch, identity, profile, authorization)
+}
+
+fn version_one_test_agent_child_launch_grant() -> serde_json::Value {
+    // Independent historical V1 wire fixture. Its fingerprint was computed
+    // from the released V1 canonical tuple, not by the current implementation.
+    serde_json::json!({
+        "version": 1,
+        "identities": [{
+            "id": "A12345678901234567890",
+            "source_kind": "native_agent",
+            "display_name": "Tasks Test Agent",
+            "nickname": "tasks-test-agent",
+            "source_revision": 1,
+            "source_fingerprint": "tasks-test-agent-v1"
+        }],
+        "allowInheritParentIdentity": false,
+        "allowServerDerivedEphemeral": false,
+        "profiles": [{
+            "id": "P12345678901234567890",
+            "compatibleAgentIdentityIds": ["A12345678901234567890"],
+            "backend": "api_provider",
+            "providerId": "openai",
+            "modelId": "test-model",
+            "providerDisplayName": "OpenAI",
+            "modelDisplayName": "Test Model",
+            "allowedReasoning": [],
+            "allowedPermissionProfiles": ["auto_accept_edits"],
+            "catalogGeneration": 1,
+            "policyGeneration": 1,
+            "fingerprint": "tasks-test-profile-v1"
+        }],
+        "allowInheritParentProfile": false,
+        "skillIds": [],
+        "mcpServerIds": [],
+        "maxPermissionProfile": {
+            "mode": "supervised",
+            "effective_policy": {
+                "default_behavior": "ask",
+                "file_read": "allow",
+                "file_write": "ask",
+                "shell_command": "ask",
+                "network": "ask",
+                "mcp_read": "allow",
+                "mcp_write_or_unknown": "ask",
+                "dynamic_skill_tool": "ask",
+                "computer_use": "ask",
+                "task_subagent": "ask"
+            }
+        },
+        "maxReasoning": { "allowed": [] },
+        "fingerprint": "170a497c113905b69cc6d131124ac19c6a2d5de4125e1193862c308309993971"
+    })
 }
 
 fn configure_agent_task(params: &mut TaskCreateParams) {
@@ -4458,6 +4512,216 @@ async fn pause_excludes_due_trigger_and_resume_restores_future_fire() {
         .expect("resume should succeed");
     assert_eq!(resumed.triggers[0].status, TaskTriggerStatus::Active);
     assert_eq!(resumed.triggers[0].next_fire_at, Some(4_000_000_000));
+}
+
+#[tokio::test]
+async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_without_write_on_read() {
+    let runtime = runtime().await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Notify::new());
+    runtime
+        .register_executor(Arc::new(SlowAgentExecutor {
+            starts: starts.clone(),
+            release: release.clone(),
+        }))
+        .await;
+
+    let mut params = create_params(TaskTriggerSpec::ScheduledAt {
+        scheduled_at: 1,
+        timezone: Some("UTC".to_owned()),
+        catch_up_policy: None,
+    });
+    configure_agent_task(&mut params);
+    params.agent_spec = Some(agent_spec(2));
+    let response = runtime
+        .service()
+        .create_task(task_create_context_for(&params), params)
+        .await
+        .expect("scheduled Agent Task should create");
+    let database = runtime.service().store().database_connection();
+    let row = pioneer_entity::task_actor_contract::Entity::find_by_id(response.task.id.clone())
+        .one(&database)
+        .await
+        .expect("Task actor query should succeed")
+        .expect("Task actor contract should exist");
+    let mut derived: serde_json::Value = serde_json::from_str(
+        row.derived_child_launch_grant_json
+            .as_deref()
+            .expect("Agent Task should have a child launch grant"),
+    )
+    .expect("current child launch grant should decode");
+    assert_eq!(
+        derived["child_launch_grant"]["version"],
+        serde_json::json!(2)
+    );
+    derived["child_launch_grant"] = version_one_test_agent_child_launch_grant();
+    database
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task_actor_contract \
+             SET derived_child_launch_grant_json = ? \
+             WHERE task_id = ?",
+            [derived.to_string().into(), response.task.id.clone().into()],
+        ))
+        .await
+        .expect("test should install a historical V1 child launch grant");
+
+    assert_eq!(
+        runtime
+            .process_due_once(4_000_000_000)
+            .await
+            .expect("scheduler should upcast the V1 Task at its read boundary"),
+        1
+    );
+    timeout(Duration::from_secs(2), async {
+        while starts.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("V1 Task should reach its executor");
+    release.notify_waiters();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let task = runtime
+                .service()
+                .get_task(pioneer_protocol::TaskGetParams {
+                    task_id: response.task.id.clone(),
+                })
+                .await
+                .expect("Task should remain readable");
+            if task.runs[0].status == TaskRunStatus::Succeeded {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("V1 Task should complete");
+
+    let projected = runtime
+        .service()
+        .store()
+        .get_task_actor_contract(response.task.id.as_str())
+        .await
+        .expect("Task actor read should succeed")
+        .expect("Task actor contract should remain");
+    let projected: serde_json::Value = serde_json::from_str(
+        projected
+            .derived_child_launch_grant_json
+            .as_deref()
+            .expect("Task child launch grant should remain"),
+    )
+    .expect("upcast Task child launch grant should decode");
+    assert_eq!(
+        projected["child_launch_grant"]["version"],
+        serde_json::json!(2)
+    );
+
+    let stored = pioneer_entity::task_actor_contract::Entity::find_by_id(response.task.id)
+        .one(&database)
+        .await
+        .expect("raw Task actor query should succeed")
+        .expect("raw Task actor contract should remain");
+    let stored: serde_json::Value = serde_json::from_str(
+        stored
+            .derived_child_launch_grant_json
+            .as_deref()
+            .expect("raw Task child launch grant should remain"),
+    )
+    .expect("raw Task child launch grant should decode");
+    assert_eq!(
+        stored["child_launch_grant"]["version"],
+        serde_json::json!(1),
+        "ordinary reads must not turn Task execution into a hidden write"
+    );
+}
+
+#[tokio::test]
+async fn invalid_due_task_is_isolated_from_new_immediate_task() {
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let invalid = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 1,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("scheduled task should create");
+    runtime
+        .service()
+        .store()
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task_actor_contract \
+             SET derived_child_launch_grant_json = '{}' \
+             WHERE task_id = ?",
+            [invalid.task.id.clone().into()],
+        ))
+        .await
+        .expect("test should corrupt the old actor contract");
+    let scheduled = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 2,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("unrelated scheduled task should create");
+
+    let immediate = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("an unrelated due Task must not fail immediate creation");
+    assert_eq!(
+        immediate.run.expect("immediate run should exist").status,
+        TaskRunStatus::Succeeded
+    );
+
+    assert_eq!(
+        runtime
+            .process_due_once(4_000_000_000)
+            .await
+            .expect("scheduler should isolate the invalid due Task"),
+        1
+    );
+    let scheduled = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: scheduled.task.id,
+        })
+        .await
+        .expect("unrelated scheduled Task should remain executable");
+    assert_eq!(scheduled.runs[0].status, TaskRunStatus::Succeeded);
+    let invalid = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: invalid.task.id,
+        })
+        .await
+        .expect("invalid Task should remain observable");
+    assert_eq!(invalid.task.status, TaskStatus::Blocked);
+    assert_eq!(invalid.triggers[0].status, TaskTriggerStatus::Paused);
+    assert_eq!(
+        invalid.task.error.as_ref().map(|error| error.code.as_str()),
+        Some("task_actor_contract_invalid")
+    );
 }
 
 #[tokio::test]
