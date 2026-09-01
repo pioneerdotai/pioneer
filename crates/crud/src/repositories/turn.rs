@@ -89,7 +89,6 @@ pub struct TurnExecutionSecuritySnapshotRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedTurnUpsert {
     expected_existing: Option<turn::Model>,
-    allow_existing_if_preflight_missing: bool,
     row: turn::ActiveModel,
     update_columns: Vec<turn::Column>,
 }
@@ -241,7 +240,6 @@ pub(crate) async fn prepare_projected_turn_upsert<C: ConnectionTrait>(
     reasoning_effort: Option<&str>,
     initiator: Option<&PersistedActorRef>,
     update_initiator: bool,
-    allow_existing_if_preflight_missing: bool,
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<PreparedTurnUpsert> {
@@ -249,7 +247,7 @@ pub(crate) async fn prepare_projected_turn_upsert<C: ConnectionTrait>(
         Some(initiator) => actor_ref_to_db(initiator),
         None => (None, None),
     };
-    let mut prepared = prepare_turn_upsert_with_actor_columns(
+    prepare_turn_upsert_with_actor_columns(
         db,
         turn_id,
         thread_id,
@@ -262,9 +260,7 @@ pub(crate) async fn prepare_projected_turn_upsert<C: ConnectionTrait>(
         created_at,
         updated_at,
     )
-    .await?;
-    prepared.allow_existing_if_preflight_missing = allow_existing_if_preflight_missing;
-    Ok(prepared)
+    .await
 }
 
 pub async fn find_turn_initiator<C: ConnectionTrait>(
@@ -514,7 +510,6 @@ async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
     };
     Ok(PreparedTurnUpsert {
         expected_existing: existing_collaboration,
-        allow_existing_if_preflight_missing: false,
         row,
         update_columns,
     })
@@ -526,11 +521,7 @@ pub(crate) async fn apply_prepared_turn_upsert<C: ConnectionTrait>(
 ) -> Result<()> {
     let turn_id = prepared.row.id.as_ref().to_owned();
     let current = find_turn_by_id(db, turn_id.as_str()).await?;
-    if current != prepared.expected_existing
-        && !(prepared.allow_existing_if_preflight_missing
-            && prepared.expected_existing.is_none()
-            && current.is_some())
-    {
+    if current != prepared.expected_existing {
         anyhow::bail!("turn `{turn_id}` changed during projection preparation");
     }
     turn::Entity::insert(prepared.row)

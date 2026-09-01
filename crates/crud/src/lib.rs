@@ -1510,6 +1510,17 @@ struct PreparedProjectedTurnEvent {
         Option<native_terminal_effect_outbox::PreparedNativeTerminalEffectActivation>,
 }
 
+/// State-independent work for a durable Turn event. This envelope is built
+/// before the writer is reserved; projection preparation is deliberately not
+/// part of it because an atomic batch must observe the effects of every
+/// preceding event in that same transaction.
+#[derive(Clone, Debug)]
+struct PreparedTurnEventEnvelope {
+    event: turn_event::PreparedTurnEvent,
+    projection_context_json: String,
+    claim_token: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnEventProjectionOutcome {
     Projected,
@@ -24441,12 +24452,7 @@ WHERE id IN (SELECT event_id FROM candidates)
         let mut prepared_events = Vec::with_capacity(events.len());
         for event in events.iter().cloned() {
             prepared_events.push(
-                prepare_projected_turn_event_for_permanent_storage(
-                    &self.connection,
-                    event,
-                    created_at,
-                )
-                .await?,
+                prepare_turn_event_envelope_for_permanent_storage(&self.connection, event).await?,
             );
         }
         let transaction = self
@@ -24479,6 +24485,16 @@ WHERE id IN (SELECT event_id FROM candidates)
         }
 
         for event in prepared_events {
+            let event =
+                match prepare_projected_turn_event_from_envelope(&transaction, event, created_at)
+                    .await
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
             if let Err(error) = self
                 .append_and_project_turn_event_in_transaction(
                     &transaction,
@@ -27456,7 +27472,36 @@ async fn prepare_projected_turn_event_for_permanent_storage<C: ConnectionTrait>(
     event: TurnEventPayload,
     created_at: DateTimeWithTimeZone,
 ) -> Result<PreparedProjectedTurnEvent> {
+    let event = prepare_turn_event_envelope_for_permanent_storage(db, event).await?;
+    prepare_projected_turn_event_from_envelope(db, event, created_at).await
+}
+
+async fn prepare_turn_event_envelope_for_permanent_storage<C: ConnectionTrait>(
+    db: &C,
+    event: TurnEventPayload,
+) -> Result<PreparedTurnEventEnvelope> {
     let event = prepare_turn_event_for_permanent_storage(db, event).await?;
+    let projection_context_json = serialize_turn_event_projection_context(
+        &TurnEventProjectionContext::default(),
+        event.id(),
+    )?;
+    Ok(PreparedTurnEventEnvelope {
+        event,
+        projection_context_json,
+        claim_token: generate_id(DB_ID_LEN),
+    })
+}
+
+async fn prepare_projected_turn_event_from_envelope<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnEventEnvelope,
+    created_at: DateTimeWithTimeZone,
+) -> Result<PreparedProjectedTurnEvent> {
+    let PreparedTurnEventEnvelope {
+        event,
+        projection_context_json,
+        claim_token,
+    } = prepared;
     let projection = TurnProjector::new()
         .prepare(db, event.id(), event.payload(), created_at)
         .await?;
@@ -27472,15 +27517,11 @@ async fn prepare_projected_turn_event_for_permanent_storage<C: ConnectionTrait>(
         } else {
             None
         };
-    let projection_context_json = serialize_turn_event_projection_context(
-        &TurnEventProjectionContext::default(),
-        event.id(),
-    )?;
     Ok(PreparedProjectedTurnEvent {
         event,
         projection,
         projection_context_json,
-        claim_token: generate_id(DB_ID_LEN),
+        claim_token,
         terminal_effect_activation,
     })
 }
@@ -44058,6 +44099,263 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_completed_message_observes_its_thread_created_in_the_same_transaction() {
+        let store = test_store_with_workspace("ws_atomic_first_message").await;
+        let connection = store.database_connection();
+        let timestamp = 1_700_000_000;
+        let principal_id =
+            PrincipalId::new("P00000000000000000001").expect("principal id should be valid");
+        let gateway_id =
+            GatewayId::new("G00000000000000000001").expect("gateway id should be valid");
+        let now = unix_to_datetime(timestamp);
+        create_gateway_singleton(&connection, &gateway_id, 0, now)
+            .await
+            .expect("gateway identity should persist");
+        create_superuser(
+            &connection,
+            &principal_id,
+            &gateway_id,
+            "Author",
+            "author",
+            "author",
+            now,
+        )
+        .await
+        .expect("author principal should persist");
+
+        let actor = PersistedActorRef::Principal(principal_id.clone());
+        let author = pioneer_protocol::TurnAuthorSnapshot {
+            actor: actor.clone(),
+            display_name: "Author".to_owned(),
+            nickname: "author".to_owned(),
+            avatar_revision: None,
+            agent: None,
+        };
+        let mut thread = sample_thread(
+            "ws_atomic_first_message",
+            "thr_atomic_first_message",
+            timestamp,
+        );
+        thread.mode = ThreadMode::Message;
+        thread.status = ThreadStatus::Idle;
+        thread.visibility = Some(pioneer_protocol::ThreadVisibility::Workspace);
+        thread.preview = "first message".to_owned();
+        let mut started = sample_turn("turn_atomic_first_message");
+        started.mode = ThreadMode::Message;
+        started.author = Some(author.clone());
+        thread.turns.push(started.clone());
+        let mut completed = started.clone();
+        completed.status = TurnStatus::Completed;
+        let input = vec![UserInput::Text {
+            text: "first message".to_owned(),
+            text_elements: Vec::new(),
+        }];
+        let audit_event = pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: started.id.clone(),
+            event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: started.permission_profile.mode,
+            profile_source: started.permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+
+        store
+            .materialize_new_superuser_completed_message_turn_with_permission_audit(
+                CompletedMessageTurnWrite {
+                    thread: &thread,
+                    sandbox_mode: SandboxMode::FullAccess,
+                    started_turn: &started,
+                    input: input.as_slice(),
+                    actor: actor.clone(),
+                    completed: TurnCompletedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn: completed,
+                    },
+                    audit_event,
+                },
+                super::PersistedThreadAccessClass::Workspace,
+            )
+            .await
+            .expect("first Message and its thread should commit atomically");
+
+        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.as_str())
+            .one(&connection)
+            .await
+            .expect("new thread should load")
+            .expect("new thread should exist");
+        assert_eq!(
+            persisted_thread.created_by_actor_kind.as_deref(),
+            Some("principal")
+        );
+        assert_eq!(
+            persisted_thread.created_by_actor_id.as_deref(),
+            Some(principal_id.as_str())
+        );
+        let (_, persisted_turn) = store
+            .get_turn(thread.id.as_str(), started.id.as_str())
+            .await
+            .expect("first Message should load")
+            .expect("first Message should exist");
+        assert_eq!(persisted_turn.status, TurnStatus::Completed);
+        assert_eq!(persisted_turn.author.as_ref(), Some(&author));
+        assert_eq!(
+            crate::find_turn_initiator(&connection, started.id.as_str())
+                .await
+                .expect("first Message initiator should load"),
+            Some(actor)
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_started_completed_batch_preserves_every_supported_initiator_kind() {
+        let store = test_store_with_workspace("ws_atomic_actor_matrix").await;
+        let connection = store.database_connection();
+        let timestamp = 1_700_000_000;
+        let thread = sample_thread(
+            "ws_atomic_actor_matrix",
+            "thr_atomic_actor_matrix",
+            timestamp,
+        );
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::System)
+            .await
+            .expect("actor-matrix thread should persist");
+
+        let principal_id =
+            PrincipalId::new("P00000000000000000001").expect("principal id should be valid");
+        let principal_actor = PersistedActorRef::Principal(principal_id.clone());
+        let principal_author = pioneer_protocol::TurnAuthorSnapshot {
+            actor: principal_actor.clone(),
+            display_name: "Principal".to_owned(),
+            nickname: "principal".to_owned(),
+            avatar_revision: None,
+            agent: None,
+        };
+        let execution_id = pioneer_protocol::AgentExecutionId::new("E00000000000000000001")
+            .expect("execution id should be valid");
+        let agent_actor = PersistedActorRef::AgentExecution(execution_id.clone());
+        let agent_author = pioneer_protocol::AgentPresentationSnapshot {
+            agent_identity_id: pioneer_protocol::AgentIdentityId::new("I00000000000000000001")
+                .expect("agent identity id should be valid"),
+            agent_execution_id: execution_id,
+            identity_source_kind: pioneer_protocol::AgentIdentitySourceKind::NativeAgent,
+            identity_source_revision: 7,
+            display_name: "Builder".to_owned(),
+            nickname: "builder".to_owned(),
+            avatar_revision: None,
+            role_label: Some("worker".to_owned()),
+        }
+        .to_turn_author_snapshot();
+
+        for (index, suffix, actor, author) in [
+            (1_i64, "principal", principal_actor, Some(principal_author)),
+            (2, "agent", agent_actor, Some(agent_author)),
+            (3, "system", PersistedActorRef::System, None),
+        ] {
+            let mut event_thread = thread.clone();
+            event_thread.updated_at = timestamp + index;
+            event_thread.preview = format!("message from {suffix}");
+            let expected_read_author = match (&actor, &author) {
+                (PersistedActorRef::System, None) => Some(pioneer_protocol::TurnAuthorSnapshot {
+                    actor: PersistedActorRef::System,
+                    display_name: "System".to_owned(),
+                    nickname: "system".to_owned(),
+                    avatar_revision: None,
+                    agent: None,
+                }),
+                _ => author.clone(),
+            };
+            let mut started = sample_turn(format!("turn_atomic_{suffix}").as_str());
+            started.mode = ThreadMode::Message;
+            started.author = author.clone();
+            let mut completed = started.clone();
+            completed.status = TurnStatus::Completed;
+            let audit_event = pioneer_protocol::TurnPermissionAuditEvent {
+                workspace_id: event_thread.workspace_id.clone(),
+                thread_id: event_thread.id.clone(),
+                turn_id: started.id.clone(),
+                event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+                profile_mode: started.permission_profile.mode,
+                profile_source: started.permission_profile.source,
+                security_snapshot_id: None,
+                security_snapshot_version: None,
+                security_reason_code: None,
+                security_capability: None,
+                item_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                action_kind: None,
+                request_key: None,
+                decision: None,
+                reason: None,
+                cached: false,
+            };
+            let input = vec![UserInput::Text {
+                text: event_thread.preview.clone(),
+                text_elements: Vec::new(),
+            }];
+
+            store
+                .materialize_completed_message_turn_with_permission_audit(
+                    CompletedMessageTurnWrite {
+                        thread: &event_thread,
+                        sandbox_mode: SandboxMode::FullAccess,
+                        started_turn: &started,
+                        input: input.as_slice(),
+                        actor: actor.clone(),
+                        completed: TurnCompletedNotification {
+                            workspace_id: event_thread.workspace_id.clone(),
+                            thread_id: event_thread.id.clone(),
+                            turn: completed,
+                        },
+                        audit_event,
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{suffix} Message batch should commit: {error:#}"));
+
+            assert_eq!(
+                crate::find_turn_initiator(&connection, started.id.as_str())
+                    .await
+                    .expect("persisted initiator should load"),
+                Some(actor.clone()),
+                "{suffix} initiator must come from TurnStarted.actor"
+            );
+            let (_, persisted) = store
+                .get_turn(event_thread.id.as_str(), started.id.as_str())
+                .await
+                .expect("persisted Turn should load")
+                .expect("persisted Turn should exist");
+            assert_eq!(persisted.status, TurnStatus::Completed);
+            assert_eq!(persisted.author, expected_read_author);
+            if matches!(actor, PersistedActorRef::System) {
+                let row = pioneer_entity::turn::Entity::find_by_id(started.id.as_str())
+                    .one(&connection)
+                    .await
+                    .expect("System Turn row should load")
+                    .expect("System Turn row should exist");
+                assert_eq!(row.initiated_by_actor_kind.as_deref(), Some("system"));
+                assert_eq!(row.initiated_by_actor_id, None);
+                assert_eq!(row.author_display_name_snapshot, None);
+                assert_eq!(row.author_nickname_snapshot, None);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn completed_message_materializes_started_and_completed_in_one_batch() {
         let store = test_store_with_workspace("ws_atomic_message").await;
         let connection = store.database_connection();
@@ -44117,13 +44415,20 @@ mod tests {
         thread.model_provider = "stale-provider".to_owned();
         thread.updated_at = timestamp + 1;
         let permission_profile = pioneer_protocol::default_turn_permission_profile_snapshot();
+        let author_snapshot = pioneer_protocol::TurnAuthorSnapshot {
+            actor: PersistedActorRef::Principal(author.clone()),
+            display_name: "Author".to_owned(),
+            nickname: "author".to_owned(),
+            avatar_revision: None,
+            agent: None,
+        };
         let started = Turn {
             id: "turn_atomic_message".to_owned(),
             status: TurnStatus::InProgress,
             turn_kind: Default::default(),
             origin: Default::default(),
             mode: ThreadMode::Message,
-            author: None,
+            author: Some(author_snapshot.clone()),
             reply_to_turn_id: None,
             mentions: Vec::new(),
             message_revision: 0,
@@ -44204,6 +44509,13 @@ mod tests {
             .expect("turn should exist");
         assert_eq!(persisted.status, TurnStatus::Completed);
         assert_eq!(persisted.mode, ThreadMode::Message);
+        assert_eq!(persisted.author.as_ref(), Some(&author_snapshot));
+        assert_eq!(
+            crate::find_turn_initiator(&connection, started.id.as_str())
+                .await
+                .expect("turn initiator should load"),
+            Some(PersistedActorRef::Principal(author.clone()))
+        );
         assert_eq!(
             store.get_turn_inputs(started.id.as_str()).await.unwrap(),
             input

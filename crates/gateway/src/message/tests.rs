@@ -29296,6 +29296,51 @@ async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispat
     assert_eq!(persisted.status, TurnStatus::Completed);
     assert_eq!(persisted.mode, ThreadMode::Message);
     assert_eq!(persisted.author.as_ref(), Some(&historical_author));
+
+    let follow_up = json!({
+        "jsonrpc": "2.0",
+        "id": "bbbbbbbbbbbbbbbbbbbf1",
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread_response.thread.id,
+            "turn_id": "turn_000000000000000005",
+            "mode": "Message",
+            "input": [{"type": "text", "text": "Follow-up"}]
+        }
+    });
+    processor
+        .process_request_for_connection(connection_id, &follow_up.to_string())
+        .await;
+    let (follow_up_response, _) = recv_response_and_notification_by_id_method(
+        &mut rx,
+        "bbbbbbbbbbbbbbbbbbbf1",
+        events::TURN_STARTED,
+    )
+    .await;
+    let _follow_up_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let _follow_up_timeline =
+        recv_notification_by_method(&mut rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
+    let _follow_up_tree = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+    let follow_up_turn: TurnStartResponse = serde_json::from_value(follow_up_response.result)
+        .expect("follow-up Message response should decode");
+    assert_eq!(follow_up_turn.turn.status, TurnStatus::Completed);
+    assert_eq!(follow_up_turn.turn.mode, ThreadMode::Message);
+    assert_eq!(
+        follow_up_turn.turn.author.as_ref(),
+        Some(&historical_author),
+        "a second Message in the same loaded thread must retain its initiator snapshot"
+    );
+    assert!(
+        crud_store
+            .get_turn(
+                thread_response.thread.id.as_str(),
+                follow_up_turn.turn.id.as_str()
+            )
+            .await
+            .expect("follow-up Turn lookup should succeed")
+            .is_some(),
+        "the follow-up Message must be durable without reloading the application"
+    );
     crud_store
         .database_connection()
         .execute_unprepared(

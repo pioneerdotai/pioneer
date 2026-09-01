@@ -143,7 +143,6 @@ impl TurnProjector {
                     payload.reasoning_effort.as_deref(),
                     payload.actor.as_ref(),
                     payload.actor.is_some(),
-                    false,
                     updated_at,
                     updated_at,
                 )
@@ -246,7 +245,6 @@ impl TurnProjector {
                     None,
                     None,
                     false,
-                    true,
                     created_at,
                     created_at,
                 )
@@ -278,7 +276,6 @@ impl TurnProjector {
                     None,
                     None,
                     false,
-                    true,
                     created_at,
                     created_at,
                 )
@@ -310,7 +307,6 @@ impl TurnProjector {
                     None,
                     None,
                     false,
-                    true,
                     created_at,
                     created_at,
                 )
