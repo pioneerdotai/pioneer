@@ -19,6 +19,9 @@ pub enum GatewayStartupStage {
     DatabaseOpen,
     DatabaseConfigure,
     DatabaseMigrate,
+    DatabaseReaderOpen,
+    DatabaseReaderConfigure,
+    DatabaseReaderValidate,
     DatabaseBootstrap,
     IdentityBootstrap,
     ServicesInitialize,
@@ -50,6 +53,9 @@ impl GatewayStartupStage {
             Self::DatabaseOpen => "database.open",
             Self::DatabaseConfigure => "database.configure",
             Self::DatabaseMigrate => "database.migrate",
+            Self::DatabaseReaderOpen => "database.reader.open",
+            Self::DatabaseReaderConfigure => "database.reader.configure",
+            Self::DatabaseReaderValidate => "database.reader.validate",
             Self::DatabaseBootstrap => "database.bootstrap",
             Self::IdentityBootstrap => "identity.bootstrap",
             Self::ServicesInitialize => "services.initialize",
@@ -924,6 +930,18 @@ mod tests {
     #[test]
     fn stage_names_are_stable_and_low_cardinality() {
         assert_eq!(GatewayStartupStage::DatabaseOpen.as_str(), "database.open");
+        assert_eq!(
+            GatewayStartupStage::DatabaseReaderOpen.as_str(),
+            "database.reader.open"
+        );
+        assert_eq!(
+            GatewayStartupStage::DatabaseReaderConfigure.as_str(),
+            "database.reader.configure"
+        );
+        assert_eq!(
+            GatewayStartupStage::DatabaseReaderValidate.as_str(),
+            "database.reader.validate"
+        );
         assert_eq!(GatewayStartupStage::ListenerBind.as_str(), "listener.bind");
         assert_eq!(
             DesktopStartupStage::OperationalFrame.as_str(),

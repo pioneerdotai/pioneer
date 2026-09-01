@@ -5,6 +5,7 @@ use std::time::Duration;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context as TracingContext, Layer};
+use tracing_subscriber::registry::LookupSpan;
 
 static NATIVE_LIFECYCLE_DEPTH_VALUES: [AtomicU64; 5] = [
     AtomicU64::new(0),
@@ -16,7 +17,6 @@ static NATIVE_LIFECYCLE_DEPTH_VALUES: [AtomicU64; 5] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatabaseRole {
-    Shared,
     Reader,
     Writer,
 }
@@ -24,7 +24,6 @@ pub enum DatabaseRole {
 impl DatabaseRole {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Shared => "shared",
             Self::Reader => "reader",
             Self::Writer => "writer",
         }
@@ -94,11 +93,39 @@ pub struct DatabaseAdmissionMetric {
     pub held: Option<Duration>,
 }
 
+/// End-to-end reader observation, including maintenance admission and SQLx
+/// pool acquisition. The class and outcome are selected from fixed enums in
+/// pioneer-sqlite; no query or request data is accepted here.
+#[derive(Clone, Copy, Debug)]
+pub struct DatabaseReadMetric {
+    pub class: &'static str,
+    pub outcome: &'static str,
+    pub elapsed: Duration,
+}
+
+/// Lifecycle of the one-permit maintenance-reader limiter.
+#[derive(Clone, Copy, Debug)]
+pub struct DatabaseReadAdmissionMetric {
+    pub event: &'static str,
+    pub class: &'static str,
+    pub queue_depth: u64,
+    pub active: u64,
+    pub waited: Option<Duration>,
+    pub held: Option<Duration>,
+}
+
 pub(crate) struct GatewayMetrics {
     pub(crate) meter: Meter,
     pub(crate) database_operations: Counter<u64>,
     pub(crate) database_operation_duration: Histogram<f64>,
     pub(crate) database_pool_acquire_duration: Histogram<f64>,
+    pub(crate) database_read_operations: Counter<u64>,
+    pub(crate) database_read_duration: Histogram<f64>,
+    pub(crate) database_read_admission_events: Counter<u64>,
+    pub(crate) database_read_admission_wait_duration: Histogram<f64>,
+    pub(crate) database_read_admission_hold_duration: Histogram<f64>,
+    pub(crate) database_read_admission_queue_depth: Histogram<u64>,
+    pub(crate) database_read_admission_active: Histogram<u64>,
     pub(crate) database_admission_events: Counter<u64>,
     pub(crate) database_admission_wait_duration: Histogram<f64>,
     pub(crate) database_admission_quantum_duration: Histogram<f64>,
@@ -147,18 +174,60 @@ impl GatewayMetrics {
                 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
             ])
             .build();
+        let database_read_operations = meter
+            .u64_counter("pioneer.gateway.db.read.operations")
+            .with_description("Number of typed SQLite reader operations by scheduling class")
+            .with_unit("{operation}")
+            .build();
+        let database_read_duration = meter
+            .f64_histogram("pioneer.gateway.db.read.duration")
+            .with_description(
+                "End-to-end typed SQLite reader duration including admission and pool wait",
+            )
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let database_read_admission_events = meter
+            .u64_counter("pioneer.gateway.db.read.admission.events")
+            .with_description("Maintenance-reader limiter lifecycle events")
+            .with_unit("{event}")
+            .build();
+        let database_read_admission_wait_duration = meter
+            .f64_histogram("pioneer.gateway.db.read.admission.wait.duration")
+            .with_description("Time a maintenance read waits for the reader limiter")
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let database_read_admission_hold_duration = meter
+            .f64_histogram("pioneer.gateway.db.read.admission.hold.duration")
+            .with_description("Time a maintenance read retains the reader limiter permit")
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let database_read_admission_queue_depth = meter
+            .u64_histogram("pioneer.gateway.db.read.admission.queue.depth")
+            .with_description("Maintenance-reader queue depth at limiter lifecycle events")
+            .with_unit("{request}")
+            .with_boundaries(vec![
+                0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_024.0,
+            ])
+            .build();
+        let database_read_admission_active = meter
+            .u64_histogram("pioneer.gateway.db.read.admission.active")
+            .with_description("Active maintenance-reader permits at limiter lifecycle events")
+            .with_unit("{request}")
+            .with_boundaries(vec![0.0, 1.0])
+            .build();
         let database_admission_events = meter
             .u64_counter("pioneer.gateway.db.admission.events")
             .with_description(
-                "Fair SQLite admission events by bounded class, event, and grant reason",
+                "SQLite writer-executor admission events by class, event, and grant reason",
             )
             .with_unit("{event}")
             .build();
         let database_admission_wait_duration = meter
             .f64_histogram("pioneer.gateway.db.admission.wait.duration")
-            .with_description(
-                "Time a foreground or background database quantum waits for fair admission",
-            )
+            .with_description("Time a SQLite write waits for writer-executor admission")
             .with_unit("ms")
             .with_boundaries(vec![
                 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
@@ -167,7 +236,7 @@ impl GatewayMetrics {
             .build();
         let database_admission_quantum_duration = meter
             .f64_histogram("pioneer.gateway.db.admission.quantum.duration")
-            .with_description("Time SQLite admission is retained by one bounded database quantum")
+            .with_description("Time one write retains the SQLite writer executor")
             .with_unit("ms")
             .with_boundaries(vec![
                 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
@@ -176,7 +245,7 @@ impl GatewayMetrics {
             .build();
         let database_admission_queue_depth = meter
             .u64_histogram("pioneer.gateway.db.admission.queue.depth")
-            .with_description("Foreground and background queue depth at SQLite admission events")
+            .with_description("Writer-executor queue depth at SQLite admission events")
             .with_unit("{request}")
             .with_boundaries(vec![
                 0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_024.0,
@@ -293,6 +362,13 @@ impl GatewayMetrics {
             database_operations,
             database_operation_duration,
             database_pool_acquire_duration,
+            database_read_operations,
+            database_read_duration,
+            database_read_admission_events,
+            database_read_admission_wait_duration,
+            database_read_admission_hold_duration,
+            database_read_admission_queue_depth,
+            database_read_admission_active,
             database_admission_events,
             database_admission_wait_duration,
             database_admission_quantum_duration,
@@ -926,7 +1002,41 @@ fn register_patch_telemetry_observables(meter: &Meter) {
         .build();
 }
 
-fn record_database_pool_acquire(role: DatabaseRole, elapsed: Duration) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DatabasePoolContext {
+    role: DatabaseRole,
+    class: &'static str,
+}
+
+impl DatabasePoolContext {
+    fn from_span_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "pioneer.sqlite.reader.interactive" => Self {
+                role: DatabaseRole::Reader,
+                class: "interactive",
+            },
+            "pioneer.sqlite.reader.maintenance" => Self {
+                role: DatabaseRole::Reader,
+                class: "maintenance",
+            },
+            "pioneer.sqlite.writer.critical" => Self {
+                role: DatabaseRole::Writer,
+                class: "critical",
+            },
+            "pioneer.sqlite.writer.interactive" => Self {
+                role: DatabaseRole::Writer,
+                class: "interactive",
+            },
+            "pioneer.sqlite.writer.maintenance" => Self {
+                role: DatabaseRole::Writer,
+                class: "maintenance",
+            },
+            _ => return None,
+        })
+    }
+}
+
+fn record_database_pool_acquire(context: DatabasePoolContext, elapsed: Duration) {
     if !super::telemetry_enabled() {
         return;
     }
@@ -940,31 +1050,49 @@ fn record_database_pool_acquire(role: DatabaseRole, elapsed: Duration) {
         elapsed.as_secs_f64() * 1_000.0,
         &[
             KeyValue::new("db.system.name", "sqlite"),
-            KeyValue::new("db.pool.role", role.as_str()),
+            KeyValue::new("db.pool.role", context.role.as_str()),
+            KeyValue::new("db.scheduling.class", context.class),
         ],
     );
 }
 
-/// Consumes SQLx's pool-acquisition timing event without exposing it in normal logs.
+/// Consumes SQLx's pool-acquisition timing event without exposing it in normal
+/// logs. Unscoped SQLx pools are deliberately ignored rather than mislabeled
+/// as the Gateway reader or writer.
 pub(crate) struct DatabasePoolAcquireMetricsLayer;
 
 impl<S> Layer<S> for DatabasePoolAcquireMetricsLayer
 where
-    S: Subscriber,
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    fn on_event(&self, event: &Event<'_>, _ctx: TracingContext<'_, S>) {
+    fn on_event(&self, event: &Event<'_>, ctx: TracingContext<'_, S>) {
         let mut visitor = PoolAcquireEventVisitor::default();
         event.record(&mut visitor);
-        if let Some(seconds) = visitor
+        let Some(seconds) = visitor
             .acquired_after_seconds
             .filter(|value| value.is_finite())
-        {
-            record_database_pool_acquire(
-                DatabaseRole::Shared,
-                Duration::from_secs_f64(seconds.max(0.0)),
-            );
-        }
+        else {
+            return;
+        };
+        let Some(context) = database_pool_context_from_event(event, &ctx) else {
+            return;
+        };
+        record_database_pool_acquire(context, Duration::from_secs_f64(seconds.max(0.0)));
     }
+}
+
+fn database_pool_context_from_event<S>(
+    event: &Event<'_>,
+    ctx: &TracingContext<'_, S>,
+) -> Option<DatabasePoolContext>
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    ctx.event_scope(event).and_then(|scope| {
+        scope
+            .into_iter()
+            .find_map(|span| DatabasePoolContext::from_span_name(span.metadata().name()))
+    })
 }
 
 #[derive(Default)]
@@ -1010,6 +1138,63 @@ pub fn record_database_operation(
         .record(elapsed.as_secs_f64() * 1_000.0, &attributes);
 }
 
+pub fn record_database_read(metric: DatabaseReadMetric) {
+    if !super::telemetry_enabled() {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return;
+    };
+    let attributes = [
+        KeyValue::new("db.system.name", "sqlite"),
+        KeyValue::new("db.pool.role", DatabaseRole::Reader.as_str()),
+        KeyValue::new("db.scheduling.class", metric.class),
+        KeyValue::new("outcome", metric.outcome),
+    ];
+    metrics.database_read_operations.add(1, &attributes);
+    metrics
+        .database_read_duration
+        .record(metric.elapsed.as_secs_f64() * 1_000.0, &attributes);
+}
+
+pub fn record_database_read_admission(metric: DatabaseReadAdmissionMetric) {
+    if !super::telemetry_enabled() {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    let Some(metrics) = state.gateway_metrics.as_ref() else {
+        return;
+    };
+    let attributes = [
+        KeyValue::new("db.system.name", "sqlite"),
+        KeyValue::new("db.pool.role", DatabaseRole::Reader.as_str()),
+        KeyValue::new("db.admission.event", metric.event),
+        KeyValue::new("db.admission.class", metric.class),
+    ];
+    metrics.database_read_admission_events.add(1, &attributes);
+    metrics
+        .database_read_admission_queue_depth
+        .record(metric.queue_depth, &attributes);
+    metrics
+        .database_read_admission_active
+        .record(metric.active, &attributes);
+    if let Some(waited) = metric.waited {
+        metrics
+            .database_read_admission_wait_duration
+            .record(waited.as_secs_f64() * 1_000.0, &attributes);
+    }
+    if let Some(held) = metric.held {
+        metrics
+            .database_read_admission_hold_duration
+            .record(held.as_secs_f64() * 1_000.0, &attributes);
+    }
+}
+
 pub fn record_database_admission(metric: DatabaseAdmissionMetric) {
     if !super::telemetry_enabled() {
         return;
@@ -1022,6 +1207,7 @@ pub fn record_database_admission(metric: DatabaseAdmissionMetric) {
     };
     let attributes = [
         KeyValue::new("db.system.name", "sqlite"),
+        KeyValue::new("db.pool.role", DatabaseRole::Writer.as_str()),
         KeyValue::new("db.admission.event", metric.event),
         KeyValue::new("db.admission.class", metric.class),
         KeyValue::new("db.admission.reason", metric.reason),
@@ -1032,6 +1218,7 @@ pub fn record_database_admission(metric: DatabaseAdmissionMetric) {
         &[
             attributes[0].clone(),
             attributes[1].clone(),
+            attributes[2].clone(),
             KeyValue::new("db.admission.queue.class", "critical"),
         ],
     );
@@ -1040,6 +1227,7 @@ pub fn record_database_admission(metric: DatabaseAdmissionMetric) {
         &[
             attributes[0].clone(),
             attributes[1].clone(),
+            attributes[2].clone(),
             KeyValue::new("db.admission.queue.class", "interactive"),
         ],
     );
@@ -1048,6 +1236,7 @@ pub fn record_database_admission(metric: DatabaseAdmissionMetric) {
         &[
             attributes[0].clone(),
             attributes[1].clone(),
+            attributes[2].clone(),
             KeyValue::new("db.admission.queue.class", "maintenance"),
         ],
     );
@@ -1126,6 +1315,103 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::layer::{Context as TracingContext, Layer};
+    use tracing_subscriber::prelude::*;
+
+    struct PoolContextCaptureLayer(Arc<Mutex<Vec<Option<DatabasePoolContext>>>>);
+
+    impl<S> Layer<S> for PoolContextCaptureLayer
+    where
+        S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_event(&self, event: &Event<'_>, ctx: TracingContext<'_, S>) {
+            if event.metadata().target() == "sqlx::pool::acquire" {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(database_pool_context_from_event(event, &ctx));
+            }
+        }
+    }
+
+    #[test]
+    fn pool_acquire_context_is_exact_and_unscoped_events_are_ignored() {
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let database_metrics_filter = Targets::new()
+            .with_default(LevelFilter::OFF)
+            .with_target("sqlx::pool::acquire", LevelFilter::TRACE)
+            .with_target("pioneer_sqlite::pool", LevelFilter::TRACE);
+        let subscriber = tracing_subscriber::registry()
+            .with(PoolContextCaptureLayer(contexts.clone()).with_filter(database_metrics_filter));
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_test_pool_acquire(tracing::trace_span!(
+                target: "pioneer_sqlite::pool",
+                "pioneer.sqlite.reader.interactive"
+            ));
+            record_test_pool_acquire(tracing::trace_span!(
+                target: "pioneer_sqlite::pool",
+                "pioneer.sqlite.reader.maintenance"
+            ));
+            record_test_pool_acquire(tracing::trace_span!(
+                target: "pioneer_sqlite::pool",
+                "pioneer.sqlite.writer.critical"
+            ));
+            record_test_pool_acquire(tracing::trace_span!(
+                target: "pioneer_sqlite::pool",
+                "pioneer.sqlite.writer.interactive"
+            ));
+            record_test_pool_acquire(tracing::trace_span!(
+                target: "pioneer_sqlite::pool",
+                "pioneer.sqlite.writer.maintenance"
+            ));
+            tracing::trace!(
+                target: "sqlx::pool::acquire",
+                acquired_after_secs = 0.5_f64,
+                "unscoped connection"
+            );
+        });
+
+        assert_eq!(
+            *contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                Some(DatabasePoolContext {
+                    role: DatabaseRole::Reader,
+                    class: "interactive",
+                }),
+                Some(DatabasePoolContext {
+                    role: DatabaseRole::Reader,
+                    class: "maintenance",
+                }),
+                Some(DatabasePoolContext {
+                    role: DatabaseRole::Writer,
+                    class: "critical",
+                }),
+                Some(DatabasePoolContext {
+                    role: DatabaseRole::Writer,
+                    class: "interactive",
+                }),
+                Some(DatabasePoolContext {
+                    role: DatabaseRole::Writer,
+                    class: "maintenance",
+                }),
+                None,
+            ]
+        );
+    }
+
+    fn record_test_pool_acquire(span: tracing::Span) {
+        let _guard = span.enter();
+        tracing::trace!(
+            target: "sqlx::pool::acquire",
+            acquired_after_secs = 0.25_f64,
+            "acquired connection"
+        );
+    }
 
     #[test]
     fn native_lifecycle_depth_is_a_bounded_latest_value_snapshot() {

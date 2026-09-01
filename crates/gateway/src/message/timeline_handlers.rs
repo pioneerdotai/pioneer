@@ -303,13 +303,40 @@ impl MessageProcessor {
             }
         };
 
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::ThreadTimelinePage,
+        );
+        trace.set_variant(match &anchor {
+            ResolvedTimelineAnchor::Newest => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineNewest
+            }
+            ResolvedTimelineAnchor::Oldest => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineOldest
+            }
+            ResolvedTimelineAnchor::Before(_) => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineBefore
+            }
+            ResolvedTimelineAnchor::After(_) => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineAfter
+            }
+            ResolvedTimelineAnchor::Around(_) => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineAround
+            }
+        });
+
+        let thread_load_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineThreadLoad);
         let thread_model = match self
             .crud_store
             .get_thread_by_id(params.thread_id.as_str())
             .await
         {
-            Ok(Some(thread_model)) => thread_model,
+            Ok(Some(thread_model)) => {
+                thread_load_stage.succeed();
+                thread_model
+            }
             Ok(None) => {
+                drop(thread_load_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -319,9 +346,11 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
             Err(error) => {
+                drop(thread_load_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -331,6 +360,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
@@ -340,9 +370,12 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            trace.finish_failure();
             return;
         }
 
+        let approval_resolve_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ThreadTimelineApprovalResolve);
         let approval_action = crate::authorization::ResourceAction::AgentRequestObserve;
         let approval_gate = crate::authorization::AuthorizationService::new().authorize_action(
             request_context.principal().kind,
@@ -384,9 +417,12 @@ impl MessageProcessor {
             approval_resolution,
             Ok(crate::authorization::ProofResolution::Authorized(_))
         );
+        approval_resolve_stage.succeed();
         let approval_scope = ThreadTimelineApprovalScope {
             can_observe_agent_requests,
         };
+        let rows_load_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineRowsLoad);
         let rows_page = match self
             .load_thread_timeline_rows(
                 params.thread_id.as_str(),
@@ -396,8 +432,12 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(page) => page,
+            Ok(page) => {
+                rows_load_stage.succeed();
+                page
+            }
             Err(error) => {
+                drop(rows_load_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -407,17 +447,28 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTimelineProjectionRows,
+            u64::try_from(rows_page.rows.len()).unwrap_or(u64::MAX),
+        );
 
+        let page_info_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelinePageInfoBuild);
         let page_info = match self.thread_timeline_page_info(
             rows_page.rows.as_slice(),
             rows_page.has_more_before,
             rows_page.has_more_after,
         ) {
-            Ok(page_info) => page_info,
+            Ok(page_info) => {
+                page_info_stage.succeed();
+                page_info
+            }
             Err(error) => {
+                drop(page_info_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -427,18 +478,25 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
 
         let requested_thread_id = params.thread_id.clone();
         let workspace_id = thread_model.workspace_id.clone();
+        let blocks_materialize_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ThreadTimelineBlocksMaterialize);
         let mut blocks = match self
             .thread_timeline_blocks_from_rows(rows_page.rows, Some(&approval_scope))
             .await
         {
-            Ok(blocks) => blocks,
+            Ok(blocks) => {
+                blocks_materialize_stage.succeed();
+                blocks
+            }
             Err(error) => {
+                drop(blocks_materialize_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -448,9 +506,17 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTimelineMaterializedBlocks,
+            u64::try_from(blocks.len()).unwrap_or(u64::MAX),
+        );
+        let descendant_pending_stage = trace.stage(
+            pioneer_observability::GatewayOperationStage::ThreadTimelineDescendantPendingLoad,
+        );
         let descendant_pending_blocks = match self
             .descendant_pending_request_blocks(
                 workspace_id.as_str(),
@@ -459,8 +525,12 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(blocks) => blocks,
+            Ok(blocks) => {
+                descendant_pending_stage.succeed();
+                blocks
+            }
             Err(error) => {
+                drop(descendant_pending_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -470,14 +540,27 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTimelineDescendantPendingBlocks,
+            u64::try_from(descendant_pending_blocks.len()).unwrap_or(u64::MAX),
+        );
         append_timeline_blocks_dedup(&mut blocks, descendant_pending_blocks);
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTimelineReturnedBlocks,
+            u64::try_from(blocks.len()).unwrap_or(u64::MAX),
+        );
 
+        let connection_workspace_stage = trace.stage(
+            pioneer_observability::GatewayOperationStage::ThreadTimelineConnectionWorkspaceSet,
+        );
         self.session_manager
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
+        connection_workspace_stage.succeed();
 
         let response_payload = ThreadTimelinePageResponse {
             workspace_id,
@@ -486,9 +569,15 @@ impl MessageProcessor {
             blocks,
             page: page_info,
         };
+        let response_encode_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
-            Ok(response) => response,
+            Ok(response) => {
+                response_encode_stage.succeed();
+                response
+            }
             Err(error) => {
+                drop(response_encode_stage);
                 self.send_error(
                     connection_id,
                     timeline_delivery_error(
@@ -498,17 +587,25 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
 
+        let response_send_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineResponseSend);
         if let Err(error) = self.send_json(connection_id, &response).await {
+            drop(response_send_stage);
             warn!(
                 connection_id,
                 error = %format!("{error:#}"),
                 "failed to send thread/timeline/page response"
             );
+            trace.finish_failure();
+            return;
         }
+        response_send_stage.succeed();
+        trace.finish_success();
     }
 
     pub(super) async fn turn_work_page(

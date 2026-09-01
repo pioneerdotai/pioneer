@@ -104,11 +104,11 @@ async fn initialize_inner(
         WRITER_MAX_CONNECTIONS,
     );
 
+    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer());
     writer
-        .ping()
+        .ping(SqliteWriteClass::Maintenance)
         .await
         .context("failed to ping gateway writer")?;
-    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer());
     retry_with_backoff(
         || writer.apply_pragmas(SqliteWriteClass::Maintenance),
         is_anyhow_sqlite_lock,
@@ -146,18 +146,39 @@ async fn initialize_inner(
             .create_if_missing(false)
             .pragma("query_only", "ON")
     });
+    let reader_open_stage = startup
+        .map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseReaderOpen));
     let mut reader = Database::connect(reader_options)
         .await
         .with_context(|| format!("failed to connect to gateway read pool `{reader_url}`"))?;
+    if let Some(stage) = reader_open_stage {
+        stage.succeed();
+    }
+    let reader_configure_stage = startup.map(|trace| {
+        trace.stage(pioneer_observability::GatewayStartupStage::DatabaseReaderConfigure)
+    });
     configure_observability(
         &mut reader,
         pioneer_observability::DatabaseRole::Reader,
         config.max_connections,
     );
-    reader
-        .ping()
+    if let Some(stage) = reader_configure_stage {
+        stage.succeed();
+    }
+
+    let database =
+        SqliteDatabase::from_executor_with_read_observer(reader, writer, super::read_observer());
+    let reader_validate_stage = startup.map(|trace| {
+        trace.stage(pioneer_observability::GatewayStartupStage::DatabaseReaderValidate)
+    });
+    database
+        .maintenance()
+        .validate_reader()
         .await
-        .context("failed to ping gateway read pool")?;
+        .context("failed to validate gateway read pool")?;
+    if let Some(stage) = reader_validate_stage {
+        stage.succeed();
+    }
 
     info!(
         database_path = %database_path.display(),
@@ -166,7 +187,7 @@ async fn initialize_inner(
         "gateway database is ready"
     );
 
-    Ok(SqliteDatabase::from_executor(reader, writer))
+    Ok(database)
 }
 
 fn connect_options(

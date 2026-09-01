@@ -644,6 +644,9 @@ pub enum GatewayOperation {
     SkillsWatcherInitialize,
     DatabaseStartupMaintenance,
     ThreadTreeLoad,
+    ThreadOpen,
+    ThreadGet,
+    ThreadTimelinePage,
 }
 
 impl GatewayOperation {
@@ -657,6 +660,9 @@ impl GatewayOperation {
             Self::SkillsWatcherInitialize => "services.skills_watcher.initialize",
             Self::DatabaseStartupMaintenance => "database.startup_maintenance",
             Self::ThreadTreeLoad => "thread_tree.load",
+            Self::ThreadOpen => "thread.open",
+            Self::ThreadGet => "thread.get",
+            Self::ThreadTimelinePage => "thread_timeline.page",
         }
     }
 
@@ -670,6 +676,9 @@ impl GatewayOperation {
             Self::SkillsWatcherInitialize => "gateway.services.skills_watcher.initialize",
             Self::DatabaseStartupMaintenance => "gateway.database.startup_maintenance",
             Self::ThreadTreeLoad => "gateway.thread_tree.load",
+            Self::ThreadOpen => "gateway.thread.open",
+            Self::ThreadGet => "gateway.thread.get",
+            Self::ThreadTimelinePage => "gateway.thread_timeline.page",
         }
     }
 }
@@ -681,6 +690,13 @@ impl GatewayOperation {
 pub enum GatewayOperationVariant {
     ThreadTreeWorkspaceWide,
     ThreadTreePrincipalScoped,
+    ThreadGetRuntime,
+    ThreadGetPersisted,
+    ThreadTimelineNewest,
+    ThreadTimelineOldest,
+    ThreadTimelineBefore,
+    ThreadTimelineAfter,
+    ThreadTimelineAround,
 }
 
 impl GatewayOperationVariant {
@@ -688,6 +704,13 @@ impl GatewayOperationVariant {
         match self {
             Self::ThreadTreeWorkspaceWide => "thread_tree.workspace_wide",
             Self::ThreadTreePrincipalScoped => "thread_tree.principal_scoped",
+            Self::ThreadGetRuntime => "thread_get.runtime",
+            Self::ThreadGetPersisted => "thread_get.persisted",
+            Self::ThreadTimelineNewest => "thread_timeline.newest",
+            Self::ThreadTimelineOldest => "thread_timeline.oldest",
+            Self::ThreadTimelineBefore => "thread_timeline.before",
+            Self::ThreadTimelineAfter => "thread_timeline.after",
+            Self::ThreadTimelineAround => "thread_timeline.around",
         }
     }
 }
@@ -728,6 +751,27 @@ pub enum GatewayOperationStage {
     ThreadTreeAgentsDocsLoad,
     ThreadTreeResponseEncode,
     ThreadTreeResponseSend,
+    ThreadOpenPersistedLoad,
+    ThreadOpenSandboxPolicyLoad,
+    ThreadOpenRuntimeSubscribe,
+    ThreadOpenConnectionWorkspaceSet,
+    ThreadOpenResponseEncode,
+    ThreadOpenResponseSend,
+    ThreadOpenPostResponseReplay,
+    ThreadGetRuntimeLookup,
+    ThreadGetPersistedLoad,
+    ThreadGetUnreadLoad,
+    ThreadGetResponseEncode,
+    ThreadGetResponseSend,
+    ThreadTimelineThreadLoad,
+    ThreadTimelineApprovalResolve,
+    ThreadTimelineRowsLoad,
+    ThreadTimelinePageInfoBuild,
+    ThreadTimelineBlocksMaterialize,
+    ThreadTimelineDescendantPendingLoad,
+    ThreadTimelineConnectionWorkspaceSet,
+    ThreadTimelineResponseEncode,
+    ThreadTimelineResponseSend,
 }
 
 impl GatewayOperationStage {
@@ -764,6 +808,27 @@ impl GatewayOperationStage {
             Self::ThreadTreeAgentsDocsLoad => "agents_docs.load",
             Self::ThreadTreeResponseEncode => "response.encode",
             Self::ThreadTreeResponseSend => "response.send",
+            Self::ThreadOpenPersistedLoad => "persisted_thread.load",
+            Self::ThreadOpenSandboxPolicyLoad => "sandbox_policy.load",
+            Self::ThreadOpenRuntimeSubscribe => "runtime_thread.subscribe",
+            Self::ThreadOpenConnectionWorkspaceSet => "connection_workspace.set",
+            Self::ThreadOpenResponseEncode => "response.encode",
+            Self::ThreadOpenResponseSend => "response.send",
+            Self::ThreadOpenPostResponseReplay => "post_response.replay",
+            Self::ThreadGetRuntimeLookup => "runtime_thread.lookup",
+            Self::ThreadGetPersistedLoad => "persisted_thread.load",
+            Self::ThreadGetUnreadLoad => "unread.load",
+            Self::ThreadGetResponseEncode => "response.encode",
+            Self::ThreadGetResponseSend => "response.send",
+            Self::ThreadTimelineThreadLoad => "thread.load",
+            Self::ThreadTimelineApprovalResolve => "approval.resolve",
+            Self::ThreadTimelineRowsLoad => "projection_rows.load",
+            Self::ThreadTimelinePageInfoBuild => "page_info.build",
+            Self::ThreadTimelineBlocksMaterialize => "blocks.materialize",
+            Self::ThreadTimelineDescendantPendingLoad => "descendant_pending.load",
+            Self::ThreadTimelineConnectionWorkspaceSet => "connection_workspace.set",
+            Self::ThreadTimelineResponseEncode => "response.encode",
+            Self::ThreadTimelineResponseSend => "response.send",
         }
     }
 }
@@ -782,6 +847,10 @@ pub enum GatewayOperationItemKind {
     ThreadTreeUnreadThreads,
     ThreadTreeUnreadMessages,
     ThreadTreeAgentsDocs,
+    ThreadTimelineProjectionRows,
+    ThreadTimelineMaterializedBlocks,
+    ThreadTimelineDescendantPendingBlocks,
+    ThreadTimelineReturnedBlocks,
 }
 
 impl GatewayOperationItemKind {
@@ -796,6 +865,12 @@ impl GatewayOperationItemKind {
             Self::ThreadTreeUnreadThreads => "thread_tree.unread.nonzero_threads",
             Self::ThreadTreeUnreadMessages => "thread_tree.unread.messages",
             Self::ThreadTreeAgentsDocs => "thread_tree.agents_docs",
+            Self::ThreadTimelineProjectionRows => "thread_timeline.projection_rows",
+            Self::ThreadTimelineMaterializedBlocks => "thread_timeline.blocks.materialized",
+            Self::ThreadTimelineDescendantPendingBlocks => {
+                "thread_timeline.blocks.descendant_pending"
+            }
+            Self::ThreadTimelineReturnedBlocks => "thread_timeline.blocks.returned",
         }
     }
 
@@ -810,6 +885,12 @@ impl GatewayOperationItemKind {
             Self::ThreadTreeUnreadThreads => "thread_tree.unread.nonzero_threads.count",
             Self::ThreadTreeUnreadMessages => "thread_tree.unread.messages.count",
             Self::ThreadTreeAgentsDocs => "thread_tree.agents_docs.count",
+            Self::ThreadTimelineProjectionRows => "thread_timeline.projection_rows.count",
+            Self::ThreadTimelineMaterializedBlocks => "thread_timeline.blocks.materialized.count",
+            Self::ThreadTimelineDescendantPendingBlocks => {
+                "thread_timeline.blocks.descendant_pending.count"
+            }
+            Self::ThreadTimelineReturnedBlocks => "thread_timeline.blocks.returned.count",
         }
     }
 }
@@ -1182,6 +1263,34 @@ mod tests {
             "payload.compress"
         );
         assert_eq!(GatewayOperation::AuthMe.span_name(), "gateway.auth.me");
+        assert_eq!(
+            GatewayOperation::ThreadOpen.span_name(),
+            "gateway.thread.open"
+        );
+        assert_eq!(
+            GatewayOperation::ThreadGet.span_name(),
+            "gateway.thread.get"
+        );
+        assert_eq!(
+            GatewayOperation::ThreadTimelinePage.span_name(),
+            "gateway.thread_timeline.page"
+        );
+        assert_eq!(
+            GatewayOperationVariant::ThreadTimelineAround.as_str(),
+            "thread_timeline.around"
+        );
+        assert_eq!(
+            GatewayOperationStage::ThreadOpenRuntimeSubscribe.as_str(),
+            "runtime_thread.subscribe"
+        );
+        assert_eq!(
+            GatewayOperationStage::ThreadTimelineBlocksMaterialize.as_str(),
+            "blocks.materialize"
+        );
+        assert_eq!(
+            GatewayOperationItemKind::ThreadTimelineReturnedBlocks.span_attribute(),
+            "thread_timeline.blocks.returned.count"
+        );
         assert_eq!(
             GatewayOperationStage::AuthMePrincipalLoad.as_str(),
             "principal.load"

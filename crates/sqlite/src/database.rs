@@ -6,33 +6,16 @@ use sea_orm::{
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::Instrument;
 
+use crate::reader::{
+    MaintenanceReadLimiter, SqliteMaintenanceReadPermit, SqliteReadClass, SqliteReadObserver,
+    SqliteReadOperation, SqliteReadOutcome, noop_read_observer, reader_pool_span,
+};
 use crate::writer::{
     SqliteQueryStream, SqliteTransaction, SqliteWriteClass, SqliteWriteConnection,
     SqliteWriteExecutor, SqliteWriteObserver,
 };
-
-pub const DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS: usize = 1;
-
-/// Scheduling class for SQLite reads. Interactive reads use the pool
-/// directly; maintenance reads share one process-local permit so background
-/// work cannot consume every physical reader connection.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SqliteReadClass {
-    #[default]
-    Interactive,
-    Maintenance,
-}
-
-impl SqliteReadClass {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Interactive => "interactive",
-            Self::Maintenance => "maintenance",
-        }
-    }
-}
 
 /// The private owner of the physical SQLite read pool.
 ///
@@ -41,17 +24,33 @@ impl SqliteReadClass {
 /// mutation entry points and non-read statements are rejected before they can
 /// reach the pool. It deliberately never crosses the crate boundary: every
 /// query must carry a typed read class through [`SqliteDatabase`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SqliteReadPool {
     connection: DatabaseConnection,
-    maintenance: Arc<Semaphore>,
+    maintenance: Arc<MaintenanceReadLimiter>,
+    observer: Arc<dyn SqliteReadObserver>,
+}
+
+impl std::fmt::Debug for SqliteReadPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SqliteReadPool")
+    }
 }
 
 impl SqliteReadPool {
+    #[cfg(test)]
     fn new(connection: DatabaseConnection) -> Self {
+        Self::with_observer(connection, noop_read_observer())
+    }
+
+    fn with_observer(
+        connection: DatabaseConnection,
+        observer: Arc<dyn SqliteReadObserver>,
+    ) -> Self {
         Self {
             connection,
-            maintenance: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS)),
+            maintenance: MaintenanceReadLimiter::new(observer.clone()),
+            observer,
         }
     }
 
@@ -74,28 +73,55 @@ impl SqliteReadPool {
             .get_max_connections()
     }
 
-    async fn query_only_enabled(&self) -> Result<bool, DbErr> {
-        let row = self
-            .connection
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA query_only".to_owned(),
-            ))
-            .await?
-            .ok_or_else(|| DbErr::Custom("PRAGMA query_only returned no row".to_owned()))?;
-        Ok(row.try_get::<i64>("", "query_only")? != 0)
+    async fn query_only_enabled(&self, class: SqliteReadClass) -> Result<bool, DbErr> {
+        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let result = async {
+            let _permit = self.acquire(class).await?;
+            let row = self
+                .connection
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "PRAGMA query_only".to_owned(),
+                ))
+                .instrument(reader_pool_span(class))
+                .await?
+                .ok_or_else(|| DbErr::Custom("PRAGMA query_only returned no row".to_owned()))?;
+            Ok(row.try_get::<i64>("", "query_only")? != 0)
+        }
+        .await;
+        operation.finish(if result.is_ok() {
+            SqliteReadOutcome::Ok
+        } else {
+            SqliteReadOutcome::Error
+        });
+        result
     }
 
-    async fn acquire(&self, class: SqliteReadClass) -> Result<Option<OwnedSemaphorePermit>, DbErr> {
+    async fn ping(&self, class: SqliteReadClass) -> Result<(), DbErr> {
+        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let result = async {
+            let _permit = self.acquire(class).await?;
+            self.connection
+                .ping()
+                .instrument(reader_pool_span(class))
+                .await
+        }
+        .await;
+        operation.finish(if result.is_ok() {
+            SqliteReadOutcome::Ok
+        } else {
+            SqliteReadOutcome::Error
+        });
+        result
+    }
+
+    async fn acquire(
+        &self,
+        class: SqliteReadClass,
+    ) -> Result<Option<SqliteMaintenanceReadPermit>, DbErr> {
         match class {
             SqliteReadClass::Interactive => Ok(None),
-            SqliteReadClass::Maintenance => self
-                .maintenance
-                .clone()
-                .acquire_owned()
-                .await
-                .map(Some)
-                .map_err(|_| DbErr::Custom("SQLite maintenance read limiter closed".to_owned())),
+            SqliteReadClass::Maintenance => self.maintenance.acquire().await.map(Some),
         }
     }
 
@@ -105,8 +131,21 @@ impl SqliteReadPool {
         statement: Statement,
     ) -> Result<Option<QueryResult>, DbErr> {
         Self::ensure_read_statement(&statement)?;
-        let _permit = self.acquire(class).await?;
-        self.connection.query_one_raw(statement).await
+        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let result = async {
+            let _permit = self.acquire(class).await?;
+            self.connection
+                .query_one_raw(statement)
+                .instrument(reader_pool_span(class))
+                .await
+        }
+        .await;
+        operation.finish(if result.is_ok() {
+            SqliteReadOutcome::Ok
+        } else {
+            SqliteReadOutcome::Error
+        });
+        result
     }
 
     async fn query_all_raw(
@@ -115,8 +154,21 @@ impl SqliteReadPool {
         statement: Statement,
     ) -> Result<Vec<QueryResult>, DbErr> {
         Self::ensure_read_statement(&statement)?;
-        let _permit = self.acquire(class).await?;
-        self.connection.query_all_raw(statement).await
+        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let result = async {
+            let _permit = self.acquire(class).await?;
+            self.connection
+                .query_all_raw(statement)
+                .instrument(reader_pool_span(class))
+                .await
+        }
+        .await;
+        operation.finish(if result.is_ok() {
+            SqliteReadOutcome::Ok
+        } else {
+            SqliteReadOutcome::Error
+        });
+        result
     }
 
     async fn stream_raw(
@@ -125,9 +177,24 @@ impl SqliteReadPool {
         statement: Statement,
     ) -> Result<SqliteQueryStream, DbErr> {
         Self::ensure_read_statement(&statement)?;
-        let permit = self.acquire(class).await?;
-        let stream = self.connection.stream_raw(statement).await?;
-        Ok(SqliteQueryStream::read(stream, permit))
+        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let result = async {
+            let permit = self.acquire(class).await?;
+            let stream = self
+                .connection
+                .stream_raw(statement)
+                .instrument(reader_pool_span(class))
+                .await?;
+            Ok((stream, permit))
+        }
+        .await;
+        match result {
+            Ok((stream, permit)) => Ok(SqliteQueryStream::read(stream, permit, operation)),
+            Err(error) => {
+                operation.finish(SqliteReadOutcome::Error);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -158,8 +225,16 @@ impl SqliteDatabase {
     }
 
     pub fn from_executor(reader: DatabaseConnection, writer: SqliteWriteExecutor) -> Self {
+        Self::from_executor_with_read_observer(reader, writer, noop_read_observer())
+    }
+
+    pub fn from_executor_with_read_observer(
+        reader: DatabaseConnection,
+        writer: SqliteWriteExecutor,
+        read_observer: Arc<dyn SqliteReadObserver>,
+    ) -> Self {
         Self {
-            reader: SqliteReadPool::new(reader),
+            reader: SqliteReadPool::with_observer(reader, read_observer),
             writer,
             read_class: SqliteReadClass::Interactive,
             write_class: SqliteWriteClass::Interactive,
@@ -219,7 +294,17 @@ impl SqliteDatabase {
     }
 
     pub async fn reader_query_only_enabled(&self) -> Result<bool, DbErr> {
-        self.reader.query_only_enabled().await
+        self.reader.query_only_enabled(self.read_class).await
+    }
+
+    pub async fn validate_reader(&self) -> Result<(), DbErr> {
+        self.reader.ping(self.read_class).await?;
+        if !self.reader.query_only_enabled(self.read_class).await? {
+            return Err(DbErr::Custom(
+                "SQLite read pool is not protected by PRAGMA query_only".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Execute a row-returning statement on the serialized writer. This is
@@ -523,9 +608,34 @@ impl<'a> SqlScanner<'a> {
 #[cfg(test)]
 mod tests {
     use super::{SqliteDatabase, SqliteReadClass, SqliteReadPool, StatementRoute, statement_route};
+    use crate::{SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome, SqliteWriteExecutor};
     use futures_util::StreamExt;
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, StreamTrait};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingReadObserver {
+        events: Mutex<Vec<SqliteReadEvent>>,
+    }
+
+    impl SqliteReadObserver for RecordingReadObserver {
+        fn observe(&self, event: SqliteReadEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+        }
+    }
+
+    impl RecordingReadObserver {
+        fn events(&self) -> Vec<SqliteReadEvent> {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
 
     async fn test_database() -> SqliteDatabase {
         let mut reader_options = ConnectOptions::new("sqlite::memory:");
@@ -541,6 +651,28 @@ mod tests {
             .expect("open test writer");
 
         SqliteDatabase::new(reader, writer)
+    }
+
+    async fn observed_test_database() -> (SqliteDatabase, Arc<RecordingReadObserver>) {
+        let mut reader_options = ConnectOptions::new("sqlite::memory:");
+        reader_options.max_connections(4);
+        let reader = Database::connect(reader_options)
+            .await
+            .expect("open observed test reader pool");
+
+        let mut writer_options = ConnectOptions::new("sqlite::memory:");
+        writer_options.max_connections(1);
+        let writer = Database::connect(writer_options)
+            .await
+            .expect("open observed test writer");
+
+        let observer = Arc::new(RecordingReadObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::new(writer),
+            observer.clone(),
+        );
+        (database, observer)
     }
 
     #[test]
@@ -679,6 +811,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_observer_reports_class_outcome_and_maintenance_lifecycle() {
+        let (database, observer) = observed_test_database().await;
+
+        database
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 AS value".to_owned(),
+            ))
+            .await
+            .expect("run observed interactive read");
+        database
+            .maintenance()
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 2 AS value".to_owned(),
+            ))
+            .await
+            .expect("run observed maintenance read");
+
+        let events = observer.events();
+        assert!(matches!(
+            events.first(),
+            Some(SqliteReadEvent::OperationFinished {
+                class: SqliteReadClass::Interactive,
+                outcome: SqliteReadOutcome::Ok,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(SqliteReadEvent::AdmissionEnqueued {
+                class: SqliteReadClass::Maintenance,
+                queue_depth: 1,
+                active: 0,
+            })
+        ));
+        assert!(matches!(
+            events.get(2),
+            Some(SqliteReadEvent::AdmissionAcquired {
+                class: SqliteReadClass::Maintenance,
+                queue_depth: 0,
+                active: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.get(3),
+            Some(SqliteReadEvent::AdmissionReleased {
+                class: SqliteReadClass::Maintenance,
+                queue_depth: 0,
+                active: 0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.get(4),
+            Some(SqliteReadEvent::OperationFinished {
+                class: SqliteReadClass::Maintenance,
+                outcome: SqliteReadOutcome::Ok,
+                ..
+            })
+        ));
+        assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn reader_ping_uses_the_typed_maintenance_limiter() {
+        let (database, observer) = observed_test_database().await;
+
+        database
+            .reader
+            .ping(SqliteReadClass::Maintenance)
+            .await
+            .expect("ping observed maintenance reader");
+
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                SqliteReadEvent::AdmissionEnqueued {
+                    class: SqliteReadClass::Maintenance,
+                    queue_depth: 1,
+                    active: 0,
+                },
+                SqliteReadEvent::AdmissionAcquired {
+                    class: SqliteReadClass::Maintenance,
+                    queue_depth: 0,
+                    active: 1,
+                    ..
+                },
+                SqliteReadEvent::AdmissionReleased {
+                    class: SqliteReadClass::Maintenance,
+                    queue_depth: 0,
+                    active: 0,
+                    ..
+                },
+                SqliteReadEvent::OperationFinished {
+                    class: SqliteReadClass::Maintenance,
+                    outcome: SqliteReadOutcome::Ok,
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[tokio::test]
     async fn maintenance_stream_reserves_one_slot_without_blocking_interactive_reads() {
         let database = test_database().await;
         let maintenance = database.maintenance();
@@ -767,7 +1005,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_waiting_maintenance_read_does_not_leak_capacity() {
-        let database = test_database().await;
+        let (database, observer) = observed_test_database().await;
         let maintenance = database.maintenance();
         let held_stream = maintenance
             .stream_raw(Statement::from_string(
@@ -791,6 +1029,15 @@ mod tests {
         tokio::task::yield_now().await;
         waiting.abort();
         let _ = waiting.await;
+        assert!(observer.events().iter().any(|event| matches!(
+            event,
+            SqliteReadEvent::AdmissionCancelled {
+                class: SqliteReadClass::Maintenance,
+                queue_depth: 0,
+                active: 1,
+                ..
+            }
+        )));
         drop(held_stream);
 
         tokio::time::timeout(
@@ -803,5 +1050,13 @@ mod tests {
         .await
         .expect("cancelled waiter must not consume maintenance capacity")
         .expect("run maintenance read after cancellation");
+        assert!(observer.events().iter().any(|event| matches!(
+            event,
+            SqliteReadEvent::OperationFinished {
+                class: SqliteReadClass::Maintenance,
+                outcome: SqliteReadOutcome::Cancelled,
+                ..
+            }
+        )));
     }
 }

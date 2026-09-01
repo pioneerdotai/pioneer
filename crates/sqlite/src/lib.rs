@@ -6,9 +6,14 @@ use std::pin::Pin;
 use std::time::Duration;
 
 mod database;
+mod reader;
 mod writer;
 
-pub use database::{DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS, SqliteDatabase, SqliteReadClass};
+pub use database::SqliteDatabase;
+pub use reader::{
+    DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS, SqliteReadClass, SqliteReadEvent, SqliteReadObserver,
+    SqliteReadOutcome,
+};
 pub use writer::{
     DEFAULT_MAX_CRITICAL_BURST, DEFAULT_MAX_MAINTENANCE_WAIT_MS, DEFAULT_MAX_NON_MAINTENANCE_BURST,
     SqliteQueryStream, SqliteTransaction, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,

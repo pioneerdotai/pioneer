@@ -235,7 +235,7 @@ impl MessageProcessor {
         self.session_manager
             .set_connection_workspace(connection_id, Some(workspace_id))
             .await;
-        self.finish_thread_start(connection_id, request_id, outcome)
+        self.finish_thread_start(connection_id, request_id, outcome, None)
             .await;
     }
 
@@ -271,6 +271,11 @@ impl MessageProcessor {
             return;
         }
 
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::ThreadOpen,
+        );
+        let persisted_load_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenPersistedLoad);
         let persisted_thread = match self
             .crud_store
             .get_thread_model(authorization.thread_id())
@@ -280,17 +285,21 @@ impl MessageProcessor {
                 if thread.workspace_id == authorization.workspace_id()
                     && thread.id == authorization.thread_id() =>
             {
+                persisted_load_stage.succeed();
                 thread
             }
             Ok(_) => {
+                drop(persisted_load_stage);
                 self.send_error(
                     connection_id,
                     AuthorizationExternalError::NotFound.response(request_id),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
             Err(error) => {
+                drop(persisted_load_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -300,16 +309,23 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
+        let sandbox_policy_load_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenSandboxPolicyLoad);
         let persisted_sandbox_mode = match self
             .crud_store
             .get_thread_sandbox_mode(authorization.thread_id())
             .await
         {
-            Ok(mode) => mode,
+            Ok(mode) => {
+                sandbox_policy_load_stage.succeed();
+                mode
+            }
             Err(error) => {
+                drop(sandbox_policy_load_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -319,10 +335,13 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
         let workspace_id = authorization.workspace_id().to_owned();
+        let runtime_subscribe_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenRuntimeSubscribe);
         let outcome = match self
             .thread_manager
             .thread_start_seeded_authenticated(
@@ -338,8 +357,12 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                runtime_subscribe_stage.succeed();
+                outcome
+            }
             Err(error) => {
+                drop(runtime_subscribe_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -349,14 +372,25 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
+        let connection_workspace_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ThreadOpenConnectionWorkspaceSet);
         self.session_manager
             .set_connection_workspace(connection_id, Some(workspace_id))
             .await;
-        self.finish_thread_start(connection_id, request_id, outcome)
-            .await;
+        connection_workspace_stage.succeed();
+
+        if self
+            .finish_thread_start(connection_id, request_id, outcome, Some(&trace))
+            .await
+        {
+            trace.finish_success();
+        } else {
+            trace.finish_failure();
+        }
     }
 
     async fn finish_thread_start(
@@ -364,13 +398,23 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         request_id: RequestId,
         outcome: crate::thread::ThreadStartOutcome,
-    ) {
+        trace: Option<&pioneer_observability::GatewayOperationTrace>,
+    ) -> bool {
         let replay_workspace_id = outcome.response.thread.workspace_id.clone();
         let replay_thread_id = outcome.response.thread.id.clone();
 
+        let response_encode_stage = trace.map(|trace| {
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenResponseEncode)
+        });
         let response = match JsonRpcResponse::from_result(request_id, &outcome.response) {
-            Ok(response) => response,
+            Ok(response) => {
+                if let Some(stage) = response_encode_stage {
+                    stage.succeed();
+                }
+                response
+            }
             Err(error) => {
+                drop(response_encode_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -380,19 +424,29 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
-                return;
+                return false;
             }
         };
 
+        let response_send_stage = trace.map(|trace| {
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenResponseSend)
+        });
         if let Err(error) = self.send_json(connection_id, &response).await {
+            drop(response_send_stage);
             warn!(
                 connection_id,
                 error = %format!("{error:#}"),
                 "failed to send thread/start response"
             );
-            return;
+            return false;
+        }
+        if let Some(stage) = response_send_stage {
+            stage.succeed();
         }
 
+        let post_response_replay_stage = trace.map(|trace| {
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadOpenPostResponseReplay)
+        });
         self.send_notification_to_authorized_thread_connections(
             replay_thread_id.as_str(),
             events::THREAD_STARTED,
@@ -413,6 +467,10 @@ impl MessageProcessor {
             replay_thread_id.as_str(),
         )
         .await;
+        if let Some(stage) = post_response_replay_stage {
+            stage.succeed();
+        }
+        true
     }
 
     pub(super) async fn thread_tree(
@@ -719,20 +777,34 @@ impl MessageProcessor {
             return;
         }
 
-        let thread = if let Some(thread) = self
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::ThreadGet,
+        );
+        let runtime_lookup_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadGetRuntimeLookup);
+        let runtime_thread = self
             .thread_manager
             .thread_get(params.thread_id.as_str())
-            .await
-        {
+            .await;
+        runtime_lookup_stage.succeed();
+        let thread = if let Some(thread) = runtime_thread {
+            trace.set_variant(pioneer_observability::GatewayOperationVariant::ThreadGetRuntime);
             Some(thread)
         } else {
+            trace.set_variant(pioneer_observability::GatewayOperationVariant::ThreadGetPersisted);
+            let persisted_load_stage =
+                trace.stage(pioneer_observability::GatewayOperationStage::ThreadGetPersistedLoad);
             match self
                 .crud_store
                 .get_thread_model(params.thread_id.as_str())
                 .await
             {
-                Ok(thread) => thread,
+                Ok(thread) => {
+                    persisted_load_stage.succeed();
+                    thread
+                }
                 Err(error) => {
+                    drop(persisted_load_stage);
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
@@ -742,6 +814,7 @@ impl MessageProcessor {
                         ),
                     )
                     .await;
+                    trace.finish_failure();
                     return;
                 }
             }
@@ -757,6 +830,7 @@ impl MessageProcessor {
                 ),
             )
             .await;
+            trace.finish_failure();
             return;
         };
         if thread.workspace_id != authorization.workspace_id() {
@@ -765,9 +839,12 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            trace.finish_failure();
             return;
         }
 
+        let unread_load_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadGetUnreadLoad);
         let unread_count = match self
             .crud_store
             .unread_counts_for_threads(
@@ -776,8 +853,12 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(counts) => counts.get(thread.id.as_str()).copied().unwrap_or(0),
+            Ok(counts) => {
+                unread_load_stage.succeed();
+                counts.get(thread.id.as_str()).copied().unwrap_or(0)
+            }
             Err(error) => {
+                drop(unread_load_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -787,6 +868,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
@@ -795,9 +877,15 @@ impl MessageProcessor {
             unread_count,
         };
 
+        let response_encode_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadGetResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
-            Ok(response) => response,
+            Ok(response) => {
+                response_encode_stage.succeed();
+                response
+            }
             Err(error) => {
+                drop(response_encode_stage);
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -807,17 +895,25 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
 
+        let response_send_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadGetResponseSend);
         if let Err(error) = self.send_json(connection_id, &response).await {
+            drop(response_send_stage);
             warn!(
                 connection_id,
                 error = %format!("{error:#}"),
                 "failed to send thread/get response"
             );
+            trace.finish_failure();
+            return;
         }
+        response_send_stage.succeed();
+        trace.finish_success();
     }
 
     #[cfg(test)]

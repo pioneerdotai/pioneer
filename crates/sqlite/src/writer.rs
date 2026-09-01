@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::sync::oneshot;
+use tracing::{Instrument, Span};
+
+use crate::reader::{SqliteMaintenanceReadPermit, SqliteReadOperation, SqliteReadOutcome};
 
 static NEXT_EXECUTOR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -44,6 +47,23 @@ impl SqliteWriteClass {
             Self::Interactive => "interactive",
             Self::Maintenance => "maintenance",
         }
+    }
+}
+
+fn writer_pool_span(class: SqliteWriteClass) -> Span {
+    match class {
+        SqliteWriteClass::Critical => tracing::trace_span!(
+            target: "pioneer_sqlite::pool",
+            "pioneer.sqlite.writer.critical"
+        ),
+        SqliteWriteClass::Interactive => tracing::trace_span!(
+            target: "pioneer_sqlite::pool",
+            "pioneer.sqlite.writer.interactive"
+        ),
+        SqliteWriteClass::Maintenance => tracing::trace_span!(
+            target: "pioneer_sqlite::pool",
+            "pioneer.sqlite.writer.maintenance"
+        ),
     }
 }
 
@@ -271,6 +291,10 @@ impl SqliteWritePermit {
         Self {
             _reservation: Arc::new(reservation),
         }
+    }
+
+    fn class(&self) -> SqliteWriteClass {
+        self._reservation.class
     }
 }
 
@@ -541,12 +565,24 @@ impl SqliteWriteExecutor {
         self.connection.close().await
     }
 
+    /// Validates the physical writer connection under the same typed
+    /// reservation and pool-attribution contract as every other operation.
+    pub async fn ping(&self, class: SqliteWriteClass) -> Result<(), DbErr> {
+        let permit = self.acquire_or_reuse(class).await;
+        self.connection
+            .ping()
+            .instrument(writer_pool_span(permit.class()))
+            .await
+    }
+
     /// Applies the Gateway's connection pragmas while the physical writer is
     /// exclusively reserved. The raw connection never crosses this crate's
     /// API boundary.
     pub async fn apply_pragmas(&self, class: SqliteWriteClass) -> anyhow::Result<()> {
-        let _permit = self.acquire_or_reuse(class).await;
-        crate::apply_sqlite_pragmas(&self.connection).await
+        let permit = self.acquire_or_reuse(class).await;
+        crate::apply_sqlite_pragmas(&self.connection)
+            .instrument(writer_pool_span(permit.class()))
+            .await
     }
 
     /// Applies one SeaORM migrator while the physical writer is exclusively
@@ -560,8 +596,10 @@ impl SqliteWriteExecutor {
     where
         M: MigratorTrait,
     {
-        let _permit = self.acquire_or_reuse(class).await;
-        M::up(&self.connection, steps).await
+        let permit = self.acquire_or_reuse(class).await;
+        M::up(&self.connection, steps)
+            .instrument(writer_pool_span(permit.class()))
+            .await
     }
 
     /// Runs one logical write operation under this executor's classed
@@ -633,23 +671,39 @@ impl ConnectionTrait for SqliteWriteConnection {
     }
 
     async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
-        let _permit = self.executor.acquire_or_reuse(self.class).await;
-        self.executor.connection.execute_raw(statement).await
+        let permit = self.executor.acquire_or_reuse(self.class).await;
+        self.executor
+            .connection
+            .execute_raw(statement)
+            .instrument(writer_pool_span(permit.class()))
+            .await
     }
 
     async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
-        let _permit = self.executor.acquire_or_reuse(self.class).await;
-        self.executor.connection.execute_unprepared(sql).await
+        let permit = self.executor.acquire_or_reuse(self.class).await;
+        self.executor
+            .connection
+            .execute_unprepared(sql)
+            .instrument(writer_pool_span(permit.class()))
+            .await
     }
 
     async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
-        let _permit = self.executor.acquire_or_reuse(self.class).await;
-        self.executor.connection.query_one_raw(statement).await
+        let permit = self.executor.acquire_or_reuse(self.class).await;
+        self.executor
+            .connection
+            .query_one_raw(statement)
+            .instrument(writer_pool_span(permit.class()))
+            .await
     }
 
     async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
-        let _permit = self.executor.acquire_or_reuse(self.class).await;
-        self.executor.connection.query_all_raw(statement).await
+        let permit = self.executor.acquire_or_reuse(self.class).await;
+        self.executor
+            .connection
+            .query_all_raw(statement)
+            .instrument(writer_pool_span(permit.class()))
+            .await
     }
 
     fn support_returning(&self) -> bool {
@@ -667,15 +721,21 @@ impl ConnectionTrait for SqliteWriteConnection {
 pub struct SqliteQueryStream {
     inner: Pin<Box<QueryStream>>,
     writer_permit: Option<SqliteWritePermit>,
-    maintenance_read_permit: Option<OwnedSemaphorePermit>,
+    maintenance_read_permit: Option<SqliteMaintenanceReadPermit>,
+    read_operation: Option<SqliteReadOperation>,
 }
 
 impl SqliteQueryStream {
-    pub(crate) fn read(inner: QueryStream, permit: Option<OwnedSemaphorePermit>) -> Self {
+    pub(crate) fn read(
+        inner: QueryStream,
+        permit: Option<SqliteMaintenanceReadPermit>,
+        operation: SqliteReadOperation,
+    ) -> Self {
         Self {
             inner: Box::pin(inner),
             writer_permit: None,
             maintenance_read_permit: permit,
+            read_operation: Some(operation),
         }
     }
 
@@ -684,6 +744,7 @@ impl SqliteQueryStream {
             inner: Box::pin(inner),
             writer_permit: Some(permit),
             maintenance_read_permit: None,
+            read_operation: None,
         }
     }
 }
@@ -693,9 +754,22 @@ impl Stream for SqliteQueryStream {
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let result = self.inner.as_mut().poll_next(context);
-        if matches!(result, Poll::Ready(None)) {
-            self.writer_permit.take();
-            self.maintenance_read_permit.take();
+        match &result {
+            Poll::Ready(None) => {
+                if let Some(operation) = self.read_operation.as_mut() {
+                    operation.finish(SqliteReadOutcome::Ok);
+                }
+                self.read_operation.take();
+                self.writer_permit.take();
+                self.maintenance_read_permit.take();
+            }
+            Poll::Ready(Some(Err(_))) => {
+                if let Some(operation) = self.read_operation.as_mut() {
+                    operation.finish(SqliteReadOutcome::Error);
+                }
+                self.read_operation.take();
+            }
+            Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
         }
         result
     }
@@ -714,7 +788,13 @@ impl StreamTrait for SqliteWriteConnection {
     ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
         Box::pin(async move {
             let permit = self.executor.acquire_or_reuse(self.class).await;
-            let stream = self.executor.connection.stream_raw(statement).await?;
+            let effective_class = permit.class();
+            let stream = self
+                .executor
+                .connection
+                .stream_raw(statement)
+                .instrument(writer_pool_span(effective_class))
+                .await?;
             Ok(SqliteQueryStream::write(stream, permit))
         })
     }
@@ -867,7 +947,13 @@ impl TransactionTrait for SqliteWriteConnection {
 
     async fn begin(&self) -> Result<Self::Transaction, DbErr> {
         let permit = self.executor.acquire_or_reuse(self.class).await;
-        let transaction = self.executor.connection.begin().await?;
+        let effective_class = permit.class();
+        let transaction = self
+            .executor
+            .connection
+            .begin()
+            .instrument(writer_pool_span(effective_class))
+            .await?;
         Ok(SqliteTransaction::root(transaction, permit))
     }
 
@@ -877,10 +963,12 @@ impl TransactionTrait for SqliteWriteConnection {
         access_mode: Option<AccessMode>,
     ) -> Result<Self::Transaction, DbErr> {
         let permit = self.executor.acquire_or_reuse(self.class).await;
+        let effective_class = permit.class();
         let transaction = self
             .executor
             .connection
             .begin_with_config(isolation_level, access_mode)
+            .instrument(writer_pool_span(effective_class))
             .await?;
         Ok(SqliteTransaction::root(transaction, permit))
     }
@@ -890,7 +978,13 @@ impl TransactionTrait for SqliteWriteConnection {
         options: TransactionOptions,
     ) -> Result<Self::Transaction, DbErr> {
         let permit = self.executor.acquire_or_reuse(self.class).await;
-        let transaction = self.executor.connection.begin_with_options(options).await?;
+        let effective_class = permit.class();
+        let transaction = self
+            .executor
+            .connection
+            .begin_with_options(options)
+            .instrument(writer_pool_span(effective_class))
+            .await?;
         Ok(SqliteTransaction::root(transaction, permit))
     }
 
@@ -1436,6 +1530,7 @@ mod tests {
         let observer = Arc::new(RecordingObserver::default());
         let executor = SqliteWriteExecutor::with_observer(connection, observer.clone());
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
+        let critical = executor.connection(SqliteWriteClass::Critical);
 
         executor
             .run_scoped(SqliteWriteClass::Maintenance, async {
@@ -1449,7 +1544,15 @@ mod tests {
                     .expect("insert in scope");
                 executor
                     .run_scoped(SqliteWriteClass::Critical, async {
-                        maintenance
+                        assert_eq!(
+                            executor
+                                .acquire_or_reuse(SqliteWriteClass::Critical)
+                                .await
+                                .class(),
+                            SqliteWriteClass::Maintenance,
+                            "nested handles must attribute work to the effective reservation"
+                        );
+                        critical
                             .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
                             .await
                             .expect("nested scope insert");

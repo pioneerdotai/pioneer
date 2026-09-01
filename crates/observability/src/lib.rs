@@ -15,7 +15,7 @@ use sentry::integrations::tracing::{
 use sentry::{ClientInitGuard, ClientOptions};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer as _;
-use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::filter::{LevelFilter, Targets, filter_fn};
 use tracing_subscriber::layer::Context as TracingContext;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
@@ -29,10 +29,11 @@ mod startup;
 mod telemetry;
 
 pub use metrics::{
-    DatabaseAdmissionMetric, DatabaseOperation, DatabasePoolSnapshot, DatabaseRole,
-    NativeLifecycleDepthKind, NativeLifecycleEventMetric, NativeLifecycleOutcome,
-    NativeLifecycleStage, NativeProviderClass, NativeReadinessComponent, NativeReadinessState,
-    PatchOperationMetric, record_database_admission, record_database_operation,
+    DatabaseAdmissionMetric, DatabaseOperation, DatabasePoolSnapshot, DatabaseReadAdmissionMetric,
+    DatabaseReadMetric, DatabaseRole, NativeLifecycleDepthKind, NativeLifecycleEventMetric,
+    NativeLifecycleOutcome, NativeLifecycleStage, NativeProviderClass, NativeReadinessComponent,
+    NativeReadinessState, PatchOperationMetric, record_database_admission,
+    record_database_operation, record_database_read, record_database_read_admission,
     record_native_lifecycle_depth, record_native_lifecycle_event,
     record_native_readiness_component, record_patch_mutation_fallback, record_patch_operation,
     register_database_pool_observer,
@@ -159,9 +160,12 @@ pub fn init_tracing(sentry_enabled: bool) {
         .with_target(false)
         .without_time()
         .with_filter(filter.clone());
-    let database_metrics_filter = Targets::new()
-        .with_default(LevelFilter::OFF)
-        .with_target("sqlx::pool::acquire", LevelFilter::TRACE);
+    // This filter is deliberately dynamic. Telemetry consent can change while
+    // the process is running, and disabled telemetry must not pay the cost of
+    // creating one attribution span and visiting one SQLx event per query.
+    let database_metrics_filter = filter_fn(|metadata| {
+        database_metrics_target_enabled(metadata.target(), telemetry_enabled())
+    });
     let subscriber = tracing_subscriber::registry()
         .with(metrics::DatabasePoolAcquireMetricsLayer.with_filter(database_metrics_filter))
         .with(format_layer);
@@ -173,6 +177,10 @@ pub fn init_tracing(sentry_enabled: bool) {
     } else {
         let _ = subscriber.try_init();
     }
+}
+
+fn database_metrics_target_enabled(target: &str, consent_enabled: bool) -> bool {
+    consent_enabled && matches!(target, "sqlx::pool::acquire" | "pioneer_sqlite::pool")
 }
 
 pub fn capture_anyhow(error: &anyhow::Error) {
@@ -555,7 +563,8 @@ fn non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        sentry_event_filter, should_demote_gpui_asset_cache_http_not_found,
+        database_metrics_target_enabled, sentry_event_filter,
+        should_demote_gpui_asset_cache_http_not_found,
         should_demote_rathole_client_control_channel_retry,
         should_demote_rmcp_transport_worker_failure,
         should_demote_tantivy_reader_commit_reload_not_found,
@@ -583,7 +592,8 @@ mod tests {
         let events = Arc::new(AtomicUsize::new(0));
         let database_metrics_filter = Targets::new()
             .with_default(LevelFilter::OFF)
-            .with_target("sqlx::pool::acquire", LevelFilter::TRACE);
+            .with_target("sqlx::pool::acquire", LevelFilter::TRACE)
+            .with_target("pioneer_sqlite::pool", LevelFilter::TRACE);
         let log_filter = Targets::new().with_default(LevelFilter::INFO);
         let subscriber = tracing_subscriber::registry()
             .with(
@@ -597,6 +607,24 @@ mod tests {
         });
 
         assert_eq!(events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn database_metrics_attribution_is_consent_gated_and_target_bounded() {
+        assert!(!database_metrics_target_enabled(
+            "sqlx::pool::acquire",
+            false
+        ));
+        assert!(!database_metrics_target_enabled(
+            "pioneer_sqlite::pool",
+            false
+        ));
+        assert!(database_metrics_target_enabled("sqlx::pool::acquire", true));
+        assert!(database_metrics_target_enabled(
+            "pioneer_sqlite::pool",
+            true
+        ));
+        assert!(!database_metrics_target_enabled("pioneer::other", true));
     }
 
     #[test]
