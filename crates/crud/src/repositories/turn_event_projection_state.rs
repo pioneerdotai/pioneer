@@ -8,7 +8,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 
 pub const PROJECTION_STATUS_PENDING: &str = "pending";
@@ -18,6 +18,42 @@ pub const PROJECTION_STATUS_FAILED: &str = "failed";
 pub const PROJECTION_STATUS_EXHAUSTED: &str = "exhausted";
 
 const CLAIM_TOKEN_LEN: usize = 21;
+const OBSERVE_PROJECTED_WATERMARK_SQL: &str = r#"
+WITH ordered_events AS (
+    SELECT
+        event.id,
+        event.turn_id,
+        event.sequence,
+        ROW_NUMBER() OVER (ORDER BY event.sequence) AS expected_sequence
+    FROM turn_event AS event
+    WHERE event.turn_id = ?
+      AND event.sequence > 0
+),
+evaluated_events AS (
+    SELECT
+        ordered.sequence,
+        ordered.expected_sequence,
+        EXISTS (
+            SELECT 1
+            FROM turn_event_projection_state AS projection
+            WHERE projection.event_id = ordered.id
+              AND projection.turn_id = ordered.turn_id
+              AND projection.sequence = ordered.sequence
+              AND projection.status = 'projected'
+        ) AS has_projected_receipt
+    FROM ordered_events AS ordered
+)
+SELECT COALESCE(
+    MIN(
+        CASE
+            WHEN sequence <> expected_sequence OR has_projected_receipt = 0
+                THEN expected_sequence - 1
+        END
+    ),
+    COUNT(*)
+) AS projected_through_sequence
+FROM evaluated_events
+"#;
 
 #[derive(Debug, Clone)]
 pub struct ClaimedTurnEventProjection {
@@ -43,6 +79,19 @@ pub struct TurnEventProjectionStreamBackfillCandidate {
     pub first_thread_id: String,
     pub last_thread_id: String,
     pub created_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectionWatermarkObservation {
+    pub observed_projected_through_sequence: i64,
+    pub stored_projected_through_sequence: i64,
+    pub watermark_advanced: bool,
+}
+
+impl ProjectionWatermarkObservation {
+    pub fn matches(&self) -> bool {
+        self.observed_projected_through_sequence == self.stored_projected_through_sequence
+    }
 }
 
 pub async fn list_stream_backfill_candidates<C: ConnectionTrait>(
@@ -399,6 +448,8 @@ pub async fn has_unprojected_predecessor<C: ConnectionTrait>(
 pub async fn mark_projected_claimed<C: ConnectionTrait>(
     db: &C,
     event_id: &str,
+    turn_id: &str,
+    sequence: i64,
     claim_token: &str,
     projected_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
@@ -436,7 +487,97 @@ pub async fn mark_projected_claimed<C: ConnectionTrait>(
         .rows_affected
         > 0;
 
+    if affected {
+        // Observation-only rollout: receipts remain authoritative. This shadow
+        // value advances only across an already projected contiguous prefix.
+        match super::turn_event_projection_stream_state::advance_projected_through(
+            db,
+            turn_id,
+            sequence.saturating_sub(1),
+            sequence,
+            projected_at,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                event_id,
+                turn_id,
+                sequence,
+                "shadow projection watermark did not advance; projection receipts remain authoritative"
+            ),
+            Err(error) => tracing::warn!(
+                event_id,
+                turn_id,
+                sequence,
+                error = %format!("{error:#}"),
+                "shadow projection watermark update failed; projection receipts remain authoritative"
+            ),
+        }
+    }
+
     Ok(affected)
+}
+
+/// Reconciles the shadow watermark with the contiguous canonical prefix whose
+/// projection receipts are all `projected`. It never mutates those receipts.
+pub async fn backfill_projected_watermark<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<ProjectionWatermarkObservation> {
+    let stream = super::turn_event_projection_stream_state::find(db, turn_id)
+        .await?
+        .with_context(|| format!("projection stream state for Turn `{turn_id}` is missing"))?;
+    if stream.projected_through_sequence < 0 {
+        anyhow::bail!("projection watermark for Turn `{turn_id}` is negative");
+    }
+
+    let observed_projected_through_sequence = db
+        .query_one_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            OBSERVE_PROJECTED_WATERMARK_SQL,
+            [turn_id.to_owned().into()],
+        ))
+        .await
+        .with_context(|| {
+            format!("failed to observe continuous projection watermark for Turn `{turn_id}`")
+        })?
+        .with_context(|| {
+            format!("continuous projection watermark query returned no row for Turn `{turn_id}`")
+        })?
+        .try_get::<i64>("", "projected_through_sequence")
+        .with_context(|| format!("failed to decode projection watermark for Turn `{turn_id}`"))?;
+
+    let watermark_advanced =
+        if observed_projected_through_sequence > stream.projected_through_sequence {
+            super::turn_event_projection_stream_state::advance_projected_through(
+                db,
+                turn_id,
+                stream.projected_through_sequence,
+                observed_projected_through_sequence,
+                updated_at,
+            )
+            .await?
+        } else {
+            false
+        };
+    let stored_projected_through_sequence = super::turn_event_projection_stream_state::find(
+        db, turn_id,
+    )
+    .await?
+    .with_context(|| {
+        format!(
+            "projection stream state for Turn `{turn_id}` disappeared during watermark observation"
+        )
+    })?
+    .projected_through_sequence;
+
+    Ok(ProjectionWatermarkObservation {
+        observed_projected_through_sequence,
+        stored_projected_through_sequence,
+        watermark_advanced,
+    })
 }
 
 pub async fn release_claim_as_pending<C: ConnectionTrait>(

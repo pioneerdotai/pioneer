@@ -9,7 +9,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use tracing::{info, warn};
 
 const PROJECTION_STREAM_STATE_BACKFILL_KEY: &str = "turn_event_projection_stream_state_backfill";
-const PROJECTION_STREAM_STATE_BACKFILL_VERSION: i64 = 2;
+const PROJECTION_STREAM_STATE_BACKFILL_VERSION: i64 = 3;
 const PROJECTION_STREAM_STATE_BACKFILL_BATCH_SIZE: u64 = 32;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,6 +21,8 @@ pub(crate) struct ProjectionStreamStateBackfillSummary {
     pub(crate) orphan_streams_quarantined: u64,
     pub(crate) streams_repaired: u64,
     pub(crate) events_repaired: u64,
+    pub(crate) watermarks_advanced: u64,
+    pub(crate) watermark_mismatches: u64,
 }
 
 pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
@@ -34,6 +36,8 @@ pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
                 orphan_streams_quarantined = summary.orphan_streams_quarantined,
                 streams_repaired = summary.streams_repaired,
                 events_repaired = summary.events_repaired,
+                watermarks_advanced = summary.watermarks_advanced,
+                watermark_mismatches = summary.watermark_mismatches,
                 "turn event projection stream state background backfill completed"
             );
         }
@@ -129,6 +133,12 @@ async fn backfill_all_batches(
         summary.events_repaired = summary
             .events_repaired
             .saturating_add(batch.events_repaired as u64);
+        summary.watermarks_advanced = summary
+            .watermarks_advanced
+            .saturating_add(batch.watermarks_advanced as u64);
+        summary.watermark_mismatches = summary
+            .watermark_mismatches
+            .saturating_add(batch.watermark_mismatches as u64);
         after_turn_id = Some(next_turn_id);
         super::maintenance_checkpoint().await?;
     }
@@ -217,7 +227,8 @@ mod tests {
     };
     use sea_orm::sea_query::Expr;
     use sea_orm::{
-        ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter, Set, Statement,
+        ColumnTrait, ConnectionTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set,
+        Statement,
     };
 
     #[tokio::test]
@@ -281,6 +292,8 @@ INSERT INTO turn_event_projection_state (
         assert!(!summary.skipped);
         assert_eq!(summary.streams_scanned, 2);
         assert_eq!(summary.streams_quarantined, 1);
+        assert_eq!(summary.watermarks_advanced, 0);
+        assert_eq!(summary.watermark_mismatches, 0);
 
         let poisoned = store
             .get_turn_event_projection_stream_state("turn_poison")
@@ -288,6 +301,7 @@ INSERT INTO turn_event_projection_state (
             .expect("poisoned stream state should query")
             .expect("poisoned stream should be backfilled");
         assert_eq!(poisoned.health, TurnProjectionStreamHealth::Quarantined);
+        assert_eq!(poisoned.projected_through_sequence, 0);
         assert_eq!(
             poisoned.blocking_event_id.as_deref(),
             Some("projection_poison_1")
@@ -303,6 +317,7 @@ INSERT INTO turn_event_projection_state (
             .expect("healthy stream state should query")
             .expect("healthy stream should be backfilled");
         assert_eq!(healthy.health, TurnProjectionStreamHealth::Healthy);
+        assert_eq!(healthy.projected_through_sequence, 0);
         assert!(healthy.blocking_event_id.is_none());
 
         let successor =
@@ -408,6 +423,7 @@ INSERT INTO turn_event_projection_state (
                 .expect("orphan stream state should query")
                 .expect("orphan stream should be retained as quarantine evidence");
             assert_eq!(stream.health, TurnProjectionStreamHealth::Quarantined);
+            assert_eq!(stream.projected_through_sequence, 0);
             assert_eq!(stream.blocking_event_id.as_deref(), Some(blocker_id));
             assert_eq!(
                 stream.last_error.as_deref(),
@@ -421,6 +437,7 @@ INSERT INTO turn_event_projection_state (
             .expect("valid successor should query")
             .expect("valid successor should still be backfilled");
         assert_eq!(valid.health, TurnProjectionStreamHealth::Healthy);
+        assert_eq!(valid.projected_through_sequence, 0);
 
         assert_eq!(
             pioneer_entity::turn_event_projection_state::Entity::find()
@@ -555,6 +572,182 @@ FROM (
             .await
             .expect("completed copy backfill should be idempotent");
         assert!(repeated.skipped);
+    }
+
+    #[tokio::test]
+    async fn watermark_backfill_observes_only_the_continuous_projected_prefix() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&db, None)
+            .await
+            .expect("schema migrations must succeed");
+        db.execute_unprepared(
+            r#"
+INSERT INTO turn (
+    id, thread_id, status, prompt_manifest_json, created_at, updated_at,
+    turn_kind, origin, mentions_json
+) VALUES (
+    'turn_watermark_observe', 'thread_watermark', 'in_progress', '{}',
+    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'conversation', 'user', '[]'
+);
+INSERT INTO turn_event (
+    id, thread_id, turn_id, sequence, event_type, payload,
+    created_at, idempotency_key
+) VALUES
+    ('watermark_event_1', 'thread_watermark', 'turn_watermark_observe', 1, 'test/one', '{}', CURRENT_TIMESTAMP, 'watermark-1'),
+    ('watermark_event_2', 'thread_watermark', 'turn_watermark_observe', 2, 'test/two', '{}', CURRENT_TIMESTAMP, 'watermark-2'),
+    ('watermark_event_3', 'thread_watermark', 'turn_watermark_observe', 3, 'test/three', '{}', CURRENT_TIMESTAMP, 'watermark-3'),
+    ('watermark_event_5', 'thread_watermark', 'turn_watermark_observe', 5, 'test/five', '{}', CURRENT_TIMESTAMP, 'watermark-5');
+INSERT INTO turn_event_projection_state (
+    event_id, thread_id, turn_id, sequence, status, attempt_count,
+    last_error, next_run_at, claim_token, claim_expires_at,
+    projection_context_json, projected_at, created_at, updated_at
+) VALUES
+    ('watermark_event_1', 'thread_watermark', 'turn_watermark_observe', 1, 'projected', 0, NULL, CURRENT_TIMESTAMP, NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('watermark_event_2', 'thread_watermark', 'turn_watermark_observe', 2, 'projected', 0, NULL, CURRENT_TIMESTAMP, NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('watermark_event_3', 'thread_watermark', 'turn_watermark_observe', 3, 'failed', 1, 'retryable', CURRENT_TIMESTAMP, NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('watermark_event_5', 'thread_watermark', 'turn_watermark_observe', 5, 'projected', 0, NULL, CURRENT_TIMESTAMP, NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+"#,
+        )
+        .await
+        .expect("legacy projection stream should insert");
+        let store = CrudStore::new(db.clone());
+
+        let summary = backfill_once(&store)
+            .await
+            .expect("watermark observation should backfill");
+        assert_eq!(summary.streams_scanned, 1);
+        assert_eq!(summary.watermarks_advanced, 1);
+        assert_eq!(summary.watermark_mismatches, 0);
+
+        let stream = store
+            .get_turn_event_projection_stream_state("turn_watermark_observe")
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should exist");
+        assert_eq!(stream.projected_through_sequence, 2);
+        assert_eq!(
+            pioneer_entity::turn_event_projection_state::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::TurnId
+                        .eq("turn_watermark_observe"),
+                )
+                .count(&db)
+                .await
+                .expect("projection receipts should count"),
+            4,
+            "watermark observation must not delete projection receipts"
+        );
+
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::Status,
+                Expr::value("projected"),
+            )
+            .filter(
+                pioneer_entity::turn_event_projection_state::Column::EventId
+                    .eq("watermark_event_3"),
+            )
+            .exec(&db)
+            .await
+            .expect("projection receipt gap should close");
+
+        let caught_up = store
+            .backfill_turn_event_projection_stream_states_batch(None, 32)
+            .await
+            .expect("watermark should advance only to the canonical sequence gap");
+        assert_eq!(caught_up.watermarks_advanced, 1);
+        assert_eq!(caught_up.watermark_mismatches, 0);
+        let stream = store
+            .get_turn_event_projection_stream_state("turn_watermark_observe")
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should exist");
+        assert_eq!(stream.projected_through_sequence, 3);
+        assert_eq!(
+            pioneer_entity::turn_event_projection_state::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::TurnId
+                        .eq("turn_watermark_observe"),
+                )
+                .count(&db)
+                .await
+                .expect("projection receipts should count"),
+            4
+        );
+
+        db.execute_unprepared(
+            r#"
+INSERT INTO turn_event (
+    id, thread_id, turn_id, sequence, event_type, payload,
+    created_at, idempotency_key
+) VALUES (
+    'watermark_event_4', 'thread_watermark', 'turn_watermark_observe', 4,
+    'test/four', '{}', CURRENT_TIMESTAMP, 'watermark-4'
+);
+INSERT INTO turn_event_projection_state (
+    event_id, thread_id, turn_id, sequence, status, attempt_count,
+    last_error, next_run_at, claim_token, claim_expires_at,
+    projection_context_json, projected_at, created_at, updated_at
+) VALUES (
+    'watermark_event_4', 'thread_watermark', 'turn_watermark_observe', 4,
+    'projected', 0, NULL, CURRENT_TIMESTAMP, NULL, NULL, '{}',
+    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+);
+"#,
+        )
+        .await
+        .expect("canonical sequence gap should close");
+        let fully_caught_up = store
+            .backfill_turn_event_projection_stream_states_batch(None, 32)
+            .await
+            .expect("watermark should catch up after both gaps close");
+        assert_eq!(fully_caught_up.watermarks_advanced, 1);
+        assert_eq!(fully_caught_up.watermark_mismatches, 0);
+        let stream = store
+            .get_turn_event_projection_stream_state("turn_watermark_observe")
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should exist");
+        assert_eq!(stream.projected_through_sequence, 5);
+        assert_eq!(
+            pioneer_entity::turn_event_projection_state::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::TurnId
+                        .eq("turn_watermark_observe"),
+                )
+                .count(&db)
+                .await
+                .expect("projection receipts should count"),
+            5,
+            "watermark observation must retain all projection receipts"
+        );
+
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::Status,
+                Expr::value("failed"),
+            )
+            .filter(
+                pioneer_entity::turn_event_projection_state::Column::EventId
+                    .eq("watermark_event_3"),
+            )
+            .exec(&db)
+            .await
+            .expect("observation mismatch should be introduced");
+        let mismatch = store
+            .backfill_turn_event_projection_stream_states_batch(None, 32)
+            .await
+            .expect("watermark mismatch should be observable without mutation");
+        assert_eq!(mismatch.watermarks_advanced, 0);
+        assert_eq!(mismatch.watermark_mismatches, 1);
+        let stream = store
+            .get_turn_event_projection_stream_state("turn_watermark_observe")
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should exist");
+        assert_eq!(stream.projected_through_sequence, 5);
     }
 
     #[tokio::test]
@@ -719,6 +912,8 @@ FROM (
         assert_eq!(summary.streams_scanned, 1);
         assert_eq!(summary.streams_repaired, 1);
         assert_eq!(summary.events_repaired, 1);
+        assert_eq!(summary.watermarks_advanced, 1);
+        assert_eq!(summary.watermark_mismatches, 0);
         assert_eq!(summary.streams_quarantined, 0);
 
         let raw_event = pioneer_entity::turn_event::Entity::find_by_id(event_id)
@@ -764,6 +959,7 @@ FROM (
             .expect("repaired stream should remain present");
         assert_eq!(stream.thread_id, canonical_thread_id);
         assert_eq!(stream.health, TurnProjectionStreamHealth::Healthy);
+        assert_eq!(stream.projected_through_sequence, 2);
 
         let marker = find_projection_meta(&db, PROJECTION_STREAM_STATE_BACKFILL_KEY)
             .await

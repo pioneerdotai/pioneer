@@ -28,6 +28,20 @@ impl MigratorTrait for BeforeTaskDeliveryTargetsMigrator {
     }
 }
 
+struct BeforeProjectionWatermarkMigrator;
+
+#[async_trait::async_trait]
+impl MigratorTrait for BeforeProjectionWatermarkMigrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        Migrator::migrations()
+            .into_iter()
+            .take_while(|migration| {
+                migration.name() != "m20260902_000002_turn_event_projection_watermark"
+            })
+            .collect()
+    }
+}
+
 fn sqlite_url(directory: &TempDir) -> String {
     format!(
         "sqlite://{}?mode=rwc",
@@ -251,6 +265,57 @@ async fn migration_upgrades_legacy_task_delivery_contract_without_runtime_fallba
         "task_legacy_exact:run_exact:thread:exact_thread:thread_exact",
     )
     .await;
+}
+
+#[tokio::test]
+async fn migration_adds_zero_watermark_without_rewriting_projection_stream_state() {
+    let directory = tempfile::tempdir().expect("create migration test directory");
+    let url = sqlite_url(&directory);
+    let previous = connect(&url).await;
+    BeforeProjectionWatermarkMigrator::up(&previous, None)
+        .await
+        .expect("apply schema before projection watermark migration");
+    previous
+        .execute_unprepared(
+            r#"
+INSERT INTO turn_event_projection_stream_state (
+    turn_id, thread_id, status, blocking_event_id, last_error,
+    quarantined_at, restored_at, created_at, updated_at
+) VALUES (
+    'turn_existing_stream', 'thread_existing', 'healthy', NULL, NULL,
+    NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+);
+"#,
+        )
+        .await
+        .expect("seed existing projection stream state");
+    previous.close().await.expect("close previous database");
+
+    let upgraded = connect(&url).await;
+    Migrator::up(&upgraded, None)
+        .await
+        .expect("apply projection watermark migration");
+
+    assert!(
+        column_exists(
+            &upgraded,
+            "turn_event_projection_stream_state",
+            "projected_through_sequence",
+        )
+        .await
+    );
+    let row = upgraded
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT projected_through_sequence FROM turn_event_projection_stream_state WHERE turn_id = 'turn_existing_stream'",
+        ))
+        .await
+        .expect("query migrated projection stream state")
+        .expect("existing projection stream state should remain");
+    assert_eq!(
+        i64::try_get(&row, "", "projected_through_sequence").expect("decode projection watermark"),
+        0
+    );
 }
 
 async fn string_column(database: &DatabaseConnection, sql: &str) -> String {

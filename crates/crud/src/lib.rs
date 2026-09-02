@@ -1470,6 +1470,8 @@ pub enum TurnProjectionStreamHealth {
 pub struct TurnProjectionStreamStateRecord {
     pub thread_id: String,
     pub turn_id: String,
+    /// Shadow observation only; projection receipts remain authoritative.
+    pub projected_through_sequence: i64,
     pub health: TurnProjectionStreamHealth,
     pub blocking_event_id: Option<String>,
     pub last_error: Option<String>,
@@ -1484,6 +1486,8 @@ pub struct TurnProjectionStreamBackfillBatch {
     pub orphan_streams_quarantined: usize,
     pub streams_repaired: usize,
     pub events_repaired: usize,
+    pub watermarks_advanced: usize,
+    pub watermark_mismatches: usize,
     pub last_turn_id: Option<String>,
 }
 
@@ -24721,6 +24725,8 @@ WHERE id IN (SELECT event_id FROM candidates)
         if !turn_event_projection_state::mark_projected_claimed(
             transaction,
             appended_event.id.as_str(),
+            appended_event.turn_id.as_str(),
+            appended_event.sequence,
             claim_token.as_str(),
             created_at,
         )
@@ -24970,6 +24976,8 @@ WHERE id IN (SELECT event_id FROM candidates)
         let projected = match turn_event_projection_state::mark_projected_claimed(
             &transaction,
             appended_event.id.as_str(),
+            appended_event.turn_id.as_str(),
+            appended_event.sequence,
             claim_token.as_str(),
             projected_at,
         )
@@ -25150,6 +25158,7 @@ WHERE id IN (SELECT event_id FROM candidates)
         Ok(Some(TurnProjectionStreamStateRecord {
             thread_id: state.thread_id,
             turn_id: state.turn_id,
+            projected_through_sequence: state.projected_through_sequence,
             health,
             blocking_event_id: state.blocking_event_id,
             last_error: state.last_error,
@@ -25212,6 +25221,8 @@ WHERE id IN (SELECT event_id FROM candidates)
                 let mut orphan_streams_quarantined = 0usize;
                 let mut streams_repaired = 0usize;
                 let mut events_repaired = 0usize;
+                let mut watermarks_advanced = 0usize;
+                let mut watermark_mismatches = 0usize;
                 for candidate in candidates {
                     let turn_model = turn::find_turn_by_id(
                         &transaction,
@@ -25310,6 +25321,28 @@ WHERE id IN (SELECT event_id FROM candidates)
                             );
                         }
                     }
+
+                    let observation =
+                        turn_event_projection_state::backfill_projected_watermark(
+                            &transaction,
+                            candidate.turn_id.as_str(),
+                            chrono::Utc::now().fixed_offset(),
+                        )
+                        .await?;
+                    if observation.watermark_advanced {
+                        watermarks_advanced = watermarks_advanced.saturating_add(1);
+                    }
+                    if !observation.matches() {
+                        watermark_mismatches = watermark_mismatches.saturating_add(1);
+                        tracing::warn!(
+                            turn_id = %candidate.turn_id,
+                            observed_projected_through_sequence = observation
+                                .observed_projected_through_sequence,
+                            stored_projected_through_sequence = observation
+                                .stored_projected_through_sequence,
+                            "shadow projection watermark differs from authoritative projection receipts"
+                        );
+                    }
                 }
 
                 Ok(TurnProjectionStreamBackfillBatch {
@@ -25318,6 +25351,8 @@ WHERE id IN (SELECT event_id FROM candidates)
                     orphan_streams_quarantined,
                     streams_repaired,
                     events_repaired,
+                    watermarks_advanced,
+                    watermark_mismatches,
                     last_turn_id,
                 })
             }
@@ -37923,6 +37958,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_watermark_does_not_replace_projection_receipt_authority() {
+        let store = test_store_with_workspace("ws_projection_watermark_shadow").await;
+        let timestamp = 1_700_000_000;
+        let thread_id = "thr_projection_watermark_shadow";
+        let turn_id = "turn_projection_watermark_shadow";
+        let thread = sample_thread("ws_projection_watermark_shadow", thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("turn start should persist");
+
+        let event = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_event::Column::Sequence.eq(1))
+            .one(&store.connection)
+            .await
+            .expect("turn event lookup should succeed")
+            .expect("turn/start event should exist");
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::Status,
+                sea_orm::sea_query::Expr::value(
+                    crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED,
+                ),
+            )
+            .filter(
+                pioneer_entity::turn_event_projection_state::Column::EventId.eq(event.id.clone()),
+            )
+            .exec(&store.connection)
+            .await
+            .expect("projection receipt should become incomplete");
+
+        let stream = store
+            .get_turn_event_projection_stream_state(turn_id)
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should exist");
+        assert_eq!(stream.projected_through_sequence, 1);
+
+        let error = store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect_err(
+                "shadow watermark must not satisfy idempotency without a projected receipt",
+            );
+        assert!(
+            format!("{error:#}").contains("authoritative projection is incomplete"),
+            "unexpected idempotency error: {error:#}"
+        );
+
+        let receipt = pioneer_entity::turn_event_projection_state::Entity::find_by_id(event.id)
+            .one(&store.connection)
+            .await
+            .expect("projection receipt should query")
+            .expect("projection receipt must remain present");
+        assert_eq!(
+            receipt.status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED
+        );
+    }
+
+    #[tokio::test]
     async fn turn_event_projection_deferral_keeps_raw_event_and_replays_in_order() {
         let store = test_store_with_workspace("ws_projection_replay").await;
         let timestamp = 1_700_000_000;
@@ -37943,6 +38054,13 @@ mod tests {
             )
             .await
             .expect("turn start should persist");
+
+        let initial_stream = store
+            .get_turn_event_projection_stream_state(turn_id)
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should exist");
+        assert_eq!(initial_stream.projected_through_sequence, 1);
 
         let start_event = pioneer_entity::turn_event::Entity::find()
             .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
@@ -38105,6 +38223,12 @@ mod tests {
             state.status
                 == crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED
         }));
+        let final_stream = store
+            .get_turn_event_projection_stream_state(turn_id)
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should exist");
+        assert_eq!(final_stream.projected_through_sequence, 2);
 
         let attempt = pioneer_entity::turn_item_attempt::Entity::find()
             .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq(turn_id))
