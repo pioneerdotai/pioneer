@@ -1071,6 +1071,7 @@ mod tests {
                 }],
                 actor: None,
                 reasoning_effort: None,
+                work_owner: Default::default(),
             }),
         }
     }

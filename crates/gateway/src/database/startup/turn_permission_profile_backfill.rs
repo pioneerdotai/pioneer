@@ -1282,6 +1282,7 @@ mod tests {
             turn_kind: Set("conversation".to_owned()),
             origin: Set("user".to_owned()),
             reasoning_effort: Set(None),
+            work_owner: Set("turn".to_owned()),
             permission_profile_mode: Set(None),
             permission_profile_source: Set(None),
             permission_profile_snapshot_json: Set(None),
@@ -1448,6 +1449,7 @@ mod tests {
             turn_kind: Set("conversation".to_owned()),
             origin: Set("user".to_owned()),
             reasoning_effort: Set(None),
+            work_owner: Set("turn".to_owned()),
             permission_profile_mode: Set(Some("auto_accept_edits".to_owned())),
             permission_profile_source: Set(Some("composer".to_owned())),
             permission_profile_snapshot_json: Set(Some(

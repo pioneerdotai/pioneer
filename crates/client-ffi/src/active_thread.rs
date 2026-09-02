@@ -2831,6 +2831,7 @@ mod tests {
             thread_id: "parent_thread".to_owned(),
             changed_block_ids: vec!["parent_answer".to_owned()],
             removed_block_ids: Vec::new(),
+            turn_work_tombstones: Vec::new(),
             before_cursor: None,
             after_cursor: None,
             reason: TimelineChangeReason::LiveEvent,

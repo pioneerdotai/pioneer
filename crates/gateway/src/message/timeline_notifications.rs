@@ -7,7 +7,7 @@ use pioneer_crud::{
 use pioneer_protocol::{
     TaskAttachmentMode, ThreadTimelineBlocksChangedNotification, TimelineChangeReason, TurnKind,
     TurnOrigin, TurnPermissionApprovalRequest, TurnWorkItemsChangedNotification,
-    TurnWorkStateChangedNotification,
+    TurnWorkStateChangedNotification, TurnWorkTombstone,
 };
 
 impl MessageProcessor {
@@ -93,23 +93,6 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) {
-        if self.is_detached_task_run_turn(thread_id, turn_id).await {
-            self.notify_semantic_timeline_blocks_changed(
-                workspace_id,
-                thread_id,
-                Vec::new(),
-                vec![work_block_id(turn_id)],
-            )
-            .await;
-            return;
-        }
-        self.notify_semantic_timeline_blocks_changed(
-            workspace_id,
-            thread_id,
-            vec![work_block_id(turn_id)],
-            Vec::new(),
-        )
-        .await;
         self.notify_semantic_turn_work_state_changed(workspace_id, thread_id, turn_id)
             .await;
     }
@@ -334,14 +317,35 @@ impl MessageProcessor {
         &self,
         workspace_id: &str,
         thread_id: &str,
+        changed_block_ids: Vec<String>,
+        removed_block_ids: Vec<String>,
+    ) {
+        self.notify_semantic_timeline_blocks_changed_with_tombstones(
+            workspace_id,
+            thread_id,
+            changed_block_ids,
+            removed_block_ids,
+            Vec::new(),
+        )
+        .await;
+    }
+
+    async fn notify_semantic_timeline_blocks_changed_with_tombstones(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
         mut changed_block_ids: Vec<String>,
         mut removed_block_ids: Vec<String>,
+        turn_work_tombstones: Vec<TurnWorkTombstone>,
     ) {
         changed_block_ids.sort();
         changed_block_ids.dedup();
         removed_block_ids.sort();
         removed_block_ids.dedup();
-        if changed_block_ids.is_empty() && removed_block_ids.is_empty() {
+        if changed_block_ids.is_empty()
+            && removed_block_ids.is_empty()
+            && turn_work_tombstones.is_empty()
+        {
             return;
         }
 
@@ -350,6 +354,7 @@ impl MessageProcessor {
             thread_id: thread_id.to_owned(),
             changed_block_ids,
             removed_block_ids,
+            turn_work_tombstones,
             before_cursor: None,
             after_cursor: None,
             reason: TimelineChangeReason::LiveEvent,
@@ -448,7 +453,42 @@ impl MessageProcessor {
     ) {
         let projection = match self.crud_store.get_turn_work_projection(turn_id).await {
             Ok(Some(projection)) => projection,
-            Ok(None) => return,
+            Ok(None) => {
+                let source_high_watermark = match self
+                    .crud_store
+                    .get_turn_event_projection_stream_state(turn_id)
+                    .await
+                {
+                    Ok(state) => state
+                        .map(|state| state.projected_through_sequence)
+                        .unwrap_or_default(),
+                    Err(error) => {
+                        warn!(
+                            thread_id,
+                            turn_id,
+                            error = %format!("{error:#}"),
+                            "failed to load turn work tombstone revision"
+                        );
+                        return;
+                    }
+                };
+                let block_id = work_block_id(turn_id);
+                self.notify_semantic_timeline_blocks_changed_with_tombstones(
+                    workspace_id,
+                    thread_id,
+                    Vec::new(),
+                    vec![block_id.clone()],
+                    vec![TurnWorkTombstone {
+                        turn_id: turn_id.to_owned(),
+                        block_id,
+                        source_high_watermark,
+                        projection_updated_at_unix_micros: pioneer_crud::utc_now()
+                            .timestamp_micros(),
+                    }],
+                )
+                .await;
+                return;
+            }
             Err(error) => {
                 warn!(
                     thread_id,
@@ -459,6 +499,13 @@ impl MessageProcessor {
                 return;
             }
         };
+        self.notify_semantic_timeline_blocks_changed(
+            workspace_id,
+            thread_id,
+            vec![work_block_id(turn_id)],
+            Vec::new(),
+        )
+        .await;
         let source_high_watermark = projection.source_high_watermark;
         let projection_updated_at_unix_micros = projection.updated_at.timestamp_micros();
         let work = match self.turn_work_block_from_projection(projection).await {

@@ -8782,6 +8782,71 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
         serde_json::from_value(response.result).expect("turn/start response should decode");
     assert_eq!(started.turn.id, turn_id);
 
+    let persisted_parent = turn::Entity::find_by_id(turn_id)
+        .one(&processor.crud_store.database_connection())
+        .await
+        .expect("Composer parent should load")
+        .expect("Composer parent should persist");
+    assert_eq!(persisted_parent.work_owner, "detached_task");
+    assert!(
+        processor
+            .crud_store
+            .get_turn_work_projection(turn_id)
+            .await
+            .expect("Composer parent work projection should query")
+            .is_none(),
+        "the message parent must never own the detached Task's work projection"
+    );
+
+    let parent_timeline_request_id = generate_test_request_id("composer", "parent-page");
+    let parent_timeline = request_thread_timeline_page_for_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        parent_thread_id,
+        parent_timeline_request_id.as_str(),
+    )
+    .await;
+    assert!(parent_timeline.blocks.iter().any(|block| {
+        block.turn_id.as_deref() == Some(turn_id)
+            && matches!(
+                &block.kind,
+                pioneer_protocol::TimelineBlockKind::UserMessage { .. }
+            )
+    }));
+    assert!(parent_timeline.blocks.iter().all(|block| {
+        !matches!(
+            &block.kind,
+            pioneer_protocol::TimelineBlockKind::TurnWork { work }
+                if work.turn_id == turn_id
+        )
+    }));
+
+    let no_work_request_id = generate_test_request_id("composer", "parent-work");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": no_work_request_id,
+                "method": "turn/work/page",
+                "params": {
+                    "threadId": parent_thread_id,
+                    "turnId": turn_id,
+                    "anchor": { "kind": "newest" },
+                    "limit": 10
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let no_work_response = recv_response_by_id(&mut rx, no_work_request_id.as_str()).await;
+    let no_work_page: pioneer_protocol::TurnWorkPageResponse =
+        serde_json::from_value(no_work_response.result)
+            .expect("valid parent without owned work should return a page tombstone");
+    assert!(no_work_page.work.is_none());
+    assert!(no_work_page.items.is_empty());
+
     let tasks = processor
         .task_runtime
         .service()
@@ -46100,9 +46165,13 @@ async fn turn_work_page_is_bounded_and_filters_hidden_rows() {
 
     assert_eq!(first_page.items.len(), 5);
     assert!(first_page.page.has_more_after);
-    assert!(first_page.work.visible_work_count > first_page.items.len() as u64);
+    let first_work = first_page
+        .work
+        .as_ref()
+        .expect("sandboxing turn should own a work projection");
+    assert!(first_work.visible_work_count > first_page.items.len() as u64);
     assert_eq!(
-        first_page.work.first_work_item_id.as_deref(),
+        first_work.first_work_item_id.as_deref(),
         first_page
             .items
             .first()
@@ -46168,8 +46237,12 @@ async fn turn_work_page_is_bounded_and_filters_hidden_rows() {
     let newest_response = recv_response_by_id(&mut harness.rx, newest_request_id.as_str()).await;
     let newest_page: pioneer_protocol::TurnWorkPageResponse =
         serde_json::from_value(newest_response.result).expect("turn/work/page should decode");
+    let newest_work = newest_page
+        .work
+        .as_ref()
+        .expect("sandboxing turn should retain its work projection");
     assert_eq!(
-        newest_page.work.last_work_item_id.as_deref(),
+        newest_work.last_work_item_id.as_deref(),
         newest_page
             .items
             .last()
@@ -46317,9 +46390,13 @@ async fn synthetic_large_turn_work_page_remains_bounded() {
         "large turn work query should stay bounded, took {work_elapsed:?}"
     );
     assert_eq!(work_page.items.len(), 100);
-    assert_eq!(work_page.work.work_count, 70_000);
-    assert_eq!(work_page.work.visible_work_count, 69_300);
-    assert_eq!(work_page.work.hidden_work_count, 700);
+    let work = work_page
+        .work
+        .as_ref()
+        .expect("synthetic large turn should own a work projection");
+    assert_eq!(work.work_count, 70_000);
+    assert_eq!(work.visible_work_count, 69_300);
+    assert_eq!(work.hidden_work_count, 700);
     assert!(!work_page.page.has_more_before);
     assert!(work_page.page.has_more_after);
     assert!(
@@ -46455,7 +46532,14 @@ async fn semantic_timeline_large_payloads_stay_websocket_safe_at_max_limits() {
         large_work_payload.len()
     );
     assert_eq!(large_work_page.items.len(), 200);
-    assert_eq!(large_work_page.work.work_count, 70_000);
+    assert_eq!(
+        large_work_page
+            .work
+            .as_ref()
+            .expect("synthetic large turn should own a work projection")
+            .work_count,
+        70_000
+    );
     assert!(large_work_page.page.has_more_after);
     assert!(
         large_work_page

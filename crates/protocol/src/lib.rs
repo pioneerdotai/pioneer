@@ -433,7 +433,7 @@ pub use timeline::{
     TimelinePageInfo, TimelineReplySummary, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
     TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
     TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
-    TurnWorkStateChangedNotification,
+    TurnWorkStateChangedNotification, TurnWorkTombstone,
 };
 pub use turn::{
     AgentExecutionBackend, AgentMessagePhase, BackendSecurityCapabilities, ByteRange,

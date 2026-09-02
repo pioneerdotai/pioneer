@@ -976,6 +976,19 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
     source_sequence: i64,
     refreshed_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    // A collaborative Composer parent persists the user message, while its
+    // detached child Task owns the execution UI. This immutable admission fact
+    // prevents the parent from ever exposing a transient empty work row.
+    if turn_model.work_owner == crate::TurnWorkOwner::DetachedTask.as_db_str() {
+        timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
+        timeline_repository::delete_thread_timeline_block(
+            db,
+            work_block_id(turn_model.id.as_str()).as_str(),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let visible_work_count = count_to_i64(
         timeline_repository::count_turn_work_items(
             db,

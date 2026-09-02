@@ -16,6 +16,27 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Declares which durable object owns the execution UI associated with a Turn.
+///
+/// This is an immutable admission fact. It must not be inferred later from the
+/// Turn author, send mode, timing, or the eventual presence of a child Task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnWorkOwner {
+    #[default]
+    Turn,
+    DetachedTask,
+}
+
+impl TurnWorkOwner {
+    pub(crate) const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::DetachedTask => "detached_task",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalTurnStartedEventPayload {
     pub thread: Thread,
@@ -26,6 +47,12 @@ pub struct CanonicalTurnStartedEventPayload {
     pub actor: Option<PersistedActorRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_turn_work_owner")]
+    pub work_owner: TurnWorkOwner,
+}
+
+const fn is_default_turn_work_owner(owner: &TurnWorkOwner) -> bool {
+    matches!(owner, TurnWorkOwner::Turn)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -272,6 +299,7 @@ mod tests {
             }],
             actor,
             reasoning_effort: Some("high".to_owned()),
+            work_owner: Default::default(),
         }
     }
 

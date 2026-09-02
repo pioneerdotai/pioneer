@@ -1589,6 +1589,7 @@ mod tests {
                     }],
                     actor: Some(principal_actor()),
                     reasoning_effort: Some("must-not-leak".to_owned()),
+                    work_owner: Default::default(),
                 }),
             ),
             record(
@@ -1625,6 +1626,7 @@ mod tests {
                     ],
                     actor: Some(principal_actor()),
                     reasoning_effort: Some(secret.to_owned()),
+                    work_owner: Default::default(),
                 }),
             ),
             record(
@@ -1916,6 +1918,7 @@ mod tests {
                     }],
                     actor: Some(principal_actor()),
                     reasoning_effort: None,
+                    work_owner: Default::default(),
                 }),
             ),
             record_in(
@@ -1947,6 +1950,7 @@ mod tests {
                     }],
                     actor: Some(PersistedActorRef::System),
                     reasoning_effort: None,
+                    work_owner: Default::default(),
                 }),
             ),
             record_in(
@@ -2080,6 +2084,7 @@ mod tests {
                     }],
                     actor: Some(principal_actor()),
                     reasoning_effort: None,
+                    work_owner: Default::default(),
                 }),
             ),
             record(
@@ -2172,6 +2177,7 @@ mod tests {
                     }],
                     actor: Some(principal_actor()),
                     reasoning_effort: None,
+                    work_owner: Default::default(),
                 }),
             ),
             record(
@@ -2212,6 +2218,7 @@ mod tests {
                     }],
                     actor: Some(principal_actor()),
                     reasoning_effort: None,
+                    work_owner: Default::default(),
                 }),
             ),
             record(

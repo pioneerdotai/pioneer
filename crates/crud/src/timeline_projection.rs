@@ -787,6 +787,7 @@ mod tests {
             updated_at: now,
             turn_kind: turn_kind.to_owned(),
             origin: "detached_task".to_owned(),
+            work_owner: "turn".to_owned(),
             reasoning_effort: None,
             permission_profile_mode: None,
             permission_profile_source: None,

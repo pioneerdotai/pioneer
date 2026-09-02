@@ -680,7 +680,7 @@ impl MessageProcessor {
                 if projection.thread_id == params.thread_id
                     && projection.workspace_id == authorization.workspace_id() =>
             {
-                projection
+                Some(projection)
             }
             Ok(Some(_)) => {
                 self.send_error(
@@ -699,21 +699,7 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "turn work projection for turn `{}` was not found",
-                            params.turn_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
+            Ok(None) => None,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -726,6 +712,68 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+        };
+
+        let Some(work_projection) = work_projection else {
+            let source_high_watermark = match self
+                .crud_store
+                .get_turn_event_projection_stream_state(params.turn_id.as_str())
+                .await
+            {
+                Ok(state) => state
+                    .map(|state| state.projected_through_sequence)
+                    .unwrap_or_default(),
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        timeline_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to load turn work tombstone revision: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let workspace_id = authorization.workspace_id().to_owned();
+            self.session_manager
+                .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+                .await;
+            let response_payload = TurnWorkPageResponse {
+                workspace_id,
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
+                source_high_watermark,
+                projection_updated_at_unix_micros: pioneer_crud::utc_now().timestamp_micros(),
+                work: None,
+                items: Vec::new(),
+                page: TimelinePageInfo::default(),
+            };
+            let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        timeline_delivery_error(
+                            None,
+                            INVALID_REQUEST_CODE,
+                            format!("failed to encode response: {error}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Err(error) = self.send_json(connection_id, &response).await {
+                warn!(
+                    connection_id,
+                    error = %format!("{error:#}"),
+                    "failed to send empty turn/work/page response"
+                );
+            }
+            return;
         };
 
         let snapshot = match self
@@ -800,7 +848,7 @@ impl MessageProcessor {
             projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
             source_high_watermark,
             projection_updated_at_unix_micros,
-            work,
+            work: Some(work),
             items: snapshot.items,
             page: page_info,
         };

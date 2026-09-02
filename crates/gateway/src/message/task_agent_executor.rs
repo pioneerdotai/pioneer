@@ -2233,6 +2233,7 @@ impl TaskAgentExecutor {
                     &materialize_turn,
                     &materialize_input,
                     materialize_reasoning_effort.as_deref(),
+                    pioneer_crud::TurnWorkOwner::Turn,
                     materialize_actor,
                     profile_selected_audit,
                     child_authority_json.as_str(),
@@ -3249,6 +3250,7 @@ impl TaskAgentExecutor {
                     &materialization_turn,
                     &materialization_input,
                     materialization_reasoning_effort.as_deref(),
+                    pioneer_crud::TurnWorkOwner::Turn,
                     action_actor,
                     profile_selected_audit,
                     child_authority_json.as_str(),
@@ -5425,6 +5427,7 @@ impl TaskAgentExecutor {
                     .reasoning
                     .as_ref()
                     .map(|reasoning| reasoning.effort.as_str()),
+                pioneer_crud::TurnWorkOwner::Turn,
                 action_actor,
                 profile_selected_audit,
                 child_authority_json.as_str(),
@@ -6844,6 +6847,7 @@ async fn ensure_task_run_occurrence_turn(
             &occurrence_turn,
             &[],
             None,
+            pioneer_crud::TurnWorkOwner::Turn,
             occurrence_actor,
             profile_selected_audit,
             occurrence_authority_json.as_str(),

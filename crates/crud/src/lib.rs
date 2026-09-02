@@ -12,7 +12,9 @@ mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
-pub use events::{AppendedTurnEvent, CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload};
+pub use events::{
+    AppendedTurnEvent, CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload, TurnWorkOwner,
+};
 pub use repositories::administrative_audit::{
     NewAdministrativeAuditEvent, audit_action_to_db, audit_domain_to_db, audit_target_kind_to_db,
     insert_administrative_audit_event,
@@ -2783,6 +2785,7 @@ fn completed_message_turn_events(
             input: write.input.to_vec(),
             actor: Some(write.actor),
             reasoning_effort: None,
+            work_owner: Default::default(),
         }),
         TurnEventPayload::TurnCompleted(write.completed),
         TurnEventPayload::TurnPermissionAudit(write.audit_event),
@@ -10457,6 +10460,7 @@ impl CrudStore {
             input: input.to_vec(),
             actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
+            work_owner: Default::default(),
         });
 
         self.materialize_turn_event(event, thread_model.updated_at)
@@ -10518,6 +10522,7 @@ impl CrudStore {
             input: Vec::new(),
             actor: Some(actor),
             reasoning_effort: None,
+            work_owner: Default::default(),
         });
         self.materialize_turn_events_atomically_with_optional_admission(
             vec![
@@ -10549,6 +10554,7 @@ impl CrudStore {
         turn_model: &Turn,
         input: &[UserInput],
         reasoning_effort: Option<&str>,
+        work_owner: TurnWorkOwner,
         actor: PersistedActorRef,
         audit_event: pioneer_protocol::TurnPermissionAuditEvent,
         authority_envelope_json: &str,
@@ -10598,6 +10604,7 @@ impl CrudStore {
             input: input.to_vec(),
             actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
+            work_owner,
         });
         let mut events = Vec::with_capacity(2usize.saturating_add(security_audit_events.len()));
         events.push(started_event);
@@ -10685,6 +10692,7 @@ impl CrudStore {
             input: input.to_vec(),
             actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
+            work_owner: Default::default(),
         });
         let mut events = Vec::with_capacity(2usize.saturating_add(security_audit_events.len()));
         events.push(started_event);
@@ -10794,6 +10802,7 @@ impl CrudStore {
                 input: Vec::new(),
                 actor: Some(write.actor),
                 reasoning_effort: None,
+                work_owner: Default::default(),
             }),
             TurnEventPayload::TurnPermissionAudit(write.audit_event),
             TurnEventPayload::ItemStarted(write.item_started),
@@ -10856,6 +10865,7 @@ impl CrudStore {
                 input: Vec::new(),
                 actor: Some(write.actor),
                 reasoning_effort: None,
+                work_owner: Default::default(),
             }),
             TurnEventPayload::TurnPermissionAudit(write.audit_event),
             TurnEventPayload::TurnFailed(write.failed),
@@ -11110,6 +11120,7 @@ impl CrudStore {
             input: input.to_vec(),
             actor: Some(actor),
             reasoning_effort: reasoning_effort.map(str::to_owned),
+            work_owner: Default::default(),
         });
         self.materialize_turn_events_atomically_with_optional_admission(
             vec![
@@ -28277,10 +28288,11 @@ mod tests {
         TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnMcpProjectionPersistenceError,
         TurnMcpProjectionRecord, TurnMcpProjectionReplacement, TurnMessageMutationFailure,
         TurnProjectionStreamHealth, TurnSkillBindingRecord, TurnWorkItemProjectionRecord,
-        WORK_ITEM_STATUS_COMPLETED, WORK_ITEM_STATUS_RUNNING, WORK_VISIBILITY_VISIBLE,
-        WorkspaceSkillPolicyRecord, create_gateway_singleton, create_member_principal,
-        create_superuser, delete_workspace_membership, ensure_pioneer_for_workspace,
-        insert_workspace_membership, list_abandoned_runtime_draft_artifact_ids,
+        TurnWorkOwner, WORK_ITEM_STATUS_COMPLETED, WORK_ITEM_STATUS_RUNNING,
+        WORK_VISIBILITY_VISIBLE, WorkspaceSkillPolicyRecord, create_gateway_singleton,
+        create_member_principal, create_superuser, delete_workspace_membership,
+        ensure_pioneer_for_workspace, insert_workspace_membership,
+        list_abandoned_runtime_draft_artifact_ids,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
         tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
@@ -28691,6 +28703,96 @@ mod tests {
             .expect("turn should persist");
 
         (store, thread, turn)
+    }
+
+    #[tokio::test]
+    async fn detached_task_owned_parent_projects_message_without_turn_work() {
+        let workspace_id = "ws_detached_parent_owner";
+        let thread_id = "thread_detached_parent_owner";
+        let turn_id = "turn_detached_parent_owner";
+        let store = test_store_with_workspace(workspace_id).await;
+        let timestamp = 1_700_000_000;
+        let thread = Thread {
+            workspace_id: workspace_id.to_owned(),
+            id: thread_id.to_owned(),
+            name: None,
+            preview: String::new(),
+            preview_author: None,
+            mode: ThreadMode::Agent,
+            model: "gpt-5.6".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::Collaborative,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        let turn = Turn {
+            id: turn_id.to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: TurnKind::Conversation,
+            origin: TurnOrigin::User,
+            mode: ThreadMode::Agent,
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .upsert_thread_model(&thread, PersistedActorRef::System)
+            .await
+            .expect("collaborative thread should persist");
+        store
+            .materialize_turn_event(
+                crate::events::TurnEventPayload::TurnStarted(
+                    crate::events::TurnStartedEventPayload {
+                        thread: thread.clone(),
+                        sandbox_mode: SandboxMode::FullAccess,
+                        turn,
+                        input: vec![UserInput::Text {
+                            text: "run this in a detached task".to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        actor: Some(PersistedActorRef::System),
+                        reasoning_effort: None,
+                        work_owner: TurnWorkOwner::DetachedTask,
+                    },
+                ),
+                timestamp,
+            )
+            .await
+            .expect("detached parent start should persist atomically");
+
+        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn_id)
+            .one(&store.connection)
+            .await
+            .expect("detached parent should load")
+            .expect("detached parent should exist");
+        assert_eq!(persisted_turn.work_owner, "detached_task");
+        assert!(
+            store
+                .get_turn_work_projection(turn_id)
+                .await
+                .expect("detached parent work projection should query")
+                .is_none(),
+            "the parent Turn must never own an observable work projection"
+        );
+        let blocks = store
+            .list_thread_timeline_projection_page(thread_id, None, ProjectionPageAnchor::Start, 10)
+            .await
+            .expect("detached parent timeline should load");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_kind, BLOCK_KIND_USER_MESSAGE);
+        assert_eq!(blocks[0].turn_id.as_deref(), Some(turn_id));
     }
 
     #[tokio::test]
@@ -32156,6 +32258,7 @@ mod tests {
             updated_at: Set(created_at),
             turn_kind: Set("conversation".to_owned()),
             origin: Set("user".to_owned()),
+            work_owner: Set("turn".to_owned()),
             reasoning_effort: Set(None),
             permission_profile_mode: Set(None),
             permission_profile_source: Set(None),
@@ -43464,6 +43567,7 @@ mod tests {
                         input: input.clone(),
                         actor: None,
                         reasoning_effort: None,
+                        work_owner: Default::default(),
                     },
                 ),
                 timestamp,
@@ -43655,6 +43759,7 @@ mod tests {
                 input: Vec::new(),
                 actor: None,
                 reasoning_effort: None,
+                work_owner: Default::default(),
             });
         let legacy_event = crate::events::AppendedTurnEvent {
             id: "event_legacy_actor".to_owned(),
@@ -43922,6 +44027,7 @@ mod tests {
                     input: Vec::new(),
                     actor: Some(actor.clone()),
                     reasoning_effort: None,
+                    work_owner: Default::default(),
                 },
             );
 
@@ -44407,6 +44513,7 @@ mod tests {
                 &turn,
                 &[],
                 None,
+                TurnWorkOwner::Turn,
                 pioneer_protocol::PersistedActorRef::System,
                 audit,
                 r#"{"kind":"test_explicit_authority"}"#,

@@ -149,10 +149,10 @@ fn large_semantic_timeline_uses_stable_blocks_and_paged_work() {
             projection_version: 1,
             source_high_watermark: 100,
             projection_updated_at_unix_micros: 100,
-            work: turn_work(
+            work: Some(turn_work(
                 TurnWorkPresentation::CollapsedAfterFinal,
                 TOTAL_WORK_ITEM_COUNT
-            ),
+            )),
             items: (0..LOADED_WORK_ITEM_COUNT).map(work_item).collect(),
             page: page_info(None, Some(format!("{}:work:0100", THREAD_ID)), false, true,),
         },

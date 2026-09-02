@@ -141,6 +141,7 @@ impl TurnProjector {
                     &payload.turn,
                     None,
                     payload.reasoning_effort.as_deref(),
+                    Some(payload.work_owner),
                     payload.actor.as_ref(),
                     payload.actor.is_some(),
                     updated_at,
@@ -244,6 +245,7 @@ impl TurnProjector {
                     None,
                     None,
                     None,
+                    None,
                     false,
                     created_at,
                     created_at,
@@ -275,6 +277,7 @@ impl TurnProjector {
                     None,
                     None,
                     None,
+                    None,
                     false,
                     created_at,
                     created_at,
@@ -303,6 +306,7 @@ impl TurnProjector {
                     payload.turn.id.as_str(),
                     payload.thread_id.as_str(),
                     &payload.turn,
+                    None,
                     None,
                     None,
                     None,
@@ -1308,6 +1312,7 @@ mod epic6_tests {
             }],
             actor: Some(PersistedActorRef::System),
             reasoning_effort: None,
+            work_owner: Default::default(),
         }));
 
         assert!(liveness_observation_from_payload(&started.payload, started.created_at).is_none());

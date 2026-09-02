@@ -1,3 +1,4 @@
+use crate::TurnWorkOwner;
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_input, turn_item, turn_message_revision, turn_status_history};
 use pioneer_protocol::{
@@ -238,6 +239,7 @@ pub(crate) async fn prepare_projected_turn_upsert<C: ConnectionTrait>(
     turn_model: &Turn,
     prompt_manifest: Option<&TurnPromptManifestColumns>,
     reasoning_effort: Option<&str>,
+    work_owner: Option<TurnWorkOwner>,
     initiator: Option<&PersistedActorRef>,
     update_initiator: bool,
     created_at: DateTimeWithTimeZone,
@@ -254,6 +256,7 @@ pub(crate) async fn prepare_projected_turn_upsert<C: ConnectionTrait>(
         turn_model,
         prompt_manifest,
         reasoning_effort,
+        work_owner,
         actor_kind,
         actor_id,
         update_initiator,
@@ -299,6 +302,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         turn_model,
         prompt_manifest,
         reasoning_effort,
+        None,
         initiated_by_actor_kind,
         initiated_by_actor_id,
         update_initiator,
@@ -317,6 +321,7 @@ async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
     turn_model: &Turn,
     prompt_manifest: Option<&TurnPromptManifestColumns>,
     reasoning_effort: Option<&str>,
+    work_owner: Option<TurnWorkOwner>,
     initiated_by_actor_kind: Option<String>,
     initiated_by_actor_id: Option<String>,
     update_initiator: bool,
@@ -339,6 +344,9 @@ async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
         turn::Column::MentionsJson,
         turn::Column::MessageRevision,
     ];
+    if work_owner.is_some() {
+        update_columns.push(turn::Column::WorkOwner);
+    }
     update_columns.extend([
         turn::Column::PermissionProfileMode,
         turn::Column::PermissionProfileSource,
@@ -395,6 +403,21 @@ async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
             anyhow::bail!("Turn author snapshot cannot change after initial persistence");
         }
     }
+    let supplied_work_owner = work_owner.map(TurnWorkOwner::as_db_str);
+    if let (Some(existing), Some(supplied_work_owner)) =
+        (existing_collaboration.as_ref(), supplied_work_owner)
+        && existing.work_owner != supplied_work_owner
+    {
+        anyhow::bail!("Turn work owner cannot change after initial persistence");
+    }
+    let effective_work_owner = supplied_work_owner
+        .map(str::to_owned)
+        .or_else(|| {
+            existing_collaboration
+                .as_ref()
+                .map(|existing| existing.work_owner.clone())
+        })
+        .unwrap_or_else(|| TurnWorkOwner::Turn.as_db_str().to_owned());
     let author = turn_model
         .author
         .as_ref()
@@ -470,6 +493,7 @@ async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
         status: Set(turn_status_to_db(turn_model.status).to_owned()),
         turn_kind: Set(turn_kind_to_db(turn_model.turn_kind).to_owned()),
         origin: Set(turn_origin_to_db(turn_model.origin).to_owned()),
+        work_owner: Set(effective_work_owner),
         error: Set(turn_model.error.clone()),
         prompt_manifest_json: Set(prompt_manifest
             .map(|manifest| manifest.prompt_manifest_json.clone())
@@ -1839,6 +1863,7 @@ mod tests {
             updated_at: now,
             turn_kind: "conversation".to_owned(),
             origin: "user".to_owned(),
+            work_owner: "turn".to_owned(),
             reasoning_effort: None,
             permission_profile_mode: None,
             permission_profile_source: None,
