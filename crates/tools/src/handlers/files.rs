@@ -23,10 +23,12 @@ use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
 const HARD_MAX_READ_PAGE_BYTES: usize = 1024 * 1024;
@@ -44,6 +46,7 @@ const HARD_MAX_GREP_OUTPUT_BYTES: usize = 512 * 1024;
 const BROAD_GREP_FILE_LIMIT: usize = 5_000;
 const DEFAULT_GREP_TIMEOUT_MS: u64 = 20_000;
 const HARD_MAX_GREP_TIMEOUT_MS: u64 = 120_000;
+const NATIVE_FILESYSTEM_MAX_CONCURRENCY: usize = 8;
 const DEFAULT_GREP_EXCLUDED_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -57,6 +60,37 @@ const DEFAULT_GREP_EXCLUDED_DIRS: &[&str] = &[
     ".venv",
     "__pycache__",
 ];
+
+static NATIVE_FILESYSTEM_CONCURRENCY: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn native_filesystem_concurrency() -> Arc<Semaphore> {
+    NATIVE_FILESYSTEM_CONCURRENCY
+        .get_or_init(|| Arc::new(Semaphore::new(NATIVE_FILESYSTEM_MAX_CONCURRENCY)))
+        .clone()
+}
+
+async fn acquire_native_filesystem_slot(
+    cancellation: &CancellationToken,
+) -> Result<OwnedSemaphorePermit, ToolError> {
+    acquire_native_filesystem_slot_from(native_filesystem_concurrency(), cancellation).await
+}
+
+async fn acquire_native_filesystem_slot_from(
+    concurrency: Arc<Semaphore>,
+    cancellation: &CancellationToken,
+) -> Result<OwnedSemaphorePermit, ToolError> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            Err(ToolError::cancelled(
+                "cancelled while waiting for native filesystem capacity",
+            ))
+        }
+        permit = concurrency.acquire_owned() => {
+            permit.map_err(|_| ToolError::internal("native filesystem concurrency gate is closed"))
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct ReadFileHandler;
@@ -122,9 +156,10 @@ impl ToolHandler for ReadFileHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-        trace: crate::events::ToolEventTrace,
+        _trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<ReadFileArgs>(invocation.payload)?;
+        let filesystem_slot = acquire_native_filesystem_slot(&invocation.cancellation).await?;
         let resolved = resolve_authorized_tool_path(
             invocation.execution_security_snapshot.as_ref(),
             invocation.workdir.as_path(),
@@ -153,14 +188,8 @@ impl ToolHandler for ReadFileHandler {
         let start_byte = args.start_byte;
         let cursor = args.cursor;
         let requested_path = file_path.clone();
-        let filesystem_permit = trace
-            // Snapshot validation may read the object before and after the
-            // selected page. Account for all three bounded passes.
-            .acquire_filesystem_io_budget("read_file", HARD_MAX_READ_FILE_BYTES.saturating_mul(3))
-            .await
-            .map_err(ToolError::Rejected)?;
         let page = tokio::task::spawn_blocking(move || {
-            let _filesystem_permit = filesystem_permit;
+            let _filesystem_slot = filesystem_slot;
             let file = capability
                 .open_regular_file()
                 .map_err(|_| ReadError::new(ReadErrorCode::PathDenied))?;
@@ -297,9 +326,10 @@ impl ToolHandler for ListDirHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-        trace: crate::events::ToolEventTrace,
+        _trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<ListDirArgs>(invocation.payload)?;
+        let filesystem_slot = acquire_native_filesystem_slot(&invocation.cancellation).await?;
         let base = args.path.unwrap_or_else(|| ".".to_owned());
         let resolved = resolve_authorized_tool_path(
             invocation.execution_security_snapshot.as_ref(),
@@ -317,15 +347,10 @@ impl ToolHandler for ListDirHandler {
             .unwrap_or(DEFAULT_LIST_LIMIT)
             .clamp(1, HARD_MAX_LIST_LIMIT);
         let include_hidden = args.include_hidden.unwrap_or(false);
-        let filesystem_permit = trace
-            .acquire_filesystem_io_budget("list_dir", (limit as u64).saturating_mul(4 * 1024))
-            .await
-            .map_err(ToolError::Rejected)?;
-
         let scan_root = root.clone();
         let capability = resolved.capability.clone();
         let (items, truncated) = tokio::task::spawn_blocking(move || {
-            let _filesystem_permit = filesystem_permit;
+            let _filesystem_slot = filesystem_slot;
             list_directory_tree_secure_with_capability(
                 scan_root.as_path(),
                 &capability,
@@ -687,9 +712,10 @@ impl ToolHandler for GrepHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-        trace: crate::events::ToolEventTrace,
+        _trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<GrepArgs>(invocation.payload)?;
+        let filesystem_slot = acquire_native_filesystem_slot(&invocation.cancellation).await?;
         let base = args.path.as_deref().unwrap_or(".");
         let resolved = resolve_authorized_tool_path(
             invocation.execution_security_snapshot.as_ref(),
@@ -744,17 +770,6 @@ impl ToolHandler for GrepHandler {
             .timeout_ms
             .unwrap_or(DEFAULT_GREP_TIMEOUT_MS)
             .clamp(1, HARD_MAX_GREP_TIMEOUT_MS);
-        let _filesystem_permit = trace
-            // `rg` performs filesystem reads outside this process, so reserve
-            // the entire Turn I/O allowance up front. This makes the external
-            // scan a single bounded operation instead of pretending its small
-            // output size measures the bytes searched.
-            .acquire_filesystem_io_budget(
-                "grep_files",
-                crate::resource_budget::TURN_FILESYSTEM_MAX_BYTES,
-            )
-            .await
-            .map_err(ToolError::Rejected)?;
         let workspace_root = resolved.cwd;
         let is_broad_workspace_search = args.glob.is_none()
             && (args.path.is_none()
@@ -787,7 +802,7 @@ impl ToolHandler for GrepHandler {
                     // A broad search must never silently fall back to an
                     // unbounded recursive shell scan.  Without the scoped
                     // file enumerator we cannot prove the workspace stays
-                    // within the resource budget, so require the model to
+                    // within the per-operation scan bound, so require the model to
                     // narrow the request explicitly.
                     return Ok(needs_narrowing_output(
                         "grep_files cannot establish the workspace file-count limit; narrow path or glob.",
@@ -874,6 +889,7 @@ impl ToolHandler for GrepHandler {
                 (output, Some(note), true)
             }
         };
+        drop(filesystem_slot);
 
         let process_exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1723,6 +1739,80 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_filesystem_concurrency_waits_and_reuses_capacity() {
+        let concurrency = Arc::new(Semaphore::new(1));
+        let holder =
+            acquire_native_filesystem_slot_from(concurrency.clone(), &CancellationToken::new())
+                .await
+                .expect("first filesystem operation should acquire the only slot");
+
+        let waiting_cancellation = CancellationToken::new();
+        let waiting =
+            acquire_native_filesystem_slot_from(concurrency.clone(), &waiting_cancellation);
+        tokio::pin!(waiting);
+        assert!(
+            timeout(Duration::from_millis(25), &mut waiting)
+                .await
+                .is_err(),
+            "a second operation must wait instead of exceeding concurrency"
+        );
+
+        drop(holder);
+        let next = timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("waiting operation should resume when capacity is released")
+            .expect("released filesystem capacity should remain reusable");
+        drop(next);
+
+        for _ in 0..32 {
+            let permit =
+                acquire_native_filesystem_slot_from(concurrency.clone(), &CancellationToken::new())
+                    .await
+                    .expect("completed operations must not consume a lifetime quota");
+            drop(permit);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_filesystem_concurrency_wait_is_cancellation_safe() {
+        let concurrency = Arc::new(Semaphore::new(1));
+        let holder =
+            acquire_native_filesystem_slot_from(concurrency.clone(), &CancellationToken::new())
+                .await
+                .expect("first filesystem operation should acquire the only slot");
+
+        let cancellation = CancellationToken::new();
+        let waiter = tokio::spawn({
+            let concurrency = concurrency.clone();
+            let cancellation = cancellation.clone();
+            async move { acquire_native_filesystem_slot_from(concurrency, &cancellation).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the queued operation must still be waiting for capacity"
+        );
+
+        cancellation.cancel();
+        let error = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled capacity wait should finish promptly")
+            .expect("capacity waiter should not panic")
+            .expect_err("cancelled capacity wait must not execute");
+        assert!(matches!(error, ToolError::Cancelled(_)));
+
+        drop(holder);
+        let permit = timeout(
+            Duration::from_secs(1),
+            acquire_native_filesystem_slot_from(concurrency, &CancellationToken::new()),
+        )
+        .await
+        .expect("capacity should not leak after cancellation")
+        .expect("capacity should be available after the holder finishes");
+        drop(permit);
+    }
+
     fn snapshot(cwd: &Path, additional: &Path) -> TurnExecutionSecuritySnapshot {
         TurnExecutionSecuritySnapshot::workspace_write(
             TurnPermissionProfileSnapshot::from_mode(
@@ -1870,6 +1960,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repeated_small_file_operations_do_not_exhaust_the_turn() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let file = root.path().join("small.txt");
+        std::fs::write(file.as_path(), "small-file\n").expect("small file fixture");
+        let security = TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                root.path().to_string_lossy(),
+            )],
+            1,
+        );
+        let event_bus = crate::events::ToolEventBus::default();
+        let turn_id = "turn_long_running_file_work";
+
+        let listing = ListDirHandler
+            .handle(
+                invocation(
+                    "list_dir",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": root.path(),
+                            "depth": 0,
+                            "limit": 10
+                        }),
+                    },
+                    root.path(),
+                    security.clone(),
+                ),
+                event_bus.start_trace(turn_id, "call_list", "list_dir"),
+            )
+            .await
+            .expect("bounded listing should succeed");
+        assert_eq!(
+            listing.raw_json()["entries"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        // The removed lifetime budget charged every read as 48 MiB regardless
+        // of the actual file size. Its sixth read in this sequence failed even
+        // though every individual operation was well within the existing
+        // per-operation limits.
+        for index in 0..8 {
+            let output = ReadFileHandler
+                .handle(
+                    invocation(
+                        "read_file",
+                        ToolPayload::Function {
+                            arguments: serde_json::json!({"path": "small.txt"}),
+                        },
+                        root.path(),
+                        security.clone(),
+                    ),
+                    event_bus.start_trace(turn_id, format!("call_read_{index}"), "read_file"),
+                )
+                .await
+                .expect("completed file operations must not consume a lifetime Turn quota");
+            assert_eq!(output.raw_json()["text"], "small-file\n");
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn slash_cwd_keeps_leading_slashes_in_reusable_file_tool_paths() {
@@ -2014,6 +2170,8 @@ mod tests {
             1,
         );
 
+        let event_bus = crate::events::ToolEventBus::default();
+        let turn_id = "turn_grep_files";
         let output = GrepHandler
             .handle(
                 invocation(
@@ -2021,19 +2179,15 @@ mod tests {
                     ToolPayload::Function {
                         arguments: serde_json::json!({
                             "pattern": "pioneer-permission-marker",
-                            "path": search_dir,
+                            "path": search_dir.clone(),
                             "max_results": 10,
                             "timeout_ms": 5_000
                         }),
                     },
                     root.path(),
-                    security,
+                    security.clone(),
                 ),
-                crate::events::ToolEventBus::default().start_trace(
-                    "turn_grep_files",
-                    "call_grep_files",
-                    "grep_files",
-                ),
+                event_bus.start_trace(turn_id, "call_grep_files", "grep_files"),
             )
             .await
             .expect("grep_files should execute inside the native sandbox");
@@ -2044,6 +2198,91 @@ mod tests {
                 .as_str()
                 .is_some_and(|stdout| stdout.contains("pioneer-permission-marker"))
         );
+
+        // A successful grep previously reserved the complete 256 MiB lifetime
+        // allowance and made every subsequent native file operation fail for
+        // this Turn. Per-operation safeguards must not poison later calls.
+        let read = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": search_dir.join("sample.txt")
+                        }),
+                    },
+                    root.path(),
+                    security,
+                ),
+                event_bus.start_trace(turn_id, "call_read_after_grep", "read_file"),
+            )
+            .await
+            .expect("grep_files must not disable subsequent file operations");
+        assert_eq!(
+            read.raw_json()["text"],
+            "alpha\npioneer-permission-marker\nomega\n"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn broad_grep_needs_narrowing_does_not_poison_later_file_calls() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let marker = root.path().join("marker.txt");
+        std::fs::write(marker.as_path(), "still-readable\n").expect("read marker");
+        for index in 0..BROAD_GREP_FILE_LIMIT {
+            std::fs::write(root.path().join(format!("candidate-{index:04}.txt")), b"")
+                .expect("broad grep fixture");
+        }
+        let security = TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                root.path().to_string_lossy(),
+            )],
+            1,
+        );
+        let event_bus = crate::events::ToolEventBus::default();
+        let turn_id = "turn_broad_grep";
+
+        let grep = GrepHandler
+            .handle(
+                invocation(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "pattern": "absent-pattern",
+                            "timeout_ms": 5_000
+                        }),
+                    },
+                    root.path(),
+                    security.clone(),
+                ),
+                event_bus.start_trace(turn_id, "call_broad_grep", "grep_files"),
+            )
+            .await
+            .expect("broad grep should return a structured narrowing result");
+        assert_eq!(grep.raw_json()["status"], "needs_narrowing");
+
+        let read = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({"path": "marker.txt"}),
+                    },
+                    root.path(),
+                    security,
+                ),
+                event_bus.start_trace(turn_id, "call_read_after_narrowing", "read_file"),
+            )
+            .await
+            .expect("a narrowing result must not disable later file operations");
+        assert_eq!(read.raw_json()["text"], "still-readable\n");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

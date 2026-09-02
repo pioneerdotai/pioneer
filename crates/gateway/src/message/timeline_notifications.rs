@@ -82,8 +82,12 @@ impl MessageProcessor {
             .await;
         }
         if notify_work_state {
-            self.notify_semantic_turn_work_state_changed(workspace_id, thread_id, turn_id)
-                .await;
+            self.notify_semantic_turn_work_state_after_block_change(
+                workspace_id,
+                thread_id,
+                turn_id,
+            )
+            .await;
         }
     }
 
@@ -160,7 +164,7 @@ impl MessageProcessor {
             Vec::new(),
         )
         .await;
-        self.notify_semantic_turn_work_state_changed(workspace_id, thread_id, turn_id)
+        self.notify_semantic_turn_work_state_after_block_change(workspace_id, thread_id, turn_id)
             .await;
     }
 
@@ -185,7 +189,7 @@ impl MessageProcessor {
             removed_block_ids,
         )
         .await;
-        self.notify_semantic_turn_work_state_changed(
+        self.notify_semantic_turn_work_state_after_block_change(
             request.workspace_id.as_str(),
             request.thread_id.as_str(),
             turn_id,
@@ -223,7 +227,7 @@ impl MessageProcessor {
             removed_block_ids,
         )
         .await;
-        self.notify_semantic_turn_work_state_changed(
+        self.notify_semantic_turn_work_state_after_block_change(
             request.workspace_id.as_str(),
             request.thread_id.as_str(),
             request.turn_id.as_str(),
@@ -451,6 +455,27 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) {
+        self.notify_semantic_turn_work_state_changed_inner(workspace_id, thread_id, turn_id, true)
+            .await;
+    }
+
+    async fn notify_semantic_turn_work_state_after_block_change(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) {
+        self.notify_semantic_turn_work_state_changed_inner(workspace_id, thread_id, turn_id, false)
+            .await;
+    }
+
+    async fn notify_semantic_turn_work_state_changed_inner(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        notify_block_change: bool,
+    ) {
         let projection = match self.crud_store.get_turn_work_projection(turn_id).await {
             Ok(Some(projection)) => projection,
             Ok(None) => {
@@ -499,13 +524,15 @@ impl MessageProcessor {
                 return;
             }
         };
-        self.notify_semantic_timeline_blocks_changed(
-            workspace_id,
-            thread_id,
-            vec![work_block_id(turn_id)],
-            Vec::new(),
-        )
-        .await;
+        if notify_block_change {
+            self.notify_semantic_timeline_blocks_changed(
+                workspace_id,
+                thread_id,
+                vec![work_block_id(turn_id)],
+                Vec::new(),
+            )
+            .await;
+        }
         let source_high_watermark = projection.source_high_watermark;
         let projection_updated_at_unix_micros = projection.updated_at.timestamp_micros();
         let work = match self.turn_work_block_from_projection(projection).await {

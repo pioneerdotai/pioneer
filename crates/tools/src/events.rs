@@ -6,7 +6,6 @@ use crate::output_policy::{
     ToolDisplayPayload, ToolOutputPolicySnapshot, ToolRecoveryView, ToolResultEnvelope,
     ToolResultView, ToolStoragePayload,
 };
-use crate::resource_budget::{TurnResourceBudget, TurnResourceBudgetPermit};
 use pioneer_protocol::{
     ItemDeltaStream, ProtocolEventClass, StorageOutputPolicy, TimelineOutputPolicy, ToolMetadata,
     ToolOutputSummary, ToolRecoveryPolicySnapshot, TurnItemExecutionClass,
@@ -271,8 +270,6 @@ pub struct ToolEventBus {
     durable_installed: Arc<AtomicBool>,
     durable_capacity: usize,
     trace_sequences: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
-    turn_resource_budgets: Arc<Mutex<HashMap<String, Arc<TurnResourceBudget>>>>,
-    overflow_resource_budget: Arc<TurnResourceBudget>,
     thread_id: Arc<String>,
 }
 
@@ -285,7 +282,6 @@ pub struct ToolEventTrace {
     tool_name: String,
     sequence: Arc<AtomicU64>,
     thread_id: Arc<String>,
-    resource_budget: Arc<TurnResourceBudget>,
 }
 
 impl ToolEventTrace {
@@ -303,16 +299,6 @@ impl ToolEventTrace {
 
     pub fn tool_name(&self) -> &str {
         self.tool_name.as_str()
-    }
-
-    pub(crate) async fn acquire_filesystem_io_budget(
-        &self,
-        operation: &str,
-        requested_bytes: u64,
-    ) -> Result<TurnResourceBudgetPermit, String> {
-        self.resource_budget
-            .acquire(operation, requested_bytes)
-            .await
     }
 
     /// Returns the trusted native patch identity and in-process observer for
@@ -588,8 +574,6 @@ impl ToolEventBus {
             durable_installed: Arc::new(AtomicBool::new(false)),
             durable_capacity: capacity.max(1),
             trace_sequences: Arc::new(Mutex::new(HashMap::new())),
-            turn_resource_budgets: Arc::new(Mutex::new(HashMap::new())),
-            overflow_resource_budget: Arc::new(TurnResourceBudget::exhausted()),
             thread_id: Arc::new(thread_id.into()),
         }
     }
@@ -642,35 +626,6 @@ impl ToolEventBus {
                 .or_insert_with(|| Arc::new(AtomicU64::new(0)))
                 .clone()
         };
-        let resource_budget = {
-            let mut budgets = self
-                .turn_resource_budgets
-                .lock()
-                .expect("turn resource budgets lock");
-            if let Some(budget) = budgets.get(&turn_id) {
-                budget.clone()
-            } else {
-                if budgets.len() >= 1_024
-                    && let Some(evict) = budgets
-                        .iter()
-                        .find(|(_, budget)| Arc::strong_count(budget) == 1)
-                        .map(|(turn_id, _)| turn_id.clone())
-                {
-                    budgets.remove(&evict);
-                }
-                if budgets.len() >= 1_024 {
-                    // Capacity pressure must fail closed. Returning a fresh,
-                    // untracked budget here would let callers bypass the
-                    // cumulative per-Turn limit by creating enough Turns.
-                    self.overflow_resource_budget.clone()
-                } else {
-                    let budget = Arc::new(TurnResourceBudget::default());
-                    budgets.insert(turn_id.clone(), budget.clone());
-                    budget
-                }
-            }
-        };
-
         ToolEventTrace {
             event_bus: self.clone(),
             trace_id,
@@ -679,7 +634,6 @@ impl ToolEventBus {
             tool_name: tool_name.into(),
             sequence,
             thread_id: self.thread_id.clone(),
-            resource_budget,
         }
     }
 
@@ -865,50 +819,6 @@ mod tests {
         });
 
         assert_eq!(event.event_class(), ProtocolEventClass::Durable);
-    }
-
-    #[tokio::test]
-    async fn traces_for_one_turn_share_the_cumulative_filesystem_budget() {
-        let bus = ToolEventBus::new(4);
-        let first = bus.start_trace("turn_shared", "call_1", "read_file");
-        let second = bus.start_trace("turn_shared", "call_2", "list_dir");
-
-        let first_permit = first
-            .acquire_filesystem_io_budget(
-                "read_file",
-                crate::resource_budget::TURN_FILESYSTEM_MAX_BYTES,
-            )
-            .await
-            .expect("first operation should fit the Turn budget");
-        drop(first_permit);
-
-        let error = second
-            .acquire_filesystem_io_budget("list_dir", 1)
-            .await
-            .expect_err("a second trace must not replenish the shared Turn budget");
-        assert!(error.contains("FILESYSTEM_IO_BYTE_BUDGET_EXCEEDED"));
-    }
-
-    #[tokio::test]
-    async fn active_turn_registry_capacity_fails_closed() {
-        let bus = ToolEventBus::new(4);
-        let traces = (0..1_024)
-            .map(|index| {
-                bus.start_trace(
-                    format!("turn_{index}"),
-                    format!("call_{index}"),
-                    "read_file",
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(traces.len(), 1_024);
-
-        let overflow = bus.start_trace("turn_overflow", "call_overflow", "read_file");
-        let error = overflow
-            .acquire_filesystem_io_budget("read_file", 1)
-            .await
-            .expect_err("registry pressure must deny I/O, never mint an untracked budget");
-        assert!(error.contains("BUDGET_EXCEEDED"));
     }
 
     #[tokio::test]
