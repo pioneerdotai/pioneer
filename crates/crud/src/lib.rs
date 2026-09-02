@@ -1481,6 +1481,7 @@ pub struct TurnProjectionStreamStateRecord {
 pub struct TurnProjectionStreamBackfillBatch {
     pub streams_scanned: usize,
     pub streams_quarantined: usize,
+    pub orphan_streams_quarantined: usize,
     pub streams_repaired: usize,
     pub events_repaired: usize,
     pub last_turn_id: Option<String>,
@@ -14284,9 +14285,7 @@ impl CrudStore {
             run_id: run_id.clone(),
             started_at,
         };
-        let prepared_event = task_event::PreparedTaskEvent::prepare(payload)?
-            .preflight_idempotency(&self.connection)
-            .await?;
+        let prepared_event = task_event::PreparedTaskEvent::prepare(payload)?;
         let transaction = self
             .connection
             .begin()
@@ -14325,6 +14324,8 @@ impl CrudStore {
                 .context("failed to rollback non-startable task run started transaction")?;
             return Ok(None);
         }
+
+        let prepared_event = prepared_event.preflight_idempotency(&transaction).await?;
 
         let mut appended_event =
             match task_event::append_prepared_event(&transaction, prepared_event, created_at).await
@@ -25208,6 +25209,7 @@ WHERE id IN (SELECT event_id FROM candidates)
                 let streams_scanned = candidates.len();
                 let last_turn_id = candidates.last().map(|candidate| candidate.turn_id.clone());
                 let mut streams_quarantined = 0usize;
+                let mut orphan_streams_quarantined = 0usize;
                 let mut streams_repaired = 0usize;
                 let mut events_repaired = 0usize;
                 for candidate in candidates {
@@ -25215,13 +25217,44 @@ WHERE id IN (SELECT event_id FROM candidates)
                         &transaction,
                         candidate.turn_id.as_str(),
                     )
-                    .await?
-                    .with_context(|| {
-                        format!(
-                            "projection stream state backfill cannot find Turn `{}`",
-                            candidate.turn_id
+                    .await?;
+                    let Some(turn_model) = turn_model else {
+                        // Builds predating `validate_turn_event_durable_owner` could append
+                        // item events after their canonical Turn had disappeared (or before it
+                        // had ever materialized). Those streams have no projection target, but
+                        // the replay worker has already classified their causal head as
+                        // exhausted. Preserve the raw audit trail and isolate the poison stream
+                        // instead of aborting every later startup backfill batch.
+                        let blocker = blockers_by_turn
+                            .remove(candidate.turn_id.as_str())
+                            .with_context(|| {
+                                format!(
+                                    "projection stream state backfill cannot find Turn `{}` and the orphan stream has no exhausted causal head",
+                                    candidate.turn_id
+                                )
+                            })?;
+                        let error_message = blocker.last_error.clone().unwrap_or_else(|| {
+                            format!(
+                                "legacy orphan projection stream cannot find canonical Turn `{}`",
+                                candidate.turn_id
+                            )
+                        });
+                        if turn_event_projection_stream_state::quarantine(
+                            &transaction,
+                            blocker.thread_id.as_str(),
+                            candidate.turn_id.as_str(),
+                            blocker.event_id.as_str(),
+                            error_message,
+                            blocker.updated_at,
                         )
-                    })?;
+                        .await?
+                        {
+                            streams_quarantined = streams_quarantined.saturating_add(1);
+                            orphan_streams_quarantined =
+                                orphan_streams_quarantined.saturating_add(1);
+                        }
+                        continue;
+                    };
                     let canonical_thread_id = turn_model.thread_id;
                     if candidate.first_thread_id != canonical_thread_id
                         || candidate.last_thread_id != canonical_thread_id
@@ -25282,6 +25315,7 @@ WHERE id IN (SELECT event_id FROM candidates)
                 Ok(TurnProjectionStreamBackfillBatch {
                     streams_scanned,
                     streams_quarantined,
+                    orphan_streams_quarantined,
                     streams_repaired,
                     events_repaired,
                     last_turn_id,
@@ -25646,67 +25680,32 @@ WHERE id IN (SELECT event_id FROM candidates)
         event: TaskEventPayload,
         event_timestamp_secs: i64,
     ) -> Result<AppendedTaskEvent> {
-        let event = self
-            .prepare_task_events_for_write(vec![event])
-            .await?
-            .pop()
-            .context("single Task event preparation returned no event")?;
+        let events = self.prepare_task_events_for_write(vec![event]).await?;
         let transaction = self
             .connection
             .begin()
             .await
             .context("failed to begin task event materialization transaction")?;
 
-        let created_at = unix_to_datetime(event_timestamp_secs);
-        let mut appended_event =
-            match task_event::append_prepared_event(&transaction, event, created_at).await {
-                Ok(event) => event,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-
-        if appended_event.append_status.is_inserted() {
-            if let Err(error) = self
-                .task_projector
-                .project(&transaction, &appended_event)
-                .await
-                .context("failed to project task event to read models")
-            {
+        let mut appended_events = match self
+            .append_task_events_in_connection(&transaction, events, event_timestamp_secs)
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
                 let _ = transaction.rollback().await;
                 return Err(error);
             }
-        }
-
-        if let Err(error) = hydrate_task_event_metadata(&transaction, &mut appended_event)
-            .await
-            .context("failed to hydrate task event metadata")
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
-
-        if appended_event.append_status.is_inserted()
-            && let Err(error) = task_event::initialize_fanout_cursor(
-                &transaction,
-                appended_event.task_id.as_str(),
-                appended_event.sequence.saturating_sub(1),
-                created_at,
-            )
-            .await
-            .context("failed to initialize task event fanout cursor")
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
+        };
 
         transaction
             .commit()
             .await
             .context("failed to commit task event materialization transaction")?;
 
-        Ok(appended_event)
+        appended_events
+            .pop()
+            .context("single Task event materialization returned no event")
     }
 
     async fn append_task_events_once(
@@ -26324,59 +26323,15 @@ WHERE id IN (SELECT event_id FROM candidates)
                 "atomic Task event batch exceeds {MAX_ATOMIC_TASK_EVENT_BATCH_SIZE} events"
             );
         }
-        let mut prepared = Vec::with_capacity(events.len());
-        let mut batch_run_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
-        for event in events {
-            if let Some(turn) = projected_legacy_task_run_turn(&event) {
-                let replace = batch_run_turns
-                    .get(turn.run_id.as_str())
-                    .is_none_or(|current| turn.order_key() >= current.order_key());
-                if replace {
-                    batch_run_turns.insert(turn.run_id.clone(), turn);
-                }
-            }
-            let delivery_authority = match &event {
-                TaskEventPayload::DeliveryQueued { delivery }
-                | TaskEventPayload::DeliveryStarted { delivery, .. }
-                | TaskEventPayload::DeliveryDelivered { delivery, .. }
-                | TaskEventPayload::DeliveryFailed { delivery, .. }
-                | TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(
-                    crate::task_projector::prepare_task_delivery_authority(
-                        &self.connection,
-                        delivery,
-                    )
-                    .await?,
-                ),
-                _ => None,
-            };
-            let event = task_event::PreparedTaskEvent::prepare(event)?
-                .preflight_idempotency(&self.connection)
-                .await?;
-            let (gate_resolution, legacy_candidate, legacy_review) = self
-                .prepare_candidate_writes_for_task_event(
-                    event.payload(),
-                    event
-                        .payload()
-                        .run_id()
-                        .and_then(|run_id| batch_run_turns.get(run_id)),
-                )
-                .await?;
-            let mut event = event
-                .with_candidate_gate_resolution(gate_resolution)
-                .with_delivery_authority(delivery_authority);
-            if let Some(candidate) = legacy_candidate {
-                event = event.with_candidate_projection(Some(candidate));
-            }
-            if let Some(review) = legacy_review {
-                event = event.with_review_projection(Some(review));
-            }
-            prepared.push(event);
-        }
-        Ok(prepared)
+        events
+            .into_iter()
+            .map(task_event::PreparedTaskEvent::prepare)
+            .collect()
     }
 
-    async fn prepare_candidate_writes_for_task_event(
+    async fn prepare_candidate_writes_for_task_event<C: ConnectionTrait>(
         &self,
+        db: &C,
         event: &TaskEventPayload,
         batch_run_turn: Option<&PreparedLegacyTaskRunTurn>,
     ) -> Result<(
@@ -26443,7 +26398,7 @@ WHERE id IN (SELECT event_id FROM candidates)
                 completed_at,
                 ..
             } => {
-                let persisted = task_run_turn::find_latest_turn_by_run(&self.connection, run_id)
+                let persisted = task_run_turn::find_latest_turn_by_run(db, run_id)
                     .await?
                     .map(PreparedLegacyTaskRunTurn::from_model);
                 let task_run_turn = match (persisted, batch_run_turn.cloned()) {
@@ -26527,7 +26482,7 @@ WHERE id IN (SELECT event_id FROM candidates)
             return Ok((None, legacy_candidate, legacy_review));
         };
         let gate_resolution = native_terminal_effect_outbox::prepare_gate_resolution_for_candidate(
-            &self.connection,
+            db,
             candidate_id.as_str(),
             thread_id.as_str(),
             turn_id.as_str(),
@@ -26546,8 +26501,52 @@ WHERE id IN (SELECT event_id FROM candidates)
     ) -> Result<Vec<AppendedTaskEvent>> {
         let created_at = unix_to_datetime(event_timestamp_secs);
         let mut appended_events = Vec::with_capacity(events.len());
+        let mut batch_run_turns = HashMap::<String, PreparedLegacyTaskRunTurn>::new();
 
         for event in events {
+            // Only state-independent work (validation, serialization and CPU
+            // projection preparation) is performed before writer admission.
+            // Database-dependent preparation is deliberately sequential here:
+            // event N must observe the projection committed by event N-1 in
+            // this same atomic batch.
+            if let Some(turn) = projected_legacy_task_run_turn(event.payload()) {
+                let replace = batch_run_turns
+                    .get(turn.run_id.as_str())
+                    .is_none_or(|current| turn.order_key() >= current.order_key());
+                if replace {
+                    batch_run_turns.insert(turn.run_id.clone(), turn);
+                }
+            }
+            let delivery_authority = match event.payload() {
+                TaskEventPayload::DeliveryQueued { delivery }
+                | TaskEventPayload::DeliveryStarted { delivery, .. }
+                | TaskEventPayload::DeliveryDelivered { delivery, .. }
+                | TaskEventPayload::DeliveryFailed { delivery, .. }
+                | TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(
+                    crate::task_projector::prepare_task_delivery_authority(db, delivery).await?,
+                ),
+                _ => None,
+            };
+            let event = event.preflight_idempotency(db).await?;
+            let (gate_resolution, legacy_candidate, legacy_review) = self
+                .prepare_candidate_writes_for_task_event(
+                    db,
+                    event.payload(),
+                    event
+                        .payload()
+                        .run_id()
+                        .and_then(|run_id| batch_run_turns.get(run_id)),
+                )
+                .await?;
+            let mut event = event
+                .with_candidate_gate_resolution(gate_resolution)
+                .with_delivery_authority(delivery_authority);
+            if let Some(candidate) = legacy_candidate {
+                event = event.with_candidate_projection(Some(candidate));
+            }
+            if let Some(review) = legacy_review {
+                event = event.with_review_projection(Some(review));
+            }
             let mut appended_event =
                 task_event::append_prepared_event(db, event, created_at).await?;
 
@@ -30453,6 +30452,187 @@ mod tests {
             .expect("effect should remain");
         assert_eq!(status.status, "ready");
         assert_eq!(status.attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_auto_accept_batch_prepares_each_gate_after_prior_event_projection() {
+        let timestamp = 1_700_015_000;
+        let workspace_id = "ws_atomic_auto_accept";
+        let thread_id = "thr_atomic_auto_accept";
+        let turn_id = "turn_atomic_auto_accept";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        store
+            .prepare_native_terminal_effects(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:batch:auto-accept"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                        effect_id: effect_id.clone(),
+                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                        gate: pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult,
+                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                            request: serde_json::json!({"durable": true}),
+                            runtime_snapshot: serde_json::json!({
+                                "schema_version": 1,
+                                "subscriptions": [],
+                                "handlers": []
+                            }),
+                        },
+                        max_attempts: 5,
+                    }],
+                },
+                timestamp,
+            )
+            .await
+            .expect("candidate-gated effect should prepare");
+        terminal_turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal commit should leave the effect waiting for acceptance");
+
+        let mut task = sample_task(timestamp + 2);
+        task.id = "task_atomic_auto_accept".to_owned();
+        task.workspace_id = workspace_id.to_owned();
+        task.created_by_thread_id = Some("parent_thread_atomic_auto_accept".to_owned());
+        task.created_by_turn_id = Some("parent_turn_atomic_auto_accept".to_owned());
+        let mut run = sample_task_run(timestamp + 2);
+        run.id = "run_atomic_auto_accept".to_owned();
+        run.task_id = task.id.clone();
+        run.trigger_id = None;
+        run.run_group_id = run.id.clone();
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                timestamp + 2,
+            )
+            .await
+            .expect("task aggregate should persist");
+
+        let task_run_turn = TaskRunTurn {
+            id: "task_run_turn_atomic_auto_accept".to_owned(),
+            task_id: task.id.clone(),
+            run_id: run.id.clone(),
+            execution_id: None,
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status: TaskRunTurnStatus::CandidateCreated,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: timestamp + 3,
+            started_at: Some(timestamp + 3),
+            completed_at: Some(timestamp + 4),
+        };
+        let review_event_id = "review_atomic_auto_accept";
+        let candidate = TaskResultCandidate {
+            id: "candidate_atomic_auto_accept".to_owned(),
+            task_id: task.id,
+            run_id: run.id,
+            task_run_turn_id: task_run_turn.id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            round: 0,
+            status: TaskResultCandidateStatus::Accepted,
+            result: Some(TaskResult {
+                summary: Some("auto accepted".to_owned()),
+                data: None,
+                artifacts: Vec::new(),
+                completed_by_run_id: Some("run_atomic_auto_accept".to_owned()),
+            }),
+            extraction_error: None,
+            summary: Some("auto accepted".to_owned()),
+            diagnostics: Vec::new(),
+            final_review_event_id: Some(review_event_id.to_owned()),
+            created_at: timestamp + 4,
+            updated_at: timestamp + 4,
+            resolved_at: Some(timestamp + 4),
+        };
+        let review_event = TaskResultReviewEvent {
+            id: review_event_id.to_owned(),
+            candidate_id: candidate.id.clone(),
+            task_id: candidate.task_id.clone(),
+            run_id: candidate.run_id.clone(),
+            task_run_turn_id: task_run_turn.id.clone(),
+            reviewer_kind: TaskResultReviewerKind::RuntimeAuto,
+            reviewer: pioneer_protocol::TaskResultReviewerRef::RuntimePolicy,
+            reviewer_thread_id: None,
+            reviewer_turn_id: None,
+            reviewer_user_id: None,
+            reviewer_agent_spec_id: None,
+            event_kind: TaskResultReviewEventKind::SystemAuto,
+            decision: TaskResultReviewDecision::Accept,
+            feedback_text: None,
+            feedback: None,
+            confidence: None,
+            supersedes_review_event_id: None,
+            next_task_run_turn_id: None,
+            created_at: timestamp + 4,
+        };
+
+        let events = vec![
+            TaskEventPayload::TaskRunTurnCompleted {
+                task_run_turn: task_run_turn.clone(),
+            },
+            TaskEventPayload::TaskResultCandidateCreated {
+                candidate: candidate.clone(),
+            },
+            TaskEventPayload::TaskResultReviewEventRecorded {
+                review_event: review_event.clone(),
+            },
+            TaskEventPayload::TaskResultCandidateAccepted {
+                candidate: candidate.clone(),
+                review_event_id: review_event.id.clone(),
+            },
+        ];
+        store
+            .append_task_events(events.clone(), timestamp + 4)
+            .await
+            .expect("auto-accept batch should observe each preceding projection");
+        store
+            .append_task_events(events, timestamp + 4)
+            .await
+            .expect("auto-accept batch replay should be idempotent");
+
+        let status = store
+            .native_terminal_effect_status(effect_id.as_str())
+            .await
+            .expect("effect status should load")
+            .expect("effect should remain durable");
+        assert_eq!(status.status, "ready");
+        assert_eq!(
+            status.accepted_candidate_id.as_deref(),
+            Some(candidate.id.as_str())
+        );
+        assert_eq!(
+            store
+                .get_accepted_task_result_candidate(candidate.run_id.as_str())
+                .await
+                .expect("accepted candidate should load")
+                .map(|persisted| persisted.id),
+            Some(candidate.id)
+        );
     }
 
     #[tokio::test]
@@ -36459,6 +36639,65 @@ mod tests {
             .1;
         assert_eq!(occurrence.status, TurnStatus::Completed);
         assert_eq!(occurrence.turn_kind, TurnKind::TaskRun);
+    }
+
+    #[tokio::test]
+    async fn repeated_run_started_with_new_timestamp_is_noop_after_run_is_running() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let store = CrudStore::new(connection);
+        let timestamp = 1_700_000_000;
+        let task = sample_task(timestamp);
+        let run = sample_task_run(timestamp);
+        store
+            .append_task_events(
+                vec![
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: None,
+                    },
+                ],
+                timestamp,
+            )
+            .await
+            .expect("task and run should persist");
+
+        assert!(
+            store
+                .append_task_run_started_once(task.id.clone(), run.id.clone(), timestamp + 1,)
+                .await
+                .expect("first start should succeed")
+                .is_some()
+        );
+        assert!(
+            store
+                .append_task_run_started_once(task.id.clone(), run.id.clone(), timestamp + 2)
+                .await
+                .expect("recovery start after the run is already running should be a no-op")
+                .is_none()
+        );
+
+        let persisted = store
+            .get_task_run(run.id.as_str())
+            .await
+            .expect("run should load")
+            .expect("run should exist");
+        assert_eq!(persisted.status, TaskRunStatus::Running);
+        assert_eq!(persisted.started_at, Some(timestamp + 1));
+        let run_started_events = store
+            .get_task_events(task.id.as_str(), None)
+            .await
+            .expect("task events should list")
+            .events
+            .into_iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::RunStarted { .. }))
+            .count();
+        assert_eq!(run_started_events, 1);
     }
 
     #[tokio::test]

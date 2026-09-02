@@ -18,6 +18,7 @@ pub(crate) struct ProjectionStreamStateBackfillSummary {
     pub(crate) batches: u64,
     pub(crate) streams_scanned: u64,
     pub(crate) streams_quarantined: u64,
+    pub(crate) orphan_streams_quarantined: u64,
     pub(crate) streams_repaired: u64,
     pub(crate) events_repaired: u64,
 }
@@ -30,6 +31,7 @@ pub(super) async fn run(crud_store: &CrudStore) -> Result<()> {
                 batches = summary.batches,
                 streams_scanned = summary.streams_scanned,
                 streams_quarantined = summary.streams_quarantined,
+                orphan_streams_quarantined = summary.orphan_streams_quarantined,
                 streams_repaired = summary.streams_repaired,
                 events_repaired = summary.events_repaired,
                 "turn event projection stream state background backfill completed"
@@ -118,6 +120,9 @@ async fn backfill_all_batches(
         summary.streams_quarantined = summary
             .streams_quarantined
             .saturating_add(batch.streams_quarantined as u64);
+        summary.orphan_streams_quarantined = summary
+            .orphan_streams_quarantined
+            .saturating_add(batch.orphan_streams_quarantined as u64);
         summary.streams_repaired = summary
             .streams_repaired
             .saturating_add(batch.streams_repaired as u64);
@@ -203,7 +208,7 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         CanonicalTurnEventPayload, CrudStore, PROJECTION_META_STATUS_COMPLETE,
-        TurnProjectionStreamHealth, find_projection_meta,
+        PROJECTION_META_STATUS_FAILED, TurnProjectionStreamHealth, find_projection_meta,
     };
     use pioneer_protocol::{
         ItemCompletedNotification, PersistedActorRef, SandboxMode, SystemEventLevel, Thread,
@@ -211,7 +216,9 @@ mod tests {
         TurnStatus, default_turn_permission_profile_snapshot,
     };
     use sea_orm::sea_query::Expr;
-    use sea_orm::{ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter, Set};
+    use sea_orm::{
+        ColumnTrait, ConnectionTrait, Database, EntityTrait, QueryFilter, Set, Statement,
+    };
 
     #[tokio::test]
     async fn background_backfill_is_batched_idempotent_and_quarantines_only_blocked_streams() {
@@ -329,6 +336,225 @@ INSERT INTO turn_event_projection_state (
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn background_backfill_quarantines_exhausted_legacy_orphans_and_keeps_scanning() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&db, None)
+            .await
+            .expect("schema migrations must succeed");
+        db.execute_unprepared(
+            r#"
+INSERT INTO turn (
+    id, thread_id, status, prompt_manifest_json, created_at, updated_at,
+    turn_kind, origin, mentions_json
+) VALUES (
+    'turn_valid_z', 'thread_valid_z', 'in_progress', '{}',
+    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'conversation', 'user', '[]'
+);
+INSERT INTO turn_event_projection_state (
+    event_id, thread_id, turn_id, sequence, status, attempt_count,
+    last_error, next_run_at, claim_token, claim_expires_at,
+    projection_context_json, projected_at, created_at, updated_at
+) VALUES
+    (
+        'orphan_a_1', 'thread_deleted_a', 'turn_orphan_a', 1,
+        'exhausted', 10, 'canonical Turn is missing', CURRENT_TIMESTAMP,
+        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    ),
+    (
+        'orphan_a_2', 'thread_deleted_a', 'turn_orphan_a', 2,
+        'pending', 0, NULL, CURRENT_TIMESTAMP,
+        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    ),
+    (
+        'orphan_b_1', 'thread_deleted_b', 'turn_orphan_b', 1,
+        'exhausted', 10, 'canonical Turn is missing', CURRENT_TIMESTAMP,
+        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    ),
+    (
+        'orphan_b_2', 'thread_deleted_b', 'turn_orphan_b', 2,
+        'pending', 0, NULL, CURRENT_TIMESTAMP,
+        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    ),
+    (
+        'valid_z_1', 'thread_valid_z', 'turn_valid_z', 1,
+        'pending', 0, NULL, CURRENT_TIMESTAMP,
+        NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    );
+"#,
+        )
+        .await
+        .expect("legacy projection streams should insert");
+        let store = CrudStore::new(db.clone());
+
+        let summary = backfill_once(&store)
+            .await
+            .expect("legacy orphan streams must not block healthy successors");
+        assert_eq!(summary.streams_scanned, 3);
+        assert_eq!(summary.streams_quarantined, 2);
+        assert_eq!(summary.orphan_streams_quarantined, 2);
+
+        for (turn_id, blocker_id) in [
+            ("turn_orphan_a", "orphan_a_1"),
+            ("turn_orphan_b", "orphan_b_1"),
+        ] {
+            let stream = store
+                .get_turn_event_projection_stream_state(turn_id)
+                .await
+                .expect("orphan stream state should query")
+                .expect("orphan stream should be retained as quarantine evidence");
+            assert_eq!(stream.health, TurnProjectionStreamHealth::Quarantined);
+            assert_eq!(stream.blocking_event_id.as_deref(), Some(blocker_id));
+            assert_eq!(
+                stream.last_error.as_deref(),
+                Some("canonical Turn is missing")
+            );
+        }
+
+        let valid = store
+            .get_turn_event_projection_stream_state("turn_valid_z")
+            .await
+            .expect("valid successor should query")
+            .expect("valid successor should still be backfilled");
+        assert_eq!(valid.health, TurnProjectionStreamHealth::Healthy);
+
+        assert_eq!(
+            pioneer_entity::turn_event_projection_state::Entity::find()
+                .all(&db)
+                .await
+                .expect("projection evidence should list")
+                .len(),
+            5,
+            "quarantine must preserve the legacy event-state evidence"
+        );
+        let marker = find_projection_meta(&db, PROJECTION_STREAM_STATE_BACKFILL_KEY)
+            .await
+            .expect("backfill marker should query")
+            .expect("backfill marker should exist");
+        assert_eq!(marker.status, PROJECTION_META_STATUS_COMPLETE);
+        assert_eq!(marker.source_turn_count, 3);
+
+        let repeated = backfill_once(&store)
+            .await
+            .expect("completed orphan migration should be idempotent");
+        assert!(repeated.skipped);
+    }
+
+    #[tokio::test]
+    async fn background_backfill_does_not_silently_classify_a_new_missing_turn_stream() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&db, None)
+            .await
+            .expect("schema migrations must succeed");
+        db.execute_unprepared(
+            r#"
+INSERT INTO turn_event_projection_state (
+    event_id, thread_id, turn_id, sequence, status, attempt_count,
+    last_error, next_run_at, claim_token, claim_expires_at,
+    projection_context_json, projected_at, created_at, updated_at
+) VALUES (
+    'unclassified_1', 'thread_unclassified', 'turn_unclassified', 1,
+    'pending', 0, NULL, CURRENT_TIMESTAMP,
+    NULL, NULL, '{}', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+);
+"#,
+        )
+        .await
+        .expect("unclassified projection stream should insert");
+        let store = CrudStore::new(db.clone());
+
+        let error = backfill_once(&store)
+            .await
+            .expect_err("a new missing-Turn shape must still fail closed");
+        assert!(
+            format!("{error:#}").contains("orphan stream has no exhausted causal head"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            store
+                .get_turn_event_projection_stream_state("turn_unclassified")
+                .await
+                .expect("stream state should query")
+                .is_none(),
+            "failed classification must not create a guessed stream state"
+        );
+        let marker = find_projection_meta(&db, PROJECTION_STREAM_STATE_BACKFILL_KEY)
+            .await
+            .expect("backfill marker should query")
+            .expect("failed backfill marker should exist");
+        assert_eq!(marker.status, PROJECTION_META_STATUS_FAILED);
+    }
+
+    /// Runs the real startup backfill against an explicitly supplied,
+    /// disposable database copy. The path guard prevents accidental use of a
+    /// live Pioneer database. This is ignored in the normal test suite because
+    /// the production-shaped fixture is several gigabytes.
+    #[tokio::test]
+    #[ignore = "requires PIONEER_PROJECTION_BACKFILL_COPY_DB under a migration-audit directory"]
+    async fn projection_stream_backfill_completes_on_explicit_database_copy() {
+        let path = std::env::var("PIONEER_PROJECTION_BACKFILL_COPY_DB")
+            .expect("PIONEER_PROJECTION_BACKFILL_COPY_DB must name an isolated database copy");
+        let path = std::fs::canonicalize(path).expect("database copy path must resolve");
+        assert!(
+            path.components()
+                .any(|component| component.as_os_str() == "migration-audit"),
+            "refusing to mutate a database outside a migration-audit directory"
+        );
+
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .expect("sqlite-zstd auto-extension should register");
+        let database_url = format!("sqlite://{}?mode=rw", path.display());
+        let db = Database::connect(database_url)
+            .await
+            .expect("isolated database copy should open");
+        Migrator::up(&db, None)
+            .await
+            .expect("schema migrations should complete on the database copy");
+        let store = CrudStore::new(db.clone());
+
+        backfill_once(&store)
+            .await
+            .expect("projection stream backfill should complete on the database copy");
+        let marker = find_projection_meta(&db, PROJECTION_STREAM_STATE_BACKFILL_KEY)
+            .await
+            .expect("backfill marker should query")
+            .expect("backfill marker should exist");
+        assert_eq!(marker.status, PROJECTION_META_STATUS_COMPLETE);
+
+        let unquarantined_orphans = db
+            .query_one_raw(Statement::from_string(
+                db.get_database_backend(),
+                r#"
+SELECT COUNT(*) AS count
+FROM (
+    SELECT projection.turn_id
+    FROM turn_event_projection_state AS projection
+    LEFT JOIN turn AS canonical_turn ON canonical_turn.id = projection.turn_id
+    LEFT JOIN turn_event_projection_stream_state AS stream
+      ON stream.turn_id = projection.turn_id
+    WHERE canonical_turn.id IS NULL
+      AND COALESCE(stream.status, '') <> 'quarantined'
+    GROUP BY projection.turn_id
+)
+"#,
+            ))
+            .await
+            .expect("orphan verification should query")
+            .expect("orphan verification should return one row")
+            .try_get::<i64>("", "count")
+            .expect("orphan count should decode");
+        assert_eq!(unquarantined_orphans, 0);
+
+        let repeated = backfill_once(&store)
+            .await
+            .expect("completed copy backfill should be idempotent");
+        assert!(repeated.skipped);
     }
 
     #[tokio::test]

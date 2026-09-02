@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Utc};
@@ -260,18 +259,14 @@ impl GatewayAuthService {
         let transaction_acquire_stage = trace.stage(
             pioneer_observability::GatewayOperationStage::AuthRefreshDatabaseTransactionAcquire,
         );
-        let transaction_deadline = tokio::time::Instant::now()
-            + Duration::from_millis(self.config.database_acquire_timeout_ms);
-        let transaction = tokio::time::timeout_at(
-            transaction_deadline,
-            self.database.begin_with_options(TransactionOptions {
+        let transaction = self
+            .database
+            .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
                 ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|_| AuthError::new(AuthErrorCode::TemporarilyUnavailable))?
-        .map_err(refresh_transaction_acquire_error)?;
+            })
+            .await
+            .map_err(refresh_transaction_acquire_error)?;
         transaction_acquire_stage.succeed();
         let session = match load_session(&transaction, &presented.session_id)
             .await
@@ -3051,7 +3046,7 @@ mod tests {
             async move {
                 let transaction = database.begin().await?;
                 entered.notify_one();
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(650)).await;
                 transaction.commit().await?;
                 Ok::<_, sea_orm::DbErr>(())
             }
@@ -3068,8 +3063,13 @@ mod tests {
             .expect("refresh should enter after the bounded background quantum");
         assert_eq!(rotated.refresh_generation, 1);
         assert!(
-            started.elapsed() < Duration::from_millis(service.config.database_acquire_timeout_ms),
-            "foreground refresh exceeded its unchanged database acquisition deadline"
+            started.elapsed() >= std::time::Duration::from_millis(500),
+            "test must cross the removed 500 ms database acquisition deadline"
+        );
+        assert!(
+            started.elapsed()
+                < std::time::Duration::from_secs(service.config.auth_exchange_timeout_seconds),
+            "refresh must remain within the single end-to-end auth deadline"
         );
         background
             .await
