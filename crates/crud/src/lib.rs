@@ -28470,6 +28470,32 @@ mod tests {
         CrudStore::new(connection)
     }
 
+    async fn test_store_with_zstd_turn_items() -> CrudStore {
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .expect("sqlite-zstd extension should register");
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        let config = serde_json::json!({
+            "table": "turn_item",
+            "column": "payload",
+            "compression_level": 3,
+            "dict_chooser": "'[nodict]'",
+        });
+        connection
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT zstd_enable_transparent(?) AS value",
+                [config.to_string().into()],
+            ))
+            .await
+            .expect("turn_item compression should enable");
+        CrudStore::new(connection)
+    }
+
     #[tokio::test]
     async fn store_preserves_typed_database_scope_across_construction_and_write_reclassification() {
         let connection = Database::connect("sqlite::memory:")
@@ -29579,6 +29605,83 @@ mod tests {
                 .is_err(),
             "a finalization generation cannot alias different provider output"
         );
+    }
+
+    #[tokio::test]
+    async fn later_failed_turn_supersedes_a_prepared_native_finalization() {
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_native_finalization_cancelled";
+        let thread_id = "thr_native_finalization_cancelled";
+        let turn_id = "turn_native_finalization_cancelled";
+        let store = test_store_with_zstd_turn_items().await;
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        let turn = sample_turn(turn_id);
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                PersistedActorRef::System,
+            )
+            .await
+            .expect("turn start should persist");
+
+        let final_notification = ItemCompletedNotification {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item: TurnItem::AgentMessage {
+                id: "final_native_finalization_cancelled".to_owned(),
+                text: "provider output accepted before cancellation".to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        };
+        assert_eq!(
+            store
+                .prepare_turn_finalization(&final_notification, 1, None, timestamp + 1)
+                .await
+                .expect("finalization intent should prepare"),
+            PrepareTurnFinalizationOutcome::Prepared
+        );
+
+        let mut interrupted = turn;
+        interrupted.status = TurnStatus::Interrupted;
+        interrupted.error = Some("cancelled after finalization preparation".to_owned());
+        store
+            .materialize_turn_failed(
+                TurnFailedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: interrupted,
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("later failure should win atomically");
+
+        assert!(
+            turn_finalization::find_by_turn_id(&store.connection, turn_id)
+                .await
+                .expect("finalization intent lookup should succeed")
+                .is_none(),
+            "a superseded prepared finalization must not poison restart reconciliation"
+        );
+        assert_eq!(
+            store
+                .reconcile_prepared_turn_finalizations(10, timestamp + 3)
+                .await
+                .expect("restart reconciliation should have no stale intent"),
+            0
+        );
+        let (_, terminal) = store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("turn lookup should succeed")
+            .expect("turn should exist");
+        assert_eq!(terminal.status, TurnStatus::Interrupted);
     }
 
     fn cleanup_effect_preparation(
@@ -38923,14 +39026,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_transition_terminalizes_and_runtime_rehydration_restores_source_attempt() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-
-        let store = CrudStore::new(connection);
+        let store = test_store_with_zstd_turn_items().await;
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_timeout_terminalize";
         let thread_id = "thr_timeout_terminalize";
@@ -39460,7 +39556,7 @@ mod tests {
     async fn terminal_turn_projection_closes_running_attempts() {
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_turn_terminal_cleanup";
-        let store = test_store_with_workspace(workspace_id).await;
+        let store = test_store_with_zstd_turn_items().await;
         let thread_id = "thr_turn_terminal_cleanup";
         let turn_id = "turn_turn_terminal_cleanup";
         let item_id = "item_turn_terminal_cleanup";

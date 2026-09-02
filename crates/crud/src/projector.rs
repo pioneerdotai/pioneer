@@ -11,7 +11,8 @@ use std::pin::Pin;
 use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_item_type_to_db};
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
 use crate::repositories::{
-    identity, policy, self_improvement_source_turn, thread, turn, turn_item_attempt, turn_liveness,
+    identity, policy, self_improvement_source_turn, thread, turn, turn_finalization,
+    turn_item_attempt, turn_liveness,
 };
 use crate::turn_item_terminal::{
     attempt_status_from_payload, terminal_turn_item_status_from_payload,
@@ -510,7 +511,9 @@ impl TurnProjector {
                     status_history.context("turn/failed status history was not prepared")?,
                     append_status_history,
                 )
-                .await
+                .await?;
+                turn_finalization::delete_prepared_by_turn_id(db, payload.turn.id.as_str()).await?;
+                Ok(())
             }),
             TurnEventPayload::TurnBlocked(payload) => project_future(async move {
                 turn_item_attempt::close_prepared_terminal_running_attempts(
@@ -527,7 +530,9 @@ impl TurnProjector {
                     status_history.context("turn/blocked status history was not prepared")?,
                     append_status_history,
                 )
-                .await
+                .await?;
+                turn_finalization::delete_prepared_by_turn_id(db, payload.turn.id.as_str()).await?;
+                Ok(())
             }),
         };
         future.await
