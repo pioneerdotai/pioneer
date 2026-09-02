@@ -4533,7 +4533,10 @@ async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_witho
         catch_up_policy: None,
     });
     configure_agent_task(&mut params);
-    params.agent_spec = Some(agent_spec(2));
+    let mut spec = agent_spec(2);
+    spec.prompt.instructions = vec!["Execute the scheduled test run once.".to_owned()];
+    spec.prompt.output_instructions = Some("Return a concise test result.".to_owned());
+    params.agent_spec = Some(spec);
     let response = runtime
         .service()
         .create_task(task_create_context_for(&params), params)
